@@ -3,6 +3,7 @@ pub fn create_makepkg_config(build_dir_base: &str) -> anyhow::Result<(String, St
         "
 MAKEFLAGS=-j$(nproc)
 PKGDEST={build_dir_base}
+VALIDATE=none
         "
     );
     let makepkg_config_path = "/var/ab/.config/pacman/makepkg.conf";
