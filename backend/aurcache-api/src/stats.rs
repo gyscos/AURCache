@@ -1,3 +1,4 @@
+use crate::auth::has_api_token;
 use anyhow::bail;
 use bigdecimal::ToPrimitive;
 
@@ -46,10 +47,21 @@ pub async fn stats(
     )
 )]
 #[get("/userinfo")]
-pub async fn user_info(a: Authenticated) -> Json<UserInfo> {
-    Json(UserInfo {
-        username: a.username,
-    })
+pub async fn user_info(
+    db: &State<DatabaseConnection>,
+    a: Authenticated,
+) -> Result<Json<UserInfo>, NotFound<String>> {
+    let username = a.username;
+    let has_api_token = match &username {
+        Some(username) => has_api_token(db, username)
+            .await
+            .map_err(|e| NotFound(e.to_string()))?,
+        None => false,
+    };
+    Ok(Json(UserInfo {
+        username,
+        has_api_token,
+    }))
 }
 
 #[utoipa::path(

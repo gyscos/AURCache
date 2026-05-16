@@ -5,6 +5,8 @@ members = [
     "pacman-repo-utils",
     "aurcache",
     "aurcache-builder",
+    "aurcache-cli",
+    "aurcache-client",
     "aurcache-deps",
     "aurcache-db",
     "aurcache-api",
