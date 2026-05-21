@@ -50,7 +50,7 @@ wait_for_service() {
 }
 
 dc() {
-    docker compose -f docker-compose.e2e.yaml "$@"
+    docker compose -f docker-compose.e2e.din.yaml "$@"
 }
 
 # =============================================================================
@@ -99,10 +99,14 @@ start_docker_services() {
 
 configure_aurcache_registry() {
     echo "=== Configuring AURCache registry ==="
-    echo '[[registry]]
-prefix = "localhost"
-location = "localhost"
-insecure = true' | docker exec -i aurcache-aurcache-1 bash -c "cat > /etc/containers/registries.conf.d/localhost.conf"
+    # In DinD mode aurcache runs Podman internally; the registry is reachable
+    # by its Docker Compose service name "registry" (not localhost).
+    docker exec aurcache-aurcache-1 bash -c "cat > /etc/containers/registries.conf.d/registry.conf" << 'EOF'
+[[registry]]
+prefix = "registry:5000"
+location = "registry:5000"
+insecure = true
+EOF
 }
 
 prepare() {
