@@ -6,9 +6,10 @@ use std::path::Path;
 /// Build the makepkg.conf for a build.
 ///
 /// User-provided content (from the `makepkg_conf` setting) is written first.
-/// PKGDEST and MAKEFLAGS are always appended at the end so the user cannot
-/// accidentally override them — without the right PKGDEST the build can't be
-/// collected from the shared mount.
+/// PKGDEST, MAKEFLAGS, and PACKAGER are always appended at the end so the
+/// user cannot accidentally override them — without the right PKGDEST the
+/// build can't be collected from the shared mount, and without a valid
+/// PACKAGER the generated `desc` file cannot be parsed by libalpm.
 ///
 /// Pass `None` for `db_ctx` when no database is available (e.g. the
 /// test-builder binary); user config is then skipped.
@@ -31,7 +32,7 @@ pub async fn create_makepkg_config(
     }
 
     config.push_str(&format!(
-        "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\n",
+        "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\nPACKAGER='AURCache <aurcache@localhost>'\n",
         pkgdest_dir_base.display()
     ));
 
