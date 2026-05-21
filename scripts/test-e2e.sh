@@ -101,7 +101,7 @@ configure_aurcache_registry() {
     echo "=== Configuring AURCache registry ==="
     # In DinD mode aurcache runs Podman internally; the registry is reachable
     # by its Docker Compose service name "registry" (not localhost).
-    docker exec aurcache-aurcache-1 bash -c "cat > /etc/containers/registries.conf.d/registry.conf" << 'EOF'
+    docker exec -i aurcache-aurcache-1 bash -c "cat > /etc/containers/registries.conf.d/registry.conf" << 'EOF'
 [[registry]]
 prefix = "registry:5000"
 location = "registry:5000"

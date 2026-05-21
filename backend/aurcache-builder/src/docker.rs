@@ -255,6 +255,9 @@ and check also if the 'DOCKER_HOST=unix:///var/run/user/1000/podman/podman.sock'
                 memory_swap: Some(memory_limit),
                 binds: Some(mountpoints),
                 mounts: Some(mounts),
+                network_mode: repo_config
+                    .host_network
+                    .then(|| "host".to_string()),
                 ..Default::default()
             }),
             networking_config: repo_config.builder_network.as_deref().map(|network| {

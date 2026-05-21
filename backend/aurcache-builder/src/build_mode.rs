@@ -98,9 +98,13 @@ pub struct RepoConfig {
     /// HTTP base URL at which builder containers reach the AURCache file server.
     pub url: String,
     /// Docker network that builder containers should join to reach `url` by IP.
-    /// `None` when the URL is reachable without joining a specific network
-    /// (e.g. via the bridge gateway in DinD mode).
+    /// `None` when the URL is reachable without joining a specific network.
     pub builder_network: Option<String>,
+    /// When `true`, builder containers are created with `--network=host` so they
+    /// share the host's network namespace and can reach `url` via `localhost`.
+    /// Used in DinD mode where the Podman bridge gateway is unreachable from
+    /// inner containers due to netavark/iptables interaction inside Docker.
+    pub host_network: bool,
 }
 
 static REPO_CONFIG: OnceCell<RepoConfig> = OnceCell::const_new();
@@ -127,6 +131,7 @@ async fn detect_repo_config(docker: &bollard::Docker) -> anyhow::Result<RepoConf
         return Ok(RepoConfig {
             url,
             builder_network: None,
+            host_network: false,
         });
     }
 
@@ -160,6 +165,7 @@ async fn detect_repo_config(docker: &bollard::Docker) -> anyhow::Result<RepoConf
                         return Ok(RepoConfig {
                             url,
                             builder_network: Some(network_name),
+                            host_network: false,
                         });
                     }
                 }
@@ -173,40 +179,25 @@ async fn detect_repo_config(docker: &bollard::Docker) -> anyhow::Result<RepoConf
         }
     }
 
-    // DinD mode (or host mode without a named network): the Docker
-    // bridge gateway is reachable from builder containers.
-    use bollard::models::NetworkInspect;
-    use bollard::query_parameters::InspectNetworkOptions;
-
-    let net: NetworkInspect = docker
-        .inspect_network("bridge", None::<InspectNetworkOptions>)
-        .await
-        .map_err(|e| anyhow!("Failed to inspect Docker bridge network: {e}"))?;
-
-    let gateway = net
-        .ipam
-        .and_then(|ipam| ipam.config)
-        .and_then(|configs| configs.into_iter().next())
-        .and_then(|c| c.gateway)
-        .ok_or_else(|| {
-            anyhow!(
-                "Could not determine Docker bridge gateway. \
-                 Set AURCACHE_REPO_URL explicitly."
-            )
-        })?;
-
+    // DinD mode: builder containers run inside Podman (inside Docker). The
+    // Podman bridge gateway IP is technically the loopback of the aurcache
+    // container but is unreachable due to netavark/iptables interaction inside
+    // Docker's network namespace. Instead, use --network=host so builder
+    // containers share the aurcache container's network namespace and can reach
+    // the AURCache file server via localhost.
     let url = format!(
-        "http://{}:{}",
-        gateway,
+        "http://localhost:{}",
         aurcache_types::ports::AURCACHE_MIRROR_PORT
     );
     info!(
-        "AURCACHE_REPO_URL not set; auto-detected bridge gateway as {url}. \
+        "AURCACHE_REPO_URL not set; DinD mode detected. Builder containers will \
+         use host networking and connect via {url}. \
          Set AURCACHE_REPO_URL explicitly to override."
     );
     Ok(RepoConfig {
         url,
         builder_network: None,
+        host_network: true,
     })
 }
 
