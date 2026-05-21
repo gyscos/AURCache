@@ -33,95 +33,141 @@ impl Builder {
         }
 
         let build_pkgs = build_output_map(archive_paths)?;
-        let txn = self.db.begin().await?;
         let pkg_id = *self.package_model.id.get()?;
         let platform = self.build_model.platform.get()?;
 
-        // ADD NEW FILES FIRST
-        let mut new_file_ids: HashMap<String, i32> = HashMap::new();
+        // PHASE 1: resolve file ownership in a short read transaction so we
+        // don't hold a DB connection during the long file-copy / repo_add phase.
+        struct FileInfo {
+            archive_name: String,
+            pkg_path: String,
+            parsed_name: String,
+            existing_id: Option<i32>,
+            existing_package_id: Option<i32>,
+        }
 
-        for (archive_path, parsed) in &build_pkgs {
-            let archive_name = archive_path.file_name().to_str().unwrap().to_string();
-            let pkg_path = format!("./repo/{platform}/{archive_name}");
+        let mut file_infos: Vec<FileInfo> = Vec::new();
+        {
+            let txn = self.db.begin().await?;
+            for (archive_path, parsed) in &build_pkgs {
+                let archive_name = archive_path.file_name().to_str().unwrap().to_string();
+                let pkg_path = format!("./repo/{platform}/{archive_name}");
 
-            let existing = Files::find()
-                .filter(files::Column::Filename.eq(&archive_name))
-                .filter(files::Column::Platform.eq(platform))
-                .one(&txn)
-                .await?;
+                let existing = Files::find()
+                    .filter(files::Column::Filename.eq(&archive_name))
+                    .filter(files::Column::Platform.eq(platform))
+                    .one(&txn)
+                    .await?;
 
-            let file_id = if let Some(existing) = existing {
-                if existing.package_id != pkg_id {
-                    // During dependency-resolution migration, files can move from a legacy owner
-                    // package to the newly created dependency package that should own them.
-                    let existing_owner_depends_on_new_owner = Dependencies::find()
-                        .filter(dependencies::Column::DependentId.eq(existing.package_id))
-                        .filter(dependencies::Column::DependeeId.eq(pkg_id))
-                        .one(&txn)
-                        .await?;
+                if let Some(ref ex) = existing {
+                    if ex.package_id != pkg_id {
+                        let existing_owner_depends_on_new_owner = Dependencies::find()
+                            .filter(dependencies::Column::DependentId.eq(ex.package_id))
+                            .filter(dependencies::Column::DependeeId.eq(pkg_id))
+                            .one(&txn)
+                            .await?;
 
-                    if existing_owner_depends_on_new_owner.is_none() {
-                        bail!("File '{archive_name}' is already produced by another package");
+                        if existing_owner_depends_on_new_owner.is_none() {
+                            bail!("File '{archive_name}' is already produced by another package");
+                        }
+                        self.logger
+                            .append(format!(
+                                "Transferring file '{archive_name}' from package {} (depends on this package)\n",
+                                ex.package_id
+                            ))
+                            .await;
                     }
-                    self.logger
-                        .append(format!(
-                            "Transferring file '{archive_name}' from package {} (depends on this package)\n",
-                            existing.package_id
-                        ))
-                        .await;
                 }
 
-                let mut active: files::ActiveModel = existing.into();
-                active.package_id = Set(pkg_id);
-                active.update(&txn).await?.id
-            } else {
-                files::ActiveModel {
-                    filename: Set(archive_name),
-                    platform: Set(platform.clone()),
-                    package_id: Set(pkg_id),
-                    ..Default::default()
-                }
-                .insert(&txn)
-                .await?
-                .id
-            };
-            new_file_ids.insert(parsed.name.clone(), file_id);
+                file_infos.push(FileInfo {
+                    archive_name,
+                    pkg_path,
+                    parsed_name: parsed.name.clone(),
+                    existing_id: existing.as_ref().map(|e| e.id),
+                    existing_package_id: existing.as_ref().map(|e| e.package_id),
+                });
+            }
+            txn.commit().await?;
+        }
+
+        // PHASE 2: copy files and update the pacman repo — no DB connection held.
+        for fi in &file_infos {
+            let archive_path = build_pkgs
+                .iter()
+                .find(|(de, _)| de.file_name().to_str().unwrap() == fi.archive_name)
+                .map(|(de, _)| de.path())
+                .expect("archive path must exist");
 
             self.logger
-                .append(format!("Move {} to repo directory\n", parsed.filename))
+                .append(format!("Move {} to repo directory\n", fi.archive_name))
                 .await;
-            fs::copy(archive_path.path(), &pkg_path)?;
-            fs::remove_file(archive_path.path())?;
+            fs::copy(&archive_path, &fi.pkg_path)?;
+            fs::remove_file(&archive_path)?;
 
             self.logger
                 .append(format!(
                     "Add {} to repo.db.tar.gz and repo.files.tar.gz\n",
-                    parsed.filename
+                    fi.archive_name
                 ))
                 .await;
             pacman_repo_utils::repo_add::repo_add(
-                &pkg_path,
+                &fi.pkg_path,
                 format!("./repo/{platform}/repo.db.tar.gz"),
                 format!("./repo/{platform}/repo.files.tar.gz"),
             )?;
         }
 
-        let stale = Files::find()
-            .filter(files::Column::PackageId.eq(pkg_id))
-            .filter(files::Column::Platform.eq(platform))
-            .all(&txn)
-            .await?;
+        // PHASE 3: write the file records and remove stale entries in one short
+        // transaction now that all filesystem work is done.
+        let mut new_file_ids: HashMap<String, i32> = HashMap::new();
+        {
+            let txn = self.db.begin().await?;
 
-        for file in stale {
-            if !new_file_ids.values().any(|&id| id == file.id) {
-                self.logger
-                    .append(format!("Removing dropped sub-package: {}\n", file.filename))
-                    .await;
-                try_remove_archive_file(file, &txn).await?;
+            for fi in &file_infos {
+                let file_id = if let Some(existing_id) = fi.existing_id {
+                    if fi.existing_package_id != Some(pkg_id) {
+                        // Transfer ownership to the current package.
+                        let mut active = files::ActiveModel {
+                            id: Set(existing_id),
+                            package_id: Set(pkg_id),
+                            ..Default::default()
+                        };
+                        active.update(&txn).await?.id
+                    } else {
+                        existing_id
+                    }
+                } else {
+                    files::ActiveModel {
+                        filename: Set(fi.archive_name.clone()),
+                        platform: Set(platform.clone()),
+                        package_id: Set(pkg_id),
+                        ..Default::default()
+                    }
+                    .insert(&txn)
+                    .await?
+                    .id
+                };
+                new_file_ids.insert(fi.parsed_name.clone(), file_id);
             }
+
+            let stale = Files::find()
+                .filter(files::Column::PackageId.eq(pkg_id))
+                .filter(files::Column::Platform.eq(platform))
+                .all(&txn)
+                .await?;
+
+            for file in stale {
+                if !new_file_ids.values().any(|&id| id == file.id) {
+                    self.logger
+                        .append(format!("Removing dropped sub-package: {}\n", file.filename))
+                        .await;
+                    try_remove_archive_file(file, &txn).await?;
+                }
+            }
+
+            txn.commit().await?;
         }
 
-        txn.commit().await?;
         self.logger
             .append("Successfully updated repo and cleaned up old files\n".to_string())
             .await;
