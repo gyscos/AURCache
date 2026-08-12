@@ -36,7 +36,7 @@ impl Default for AurClient {
 
 /// Build a snapshot download URL for an AUR package from the RPC URL.
 /// Strips `/rpc/v5` from the RPC URL to derive the base domain (if present).
-pub fn snapshot_url(rpc_url: &str, pkgbase: &str) -> String {
+pub(crate) fn snapshot_url(rpc_url: &str, pkgbase: &str) -> String {
     let base = rpc_url.trim_end_matches("/rpc/v5").trim_end_matches('/');
     format!("{base}/cgit/aur.git/snapshot/{pkgbase}.tar.gz")
 }
@@ -56,40 +56,12 @@ impl AurClient {
         }
     }
 
-    /// Construct a new client using the given AUR RPC base URL.
-    pub fn with_aur_url(aur_url: impl Into<String>) -> Self {
-        let rpc_url = aur_url.into();
-        Self {
-            http: Client::new(),
-            official_packages_url: official_packages_url_for_aur(&rpc_url),
-            repo_root: crate::repo::default_repo_root(),
-            official_mirrorlist_path: default_official_mirrorlist_path(),
-            official_repo_cache_dir: default_official_repo_cache_dir(),
-            rpc_url,
-        }
-    }
-
     /// Construct a client with explicit AUR and official packages API URLs.
     pub fn with_urls(aur_url: impl Into<String>, official_packages_url: impl Into<String>) -> Self {
         Self::with_urls_and_paths(
             aur_url,
             official_packages_url,
             crate::repo::default_repo_root(),
-            default_official_mirrorlist_path(),
-            default_official_repo_cache_dir(),
-        )
-    }
-
-    /// Construct a client with explicit URLs and a custom local repo root path.
-    pub fn with_urls_and_repo_root(
-        aur_url: impl Into<String>,
-        official_packages_url: impl Into<String>,
-        repo_root: impl Into<PathBuf>,
-    ) -> Self {
-        Self::with_urls_and_paths(
-            aur_url,
-            official_packages_url,
-            repo_root,
             default_official_mirrorlist_path(),
             default_official_repo_cache_dir(),
         )
@@ -140,7 +112,8 @@ impl AurClient {
 
     /// Fetch the dependency lists for a pkgbase via the AUR RPC.
     pub async fn deps_of(&self, pkgbase: &str) -> Result<PkgDeps, Error> {
-        self.deps_of_rpc(pkgbase).await
+        let packages = self.rpc_request(&[pkgbase]).await?;
+        Ok(deps_from_packages(&packages))
     }
 
     /// Fetch metadata for a single AUR package by name, returning `None` if not found.
@@ -273,11 +246,6 @@ impl AurClient {
             .map_err(Error::Http)?;
         let bytes = resp.bytes().await?.to_vec();
         Ok(bytes)
-    }
-
-    async fn deps_of_rpc(&self, pkgbase: &str) -> Result<PkgDeps, Error> {
-        let packages = self.rpc_request(&[pkgbase]).await?;
-        Ok(deps_from_packages(&packages))
     }
 
     pub(crate) async fn official_dependency_exists(&self, dep_name: &str) -> Result<bool, Error> {

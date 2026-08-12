@@ -167,7 +167,7 @@ async fn mock_official_repo_db(
             .collect::<Vec<_>>(),
     );
     Mock::given(method("GET"))
-        .and(path(&format!("/{repo_name}/os/x86_64/{repo_name}.db")))
+        .and(path(format!("/{repo_name}/os/x86_64/{repo_name}.db")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
         .mount(server)
         .await;

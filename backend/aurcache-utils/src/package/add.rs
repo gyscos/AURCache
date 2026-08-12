@@ -332,27 +332,11 @@ pub(crate) async fn resolve_dependency_resolutions(
     db: &DatabaseConnection,
     dep_names: &[String],
 ) -> anyhow::Result<HashMap<String, DependencyResolution>> {
-    if dep_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut resolutions = resolve_local_dependency_resolutions(db, dep_names).await?;
-    let unresolved = dep_names
-        .iter()
-        .filter(|dep_name| !resolutions.contains_key(dep_name.as_str()))
-        .map(|dep_name| dep_name.as_str())
-        .collect::<Vec<_>>();
-    if unresolved.is_empty() {
-        return Ok(resolutions);
-    }
-
-    resolutions.extend(
-        client
-            .resolve_dependencies(&unresolved)
-            .await
-            .map_err(|e| anyhow!("Failed to resolve dependencies: {e}"))?,
-    );
-    Ok(resolutions)
+    aurcache_db::helpers::dependency_resolution::resolve_dependency_resolutions(
+        client, db, dep_names,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to resolve dependencies: {e}"))
 }
 
 async fn insert_package_with_deps(
@@ -506,66 +490,6 @@ pub(crate) fn provides_json(provides: &[String]) -> anyhow::Result<Option<String
     }
 
     Ok(Some(serde_json::to_string(provides)?))
-}
-
-async fn resolve_local_dependency_resolutions(
-    db: &DatabaseConnection,
-    dep_names: &[String],
-) -> anyhow::Result<HashMap<String, DependencyResolution>> {
-    let local_packages = Packages::find()
-        .filter(packages::Column::Status.is_in(vec![
-            BuildStates::ENQUEUED_BUILD,
-            BuildStates::ACTIVE_BUILD,
-            BuildStates::SUCCESSFUL_BUILD,
-        ]))
-        .all(db)
-        .await?;
-
-    Ok(dep_names
-        .iter()
-        .filter_map(|dep_name| {
-            find_local_dependee_pkgbase(&local_packages, dep_name)
-                .map(|pkgbase| (dep_name.clone(), DependencyResolution::Local { pkgbase }))
-        })
-        .collect())
-}
-
-fn find_local_dependee_pkgbase(
-    local_packages: &[packages::Model],
-    dep_name: &str,
-) -> Option<String> {
-    local_packages
-        .iter()
-        .filter_map(|pkg| local_match_rank(pkg, dep_name).map(|rank| (rank, pkg.name.as_str())))
-        .min_by(|(left_rank, left_name), (right_rank, right_name)| {
-            left_rank.cmp(right_rank).then(left_name.cmp(right_name))
-        })
-        .map(|(_, pkgbase)| pkgbase.to_string())
-}
-
-fn local_match_rank(pkg: &packages::Model, dep_name: &str) -> Option<u8> {
-    if pkg.name == dep_name {
-        return Some(0);
-    }
-    if json_list_contains(pkg.split_packages.as_deref(), dep_name, false) {
-        return Some(1);
-    }
-    json_list_contains(pkg.provides.as_deref(), dep_name, true).then_some(2)
-}
-
-fn json_list_contains(json: Option<&str>, dep_name: &str, parse_relation: bool) -> bool {
-    parse_json_list(json).into_iter().any(|value| {
-        if parse_relation {
-            aurcache_deps::parse_dep(&value).0 == dep_name
-        } else {
-            value == dep_name
-        }
-    })
-}
-
-fn parse_json_list(json: Option<&str>) -> Vec<String> {
-    json.and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_default()
 }
 
 fn check_platforms(platforms: &Vec<Platform>) -> anyhow::Result<()> {

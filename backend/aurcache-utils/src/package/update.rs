@@ -405,10 +405,7 @@ async fn sync_dependency_rows(
     dep_packages: &HashMap<String, packages::Model>,
 ) -> anyhow::Result<()> {
     let txn = db.begin().await?;
-    let desired_dependee_ids = dep_packages
-        .keys()
-        .filter_map(|pkgbase| dep_packages.get(pkgbase).map(|pkg| pkg.id))
-        .collect::<Vec<_>>();
+    let desired_dependee_ids = dep_packages.values().map(|pkg| pkg.id).collect::<Vec<_>>();
 
     for existing in Dependencies::find()
         .filter(dependencies::Column::DependentId.eq(dependent_id))
