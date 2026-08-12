@@ -73,7 +73,7 @@ pub async fn package_update_all_outdated(
     let mut ids_total = vec![];
     for pkg in &pkg_models {
         if pkg.status == BuildStates::SUCCESSFUL_BUILD {
-            let mut ids = package_update(db, pkg.to_owned(), false, tx).await?;
+            let results = package_update(db, pkg.to_owned(), false, tx).await?;
             activity_log
                 .add(
                     PackageUpdateActivity {
@@ -84,7 +84,12 @@ pub async fn package_update_all_outdated(
                     Some("Server".to_string()),
                 )
                 .await?;
-            ids_total.append(&mut ids);
+            ids_total.extend(
+                results
+                    .into_iter()
+                    .filter(|r| r.enqueued)
+                    .map(|r| r.build_id),
+            );
         } else {
             info!(
                 "Package auto update was not triggered for package {} because of prev. build status: {}",
@@ -108,14 +113,15 @@ pub async fn package_update_all_outdated(
 ///
 /// # Returns
 ///
-/// * `Ok(Vec<i32>)` - A vector of build IDs for the updated package.
+/// * `Ok(Vec<PlatformUpdateResult>)` - One entry per configured platform, describing the build
+///   that was enqueued/promoted or left waiting on dependencies.
 /// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
 pub async fn package_update(
     db: &DatabaseConnection,
     pkg_model: packages::Model,
     force: bool,
     tx: &Sender<Action>,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let client = AurClient::new();
     let mut store = SnapshotStore::new();
     package_update_with_client(&client, &mut store, db, pkg_model, force, tx).await
@@ -123,7 +129,7 @@ pub async fn package_update(
 
 /// Update a single package using a caller-provided AUR client.
 ///
-/// Returns the build IDs that were enqueued for the package's ready platforms.
+/// Returns one [`PlatformUpdateResult`] per configured platform.
 pub async fn package_update_with_client(
     client: &AurClient,
     store: &mut SnapshotStore,
@@ -131,7 +137,7 @@ pub async fn package_update_with_client(
     pkg_model: packages::Model,
     force: bool,
     tx: &Sender<Action>,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let mut visited = HashSet::new();
     let mut services = Services {
         client,
@@ -149,7 +155,7 @@ async fn package_update_with_client_inner(
     pkg_model: packages::Model,
     force: bool,
     visited: &mut HashSet<i32>,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     if !visited.insert(pkg_model.id) {
         return Ok(vec![]);
     }
@@ -183,7 +189,7 @@ async fn package_update_with_client_inner(
         );
     }
 
-    let (enqueued_ids, has_waiting) = enqueue_platform_builds(
+    let platform_results = enqueue_platform_builds(
         services,
         BuildRequest {
             pkg_model: &pkg_model,
@@ -194,9 +200,12 @@ async fn package_update_with_client_inner(
     )
     .await?;
 
+    let any_enqueued = platform_results.iter().any(|r| r.enqueued);
+    let has_waiting = platform_results.iter().any(|r| !r.enqueued);
+
     let pkgbase = sourceinfo.base.name.to_string();
     let mut pkg_model_active: packages::ActiveModel = pkg_model.clone().into();
-    let initial_status = if has_waiting && enqueued_ids.is_empty() {
+    let initial_status = if has_waiting && !any_enqueued {
         BuildStates::WAITING_FOR_DEPS
     } else {
         BuildStates::ENQUEUED_BUILD
@@ -209,7 +218,7 @@ async fn package_update_with_client_inner(
     pkg_model_active.save(&txn).await?;
     txn.commit().await?;
 
-    Ok(enqueued_ids)
+    Ok(platform_results)
 }
 
 /// A single dependency of the package being updated, with its constraint.
@@ -548,18 +557,30 @@ struct BuildRequest<'a> {
     graph: &'a DependencyGraph,
 }
 
+/// Outcome of triggering an update for a single platform of a package.
+#[derive(Debug, Clone)]
+pub struct PlatformUpdateResult {
+    pub platform: Platform,
+    /// The build row created/reused for this platform. Present regardless of
+    /// whether the build was actually dispatched or is still waiting on a
+    /// dependency rebuild.
+    pub build_id: i32,
+    /// `true` if the build was enqueued/promoted and dispatched to the builder;
+    /// `false` if it was left `WAITING_FOR_DEPS` pending an unfinished
+    /// dependency rebuild.
+    pub enqueued: bool,
+}
+
 /// For each configured platform, check dep readiness and enqueue builds.
-/// Returns (enqueued_build_ids, has_waiting_platforms).
 async fn enqueue_platform_builds(
     services: &mut Services<'_>,
     request: BuildRequest<'_>,
     visited: &mut HashSet<i32>,
-) -> anyhow::Result<(Vec<i32>, bool)> {
+) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let configured_platforms =
         Platform::parse_many(&request.pkg_model.platforms).collect::<Result<Vec<_>, _>>()?;
 
-    let mut enqueued_ids = Vec::new();
-    let mut has_waiting = false;
+    let mut results = Vec::new();
 
     for platform in &configured_platforms {
         let ready =
@@ -574,14 +595,15 @@ async fn enqueue_platform_builds(
                 services.tx,
             )
             .await?;
-            if result.inserted {
-                enqueued_ids.push(result.build.id);
-            }
+            results.push(PlatformUpdateResult {
+                platform: *platform,
+                build_id: result.build.id,
+                enqueued: result.inserted,
+            });
         } else {
-            has_waiting = true;
             let txn = services.db.begin().await?;
             let start_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-            enqueue_build_if_missing(
+            let waiting = enqueue_build_if_missing(
                 &txn,
                 request.pkg_model.id,
                 *platform,
@@ -591,10 +613,15 @@ async fn enqueue_platform_builds(
             )
             .await?;
             txn.commit().await?;
+            results.push(PlatformUpdateResult {
+                platform: *platform,
+                build_id: waiting.build.id,
+                enqueued: false,
+            });
         }
     }
 
-    Ok((enqueued_ids, has_waiting))
+    Ok(results)
 }
 
 /// Create or reuse the pending build entry for a package on one platform.
@@ -920,13 +947,13 @@ mod tests {
         .unwrap();
 
         let mut store = SnapshotStore::new();
-        let build_ids =
+        let results =
             package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
                 .await
                 .unwrap();
 
         assert!(
-            build_ids.is_empty(),
+            results.iter().all(|r| !r.enqueued),
             "parent should wait for dependency rebuild"
         );
 
@@ -1135,13 +1162,13 @@ mod tests {
         .unwrap();
 
         let mut store = SnapshotStore::new();
-        let build_ids =
+        let results =
             package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
                 .await
                 .unwrap();
 
         assert!(
-            build_ids.is_empty(),
+            results.iter().all(|r| !r.enqueued),
             "parent should wait for transitive dependency rebuilds"
         );
 
@@ -1359,13 +1386,13 @@ mod tests {
         .unwrap();
 
         let mut store = SnapshotStore::new();
-        let build_ids =
+        let results =
             package_update_with_client(&client, &mut store, &db, parent.clone(), true, &tx)
                 .await
                 .unwrap();
 
         assert!(
-            build_ids.is_empty(),
+            results.iter().all(|r| !r.enqueued),
             "forced rebuild should still wait for transitive dependency rebuilds"
         );
 
