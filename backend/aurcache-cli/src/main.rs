@@ -44,7 +44,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Command {
     /// Check whether the server is healthy.
     Health,
@@ -70,7 +70,7 @@ enum Command {
         command: ConfigCommand,
     },
     /// Manage packages.
-    Packages {
+    Pkg {
         #[command(subcommand)]
         command: PackagesCommand,
     },
@@ -83,13 +83,13 @@ enum Command {
     Raw(RawArgs),
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum TokenCommand {
     /// Regenerate the currently authenticated user's API token.
     Regenerate,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum ConfigCommand {
     /// Show the saved config location and stored values.
     Show,
@@ -105,7 +105,7 @@ enum ConfigCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum PackagesCommand {
     /// List directly requested packages.
     List(ListPackagesArgs),
@@ -130,7 +130,7 @@ enum PackagesCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum AddPackageCommand {
     /// Add a package from the AUR.
     Aur(AddAurPackageArgs),
@@ -138,7 +138,7 @@ enum AddPackageCommand {
     Git(AddGitPackageArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct ListPackagesArgs {
     /// Maximum number of packages to return.
     #[arg(long)]
@@ -149,7 +149,7 @@ struct ListPackagesArgs {
     page: Option<u64>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct AddAurPackageArgs {
     /// AUR package names.
     #[arg(required = true)]
@@ -164,7 +164,7 @@ struct AddAurPackageArgs {
     build_flags: Vec<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct AddGitPackageArgs {
     /// Git repository URL.
     #[arg(long)]
@@ -187,7 +187,7 @@ struct AddGitPackageArgs {
     build_flags: Vec<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct UpdatePackageArgs {
     /// Package id.
     id: i32,
@@ -197,7 +197,7 @@ struct UpdatePackageArgs {
     force: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct PatchPackageArgs {
     /// Package id.
     id: i32,
@@ -226,7 +226,7 @@ struct PatchPackageArgs {
     build_flags: Vec<String>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum BuildsCommand {
     /// List builds.
     List(ListBuildsArgs),
@@ -254,7 +254,7 @@ enum BuildsCommand {
     },
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct ListBuildsArgs {
     /// Optional package id to filter by.
     #[arg(long = "package-id")]
@@ -269,7 +269,7 @@ struct ListBuildsArgs {
     page: Option<u64>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct BuildOutputArgs {
     /// Build id.
     id: i32,
@@ -279,7 +279,7 @@ struct BuildOutputArgs {
     start_line: Option<i32>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct RawArgs {
     /// HTTP method to use, for example GET or POST.
     method: String,
@@ -305,10 +305,25 @@ async fn main() -> Result<()> {
         Command::Config { command } => run_config_command(format, command),
         command => {
             let runtime = resolve_runtime_config(cli.url, cli.token)?;
-            let client = AurCacheClient::new(runtime.url, runtime.token)?;
-            run(&client, format, command).await
+            let client = AurCacheClient::new(runtime.url.clone(), runtime.token)?;
+            match run(&client, format, command.clone()).await {
+                Err(err) if is_unauthorized(&err) && config::is_interactive() => {
+                    eprintln!("{err}");
+                    eprintln!("Please re-enter your AURCache API token to continue.");
+                    let token = config::prompt_and_save_token(load_config()?)?;
+                    let client = AurCacheClient::new(runtime.url, Some(token))?;
+                    run(&client, format, command).await
+                }
+                result => result,
+            }
         }
     }
+}
+
+/// Whether the given error is an HTTP 401 Unauthorized response from the API.
+fn is_unauthorized(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<aurcache_client::ApiError>()
+        .is_some_and(aurcache_client::ApiError::is_unauthorized)
 }
 
 async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) -> Result<()> {
@@ -320,7 +335,7 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Search { query } => render_search_results(client, format, &query).await,
         Command::Token { command } => run_token_command(client, format, command).await,
         Command::Config { .. } => unreachable!("config commands are handled before client setup"),
-        Command::Packages { command } => run_packages_command(client, format, command).await,
+        Command::Pkg { command } => run_packages_command(client, format, command).await,
         Command::Builds { command } => run_builds_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
     }

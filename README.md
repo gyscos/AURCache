@@ -32,8 +32,8 @@ The reusable Rust client library backing it lives in `backend/aurcache-client`.
 export AURCACHE_URL=http://localhost:8080/api
 export AURCACHE_TOKEN=your-token
 
-cargo run -p aurcache-cli -- packages list
-cargo run -p aurcache-cli -- packages add aur paru --platform x86_64
+cargo run -p aurcache-cli -- pkg list
+cargo run -p aurcache-cli -- pkg add aur paru --platform x86_64
 cargo run -p aurcache-cli -- builds list --limit 10
 cargo run -p aurcache-cli -- token regenerate
 ```

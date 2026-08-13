@@ -158,7 +158,7 @@ request_package() {
     log "=== Adding package: $PACKAGE ==="
     # We're starting from a fresh DB every time, so we know it'll be a new package.
     # If we reused the DB test after test we'd need to delete the package before adding it again.
-    if ! aurcache_cli packages add aur "$PACKAGE" --platform x86_64; then
+    if ! aurcache_cli pkg add aur "$PACKAGE" --platform x86_64; then
         echo "ERROR: Package request failed"
         dc logs
         exit 1
@@ -179,7 +179,7 @@ request_package() {
         fi
 
         local RESPONSE
-        RESPONSE=$(aurcache_cli --format json packages list --limit 100)
+        RESPONSE=$(aurcache_cli --format json pkg list --limit 100)
         local BUILD_STATUS
         BUILD_STATUS=$(echo "$RESPONSE" | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "not_found")
 
