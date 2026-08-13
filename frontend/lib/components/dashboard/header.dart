@@ -1,17 +1,18 @@
 import 'package:aurcache/components/add_package_popup.dart';
-import 'package:aurcache/components/api/api_builder.dart';
 import 'package:aurcache/providers/statistics.dart';
 import 'package:flutter/material.dart';
-import 'package:skeletonizer/skeletonizer.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../constants/color_constants.dart';
 import '../../models/user_info.dart';
 import '../../utils/responsive.dart';
 
-class Header extends StatelessWidget {
+class Header extends ConsumerWidget {
   const Header({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final userInfo = ref.watch(userInfoProvider);
+
     return Row(
       children: [
         if (context.mobile)
@@ -26,22 +27,21 @@ class Header extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.start,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              APIBuilder(
-                onLoad: () {
-                  return Text(
-                    "Hi, Arch User :)",
-                    style: Theme.of(context).textTheme.titleLarge,
-                  );
-                },
-                onData: (UserInfo data) {
-                  return Text(
-                    data.username == null
-                        ? "Hi, Arch User :)"
-                        : "Hi, ${data.username} :)",
-                    style: Theme.of(context).textTheme.titleLarge,
-                  );
-                },
-                provider: userInfoProvider,
+              userInfo.when(
+                loading: () => Text(
+                  "Hi, Arch User :)",
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                error: (_, __) => Text(
+                  "Hi, Arch User :)",
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                data: (UserInfo data) => Text(
+                  data.username == null
+                      ? "Hi, Arch User :)"
+                      : "Hi, ${data.username} :)",
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
               ),
               const SizedBox(height: 8),
               Text(
@@ -53,14 +53,14 @@ class Header extends StatelessWidget {
         Spacer(flex: context.desktop ? 2 : 1),
         OutlinedButton.icon(
           style: OutlinedButton.styleFrom(
-            backgroundColor: Color(0xff0059FF),
-            side: BorderSide(color: Color(0xff0059FF), width: 0),
+            backgroundColor: const Color(0xff0059FF),
+            side: const BorderSide(color: Color(0xff0059FF), width: 0),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(8),
             ),
-            padding: EdgeInsets.symmetric(
+            padding: const EdgeInsets.symmetric(
               horizontal: defaultPadding,
-              vertical: defaultPadding / (context.mobile ? 2 : 1),
+              vertical: defaultPadding,
             ),
           ),
           onPressed: () {

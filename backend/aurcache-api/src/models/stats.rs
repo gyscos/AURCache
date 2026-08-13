@@ -25,4 +25,5 @@ pub struct GraphDataPoint {
 #[derive(FromQueryResult, Deserialize, ToSchema, Serialize)]
 pub struct UserInfo {
     pub username: Option<String>,
+    pub has_api_token: bool,
 }

@@ -1,6 +1,8 @@
 import 'package:aurcache/api/API.dart';
 import 'package:aurcache/api/settings.dart';
+import 'package:aurcache/components/api_token_settings.dart';
 import 'package:aurcache/components/settings_item.dart';
+import 'package:aurcache/providers/statistics.dart';
 import 'package:aurcache/providers/settings.dart';
 import 'package:aurcache/utils/responsive.dart';
 import 'package:flutter/material.dart';
@@ -12,12 +14,15 @@ import 'package:toastification/toastification.dart';
 
 import '../components/api/api_builder.dart';
 import '../models/settings.dart';
+import '../models/user_info.dart';
 
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final userInfo = ref.watch(userInfoProvider);
+
     return Scaffold(
       appBar: AppBar(
         title: const Text("Settings"),
@@ -33,7 +38,7 @@ class SettingsScreen extends ConsumerWidget {
       ),
       body: APIBuilder(
         onLoad: () => const Center(child: CircularProgressIndicator()),
-        onData: (data) => _renderSettingsList(context, ref, data),
+        onData: (data) => _renderSettingsList(context, ref, data, userInfo),
         provider: getSettingsProvider(),
       ),
     );
@@ -54,6 +59,7 @@ class SettingsScreen extends ConsumerWidget {
     BuildContext context,
     WidgetRef ref,
     ApplicationSettings settings,
+    AsyncValue<UserInfo> userInfo,
   ) {
     return SettingsList(
       platform: context.desktop ? DevicePlatform.web : DevicePlatform.android,
@@ -203,6 +209,15 @@ class SettingsScreen extends ConsumerWidget {
             ).asCustomSettingstile(),
           ],
         ),
+        if (userInfo.hasValue && userInfo.value?.username != null)
+          SettingsSection(
+            title: const Text('API Access'),
+            tiles: [
+              CustomSettingsTile(
+                child: ApiTokenSettingsContent(userInfo: userInfo.requireValue),
+              ),
+            ],
+          ),
       ],
     );
   }
