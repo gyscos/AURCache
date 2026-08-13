@@ -3,7 +3,7 @@
 //! This crate exposes request/response models for the API together with
 //! [`AurCacheClient`], a small async wrapper around the most common endpoints.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -564,12 +564,53 @@ async fn ensure_success(response: Response) -> Result<Response> {
     }
 
     let body = response.text().await.unwrap_or_default();
-    let body = normalize_error_body(&body);
-    if body.is_empty() {
-        bail!("request failed with HTTP {status}");
-    }
-    bail!("request failed with HTTP {status}: {body}")
+    Err(ApiError::from_response(status, &body).into())
 }
+
+/// A structured error for a non-2xx API response.
+///
+/// Server error pages are not guaranteed to be plain text (Rocket's default
+/// error pages, for instance, are HTML), so this normalizes the body into a
+/// short, human-readable message instead of dumping raw markup, and exposes
+/// the status code so callers (like the CLI) can react to specific cases
+/// such as authentication failures.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: reqwest::StatusCode,
+    pub message: String,
+}
+
+impl ApiError {
+    fn from_response(status: reqwest::StatusCode, body: &str) -> Self {
+        let message = if status == reqwest::StatusCode::UNAUTHORIZED {
+            "Authentication failed: missing or invalid API token".to_string()
+        } else {
+            normalize_error_body(body)
+        };
+        Self { status, message }
+    }
+
+    /// Whether this error corresponds to an HTTP 401 Unauthorized response.
+    pub fn is_unauthorized(&self) -> bool {
+        self.status == reqwest::StatusCode::UNAUTHORIZED
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "request failed with HTTP {}", self.status)
+        } else {
+            write!(
+                f,
+                "request failed with HTTP {}: {}",
+                self.status, self.message
+            )
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 fn normalize_error_body(body: &str) -> String {
     let trimmed = body.trim();
@@ -582,7 +623,17 @@ fn normalize_error_body(body: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string());
     }
+    // Fall back for non-JSON bodies: avoid dumping raw HTML error pages
+    // (e.g. Rocket's default catchers) in favor of a short, readable message.
+    if looks_like_html(trimmed) {
+        return String::new();
+    }
     trimmed.to_string()
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let lower = body.trim_start().to_ascii_lowercase();
+    lower.starts_with("<!doctype html") || lower.starts_with("<html")
 }
 
 #[cfg(test)]

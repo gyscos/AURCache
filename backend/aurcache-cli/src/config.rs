@@ -103,6 +103,26 @@ pub fn set_token(mut config: ClientConfig, token: Option<String>) -> Result<Clie
     Ok(config)
 }
 
+/// Whether both stdin and stdout are attached to a terminal, i.e. whether
+/// it's safe to prompt the user interactively.
+pub fn is_interactive() -> bool {
+    stdin().is_terminal() && stdout().is_terminal()
+}
+
+/// Prompts for a new API token and persists it to the config file.
+///
+/// This reuses the same prompt as `set_token`/initial resolution (via
+/// `prompt_for_token`), so a user who never configured a token and one whose
+/// stored token was rejected (401) get the identical prompt/save behavior.
+/// Used when a request fails authentication and we want to give the user a
+/// chance to fix their credentials without re-running the command from
+/// scratch.
+pub fn prompt_and_save_token(config: ClientConfig) -> Result<String> {
+    let config = set_token(config, None)?;
+    save_config(&config)?;
+    Ok(config.token.unwrap_or_default())
+}
+
 fn prompt_for_url() -> Result<String> {
     let url: String = Input::new()
         .with_prompt("AURCache URL (including /api)")
