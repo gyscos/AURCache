@@ -290,10 +290,12 @@ async fn main() -> Result<()> {
         Command::Config { command } => run_config_command(format, command),
         command => {
             let runtime = resolve_runtime_config(cli.url, cli.token)?;
+            let used_token = runtime.token.clone();
             let client = AurCacheClient::new(runtime.url.clone(), runtime.token)?;
             match run(&client, format, command.clone()).await {
                 Err(err) if is_unauthorized(&err) && config::is_interactive() => {
                     eprintln!("{err}");
+                    warn_if_token_from_env(used_token.as_deref());
                     eprintln!("Please re-enter your AURCache API token to continue.");
                     let token = config::prompt_and_save_token(load_config()?)?;
                     let client = AurCacheClient::new(runtime.url, Some(token))?;
@@ -302,6 +304,24 @@ async fn main() -> Result<()> {
                 result => result,
             }
         }
+    }
+}
+
+/// Warns the user if the token that was just rejected came from the
+/// `AURCACHE_TOKEN` environment variable. Env vars take precedence over the
+/// config file (see `resolve_runtime_config`), so saving a freshly prompted
+/// token there won't actually fix anything next run unless the stale
+/// environment variable is also updated or unset.
+fn warn_if_token_from_env(used_token: Option<&str>) {
+    if let (Some(used), Ok(env_token)) = (used_token, std::env::var("AURCACHE_TOKEN"))
+        && used == env_token
+    {
+        eprintln!(
+            "Warning: that token came from the AURCACHE_TOKEN environment variable. \
+             The new token will be saved to the config file, but AURCACHE_TOKEN still \
+             takes precedence over it, so this will keep failing until you update or \
+             unset that environment variable."
+        );
     }
 }
 
@@ -396,6 +416,22 @@ async fn run_token_command(
     match command {
         TokenCommand::Regenerate => {
             let response = client.regenerate_api_token().await?;
+
+            // Persist the new token to the config file so subsequent CLI
+            // invocations keep working without requiring the user to run
+            // `config set-token` themselves. If AURCACHE_TOKEN is set, it
+            // still takes precedence at runtime, so warn about that too.
+            let config = set_token(load_config()?, Some(response.token.clone()))?;
+            save_config(&config)?;
+            if std::env::var("AURCACHE_TOKEN").is_ok() {
+                eprintln!(
+                    "Note: the new token was saved to the config file, but the \
+                     AURCACHE_TOKEN environment variable is set and will keep \
+                     taking precedence over it. Update or unset that environment \
+                     variable to actually use the new token."
+                );
+            }
+
             match format {
                 OutputFormat::Json => print_json(&response),
                 OutputFormat::Text => {
