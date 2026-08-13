@@ -1,6 +1,8 @@
+use crate::auth::username_for_api_token;
 use rocket::Request;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
+use sea_orm::DatabaseConnection;
 
 #[derive(Debug, Clone)]
 pub struct OauthEnabled(pub bool);
@@ -25,20 +27,44 @@ impl<'r> FromRequest<'r> for Authenticated {
             .state::<OauthEnabled>()
             .unwrap_or(&OauthEnabled(false));
         if oauth_enabled.0 {
-            req.cookies()
+            if let Some(authenticated) = req
+                .cookies()
                 .get_private("token")
                 .and_then(|cookie| cookie.value().parse().ok())
-                .map_or_else(
-                    || Outcome::Error((Status::Unauthorized, LoginError::InvalidData)),
-                    |_: String| {
-                        let username: Option<String> = req
-                            .cookies()
-                            .get_private("username")
-                            .and_then(|cookie| cookie.value().parse().ok());
+                .map(|_: String| {
+                    let username: Option<String> = req
+                        .cookies()
+                        .get_private("username")
+                        .and_then(|cookie| cookie.value().parse().ok());
 
-                        Outcome::Success(Authenticated { username })
-                    },
-                )
+                    Authenticated { username }
+                })
+            {
+                return Outcome::Success(authenticated);
+            }
+
+            let bearer_token = req
+                .headers()
+                .get_one("Authorization")
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|token| !token.is_empty());
+
+            let Some(bearer_token) = bearer_token else {
+                return Outcome::Error((Status::Unauthorized, LoginError::InvalidData));
+            };
+
+            let Some(db) = req.rocket().state::<DatabaseConnection>() else {
+                return Outcome::Error((Status::InternalServerError, LoginError::InvalidData));
+            };
+
+            match username_for_api_token(db, bearer_token).await {
+                Ok(Some(username)) => Outcome::Success(Authenticated {
+                    username: Some(username),
+                }),
+                Ok(None) => Outcome::Error((Status::Unauthorized, LoginError::InvalidData)),
+                Err(_) => Outcome::Error((Status::InternalServerError, LoginError::InvalidData)),
+            }
         } else {
             Outcome::Success(Authenticated { username: None })
         }

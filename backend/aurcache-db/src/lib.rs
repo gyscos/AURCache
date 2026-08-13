@@ -3,6 +3,7 @@
 pub mod prelude;
 
 pub mod activities;
+pub mod api_tokens;
 pub mod builds;
 pub mod dependencies;
 pub mod files;

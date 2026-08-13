@@ -23,6 +23,38 @@ AURCache is a build server and repository for Archlinux packages sourced from th
 
 <p><img src="docs/static/img/screenshot1.png" alt=""/> 
 
+## CLI client
+
+A typed CLI for the HTTP API lives in `backend/aurcache-cli`. It authenticates with the API token via `Authorization: Bearer <token>`.
+The reusable Rust client library backing it lives in `backend/aurcache-client`.
+
+```bash
+export AURCACHE_URL=http://localhost:8080/api
+export AURCACHE_TOKEN=your-token
+
+cargo run -p aurcache-cli -- packages list
+cargo run -p aurcache-cli -- packages add aur paru --platform x86_64
+cargo run -p aurcache-cli -- builds list --limit 10
+cargo run -p aurcache-cli -- token regenerate
+```
+
+The CLI also reads `~/.config/aurcache-client/config.json`. Resolution order is:
+
+1. `--url` / `--token`
+2. `AURCACHE_URL` / `AURCACHE_TOKEN`
+3. `~/.config/aurcache-client/config.json`
+4. interactive prompt, with the prompted values saved back to the config file
+
+Useful config commands:
+
+```bash
+cargo run -p aurcache-cli -- config show
+cargo run -p aurcache-cli -- config set-url http://localhost:8080/api
+cargo run -p aurcache-cli -- config set-token
+```
+
+Use `--format json` for machine-readable output, or `raw` for endpoints that do not have a dedicated subcommand yet.
+
 <details>
 <summary>More Images:</summary>
 <br>

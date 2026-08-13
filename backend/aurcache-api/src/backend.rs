@@ -1,5 +1,6 @@
 use crate::activity::activity;
 use crate::aur::search;
+use crate::auth::regenerate_api_token_endpoint;
 use crate::build::{build_output, cancel_build, delete_build, get_build, list_builds, rery_build};
 use crate::health::health;
 use crate::package::{
@@ -14,6 +15,7 @@ use rocket::{Route, routes};
 pub fn build_api() -> Vec<Route> {
     routes![
         search,
+        regenerate_api_token_endpoint,
         package_list,
         package_add_endpoint,
         package_del,

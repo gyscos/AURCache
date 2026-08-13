@@ -1,3 +1,4 @@
+import '../models/api_token_response.dart';
 import '../models/graph_datapoint.dart';
 import '../models/stats.dart';
 import '../models/user_info.dart';
@@ -12,6 +13,11 @@ extension StatsAPI on ApiClient {
   Future<UserInfo> userInfo() async {
     final resp = await getRawClient().get("/userinfo");
     return UserInfo.fromJson(resp.data);
+  }
+
+  Future<ApiTokenResponse> regenerateApiToken() async {
+    final resp = await getRawClient().post("/token/regenerate");
+    return ApiTokenResponse.fromJson(resp.data);
   }
 
   Future<List<GraphDataPoint>> getGraphData() async {

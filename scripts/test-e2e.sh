@@ -7,15 +7,13 @@ export AURCACHE_PORT="${2:-8080}"
 export AURCACHE_MIRROR_PORT=$((AURCACHE_PORT + 1))
 BUILD_TIMEOUT="${3:-300}"
 
-# We take security very seriously
-AUTH_HEADER="Authorization: Basic $(echo -n 'admin:secret' | base64)"
-
 # Build mode: "dind" (default) uses an internal Podman inside a privileged
 # container; "host" mounts the host Docker socket instead.
 E2E_MODE="${E2E_MODE:-dind}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
 export AURCACHE_URL="http://localhost:$AURCACHE_PORT/api"
 export AURCACHE_TOKEN="${AURCACHE_TOKEN:-}"
 
@@ -49,13 +47,8 @@ dump_logs_on_failure() {
 }
 
 
-curl_api() {
-    local path="$1"
-    shift
-    curl -s "http://localhost:$AURCACHE_PORT$path" \
-        -H "$AUTH_HEADER" \
-        -H "Content-Type: application/json" \
-        "$@"
+aurcache_cli() {
+    "$CLI_BIN" "$@"
 }
 
 wait_for_service() {
@@ -64,7 +57,7 @@ wait_for_service() {
     local delay=2
 
     for i in $(seq 1 "$max_attempts"); do
-        if curl -s "http://localhost:$AURCACHE_PORT/api"  > /dev/null 2>&1; then
+        if aurcache_cli health > /dev/null 2>&1; then
             echo "    AURCache is ready"
             return 0
         fi
@@ -121,8 +114,14 @@ start_docker_services() {
     dc up -d registry
     sleep 2
 
-    log "=== Building and pushing builder image ==="
-    docker buildx build --platform linux/amd64 --build-arg TARGETARCH=amd64 --build-arg TARGETPLATFORM=linux/amd64 --build-arg TARGETVARIANT= -q -t localhost:5000/aurcache-builder:test -f docker/builder.Dockerfile --push .
+    echo "=== Building AURCache CLI ==="
+    (
+        cd "$PROJECT_DIR/backend"
+        cargo build -q -p aurcache-cli
+    )
+
+    echo "=== Building and pushing builder image ==="
+    docker build -q -t localhost:5000/aurcache-builder:test -f docker/builder.Dockerfile --push .
 
     log "=== Building and starting AURCache ==="
     dc build -q aurcache && dc up -d aurcache
@@ -159,17 +158,9 @@ request_package() {
     log "=== Adding package: $PACKAGE ==="
     # We're starting from a fresh DB every time, so we know it'll be a new package.
     # If we reused the DB test after test we'd need to delete the package before adding it again.
-    local HTTP_STATUS
-    local RESPONSE_BODY
-    RESPONSE_BODY=$(curl -sS -w '\n%{http_code}' "http://localhost:$AURCACHE_PORT/api/package" \
-        -H "$AUTH_HEADER" \
-        -H "Content-Type: application/json" \
-        -X POST -d "{\"source\": {\"type\": \"aur\", \"name\": \"$PACKAGE\"}, \"platforms\": [\"x86_64\"]}")
-    HTTP_STATUS=$(echo "$RESPONSE_BODY" | tail -n1)
-    RESPONSE_BODY=$(echo "$RESPONSE_BODY" | sed '$d')
-    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
-        log "ERROR: Package request failed (HTTP $HTTP_STATUS): $RESPONSE_BODY"
-        dump_logs_on_failure
+    if ! aurcache_cli packages add aur "$PACKAGE" --platform x86_64; then
+        echo "ERROR: Package request failed"
+        dc logs
         exit 1
     fi
     log "    Package request accepted (HTTP $HTTP_STATUS)"
@@ -188,7 +179,7 @@ request_package() {
         fi
 
         local RESPONSE
-        RESPONSE=$(curl_api "/api/packages/list?limit=100")
+        RESPONSE=$(aurcache_cli --format json packages list --limit 100)
         local BUILD_STATUS
         BUILD_STATUS=$(echo "$RESPONSE" | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "not_found")
 
