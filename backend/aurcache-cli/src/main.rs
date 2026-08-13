@@ -202,21 +202,6 @@ struct PatchPackageArgs {
     /// Package id.
     id: i32,
 
-    #[arg(long)]
-    name: Option<String>,
-
-    #[arg(long)]
-    status: Option<i32>,
-
-    #[arg(long = "out-of-date")]
-    out_of_date: Option<i32>,
-
-    #[arg(long = "latest-build")]
-    latest_build: Option<i32>,
-
-    #[arg(long = "clear-latest-build")]
-    clear_latest_build: bool,
-
     /// Platform selection. Repeat to replace with multiple values.
     #[arg(long = "platform")]
     platforms: Vec<String>,
@@ -626,16 +611,15 @@ async fn patch_package_command(
 }
 
 fn build_patch_package_request(args: PatchPackageArgs) -> Result<(i32, PatchPackageRequest)> {
-    let latest_build = if args.clear_latest_build {
-        Some(None)
-    } else {
-        args.latest_build.map(Some)
-    };
     let body = PatchPackageRequest {
-        name: args.name,
-        status: args.status,
-        out_of_date: args.out_of_date,
-        latest_build,
+        // `name`, `status`, `out_of_date`, and `latest_build` are internal,
+        // server-managed fields (set by the add/build/version-check flows),
+        // so they are intentionally not exposed as CLI flags here even
+        // though the underlying API technically accepts them.
+        name: None,
+        status: None,
+        out_of_date: None,
+        latest_build: None,
         build_flags: some_vec(args.build_flags),
         platforms: some_vec(args.platforms),
     };
@@ -644,13 +628,7 @@ fn build_patch_package_request(args: PatchPackageArgs) -> Result<(i32, PatchPack
 }
 
 fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
-    if body.name.is_none()
-        && body.status.is_none()
-        && body.out_of_date.is_none()
-        && body.latest_build.is_none()
-        && body.build_flags.is_none()
-        && body.platforms.is_none()
-    {
+    if body.build_flags.is_none() && body.platforms.is_none() {
         bail!("no changes specified");
     }
     Ok(())
