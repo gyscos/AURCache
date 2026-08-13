@@ -35,6 +35,13 @@ pub struct ApiTokenResponse {
     pub token: String,
 }
 
+// Intentionally unsalted: unlike passwords, API tokens are generated
+// server-side as 256 bits of CSPRNG output (see `generate_api_token`), so
+// they have no meaningful entropy to protect against dictionary/rainbow-table
+// attacks, and collisions between two users' tokens are not a concern. A
+// per-token salt (or slow KDF like bcrypt) would add cost without adding
+// security here. A fast, unsalted hash just lets us look up the token by its
+// digest without storing the secret itself in the DB.
 pub fn hash_api_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
