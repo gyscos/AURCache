@@ -7,6 +7,7 @@
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_settings_ui/flutter_settings_ui.dart';
 
 import 'package:aurcache/components/api_token_settings.dart';
 import 'package:aurcache/models/user_info.dart';
@@ -14,14 +15,27 @@ import 'package:flutter/material.dart';
 
 void main() {
   testWidgets(
-    'settings token content shows token action for authenticated users',
+    'settings token tile shows a regenerate action for authenticated users',
     (WidgetTester tester) async {
       await tester.pumpWidget(
         ProviderScope(
           child: MaterialApp(
             home: Scaffold(
-              body: ApiTokenSettingsContent(
-                userInfo: UserInfo(username: 'alice', hasApiToken: true),
+              body: Consumer(
+                builder: (context, ref, _) => SettingsList(
+                  sections: [
+                    SettingsSection(
+                      title: const Text('API Access'),
+                      tiles: [
+                        apiTokenSettingsTile(
+                          context,
+                          ref,
+                          UserInfo(username: 'alice', hasApiToken: true),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -29,7 +43,11 @@ void main() {
       );
       await tester.pump();
 
-      expect(find.text('Regenerate Token'), findsOneWidget);
+      expect(find.text('API Token'), findsOneWidget);
+      expect(
+        find.text('Regenerate your personal API token for CLI or API access.'),
+        findsOneWidget,
+      );
     },
   );
 }

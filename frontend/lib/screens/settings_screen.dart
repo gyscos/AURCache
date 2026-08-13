@@ -212,11 +212,7 @@ class SettingsScreen extends ConsumerWidget {
         if (userInfo.hasValue && userInfo.value?.username != null)
           SettingsSection(
             title: const Text('API Access'),
-            tiles: [
-              CustomSettingsTile(
-                child: ApiTokenSettingsContent(userInfo: userInfo.requireValue),
-              ),
-            ],
+            tiles: [apiTokenSettingsTile(context, ref, userInfo.requireValue)],
           ),
       ],
     );

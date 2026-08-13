@@ -6,44 +6,29 @@ import 'package:aurcache/providers/statistics.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_settings_ui/flutter_settings_ui.dart';
 import 'package:toastification/toastification.dart';
 
-class ApiTokenSettingsContent extends ConsumerWidget {
-  const ApiTokenSettingsContent({super.key, required this.userInfo});
-
-  final UserInfo userInfo;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('API Token', style: Theme.of(context).textTheme.titleSmall),
-          const SizedBox(height: 4),
-          Text(
-            userInfo.hasApiToken
-                ? 'Regenerate your personal API token for CLI or API access.'
-                : 'Create a personal API token for CLI or API access.',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Theme.of(
-                context,
-              ).textTheme.bodySmall?.color?.withValues(alpha: 0.75),
-            ),
-          ),
-          const SizedBox(height: 12),
-          OutlinedButton.icon(
-            onPressed: () => showApiTokenDialog(context, ref, userInfo),
-            icon: const Icon(Icons.key),
-            label: Text(
-              userInfo.hasApiToken ? 'Regenerate Token' : 'Create Token',
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+/// Builds the "API Token" settings tile as a plain `SettingsTile.navigation`
+/// so it inherits the same title/description text styling as the other
+/// entries in the settings list (e.g. "Builder Image"), instead of a
+/// separately-styled widget.
+SettingsTile apiTokenSettingsTile(
+  BuildContext context,
+  WidgetRef ref,
+  UserInfo userInfo,
+) {
+  return SettingsTile.navigation(
+    leading: const Icon(Icons.key),
+    title: const Text('API Token'),
+    description: Text(
+      userInfo.hasApiToken
+          ? 'Regenerate your personal API token for CLI or API access.'
+          : 'Create a personal API token for CLI or API access.',
+    ),
+    trailing: const Icon(Icons.chevron_right),
+    onPressed: (_) => showApiTokenDialog(context, ref, userInfo),
+  );
 }
 
 Future<void> showApiTokenDialog(
@@ -59,12 +44,12 @@ Future<void> showApiTokenDialog(
     builder: (dialogContext) {
       return StatefulBuilder(
         builder: (context, setState) {
+          // Once a token has been generated in this dialog, treat it the
+          // same as `hasApiToken` so the title/description/button reflect
+          // "Regenerate" instead of sticking with the initial "Create".
+          final hasToken = userInfo.hasApiToken || generatedToken != null;
           return AlertDialog(
-            title: Text(
-              userInfo.hasApiToken
-                  ? 'Regenerate API Token'
-                  : 'Create API Token',
-            ),
+            title: Text(hasToken ? 'Regenerate API Token' : 'Create API Token'),
             content: SizedBox(
               width: 480,
               child: Column(
@@ -72,9 +57,9 @@ Future<void> showApiTokenDialog(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    userInfo.hasApiToken
+                    hasToken
                         ? 'Generating a new token will immediately replace the current one.'
-                        : 'Create a personal token to authenticate API requests with a Bearer header.',
+                        : 'Create a personal token to authenticate API requests with a ******',
                   ),
                   const SizedBox(height: 16),
                   if (generatedToken != null) ...[
@@ -150,9 +135,7 @@ Future<void> showApiTokenDialog(
                 child: Text(
                   isLoading
                       ? 'Working...'
-                      : userInfo.hasApiToken
-                      ? 'Regenerate'
-                      : 'Create',
+                      : (hasToken ? 'Regenerate' : 'Create'),
                 ),
               ),
             ],
