@@ -60,7 +60,6 @@ async fn setup_env() -> TestEnv {
 
     let client = AurClient::with_urls_and_paths(
         format!("{base_url}/rpc/v5"),
-        format!("{base_url}/packages/search/json/"),
         repo_root.clone(),
         mirrorlist_path,
         official_cache_dir.clone(),
@@ -132,15 +131,6 @@ async fn mock_snapshot(server: &MockServer, pkgbase: &str, version: &str, depend
     Mock::given(method("GET"))
         .and(path(format!("/cgit/aur.git/snapshot/{pkgbase}.tar.gz")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tar_gz))
-        .mount(server)
-        .await;
-}
-
-async fn mock_official_search(server: &MockServer, query: &str, results: serde_json::Value) {
-    Mock::given(method("GET"))
-        .and(path("/packages/search/json/"))
-        .and(query_param("q", query))
-        .respond_with(ResponseTemplate::new(200).set_body_json(results))
         .mount(server)
         .await;
 }
@@ -279,12 +269,6 @@ fn multiinfo_json(results: Vec<serde_json::Value>) -> serde_json::Value {
     })
 }
 
-fn official_search_json(results: Vec<serde_json::Value>) -> serde_json::Value {
-    json!({
-        "results": results,
-    })
-}
-
 async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
     let (tx, _) = tokio::sync::broadcast::channel(100);
     let mut store = SnapshotStore::new();
@@ -355,8 +339,6 @@ async fn scenario_b_one_aur_dep() {
     )
     .await;
     mock_snapshot(&env.server, "child-pkg", "1.0.0", &[]).await;
-    mock_official_search(&env.server, "child-pkg", official_search_json(vec![])).await;
-    mock_official_search(&env.server, "child-pkg", official_search_json(vec![])).await;
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -425,7 +407,6 @@ async fn scenario_c_cascade_after_dep_build() {
     )
     .await;
     mock_snapshot(&env.server, "child-pkg", "1.0.0", &[]).await;
-    mock_official_search(&env.server, "child-pkg", official_search_json(vec![])).await;
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -513,7 +494,6 @@ async fn scenario_d_make_dep_only() {
     )
     .await;
     mock_snapshot(&env.server, "make-env-pkg", "1.0.0", &[]).await;
-    mock_official_search(&env.server, "make-env-pkg", official_search_json(vec![])).await;
 
     let result = add_pkg_via_rpc(&env, "build-tool").await;
     assert!(result.is_ok());
@@ -564,7 +544,6 @@ async fn scenario_e_shared_dep_no_duplicate() {
     )
     .await;
     mock_snapshot(&env.server, "child", "1.0.0", &[]).await;
-    mock_official_search(&env.server, "child", official_search_json(vec![])).await;
 
     let result1 = add_pkg_via_rpc(&env, "parent-1").await;
     assert!(result1.is_ok());
@@ -701,8 +680,6 @@ async fn scenario_g_split_package_constraints_are_merged_per_pkgbase() {
         )
         .mount(&env.server)
         .await;
-    mock_official_search(&env.server, "shared-base", official_search_json(vec![])).await;
-    mock_official_search(&env.server, "shared-lib", official_search_json(vec![])).await;
 
     mock_rpc_info(
         &env.server,
@@ -774,7 +751,6 @@ async fn scenario_h_provider_dependency_resolves_to_aur_package() {
         .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
         .mount(&env.server)
         .await;
-    mock_official_search(&env.server, "virtual-dep", official_search_json(vec![])).await;
     Mock::given(method("GET"))
         .and(path("/rpc/v5/search/virtual-dep"))
         .and(query_param("by", "provides"))
@@ -910,7 +886,6 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
         .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
         .mount(&env.server)
         .await;
-    mock_official_search(&env.server, "virtual-dep", official_search_json(vec![])).await;
     Mock::given(method("GET"))
         .and(path("/rpc/v5/search/virtual-dep"))
         .and(query_param("by", "provides"))
@@ -984,7 +959,6 @@ async fn scenario_k_self_resolved_dependency_is_ignored() {
         )
         .mount(&env.server)
         .await;
-    mock_official_search(&env.server, "self-split", official_search_json(vec![])).await;
 
     let result = add_pkg_via_rpc(&env, "self-base").await;
     assert!(result.is_ok(), "{result:?}");

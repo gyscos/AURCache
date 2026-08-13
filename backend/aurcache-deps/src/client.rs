@@ -6,12 +6,9 @@ use backon::{FibonacciBuilder, Retryable};
 use reqwest::Client;
 use url::Url;
 
-use crate::deps::{deps_from_packages, parse_dep};
+use crate::deps::deps_from_packages;
 use crate::model::{DependencyResolution, Error, Package, PackageResponse, PkgDeps};
-use crate::repo::{
-    default_official_mirrorlist_path, default_official_repo_cache_dir,
-    official_packages_url_for_aur,
-};
+use crate::repo::{default_official_mirrorlist_path, default_official_repo_cache_dir};
 
 /// Client for the AUR RPC and Arch Linux official package search APIs.
 ///
@@ -22,7 +19,6 @@ use crate::repo::{
 pub struct AurClient {
     pub(crate) http: Client,
     pub(crate) rpc_url: String,
-    pub(crate) official_packages_url: String,
     pub(crate) repo_root: PathBuf,
     pub(crate) official_mirrorlist_path: PathBuf,
     pub(crate) official_repo_cache_dir: PathBuf,
@@ -48,7 +44,6 @@ impl AurClient {
             .unwrap_or_else(|_| "https://aur.archlinux.org/rpc/v5".to_string());
         Self {
             http: Client::new(),
-            official_packages_url: official_packages_url_for_aur(&rpc_url),
             repo_root: crate::repo::default_repo_root(),
             official_mirrorlist_path: default_official_mirrorlist_path(),
             official_repo_cache_dir: default_official_repo_cache_dir(),
@@ -56,21 +51,19 @@ impl AurClient {
         }
     }
 
-    /// Construct a client with explicit AUR and official packages API URLs.
-    pub fn with_urls(aur_url: impl Into<String>, official_packages_url: impl Into<String>) -> Self {
+    /// Construct a client with an explicit AUR RPC URL and default filesystem paths.
+    pub fn with_urls(aur_url: impl Into<String>) -> Self {
         Self::with_urls_and_paths(
             aur_url,
-            official_packages_url,
             crate::repo::default_repo_root(),
             default_official_mirrorlist_path(),
             default_official_repo_cache_dir(),
         )
     }
 
-    /// Construct a client with full control over all URLs and filesystem paths.
+    /// Construct a client with full control over the AUR RPC URL and filesystem paths.
     pub fn with_urls_and_paths(
         aur_url: impl Into<String>,
-        official_packages_url: impl Into<String>,
         repo_root: impl Into<PathBuf>,
         official_mirrorlist_path: impl Into<PathBuf>,
         official_repo_cache_dir: impl Into<PathBuf>,
@@ -78,7 +71,6 @@ impl AurClient {
         Self {
             http: Client::new(),
             rpc_url: aur_url.into(),
-            official_packages_url: official_packages_url.into(),
             repo_root: repo_root.into(),
             official_mirrorlist_path: official_mirrorlist_path.into(),
             official_repo_cache_dir: official_repo_cache_dir.into(),
@@ -91,13 +83,6 @@ impl AurClient {
         for arg in args {
             url.query_pairs_mut().append_pair("arg[]", arg);
         }
-        Ok(url)
-    }
-
-    pub(crate) fn official_search_url(&self, query: &str) -> Result<Url, Error> {
-        let mut url =
-            Url::parse(&self.official_packages_url).map_err(|e| Error::Rpc(e.to_string()))?;
-        url.query_pairs_mut().append_pair("q", query);
         Ok(url)
     }
 
@@ -188,22 +173,7 @@ impl AurClient {
     }
 
     async fn rpc_fetch(&self, url: Url) -> Result<Vec<Package>, Error> {
-        let http = self.http.clone();
-        let fetch = move || {
-            let http = http.clone();
-            let url = url.clone();
-            async move { http.get(url).send().await }
-        };
-        let resp = fetch
-            .retry(
-                FibonacciBuilder::default()
-                    .with_min_delay(Duration::from_millis(500))
-                    .with_max_times(3),
-            )
-            .await
-            .map_err(Error::Http)?
-            .error_for_status()
-            .map_err(Error::Http)?;
+        let resp = self.retry_get(url).await?;
         let text = resp.text().await?;
         let response: PackageResponse =
             serde_json::from_str(&text).map_err(|e| Error::Rpc(e.to_string()))?;
@@ -225,16 +195,19 @@ impl AurClient {
         Ok(packages)
     }
 
-    /// Download the raw snapshot tarball for an AUR pkgbase.
-    pub async fn download_snapshot_bytes(&self, pkgbase: &str) -> Result<Vec<u8>, Error> {
-        let url = snapshot_url(&self.rpc_url, pkgbase);
+    /// Perform an HTTP GET with the shared Fibonacci retry policy, returning the
+    /// response only if it has a success status.
+    pub(crate) async fn retry_get<U: reqwest::IntoUrl + Clone>(
+        &self,
+        url: U,
+    ) -> Result<reqwest::Response, Error> {
         let http = self.http.clone();
         let fetch = move || {
             let http = http.clone();
             let url = url.clone();
-            async move { http.get(url.as_str()).send().await }
+            async move { http.get(url).send().await }
         };
-        let resp = fetch
+        fetch
             .retry(
                 FibonacciBuilder::default()
                     .with_min_delay(Duration::from_millis(500))
@@ -243,23 +216,22 @@ impl AurClient {
             .await
             .map_err(Error::Http)?
             .error_for_status()
-            .map_err(Error::Http)?;
+            .map_err(Error::Http)
+    }
+
+    /// Download the raw snapshot tarball for an AUR pkgbase.
+    pub async fn download_snapshot_bytes(&self, pkgbase: &str) -> Result<Vec<u8>, Error> {
+        let url = snapshot_url(&self.rpc_url, pkgbase);
+        let resp = self.retry_get(url).await?;
         let bytes = resp.bytes().await?.to_vec();
         Ok(bytes)
     }
 
     pub(crate) async fn official_dependency_exists(&self, dep_name: &str) -> Result<bool, Error> {
-        if let Ok(found) = self.cached_official_dependency_exists(dep_name).await {
-            return Ok(found);
-        }
-        let packages = self.official_search(dep_name).await?;
-        Ok(packages.into_iter().any(|pkg| {
-            pkg.pkgname == dep_name
-                || pkg
-                    .provides
-                    .iter()
-                    .any(|provide| parse_dep(provide).0 == dep_name)
-        }))
+        Ok(self
+            .cached_official_dependency_exists(dep_name)
+            .await
+            .unwrap_or(false))
     }
 
     async fn provider_pkgbase(&self, dep_name: &str) -> Result<Option<String>, Error> {

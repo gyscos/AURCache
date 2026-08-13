@@ -777,16 +777,6 @@ mod tests {
             .await;
     }
 
-    async fn mock_official_search_fallback(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/packages/search/json/"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "results": [],
-            })))
-            .mount(server)
-            .await;
-    }
-
     fn git_pkgbuild(version: &str, depends: &[&str]) -> String {
         let depends = depends
             .iter()
@@ -851,14 +841,10 @@ mod tests {
     #[tokio::test]
     async fn package_update_queues_dependency_builds_before_parent_when_constraints_tighten() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
         mock_snapshot(&server, "child", "2.0.0", &[]).await;
@@ -1004,14 +990,10 @@ mod tests {
     #[tokio::test]
     async fn package_update_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
         mock_snapshot(&server, "child", "2.0.0", &["grandchild>=2.0"]).await;
@@ -1228,14 +1210,10 @@ mod tests {
     #[tokio::test]
     async fn force_rebuild_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
         mock_snapshot(&server, "child", "2.0.0", &["grandchild>=2.0"]).await;
@@ -1444,14 +1422,10 @@ mod tests {
     #[tokio::test]
     async fn git_update_refreshes_dependency_rows() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         Mock::given(method("GET"))
             .and(path("/rpc/v5/info"))
@@ -1614,14 +1588,10 @@ mod tests {
     #[tokio::test]
     async fn force_rebuild_after_failure_queues_new_build() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         mock_snapshot(&server, "mypkg", "1.0.0", &[]).await;
 
@@ -1708,14 +1678,10 @@ mod tests {
     #[tokio::test]
     async fn update_removes_orphaned_dependency_package() {
         let server = MockServer::start().await;
-        let client = AurClient::with_urls(
-            format!("{}/rpc/v5", server.uri()),
-            format!("{}/packages/search/json/", server.uri()),
-        );
+        let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
-        mock_official_search_fallback(&server).await;
 
         // A v2.0.0 no longer depends on B
         mock_snapshot(&server, "parent", "2.0.0", &[]).await;

@@ -3,32 +3,14 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use alpm_compress::tarball::TarballReader;
-use backon::{FibonacciBuilder, Retryable};
 use url::Url;
 
 use crate::client::AurClient;
 use crate::deps::parse_dep;
-use crate::model::{Error, OfficialPackage, OfficialPackageResponse};
+use crate::model::Error;
 
 const OFFICIAL_REPO_NAMES: &[&str] = &["core", "extra", "multilib"];
 const OFFICIAL_REPO_CACHE_TTL_SECS: u64 = 60 * 60;
-
-pub(crate) fn official_packages_url_for_aur(rpc_url: &str) -> String {
-    if let Ok(url) = std::env::var("ARCH_PACKAGES_API_URL") {
-        return url;
-    }
-
-    if rpc_url.starts_with("https://aur.archlinux.org/") {
-        return "https://archlinux.org/packages/search/json/".to_string();
-    }
-
-    let Ok(mut url) = Url::parse(rpc_url) else {
-        return "https://archlinux.org/packages/search/json/".to_string();
-    };
-    url.set_path("/packages/search/json/");
-    url.set_query(None);
-    url.into()
-}
 
 pub(crate) fn default_repo_root() -> PathBuf {
     std::env::var("AURCACHE_REPO_PATH")
@@ -64,43 +46,13 @@ impl AurClient {
             return Ok(false);
         }
 
+        let mut archives = Vec::new();
         for entry in fs::read_dir(&self.repo_root).map_err(|e| Error::Rpc(e.to_string()))? {
             let entry = entry.map_err(|e| Error::Rpc(e.to_string()))?;
-            let archive_path = entry.path().join("repo.db.tar.gz");
-            if !archive_path.exists() {
-                continue;
-            }
-
-            if repo_archive_provides(&archive_path, dep_name)? {
-                return Ok(true);
-            }
+            archives.push(entry.path().join("repo.db.tar.gz"));
         }
 
-        Ok(false)
-    }
-
-    pub(crate) async fn official_search(&self, query: &str) -> Result<Vec<OfficialPackage>, Error> {
-        let url = self.official_search_url(query)?;
-        let http = self.http.clone();
-        let fetch = move || {
-            let http = http.clone();
-            let url = url.clone();
-            async move { http.get(url).send().await }
-        };
-        let resp = fetch
-            .retry(
-                FibonacciBuilder::default()
-                    .with_min_delay(std::time::Duration::from_millis(500))
-                    .with_max_times(3),
-            )
-            .await
-            .map_err(Error::Http)?
-            .error_for_status()
-            .map_err(Error::Http)?;
-        let text = resp.text().await?;
-        let response: OfficialPackageResponse =
-            serde_json::from_str(&text).map_err(|e| Error::Rpc(e.to_string()))?;
-        Ok(response.results)
+        any_archive_provides(archives, dep_name)
     }
 
     pub(crate) async fn cached_official_dependency_exists(
@@ -108,18 +60,11 @@ impl AurClient {
         dep_name: &str,
     ) -> Result<bool, Error> {
         self.refresh_official_repo_cache_if_needed().await?;
-        for repo_name in OFFICIAL_REPO_NAMES {
-            let archive_path = self
-                .official_repo_cache_dir
-                .join(cache_file_name(repo_name));
-            if !archive_path.exists() {
-                continue;
-            }
-            if repo_archive_provides(&archive_path, dep_name)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let archives = OFFICIAL_REPO_NAMES.iter().map(|repo_name| {
+            self.official_repo_cache_dir
+                .join(cache_file_name(repo_name))
+        });
+        any_archive_provides(archives, dep_name)
     }
 
     async fn refresh_official_repo_cache_if_needed(&self) -> Result<(), Error> {
@@ -215,6 +160,23 @@ fn official_repo_db_url(mirror: &str, repo_name: &str) -> Result<Url, Error> {
 
 fn cache_file_name(repo_name: &str) -> String {
     format!("{repo_name}.db.tar.gz")
+}
+
+/// Returns true if any of the given `repo.db`-style archives provides `dep_name`
+/// (by package name or `%PROVIDES%`). Missing archive paths are skipped.
+fn any_archive_provides(
+    archive_paths: impl IntoIterator<Item = PathBuf>,
+    dep_name: &str,
+) -> Result<bool, Error> {
+    for archive_path in archive_paths {
+        if !archive_path.exists() {
+            continue;
+        }
+        if repo_archive_provides(&archive_path, dep_name)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn repo_archive_provides(archive_path: &Path, dep_name: &str) -> Result<bool, Error> {
