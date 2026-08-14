@@ -356,6 +356,7 @@ dependencies = [
  "aurcache-db",
  "aurcache-scheduler",
  "aurcache-types",
+ "aurcache-utils",
  "dotenvy",
  "openssl",
  "pacman-mirrors",

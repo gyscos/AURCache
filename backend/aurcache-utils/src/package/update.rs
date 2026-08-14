@@ -62,6 +62,7 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 /// Returns the build IDs enqueued across all updated packages.
 pub async fn package_update_all_outdated(
     db: &DatabaseConnection,
+    store: &SnapshotStore,
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<i32>> {
     let pkg_models: Vec<packages::Model> = Packages::find()
@@ -69,11 +70,13 @@ pub async fn package_update_all_outdated(
         .all(db)
         .await?;
     let activity_log = ActivityLog::new(db.clone());
+    let client = AurClient::new();
 
     let mut ids_total = vec![];
     for pkg in &pkg_models {
         if pkg.status == BuildStates::SUCCESSFUL_BUILD {
-            let results = package_update(db, pkg.to_owned(), false, tx).await?;
+            let results =
+                package_update_with_client(&client, store, db, pkg.to_owned(), false, tx).await?;
             activity_log
                 .add(
                     PackageUpdateActivity {

@@ -12,16 +12,20 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait, Order, QuerySelect,
 };
 use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 #[must_use]
-pub fn start_update_version_checking(db: DatabaseConnection) -> JoinHandle<()> {
+pub fn start_update_version_checking(
+    db: DatabaseConnection,
+    store: Arc<SnapshotStore>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(db.clone()).await {
+            if let Err(e) = check_versions(db.clone(), &store).await {
                 error!("Failed to perform aur version check: {e}");
             }
 
@@ -32,10 +36,9 @@ pub fn start_update_version_checking(db: DatabaseConnection) -> JoinHandle<()> {
     })
 }
 
-async fn check_versions(db: DatabaseConnection) -> anyhow::Result<()> {
+async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow::Result<()> {
     let packages = Packages::find().all(&db).await?;
     let client = AurClient::new();
-    let store = SnapshotStore::new();
     let aur_query_names: Vec<String> = packages
         .iter()
         .filter(|x| x.source_type == SourceType::Aur)
