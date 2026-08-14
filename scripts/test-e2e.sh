@@ -68,11 +68,11 @@ dc() {
 # =============================================================================
 
 setup_directories() {
-    mkdir -p "$BUILD_DIR"/{builds,repo,db,downloads,config/pacman_x86_64}
-    chmod 777 "$BUILD_DIR"/{builds,repo,db,downloads}
+    mkdir -p "$TEMP_DIR"/{builds,repo,db,downloads,config/pacman_x86_64}
+    chmod 777 "$TEMP_DIR"/{builds,repo,db,downloads}
 
-    # The build config expects mirrorlist at BUILD_DIR/config/pacman_x86_64/mirrorlist
-    echo "Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch" > "$BUILD_DIR/config/pacman_x86_64/mirrorlist"
+    # The build config expects mirrorlist at TEMP_DIR/config/pacman_x86_64/mirrorlist
+    echo "Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch" > "$TEMP_DIR/config/pacman_x86_64/mirrorlist"
 }
 
 cleanup() {
@@ -95,7 +95,7 @@ start_docker_services() {
     sleep 2
 
     echo "=== Building and pushing builder image ==="
-    docker build -q -t localhost:5000/aurcache-builder:test -f docker/builder.Dockerfile --push .
+    docker buildx build --platform linux/amd64 --build-arg TARGETARCH=amd64 --build-arg TARGETPLATFORM=linux/amd64 --build-arg TARGETVARIANT= -q -t localhost:5000/aurcache-builder:test -f docker/builder.Dockerfile --push .
 
     echo "=== Building and starting AURCache ==="
     dc build -q aurcache && dc up -d aurcache
