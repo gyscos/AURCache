@@ -128,7 +128,7 @@ async fn resolve_aur_pkgbase(
 }
 
 async fn resolve_srcinfo_to_spec(
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     client: &aurcache_deps::AurClient,
     source_data: &SourceData,
 ) -> anyhow::Result<PackageInsertSpec> {
@@ -156,7 +156,7 @@ async fn resolve_srcinfo_to_spec(
 
 async fn finalize_package_add(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
     context: &AddContext,
@@ -193,7 +193,7 @@ async fn finalize_package_add(
 
 pub async fn package_add_with_client(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
     platforms: Option<Vec<Platform>>,
@@ -212,17 +212,8 @@ pub async fn package_add(
     source_data: SourceData,
 ) -> anyhow::Result<String> {
     let client = aurcache_deps::AurClient::new();
-    let mut store = SnapshotStore::new();
-    package_add_with_client(
-        &client,
-        &mut store,
-        db,
-        tx,
-        platforms,
-        build_flags,
-        source_data,
-    )
-    .await
+    let store = SnapshotStore::new();
+    package_add_with_client(&client, &store, db, tx, platforms, build_flags, source_data).await
 }
 
 async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<()> {
@@ -239,7 +230,7 @@ async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyho
 
 async fn add_package_with_source(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
     context: &AddContext,
@@ -267,7 +258,7 @@ async fn add_package_with_source(
 #[async_recursion]
 async fn add_dependency_recursive(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     pkgbase: &str,
     context: &AddContext,
@@ -300,7 +291,7 @@ async fn add_dependency_recursive(
 
 pub(crate) async fn ensure_aur_package_exists_recursive(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     pkgbase: &str,
     platforms_str: &str,
@@ -341,7 +332,7 @@ pub(crate) async fn resolve_dependency_resolutions(
 
 async fn insert_package_with_deps(
     client: &aurcache_deps::AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     package_spec: PackageInsertSpec,
     context: &AddContext,

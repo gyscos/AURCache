@@ -123,8 +123,8 @@ pub async fn package_update(
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let client = AurClient::new();
-    let mut store = SnapshotStore::new();
-    package_update_with_client(&client, &mut store, db, pkg_model, force, tx).await
+    let store = SnapshotStore::new();
+    package_update_with_client(&client, &store, db, pkg_model, force, tx).await
 }
 
 /// Update a single package using a caller-provided AUR client.
@@ -132,7 +132,7 @@ pub async fn package_update(
 /// Returns one [`PlatformUpdateResult`] per configured platform.
 pub async fn package_update_with_client(
     client: &AurClient,
-    store: &mut SnapshotStore,
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     pkg_model: packages::Model,
     force: bool,
@@ -545,7 +545,7 @@ async fn dependencies_ready_for_platform(
 /// Shared service dependencies passed through the update pipeline.
 struct Services<'a> {
     client: &'a AurClient,
-    store: &'a mut SnapshotStore,
+    store: &'a SnapshotStore,
     db: &'a DatabaseConnection,
     tx: &'a Sender<Action>,
 }
@@ -686,7 +686,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
     use serde_json::json;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -751,30 +751,55 @@ mod tests {
         )
     }
 
-    fn make_snapshot_tar_gz(pkgbase: &str, srcinfo: &str) -> Vec<u8> {
-        let dir = tempfile::tempdir().unwrap();
-        let pkgbase_dir = dir.path().join(pkgbase);
-        std::fs::create_dir_all(&pkgbase_dir).unwrap();
-        std::fs::write(pkgbase_dir.join(".SRCINFO"), srcinfo).unwrap();
-        let mut tar_buf = Vec::new();
-        {
-            let enc = flate2::write::GzEncoder::new(&mut tar_buf, flate2::Compression::fast());
-            let mut tar = tar::Builder::new(enc);
-            tar.append_dir_all(pkgbase, &pkgbase_dir).unwrap();
-            tar.finish().unwrap();
-        }
-        tar_buf
+    /// Create a local bare-ish git repository at `aur_root/{pkgbase}.git`
+    /// containing a PKGBUILD + .SRCINFO, standing in for the real AUR git
+    /// remote (`https://aur.archlinux.org/{pkgbase}.git`) in tests. Returns
+    /// the repo's filesystem path, usable directly as a git remote URL.
+    fn create_aur_git_repo(
+        aur_root: &Path,
+        pkgbase: &str,
+        version: &str,
+        depends: &[&str],
+    ) -> PathBuf {
+        let repo_path = aur_root.join(format!("{pkgbase}.git"));
+        let repo = Repository::init(&repo_path).unwrap();
+
+        let srcinfo = make_srcinfo(pkgbase, version, depends);
+        let depends_arr = depends
+            .iter()
+            .map(|dep| format!("'{dep}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pkgbuild = format!(
+            "pkgname={pkgbase}\npkgver={version}\npkgrel=1\narch=('x86_64')\ndepends=({depends_arr})\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n"
+        );
+
+        fs::write(repo_path.join("PKGBUILD"), pkgbuild).unwrap();
+        fs::write(repo_path.join(".SRCINFO"), srcinfo).unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("PKGBUILD")).unwrap();
+        index.add_path(Path::new(".SRCINFO")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        repo_path
     }
 
-    /// Mount a mock snapshot endpoint on the mock server.
-    async fn mock_snapshot(server: &MockServer, pkgbase: &str, version: &str, depends: &[&str]) {
-        let srcinfo = make_srcinfo(pkgbase, version, depends);
-        let tar_gz = make_snapshot_tar_gz(pkgbase, &srcinfo);
-        Mock::given(method("GET"))
-            .and(path(format!("/cgit/aur.git/snapshot/{pkgbase}.tar.gz")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(tar_gz))
-            .mount(server)
-            .await;
+    /// Build a `SnapshotStore` for tests: AUR sources resolve against local
+    /// git repos under `aur_root` instead of the real AUR, and checkouts are
+    /// kept under a fresh temp dir.
+    fn test_store(aur_root: &Path) -> (SnapshotStore, tempfile::TempDir) {
+        let checkout_dir = tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root_and_aur_base(
+            checkout_dir.path().to_path_buf(),
+            aur_root.to_string_lossy().to_string(),
+        );
+        (store, checkout_dir)
     }
 
     fn git_pkgbuild(version: &str, depends: &[&str]) -> String {
@@ -846,8 +871,9 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
-        mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
-        mock_snapshot(&server, "child", "2.0.0", &[]).await;
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
+        create_aur_git_repo(aur_root.path(), "child", "2.0.0", &[]);
 
         Mock::given(method("GET"))
             .and(path("/rpc/v5/info"))
@@ -932,11 +958,10 @@ mod tests {
         .await
         .unwrap();
 
-        let mut store = SnapshotStore::new();
-        let results =
-            package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
-                .await
-                .unwrap();
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let results = package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
+            .await
+            .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -995,9 +1020,10 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
-        mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
-        mock_snapshot(&server, "child", "2.0.0", &["grandchild>=2.0"]).await;
-        mock_snapshot(&server, "grandchild", "2.0.0", &[]).await;
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
+        create_aur_git_repo(aur_root.path(), "child", "2.0.0", &["grandchild>=2.0"]);
+        create_aur_git_repo(aur_root.path(), "grandchild", "2.0.0", &[]);
 
         Mock::given(method("GET"))
             .and(path("/rpc/v5/info"))
@@ -1143,11 +1169,10 @@ mod tests {
         .await
         .unwrap();
 
-        let mut store = SnapshotStore::new();
-        let results =
-            package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
-                .await
-                .unwrap();
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let results = package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
+            .await
+            .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -1215,9 +1240,10 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
-        mock_snapshot(&server, "parent", "2.0.0", &["child>=2.0"]).await;
-        mock_snapshot(&server, "child", "2.0.0", &["grandchild>=2.0"]).await;
-        mock_snapshot(&server, "grandchild", "2.0.0", &[]).await;
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
+        create_aur_git_repo(aur_root.path(), "child", "2.0.0", &["grandchild>=2.0"]);
+        create_aur_git_repo(aur_root.path(), "grandchild", "2.0.0", &[]);
 
         Mock::given(method("GET"))
             .and(path("/rpc/v5/info"))
@@ -1363,11 +1389,10 @@ mod tests {
         .await
         .unwrap();
 
-        let mut store = SnapshotStore::new();
-        let results =
-            package_update_with_client(&client, &mut store, &db, parent.clone(), true, &tx)
-                .await
-                .unwrap();
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let results = package_update_with_client(&client, &store, &db, parent.clone(), true, &tx)
+            .await
+            .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -1556,9 +1581,10 @@ mod tests {
 
         commit_pkgbuild(&repo, "updated", "2.0.0", &["new-dep>=2.0"]);
 
-        let mut store = SnapshotStore::new();
+        let checkout_dir = tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
         let build_ids =
-            package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
+            package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
                 .await
                 .unwrap();
 
@@ -1593,7 +1619,8 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<Action>(100);
 
-        mock_snapshot(&server, "mypkg", "1.0.0", &[]).await;
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "mypkg", "1.0.0", &[]);
 
         // Simulate package that previously failed its first build.
         let pkg = packages::ActiveModel {
@@ -1636,11 +1663,10 @@ mod tests {
         // Drain any stale messages before the force-rebuild call.
         while rx.try_recv().is_ok() {}
 
-        let mut store = SnapshotStore::new();
-        let build_ids =
-            package_update_with_client(&client, &mut store, &db, pkg.clone(), true, &tx)
-                .await
-                .unwrap();
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let build_ids = package_update_with_client(&client, &store, &db, pkg.clone(), true, &tx)
+            .await
+            .unwrap();
 
         assert_eq!(
             build_ids.len(),
@@ -1684,7 +1710,8 @@ mod tests {
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         // A v2.0.0 no longer depends on B
-        mock_snapshot(&server, "parent", "2.0.0", &[]).await;
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &[]);
 
         // Insert parent (directly requested, with a successful build)
         let parent = packages::ActiveModel {
@@ -1758,8 +1785,8 @@ mod tests {
         .await
         .unwrap();
 
-        let mut store = SnapshotStore::new();
-        package_update_with_client(&client, &mut store, &db, parent.clone(), false, &tx)
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
             .await
             .unwrap();
 

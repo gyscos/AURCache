@@ -103,10 +103,28 @@ async fn check_versions(db: DatabaseConnection) -> anyhow::Result<()> {
                             }
                         };
                         package_model.out_of_date = Set(i32::from(is_outdated));
+
+                        // The AUR RPC `/info` response is a cheap way to know
+                        // whether the package has actually changed upstream
+                        // (via `version`/`last_modified`); only refresh the
+                        // (git-backed) snapshot cache -- which requires a
+                        // `git fetch` -- when it looks like something changed,
+                        // instead of unconditionally re-fetching every package
+                        // on every check.
+                        if is_outdated && let Err(e) = store.refresh(&client, &source_data).await {
+                            warn!("Failed to refresh snapshot cache for {}: {e}", package.name);
+                        }
                     }
                 }
             }
             SourceData::Git { .. } => {
+                // No cheap upstream-metadata API for arbitrary git remotes,
+                // so always refresh: this is an incremental `git fetch`
+                // against the persistent checkout, not a full re-clone.
+                store
+                    .refresh(&client, &source_data)
+                    .await
+                    .map_err(|e| anyhow!("Failed to refresh git source: {e}"))?;
                 let sourceinfo = store
                     .sourceinfo(&client, &source_data)
                     .await

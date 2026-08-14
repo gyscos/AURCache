@@ -39,6 +39,8 @@ struct TestEnv {
     _official_dir: TempDir,
     _repo_root: std::path::PathBuf,
     official_cache_dir: std::path::PathBuf,
+    aur_root: TempDir,
+    _checkout_dir: TempDir,
 }
 
 async fn setup_env() -> TestEnv {
@@ -74,6 +76,9 @@ async fn setup_env() -> TestEnv {
 
     let (_, rx) = tokio::sync::broadcast::channel(100);
 
+    let aur_root = tempfile::tempdir().expect("failed to create aur root tempdir");
+    let checkout_dir = tempfile::tempdir().expect("failed to create checkout tempdir");
+
     TestEnv {
         db,
         _rx: rx,
@@ -83,6 +88,8 @@ async fn setup_env() -> TestEnv {
         _official_dir: official_dir,
         _repo_root: repo_root,
         official_cache_dir,
+        aur_root,
+        _checkout_dir: checkout_dir,
     }
 }
 
@@ -110,29 +117,32 @@ fn make_srcinfo(pkgbase: &str, version: &str, depends: &[&str]) -> String {
     )
 }
 
-fn make_snapshot_tar_gz(pkgbase: &str, srcinfo: &str) -> Vec<u8> {
-    let dir = tempfile::tempdir().unwrap();
-    let pkgbase_dir = dir.path().join(pkgbase);
-    std::fs::create_dir_all(&pkgbase_dir).unwrap();
-    std::fs::write(pkgbase_dir.join(".SRCINFO"), srcinfo).unwrap();
-    let mut tar_buf = Vec::new();
-    {
-        let enc = GzEncoder::new(&mut tar_buf, Compression::fast());
-        let mut tar = Builder::new(enc);
-        tar.append_dir_all(pkgbase, &pkgbase_dir).unwrap();
-        tar.finish().unwrap();
-    }
-    tar_buf
-}
+fn create_aur_git_repo(aur_root: &Path, pkgbase: &str, version: &str, depends: &[&str]) {
+    let repo_path = aur_root.join(format!("{pkgbase}.git"));
+    let repo = git2::Repository::init(&repo_path).expect("failed to init aur git repo");
 
-async fn mock_snapshot(server: &MockServer, pkgbase: &str, version: &str, depends: &[&str]) {
     let srcinfo = make_srcinfo(pkgbase, version, depends);
-    let tar_gz = make_snapshot_tar_gz(pkgbase, &srcinfo);
-    Mock::given(method("GET"))
-        .and(path(format!("/cgit/aur.git/snapshot/{pkgbase}.tar.gz")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar_gz))
-        .mount(server)
-        .await;
+    let depends_arr = depends
+        .iter()
+        .map(|dep| format!("'{dep}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pkgbuild = format!(
+        "pkgname={pkgbase}\npkgver={version}\npkgrel=1\narch=('x86_64')\ndepends=({depends_arr})\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n"
+    );
+
+    fs::write(repo_path.join("PKGBUILD"), pkgbuild).unwrap();
+    fs::write(repo_path.join(".SRCINFO"), srcinfo).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("PKGBUILD")).unwrap();
+    index.add_path(Path::new(".SRCINFO")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
 }
 
 fn seed_official_repo_cache_empty(cache_dir: &Path) {
@@ -271,10 +281,13 @@ fn multiinfo_json(results: Vec<serde_json::Value>) -> serde_json::Value {
 
 async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
     let (tx, _) = tokio::sync::broadcast::channel(100);
-    let mut store = SnapshotStore::new();
+    let store = SnapshotStore::with_checkout_root_and_aur_base(
+        env._checkout_dir.path().to_path_buf(),
+        env.aur_root.path().to_string_lossy().to_string(),
+    );
     package_add_with_client(
         &env.client,
-        &mut store,
+        &store,
         &env.db,
         &tx,
         None,
@@ -300,7 +313,7 @@ async fn scenario_a_no_aur_deps() {
         rpc_deps_json("no-deps-pkg", "no-deps-pkg", &[], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "no-deps-pkg", "1.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "no-deps-pkg", "1.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "no-deps-pkg").await;
     assert!(result.is_ok());
@@ -330,7 +343,7 @@ async fn scenario_b_one_aur_dep() {
         rpc_deps_json("parent-pkg", "parent-pkg", &["child-pkg"], &[], "2.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-pkg", "2.0.0", &["child-pkg"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-pkg", "2.0.0", &["child-pkg"]);
 
     mock_rpc_info(
         &env.server,
@@ -338,7 +351,7 @@ async fn scenario_b_one_aur_dep() {
         rpc_deps_json("child-pkg", "child-pkg", &[], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "child-pkg", "1.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "child-pkg", "1.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -399,14 +412,14 @@ async fn scenario_c_cascade_after_dep_build() {
         rpc_deps_json("parent-pkg", "parent-pkg", &["child-pkg"], &[], "2.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-pkg", "2.0.0", &["child-pkg"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-pkg", "2.0.0", &["child-pkg"]);
     mock_rpc_info(
         &env.server,
         "child-pkg",
         rpc_deps_json("child-pkg", "child-pkg", &[], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "child-pkg", "1.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "child-pkg", "1.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -486,14 +499,19 @@ async fn scenario_d_make_dep_only() {
         rpc_deps_json("build-tool", "build-tool", &[], &["make-env-pkg"], "3.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "build-tool", "3.0.0", &["make-env-pkg"]).await;
+    create_aur_git_repo(
+        env.aur_root.path(),
+        "build-tool",
+        "3.0.0",
+        &["make-env-pkg"],
+    );
     mock_rpc_info(
         &env.server,
         "make-env-pkg",
         rpc_deps_json("make-env-pkg", "make-env-pkg", &[], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "make-env-pkg", "1.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "make-env-pkg", "1.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "build-tool").await;
     assert!(result.is_ok());
@@ -536,14 +554,14 @@ async fn scenario_e_shared_dep_no_duplicate() {
         rpc_deps_json("parent-1", "parent-1", &["child"], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-1", "1.0.0", &["child"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-1", "1.0.0", &["child"]);
     mock_rpc_info(
         &env.server,
         "child",
         rpc_deps_json("child", "child", &[], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "child", "1.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "child", "1.0.0", &[]);
 
     let result1 = add_pkg_via_rpc(&env, "parent-1").await;
     assert!(result1.is_ok());
@@ -554,7 +572,7 @@ async fn scenario_e_shared_dep_no_duplicate() {
         rpc_deps_json("parent-2", "parent-2", &["child"], &[], "2.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-2", "2.0.0", &["child"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-2", "2.0.0", &["child"]);
 
     let result2 = add_pkg_via_rpc(&env, "parent-2").await;
     assert!(result2.is_ok());
@@ -613,7 +631,7 @@ async fn scenario_f_system_deps_only() {
         rpc_deps_json("my-pkg", "my-pkg", &["glibc>=2.35"], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "my-pkg", "1.0.0", &["glibc>=2.35"]).await;
+    create_aur_git_repo(env.aur_root.path(), "my-pkg", "1.0.0", &["glibc>=2.35"]);
 
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
@@ -660,13 +678,12 @@ async fn scenario_g_split_package_constraints_are_merged_per_pkgbase() {
         ),
     )
     .await;
-    mock_snapshot(
-        &env.server,
+    create_aur_git_repo(
+        env.aur_root.path(),
         "parent-pkg",
         "1.0.0",
         &["shared-base>=2.0", "shared-lib>=3.0"],
-    )
-    .await;
+    );
 
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
@@ -687,7 +704,7 @@ async fn scenario_g_split_package_constraints_are_merged_per_pkgbase() {
         rpc_deps_json("shared-base", "shared-base", &[], &[], "3.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "shared-base", "3.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "shared-base", "3.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -744,7 +761,12 @@ async fn scenario_h_provider_dependency_resolves_to_aur_package() {
         ),
     )
     .await;
-    mock_snapshot(&env.server, "parent-pkg", "1.0.0", &["virtual-dep>=2.0"]).await;
+    create_aur_git_repo(
+        env.aur_root.path(),
+        "parent-pkg",
+        "1.0.0",
+        &["virtual-dep>=2.0"],
+    );
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
@@ -770,7 +792,7 @@ async fn scenario_h_provider_dependency_resolves_to_aur_package() {
         rpc_deps_json("virtual-provider", "virtual-provider", &[], &[], "2.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "virtual-provider", "2.0.0", &[]).await;
+    create_aur_git_repo(env.aur_root.path(), "virtual-provider", "2.0.0", &[]);
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -808,7 +830,7 @@ async fn scenario_i_official_provider_prevents_aur_dependency_addition() {
         rpc_deps_json("parent-pkg", "parent-pkg", &["virtual-dep"], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-pkg", "1.0.0", &["virtual-dep"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-pkg", "1.0.0", &["virtual-dep"]);
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
@@ -879,7 +901,7 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
         rpc_deps_json("parent-pkg", "parent-pkg", &["virtual-dep"], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "parent-pkg", "1.0.0", &["virtual-dep"]).await;
+    create_aur_git_repo(env.aur_root.path(), "parent-pkg", "1.0.0", &["virtual-dep"]);
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
@@ -944,7 +966,12 @@ async fn scenario_k_self_resolved_dependency_is_ignored() {
         rpc_deps_json("self-base", "self-base", &["self-split>=1.0"], &[], "1.0.0"),
     )
     .await;
-    mock_snapshot(&env.server, "self-base", "1.0.0", &["self-split>=1.0"]).await;
+    create_aur_git_repo(
+        env.aur_root.path(),
+        "self-base",
+        "1.0.0",
+        &["self-split>=1.0"],
+    );
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "self-split"))
