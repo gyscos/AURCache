@@ -295,6 +295,7 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
         SourceData::Aur {
             name: name.to_string(),
         },
+        None,
     )
     .await
 }

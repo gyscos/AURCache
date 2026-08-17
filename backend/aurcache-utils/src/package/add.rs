@@ -31,6 +31,7 @@ struct PackageInsertSpec {
     provides: Vec<String>,
     source_type: SourceType,
     source_data: SourceData,
+    patch: Option<String>,
 }
 
 struct DependencyRequirements {
@@ -131,9 +132,14 @@ async fn resolve_srcinfo_to_spec(
     store: &SnapshotStore,
     client: &aurcache_deps::AurClient,
     source_data: &SourceData,
+    patch: Option<String>,
 ) -> anyhow::Result<PackageInsertSpec> {
-    // New packages have no patch yet - that's only added afterwards via the editor.
-    let sourceinfo = store.sourceinfo(client, source_data, None).await?;
+    // Resolve dependencies/version off of the (possibly initial-patched)
+    // source, so a patch supplied to fix an otherwise-unparseable PKGBUILD
+    // (e.g. ogdf) is taken into account right away.
+    let sourceinfo = store
+        .sourceinfo(client, source_data, patch.as_deref())
+        .await?;
     let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
     let pkgbase = sourceinfo.base.name.to_string();
     let requirements =
@@ -146,6 +152,7 @@ async fn resolve_srcinfo_to_spec(
         dep_constraints: requirements.dep_constraints,
         pkgnames: deps.pkgnames,
         provides: deps.provides,
+        patch,
         source_type: match source_data {
             SourceData::Aur { .. } => SourceType::Aur,
             SourceData::Git { .. } => SourceType::Git,
@@ -200,9 +207,10 @@ pub async fn package_add_with_client(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
+    initial_patch: Option<String>,
 ) -> anyhow::Result<String> {
     let context = build_add_context(platforms, build_flags)?;
-    add_package_with_source(client, store, db, tx, &context, source_data).await
+    add_package_with_source(client, store, db, tx, &context, source_data, initial_patch).await
 }
 
 pub async fn package_add(
@@ -211,10 +219,21 @@ pub async fn package_add(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
+    initial_patch: Option<String>,
 ) -> anyhow::Result<String> {
     let client = aurcache_deps::AurClient::new();
     let store = SnapshotStore::new();
-    package_add_with_client(&client, &store, db, tx, platforms, build_flags, source_data).await
+    package_add_with_client(
+        &client,
+        &store,
+        db,
+        tx,
+        platforms,
+        build_flags,
+        source_data,
+        initial_patch,
+    )
+    .await
 }
 
 async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<()> {
@@ -236,6 +255,7 @@ async fn add_package_with_source(
     tx: &Sender<Action>,
     context: &AddContext,
     source_data: SourceData,
+    initial_patch: Option<String>,
 ) -> anyhow::Result<String> {
     match &source_data {
         SourceData::Aur { name } => {
@@ -243,11 +263,13 @@ async fn add_package_with_source(
             let aur_data = SourceData::Aur {
                 name: pkgbase.clone(),
             };
-            let package_spec = resolve_srcinfo_to_spec(store, client, &aur_data).await?;
+            let package_spec =
+                resolve_srcinfo_to_spec(store, client, &aur_data, initial_patch).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Git { .. } => {
-            let package_spec = resolve_srcinfo_to_spec(store, client, &source_data).await?;
+            let package_spec =
+                resolve_srcinfo_to_spec(store, client, &source_data, initial_patch).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Upload { .. } => {
@@ -278,7 +300,7 @@ async fn add_dependency_recursive(
     let source_data = SourceData::Aur {
         name: pkgbase.to_string(),
     };
-    let package_spec = resolve_srcinfo_to_spec(store, client, &source_data).await?;
+    let package_spec = resolve_srcinfo_to_spec(store, client, &source_data, None).await?;
     insert_package_with_deps(
         client,
         store,
@@ -399,6 +421,7 @@ async fn insert_package_with_deps(
         directly_requested: Set(false),
         split_packages: Set(split_packages_str),
         provides: Set(provides_str),
+        patch: Set(package_spec.patch),
         ..Default::default()
     };
     let txn = db.begin().await?;

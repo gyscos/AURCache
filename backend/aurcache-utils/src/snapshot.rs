@@ -23,8 +23,17 @@ fn default_aur_git_base_url() -> String {
 }
 
 struct CacheEntry {
-    sourceinfo: Arc<SourceInfoV1>,
+    /// `None` when the fetched source's `.SRCINFO`/`PKGBUILD` could not be
+    /// parsed (e.g. a malformed PKGBUILD upstream, such as `ogdf`). Browsing
+    /// and editing raw source files must keep working in that case so a
+    /// patch can be authored to fix the parse failure before the source is
+    /// ever added as a package; only dependency/version resolution actually
+    /// requires a successfully parsed `.SRCINFO`.
+    sourceinfo: Option<Arc<SourceInfoV1>>,
     archive_bytes: Arc<Vec<u8>>,
+    /// Best-effort pkgbase, used to name the archive's top-level directory
+    /// and as the file-listing root even when `sourceinfo` is `None`.
+    pkgbase: String,
     /// Resolved commit id last used to build this entry, used to detect
     /// whether a `refresh` actually changed anything. Patched entries reuse
     /// the underlying raw entry's commit id (patch content itself has no
@@ -101,6 +110,11 @@ impl SnapshotStore {
     /// in `packages.patch`); pass `None` for unpatched sources. When a
     /// (non-empty) patch is given, `.SRCINFO` is always regenerated from the
     /// patched `PKGBUILD`.
+    ///
+    /// Returns an error if the (possibly patched) source's `.SRCINFO`/PKGBUILD
+    /// could not be parsed - unlike [`SnapshotStore::list_files`]/
+    /// [`SnapshotStore::read_file`], which work even for unparseable sources
+    /// so a patch can be authored to fix the parse failure.
     pub async fn sourceinfo(
         &self,
         client: &AurClient,
@@ -108,7 +122,11 @@ impl SnapshotStore {
         patch: Option<&str>,
     ) -> anyhow::Result<SourceInfoV1> {
         let entry = self.get_or_fetch(client, source_data, patch).await?;
-        Ok((*entry.sourceinfo).clone())
+        entry
+            .sourceinfo
+            .as_ref()
+            .map(|info| (**info).clone())
+            .ok_or_else(|| anyhow::anyhow!("Source's .SRCINFO/PKGBUILD could not be parsed"))
     }
 
     /// Return the raw archive bytes for `source_data`, fetching it if not cached.
@@ -125,19 +143,21 @@ impl SnapshotStore {
     }
 
     /// List the (unpatched) source files available for editing, relative to
-    /// the source root (e.g. `PKGBUILD`, `foo.install`).
+    /// the source root (e.g. `PKGBUILD`, `foo.install`). Works even if the
+    /// source's `.SRCINFO`/PKGBUILD fails to parse.
     pub async fn list_files(
         &self,
         client: &AurClient,
         source_data: &SourceData,
     ) -> anyhow::Result<Vec<String>> {
         let entry = self.get_or_fetch_raw(client, source_data).await?;
-        list_files_in_archive(&entry.archive_bytes, entry.sourceinfo.base.name.as_ref())
+        list_files_in_archive(&entry.archive_bytes, &entry.pkgbase)
     }
 
     /// Return the effective content of a single source file: the pristine
     /// content when `patch` is `None`, otherwise that content with the
-    /// stored patch (if any) applied.
+    /// stored patch (if any) applied. Works even if the source's
+    /// `.SRCINFO`/PKGBUILD fails to parse.
     pub async fn read_file(
         &self,
         client: &AurClient,
@@ -146,8 +166,7 @@ impl SnapshotStore {
         rel_path: &str,
     ) -> anyhow::Result<String> {
         let entry = self.get_or_fetch_raw(client, source_data).await?;
-        let pkgbase = entry.sourceinfo.base.name.to_string();
-        let original = read_file_from_archive(&entry.archive_bytes, &pkgbase, rel_path)?;
+        let original = read_file_from_archive(&entry.archive_bytes, &entry.pkgbase, rel_path)?;
 
         match patch.map(SourcePatch::parse).transpose()? {
             None => Ok(original),
@@ -180,14 +199,15 @@ impl SnapshotStore {
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
 
-        let (commit, archive_bytes, sourceinfo) =
+        let (commit, archive_bytes, pkgbase, sourceinfo) =
             checkout_and_parse(&repo_url, &git_ref, &subfolder, &path).await?;
 
         let changed = previous_commit != Some(commit);
         if changed {
             let entry = Arc::new(CacheEntry {
-                sourceinfo: Arc::new(sourceinfo),
+                sourceinfo: sourceinfo.map(Arc::new),
                 archive_bytes: Arc::new(archive_bytes),
+                pkgbase,
                 commit,
             });
             self.raw_cache.lock().await.insert(cache_key, entry);
@@ -225,8 +245,9 @@ impl SnapshotStore {
         let (archive_bytes, sourceinfo) = apply_patch_to_archive(&raw_entry.archive_bytes, &patch)?;
 
         let entry = Arc::new(CacheEntry {
-            sourceinfo: Arc::new(sourceinfo),
+            sourceinfo: Some(Arc::new(sourceinfo)),
             archive_bytes: Arc::new(archive_bytes),
+            pkgbase: raw_entry.pkgbase.clone(),
             commit: raw_entry.commit,
         });
 
@@ -254,12 +275,13 @@ impl SnapshotStore {
 
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
-        let (commit, archive_bytes, sourceinfo) =
+        let (commit, archive_bytes, pkgbase, sourceinfo) =
             checkout_and_parse(&repo_url, &git_ref, &subfolder, &path).await?;
 
         let entry = Arc::new(CacheEntry {
-            sourceinfo: Arc::new(sourceinfo),
+            sourceinfo: sourceinfo.map(Arc::new),
             archive_bytes: Arc::new(archive_bytes),
+            pkgbase,
             commit,
         });
 
@@ -306,12 +328,19 @@ fn sanitize_cache_key(cache_key: &str) -> String {
 /// `path`, then parse the `.SRCINFO`/PKGBUILD and build a tar.gz archive of
 /// `subfolder` (or the repo root if empty) with `{pkgbase}/` as the
 /// top-level directory, matching the structure of AUR snapshots.
+///
+/// Parsing the fetched `.SRCINFO`/PKGBUILD may fail for malformed real-world
+/// PKGBUILDs (e.g. `ogdf`) that `alpm-srcinfo` cannot handle. When that
+/// happens, `sourceinfo` is `None` rather than the whole fetch failing, so
+/// the raw source can still be browsed/edited (and a patch authored to fix
+/// the parse failure) before it's ever successfully added as a package. A
+/// best-effort `pkgbase` is derived from the repo URL/subfolder in that case.
 async fn checkout_and_parse(
     repo_url: &str,
     git_ref: &str,
     subfolder: &str,
     path: &Path,
-) -> anyhow::Result<(Oid, Vec<u8>, SourceInfoV1)> {
+) -> anyhow::Result<(Oid, Vec<u8>, String, Option<SourceInfoV1>)> {
     use crate::git::checkout::checkout_or_fetch_repo_ref;
     use crate::pkgbuild::parse_pkgbuild;
 
@@ -334,17 +363,45 @@ async fn checkout_and_parse(
     .await??;
 
     let srcinfo_path = package_dir.join(".SRCINFO");
-    let sourceinfo = if srcinfo_path.exists() {
-        let content = std::fs::read_to_string(&srcinfo_path)?;
-        SourceInfoV1::from_string(&fix_source_urls(&content))?
+    let parsed = if srcinfo_path.exists() {
+        std::fs::read_to_string(&srcinfo_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
     } else {
-        parse_pkgbuild(package_dir.join("PKGBUILD").as_path())?
+        parse_pkgbuild(package_dir.join("PKGBUILD").as_path())
     };
 
-    let pkgbase = sourceinfo.base.name.to_string();
+    let (pkgbase, sourceinfo) = match parsed {
+        Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
+        Err(_) => (fallback_pkgbase(&package_dir), None),
+    };
+
     let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
 
-    Ok((commit, tar_gz_bytes, sourceinfo))
+    Ok((commit, tar_gz_bytes, pkgbase, sourceinfo))
+}
+
+/// Best-effort pkgbase name to use as the archive's top-level directory when
+/// `.SRCINFO`/PKGBUILD parsing fails: read `pkgbase=`/`pkgname=` directly out
+/// of the PKGBUILD text, falling back to the checkout directory's name.
+fn fallback_pkgbase(package_dir: &Path) -> String {
+    if let Ok(content) = std::fs::read_to_string(package_dir.join("PKGBUILD")) {
+        for line in content.lines() {
+            let line = line.trim();
+            for prefix in ["pkgbase=", "pkgname="] {
+                if let Some(value) = line.strip_prefix(prefix) {
+                    let value = value.trim_matches(['"', '\''].as_ref()).trim();
+                    if !value.is_empty() {
+                        return value.to_string();
+                    }
+                }
+            }
+        }
+    }
+    package_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "source".to_string())
 }
 
 fn hash_patch(patch: &SourcePatch) -> u64 {

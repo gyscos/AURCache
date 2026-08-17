@@ -1,7 +1,7 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::package::{
     AddPackage, PackagePatchModel, SourceFileContent, SourceFileList, SourceFileUpdate,
-    UpdatePackage,
+    SourcePreviewFileUpdate, SourcePreviewPatchResult, SourcePreviewRequest, UpdatePackage,
 };
 use crate::models::package::{
     AurNotFoundPackage, AurPackage, ExtendedPackageModel, PackageDependencyModel, PackageSource,
@@ -46,7 +46,10 @@ use utoipa::OpenApi;
     get_package,
     package_source_files,
     package_source_file,
-    package_source_file_update
+    package_source_file_update,
+    package_source_preview_files,
+    package_source_preview_file,
+    package_source_preview_file_update
 ))]
 pub struct PackageApi;
 
@@ -89,6 +92,7 @@ pub async fn package_add_endpoint(
         platforms,
         normalize_build_flags(input.build_flags.as_deref()),
         input.source.clone(),
+        input.patch.clone(),
     )
     .await
     .map_err(|e| BadRequest(e.to_string()))?;
@@ -333,6 +337,120 @@ pub async fn package_source_file_update(
         })?;
 
     Ok(())
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "List source files for a not-yet-added source", body = SourceFileList),
+    )
+)]
+#[post("/package/source/preview/files", data = "<input>")]
+pub async fn package_source_preview_files(
+    store: &State<SnapshotStore>,
+    input: Json<SourcePreviewRequest>,
+    _a: Authenticated,
+) -> Result<Json<SourceFileList>, Custom<String>> {
+    let client = AurClient::new();
+    let files = store
+        .list_files(&client, &input.source)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+    Ok(Json(SourceFileList { files }))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Get the effective (patched, if applicable) content of a source file for a not-yet-added source", body = SourceFileContent),
+    )
+)]
+#[post("/package/source/preview/file", data = "<input>")]
+pub async fn package_source_preview_file(
+    store: &State<SnapshotStore>,
+    input: Json<SourcePreviewFileUpdate>,
+    _a: Authenticated,
+) -> Result<Json<SourceFileContent>, Custom<String>> {
+    let client = AurClient::new();
+
+    let content = store
+        .read_file(
+            &client,
+            &input.source,
+            input.patch.as_deref(),
+            &input.path,
+        )
+        .await
+        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+
+    let patched = match &input.patch {
+        None => false,
+        Some(raw) => SourcePatch::parse(raw)
+            .map(|p| p.diff_for(&input.path).is_some())
+            .unwrap_or(false),
+    };
+
+    Ok(Json(SourceFileContent {
+        path: input.path.clone(),
+        content,
+        patched,
+    }))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Merge an edit into an in-progress patch for a not-yet-added source", body = SourcePreviewPatchResult),
+    )
+)]
+#[put("/package/source/preview/file", data = "<input>")]
+pub async fn package_source_preview_file_update(
+    store: &State<SnapshotStore>,
+    input: Json<SourcePreviewFileUpdate>,
+    _a: Authenticated,
+) -> Result<Json<SourcePreviewPatchResult>, Custom<String>> {
+    let client = AurClient::new();
+
+    // Diff against the pristine (unpatched) file, not the currently effective
+    // one, so re-saving the same edit twice is idempotent.
+    let original = store
+        .read_file(&client, &input.source, None, &input.path)
+        .await
+        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+
+    let mut patch = input
+        .patch
+        .as_deref()
+        .map(SourcePatch::parse)
+        .transpose()
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .unwrap_or_default();
+    patch.merge_file(&input.path, &original, &input.content);
+
+    let new_patch = if patch.is_empty() {
+        None
+    } else {
+        Some(
+            patch
+                .to_json()
+                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?,
+        )
+    };
+
+    // Unlike the post-add save endpoint, a preview patch that still doesn't
+    // parse is not an error - the whole point is to let the user keep
+    // editing (e.g. fixing a malformed upstream PKGBUILD) until it does.
+    let (parses, parse_error) = match store
+        .sourceinfo(&client, &input.source, new_patch.as_deref())
+        .await
+    {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+
+    Ok(Json(SourcePreviewPatchResult {
+        patch: new_patch,
+        parses,
+        parse_error,
+    }))
 }
 
 #[utoipa::path(

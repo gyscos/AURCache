@@ -5,7 +5,8 @@ use crate::build::{build_output, cancel_build, delete_build, get_build, list_bui
 use crate::health::health;
 use crate::package::{
     get_package, package_add_endpoint, package_del, package_list, package_source_file,
-    package_source_file_update, package_source_files, package_update_endpoint,
+    package_source_file_update, package_source_files, package_source_preview_file,
+    package_source_preview_file_update, package_source_preview_files, package_update_endpoint,
     package_update_entity_endpoint,
 };
 use crate::settings::{setting_get, setting_patch, setting_reset, settings};
@@ -34,6 +35,9 @@ pub fn build_api() -> Vec<Route> {
         package_source_files,
         package_source_file,
         package_source_file_update,
+        package_source_preview_files,
+        package_source_preview_file,
+        package_source_preview_file_update,
         cancel_build,
         health,
         activity,

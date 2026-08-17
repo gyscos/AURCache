@@ -9,6 +9,13 @@ pub struct AddPackage {
     pub(crate) platforms: Option<Vec<String>>,
     pub(crate) build_flags: Option<Vec<String>>,
     pub(crate) source: SourceData,
+    /// Optional initial patch (raw JSON [`SourcePatch`]) to apply before the
+    /// source is fetched/parsed for the first time. Lets a package that
+    /// fails to parse upstream (e.g. a malformed PKGBUILD) be fixed up and
+    /// added in one step, instead of having to add it broken and edit it
+    /// afterwards.
+    #[serde(default)]
+    pub(crate) patch: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -35,6 +42,36 @@ pub struct SourceFileContent {
 pub struct SourceFileUpdate {
     pub path: String,
     pub content: String,
+}
+
+/// Request body for the pre-add source preview endpoints: identifies a
+/// not-yet-added source (and an in-progress patch, if any) so its files can
+/// be listed/edited before `POST /package` is ever called.
+#[derive(Deserialize, ToSchema, Clone)]
+#[serde(crate = "rocket::serde")]
+pub struct SourcePreviewRequest {
+    pub source: SourceData,
+}
+
+/// Request body to merge an edit into an in-progress (pre-add) patch.
+#[derive(Deserialize, ToSchema, Clone)]
+#[serde(crate = "rocket::serde")]
+pub struct SourcePreviewFileUpdate {
+    pub source: SourceData,
+    #[serde(default)]
+    pub patch: Option<String>,
+    pub path: String,
+    pub content: String,
+}
+
+/// Response for [`SourcePreviewFileUpdate`]: the merged patch, plus whether
+/// it now parses cleanly (dependencies/version can only be resolved once it
+/// does).
+#[derive(Serialize, ToSchema)]
+pub struct SourcePreviewPatchResult {
+    pub patch: Option<String>,
+    pub parses: bool,
+    pub parse_error: Option<String>,
 }
 
 #[derive(FromQueryResult, Deserialize, ToSchema, Serialize, Default)]
