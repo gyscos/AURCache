@@ -460,11 +460,16 @@ dependencies = [
  "alpm-srcinfo",
  "alpm-types",
  "backon",
+ "flate2",
  "reqwest",
  "serde",
  "serde_json",
+ "tar",
+ "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "url",
+ "wiremock",
 ]
 
 [[package]]

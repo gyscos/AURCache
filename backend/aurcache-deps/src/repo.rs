@@ -109,10 +109,18 @@ impl AurClient {
             .unwrap_or_else(|| Error::Rpc("Failed to download official repo db".to_string())))
     }
 
+    /// Downloads `url` to `archive_path`, disabling reqwest's transparent gzip
+    /// decompression (via `Accept-Encoding: identity`) so the bytes written to
+    /// disk match the wire format of an Arch repo DB (gzip, `.db` served as
+    /// `.db.tar.gz`). Without this, reqwest's `gzip` feature auto-decompresses
+    /// the response body while the file is still named/expected as `.tar.gz`,
+    /// causing `TarballReader` to try to gunzip already-plain tar bytes and
+    /// silently fail every lookup against the cache.
     async fn download_to_path(&self, url: &Url, archive_path: &Path) -> Result<(), Error> {
         let bytes = self
             .http
             .get(url.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(Error::Http)?
@@ -250,4 +258,120 @@ fn parse_desc_sections(content: &str) -> std::collections::HashMap<String, Vec<S
         );
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::{Builder, Header};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Builds a gzip-compressed tar archive (matching the real wire format of
+    /// Arch repo DBs, e.g. `core.db.tar.gz`) containing a single package
+    /// `desc` entry for `pkg_name`, optionally providing `provides_name`.
+    fn build_repo_db_tar_gz(pkg_name: &str, provides_name: Option<&str>) -> Vec<u8> {
+        let mut desc = format!("%NAME%\n{pkg_name}\n\n%VERSION%\n1.0-1\n\n");
+        if let Some(provides) = provides_name {
+            desc.push_str(&format!("%PROVIDES%\n{provides}\n\n"));
+        }
+
+        let gz = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar_builder = Builder::new(gz);
+        let entry_path = format!("{pkg_name}-1.0-1/desc");
+        let mut header = Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_cksum();
+        tar_builder
+            .append_data(&mut header, &entry_path, desc.as_bytes())
+            .unwrap();
+        let gz = tar_builder.into_inner().unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// Regression test for the reqwest gzip auto-decompression bug: the
+    /// official Arch mirrors serve `core.db`/`extra.db`/`multilib.db` as
+    /// statically pre-gzipped files. If reqwest's `gzip` feature is enabled
+    /// (as it is workspace-wide via other crates) and `download_to_path`
+    /// doesn't explicitly disable transparent decompression, the
+    /// already-decompressed (plain tar) bytes get written to disk under a
+    /// `.tar.gz` filename, and `TarballReader` (which selects its
+    /// decompression algorithm by file extension) fails to read them back,
+    /// making every official-repo dependency lookup silently report "not
+    /// found".
+    ///
+    /// Rather than relying on the `gzip` cargo feature actually being enabled
+    /// for this crate in isolation (which depends on feature unification with
+    /// other workspace crates, and so isn't reliably exercised by `cargo test
+    /// -p aurcache-deps`), this test asserts directly on the outgoing
+    /// request: `download_to_path` must send `Accept-Encoding: identity` to
+    /// explicitly opt out of any transparent decompression, regardless of
+    /// which reqwest features happen to be compiled in. The mock only
+    /// responds to requests carrying that header, so this test fails
+    /// (download error propagates) if the header is ever removed.
+    #[tokio::test]
+    async fn download_to_path_disables_transparent_decompression() {
+        let server = MockServer::start().await;
+        let body = build_repo_db_tar_gz("git", None);
+
+        for repo_name in OFFICIAL_REPO_NAMES {
+            Mock::given(method("GET"))
+                .and(path(format!("/{repo_name}/os/x86_64/{repo_name}.db")))
+                .and(header("Accept-Encoding", "identity"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(body.clone(), "application/octet-stream")
+                        .append_header("Content-Encoding", "x-gzip"),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let mirrorlist_dir = tempfile::tempdir().unwrap();
+        let mirrorlist_path = mirrorlist_dir.path().join("mirrorlist");
+        fs::write(
+            &mirrorlist_path,
+            format!("Server = {}/$repo/os/$arch\n", server.uri()),
+        )
+        .unwrap();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = AurClient::with_urls_and_paths(
+            "http://unused.invalid/rpc/v5",
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            mirrorlist_path,
+            cache_dir.path().to_path_buf(),
+        );
+
+        assert!(
+            client
+                .cached_official_dependency_exists("git")
+                .await
+                .expect(
+                    "download_to_path must send Accept-Encoding: identity; \
+                     otherwise the mock rejects the request (404) and the \
+                     lookup fails"
+                ),
+            "expected 'git' to be found in the cached official repo DBs"
+        );
+
+        // Sanity check: the cached archive on disk is genuinely gzip-compressed
+        // (matching its `.tar.gz` extension), not silently auto-decompressed.
+        let cached_path = cache_dir.path().join(cache_file_name("core"));
+        let on_disk = fs::read(&cached_path).unwrap();
+        assert_eq!(
+            &on_disk[0..2],
+            &[0x1f, 0x8b],
+            "cached archive should be gzip-compressed on disk (gzip magic bytes)"
+        );
+
+        assert!(
+            !client
+                .cached_official_dependency_exists("not-a-real-package")
+                .await
+                .unwrap()
+        );
+    }
 }
