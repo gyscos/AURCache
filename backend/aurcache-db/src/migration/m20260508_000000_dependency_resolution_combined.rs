@@ -571,6 +571,7 @@ pub async fn backfill_dependencies(
 
 /// Recursively ensure that `pkgbase` and all its AUR dependencies exist in the
 /// `packages` table with proper links in the `dependencies` table.
+#[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn ensure_deps(
     client: &AurClient,

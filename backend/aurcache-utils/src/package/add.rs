@@ -255,6 +255,7 @@ async fn add_package_with_source(
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn add_dependency_recursive(
     client: &aurcache_deps::AurClient,

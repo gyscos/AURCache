@@ -154,7 +154,7 @@ and check also if the 'DOCKER_HOST=unix:///var/run/user/1000/podman/podman.sock'
         // starts. Docker's `upload_to_container` requires the destination
         // directory to already exist on the host side of the bind mount, so
         // create it up front (it won't exist yet for a fresh build).
-        let local_src_dir = Path::new(&local_build_dir).join(&*name).join("src");
+        let local_src_dir = Path::new(&local_build_dir).join(name).join("src");
         std::fs::create_dir_all(&local_src_dir)
             .map_err(|e| anyhow!("Failed to create build src dir {local_src_dir:?}: {e}"))?;
 

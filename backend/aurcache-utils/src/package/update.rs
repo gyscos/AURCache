@@ -152,6 +152,7 @@ pub async fn package_update_with_client(
 }
 
 /// Recursively update a package and its dependencies, enqueuing builds for ready platforms.
+#[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn package_update_with_client_inner(
     services: &mut Services<'_>,
