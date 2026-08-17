@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use aurcache_db::packages::GitSourceSpec;
-use git2::{Oid, Repository};
+use git2::{Direction, Oid, Repository};
 use std::path::{Path, PathBuf};
 
 /// checkout git repo at specific ref
@@ -87,4 +87,42 @@ pub fn checkout_or_fetch_repo_ref(
     };
 
     resolve_and_checkout(&repo, git_ref)
+}
+
+/// Resolve the commit that `git_ref` currently points to on the remote
+/// `git_repo`, without cloning or fetching any objects (equivalent to
+/// `git ls-remote <repo> <ref>`).
+///
+/// Uses an in-memory (non-cloned) `git2` remote connection. `git_ref` may be
+/// a branch name, tag name, or `HEAD`; ambiguous short names are resolved the
+/// same way the remote's advertised ref list would allow (exact ref name,
+/// then `refs/heads/<name>`, then `refs/tags/<name>`).
+pub fn ls_remote(git_repo: &str, git_ref: &str) -> anyhow::Result<String> {
+    // A throwaway repository is required to create a remote in git2, even
+    // for a purely in-memory listing; it performs no disk I/O for the actual
+    // remote sources.
+    let dir = tempfile::tempdir()?;
+    let repo = Repository::init_bare(dir.path())?;
+    let mut remote = repo.remote_anonymous(git_repo)?;
+    remote.connect(Direction::Fetch)?;
+
+    let heads = remote.list()?;
+    let candidates = [
+        git_ref.to_string(),
+        format!("refs/heads/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+        "HEAD".to_string(),
+    ];
+
+    let result = candidates
+        .iter()
+        .find_map(|candidate| heads.iter().find(|h| h.name() == candidate))
+        .map(|head| head.oid().to_string());
+
+    remote.disconnect()?;
+    drop(remote);
+    drop(repo);
+    dir.close()?;
+
+    result.ok_or_else(|| anyhow!("Ref '{git_ref}' not found on remote '{git_repo}'"))
 }

@@ -103,6 +103,12 @@ pub struct Model {
     pub directly_requested: bool,
     pub split_packages: Option<String>,
     pub provides: Option<String>,
+    /// Optional multi-file unified diff (similar to a `git diff`) applied to the
+    /// fetched source before it is handed to the builder. May touch `PKGBUILD`
+    /// or any other tracked source file; `.SRCINFO` is always regenerated from
+    /// the (possibly patched) `PKGBUILD` when a patch is present, so it never
+    /// needs to be included in the patch itself.
+    pub patch: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}
@@ -113,6 +119,8 @@ pub enum Relation {
     Builds,
     #[sea_orm(has_many = "super::files::Entity")]
     Files,
+    #[sea_orm(has_many = "super::package_vcs_sources::Entity")]
+    PackageVcsSources,
     #[sea_orm(
         belongs_to = "super::builds::Entity",
         from = "Column::LatestBuild",
@@ -124,6 +132,12 @@ pub enum Relation {
 impl Related<super::files::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Files.def()
+    }
+}
+
+impl Related<super::package_vcs_sources::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PackageVcsSources.def()
     }
 }
 

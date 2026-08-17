@@ -542,6 +542,7 @@ dependencies = [
  "aurcache-db",
  "aurcache-deps",
  "aurcache-types",
+ "diffy",
  "flate2",
  "futures",
  "git2",
@@ -1328,6 +1329,15 @@ dependencies = [
  "shell-words",
  "tempfile",
  "zeroize",
+]
+
+[[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
 ]
 
 [[package]]

@@ -1,5 +1,8 @@
 use crate::models::authenticated::Authenticated;
-use crate::models::package::{AddPackage, PackagePatchModel, UpdatePackage};
+use crate::models::package::{
+    AddPackage, PackagePatchModel, SourceFileContent, SourceFileList, SourceFileUpdate,
+    UpdatePackage,
+};
 use crate::models::package::{
     AurNotFoundPackage, AurPackage, ExtendedPackageModel, PackageDependencyModel, PackageSource,
     SimplePackageModel,
@@ -12,16 +15,19 @@ use aurcache_db::activities::ActivityType;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
+use aurcache_deps::AurClient;
 use aurcache_types::builder::Action;
 use aurcache_utils::aur::api::get_package_info;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
-use aurcache_utils::package::update::package_update;
+use aurcache_utils::package::update::{package_resync_dependencies, package_update};
+use aurcache_utils::patch::SourcePatch;
+use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::response::status::{BadRequest, Custom, NotFound};
 use rocket::serde::json::Json;
-use rocket::{State, delete, get, patch, post};
+use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
@@ -37,7 +43,10 @@ use utoipa::OpenApi;
     package_update_endpoint,
     package_del,
     package_list,
-    get_package
+    get_package,
+    package_source_files,
+    package_source_file,
+    package_source_file_update
 ))]
 pub struct PackageApi;
 
@@ -107,6 +116,8 @@ pub async fn package_add_endpoint(
 #[patch("/package/<id>", data = "<input>")]
 pub async fn package_update_entity_endpoint(
     db: &State<DatabaseConnection>,
+    tx: &State<Sender<Action>>,
+    store: &State<SnapshotStore>,
     input: Json<PackagePatchModel>,
     id: i32,
     _a: Authenticated,
@@ -115,6 +126,7 @@ pub async fn package_update_entity_endpoint(
 
     // We cannot move things out of Json<T>, but we can move it out of T.
     let input = input.into_inner();
+    let patch_changed = input.patch.is_some();
 
     // Start building the update operation
     let update_pkg = packages::ActiveModel {
@@ -135,13 +147,190 @@ pub async fn package_update_entity_endpoint(
         directly_requested: NotSet,
         split_packages: NotSet,
         provides: NotSet,
+        patch: input.patch.map_or(NotSet, Set),
     };
 
     // Execute the update query
-    update_pkg
+    let updated = update_pkg
         .update(db)
         .await
         .map_err(|e| BadRequest(e.to_string()))?;
+
+    // A patch being set or cleared here (e.g. via the "reset patch" action)
+    // can change `depends`/`makedepends` without bumping the package's
+    // version, so keep the dependency graph in sync immediately.
+    if patch_changed {
+        let client = AurClient::new();
+        package_resync_dependencies(&client, store, db, tx, &updated)
+            .await
+            .map_err(|e| BadRequest(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "List the files in a package's source, available for viewing/editing", body = SourceFileList),
+    ),
+    params(
+            ("id", description = "Id of package")
+    )
+)]
+#[get("/package/<id>/source/files")]
+pub async fn package_source_files(
+    db: &State<DatabaseConnection>,
+    store: &State<SnapshotStore>,
+    id: i32,
+    _a: Authenticated,
+) -> Result<Json<SourceFileList>, Custom<String>> {
+    let db = db as &DatabaseConnection;
+
+    let pkg = Packages::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+
+    let client = AurClient::new();
+    let files = store
+        .list_files(&client, &pkg.source_data)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+    Ok(Json(SourceFileList { files }))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Get the effective (patched, if applicable) content of a source file", body = SourceFileContent),
+    ),
+    params(
+            ("id", description = "Id of package"),
+            ("path", description = "File path relative to the source root, e.g. 'PKGBUILD'")
+    )
+)]
+#[get("/package/<id>/source/file?<path>")]
+pub async fn package_source_file(
+    db: &State<DatabaseConnection>,
+    store: &State<SnapshotStore>,
+    id: i32,
+    path: String,
+    _a: Authenticated,
+) -> Result<Json<SourceFileContent>, Custom<String>> {
+    let db = db as &DatabaseConnection;
+
+    let pkg = Packages::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+
+    let client = AurClient::new();
+
+    let content = store
+        .read_file(&client, &pkg.source_data, pkg.patch.as_deref(), &path)
+        .await
+        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+
+    let patched = match &pkg.patch {
+        None => false,
+        Some(raw) => SourcePatch::parse(raw)
+            .map(|p| p.diff_for(&path).is_some())
+            .unwrap_or(false),
+    };
+
+    Ok(Json(SourceFileContent {
+        path,
+        content,
+        patched,
+    }))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Save an edit to a source file as part of the package's patch"),
+    ),
+    params(
+            ("id", description = "Id of package")
+    )
+)]
+#[put("/package/<id>/source/file", data = "<input>")]
+pub async fn package_source_file_update(
+    db: &State<DatabaseConnection>,
+    tx: &State<Sender<Action>>,
+    store: &State<SnapshotStore>,
+    id: i32,
+    input: Json<SourceFileUpdate>,
+    _a: Authenticated,
+) -> Result<(), Custom<String>> {
+    let db = db as &DatabaseConnection;
+    let input = input.into_inner();
+
+    let pkg = Packages::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+
+    let client = AurClient::new();
+
+    // Diff against the pristine (unpatched) file, not the currently effective
+    // one, so re-saving the same edit twice is idempotent.
+    let original = store
+        .read_file(&client, &pkg.source_data, None, &input.path)
+        .await
+        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+
+    let mut patch = pkg
+        .patch
+        .as_deref()
+        .map(SourcePatch::parse)
+        .transpose()
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .unwrap_or_default();
+    patch.merge_file(&input.path, &original, &input.content);
+
+    let new_patch = if patch.is_empty() {
+        None
+    } else {
+        Some(
+            patch
+                .to_json()
+                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?,
+        )
+    };
+
+    // Validate the patch still applies cleanly and .SRCINFO can be
+    // regenerated from it before persisting.
+    store
+        .sourceinfo(&client, &pkg.source_data, new_patch.as_deref())
+        .await
+        .map_err(|e| Custom(Status::BadRequest, format!("Patch could not be applied: {e}")))?;
+
+    let update_pkg = packages::ActiveModel {
+        id: Set(id),
+        patch: Set(new_patch.clone()),
+        ..Default::default()
+    };
+    update_pkg
+        .update(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+    // A patch can change `depends`/`makedepends` without bumping the
+    // package's version, so resync the dependency graph immediately rather
+    // than waiting for the next explicit "update" trigger.
+    let mut resynced_pkg = pkg;
+    resynced_pkg.patch = new_patch;
+    package_resync_dependencies(&client, store, db, tx, &resynced_pkg)
+        .await
+        .map_err(|e| {
+            Custom(
+                Status::InternalServerError,
+                format!("Patch saved, but failed to resync dependencies: {e}"),
+            )
+        })?;
 
     Ok(())
 }
@@ -578,6 +767,7 @@ pub async fn get_package(
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
 
+    let has_patch = pkg.patch.is_some();
     let source_data = pkg.source_data;
 
     let (package_source, version) = match source_data {
@@ -652,6 +842,7 @@ pub async fn get_package(
             .and_then(|s| serde_json::from_str(&s).ok()),
         dependencies,
         dependents,
+        has_patch,
     };
 
     Ok(Json(ext_pkg))

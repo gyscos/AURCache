@@ -1,7 +1,7 @@
 use crate::utils::remove_archive_file::try_remove_archive_file;
 use anyhow::anyhow;
-use aurcache_db::prelude::{Builds, Files, Packages, Settings};
-use aurcache_db::{builds, files, settings};
+use aurcache_db::prelude::{Builds, Files, PackageVcsSources, Packages, Settings};
+use aurcache_db::{builds, files, package_vcs_sources, settings};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter, TransactionTrait,
 };
@@ -39,6 +39,14 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     // delete corresponding settings entries
     Settings::delete_many()
         .filter(settings::Column::PkgId.eq(pkg.id))
+        .exec(&txn)
+        .await?;
+
+    // delete tracked VCS source commits (not relied upon `ON DELETE CASCADE`
+    // alone, since SQLite only enforces it when foreign_keys is on for the
+    // connection actually issuing the DELETE)
+    PackageVcsSources::delete_many()
+        .filter(package_vcs_sources::Column::PackageId.eq(pkg.id))
         .exec(&txn)
         .await?;
 

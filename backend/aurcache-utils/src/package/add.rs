@@ -132,7 +132,8 @@ async fn resolve_srcinfo_to_spec(
     client: &aurcache_deps::AurClient,
     source_data: &SourceData,
 ) -> anyhow::Result<PackageInsertSpec> {
-    let sourceinfo = store.sourceinfo(client, source_data).await?;
+    // New packages have no patch yet - that's only added afterwards via the editor.
+    let sourceinfo = store.sourceinfo(client, source_data, None).await?;
     let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
     let pkgbase = sourceinfo.base.name.to_string();
     let requirements =

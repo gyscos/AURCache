@@ -10,5 +10,6 @@ pub mod files;
 pub mod helpers;
 pub mod init;
 pub mod migration;
+pub mod package_vcs_sources;
 pub mod packages;
 pub mod settings;

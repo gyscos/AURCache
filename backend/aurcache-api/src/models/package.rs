@@ -17,6 +17,26 @@ pub struct UpdatePackage {
     pub(crate) force: bool,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct SourceFileList {
+    pub files: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct SourceFileContent {
+    pub path: String,
+    pub content: String,
+    /// Whether this file currently differs from the pristine upstream source.
+    pub patched: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(crate = "rocket::serde")]
+pub struct SourceFileUpdate {
+    pub path: String,
+    pub content: String,
+}
+
 #[derive(FromQueryResult, Deserialize, ToSchema, Serialize, Default)]
 pub struct PackagePatchModel {
     pub name: Option<String>,
@@ -25,6 +45,9 @@ pub struct PackagePatchModel {
     pub latest_build: Option<Option<i32>>,
     pub build_flags: Option<Vec<String>>,
     pub platforms: Option<Vec<String>>,
+    /// Multi-file unified diff applied on top of the fetched source.
+    /// `Some(None)` clears an existing patch, `None` leaves it untouched.
+    pub patch: Option<Option<String>>,
 }
 
 #[derive(FromQueryResult, Deserialize, ToSchema, Serialize)]
@@ -53,6 +76,8 @@ pub struct ExtendedPackageModel {
     pub split_packages: Option<Vec<String>>,
     pub dependencies: Vec<PackageDependencyModel>,
     pub dependents: Vec<PackageDependencyModel>,
+    /// Whether the package currently has a source patch applied.
+    pub has_patch: bool,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, sea_orm::FromQueryResult)]

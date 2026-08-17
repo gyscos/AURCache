@@ -8,6 +8,7 @@ use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
+use aurcache_utils::vcs_check::sync_vcs_sources;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait, Order, QuerySelect,
 };
@@ -99,12 +100,36 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                         // from looping: the AUR-reported version is the one from when the
                         // PKGBUILD was last touched, which may be *older* than what was
                         // actually built from the live VCS source.
-                        let is_outdated = match &latest_version {
+                        let mut is_outdated = match &latest_version {
                             None => true,
                             Some(built) => {
                                 vercmp(&result.version, built) == std::cmp::Ordering::Greater
                             }
                         };
+
+                        // `pkgver` alone doesn't catch VCS packages (-git etc.)
+                        // whose upstream repo moved without the AUR PKGBUILD's
+                        // version being bumped. Resolve any git+ VCS sources
+                        // and flag out-of-date if any of them changed.
+                        match store
+                            .sourceinfo(&client, &source_data, package.patch.as_deref())
+                            .await
+                        {
+                            Ok(sourceinfo) => {
+                                match sync_vcs_sources(&db, *package_id, &sourceinfo).await {
+                                    Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
+                                    Err(e) => warn!(
+                                        "Failed to sync VCS sources for {}: {e}",
+                                        package.name
+                                    ),
+                                }
+                            }
+                            Err(e) => warn!(
+                                "Failed to resolve sourceinfo for VCS check of {}: {e}",
+                                package.name
+                            ),
+                        }
+
                         package_model.out_of_date = Set(i32::from(is_outdated));
 
                         // The AUR RPC `/info` response is a cheap way to know
@@ -129,20 +154,27 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                     .await
                     .map_err(|e| anyhow!("Failed to refresh git source: {e}"))?;
                 let sourceinfo = store
-                    .sourceinfo(&client, &source_data)
+                    .sourceinfo(&client, &source_data, package.patch.as_deref())
                     .await
                     .map_err(|e| anyhow!("Failed to get sourceinfo: {e}"))?;
                 // This still only tracks the version in PKGBUILD/.SRCINFO; a ref
-                // moving without a version bump will not mark the package outdated.
+                // moving without a version bump will not mark the package outdated
+                // by itself - the VCS-source check below covers that case.
                 let version = sourceinfo.base.version.to_string();
 
                 package_model.upstream_version = Set(Option::from(version.clone()));
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
-                let is_outdated = match &latest_version {
+                let mut is_outdated = match &latest_version {
                     None => true,
                     Some(built) => vercmp(&version, built) == std::cmp::Ordering::Greater,
                 };
+
+                match sync_vcs_sources(&db, *package_id, &sourceinfo).await {
+                    Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
+                    Err(e) => warn!("Failed to sync VCS sources for {}: {e}", package.name),
+                }
+
                 package_model.out_of_date = Set(i32::from(is_outdated));
             }
             SourceData::Upload { .. } => {

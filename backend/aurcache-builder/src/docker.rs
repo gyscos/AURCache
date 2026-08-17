@@ -256,9 +256,10 @@ and check also if the 'DOCKER_HOST=unix:///var/run/user/1000/podman/podman.sock'
         // Upload the source archive to the build container.
         // Docker's upload_to_container API expects a raw tar stream, so we
         // decompress the gzipped archive before sending it.
+        let patch = self.package_model.patch.get()?;
         let archive_bytes = self
             .store
-            .archive_bytes(&self.client, source_data)
+            .archive_bytes(&self.client, source_data, patch.as_deref())
             .await
             .map_err(|e| anyhow!("Failed to get source archive: {e}"))?;
 

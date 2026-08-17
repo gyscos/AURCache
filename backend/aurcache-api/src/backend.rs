@@ -4,7 +4,8 @@ use crate::auth::regenerate_api_token_endpoint;
 use crate::build::{build_output, cancel_build, delete_build, get_build, list_builds, rery_build};
 use crate::health::health;
 use crate::package::{
-    get_package, package_add_endpoint, package_del, package_list, package_update_endpoint,
+    get_package, package_add_endpoint, package_del, package_list, package_source_file,
+    package_source_file_update, package_source_files, package_update_endpoint,
     package_update_entity_endpoint,
 };
 use crate::settings::{setting_get, setting_patch, setting_reset, settings};
@@ -30,6 +31,9 @@ pub fn build_api() -> Vec<Route> {
         get_package,
         rery_build,
         package_update_endpoint,
+        package_source_files,
+        package_source_file,
+        package_source_file_update,
         cancel_build,
         health,
         activity,

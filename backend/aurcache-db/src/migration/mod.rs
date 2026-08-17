@@ -9,6 +9,8 @@ mod m20251107_000000_build_flags_no_install;
 mod m20251204_160000_settings;
 pub mod m20260508_000000_dependency_resolution_combined;
 mod m20260515_000000_api_tokens;
+mod m20260601_000000_package_patch;
+mod m20260814_000000_package_vcs_sources;
 
 pub struct Migrator;
 
@@ -23,8 +25,12 @@ impl MigratorTrait for Migrator {
             Box::new(m20251015_230000_pkg_sources::Migration),
             Box::new(m20251204_160000_settings::Migration),
             Box::new(m20251107_000000_build_flags_no_install::Migration),
+            // Must run before `m20260508_..._dependency_resolution_combined`, which
+            // queries `packages::Entity` using the *current* (compiled) entity shape.
+            Box::new(m20260601_000000_package_patch::Migration),
             Box::new(m20260508_000000_dependency_resolution_combined::Migration),
             Box::new(m20260515_000000_api_tokens::Migration),
+            Box::new(m20260814_000000_package_vcs_sources::Migration),
         ]
     }
 }

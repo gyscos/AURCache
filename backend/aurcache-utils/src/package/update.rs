@@ -50,6 +50,10 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
             .filter(dependencies::Column::DependentId.eq(pkg.id))
             .exec(&txn)
             .await?;
+        aurcache_db::package_vcs_sources::Entity::delete_many()
+            .filter(aurcache_db::package_vcs_sources::Column::PackageId.eq(pkg.id))
+            .exec(&txn)
+            .await?;
         packages::Entity::delete_by_id(pkg.id).exec(&txn).await?;
         txn.commit().await?;
     }
@@ -151,6 +155,48 @@ pub async fn package_update_with_client(
     package_update_with_client_inner(&mut services, pkg_model, force, &mut visited).await
 }
 
+/// Recompute and persist a package's dependency graph from its current
+/// (possibly patched) source, without checking versions or enqueuing builds.
+///
+/// A patch edit can change `depends`/`makedepends` without necessarily
+/// bumping `pkgver`/`pkgrel`, so the dependency graph needs to be kept in
+/// sync independently of the regular version-triggered update flow. This is
+/// intentionally lighter-weight than [`package_update_with_client`]: it does
+/// not enqueue or promote any builds.
+pub async fn package_resync_dependencies(
+    client: &AurClient,
+    store: &SnapshotStore,
+    db: &DatabaseConnection,
+    tx: &Sender<Action>,
+    pkg_model: &packages::Model,
+) -> anyhow::Result<()> {
+    let mut services = Services {
+        client,
+        store,
+        db,
+        tx,
+    };
+
+    let sourceinfo = services
+        .store
+        .sourceinfo(
+            services.client,
+            &pkg_model.source_data,
+            pkg_model.patch.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow!("Failed to resolve source info: {e}"))?;
+    let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
+
+    sync_dependency_graph(&mut services, pkg_model, &deps).await?;
+
+    // The dependency change may have made some previously-required
+    // dependency-only packages no longer needed.
+    remove_orphaned_packages(services.db, pkg_model.id).await?;
+
+    Ok(())
+}
+
 /// Recursively update a package and its dependencies, enqueuing builds for ready platforms.
 #[allow(clippy::double_must_use)]
 #[async_recursion]
@@ -166,7 +212,11 @@ async fn package_update_with_client_inner(
 
     let sourceinfo = services
         .store
-        .sourceinfo(services.client, &pkg_model.source_data)
+        .sourceinfo(
+            services.client,
+            &pkg_model.source_data,
+            pkg_model.patch.as_deref(),
+        )
         .await
         .map_err(|e| anyhow!("Failed to resolve source info: {e}"))?;
     let upstream_version = sourceinfo.base.version.to_string();

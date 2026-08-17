@@ -8,6 +8,7 @@ use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::oauth_config_from_env;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_types::builder::Action;
+use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
 use rocket::http::private::cookie::Key;
@@ -95,6 +96,7 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
             .manage(tx)
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
+            .manage(SnapshotStore::new())
             .mount("/api/", build_api())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))
             .mount("/", Redoc::with_url("/redoc", ApiDoc::openapi()));
