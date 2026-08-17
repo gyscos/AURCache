@@ -117,12 +117,11 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
     }
   }
 
-  Future<void> _revert() async {
+  void _revert() {
     if (_originalContent == null) return;
     setState(() {
       _controller.text = _originalContent!;
     });
-    await _save();
   }
 
   @override
