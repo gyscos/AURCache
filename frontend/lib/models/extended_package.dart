@@ -25,6 +25,7 @@ sealed class ExtendedPackage with _$ExtendedPackage {
     required List<PackageDependency> dependencies,
     required List<PackageDependency> dependents,
     final List<String>? split_packages,
+    required bool has_patch,
     // ignore: invalid_annotation_target
     @JsonKey(toJson: _toString) required PackageSource package_source,
   }) = _ExtendedPackage;
@@ -52,6 +53,7 @@ sealed class ExtendedPackage with _$ExtendedPackage {
       ),
     ],
     split_packages: null,
+    has_patch: false,
     package_source: PackageSource.git(
       GitPackage(
         ref: "master",

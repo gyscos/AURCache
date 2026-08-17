@@ -12,6 +12,7 @@ import '../api/API.dart';
 import '../components/api/api_builder.dart';
 import '../components/builds_table.dart';
 import '../components/confirm_popup.dart';
+import '../components/package_source_patch_popup.dart';
 import '../constants/color_constants.dart';
 import '../models/build.dart';
 import '../providers/activity_log.dart';
@@ -165,6 +166,23 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
           child: const Text(
             "Delete",
             style: TextStyle(color: Colors.redAccent),
+          ),
+        ),
+        const SizedBox(width: 10),
+        ElevatedButton(
+          onPressed: () async {
+            await showPackageSourcePatchPopup(context, pkg.id);
+            // A saved/reverted edit can change dependencies/version without
+            // bumping the upstream version, so refresh everything relevant.
+            ref.invalidate(getPackageProvider(pkg.id));
+            ref.invalidate(listPackagesProvider);
+            ref.invalidate(getGraphDataProvider);
+          },
+          child: Text(
+            pkg.has_patch ? "Patch (active)" : "Patch",
+            style: TextStyle(
+              color: pkg.has_patch ? Colors.greenAccent : Colors.white,
+            ),
           ),
         ),
         const SizedBox(width: 10),
