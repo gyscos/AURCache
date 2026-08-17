@@ -1,7 +1,7 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::package::{
     AddPackage, PackagePatchModel, SourceFileContent, SourceFileList, SourceFileUpdate,
-    SourcePreviewFileUpdate, SourcePreviewPatchResult, SourcePreviewRequest, UpdatePackage,
+    SourcePreviewFileRequest, SourcePreviewRequest, UpdatePackage,
 };
 use crate::models::package::{
     AurNotFoundPackage, AurPackage, ExtendedPackageModel, PackageDependencyModel, PackageSource,
@@ -48,8 +48,7 @@ use utoipa::OpenApi;
     package_source_file,
     package_source_file_update,
     package_source_preview_files,
-    package_source_preview_file,
-    package_source_preview_file_update
+    package_source_preview_file
 ))]
 pub struct PackageApi;
 
@@ -92,7 +91,7 @@ pub async fn package_add_endpoint(
         platforms,
         normalize_build_flags(input.build_flags.as_deref()),
         input.source.clone(),
-        input.patch.clone(),
+        input.patched_files.clone(),
     )
     .await
     .map_err(|e| BadRequest(e.to_string()))?;
@@ -207,7 +206,7 @@ pub async fn package_source_files(
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Get the effective (patched, if applicable) content of a source file", body = SourceFileContent),
+            (status = 200, description = "Get the pristine content, and (if applicable) patched content, of a source file", body = SourceFileContent),
     ),
     params(
             ("id", description = "Id of package"),
@@ -232,22 +231,16 @@ pub async fn package_source_file(
 
     let client = AurClient::new();
 
-    let content = store
-        .read_file(&client, &pkg.source_data, pkg.patch.as_deref(), &path)
+    let (original_content, patched_content, patch_error) = store
+        .read_file_with_patch_status(&client, &pkg.source_data, pkg.patch.as_deref(), &path)
         .await
         .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
 
-    let patched = match &pkg.patch {
-        None => false,
-        Some(raw) => SourcePatch::parse(raw)
-            .map(|p| p.diff_for(&path).is_some())
-            .unwrap_or(false),
-    };
-
     Ok(Json(SourceFileContent {
         path,
-        content,
-        patched,
+        original_content,
+        patched_content,
+        patch_error,
     }))
 }
 
@@ -305,13 +298,9 @@ pub async fn package_source_file_update(
         )
     };
 
-    // Validate the patch still applies cleanly and .SRCINFO can be
-    // regenerated from it before persisting.
-    store
-        .sourceinfo(&client, &pkg.source_data, new_patch.as_deref())
-        .await
-        .map_err(|e| Custom(Status::BadRequest, format!("Patch could not be applied: {e}")))?;
-
+    // No need to validate the patch applies cleanly here: it was just
+    // diffed fresh against the current pristine content above, so applying
+    // it back is guaranteed to succeed.
     let update_pkg = packages::ActiveModel {
         id: Set(id),
         patch: Set(new_patch.clone()),
@@ -361,95 +350,27 @@ pub async fn package_source_preview_files(
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Get the effective (patched, if applicable) content of a source file for a not-yet-added source", body = SourceFileContent),
+            (status = 200, description = "Get the pristine content of a source file for a not-yet-added source", body = SourceFileContent),
     )
 )]
 #[post("/package/source/preview/file", data = "<input>")]
 pub async fn package_source_preview_file(
     store: &State<SnapshotStore>,
-    input: Json<SourcePreviewFileUpdate>,
+    input: Json<SourcePreviewFileRequest>,
     _a: Authenticated,
 ) -> Result<Json<SourceFileContent>, Custom<String>> {
     let client = AurClient::new();
 
-    let content = store
-        .read_file(
-            &client,
-            &input.source,
-            input.patch.as_deref(),
-            &input.path,
-        )
-        .await
-        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
-
-    let patched = match &input.patch {
-        None => false,
-        Some(raw) => SourcePatch::parse(raw)
-            .map(|p| p.diff_for(&input.path).is_some())
-            .unwrap_or(false),
-    };
-
-    Ok(Json(SourceFileContent {
-        path: input.path.clone(),
-        content,
-        patched,
-    }))
-}
-
-#[utoipa::path(
-    responses(
-            (status = 200, description = "Merge an edit into an in-progress patch for a not-yet-added source", body = SourcePreviewPatchResult),
-    )
-)]
-#[put("/package/source/preview/file", data = "<input>")]
-pub async fn package_source_preview_file_update(
-    store: &State<SnapshotStore>,
-    input: Json<SourcePreviewFileUpdate>,
-    _a: Authenticated,
-) -> Result<Json<SourcePreviewPatchResult>, Custom<String>> {
-    let client = AurClient::new();
-
-    // Diff against the pristine (unpatched) file, not the currently effective
-    // one, so re-saving the same edit twice is idempotent.
-    let original = store
+    let original_content = store
         .read_file(&client, &input.source, None, &input.path)
         .await
         .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
 
-    let mut patch = input
-        .patch
-        .as_deref()
-        .map(SourcePatch::parse)
-        .transpose()
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .unwrap_or_default();
-    patch.merge_file(&input.path, &original, &input.content);
-
-    let new_patch = if patch.is_empty() {
-        None
-    } else {
-        Some(
-            patch
-                .to_json()
-                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?,
-        )
-    };
-
-    // Unlike the post-add save endpoint, a preview patch that still doesn't
-    // parse is not an error - the whole point is to let the user keep
-    // editing (e.g. fixing a malformed upstream PKGBUILD) until it does.
-    let (parses, parse_error) = match store
-        .sourceinfo(&client, &input.source, new_patch.as_deref())
-        .await
-    {
-        Ok(_) => (true, None),
-        Err(e) => (false, Some(e.to_string())),
-    };
-
-    Ok(Json(SourcePreviewPatchResult {
-        patch: new_patch,
-        parses,
-        parse_error,
+    Ok(Json(SourceFileContent {
+        path: input.path.clone(),
+        original_content,
+        patched_content: None,
+        patch_error: None,
     }))
 }
 

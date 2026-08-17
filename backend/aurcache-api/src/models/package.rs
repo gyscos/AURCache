@@ -1,6 +1,7 @@
 use aurcache_db::packages::{GitSourceSpec, SourceData};
 use rocket::serde::{Deserialize, Serialize};
 use sea_orm::FromQueryResult;
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -9,13 +10,13 @@ pub struct AddPackage {
     pub(crate) platforms: Option<Vec<String>>,
     pub(crate) build_flags: Option<Vec<String>>,
     pub(crate) source: SourceData,
-    /// Optional initial patch (raw JSON [`SourcePatch`]) to apply before the
-    /// source is fetched/parsed for the first time. Lets a package that
-    /// fails to parse upstream (e.g. a malformed PKGBUILD) be fixed up and
-    /// added in one step, instead of having to add it broken and edit it
-    /// afterwards.
+    /// Optional initial patch, expressed as full file contents (path -> new
+    /// content) rather than a diff - the backend diffs each entry against
+    /// the source's pristine content itself. Lets a package that fails to
+    /// parse upstream (e.g. a malformed PKGBUILD) be fixed up and added in
+    /// one step, instead of having to add it broken and edit it afterwards.
     #[serde(default)]
-    pub(crate) patch: Option<String>,
+    pub(crate) patched_files: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -29,12 +30,24 @@ pub struct SourceFileList {
     pub files: Vec<String>,
 }
 
+/// Effective content of a single source file for an already-added package.
+/// The pristine content is always included so the UI can fall back to it
+/// (and offer a "revert" action) even if the stored patch no longer applies
+/// cleanly to the current upstream source.
 #[derive(Serialize, ToSchema)]
 pub struct SourceFileContent {
     pub path: String,
-    pub content: String,
-    /// Whether this file currently differs from the pristine upstream source.
-    pub patched: bool,
+    pub original_content: String,
+    /// Content with the stored patch applied, if this file is part of the
+    /// patch and it still applies cleanly. `None` if there's no patch for
+    /// this file, or if the stored diff no longer applies (see
+    /// `patch_error`) - in that case the UI should fall back to
+    /// `original_content`.
+    pub patched_content: Option<String>,
+    /// Set if this file is part of the stored patch but applying it failed
+    /// (e.g. upstream changed enough that the diff's context no longer
+    /// matches).
+    pub patch_error: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -45,33 +58,20 @@ pub struct SourceFileUpdate {
 }
 
 /// Request body for the pre-add source preview endpoints: identifies a
-/// not-yet-added source (and an in-progress patch, if any) so its files can
-/// be listed/edited before `POST /package` is ever called.
+/// not-yet-added source so its (pristine) files can be listed/read before
+/// `POST /package` is ever called.
 #[derive(Deserialize, ToSchema, Clone)]
 #[serde(crate = "rocket::serde")]
 pub struct SourcePreviewRequest {
     pub source: SourceData,
 }
 
-/// Request body to merge an edit into an in-progress (pre-add) patch.
+/// Request body to read a single pristine file of a not-yet-added source.
 #[derive(Deserialize, ToSchema, Clone)]
 #[serde(crate = "rocket::serde")]
-pub struct SourcePreviewFileUpdate {
+pub struct SourcePreviewFileRequest {
     pub source: SourceData,
-    #[serde(default)]
-    pub patch: Option<String>,
     pub path: String,
-    pub content: String,
-}
-
-/// Response for [`SourcePreviewFileUpdate`]: the merged patch, plus whether
-/// it now parses cleanly (dependencies/version can only be resolved once it
-/// does).
-#[derive(Serialize, ToSchema)]
-pub struct SourcePreviewPatchResult {
-    pub patch: Option<String>,
-    pub parses: bool,
-    pub parse_error: Option<String>,
 }
 
 #[derive(FromQueryResult, Deserialize, ToSchema, Serialize, Default)]

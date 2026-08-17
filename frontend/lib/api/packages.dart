@@ -50,14 +50,14 @@ extension PackagesAPI on ApiClient {
   Future<void> addAurPackage({
     required List<String> selectedArchs,
     required String name,
-    String? patch,
+    Map<String, String>? patchedFiles,
   }) async {
     final resp = await getRawClient().post(
       "/package",
       data: {
         'platforms': selectedArchs,
         'source': {'name': name, 'type': 'aur'},
-        if (patch != null) 'patch': patch,
+        if (patchedFiles != null) 'patched_files': patchedFiles,
       },
     );
     print(resp.data);
@@ -68,7 +68,7 @@ extension PackagesAPI on ApiClient {
     required String gitUrl,
     required String gitRef,
     required String subFolder,
-    String? patch,
+    Map<String, String>? patchedFiles,
   }) async {
     final resp = await getRawClient().post(
       "/package",
@@ -80,7 +80,7 @@ extension PackagesAPI on ApiClient {
           'subfolder': subFolder,
           'type': 'git',
         },
-        if (patch != null) 'patch': patch,
+        if (patchedFiles != null) 'patched_files': patchedFiles,
       },
     );
     print(resp.data);

@@ -5,9 +5,11 @@ import '../../api/source_preview.dart';
 
 /// Inline editor, embeddable in the "Add Package" wizard, that lets the user
 /// browse the files of a not-yet-added source (AUR/Git) and edit one of them
-/// (typically PKGBUILD) before the package is created. Edits are merged into
-/// a multi-file patch (same format used post-add) which is surfaced via
-/// [onPatchChanged] so the caller can send it along with `POST /package`.
+/// (typically PKGBUILD) before the package is created. Edits are kept
+/// entirely client-side as full file contents (path -> new content) and
+/// surfaced via [onPatchedFilesChanged] so the caller can send them along
+/// with `POST /package` as `patched_files` - the backend diffs each entry
+/// against the source's pristine content itself when the package is added.
 ///
 /// This is especially useful for AUR packages whose upstream PKGBUILD/
 /// .SRCINFO fails to parse: the user can fix it up here first instead of
@@ -16,14 +18,14 @@ class SourcePatchEditor extends StatefulWidget {
   const SourcePatchEditor({
     super.key,
     required this.source,
-    required this.onPatchChanged,
+    required this.onPatchedFilesChanged,
   });
 
   /// Returns the current `source` request body (AUR/Git spec), or null if
   /// not enough information has been entered yet (e.g. no package selected).
   final Map<String, dynamic>? Function() source;
 
-  final void Function(String? patch) onPatchChanged;
+  final void Function(Map<String, String>? patchedFiles) onPatchedFilesChanged;
 
   @override
   State<SourcePatchEditor> createState() => _SourcePatchEditorState();
@@ -33,16 +35,18 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
   bool _expanded = false;
   bool _loadingFiles = false;
   bool _loadingFile = false;
-  bool _saving = false;
 
   List<String> _files = [];
   String? _selectedFile;
   final _controller = TextEditingController();
 
-  String? _patch;
-  bool _dirty = false;
-  bool? _parses;
-  String? _parseError;
+  // Pristine content of each file already fetched, keyed by path - used as
+  // the baseline to detect whether an edit actually changed anything.
+  final Map<String, String> _originalContent = {};
+  // Edited content the user has saved for a file, keyed by path. Only
+  // contains entries that differ from `_originalContent`.
+  final Map<String, String> _editedContent = {};
+
   String? _error;
 
   @override
@@ -97,19 +101,29 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
   Future<void> _selectFile(String path) async {
     final source = widget.source();
     if (source == null) return;
+
+    // Prefer whatever the user has already edited this session, so
+    // switching files and back doesn't lose unsaved-but-applied edits.
+    if (_editedContent.containsKey(path)) {
+      setState(() {
+        _selectedFile = path;
+        _controller.text = _editedContent[path]!;
+        _error = null;
+      });
+      return;
+    }
+
     setState(() {
       _loadingFile = true;
       _selectedFile = path;
       _error = null;
     });
     try {
-      final content = await API.previewSourceFile(
-        source: source,
-        patch: _patch,
-        path: path,
-      );
+      final content =
+          _originalContent[path] ??
+          await API.previewSourceFile(source: source, path: path);
+      _originalContent[path] = content;
       _controller.text = content;
-      setState(() => _dirty = false);
     } catch (e) {
       setState(() => _error = 'Failed to read $path: $e');
     } finally {
@@ -117,36 +131,44 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
     }
   }
 
-  Future<void> _saveEdit() async {
-    final source = widget.source();
-    if (source == null || _selectedFile == null) return;
+  void _applyEdit() {
+    final path = _selectedFile;
+    if (path == null) return;
+    final original = _originalContent[path];
+    final newContent = _controller.text;
     setState(() {
-      _saving = true;
-      _error = null;
+      if (original == newContent) {
+        _editedContent.remove(path);
+      } else {
+        _editedContent[path] = newContent;
+      }
     });
-    try {
-      final result = await API.updatePreviewSourceFile(
-        source: source,
-        patch: _patch,
-        path: _selectedFile!,
-        content: _controller.text,
-      );
-      setState(() {
-        _patch = result.patch;
-        _parses = result.parses;
-        _parseError = result.parseError;
-        _dirty = false;
-      });
-      widget.onPatchChanged(_patch);
-    } catch (e) {
-      setState(() => _error = 'Failed to apply edit: $e');
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
+    widget.onPatchedFilesChanged(
+      _editedContent.isEmpty ? null : Map.of(_editedContent),
+    );
+  }
+
+  void _revert() {
+    final path = _selectedFile;
+    if (path == null) return;
+    final original = _originalContent[path];
+    if (original == null) return;
+    setState(() {
+      _controller.text = original;
+      _editedContent.remove(path);
+    });
+    widget.onPatchedFilesChanged(
+      _editedContent.isEmpty ? null : Map.of(_editedContent),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final dirty =
+        _selectedFile != null &&
+        _controller.text != (_originalContent[_selectedFile] ?? '');
+    final hasEdits = _editedContent.isNotEmpty;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -156,8 +178,8 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
           label: Text(
             _expanded
                 ? 'Hide source editor'
-                : (_patch != null
-                      ? 'Edit source files (patch applied)'
+                : (hasEdits
+                      ? 'Edit source files (${_editedContent.length} edited)'
                       : 'Edit source files (e.g. fix PKGBUILD)'),
           ),
         ),
@@ -166,12 +188,12 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
             padding: const EdgeInsets.only(bottom: 8),
             child: Text(_error!, style: const TextStyle(color: Colors.red)),
           ),
-        if (_expanded) _buildEditor(context),
+        if (_expanded) _buildEditor(context, dirty),
       ],
     );
   }
 
-  Widget _buildEditor(BuildContext context) {
+  Widget _buildEditor(BuildContext context, bool dirty) {
     if (_loadingFiles) {
       return const Padding(
         padding: EdgeInsets.all(16),
@@ -192,7 +214,10 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                 return ListTile(
                   dense: true,
                   selected: f == _selectedFile,
-                  title: Text(f, style: const TextStyle(fontSize: 12)),
+                  title: Text(
+                    _editedContent.containsKey(f) ? '$f *' : f,
+                    style: const TextStyle(fontSize: 12),
+                  ),
                   onTap: () => _selectFile(f),
                 );
               },
@@ -203,22 +228,6 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (_parses != null)
-                  Container(
-                    color: _parses!
-                        ? Colors.green.withValues(alpha: 0.15)
-                        : Colors.orange.withValues(alpha: 0.15),
-                    padding: const EdgeInsets.all(6),
-                    child: Text(
-                      _parses!
-                          ? 'Patched source parses correctly.'
-                          : 'Patched source still fails to parse: ${_parseError ?? 'unknown error'}',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: _parses! ? Colors.green[800] : Colors.orange[900],
-                      ),
-                    ),
-                  ),
                 Expanded(
                   child: _loadingFile
                       ? const Center(child: CircularProgressIndicator())
@@ -226,7 +235,7 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                           padding: const EdgeInsets.all(8),
                           child: TextField(
                             controller: _controller,
-                            onChanged: (_) => setState(() => _dirty = true),
+                            onChanged: (_) => setState(() {}),
                             maxLines: null,
                             expands: true,
                             textAlignVertical: TextAlignVertical.top,
@@ -243,21 +252,25 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                 ),
                 Padding(
                   padding: const EdgeInsets.all(8),
-                  child: Align(
-                    alignment: Alignment.centerRight,
-                    child: FilledButton.icon(
-                      onPressed: (_dirty && !_saving && _selectedFile != null)
-                          ? _saveEdit
-                          : null,
-                      icon: _saving
-                          ? const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.check, size: 16),
-                      label: const Text('Apply edit to patch'),
-                    ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (_selectedFile != null &&
+                          _editedContent.containsKey(_selectedFile))
+                        TextButton.icon(
+                          onPressed: _revert,
+                          icon: const Icon(Icons.restore, size: 16),
+                          label: const Text('Revert'),
+                        ),
+                      const SizedBox(width: 8),
+                      FilledButton.icon(
+                        onPressed: (dirty && _selectedFile != null)
+                            ? _applyEdit
+                            : null,
+                        icon: const Icon(Icons.check, size: 16),
+                        label: const Text('Apply edit'),
+                      ),
+                    ],
                   ),
                 ),
               ],

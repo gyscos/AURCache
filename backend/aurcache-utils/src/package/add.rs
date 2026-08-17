@@ -1,4 +1,5 @@
 use crate::package::enqueue::trigger_initial_builds;
+use crate::patch::SourcePatch;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
@@ -13,7 +14,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
     TransactionTrait,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::broadcast::Sender;
 
 struct AddContext {
@@ -128,12 +129,40 @@ async fn resolve_aur_pkgbase(
         .unwrap_or_else(|| pkg_name.to_string()))
 }
 
+/// Build a [`SourcePatch`] from a caller-supplied map of full file contents
+/// (path -> new content), diffing each against the source's current
+/// pristine content. Since the diff is always computed fresh against the
+/// current pristine base, the resulting patch is guaranteed to apply -
+/// no separate "does it apply" validation is needed.
+async fn build_patch_from_files(
+    store: &SnapshotStore,
+    client: &aurcache_deps::AurClient,
+    source_data: &SourceData,
+    patched_files: BTreeMap<String, String>,
+) -> anyhow::Result<Option<String>> {
+    let mut patch = SourcePatch::default();
+    for (path, new_content) in patched_files {
+        let original = store.read_file(client, source_data, None, &path).await?;
+        patch.merge_file(&path, &original, &new_content);
+    }
+    if patch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(patch.to_json()?))
+    }
+}
+
 async fn resolve_srcinfo_to_spec(
     store: &SnapshotStore,
     client: &aurcache_deps::AurClient,
     source_data: &SourceData,
-    patch: Option<String>,
+    patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<PackageInsertSpec> {
+    let patch = match patched_files {
+        Some(files) => build_patch_from_files(store, client, source_data, files).await?,
+        None => None,
+    };
+
     // Resolve dependencies/version off of the (possibly initial-patched)
     // source, so a patch supplied to fix an otherwise-unparseable PKGBUILD
     // (e.g. ogdf) is taken into account right away.
@@ -207,10 +236,10 @@ pub async fn package_add_with_client(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
-    initial_patch: Option<String>,
+    patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let context = build_add_context(platforms, build_flags)?;
-    add_package_with_source(client, store, db, tx, &context, source_data, initial_patch).await
+    add_package_with_source(client, store, db, tx, &context, source_data, patched_files).await
 }
 
 pub async fn package_add(
@@ -219,7 +248,7 @@ pub async fn package_add(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
-    initial_patch: Option<String>,
+    patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let client = aurcache_deps::AurClient::new();
     let store = SnapshotStore::new();
@@ -231,7 +260,7 @@ pub async fn package_add(
         platforms,
         build_flags,
         source_data,
-        initial_patch,
+        patched_files,
     )
     .await
 }
@@ -255,7 +284,7 @@ async fn add_package_with_source(
     tx: &Sender<Action>,
     context: &AddContext,
     source_data: SourceData,
-    initial_patch: Option<String>,
+    patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     match &source_data {
         SourceData::Aur { name } => {
@@ -264,12 +293,12 @@ async fn add_package_with_source(
                 name: pkgbase.clone(),
             };
             let package_spec =
-                resolve_srcinfo_to_spec(store, client, &aur_data, initial_patch).await?;
+                resolve_srcinfo_to_spec(store, client, &aur_data, patched_files).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Git { .. } => {
             let package_spec =
-                resolve_srcinfo_to_spec(store, client, &source_data, initial_patch).await?;
+                resolve_srcinfo_to_spec(store, client, &source_data, patched_files).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Upload { .. } => {

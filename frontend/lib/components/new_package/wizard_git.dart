@@ -3,11 +3,16 @@ import 'package:flutter/material.dart';
 import 'source_patch_editor.dart';
 
 class GitWizard extends StatefulWidget {
-  const GitWizard({super.key, required this.onChange, this.onPatchChanged});
+  const GitWizard({
+    super.key,
+    required this.onChange,
+    this.onPatchedFilesChanged,
+  });
   final void Function((String, String, String)) onChange;
 
-  /// Called when the accumulated patch (from [SourcePatchEditor]) changes.
-  final void Function(String? patch)? onPatchChanged;
+  /// Called when the accumulated edits (from [SourcePatchEditor]) change.
+  final void Function(Map<String, String>? patchedFiles)?
+  onPatchedFilesChanged;
 
   @override
   State<GitWizard> createState() => _GitWizardState();
@@ -87,7 +92,7 @@ class _GitWizardState extends State<GitWizard> {
               ),
               onChanged: this._onTextChanged,
             ),
-            if (widget.onPatchChanged != null) ...[
+            if (widget.onPatchedFilesChanged != null) ...[
               const SizedBox(height: 16),
               SourcePatchEditor(
                 source: () {
@@ -106,7 +111,7 @@ class _GitWizardState extends State<GitWizard> {
                     'type': 'git',
                   };
                 },
-                onPatchChanged: widget.onPatchChanged!,
+                onPatchedFilesChanged: widget.onPatchedFilesChanged!,
               ),
             ],
           ],
