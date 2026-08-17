@@ -386,10 +386,7 @@ impl SnapshotStore {
             }
         };
 
-        self.cache
-            .lock()
-            .await
-            .put(cache_key, Arc::clone(&entry));
+        self.cache.lock().await.put(cache_key, Arc::clone(&entry));
         let _ = client;
         Ok(entry)
     }
@@ -427,7 +424,10 @@ impl SnapshotStore {
 
     /// Map a `SourceData` to the git coordinates used to fetch it: repo URL,
     /// ref, and subfolder within the repo containing the PKGBUILD/.SRCINFO.
-    fn git_coordinates(&self, source_data: &SourceData) -> anyhow::Result<(String, String, String)> {
+    fn git_coordinates(
+        &self,
+        source_data: &SourceData,
+    ) -> anyhow::Result<(String, String, String)> {
         match source_data {
             SourceData::Aur { name } => Ok((
                 format!("{}/{name}.git", self.aur_git_base_url),
@@ -604,7 +604,8 @@ fn extract_tar_gz_to_memory(
         files.insert(rel_path.to_string(), buf);
     }
 
-    let pkgbase = pkgbase.ok_or_else(|| anyhow::anyhow!("Extracted archive did not contain a pkgbase directory"))?;
+    let pkgbase = pkgbase
+        .ok_or_else(|| anyhow::anyhow!("Extracted archive did not contain a pkgbase directory"))?;
     Ok((pkgbase, files))
 }
 
@@ -622,7 +623,11 @@ fn create_archive_from_memory(
         header.set_size(content.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, format!("{pkgbase}/{rel_path}"), content.as_slice())?;
+        tar.append_data(
+            &mut header,
+            format!("{pkgbase}/{rel_path}"),
+            content.as_slice(),
+        )?;
     }
     let enc = tar.into_inner()?;
     drop(enc);
@@ -658,7 +663,11 @@ fn list_files_in_archive(archive_bytes: &[u8], pkgbase: &str) -> anyhow::Result<
 }
 
 /// Read a single file's content out of a `{pkgbase}/...` tar.gz archive.
-fn read_file_from_archive(archive_bytes: &[u8], pkgbase: &str, rel_path: &str) -> anyhow::Result<String> {
+fn read_file_from_archive(
+    archive_bytes: &[u8],
+    pkgbase: &str,
+    rel_path: &str,
+) -> anyhow::Result<String> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
 
@@ -745,7 +754,8 @@ license=('MIT')
         let patched_pkgbuild = PKGBUILD.replace("pkgver=1.0", "pkgver=2.0");
         patch.merge_file("PKGBUILD", PKGBUILD, &patched_pkgbuild);
 
-        let (new_archive_bytes, sourceinfo) = apply_patch_to_archive(&archive_bytes, &patch).unwrap();
+        let (new_archive_bytes, sourceinfo) =
+            apply_patch_to_archive(&archive_bytes, &patch).unwrap();
 
         // .SRCINFO was regenerated from the patched PKGBUILD (version 2.0),
         // not copied over from the (stale, unpatched) shipped .SRCINFO.
@@ -756,7 +766,8 @@ license=('MIT')
         // The shipped .SRCINFO must never be surfaced as an editable/patchable file.
         assert!(!files.contains(&".SRCINFO".to_string()));
 
-        let pkgbuild_content = read_file_from_archive(&new_archive_bytes, "foo", "PKGBUILD").unwrap();
+        let pkgbuild_content =
+            read_file_from_archive(&new_archive_bytes, "foo", "PKGBUILD").unwrap();
         assert_eq!(pkgbuild_content, patched_pkgbuild);
     }
 
@@ -829,7 +840,8 @@ license=('MIT')
         let pkgbuild = format!(
             "pkgname=bar\npkgver=1.0\npkgrel=1\narch=('x86_64')\ndepends=()\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n# {marker}\n"
         );
-        let srcinfo = "pkgbase = bar\n\tpkgver = 1.0\n\tpkgrel = 1\n\narch = x86_64\n\npkgname = bar\n";
+        let srcinfo =
+            "pkgbase = bar\n\tpkgver = 1.0\n\tpkgrel = 1\n\narch = x86_64\n\npkgname = bar\n";
 
         std::fs::write(repo.workdir().unwrap().join("PKGBUILD"), pkgbuild).unwrap();
         std::fs::write(repo.workdir().unwrap().join(".SRCINFO"), srcinfo).unwrap();
@@ -849,8 +861,15 @@ license=('MIT')
             .map(|commit| vec![commit])
             .unwrap_or_default();
         let parent_refs = parents.iter().collect::<Vec<_>>();
-        repo.commit(Some("refs/heads/main"), &sig, &sig, message, &tree, &parent_refs)
-            .unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .unwrap();
         repo.set_head("refs/heads/main").unwrap();
         repo.checkout_head(None).unwrap();
     }
@@ -989,7 +1008,10 @@ license=('MIT')
         let changed = store.refresh(&client, &source).await.unwrap();
         assert!(changed, "refresh should detect the new upstream commit");
 
-        let after_refresh = store.sourceinfo(&client, &source, Some(&patch)).await.unwrap();
+        let after_refresh = store
+            .sourceinfo(&client, &source, Some(&patch))
+            .await
+            .unwrap();
         assert_eq!(after_refresh.base.version.to_string(), "2.0-1");
     }
 }

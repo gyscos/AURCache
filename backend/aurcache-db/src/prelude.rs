@@ -5,6 +5,6 @@ pub use super::api_tokens::Entity as ApiTokens;
 pub use super::builds::Entity as Builds;
 pub use super::dependencies::Entity as Dependencies;
 pub use super::files::Entity as Files;
-pub use super::packages::Entity as Packages;
 pub use super::package_vcs_sources::Entity as PackageVcsSources;
+pub use super::packages::Entity as Packages;
 pub use super::settings::Entity as Settings;
