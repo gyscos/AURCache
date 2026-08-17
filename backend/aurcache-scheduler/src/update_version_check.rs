@@ -149,14 +149,29 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                 // No cheap upstream-metadata API for arbitrary git remotes,
                 // so always refresh: this is an incremental `git fetch`
                 // against the persistent checkout, not a full re-clone.
-                store
-                    .refresh(&client, &source_data)
-                    .await
-                    .map_err(|e| anyhow!("Failed to refresh git source: {e}"))?;
-                let sourceinfo = store
+                if let Err(e) = store.refresh(&client, &source_data).await {
+                    warn!("Failed to refresh git source for {}: {e}", package.name);
+                    let _ = package_model.update(&db).await;
+                    continue;
+                }
+                // A failure here (e.g. a patch that no longer applies
+                // cleanly against a new upstream commit) must not abort
+                // version-checking for the remaining packages - it only
+                // means this package's own out-of-date/version tracking
+                // can't be updated this round; the actual build for this
+                // package will separately fail later with the same error,
+                // which is the desired outcome for an unapplicable patch.
+                let sourceinfo = match store
                     .sourceinfo(&client, &source_data, package.patch.as_deref())
                     .await
-                    .map_err(|e| anyhow!("Failed to get sourceinfo: {e}"))?;
+                {
+                    Ok(sourceinfo) => sourceinfo,
+                    Err(e) => {
+                        warn!("Failed to get sourceinfo for {}: {e}", package.name);
+                        let _ = package_model.update(&db).await;
+                        continue;
+                    }
+                };
                 // This still only tracks the version in PKGBUILD/.SRCINFO; a ref
                 // moving without a version bump will not mark the package outdated
                 // by itself - the VCS-source check below covers that case.

@@ -31,3 +31,30 @@ pub fn parse_pkgbuild(path: &Path) -> anyhow::Result<SourceInfoV1> {
     dir.close()?;
     Ok(result)
 }
+
+/// Parse PKGBUILD content held in memory, applying the same workarounds as
+/// [`parse_pkgbuild`]. Since `alpm-srcinfo` shells out to a bash script that
+/// needs a real filesystem path to `source` the PKGBUILD, the content is
+/// written to a short-lived temp file that's removed again as soon as
+/// parsing finishes - no other part of this function touches disk.
+pub fn parse_pkgbuild_content(content: &str) -> anyhow::Result<SourceInfoV1> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("PKGBUILD");
+
+    std::fs::write(&path, content)?;
+    let result = SourceInfoV1::from_pkgbuild(&path);
+    let result = match result {
+        Ok(info) => Ok(info),
+        Err(_) => {
+            let fixed = fix_source_urls(content);
+            if fixed == content {
+                anyhow::bail!("PKGBUILD parsing failed and no fixes were applied");
+            }
+            std::fs::write(&path, &fixed)?;
+            SourceInfoV1::from_pkgbuild(&path).map_err(anyhow::Error::from)
+        }
+    };
+
+    dir.close()?;
+    result
+}

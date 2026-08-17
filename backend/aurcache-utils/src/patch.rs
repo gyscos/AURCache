@@ -13,7 +13,6 @@
 //! metadata such as dependencies or the package version.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use diffy::Patch;
 use serde::{Deserialize, Serialize};
@@ -55,25 +54,6 @@ impl SourcePatch {
     /// Look up the stored unified diff for a single file, if any.
     pub fn diff_for(&self, rel_path: &str) -> Option<&str> {
         self.files.get(rel_path).map(String::as_str)
-    }
-
-    /// Apply every per-file diff onto the corresponding file inside `dir`.
-    pub fn apply_to_dir(&self, dir: &Path) -> anyhow::Result<()> {
-        for (rel_path, diff_text) in &self.files {
-            let file_path = dir.join(rel_path);
-            let patch = Patch::from_str(diff_text)
-                .map_err(|e| anyhow::anyhow!("Invalid patch for '{rel_path}': {e}"))?;
-
-            let original = std::fs::read_to_string(&file_path).unwrap_or_default();
-            let patched = diffy::apply(&original, &patch)
-                .map_err(|e| anyhow::anyhow!("Failed to apply patch to '{rel_path}': {e}"))?;
-
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&file_path, patched)?;
-        }
-        Ok(())
     }
 
     /// Apply the effective (patched) content for a single file onto `content`,
@@ -143,18 +123,5 @@ mod tests {
         // Files untouched by the patch pass through unchanged.
         let other = patch.apply_to_content("other.install", "hello\n").unwrap();
         assert_eq!(other, "hello\n");
-    }
-
-    #[test]
-    fn apply_to_dir_patches_files_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("PKGBUILD"), "pkgver=1\n").unwrap();
-
-        let mut patch = SourcePatch::default();
-        patch.merge_file("PKGBUILD", "pkgver=1\n", "pkgver=2\n");
-        patch.apply_to_dir(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join("PKGBUILD")).unwrap();
-        assert_eq!(content, "pkgver=2\n");
     }
 }

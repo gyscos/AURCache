@@ -416,45 +416,93 @@ fn hash_patch(patch: &SourcePatch) -> u64 {
 /// tar.gz, regenerating `.SRCINFO` from the patched `PKGBUILD` and
 /// re-packaging the result into a new tar.gz with the same `{pkgbase}/`
 /// layout.
+///
+/// This operates entirely in memory: the archive is unpacked into a
+/// `{relative path -> bytes}` map, the patch is applied to that map, and the
+/// result is re-tarred directly from memory. The lone exception is the
+/// (patched) `PKGBUILD`, which is written to a short-lived temp file purely
+/// because parsing it shells out to a bash script (`alpm-pkgbuild-bridge`)
+/// that needs a real path to `source` - the file is removed again as soon as
+/// parsing finishes.
 fn apply_patch_to_archive(
     archive_bytes: &[u8],
     patch: &SourcePatch,
 ) -> anyhow::Result<(Vec<u8>, SourceInfoV1)> {
-    use crate::pkgbuild::parse_pkgbuild;
+    use crate::pkgbuild::parse_pkgbuild_content;
 
-    let dir = tempfile::tempdir()?;
-    let extract_root = dir.path().join("src");
-    std::fs::create_dir_all(&extract_root)?;
-    extract_tar_gz(archive_bytes, &extract_root)?;
+    let (pkgbase, mut files) = extract_tar_gz_to_memory(archive_bytes)?;
 
-    let pkgbase = find_pkgbase_dir_name(&extract_root)?;
-    let package_dir = extract_root.join(&pkgbase);
+    for rel_path in patch.paths() {
+        let original = files.get(rel_path).cloned().unwrap_or_default();
+        let original = String::from_utf8(original)
+            .map_err(|_| anyhow::anyhow!("File '{rel_path}' is not valid UTF-8, cannot patch"))?;
+        let patched = patch.apply_to_content(rel_path, &original)?;
+        files.insert(rel_path.to_string(), patched.into_bytes());
+    }
 
-    patch.apply_to_dir(&package_dir)?;
+    let pkgbuild = files
+        .get("PKGBUILD")
+        .ok_or_else(|| anyhow::anyhow!("Archive has no PKGBUILD to parse"))?;
+    let pkgbuild = std::str::from_utf8(pkgbuild)
+        .map_err(|_| anyhow::anyhow!("PKGBUILD is not valid UTF-8, cannot parse"))?;
+    let sourceinfo = parse_pkgbuild_content(pkgbuild)?;
 
-    let sourceinfo = parse_pkgbuild(package_dir.join("PKGBUILD").as_path())?;
-    let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
+    let tar_gz_bytes = create_archive_from_memory(&pkgbase, &files)?;
 
-    dir.close()?;
     Ok((tar_gz_bytes, sourceinfo))
 }
 
-fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> anyhow::Result<()> {
+/// Unpack a `{pkgbase}/...` tar.gz archive entirely into memory, returning
+/// the pkgbase directory name and a map of file paths (relative to that
+/// directory) to their raw bytes.
+fn extract_tar_gz_to_memory(
+    archive_bytes: &[u8],
+) -> anyhow::Result<(String, std::collections::BTreeMap<String, Vec<u8>>)> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(dest)?;
-    Ok(())
+
+    let mut pkgbase = None;
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.to_string_lossy().to_string();
+        let Some((dir, rel_path)) = path.split_once('/') else {
+            continue;
+        };
+        if pkgbase.is_none() {
+            pkgbase = Some(dir.to_string());
+        }
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        files.insert(rel_path.to_string(), buf);
+    }
+
+    let pkgbase = pkgbase.ok_or_else(|| anyhow::anyhow!("Extracted archive did not contain a pkgbase directory"))?;
+    Ok((pkgbase, files))
 }
 
-/// Find the single top-level directory of an extracted `{pkgbase}/...` archive.
-fn find_pkgbase_dir_name(extract_root: &Path) -> anyhow::Result<String> {
-    for entry in std::fs::read_dir(extract_root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            return Ok(entry.file_name().to_string_lossy().to_string());
-        }
+/// Re-package an in-memory `{relative path -> bytes}` map into a `{pkgbase}/...`
+/// tar.gz archive, matching the layout produced by [`extract_tar_gz_to_memory`].
+fn create_archive_from_memory(
+    pkgbase: &str,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    for (rel_path, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, format!("{pkgbase}/{rel_path}"), content.as_slice())?;
     }
-    anyhow::bail!("Extracted archive did not contain a pkgbase directory")
+    let enc = tar.into_inner()?;
+    drop(enc);
+    Ok(buf)
 }
 
 /// List files (relative to the source root) available for viewing/editing.
