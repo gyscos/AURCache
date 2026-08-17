@@ -1,8 +1,13 @@
 import 'package:flutter/material.dart';
 
+import 'source_patch_editor.dart';
+
 class GitWizard extends StatefulWidget {
-  const GitWizard({super.key, required this.onChange});
+  const GitWizard({super.key, required this.onChange, this.onPatchChanged});
   final void Function((String, String, String)) onChange;
+
+  /// Called when the accumulated patch (from [SourcePatchEditor]) changes.
+  final void Function(String? patch)? onPatchChanged;
 
   @override
   State<GitWizard> createState() => _GitWizardState();
@@ -82,6 +87,28 @@ class _GitWizardState extends State<GitWizard> {
               ),
               onChanged: this._onTextChanged,
             ),
+            if (widget.onPatchChanged != null) ...[
+              const SizedBox(height: 16),
+              SourcePatchEditor(
+                source: () {
+                  final url = _repoUrlController.text.trim();
+                  if (url.isEmpty || !_formKey.currentState!.validate()) {
+                    return null;
+                  }
+                  final subfolder = _subfolderController.text.trim();
+                  final gitRef = _gitRefController.text.trim().isEmpty
+                      ? "master"
+                      : _gitRefController.text.trim();
+                  return {
+                    'url': url,
+                    'ref': gitRef,
+                    'subfolder': subfolder,
+                    'type': 'git',
+                  };
+                },
+                onPatchChanged: widget.onPatchChanged!,
+              ),
+            ],
           ],
         ),
       ),

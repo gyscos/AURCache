@@ -3,10 +3,14 @@ import 'package:flutter/material.dart';
 import '../../models/aur_package.dart';
 import '../../providers/aur.dart';
 import '../api/api_builder.dart';
+import 'source_patch_editor.dart';
 
 class AurWizard extends StatefulWidget {
-  AurWizard({super.key, required this.onSelect});
+  AurWizard({super.key, required this.onSelect, this.onPatchChanged});
   final void Function(String) onSelect;
+
+  /// Called when the accumulated patch (from [SourcePatchEditor]) changes.
+  final void Function(String? patch)? onPatchChanged;
 
   @override
   State<AurWizard> createState() => _AurWizardState();
@@ -19,6 +23,7 @@ class _AurWizardState extends State<AurWizard> {
 
   Timer? timer;
   int? selectedIndex;
+  String? selectedName;
 
   @override
   Widget build(BuildContext context) {
@@ -91,7 +96,10 @@ class _AurWizardState extends State<AurWizard> {
                                       )
                                     : null,
                                 onTap: () {
-                                  setState(() => selectedIndex = index);
+                                  setState(() {
+                                    selectedIndex = index;
+                                    selectedName = data[index].name;
+                                  });
 
                                   widget.onSelect(data[index].name);
                                 },
@@ -105,6 +113,12 @@ class _AurWizardState extends State<AurWizard> {
                   ),
             provider: getAurPackagesProvider(query),
           ),
+          if (widget.onPatchChanged != null && selectedName != null)
+            SourcePatchEditor(
+              source: () =>
+                  selectedName == null ? null : {'name': selectedName, 'type': 'aur'},
+              onPatchChanged: widget.onPatchChanged!,
+            ),
         ],
       ),
     );

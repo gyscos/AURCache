@@ -31,6 +31,7 @@ class _AddPackagePopupState extends ConsumerState<AddPackagePopup> {
   bool _isInstalling = false;
   String? selectedAurPkgname;
   final List<String> selectedArchs = ["x86_64"];
+  String? _patch;
 
   (String, String, String)? gitInfos;
 
@@ -117,10 +118,16 @@ class _AddPackagePopupState extends ConsumerState<AddPackagePopup> {
                       onSelect: (String pkgname) {
                         selectedAurPkgname = pkgname;
                       },
+                      onPatchChanged: (patch) {
+                        setState(() => _patch = patch);
+                      },
                     ),
                     1 => GitWizard(
                       onChange: (gi) {
                         gitInfos = gi;
+                      },
+                      onPatchChanged: (patch) {
+                        setState(() => _patch = patch);
                       },
                     ),
                     2 => ZipWizard(),
@@ -165,6 +172,7 @@ class _AddPackagePopupState extends ConsumerState<AddPackagePopup> {
                               await API.addAurPackage(
                                 selectedArchs: selectedArchs,
                                 name: selectedAurPkgname!,
+                                patch: _patch,
                               );
                             }
                           } else if (selectedSource == 1) {
@@ -176,6 +184,7 @@ class _AddPackagePopupState extends ConsumerState<AddPackagePopup> {
                                 gitUrl: gitUrl,
                                 gitRef: gitRef,
                                 subFolder: subFolder,
+                                patch: _patch,
                               );
                             }
                           } else {
