@@ -1,0 +1,15 @@
+[package]
+name = "aurcache-ca"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+x509-parser = "0.16"
+sha2 = "0.10"
+time = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }

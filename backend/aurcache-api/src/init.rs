@@ -33,13 +33,47 @@ fn get_secret_key() -> SecretKey {
     }
 }
 
+/// Build the mutual-TLS configuration for the worker protocol port: a server
+/// certificate issued by the internal CA, with client certificates optional
+/// (`mandatory = false`) so enrollment endpoints remain reachable without one.
+fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> {
+    use rocket::config::{MutualTls, TlsConfig};
+
+    let sans = env::var("AURCACHE_TLS_SANS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["localhost".to_string()]);
+
+    let (cert_pem, key_pem) = match ca.issue_server_cert(sans) {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!("Failed to issue server certificate, TLS disabled: {e}");
+            return None;
+        }
+    };
+    let ca_pem = ca.ca_cert_pem().as_bytes().to_vec();
+
+    let tls = TlsConfig::from_bytes(cert_pem.as_bytes(), key_pem.as_bytes())
+        .with_mutual(MutualTls::from_bytes(&ca_pem).mandatory(false));
+    Some(tls)
+}
+
 #[must_use]
-pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
-    tokio::spawn(async {
+pub fn init_api(db: DatabaseConnection, tx: Sender<Action>, ca: aurcache_ca::Ca) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let tls = worker_tls_config(&ca);
         let config = Config {
             address: "0.0.0.0".parse().unwrap(),
             port: aurcache_types::ports::AURCACHE_HTTP_PORT,
             secret_key: get_secret_key(),
+            tls,
             ..Default::default()
         };
 
@@ -54,6 +88,7 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
                 (path = "/api", api = crate::stats::StatsApi, tags = ["Stats"]),
                 (path = "/api", api = crate::activity::ActivityApi, tags = ["Activity"]),
                 (path = "/api", api = crate::settings::SettingsApi, tags = ["Settings"]),
+                (path = "/api", api = crate::worker::WorkerApi, tags = ["Worker"]),
             ),
             tags(
                 (name = "AUR", description = "AUR management endpoints."),
@@ -64,6 +99,7 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
                 (name = "Stats", description = "Statistics endpoints."),
                 (name = "Activity", description = "Activity endpoints."),
                 (name = "Settings", description = "Settings endpoints."),
+                (name = "Worker", description = "Remote build worker protocol and management."),
             ),
             modifiers(&SecurityAddon)
         )]
@@ -94,10 +130,12 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
         let mut rock = rocket::custom(config)
             .manage(db.clone())
             .manage(tx)
+            .manage(ca)
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
             .manage(SnapshotStore::new())
             .mount("/api/", build_api())
+            .mount("/api/", crate::worker::worker_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))
             .mount("/", Redoc::with_url("/redoc", ApiDoc::openapi()));
 

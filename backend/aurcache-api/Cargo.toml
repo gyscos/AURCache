@@ -14,7 +14,7 @@ chrono = {workspace = true}
 
 aurcache-deps = {path = "../aurcache-deps"}
 
-rocket = "0.5.1"
+rocket = { version = "0.5.1", features = ["mtls", "json"] }
 rocket_oauth2 = "0.5.0"
 utoipa = { workspace = true }
 utoipa-redoc = { version = "6.0.0", features = ["rocket"] }
@@ -29,6 +29,7 @@ sha2 = "0.10.8"
 
 aurcache-db = {path = "../aurcache-db"}
 aurcache-builder = {path = "../aurcache-builder"}
+aurcache-ca = {path = "../aurcache-ca"}
 aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-utils = {path = "../aurcache-utils"}
 pacman-mirrors = {path = "../pacman-mirrors"}

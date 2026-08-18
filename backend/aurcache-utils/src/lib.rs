@@ -11,3 +11,4 @@ pub mod settings;
 pub mod snapshot;
 pub mod utils;
 pub mod vcs_check;
+pub mod worker_complete;

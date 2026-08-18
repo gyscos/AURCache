@@ -13,3 +13,4 @@ mod package;
 mod settings;
 mod stats;
 mod utils;
+mod worker;

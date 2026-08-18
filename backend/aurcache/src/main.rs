@@ -28,6 +28,13 @@ async fn main() {
 
     let _ = post_startup_tasks(&db).await;
 
+    // Load (or create on first run) the internal CA used to authenticate remote
+    // build workers over mutual TLS. Persisted under the data directory.
+    let ca_dir = std::path::PathBuf::from(
+        env::var("AURCACHE_CA_DIR").unwrap_or_else(|_| "./data/ca".to_string()),
+    );
+    let ca = aurcache_ca::Ca::load_or_create(&ca_dir).expect("failed to initialize internal CA");
+
     // A single, long-lived `SnapshotStore` is shared across the build queue,
     // version-check loop, and auto-update job. Its persistent on-disk git
     // checkouts and `refresh()` incremental-fetch model make this safe: repeat
@@ -46,7 +53,7 @@ async fn main() {
     if !mirrorlist_override && let Err(e) = start_mirror_rank_job(db.clone(), tx.clone()) {
         warn!("mirror_rank job not properly configured: {e}");
     }
-    let api_handle = init_api(db, tx);
+    let api_handle = init_api(db, tx, ca);
     let repo_handle = init_repo();
 
     tokio::select! {
