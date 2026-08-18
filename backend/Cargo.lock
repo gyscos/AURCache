@@ -657,6 +657,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurcache-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aurcache-types",
+ "clap",
+ "flate2",
+ "hex",
+ "rcgen",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5201,6 +5222,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.3",

@@ -1,0 +1,27 @@
+[package]
+name = "aurcache-worker"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "aurcache-worker"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls"] }
+rcgen = { version = "0.13", features = ["pem"] }
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = { workspace = true }
+tar = { workspace = true }
+aurcache-types = { path = "../aurcache-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

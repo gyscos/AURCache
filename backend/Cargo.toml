@@ -14,7 +14,8 @@ members = [
     "aurcache-utils",
     "aurcache-scheduler",
     "aurcache-types",
-    "aurcache-ca"]
+    "aurcache-ca",
+    "aurcache-worker"]
 
 [workspace.dependencies]
 tokio = "1.52.3"
