@@ -8,6 +8,7 @@ use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
@@ -214,6 +215,11 @@ pub struct AddPackageRequest {
     pub build_flags: Option<Vec<String>>,
     /// Package source to add.
     pub source: AddPackageSource,
+    /// Optional initial patch, expressed as full file contents (path -> new
+    /// content) rather than a diff - the server diffs each entry against the
+    /// source's pristine content itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patched_files: Option<BTreeMap<String, String>>,
 }
 
 /// Source payload used when creating a package.

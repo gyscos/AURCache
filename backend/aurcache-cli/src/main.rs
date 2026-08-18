@@ -114,11 +114,10 @@ enum PackagesCommand {
         /// Package id.
         id: i32,
     },
-    /// Add a package.
-    Add {
-        #[command(subcommand)]
-        command: AddPackageCommand,
-    },
+    /// Add a package. Each entry is treated as a git repository URL if it
+    /// looks like one (contains `@` or a URL scheme like `https://`),
+    /// otherwise as an AUR package name.
+    Add(AddPackageArgs),
     /// Trigger an update check for a package.
     Update(UpdatePackageArgs),
     /// Partially update package metadata.
@@ -128,14 +127,6 @@ enum PackagesCommand {
         /// Package id.
         id: i32,
     },
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum AddPackageCommand {
-    /// Add a package from the AUR.
-    Aur(AddAurPackageArgs),
-    /// Add a package from git.
-    Git(AddGitPackageArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -150,31 +141,18 @@ struct ListPackagesArgs {
 }
 
 #[derive(Args, Debug, Clone)]
-struct AddAurPackageArgs {
-    /// AUR package names.
+struct AddPackageArgs {
+    /// AUR package names and/or git repository URLs. Each entry is treated
+    /// as a git URL if it looks like one (contains `@` or a URL scheme like
+    /// `https://`), otherwise as an AUR package name.
     #[arg(required = true)]
-    names: Vec<String>,
+    packages: Vec<String>,
 
-    /// Target platform. Repeat for multiple platforms.
-    #[arg(long = "platform")]
-    platforms: Vec<String>,
-
-    /// Build flag. Repeat for multiple flags.
-    #[arg(long = "build-flag")]
-    build_flags: Vec<String>,
-}
-
-#[derive(Args, Debug, Clone)]
-struct AddGitPackageArgs {
-    /// Git repository URL.
-    #[arg(long)]
-    url: String,
-
-    /// Git ref to checkout.
+    /// Git ref to checkout. Required if any entry is a git URL.
     #[arg(long = "ref")]
-    git_ref: String,
+    git_ref: Option<String>,
 
-    /// Subfolder containing the PKGBUILD.
+    /// Subfolder containing the PKGBUILD, for git URL entries.
     #[arg(long, default_value = "")]
     subfolder: String,
 
@@ -185,6 +163,14 @@ struct AddGitPackageArgs {
     /// Build flag. Repeat for multiple flags.
     #[arg(long = "build-flag")]
     build_flags: Vec<String>,
+
+    /// Patch a source file before adding: either `SOURCE_PATH=LOCAL_FILE`
+    /// (e.g. `--patch PKGBUILD=./fixed-PKGBUILD`) or just `LOCAL_FILE`, in
+    /// which case the file's own base name is used as the source path (e.g.
+    /// `--patch ./PKGBUILD` patches `PKGBUILD`). Repeat for multiple files.
+    /// Only valid when adding a single package.
+    #[arg(long = "patch", value_parser = parse_patch_arg)]
+    patches: Vec<(String, String)>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -451,7 +437,7 @@ async fn run_packages_command(
     match command {
         PackagesCommand::List(args) => render_packages_list(client, format, args).await,
         PackagesCommand::Get { id } => render_package(client, format, id).await,
-        PackagesCommand::Add { command } => add_package_command(client, format, command).await,
+        PackagesCommand::Add(args) => add_package_command(client, format, args).await,
         PackagesCommand::Update(args) => update_package_command(client, format, args).await,
         PackagesCommand::Patch(args) => patch_package_command(client, format, args).await,
         PackagesCommand::Delete { id } => delete_package_command(client, format, id).await,
@@ -552,57 +538,102 @@ async fn render_package(client: &AurCacheClient, format: OutputFormat, id: i32) 
 async fn add_package_command(
     client: &AurCacheClient,
     format: OutputFormat,
-    command: AddPackageCommand,
+    args: AddPackageArgs,
 ) -> Result<()> {
-    match command {
-        AddPackageCommand::Aur(args) => add_aur_packages(client, format, args).await?,
-        AddPackageCommand::Git(args) => add_git_package(client, args).await?,
+    if !args.patches.is_empty() && args.packages.len() > 1 {
+        bail!("--patch can only be used when adding a single package");
     }
+    let git_entries = args.packages.iter().filter(|p| looks_like_git_url(p)).count();
+    if git_entries > 0 && args.git_ref.is_none() {
+        bail!("--ref is required when adding a git repository URL");
+    }
+
+    let patched_files = read_patch_files(&args.patches)?;
+    for package in args.packages {
+        let source = if looks_like_git_url(&package) {
+            if format == OutputFormat::Text {
+                println!("adding package from git: {package}");
+            }
+            AddPackageSource::Git {
+                url: package,
+                git_ref: args.git_ref.clone().expect("checked above"),
+                subfolder: args.subfolder.clone(),
+            }
+        } else {
+            if format == OutputFormat::Text {
+                println!("adding package: {package}");
+            }
+            AddPackageSource::Aur { name: package }
+        };
+        let body = AddPackageRequest {
+            platforms: some_vec(args.platforms.clone()),
+            build_flags: some_vec(args.build_flags.clone()),
+            source,
+            patched_files: patched_files.clone(),
+        };
+        client.add_package(&body).await?;
+    }
+
     if format == OutputFormat::Text {
         println!("package add request complete");
     }
     Ok(())
 }
 
-async fn add_aur_packages(
-    client: &AurCacheClient,
-    format: OutputFormat,
-    args: AddAurPackageArgs,
-) -> Result<()> {
-    for name in args.names {
-        if format == OutputFormat::Text {
-            println!("adding package: {name}");
+/// Heuristic used to route a `pkg add` entry to the git or AUR source: git
+/// URLs either use the SCP-like `user@host:path` shorthand (any user, not
+/// just `git`, e.g. `aur@aur.archlinux.org:foo.git`) or an explicit URL
+/// scheme (`https://`, `ssh://`, `git://`, ...). AUR package names can't
+/// contain `@`, so any entry with one is unambiguously a git remote. A bare
+/// `.git` suffix with no scheme/user isn't enough on its own though - AUR
+/// package names can legitimately contain one (and there's no local
+/// filesystem to resolve a scheme-less path against anyway) - so those fall
+/// through to being treated as AUR package names.
+fn looks_like_git_url(s: &str) -> bool {
+    s.contains('@') || s.contains("://")
+}
+
+/// Parses a single `--patch` argument, accepting either
+/// `SOURCE_PATH=LOCAL_FILE` or just `LOCAL_FILE` (in which case the file's
+/// own base name is used as the source path).
+fn parse_patch_arg(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((path, file)) => {
+            if path.is_empty() {
+                return Err("invalid --patch value: SOURCE_PATH must not be empty".to_string());
+            }
+            Ok((path.to_string(), file.to_string()))
         }
-        let body = aur_add_request(name, &args.platforms, &args.build_flags);
-        client.add_package(&body).await?;
-    }
-    Ok(())
-}
-
-async fn add_git_package(client: &AurCacheClient, args: AddGitPackageArgs) -> Result<()> {
-    let body = AddPackageRequest {
-        platforms: some_vec(args.platforms),
-        build_flags: some_vec(args.build_flags),
-        source: AddPackageSource::Git {
-            url: args.url,
-            git_ref: args.git_ref,
-            subfolder: args.subfolder,
-        },
-    };
-    client.add_package(&body).await
-}
-
-fn aur_add_request(
-    name: String,
-    platforms: &[String],
-    build_flags: &[String],
-) -> AddPackageRequest {
-    AddPackageRequest {
-        platforms: some_vec(platforms.to_vec()),
-        build_flags: some_vec(build_flags.to_vec()),
-        source: AddPackageSource::Aur { name },
+        None => {
+            let path = std::path::Path::new(s)
+                .file_name()
+                .ok_or_else(|| format!("invalid --patch value `{s}`"))?
+                .to_string_lossy()
+                .into_owned();
+            Ok((path, s.to_string()))
+        }
     }
 }
+
+/// Reads the local files referenced by `--patch` arguments into a
+/// path -> content map suitable for [`AddPackageRequest::patched_files`].
+fn read_patch_files(
+    patches: &[(String, String)],
+) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+    if patches.is_empty() {
+        return Ok(None);
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for (source_path, local_file) in patches {
+        let content = std::fs::read_to_string(local_file)
+            .with_context(|| format!("failed to read patch file `{local_file}`"))?;
+        if files.insert(source_path.clone(), content).is_some() {
+            bail!("--patch specified for `{source_path}` more than once");
+        }
+    }
+    Ok(Some(files))
+}
+
 
 async fn update_package_command(
     client: &AurCacheClient,
@@ -1055,7 +1086,7 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddAurPackageArgs, build_status_label, parse_key_val};
+    use super::{AddPackageArgs, build_status_label, looks_like_git_url, parse_key_val};
     use crate::config::ClientConfig;
     use clap::Parser;
 
@@ -1088,7 +1119,7 @@ mod tests {
         #[derive(Parser)]
         struct Wrapper {
             #[command(flatten)]
-            args: AddAurPackageArgs,
+            args: AddPackageArgs,
         }
 
         let parsed = Wrapper::parse_from([
@@ -1100,8 +1131,26 @@ mod tests {
             "--build-flag=--noconfirm",
         ]);
 
-        assert_eq!(parsed.args.names, vec!["paru", "yay"]);
+        assert_eq!(parsed.args.packages, vec!["paru", "yay"]);
         assert_eq!(parsed.args.platforms, vec!["x86_64"]);
         assert_eq!(parsed.args.build_flags, vec!["--noconfirm"]);
     }
+
+    #[test]
+    fn detects_scp_like_git_urls() {
+        assert!(looks_like_git_url("aur@aur.archlinux.org:paru"));
+        assert!(looks_like_git_url("git@github.com:user/project"));
+    }
+
+    #[test]
+    fn detects_scheme_git_urls() {
+        assert!(looks_like_git_url("https://github.com/user/project"));
+    }
+
+    #[test]
+    fn does_not_treat_git_like_aur_names_as_urls() {
+        assert!(!looks_like_git_url("paru-git"));
+        assert!(!looks_like_git_url("lab.git"));
+    }
 }
+
