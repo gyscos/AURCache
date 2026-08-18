@@ -20,7 +20,6 @@ pub async fn health(db: &State<DatabaseConnection>) -> Result<(), String> {
 async fn check_health(db: &DatabaseConnection) -> anyhow::Result<()> {
     // check databse connection
     db.ping().await?;
-    aurcache_builder::utils::healthy::healthy().await?;
 
     Ok(())
 }

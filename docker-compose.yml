@@ -87,6 +87,53 @@ services:
       - aurcache
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Optional: a foreign-architecture builder (e.g. aarch64) on this same host.
+  # It is the exact same worker image, just run emulated via qemu-user + binfmt
+  # (`platform: linux/arm64`). The build path stays uniform — the emulated
+  # worker builds aarch64 packages in a devtools chroot like any native worker.
+  # Jobs for aarch64 are routed here in preference to slow emulation elsewhere.
+  #
+  # To enable: `docker compose --profile arm up -d`. The `binfmt` one-shot below
+  # registers the qemu handlers on the host kernel (idempotent) before the
+  # emulated worker starts.
+  # ---------------------------------------------------------------------------
+  binfmt:
+    image: tonistiigi/binfmt:latest
+    profiles: ["arm"]
+    privileged: true
+    command: --install arm64,arm
+    restart: "no"
+
+  aarch64-builder:
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest-arm64
+    profiles: ["arm"]
+    platform: linux/arm64
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    depends_on:
+      - aurcache
+      - binfmt
+    environment:
+      - RUST_LOG=info
+      - AURCACHE_URL=https://aurcache:8080
+      - AURCACHE_ENROLLMENT_DIR=/enroll
+      # This worker builds aarch64 natively (from the emulated container's POV).
+      - WORKER_ARCHES=aarch64
+      # Emulated builds are slow; keep concurrency low.
+      - WORKER_CONCURRENCY=1
+    volumes:
+      - enroll:/enroll
+      - worker_data_arm:/var/lib/aurcache-worker
+      - worker_cache_arm:/var/cache/aurcache-worker
+    privileged: true
+    tmpfs:
+      - /run
+    networks:
+      - aurcache
+    restart: unless-stopped
+
 volumes:
   aurcache_db:
   aurcache_repo:
@@ -94,6 +141,8 @@ volumes:
   enroll:
   worker_data:
   worker_cache:
+  worker_data_arm:
+  worker_cache_arm:
 
 networks:
   aurcache:

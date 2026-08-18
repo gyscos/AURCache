@@ -2,25 +2,17 @@ use std::env;
 use std::path::PathBuf;
 use tokio::fs;
 
-use aurcache_builder::build_mode::{BuildMode, get_build_mode};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, packages};
 use aurcache_types::builder::BuildStates;
+use aurcache_utils::job_config::mirrorlist_dir;
 use pacman_mirrors::benchmark::Bench;
 use pacman_mirrors::platforms::{Platform, Platforms};
 use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait};
 use tracing::{error, info, warn};
-#[cfg(not(debug_assertions))]
-use {
-    std::fs::File,
-    std::io::{BufRead, BufReader, Write},
-    std::path::Path,
-    tracing::debug,
-};
 
-const CONTAINER_STORAGE_DIRS: [&str; 2] = ["/run/containers/storage", "/run/libpod"];
 const START_BANNER: &str = r"
           _    _ _____   _____           _
      /\  | |  | |  __ \ / ____|         | |
@@ -42,12 +34,6 @@ pub async fn pre_startup_tasks() {
     #[cfg(debug_assertions)]
     warn!("This is a dev build! Consider using a stable release.");
 
-    for cs in CONTAINER_STORAGE_DIRS {
-        if fs::remove_dir_all(cs).await.is_ok() {
-            info!("Removed old container storage `{cs}`");
-        }
-    }
-
     for platform in Platforms {
         if let Err(e) = pacman_repo_utils::repo_init::init_repo(
             &PathBuf::from(format!("./repo/{platform}")),
@@ -56,10 +42,6 @@ pub async fn pre_startup_tasks() {
             error!("Failed to initialize pacman repo: {e:?}");
         }
     }
-
-    // disable on debug builds since annoying bc. of root permissions
-    #[cfg(not(debug_assertions))]
-    init_qemu_binfmt().await.unwrap();
 }
 
 pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
@@ -90,12 +72,12 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         .await?;
 
     // todo arm mirrorlists unsupported for now!
-    let mirrorlist_path = match get_build_mode() {
-        BuildMode::DinD(cfg) => cfg.mirrorlist_path,
-        BuildMode::Host(cfg) => cfg.mirrorlist_path_aurcache,
-    };
-
-    let mirrorlist_file = format!("{mirrorlist_path}/mirrorlist");
+    let mirrorlist_dir = mirrorlist_dir();
+    if let Err(e) = fs::create_dir_all(&mirrorlist_dir).await {
+        warn!("Failed to create mirrorlist dir {}: {e}", mirrorlist_dir.display());
+    }
+    let mirrorlist_path = mirrorlist_dir.display().to_string();
+    let mirrorlist_file = mirrorlist_dir.join("mirrorlist");
 
     // Check if mirrorlist servers are provided via env var (semicolon-separated)
     // Treat an empty var the same way as an unset var.
@@ -123,39 +105,6 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             Err(e) => {
                 warn!("Failed to get mirror list: {e}");
             }
-        }
-    }
-
-    Ok(())
-}
-
-/// This is required to initialize the binfmt configuration for QEMU on x86_64 correctly
-/// aarch64 is not supported by qemu binfmt, but might tho?
-/// see https://stackoverflow.com/questions/75954301/using-sudo-in-podman-with-qemu-architecture-emulation-leads-to-sudo-effective-u
-#[cfg(not(debug_assertions))]
-async fn init_qemu_binfmt() -> anyhow::Result<()> {
-    let source_dir = Path::new("/usr/lib/binfmt.d");
-    let target_dir = Path::new("/etc/binfmt.d");
-
-    // Iterate over all .conf files in the source directory
-    for entry in std::fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.extension().and_then(|s| s.to_str()) == Some("conf") {
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
-
-            // Create the target file path
-            let target_path = target_dir.join(path.file_name().unwrap());
-            let mut target_file = File::create(&target_path)?;
-
-            for mut line in reader.lines().map_while(Result::ok) {
-                line.push('C');
-                target_file.write_all(line.as_bytes())?;
-            }
-
-            debug!("Created qemu binfmt config: {}", path.display());
         }
     }
 

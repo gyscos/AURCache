@@ -1,5 +1,5 @@
-use aurcache_builder::build_mode::{BuildMode, get_build_mode};
 use aurcache_types::builder::Action;
+use aurcache_utils::job_config::mirrorlist_dir;
 use chrono::Utc;
 use cron::Schedule;
 use pacman_mirrors::benchmark::Bench;
@@ -81,13 +81,11 @@ async fn update_mirrorlist() -> anyhow::Result<()> {
             let mirrors = urls.rank().await?;
             let mirrorlist = urls.gen_mirrorlist(mirrors)?;
 
-            let mirrorlist_path = match get_build_mode() {
-                BuildMode::DinD(cfg) => cfg.mirrorlist_path,
-                BuildMode::Host(cfg) => cfg.mirrorlist_path_aurcache,
-            };
-            let mirrorlist_path = format!("{mirrorlist_path}/mirrorlist");
-            fs::write(mirrorlist_path.as_str(), mirrorlist).await?;
-            info!("Wrote mirrorlist to {mirrorlist_path}");
+            let dir = mirrorlist_dir();
+            fs::create_dir_all(&dir).await?;
+            let mirrorlist_path = dir.join("mirrorlist");
+            fs::write(&mirrorlist_path, mirrorlist).await?;
+            info!("Wrote mirrorlist to {}", mirrorlist_path.display());
         }
         Err(e) => {
             warn!("Failed to get mirror list: {e}");
@@ -99,9 +97,5 @@ async fn update_mirrorlist() -> anyhow::Result<()> {
 /// Returns `true` if a `mirrorlist` file is already present at the path the
 /// scheduled job would write to.
 fn mirrorlist_exists() -> bool {
-    let mirrorlist_path = match get_build_mode() {
-        BuildMode::DinD(cfg) => cfg.mirrorlist_path,
-        BuildMode::Host(cfg) => cfg.mirrorlist_path_aurcache,
-    };
-    std::path::Path::new(&format!("{mirrorlist_path}/mirrorlist")).exists()
+    mirrorlist_dir().join("mirrorlist").exists()
 }

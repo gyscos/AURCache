@@ -1,7 +1,19 @@
 use aurcache_types::settings::{ApplicationSettings, Setting};
 use crate::settings::general::SettingsTraits;
 use sea_orm::DatabaseConnection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Canonical directory AURCache stores/serves the pacman `mirrorlist` from.
+///
+/// Single source of truth shared by the mirrorlist writers (startup mirrorlist
+/// bootstrap, the mirror-ranking scheduler) and the worker job-config endpoint
+/// that serves it. Overridable via `AURCACHE_MIRRORLIST_DIR` (default `./repo`).
+#[must_use]
+pub fn mirrorlist_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()),
+    )
+}
 
 /// Build the makepkg.conf for a build.
 ///

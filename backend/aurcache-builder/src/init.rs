@@ -1,28 +1,28 @@
-use crate::cancel::cancel_build;
-use crate::queue::queue_package;
-use aurcache_types::builder::Action;
-use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
+//! Lightweight build-queue coordinator.
+//!
+//! In the remote-worker model the server does not build packages; workers poll
+//! for `ENQUEUED` builds and claim them. This coordinator therefore only:
+//!
+//! * seeds buildable packages into the queue on startup, and
+//! * translates a user `Cancel` action into a terminal database state that the
+//!   owning worker observes via `GET /worker/jobs/{id}/status` and aborts.
+//!
+//! `Action::Build` is just a low-latency wakeup hint; workers also poll on an
+//! interval, so there is nothing to do for it here.
+
+use aurcache_db::prelude::Builds;
+use aurcache_types::builder::{Action, BuildStates};
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
-use aurcache_utils::settings::general::SettingsTraits;
-use aurcache_utils::snapshot::SnapshotStore;
-use sea_orm::DatabaseConnection;
-use std::collections::HashMap;
-use std::sync::Arc;
+use sea_orm::ActiveValue::Set;
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::Sender;
-use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{error, info, warn};
 
 #[must_use]
-pub fn init_build_queue(
-    db: DatabaseConnection,
-    tx: Sender<Action>,
-    store: Arc<SnapshotStore>,
-) -> JoinHandle<()> {
+pub fn init_build_queue(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut concurrent_builds = get_max_concurrent_builds(&db).await;
-        let semaphore = Arc::new(Semaphore::new(concurrent_builds));
-        let job_containers: Arc<Mutex<HashMap<i32, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let mut rx = tx.subscribe();
 
         if let Err(e) = enqueue_missing_buildable_packages(&db, &tx).await {
@@ -30,43 +30,46 @@ pub fn init_build_queue(
         }
 
         loop {
-            // Adjust semaphore permits dynamically
-            let new_max = get_max_concurrent_builds(&db).await;
-            if new_max != concurrent_builds {
-                if new_max > concurrent_builds {
-                    semaphore.add_permits(new_max - concurrent_builds);
-                } else {
-                    semaphore.forget_permits(concurrent_builds - new_max);
+            match rx.recv().await {
+                // Workers poll for enqueued builds; the wakeup needs no action.
+                Ok(Action::Build(_, _)) => {}
+                Ok(Action::Cancel(build_id)) => {
+                    if let Err(e) = cancel_build(&db, build_id).await {
+                        warn!("Failed to cancel build #{build_id}: {e}");
+                    }
                 }
-                concurrent_builds = new_max;
-            }
-
-            if let Ok(_result) = rx.recv().await {
-                match _result {
-                    // add a package to parallel build
-                    Action::Build(package_model, build_model) => {
-                        let _ = queue_package(
-                            package_model,
-                            build_model,
-                            db.clone(),
-                            semaphore.clone(),
-                            job_containers.clone(),
-                            tx.clone(),
-                            store.clone(),
-                        )
-                        .await;
-                    }
-                    Action::Cancel(build_id) => {
-                        let _ = cancel_build(build_id, job_containers.clone(), db.clone()).await;
-                    }
+                Err(e) => {
+                    // Lagged/closed channel: keep the coordinator alive.
+                    warn!("Build action channel error: {e}");
                 }
             }
         }
     })
 }
 
-async fn get_max_concurrent_builds(db: &DatabaseConnection) -> usize {
-    let max_concurrent_builds: SettingsEntry<u32> =
-        ApplicationSettings::get(Setting::MaxConcurrentBuilds, None, db).await;
-    max_concurrent_builds.value as usize
+/// Cancel a build by moving it to a terminal `FAILED` state.
+///
+/// * An `ENQUEUED` build can no longer be claimed by a worker.
+/// * An `ACTIVE` build leaves the `ACTIVE` state, so its owning worker sees
+///   `cancel_requested` on its next status poll and aborts; the lease reaper
+///   never requeues it (it only reclaims `ACTIVE` builds).
+async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<()> {
+    let Some(build) = Builds::find_by_id(build_id).one(db).await? else {
+        anyhow::bail!("no build with id {build_id}");
+    };
+    let mut active = build.into_active_model();
+    active.status = Set(Some(BuildStates::FAILED_BUILD));
+    active.worker_id = Set(None);
+    active.lease_expires_at = Set(None);
+    active.end_time = Set(Some(now_secs()));
+    active.update(db).await?;
+    info!("Cancelled build #{build_id}");
+    Ok(())
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

@@ -45,7 +45,7 @@ async fn main() {
     // requests reuse the same checkout instead of re-cloning/re-downloading.
     let store = Arc::new(SnapshotStore::new());
 
-    let build_queue_handle = init_build_queue(db.clone(), tx.clone(), store.clone());
+    let build_queue_handle = init_build_queue(db.clone(), tx.clone());
     let version_check_handle = start_update_version_checking(db.clone(), store.clone());
     if let Err(e) = start_auto_update_job(db.clone(), tx.clone(), store.clone()) {
         warn!("auto_update job not properly configured: {e}");
