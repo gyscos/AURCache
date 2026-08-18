@@ -3,6 +3,7 @@ import 'package:aurcache/api/settings.dart';
 import 'package:aurcache/utils/responsive.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:toastification/toastification.dart';
 
 import '../models/settings.dart';
@@ -266,17 +267,24 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
           ],
           const SizedBox(height: 12),
           Expanded(
-            child: TextField(
-              controller: controller,
-              enabled: !envLocking,
-              onChanged: (_) => onDirty(),
-              maxLines: null,
-              expands: true,
-              textAlignVertical: TextAlignVertical.top,
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                contentPadding: EdgeInsets.all(12),
+            child: Container(
+              decoration: BoxDecoration(
+                border: Border.all(color: Theme.of(context).colorScheme.outline),
+              ),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(12),
+                child: TextField(
+                  controller: controller,
+                  enabled: !envLocking,
+                  onChanged: (_) => onDirty(),
+                  maxLines: null,
+                  textAlignVertical: TextAlignVertical.top,
+                  style: GoogleFonts.jetBrainsMono(fontSize: 13),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isDense: true,
+                  ),
+                ),
               ),
             ),
           ),
