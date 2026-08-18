@@ -1,0 +1,56 @@
+# =============================================================================
+# AURCache — remote / foreign-architecture build worker (alternate topology)
+# =============================================================================
+# Run this on separate hardware (e.g. an aarch64 or armv7h machine) to add a
+# native builder for that architecture to an AURCache server running elsewhere.
+# Jobs for this worker's native arch are routed to it in preference to slow
+# emulation on the main host.
+#
+# Unlike the bundled setup there is no shared `enroll` volume, so trust must be
+# established explicitly. Two independent things:
+#
+#   1. Anti-MITM during enrollment — pin the server's CA fingerprint. Read it
+#      from the server startup log line:
+#          "Worker CA fingerprint (pin this on workers): <sha256>"
+#      and set AURCACHE_SERVER_CA_FINGERPRINT below. Without a pin the worker
+#      trusts-on-first-use, which is fine on a trusted network but not over the
+#      public internet.
+#
+#   2. Approving THIS worker — pick ONE:
+#      a) Pre-approve its cert fingerprint on the server (recommended). The
+#         worker prints its fingerprint on first start; add it to the server's
+#             AURCACHE_PREAPPROVED_WORKERS=<fingerprint>:arm-box:aarch64
+#      b) Share an enrollment token: set the same value in the server's
+#         AURCACHE_ENROLLMENT_TOKEN and this worker's AURCACHE_ENROLLMENT_TOKEN.
+#      c) Just approve it once in the web UI (Workers page).
+#
+# Then:  docker compose -f docker-compose.remote-worker.yml up -d
+# =============================================================================
+
+services:
+  builder:
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+    environment:
+      - RUST_LOG=info
+      # Public URL of the AURCache server's API (mutual TLS).
+      - AURCACHE_URL=https://aurcache.example.com:8080
+      # Pin the server's CA (strongly recommended over the public internet).
+      - AURCACHE_SERVER_CA_FINGERPRINT=REPLACE_WITH_SERVER_CA_SHA256
+      # Native architecture(s) of this machine; foreign-arch jobs route here.
+      - WORKER_ARCHES=aarch64
+      - WORKER_CONCURRENCY=2
+      # Optional shared-secret enrollment (alternative to pre-approving the fp):
+      # - AURCACHE_ENROLLMENT_TOKEN=your-shared-secret
+      # A human-friendly name shown in the Workers UI (defaults to hostname).
+      # - WORKER_NAME=arm-box
+    volumes:
+      - worker_data:/var/lib/aurcache-worker   # persisted base chroot
+      - worker_cache:/var/cache/aurcache-worker
+    privileged: true
+    tmpfs:
+      - /run
+    restart: unless-stopped
+
+volumes:
+  worker_data:
+  worker_cache:

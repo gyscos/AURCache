@@ -23,6 +23,25 @@ AURCache is a build server and repository for Archlinux packages sourced from th
 
 <p><img src="docs/static/img/screenshot1.png" alt=""/> 
 
+## Quickstart
+
+Bring up the server plus a local build worker with a single command — no edits,
+no secrets, no approval clicks:
+
+```bash
+curl -O https://raw.githubusercontent.com/Lukas-Heiligenbrunner/AURCache/main/docker-compose.yml
+docker compose up -d
+```
+
+- Web UI / API: `https://localhost:8080` (self-signed cert — accept the warning)
+- Pacman repo: `http://localhost:8081` (add as a `[repo] Server` in `pacman.conf`)
+
+The bundled worker auto-enrolls via a shared volume and starts polling for jobs
+within seconds. Scale local build throughput with `docker compose up -d --scale
+builder=3` or raise `WORKER_CONCURRENCY`. To attach a worker on separate
+hardware or a foreign architecture (e.g. aarch64), see
+[`docker-compose.remote-worker.yml`](docker-compose.remote-worker.yml).
+
 ## CLI client
 
 A typed CLI for the HTTP API lives in `backend/aurcache-cli`. It authenticates with the API token via `Authorization: Bearer <token>`.

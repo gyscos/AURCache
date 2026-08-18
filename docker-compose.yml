@@ -1,0 +1,100 @@
+# =============================================================================
+# AURCache — bundled single-host setup (the turnkey default)
+# =============================================================================
+# One command, zero edits, zero secrets, zero approval clicks:
+#
+#     docker compose up -d
+#
+# This starts the AURCache server plus a single local build worker. The worker
+# auto-enrolls by dropping its certificate request into the shared `enroll`
+# volume that the server reads — presence in that volume is proof of trust, so
+# no token and no manual approval are needed. Within a few seconds the worker
+# logs that it is connected and starts polling for build jobs.
+#
+# Web UI / API : https://localhost:8080  (self-signed cert — accept the warning)
+# Pacman repo  : http://localhost:8081   (add as a [repo] Server in pacman.conf)
+#
+# To scale local build throughput, raise WORKER_CONCURRENCY or run more workers:
+#     docker compose up -d --scale builder=3
+#
+# For a worker on separate hardware / a foreign architecture (e.g. aarch64), see
+# docker-compose.remote-worker.yml.
+# =============================================================================
+
+services:
+  aurcache:
+    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    # Prefer a published image; uncomment to build locally instead:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"   # Web UI + API (mutual TLS; workers authenticate here)
+      - "8081:8081"   # Pacman repository (plain HTTP, for `pacman -Sy`)
+    environment:
+      - LOG_LEVEL=info
+      # The server's TLS certificate must be valid for the hostname the worker
+      # dials. In-compose that is the service name `aurcache`; keep `localhost`
+      # so the UI/API is reachable from the host too.
+      - AURCACHE_TLS_SANS=aurcache,localhost
+      # Public base URL pacman clients (and workers) use to fetch built packages.
+      # Set this to your host's address/domain for remote pacman clients.
+      - AURCACHE_PUBLIC_URL=http://localhost:8081
+      # Bundled enrollment: auto-approve any worker that can write to the shared
+      # `enroll` volume (mounted read-only here). No secret, no approval click.
+      - AURCACHE_ENROLLMENT_DIR=/enroll
+    volumes:
+      - aurcache_db:/app/db
+      - aurcache_repo:/app/repo
+      - aurcache_ca:/app/data/ca      # internal worker CA (persist across restarts)
+      - enroll:/enroll:ro             # read the workers' enrollment CSRs
+    networks:
+      - aurcache
+    restart: unless-stopped
+
+  builder:
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+    # Prefer a published image; uncomment to build locally instead:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    depends_on:
+      - aurcache
+    environment:
+      - RUST_LOG=info
+      # Reach the server over the internal network. mTLS host must match a SAN
+      # in AURCACHE_TLS_SANS above.
+      - AURCACHE_URL=https://aurcache:8080
+      # Same shared volume as the server -> this worker is auto-approved. This is
+      # also the worker's default path, shown here for clarity.
+      - AURCACHE_ENROLLMENT_DIR=/enroll
+      # How many packages this worker builds in parallel.
+      - WORKER_CONCURRENCY=2
+      # Native architectures this worker builds (default: auto = host arch).
+      # - WORKER_ARCHES=x86_64
+    volumes:
+      - enroll:/enroll                # writable: drop CSR for auto-enrollment
+      - worker_data:/var/lib/aurcache-worker   # persisted base chroot
+      - worker_cache:/var/cache/aurcache-worker
+    # devtools builds each package in a systemd-nspawn chroot, which needs the
+    # namespaces/mounts a plain container forbids. `privileged` + a tmpfs `/run`
+    # is the tightest config that works out of the box. If your host lets you,
+    # you can narrow this to specific capabilities + seccomp/apparmor unconfined.
+    privileged: true
+    tmpfs:
+      - /run
+    networks:
+      - aurcache
+    restart: unless-stopped
+
+volumes:
+  aurcache_db:
+  aurcache_repo:
+  aurcache_ca:
+  enroll:
+  worker_data:
+  worker_cache:
+
+networks:
+  aurcache:
+    driver: bridge

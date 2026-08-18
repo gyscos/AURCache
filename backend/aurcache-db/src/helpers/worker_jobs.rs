@@ -215,6 +215,64 @@ pub async fn requeue_or_fail<C: ConnectionTrait>(
     }
 }
 
+/// Result of a reaper pass: which owned+active builds were requeued vs. given up.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReapOutcome {
+    /// Builds re-enqueued for another attempt (budget remaining).
+    pub requeued: Vec<i32>,
+    /// Builds terminally failed (budget exhausted or backstop timeout).
+    pub failed: Vec<i32>,
+}
+
+/// Reaper pass: reclaim `ACTIVE` builds whose owning worker went silent, and
+/// backstop builds that have run implausibly long.
+///
+/// A build is reaped when either:
+/// * its lease has expired (`lease_expires_at < now`, or `NULL` — no live
+///   lease) — the worker missed enough heartbeats that we treat it as lost; or
+/// * it has been `ACTIVE` past the backstop deadline
+///   (`start_time + max_build_age < now`) even if a lease still appears fresh —
+///   covers a hung build whose worker keeps heartbeating.
+///
+/// Each reaped build goes through [`requeue_or_fail`], so the `attempt_count`
+/// budget bounds retries before a terminal `FAILED`.
+///
+/// `now` and `max_build_age` (`MAX_BUILD_DURATION + grace`, in seconds) are
+/// passed in so callers stay testable and can source them from settings.
+pub async fn reap_expired_builds<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+    max_attempts: i32,
+    max_build_age: i64,
+) -> Result<ReapOutcome, DbErr> {
+    let backstop_before = now - max_build_age;
+    let candidates: Vec<i32> = Builds::find()
+        .select_only()
+        .column(builds::Column::Id)
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(
+            sea_orm::Condition::any()
+                .add(builds::Column::LeaseExpiresAt.lt(now))
+                .add(builds::Column::LeaseExpiresAt.is_null())
+                .add(builds::Column::StartTime.lt(backstop_before)),
+        )
+        .into_tuple()
+        .all(db)
+        .await?;
+
+    let mut outcome = ReapOutcome::default();
+    for id in candidates {
+        // Re-check ownership/state inside requeue_or_fail via a fresh read; a
+        // concurrent heartbeat/complete may have moved the build already.
+        if requeue_or_fail(db, id, max_attempts).await? {
+            outcome.requeued.push(id);
+        } else {
+            outcome.failed.push(id);
+        }
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +430,74 @@ mod tests {
             assert_eq!(requeued, expected_requeue);
         }
         let b = Builds::find_by_id(40).one(&db).await.unwrap().unwrap();
+        assert_eq!(b.status, Some(STATUS_FAILED));
+    }
+
+    #[tokio::test]
+    async fn reaper_requeues_expired_lease_only() {
+        let db = setup().await;
+        enqueue(&db, 60, "x86_64", 100).await;
+        enqueue(&db, 61, "x86_64", 100).await;
+        // Claim both with a 60s lease so lease_expires_at = claim_now + 60.
+        claim_job(&db, 3, &["x86_64".to_string()], &[], 60).await.unwrap();
+        claim_job(&db, 3, &["x86_64".to_string()], &[], 60).await.unwrap();
+
+        // "now" far in the future: both leases are expired -> both requeued.
+        let far = now_secs() + 10_000;
+        let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
+        assert_eq!(out.requeued.len(), 2);
+        assert!(out.failed.is_empty());
+        for id in [60, 61] {
+            let b = Builds::find_by_id(id).one(&db).await.unwrap().unwrap();
+            assert_eq!(b.status, Some(STATUS_ENQUEUED));
+            assert_eq!(b.worker_id, None);
+            assert_eq!(b.attempt_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_leaves_fresh_leases_alone() {
+        let db = setup().await;
+        enqueue(&db, 70, "x86_64", 100).await;
+        claim_job(&db, 4, &["x86_64".to_string()], &[], 600).await.unwrap();
+
+        // "now" is right after the claim: lease is fresh, build is young.
+        let out = reap_expired_builds(&db, now_secs(), 3, 100_000).await.unwrap();
+        assert!(out.requeued.is_empty());
+        assert!(out.failed.is_empty());
+        let b = Builds::find_by_id(70).one(&db).await.unwrap().unwrap();
+        assert_eq!(b.status, Some(STATUS_ACTIVE));
+    }
+
+    #[tokio::test]
+    async fn reaper_backstop_fires_despite_fresh_lease() {
+        let db = setup().await;
+        // start_time = 100 (long ago); claim gives a fresh far-future lease.
+        enqueue(&db, 80, "x86_64", 100).await;
+        claim_job(&db, 6, &["x86_64".to_string()], &[], 1_000_000).await.unwrap();
+
+        // Backstop: max_build_age small so start_time(=claim now) is "too old"
+        // relative to a `now` well past it, even though the lease is fresh.
+        let now = now_secs() + 10_000;
+        let out = reap_expired_builds(&db, now, 3, 1).await.unwrap();
+        assert_eq!(out.requeued, vec![80]);
+    }
+
+    #[tokio::test]
+    async fn reaper_gives_up_after_budget() {
+        let db = setup().await;
+        enqueue(&db, 90, "x86_64", 100).await;
+        claim_job(&db, 2, &["x86_64".to_string()], &[], 60).await.unwrap();
+        // Pre-exhaust the budget.
+        db.execute_unprepared("UPDATE builds SET attempt_count = 3 WHERE id = 90")
+            .await
+            .unwrap();
+
+        let far = now_secs() + 10_000;
+        let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
+        assert_eq!(out.failed, vec![90]);
+        assert!(out.requeued.is_empty());
+        let b = Builds::find_by_id(90).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(STATUS_FAILED));
     }
 }

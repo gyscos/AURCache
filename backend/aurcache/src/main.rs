@@ -4,6 +4,7 @@ use aurcache_api::init::{init_api, init_repo};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::init::init_db;
 use aurcache_scheduler::auto_update::start_auto_update_job;
+use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
 use aurcache_types::builder::Action;
@@ -56,6 +57,10 @@ async fn main() {
     if !mirrorlist_override && let Err(e) = start_mirror_rank_job(db.clone(), tx.clone()) {
         warn!("mirror_rank job not properly configured: {e}");
     }
+
+    // Reclaim build jobs whose remote worker went silent (lease liveness).
+    let lease_reaper_handle = start_lease_reaper(db.clone());
+
     let api_handle = init_api(db, tx, ca);
     let repo_handle = init_repo();
 
@@ -65,6 +70,9 @@ async fn main() {
         }
         _ = build_queue_handle => {
             warn!("Build queue handle exited");
+        }
+        _ = lease_reaper_handle => {
+            warn!("Lease reaper handle exited");
         }
         _ = repo_handle => {
             warn!("Repo web server handle exited");
