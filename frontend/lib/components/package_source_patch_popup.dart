@@ -207,20 +207,31 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
                                     ? const Center(
                                         child: CircularProgressIndicator(),
                                       )
-                                    : TextField(
-                                        controller: _controller,
-                                        onChanged: (_) => setState(() {}),
-                                        maxLines: null,
-                                        expands: true,
-                                        textAlignVertical:
-                                            TextAlignVertical.top,
-                                        style: const TextStyle(
-                                          fontFamily: 'monospace',
-                                          fontSize: 12,
+                                    : Container(
+                                        decoration: BoxDecoration(
+                                          border: Border.all(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .outline,
+                                          ),
                                         ),
-                                        decoration: const InputDecoration(
-                                          border: OutlineInputBorder(),
-                                          contentPadding: EdgeInsets.all(8),
+                                        child: SingleChildScrollView(
+                                          padding: const EdgeInsets.all(8),
+                                          child: TextField(
+                                            controller: _controller,
+                                            onChanged: (_) => setState(() {}),
+                                            maxLines: null,
+                                            textAlignVertical:
+                                                TextAlignVertical.top,
+                                            style: const TextStyle(
+                                              fontFamily: 'monospace',
+                                              fontSize: 12,
+                                            ),
+                                            decoration: const InputDecoration(
+                                              border: InputBorder.none,
+                                              isDense: true,
+                                            ),
+                                          ),
                                         ),
                                       ),
                               ),
