@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import '../api/API.dart';
 import '../api/source_edit.dart';
@@ -223,8 +224,7 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
                                             maxLines: null,
                                             textAlignVertical:
                                                 TextAlignVertical.top,
-                                            style: const TextStyle(
-                                              fontFamily: 'monospace',
+                                            style: GoogleFonts.jetBrainsMono(
                                               fontSize: 12,
                                             ),
                                             decoration: const InputDecoration(

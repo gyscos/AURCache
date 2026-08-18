@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import '../../api/API.dart';
 import '../../api/source_preview.dart';
@@ -246,8 +247,7 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                                 onChanged: (_) => setState(() {}),
                                 maxLines: null,
                                 textAlignVertical: TextAlignVertical.top,
-                                style: const TextStyle(
-                                  fontFamily: 'monospace',
+                                style: GoogleFonts.jetBrainsMono(
                                   fontSize: 12,
                                 ),
                                 decoration: const InputDecoration(
