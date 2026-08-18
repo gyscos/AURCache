@@ -1,9 +1,12 @@
 pub mod aur;
+pub mod build_logger;
 pub mod git;
+pub mod job_config;
 pub mod package;
 pub mod patch;
 pub mod pkg;
 pub mod pkgbuild;
+pub mod repo_ingest;
 pub mod settings;
 pub mod snapshot;
 pub mod utils;
