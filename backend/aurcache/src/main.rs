@@ -34,6 +34,9 @@ async fn main() {
         env::var("AURCACHE_CA_DIR").unwrap_or_else(|_| "./data/ca".to_string()),
     );
     let ca = aurcache_ca::Ca::load_or_create(&ca_dir).expect("failed to initialize internal CA");
+    if let Ok(fp) = ca.ca_cert_fingerprint() {
+        tracing::info!("Worker CA fingerprint (pin this on workers): {fp}");
+    }
 
     // A single, long-lived `SnapshotStore` is shared across the build queue,
     // version-check loop, and auto-update job. Its persistent on-disk git

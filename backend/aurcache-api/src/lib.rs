@@ -14,3 +14,4 @@ mod settings;
 mod stats;
 mod utils;
 mod worker;
+mod worker_enroll;

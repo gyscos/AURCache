@@ -236,6 +236,36 @@ fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
     })
 }
 
+/// Sanity-check uploaded artifact filenames against the set of package names the
+/// server expects for this package (its pkgbase plus any split packages).
+///
+/// This blocks *wrong-named* artifacts (e.g. a worker uploading `openssh-*`
+/// under a job for `hello`); it does **not** and cannot verify the *contents* of
+/// a correctly-named package (see design non-goals). Signature sidecars
+/// (`*.sig`) and hidden helper files are ignored; every remaining file must be a
+/// `*.pkg.tar.*` whose parsed pkgname is in `expected`.
+pub fn validate_artifact_names(expected: &[String], filenames: &[String]) -> anyhow::Result<()> {
+    if expected.is_empty() {
+        bail!("no expected package names to validate against");
+    }
+    for filename in filenames {
+        if filename.starts_with('.') || filename.ends_with(".sig") {
+            continue;
+        }
+        if !filename.contains(".pkg.tar") {
+            bail!("unexpected non-package artifact: {filename}");
+        }
+        let parsed = parse_arch_pkg(filename)?;
+        if !expected.iter().any(|e| e == &parsed.name) {
+            bail!(
+                "artifact '{filename}' has pkgname '{}' not among expected {expected:?}",
+                parsed.name
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +289,30 @@ mod tests {
     #[test]
     fn rejects_malformed_filename() {
         assert!(parse_arch_pkg("garbage.pkg.tar.zst").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_expected_and_signatures() {
+        let expected = vec!["hello".to_string(), "hello-docs".to_string()];
+        let files = vec![
+            "hello-1.0-1-x86_64.pkg.tar.zst".to_string(),
+            "hello-1.0-1-x86_64.pkg.tar.zst.sig".to_string(),
+            "hello-docs-1.0-1-x86_64.pkg.tar.zst".to_string(),
+        ];
+        assert!(validate_artifact_names(&expected, &files).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_pkgname() {
+        let expected = vec!["hello".to_string()];
+        let files = vec!["openssh-9.0-1-x86_64.pkg.tar.zst".to_string()];
+        assert!(validate_artifact_names(&expected, &files).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_package_file() {
+        let expected = vec!["hello".to_string()];
+        let files = vec!["evil.sh".to_string()];
+        assert!(validate_artifact_names(&expected, &files).is_err());
     }
 }

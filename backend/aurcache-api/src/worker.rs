@@ -18,7 +18,7 @@ use aurcache_types::worker::{
     RegisterStatus, WorkerStatus,
 };
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
-use aurcache_utils::repo_ingest::ingest_pkgs;
+use aurcache_utils::repo_ingest::{ingest_pkgs, validate_artifact_names};
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::build_logger::BuildLogger;
 use aurcache_utils::worker_complete;
@@ -120,6 +120,7 @@ pub fn worker_routes() -> Vec<rocket::Route> {
         register_worker,
         register_status,
         get_ca,
+        get_ca_fingerprint,
         claim_job,
         job_source,
         job_logs,
@@ -180,6 +181,16 @@ pub async fn register_worker(
         .map_err(|e| err(Status::InternalServerError, e))?;
     }
 
+    // Non-interactive enrollment: auto-approve when a configured mode matches.
+    if worker.status != WorkerStatus::APPROVED
+        && crate::worker_enroll::auto_approve_from_env(&fingerprint, input.enrollment_token.as_deref())
+    {
+        worker_store::approve_worker(db, worker.id)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+        tracing::info!("Auto-approved worker '{}' ({fingerprint})", worker.name);
+    }
+
     register_status_for(db, ca, &fingerprint).await
 }
 
@@ -225,6 +236,15 @@ pub async fn get_ca(ca: &State<Ca>) -> String {
     ca.ca_cert_pem().to_string()
 }
 
+/// Return the CA certificate's SHA-256 fingerprint so a worker can pin the
+/// server before trusting any issued certificate (anti-MITM during enrollment).
+#[utoipa::path(get, path = "/worker/ca/fingerprint", responses((status = 200, description = "CA fingerprint")))]
+#[get("/worker/ca/fingerprint")]
+pub async fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>> {
+    ca.ca_cert_fingerprint()
+        .map_err(|e| err(Status::InternalServerError, e))
+}
+
 // ----------------------------------------------------------------------------
 // Job lifecycle (approved worker certificate required)
 // ----------------------------------------------------------------------------
@@ -240,12 +260,15 @@ pub async fn claim_job(
     let db = db as &DatabaseConnection;
     let input = input.into_inner();
 
-    let mut arches = input.native_arches.clone();
-    arches.extend(input.emulated_arches.clone());
-
-    let Some(build) = worker_jobs::claim_job(db, auth.worker.id, &arches, lease_ttl_secs())
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
+    let Some(build) = worker_jobs::claim_job(
+        db,
+        auth.worker.id,
+        &input.native_arches,
+        &input.emulated_arches,
+        lease_ttl_secs(),
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))?
     else {
         return Ok(None);
     };
@@ -427,6 +450,23 @@ pub async fn complete_job(
         if files.is_empty() {
             return Err(err(Status::BadRequest, "no artifacts uploaded"));
         }
+
+        // Sanity-check filenames against the package names we expect. Blocks
+        // wrong-named uploads (not malicious contents — see design non-goals).
+        let pkg = Packages::find_by_id(build.pkg_id)
+            .one(db)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?
+            .ok_or_else(|| err(Status::NotFound, "package not found"))?;
+        let expected = expected_pkgnames(&pkg);
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        if let Err(e) = validate_artifact_names(&expected, &names) {
+            BuildLogger::new(build_id, db.clone())
+                .append(format!("rejected artifacts: {e}\n"))
+                .await;
+            return Err(err(Status::BadRequest, e));
+        }
+
         let logger = BuildLogger::new(build_id, db.clone());
         let version = ingest_pkgs(db, &logger, build.pkg_id, &build.platform, files)
             .await
@@ -449,6 +489,22 @@ pub async fn complete_job(
     }
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
+}
+
+/// The package names the server expects a build to produce: the pkgbase plus any
+/// split-package names recorded on the package row.
+fn expected_pkgnames(pkg: &aurcache_db::packages::Model) -> Vec<String> {
+    let mut names = vec![pkg.name.clone()];
+    if let Some(json) = &pkg.split_packages
+        && let Ok(split) = serde_json::from_str::<Vec<String>>(json)
+    {
+        for s in split {
+            if !names.contains(&s) {
+                names.push(s);
+            }
+        }
+    }
+    names
 }
 
 async fn read_staging(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
