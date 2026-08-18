@@ -226,13 +226,29 @@ async fn merge_files_package_links(manager: &SchemaManager<'_>) -> Result<(), Db
 }
 
 async fn mark_duplicate_pending_builds_failed(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    // Before putting a unique index on active/pending builds, mark any duplicate as failed.
-    let mut pending = builds::Entity::find()
+    use sea_orm::QuerySelect;
+
+    // (id, pkg_id, platform, status, start_time)
+    type PendingBuildRow = (i32, i32, String, Option<i32>, Option<i64>);
+
+    // Before putting a unique index on active/pending builds, mark any duplicate
+    // as failed. Select only the columns this migration needs (via a tuple query)
+    // rather than the full `builds` entity, so later columns added to the entity
+    // (e.g. worker leasing fields) don't make this historical migration select
+    // columns that don't exist yet at this point in the chain.
+    let mut pending: Vec<PendingBuildRow> = builds::Entity::find()
+        .select_only()
+        .column(builds::Column::Id)
+        .column(builds::Column::PkgId)
+        .column(builds::Column::Platform)
+        .column(builds::Column::Status)
+        .column(builds::Column::StartTime)
         .filter(builds::Column::Status.is_in([
             Some(ACTIVE_BUILD_STATUS),
             Some(ENQUEUED_BUILD_STATUS),
             Some(WAITING_FOR_DEPS_STATUS),
         ]))
+        .into_tuple()
         .all(db)
         .await?;
 
@@ -245,20 +261,20 @@ async fn mark_duplicate_pending_builds_failed(db: &impl ConnectionTrait) -> Resu
             Some(x) if x == WAITING_FOR_DEPS_STATUS => 2,
             _ => 3,
         };
-        priority(a.status)
-            .cmp(&priority(b.status))
-            .then(b.start_time.unwrap_or(0).cmp(&a.start_time.unwrap_or(0)))
-            .then(b.id.cmp(&a.id))
+        priority(a.3)
+            .cmp(&priority(b.3))
+            .then(b.4.unwrap_or(0).cmp(&a.4.unwrap_or(0)))
+            .then(b.0.cmp(&a.0))
     });
 
     let mut seen = HashSet::new();
     let to_fail: Vec<i32> = pending
         .into_iter()
-        .filter_map(|b| {
-            if seen.insert((b.pkg_id, b.platform)) {
+        .filter_map(|(id, pkg_id, platform, _status, _start_time)| {
+            if seen.insert((pkg_id, platform)) {
                 None
             } else {
-                Some(b.id)
+                Some(id)
             }
         })
         .collect();

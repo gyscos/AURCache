@@ -13,3 +13,4 @@ pub mod migration;
 pub mod package_vcs_sources;
 pub mod packages;
 pub mod settings;
+pub mod workers;

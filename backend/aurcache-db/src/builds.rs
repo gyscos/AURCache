@@ -19,6 +19,13 @@ pub struct Model {
     #[schema(value_type = String)]
     pub platform: Platform,
     pub version: String,
+    /// Id of the worker that holds the active lease on this build, if any.
+    pub worker_id: Option<i32>,
+    /// Epoch seconds when the current worker's lease expires. Renewed by
+    /// heartbeats; a passed value means the worker went silent.
+    pub lease_expires_at: Option<i64>,
+    /// Number of times this build has been re-enqueued after a silent worker.
+    pub attempt_count: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

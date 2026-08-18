@@ -11,6 +11,7 @@ pub mod m20260508_000000_dependency_resolution_combined;
 mod m20260515_000000_api_tokens;
 mod m20260601_000000_package_patch;
 mod m20260814_000000_package_vcs_sources;
+mod m20260818_000000_remote_workers;
 
 pub struct Migrator;
 
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260508_000000_dependency_resolution_combined::Migration),
             Box::new(m20260515_000000_api_tokens::Migration),
             Box::new(m20260814_000000_package_vcs_sources::Migration),
+            Box::new(m20260818_000000_remote_workers::Migration),
         ]
     }
 }

@@ -8,3 +8,4 @@ pub use super::files::Entity as Files;
 pub use super::package_vcs_sources::Entity as PackageVcsSources;
 pub use super::packages::Entity as Packages;
 pub use super::settings::Entity as Settings;
+pub use super::workers::Entity as Workers;
