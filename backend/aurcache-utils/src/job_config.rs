@@ -58,6 +58,11 @@ pub async fn create_makepkg_config(
 /// AURCache package server is appended so makepkg can resolve previously built
 /// packages.  Pass `None` for standalone builds (e.g. the test-builder) where
 /// no AURCache server is running.
+///
+/// `DisableSandbox`: pacman 7's Landlock download sandbox cannot initialise
+/// inside the unprivileged/nested build chroot and aborts every `pacman -Sy`.
+/// Disabling it is required for pacman to run there; it only relaxes pacman's
+/// own download isolation, not the surrounding `makechrootpkg` chroot.
 pub fn base_pacman_config(aurcache_repo_url: Option<&str>) -> String {
     let base = "[options]\nDisableSandbox\nSigLevel = Never\nHoldPkg = pacman glibc\nArchitecture = auto\n\n\
                 [core]\nInclude = /etc/pacman.d/mirrorlist\n\n\

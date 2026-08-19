@@ -36,7 +36,14 @@ ARG TARGET_ARCH
 ADD docker/build-rust.sh /root
 RUN bash /root/build-rust.sh $TARGET_ARCH
 
-FROM --platform=$TARGET_ARCH quay.io/podman/stable:v5.8.2
+FROM --platform=$TARGET_ARCH debian:bookworm-slim
+# Podman/Docker is no longer used at runtime (remote workers build packages),
+# so the server just needs a minimal glibc base matching its build image
+# (debian bookworm). Runtime deps: ca-certificates (HTTPS to the AUR) and bash
+# (the alpm-pkgbuild-bridge PKGBUILD parser is a bash script).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates bash \
+    && rm -rf /var/lib/apt/lists/*
 # Copy the built binary from the previous stage
 COPY --from=builder --chmod=0755 /app/target/aurcache /usr/local/bin/aurcache
 COPY --chmod=0755 docker/entrypoint.sh /entrypoint.sh

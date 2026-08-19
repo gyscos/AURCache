@@ -55,9 +55,15 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
 
 /// Record the authoritative built version (extracted from the uploaded package
 /// files) on the build and its package.
+///
+/// The build write is a compare-and-swap on `status = ACTIVE AND worker_id = ?`
+/// so a build the calling worker has already lost (reaper reclaim) is never
+/// silently mutated. If the lease was lost, this returns [`LeaseLostError`]-style
+/// `DbErr::Custom` and the caller should abort the completion.
 pub async fn record_built_version<C: ConnectionTrait>(
     db: &C,
     build_id: i32,
+    worker_id: i32,
     version: &str,
 ) -> Result<(), DbErr> {
     let build = Builds::find_by_id(build_id)
@@ -65,9 +71,17 @@ pub async fn record_built_version<C: ConnectionTrait>(
         .await?
         .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
     let pkg_id = build.pkg_id;
-    let mut active = build.into_active_model();
-    active.version = Set(version.to_string());
-    active.update(db).await?;
+
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Version, version.to_string().into())
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .exec(db)
+        .await?;
+    if res.rows_affected == 0 {
+        return Err(lease_lost(build_id, worker_id));
+    }
 
     if let Some(pkg) = Packages::find_by_id(pkg_id).one(db).await? {
         let mut pkg = pkg.into_active_model();
@@ -77,11 +91,21 @@ pub async fn record_built_version<C: ConnectionTrait>(
     Ok(())
 }
 
+/// A build the worker was building is no longer `ACTIVE`-and-owned by it (the
+/// lease was reclaimed by the reaper and possibly re-handed to another worker).
+/// The late completion must be discarded rather than clobbering the new owner.
+fn lease_lost(build_id: i32, worker_id: i32) -> DbErr {
+    DbErr::Custom(format!(
+        "build {build_id} is no longer owned+active by worker {worker_id} (lease lost); completion discarded"
+    ))
+}
+
 /// Mark a build (and its package) as successfully built, then promote any
 /// dependents whose dependencies are now satisfied.
 pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
+    worker_id: i32,
 ) -> Result<(), DbErr> {
     let build = Builds::find_by_id(build_id)
         .one(db)
@@ -91,12 +115,20 @@ pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
     let platform = build.platform;
 
     let txn = db.begin().await?;
-    let mut b = build.into_active_model();
-    b.status = Set(Some(STATUS_SUCCESS));
-    b.worker_id = Set(None);
-    b.lease_expires_at = Set(None);
-    b.end_time = Set(Some(now_secs()));
-    b.update(&txn).await?;
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Status, STATUS_SUCCESS.into())
+        .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
+        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
+        .col_expr(builds::Column::EndTime, Some(now_secs()).into())
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .exec(&txn)
+        .await?;
+    if res.rows_affected == 0 {
+        txn.rollback().await?;
+        return Err(lease_lost(build_id, worker_id));
+    }
 
     if let Some(pkg) = Packages::find_by_id(pkg_id).one(&txn).await? {
         let mut pkg = pkg.into_active_model();
@@ -117,6 +149,7 @@ pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
 pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
+    worker_id: i32,
 ) -> Result<(), DbErr> {
     let build = Builds::find_by_id(build_id)
         .one(db)
@@ -125,12 +158,20 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
     let pkg_id = build.pkg_id;
 
     let txn = db.begin().await?;
-    let mut b = build.into_active_model();
-    b.status = Set(Some(STATUS_FAILED));
-    b.worker_id = Set(None);
-    b.lease_expires_at = Set(None);
-    b.end_time = Set(Some(now_secs()));
-    b.update(&txn).await?;
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Status, STATUS_FAILED.into())
+        .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
+        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
+        .col_expr(builds::Column::EndTime, Some(now_secs()).into())
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .exec(&txn)
+        .await?;
+    if res.rows_affected == 0 {
+        txn.rollback().await?;
+        return Err(lease_lost(build_id, worker_id));
+    }
 
     if let Some(pkg) = Packages::find_by_id(pkg_id).one(&txn).await? {
         let mut pkg = pkg.into_active_model();
@@ -289,8 +330,8 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         build(&db, 10, 1, STATUS_ACTIVE, "5").await;
-        record_built_version(&db, 10, "2.0-1").await.unwrap();
-        complete_success(&db, 10).await.unwrap();
+        record_built_version(&db, 10, 5, "2.0-1").await.unwrap();
+        complete_success(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(STATUS_SUCCESS));
         assert_eq!(b.worker_id, None);
@@ -303,9 +344,24 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         build(&db, 10, 1, STATUS_ACTIVE, "5").await;
-        complete_failure(&db, 10).await.unwrap();
+        complete_failure(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(STATUS_FAILED));
         assert_eq!(b.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn completion_by_non_owner_is_discarded() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        // Build reclaimed and re-handed to worker 6.
+        build(&db, 10, 1, STATUS_ACTIVE, "6").await;
+        // Late completion from the original owner (worker 5) must not clobber it.
+        assert!(complete_success(&db, 10, 5).await.is_err());
+        assert!(complete_failure(&db, 10, 5).await.is_err());
+        assert!(record_built_version(&db, 10, 5, "9.9-9").await.is_err());
+        let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
+        assert_eq!(b.status, Some(STATUS_ACTIVE));
+        assert_eq!(b.worker_id, Some(6));
     }
 }

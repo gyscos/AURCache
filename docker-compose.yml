@@ -25,9 +25,9 @@ services:
   aurcache:
     image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
     # Prefer a published image; uncomment to build locally instead:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: docker/Dockerfile
     ports:
       - "8080:8080"   # Web UI + API (plain HTTP; front with a reverse proxy for TLS)
       - "8081:8081"   # Pacman repository (plain HTTP, for `pacman -Sy`)
@@ -56,9 +56,9 @@ services:
   builder:
     image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
     # Prefer a published image; uncomment to build locally instead:
-    build:
-      context: .
-      dockerfile: docker/worker.Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: docker/worker.Dockerfile
     depends_on:
       - aurcache
     environment:

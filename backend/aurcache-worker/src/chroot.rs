@@ -4,7 +4,18 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Mutex;
+
+/// Serializes base-chroot creation/refresh across concurrent jobs so two builds
+/// never race to `mkarchroot`/`arch-nspawn` the same shared `<chroot_dir>/root`
+/// (which would corrupt it). Keyed by chroot dir so distinct dirs don't block.
+fn base_chroot_lock() -> Arc<Mutex<()>> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
+}
 
 /// Run a command, returning combined stdout+stderr and the exit status.
 pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::ExitStatus)> {
@@ -20,9 +31,14 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 /// The worker runs as an unprivileged `builder` user inside the container:
 /// `sudo` provides the root needed for chroot ops and, crucially, sets
 /// `SUDO_USER` so `makechrootpkg` runs `makepkg` as `builder` (never root).
+///
+/// Only `GNUPGHOME` is preserved: it is the one variable the worker actually
+/// exports (see [`import_pgp_keys`]). `SRCDEST`/`PKGDEST` are passed to
+/// `makechrootpkg`/`makepkg.conf` by other means, never via the environment,
+/// so preserving them here would be a no-op.
 pub fn devtools(program: &str) -> Command {
     let mut cmd = Command::new("sudo");
-    cmd.arg("--preserve-env=SRCDEST,PKGDEST,GNUPGHOME").arg(program);
+    cmd.arg("--preserve-env=GNUPGHOME").arg(program);
     cmd
 }
 
@@ -36,6 +52,11 @@ pub async fn ensure_base_chroot(
     pacman_conf: &Path,
     makepkg_conf: &Path,
 ) -> Result<PathBuf> {
+    // Serialize base-chroot creation/refresh: concurrent jobs must not race to
+    // build or `-Syu` the same shared root.
+    let lock = base_chroot_lock();
+    let _guard = lock.lock().await;
+
     std::fs::create_dir_all(chroot_dir)
         .with_context(|| format!("creating chroot dir {}", chroot_dir.display()))?;
     let root = chroot_dir.join("root");

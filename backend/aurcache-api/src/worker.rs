@@ -479,10 +479,10 @@ pub async fn complete_job(
         let version = ingest_pkgs(db, &logger, build.pkg_id, &build.platform, files)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_complete::record_built_version(db, build_id, &version)
+        worker_complete::record_built_version(db, build_id, auth.worker.id, &version)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_complete::complete_success(db, build_id)
+        worker_complete::complete_success(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     } else {
@@ -491,7 +491,7 @@ pub async fn complete_job(
                 .append(format!("worker reported failure: {reason}\n"))
                 .await;
         }
-        worker_complete::complete_failure(db, build_id)
+        worker_complete::complete_failure(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     }

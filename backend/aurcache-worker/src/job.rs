@@ -6,10 +6,12 @@
 
 use anyhow::{Context, Result};
 use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use crate::build;
 use crate::cache::Cache;
@@ -23,8 +25,9 @@ pub async fn run_job(
     client: &WorkerClient,
     job: JobDescriptor,
     cancel: Arc<AtomicBool>,
+    active_pkgbases: Arc<Mutex<HashSet<String>>>,
 ) -> CompleteReport {
-    match run_job_inner(cfg, client, &job, &cancel).await {
+    match run_job_inner(cfg, client, &job, &cancel, &active_pkgbases).await {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("build setup failed: {e:#}");
@@ -39,12 +42,19 @@ async fn run_job_inner(
     client: &WorkerClient,
     job: &JobDescriptor,
     cancel: &Arc<AtomicBool>,
+    active_pkgbases: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let cache = Cache::new(&cfg.cache_dir, cfg.cache_max_size, cfg.cache_ttl);
 
-    // Opportunistic cache GC (never blocks the build).
-    cache.evict(std::slice::from_ref(&job.pkgbase));
+    // Opportunistic cache GC (never blocks the build). Pin every pkgbase that is
+    // currently building — not just this job's — so a concurrent sibling's
+    // in-progress SRCDEST is never wiped out from under it.
+    let in_use: Vec<String> = {
+        let guard = active_pkgbases.lock().await;
+        guard.iter().cloned().collect()
+    };
+    cache.evict(&in_use);
 
     // 1. Fetch + extract source.
     log(client, build_id, "[worker] downloading source\n").await;
@@ -130,9 +140,15 @@ async fn run_build(
         }
     };
 
-    // Poll for cancellation / timeout while the child runs.
+    // Poll for cancellation / timeout while the child runs. Local self-abort and
+    // the build timeout are checked every 5s (cheap, in-process); the remote
+    // cancel flag is polled less often (an HTTP round-trip) to avoid hammering
+    // the server, and — now that the client carries connect/read timeouts — can
+    // no longer block this loop indefinitely.
     let started = std::time::Instant::now();
     let timeout = cfg.build_timeout;
+    let remote_poll = Duration::from_secs(30);
+    let mut last_remote_poll = std::time::Instant::now();
     let mut canceled = false;
     let mut timed_out = false;
     let status = loop {
@@ -143,8 +159,13 @@ async fn run_build(
                 if hit_timeout {
                     timed_out = true;
                 }
-                if cancel.load(Ordering::SeqCst) || remote_cancel(client, build_id).await {
+                if cancel.load(Ordering::SeqCst) {
                     canceled = true;
+                } else if last_remote_poll.elapsed() >= remote_poll {
+                    last_remote_poll = std::time::Instant::now();
+                    if remote_cancel(client, build_id).await {
+                        canceled = true;
+                    }
                 }
                 if canceled || hit_timeout {
                     let _ = child.start_kill();

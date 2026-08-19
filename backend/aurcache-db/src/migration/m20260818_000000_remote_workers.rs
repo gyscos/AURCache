@@ -50,6 +50,20 @@ ALTER TABLE builds ADD attempt_count INTEGER NOT NULL DEFAULT 0;
 ",
                 )
                 .await?;
+
+                // Indexes for the worker hot-path queries: claim scans
+                // ENQUEUED builds filtered by (status, platform); heartbeat and
+                // the lease reaper filter/renew by worker_id. (workers
+                // .cert_fingerprint — looked up on every mTLS request — is
+                // already indexed via its UNIQUE constraint.)
+                db.execute_unprepared(
+                    "CREATE INDEX idx_builds_status_platform ON builds (status, platform);",
+                )
+                .await?;
+                db.execute_unprepared(
+                    "CREATE INDEX idx_builds_worker_id ON builds (worker_id);",
+                )
+                .await?;
             }
             DbBackend::Postgres => {
                 db.execute_unprepared(
@@ -90,6 +104,15 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
 ",
                 )
                 .await?;
+
+                db.execute_unprepared(
+                    "CREATE INDEX idx_builds_status_platform ON builds (status, platform);",
+                )
+                .await?;
+                db.execute_unprepared(
+                    "CREATE INDEX idx_builds_worker_id ON builds (worker_id);",
+                )
+                .await?;
             }
             _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
         }
@@ -102,6 +125,10 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
 
         match database_type() {
             DbBackend::Sqlite => {
+                db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_worker_id;")
+                    .await?;
+                db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_status_platform;")
+                    .await?;
                 db.execute_unprepared("ALTER TABLE builds DROP COLUMN attempt_count;")
                     .await?;
                 db.execute_unprepared("ALTER TABLE builds DROP COLUMN lease_expires_at;")
@@ -111,6 +138,10 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
                 db.execute_unprepared("DROP TABLE workers;").await?;
             }
             DbBackend::Postgres => {
+                db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_worker_id;")
+                    .await?;
+                db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_status_platform;")
+                    .await?;
                 db.execute_unprepared("ALTER TABLE builds DROP COLUMN attempt_count;")
                     .await?;
                 db.execute_unprepared("ALTER TABLE builds DROP COLUMN lease_expires_at;")
@@ -197,8 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_status_defaults_to_pending() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+    async fn worker_status_defaults_to_pending() {        let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
         db.execute_unprepared(
@@ -219,5 +249,24 @@ mod tests {
         let native_arches: String = row.try_get("", "native_arches").unwrap();
         assert_eq!(status, "pending");
         assert_eq!(native_arches, "");
+    }
+
+    #[tokio::test]
+    async fn hot_path_indexes_exist() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        for idx in &["idx_builds_status_platform", "idx_builds_worker_id"] {
+            let row = db
+                .query_one(sea_orm::Statement::from_string(
+                    db.get_database_backend(),
+                    format!(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND name='{idx}'"
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert!(row.is_some(), "index '{idx}' should exist");
+        }
     }
 }

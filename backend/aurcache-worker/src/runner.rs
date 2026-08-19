@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use aurcache_types::worker::{ClaimRequest, CompleteReport, Heartbeat, JobDescriptor};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,10 @@ pub struct Runner {
     client: Arc<WorkerClient>,
     /// Build ids currently executing (reported in each heartbeat).
     active: Mutex<HashMap<i32, Arc<AtomicBool>>>,
+    /// Pkgbases of currently-running jobs. Shared with each job so the cache
+    /// garbage-collector never evicts a sibling job's in-progress `SRCDEST`
+    /// when `concurrency > 1`.
+    active_pkgbases: Arc<Mutex<HashSet<String>>>,
     /// Unix seconds of the last successful server contact.
     last_contact: AtomicU64,
     /// Bounds concurrent builds.
@@ -42,6 +46,7 @@ impl Runner {
             cfg,
             client,
             active: Mutex::new(HashMap::new()),
+            active_pkgbases: Arc::new(Mutex::new(HashSet::new())),
             last_contact: AtomicU64::new(now_secs()),
             permits: Arc::new(Semaphore::new(concurrency)),
         })
@@ -103,16 +108,28 @@ impl Runner {
     /// Execute a single job with panic-safe, always-emitted completion.
     async fn run_one(self: &Arc<Self>, job: JobDescriptor) {
         let build_id = job.build_id;
+        let pkgbase = job.pkgbase.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.active.lock().await.insert(build_id, Arc::clone(&cancel));
+        // Register before building so this job's own SRCDEST (and every sibling's)
+        // is protected from the cache GC that runs at each job's start.
+        self.active_pkgbases.lock().await.insert(pkgbase.clone());
         tracing::info!("Building {}", build::describe(&job));
 
         // Panic-wrap so a task panic still yields a terminal completion.
         let this = Arc::clone(self);
         let cancel_for_build = Arc::clone(&cancel);
         let job_for_build = job.clone();
+        let active_pkgbases = Arc::clone(&self.active_pkgbases);
         let result = tokio::spawn(async move {
-            job::run_job(&this.cfg, &this.client, job_for_build, cancel_for_build).await
+            job::run_job(
+                &this.cfg,
+                &this.client,
+                job_for_build,
+                cancel_for_build,
+                active_pkgbases,
+            )
+            .await
         })
         .await;
 
@@ -123,6 +140,7 @@ impl Runner {
 
         self.report_completion(build_id, &report).await;
         self.active.lock().await.remove(&build_id);
+        self.active_pkgbases.lock().await.remove(&pkgbase);
     }
 
     /// Send the terminal completion, retrying briefly so a transient network

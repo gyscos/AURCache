@@ -49,20 +49,33 @@ dump_logs_on_failure() {
 
 cleanup() {
     local exit_code=$?
-    if [ "$exit_code" -ne 0 ] && [ "${CLEANUP:-1}" != "1" ]; then
-        echo "=== Test failed (exit $exit_code): leaving containers up for debugging ==="
+    # Cleanup policy:
+    #   CLEANUP=1  -> always tear down (even on failure; e.g. CI)
+    #   CLEANUP=0  -> never tear down
+    #   CLEANUP unset (default): tear down on success, PRESERVE on failure so a
+    #                            failed run can be debugged.
+    local do_cleanup
+    if [ "${CLEANUP:-}" = "1" ]; then
+        do_cleanup=1
+    elif [ "${CLEANUP:-}" = "0" ]; then
+        do_cleanup=0
+    elif [ "$exit_code" -eq 0 ]; then
+        do_cleanup=1
+    else
+        do_cleanup=0
+    fi
+
+    if [ "$do_cleanup" = "0" ]; then
+        echo "=== Leaving containers up (exit $exit_code) ==="
         echo "    Logs: dc logs   (compose file: $COMPOSE_FILE)"
         echo "    Full logs saved to: $LOG_FILE"
         echo "    Clean up with: docker compose -f '$COMPOSE_FILE' down -v --remove-orphans"
         return
     fi
-    if [ "${CLEANUP:-1}" = "1" ]; then
-        log "=== Cleaning up ==="
-        # Named volumes make cleanup trivial and root-owned-file-proof.
-        dc down -v --remove-orphans -t 10 2>/dev/null || true
-    else
-        log "=== Skipping cleanup (CLEANUP=0) ==="
-    fi
+
+    log "=== Cleaning up ==="
+    # Named volumes make cleanup trivial and root-owned-file-proof.
+    dc down -v --remove-orphans -t 10 2>/dev/null || true
 }
 
 wait_for_service() {

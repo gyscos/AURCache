@@ -13,9 +13,21 @@ use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus,
 };
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use reqwest::{Certificate, Client, Identity, StatusCode};
+use std::time::Duration;
 
 use crate::identity::spki_fingerprint;
+
+/// How long to wait for a TCP+TLS connection to establish before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Inactivity timeout while reading a response body. A silently stalled
+/// connection trips this well before the lease TTL (default 60s), so the
+/// worker's lease self-abort watchdog is never defeated by a hung socket.
+/// This is a per-read idle timeout, not a total-request deadline, so it does
+/// not break legitimately slow large source downloads / artifact uploads.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A configured protocol client bound to a base URL.
 pub struct WorkerClient {
@@ -29,6 +41,8 @@ pub struct WorkerClient {
 pub async fn fetch_and_pin_ca(base: &str, pin: Option<&str>) -> Result<String> {
     let insecure = Client::builder()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .build()
         .context("building bootstrap client")?;
 
@@ -93,43 +107,10 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
 /// Note: [`spki_fingerprint`] simply hashes the bytes it is given, so passing
 /// the full cert DER yields the certificate fingerprint.
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    // Standard base64 alphabet decoder (no external dep).
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let mut buf = [0u8; 4];
-        let mut pad = 0;
-        for (i, &c) in chunk.iter().enumerate() {
-            if c == b'=' {
-                pad += 1;
-                buf[i] = 0;
-            } else {
-                buf[i] = val(c).context("invalid base64 character")?;
-            }
-        }
-        let n = (u32::from(buf[0]) << 18)
-            | (u32::from(buf[1]) << 12)
-            | (u32::from(buf[2]) << 6)
-            | u32::from(buf[3]);
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
-        }
-    }
-    Ok(out)
+    let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    STANDARD
+        .decode(cleaned.as_bytes())
+        .context("invalid base64 in PEM body")
 }
 
 impl WorkerClient {
@@ -140,6 +121,8 @@ impl WorkerClient {
         let http = Client::builder()
             .use_rustls_tls()
             .add_root_certificate(ca)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .context("building enrollment client")?;
         Ok(Self {
@@ -159,6 +142,8 @@ impl WorkerClient {
             .use_rustls_tls()
             .add_root_certificate(ca)
             .identity(identity)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .context("building authenticated client")?;
         Ok(Self {

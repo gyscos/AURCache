@@ -77,12 +77,21 @@ class WorkersScreen extends StatelessWidget {
   }
 }
 
-class WorkersTable extends ConsumerWidget {
+class WorkersTable extends ConsumerStatefulWidget {
   const WorkersTable({super.key, required this.data});
   final List<Worker> data;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<WorkersTable> createState() => _WorkersTableState();
+}
+
+class _WorkersTableState extends ConsumerState<WorkersTable> {
+  /// Worker ids with an approve/revoke request currently in flight. Their
+  /// buttons are disabled to prevent double-tap races.
+  final Set<int> _pending = {};
+
+  @override
+  Widget build(BuildContext context) {
     return DataTable(
       horizontalMargin: 12,
       columnSpacing: defaultPadding,
@@ -102,16 +111,14 @@ class WorkersTable extends ConsumerWidget {
           DataColumn(label: Skeleton.keep(child: const Text("Last Seen"))),
         DataColumn(label: Skeleton.keep(child: const Text("Action"))),
       ],
-      rows: data
-          .map((e) => buildDataRow(e, context, ref))
+      rows: widget.data
+          .map((e) => buildDataRow(e, context))
           .toList(growable: false),
     );
   }
 
-  DataRow buildDataRow(Worker worker, BuildContext context, WidgetRef ref) {
-    final arches = worker.emulated_arches.isEmpty
-        ? worker.native_arches
-        : "${worker.native_arches} (+${worker.emulated_arches})";
+  DataRow buildDataRow(Worker worker, BuildContext context) {
+    final arches = _formatArches(worker);
 
     return DataRow(
       cells: [
@@ -123,12 +130,21 @@ class WorkersTable extends ConsumerWidget {
           ),
         ),
         DataCell(_statusChip(worker.status)),
-        DataCell(Text(arches.isEmpty ? "-" : arches)),
+        DataCell(Text(arches)),
         if (context.desktop) DataCell(Text(worker.version ?? "-")),
         if (context.desktop) DataCell(Text(_formatLastSeen(worker.last_seen))),
-        DataCell(_actionButtons(worker, ref)),
+        DataCell(_actionButtons(worker)),
       ],
     );
+  }
+
+  static String _formatArches(Worker worker) {
+    final native = worker.native_arches.trim();
+    final emulated = worker.emulated_arches.trim();
+    if (native.isEmpty && emulated.isEmpty) return "-";
+    if (emulated.isEmpty) return native;
+    if (native.isEmpty) return "(+$emulated)";
+    return "$native (+$emulated)";
   }
 
   Widget _statusChip(String status) {
@@ -147,7 +163,8 @@ class WorkersTable extends ConsumerWidget {
     );
   }
 
-  Widget _actionButtons(Worker worker, WidgetRef ref) {
+  Widget _actionButtons(Worker worker) {
+    final busy = _pending.contains(worker.id);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -155,24 +172,28 @@ class WorkersTable extends ConsumerWidget {
           _actionButton(
             label: "Approve",
             color: const Color(0xFF0A6900),
-            onPressed: () => _run(
-              ref,
-              () => API.approveWorker(worker.id),
-              "worker approved",
-              "Failed to approve worker!",
-            ),
+            onPressed: busy
+                ? null
+                : () => _run(
+                      worker.id,
+                      () => API.approveWorker(worker.id),
+                      "worker approved",
+                      "Failed to approve worker!",
+                    ),
           ),
         if (!worker.isApproved && !worker.isRevoked) const SizedBox(width: 8),
         if (!worker.isRevoked)
           _actionButton(
             label: "Revoke",
             color: const Color(0xFF900A0A),
-            onPressed: () => _run(
-              ref,
-              () => API.revokeWorker(worker.id),
-              "worker revoked",
-              "Failed to revoke worker!",
-            ),
+            onPressed: busy
+                ? null
+                : () => _run(
+                      worker.id,
+                      () => API.revokeWorker(worker.id),
+                      "worker revoked",
+                      "Failed to revoke worker!",
+                    ),
           ),
       ],
     );
@@ -181,7 +202,7 @@ class WorkersTable extends ConsumerWidget {
   Widget _actionButton({
     required String label,
     required Color color,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
   }) {
     return OutlinedButton(
       style: OutlinedButton.styleFrom(
@@ -201,11 +222,13 @@ class WorkersTable extends ConsumerWidget {
   }
 
   Future<void> _run(
-    WidgetRef ref,
+    int workerId,
     Future<bool> Function() action,
     String successMessage,
     String errorMessage,
   ) async {
+    if (_pending.contains(workerId)) return;
+    setState(() => _pending.add(workerId));
     try {
       await action();
       toastification.show(
@@ -219,6 +242,8 @@ class WorkersTable extends ConsumerWidget {
         autoCloseDuration: const Duration(seconds: 5),
         type: ToastificationType.error,
       );
+    } finally {
+      if (mounted) setState(() => _pending.remove(workerId));
     }
     ref.invalidate(listWorkersProvider);
   }
