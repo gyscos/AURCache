@@ -84,6 +84,14 @@ class SideMenu extends StatelessWidget {
                             context.go("/activities");
                           },
                         ),
+                        DrawerListTile(
+                          title: "Workers",
+                          icon: Icons.dns,
+                          active: activeUri.startsWith("/workers"),
+                          press: () {
+                            context.go("/workers");
+                          },
+                        ),
                       ],
                     ),
                   ],

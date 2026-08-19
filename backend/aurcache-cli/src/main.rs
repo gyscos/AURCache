@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use aurcache_client::{
     AddPackageRequest, AddPackageSource, AurCacheClient, Build, ExtendedPackage, GraphDataPoint,
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
-    SimplePackage, UpdatePackageRequest, UserInfo,
+    SimplePackage, UpdatePackageRequest, UserInfo, Worker,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -79,6 +79,11 @@ enum Command {
         #[command(subcommand)]
         command: BuildsCommand,
     },
+    /// Manage remote build workers.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
     /// Call an arbitrary API path.
     Raw(RawArgs),
 }
@@ -87,6 +92,22 @@ enum Command {
 enum TokenCommand {
     /// Regenerate the currently authenticated user's API token.
     Regenerate,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum WorkerCommand {
+    /// List enrolled remote build workers.
+    List,
+    /// Approve a pending worker so it can build.
+    Approve {
+        /// Worker id.
+        id: i32,
+    },
+    /// Revoke a worker, immediately refusing its certificate.
+    Revoke {
+        /// Worker id.
+        id: i32,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -328,6 +349,7 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Config { .. } => unreachable!("config commands are handled before client setup"),
         Command::Pkg { command } => run_packages_command(client, format, command).await,
         Command::Builds { command } => run_builds_command(client, format, command).await,
+        Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
     }
 }
@@ -456,6 +478,18 @@ async fn run_builds_command(
         BuildsCommand::Retry { id } => retry_build_command(client, format, id).await,
         BuildsCommand::Cancel { id } => cancel_build_command(client, format, id).await,
         BuildsCommand::Delete { id } => delete_build_command(client, format, id).await,
+    }
+}
+
+async fn run_worker_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    command: WorkerCommand,
+) -> Result<()> {
+    match command {
+        WorkerCommand::List => render_workers_list(client, format).await,
+        WorkerCommand::Approve { id } => approve_worker_command(client, format, id).await,
+        WorkerCommand::Revoke { id } => revoke_worker_command(client, format, id).await,
     }
 }
 
@@ -787,6 +821,79 @@ fn print_done_message(format: OutputFormat, message: &str) -> Result<()> {
         println!("{message}");
     }
     Ok(())
+}
+
+async fn render_workers_list(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
+    let workers = client.list_workers().await?;
+    match format {
+        OutputFormat::Json => print_json(&workers),
+        OutputFormat::Text => {
+            print_worker_list(&workers);
+            Ok(())
+        }
+    }
+}
+
+async fn approve_worker_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    id: i32,
+) -> Result<()> {
+    client.approve_worker(id).await?;
+    print_done_message(format, &format!("worker {id} approved"))
+}
+
+async fn revoke_worker_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    id: i32,
+) -> Result<()> {
+    client.revoke_worker(id).await?;
+    print_done_message(format, &format!("worker {id} revoked"))
+}
+
+fn print_worker_list(workers: &[Worker]) {
+    let rows = workers
+        .iter()
+        .map(|w| {
+            let fp = if w.cert_fingerprint.len() > 16 {
+                format!("{}…", &w.cert_fingerprint[..16])
+            } else {
+                w.cert_fingerprint.clone()
+            };
+            vec![
+                w.id.to_string(),
+                w.name.clone(),
+                w.status.clone(),
+                if w.native_arches.is_empty() {
+                    "-".to_string()
+                } else {
+                    w.native_arches.clone()
+                },
+                if w.emulated_arches.is_empty() {
+                    "-".to_string()
+                } else {
+                    w.emulated_arches.clone()
+                },
+                w.version.clone().unwrap_or_else(|| "-".to_string()),
+                format_timestamp(w.last_seen),
+                fp,
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &[
+            "id",
+            "name",
+            "status",
+            "native",
+            "emulated",
+            "version",
+            "last_seen",
+            "fingerprint",
+        ],
+        &rows,
+    );
 }
 
 fn parse_json_body(body: &str) -> Result<Value> {

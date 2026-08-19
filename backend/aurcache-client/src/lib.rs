@@ -204,6 +204,30 @@ pub struct Build {
     pub platform: String,
 }
 
+/// Remote build worker record returned by the worker-admin endpoints.
+///
+/// Mirrors the server's `workers` row; extra fields (signed certificate, etc.)
+/// are ignored on decode as they are not needed for CLI/UI management.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Worker {
+    /// Internal worker id.
+    pub id: i32,
+    /// Operator-facing worker name reported at enrollment.
+    pub name: String,
+    /// Enrollment status: `pending`, `approved`, or `revoked`.
+    pub status: String,
+    /// SHA-256 fingerprint of the worker's certificate/CSR (stable identity).
+    pub cert_fingerprint: String,
+    /// Comma-separated architectures the worker builds natively.
+    pub native_arches: String,
+    /// Comma-separated architectures the worker can build via emulation.
+    pub emulated_arches: String,
+    /// Unix seconds of the last heartbeat/contact, if ever seen.
+    pub last_seen: Option<i64>,
+    /// Worker software version reported at enrollment/heartbeat.
+    pub version: Option<String>,
+}
+
 /// Request payload for adding a package to AURCache.
 #[derive(Debug, Serialize)]
 pub struct AddPackageRequest {
@@ -436,6 +460,24 @@ impl AurCacheClient {
     /// Deletes the given build record.
     pub async fn delete_build(&self, id: i32) -> Result<()> {
         self.request_empty::<Value>(Method::DELETE, &format!("/build/{id}"), &[], None)
+            .await
+    }
+
+    /// Lists all enrolled remote build workers and their status.
+    pub async fn list_workers(&self) -> Result<Vec<Worker>> {
+        self.request_json::<Vec<Worker>, Value>(Method::GET, "/workers", &[], None)
+            .await
+    }
+
+    /// Approves a pending worker, signing its CSR so it can build.
+    pub async fn approve_worker(&self, id: i32) -> Result<()> {
+        self.request_empty::<Value>(Method::POST, &format!("/workers/{id}/approve"), &[], None)
+            .await
+    }
+
+    /// Revokes a worker, immediately refusing its certificate on the next call.
+    pub async fn revoke_worker(&self, id: i32) -> Result<()> {
+        self.request_empty::<Value>(Method::POST, &format!("/workers/{id}/revoke"), &[], None)
             .await
     }
 

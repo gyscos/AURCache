@@ -446,9 +446,22 @@ Its native-arch jobs are prioritized to it.
 
 ## Frontend & CLI
 
-- Frontend **Workers** page: approve/revoke, arch, status, last-seen; show which
-  worker built each build; backend indicates worker connectivity.
-- `aurcache-cli`: `worker list | approve | revoke`.
+Both surfaces consume the plain-HTTP worker **admin** endpoints on `:8080`
+(`GET /api/workers`, `POST /api/workers/{id}/approve`, `.../revoke`) — no client
+cert needed (those are only for the worker *protocol* on `:8083`).
+
+- **CLI** (`aurcache-cli`): `worker list | approve <id> | revoke <id>`.
+  `list` renders a table (id, name, status, native/emulated arches, version,
+  last-seen, truncated fingerprint) or JSON with `--format json`. Backed by
+  `AurCacheClient::{list_workers,approve_worker,revoke_worker}` +
+  `aurcache_client::Worker`.
+- **Frontend Workers page** (`lib/screens/workers_screen.dart`, route `/workers`,
+  side-menu "Workers"): a live-refreshing (10s) table showing name (fingerprint
+  on hover), a colored status chip (pending/approved/revoked), arches, version
+  and relative last-seen, with inline **Approve**/**Revoke** buttons that toast
+  and refresh. Uses a hand-written model/provider (`models/worker.dart`,
+  `providers/workers.dart`, `api/workers.dart`) so it needs no `build_runner`
+  codegen.
 
 ---
 
