@@ -1,6 +1,6 @@
 use crate::logger::init_logger;
 use crate::startup::{post_startup_tasks, pre_startup_tasks};
-use aurcache_api::init::{init_api, init_repo};
+use aurcache_api::init::{init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::init::init_db;
 use aurcache_scheduler::auto_update::start_auto_update_job;
@@ -61,7 +61,8 @@ async fn main() {
     // Reclaim build jobs whose remote worker went silent (lease liveness).
     let lease_reaper_handle = start_lease_reaper(db.clone());
 
-    let api_handle = init_api(db, tx, ca);
+    let api_handle = init_api(db.clone(), tx);
+    let worker_api_handle = init_worker_api(db, ca);
     let repo_handle = init_repo();
 
     tokio::select! {
@@ -79,6 +80,9 @@ async fn main() {
         }
         _ = api_handle => {
             warn!("API web server handle exited");
+        }
+        _ = worker_api_handle => {
+            warn!("Worker protocol listener exited");
         }
     }
 }

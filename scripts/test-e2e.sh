@@ -1,234 +1,173 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${1?Usage: E2E_MODE=host|dind $0 <package> [port] [timeout]}"
+# End-to-end test for the remote-worker architecture.
+#
+# Brings up the AURCache server + one real privileged build worker (see
+# docker-compose.e2e.yaml), then: requests a package, waits for the worker to
+# enroll/approve, waits for the build to finish, and finally installs the built
+# package from the repo in a throwaway container. Single mode only.
+#
+#   ./scripts/test-e2e.sh <package> [port] [timeout]
+
+: "${1?Usage: $0 <package> [port] [timeout]}"
 PACKAGE="$1"
 export AURCACHE_PORT="${2:-8080}"
 export AURCACHE_MIRROR_PORT=$((AURCACHE_PORT + 1))
-BUILD_TIMEOUT="${3:-300}"
-
-# Build mode: "dind" (default) uses an internal Podman inside a privileged
-# container; "host" mounts the host Docker socket instead.
-E2E_MODE="${E2E_MODE:-dind}"
+export AURCACHE_WORKER_PORT=$((AURCACHE_PORT + 3))
+BUILD_TIMEOUT="${3:-600}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
+
+# The human-facing API is plain HTTP now (worker mTLS lives on its own port), so
+# the CLI needs no TLS to talk to it.
 export AURCACHE_URL="http://localhost:$AURCACHE_PORT/api"
 export AURCACHE_TOKEN="${AURCACHE_TOKEN:-}"
 
-# A clean slate for each new test.
-export TEMP_DIR=$(mktemp -d)
-LOG_FILE="$TEMP_DIR/e2e-full.log"
-echo "Using temp dir $TEMP_DIR (mode: $E2E_MODE)"
-echo "Full service logs (all containers, all output) will be saved to: $LOG_FILE"
-
-# These are mounted by docker-compose
-BUILD_DIR="$TEMP_DIR/builds"
-
-# These will be picked up by docker-compose
+COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e.yaml"
+LOG_FILE="$(mktemp -t aurcache-e2e-XXXXXX.log)"
 
 # =============================================================================
-# Helper Functions
+# Helpers
 # =============================================================================
 
-log() {
-    echo "[$(date '+%H:%M:%S')] $*"
-}
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
-# Dumps full multi-service logs (with timestamps) to $LOG_FILE for later
-# inspection, and prints only the aurcache service's own log lines to the
-# console (the ones almost always relevant for triage) so failures aren't
-# swamped by noisy registry/build-tool chatter.
+dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
+
+aurcache_cli() { "$CLI_BIN" "$@"; }
+
 dump_logs_on_failure() {
     dc logs -t > "$LOG_FILE" 2>&1 || true
     echo "--- aurcache service logs (tail; full multi-service logs in $LOG_FILE) ---"
-    dc logs aurcache 2>&1 | tail -n 200
-}
-
-
-aurcache_cli() {
-    "$CLI_BIN" "$@"
-}
-
-wait_for_service() {
-    log "=== Waiting for AURCache to be ready ==="
-    local max_attempts=30
-    local delay=2
-
-    for i in $(seq 1 "$max_attempts"); do
-        if aurcache_cli health > /dev/null 2>&1; then
-            echo "    AURCache is ready"
-            return 0
-        fi
-        if [ "$i" -eq "$max_attempts" ]; then
-            return 1
-        fi
-        sleep "$delay"
-    done
-}
-
-dc() {
-    docker compose -f docker-compose.e2e.$E2E_MODE.yaml "$@"
-}
-
-# =============================================================================
-# Setup Functions
-# =============================================================================
-
-setup_directories() {
-    mkdir -p "$TEMP_DIR"/{builds,repo,db,downloads,config/pacman_x86_64}
-    chmod 777 "$TEMP_DIR"/{builds,repo,db,downloads}
-
-    # The build config expects mirrorlist at TEMP_DIR/config/pacman_x86_64/mirrorlist
-    echo "Server = https://mirror.rackspace.com/archlinux/\$repo/os/\$arch" > "$TEMP_DIR/config/pacman_x86_64/mirrorlist"
+    dc logs aurcache 2>&1 | tail -n 150
+    echo "--- builder (worker) logs (tail) ---"
+    dc logs builder 2>&1 | tail -n 150
 }
 
 cleanup() {
     local exit_code=$?
-    if [ "$exit_code" -ne 0 ] && [ -z "${CLEANUP:-}" ]; then
-        # Auto-preserve on failure unless the caller explicitly set CLEANUP.
-        echo "=== Test failed (exit $exit_code): leaving containers/temp dir up for debugging ==="
-        echo "    Inspect with: docker compose -f docker-compose.e2e.$E2E_MODE.yaml logs aurcache"
+    if [ "$exit_code" -ne 0 ] && [ "${CLEANUP:-1}" != "1" ]; then
+        echo "=== Test failed (exit $exit_code): leaving containers up for debugging ==="
+        echo "    Logs: dc logs   (compose file: $COMPOSE_FILE)"
         echo "    Full logs saved to: $LOG_FILE"
-        echo "    Temp dir: $TEMP_DIR"
-        echo "    When done, clean up with: docker compose -f docker-compose.e2e.$E2E_MODE.yaml down --remove-orphans && rm -rf '$TEMP_DIR'"
+        echo "    Clean up with: docker compose -f '$COMPOSE_FILE' down -v --remove-orphans"
         return
     fi
-
     if [ "${CLEANUP:-1}" = "1" ]; then
         log "=== Cleaning up ==="
-        dc down --remove-orphans -t 10 2>/dev/null || true
-        # Note: some of the files there were written by root in a docker container.
-        # So we're not legally allowed to touch them. But we can use the same docker trick to do that.
-        # We need to mount TEMP_DIR's parent to properly remove the folder itself.
-        TEMP_PARENT=$(dirname "$TEMP_DIR")
-        docker run --rm -v "$TEMP_PARENT:$TEMP_PARENT" archlinux bash -c " rm -rf '$TEMP_DIR' "
+        # Named volumes make cleanup trivial and root-owned-file-proof.
+        dc down -v --remove-orphans -t 10 2>/dev/null || true
     else
         log "=== Skipping cleanup (CLEANUP=0) ==="
     fi
 }
 
-start_docker_services() {
-    log "=== Starting Docker services ==="
-    dc up -d registry
-    sleep 2
-
-    echo "=== Building AURCache CLI ==="
-    (
-        cd "$PROJECT_DIR/backend"
-        cargo build -q -p aurcache-cli
-    )
-
-    echo "=== Building and pushing builder image ==="
-    docker build -q -t localhost:5000/aurcache-builder:test -f docker/builder.Dockerfile --push .
-
-    log "=== Building and starting AURCache ==="
-    dc build -q aurcache && dc up -d aurcache
+wait_for_service() {
+    log "=== Waiting for AURCache API to be ready ==="
+    for i in $(seq 1 60); do
+        if aurcache_cli health > /dev/null 2>&1; then
+            echo "    AURCache is ready"
+            return 0
+        fi
+        [ "$i" -eq 60 ] && return 1
+        sleep 2
+    done
 }
 
-configure_aurcache_registry() {
-    # Only needed in DinD mode: aurcache runs Podman internally and the
-    # registry is reachable by its Docker Compose service name, not localhost.
-    if [ "$E2E_MODE" != "dind" ]; then
-        return
-    fi
-    log "=== Configuring AURCache registry ==="
-    docker exec -i aurcache-aurcache-1 bash -c "cat > /etc/containers/registries.conf.d/registry.conf" << 'EOF'
-[[registry]]
-prefix = "registry:5000"
-location = "registry:5000"
-insecure = true
-EOF
-}
-
-prepare() {
-    start_docker_services
-
-    wait_for_service || { dump_logs_on_failure; exit 1; }
-
-    configure_aurcache_registry
+wait_for_worker() {
+    log "=== Waiting for a worker to enroll and be approved ==="
+    # OAuth is disabled in this setup, so /api/workers is readable without auth.
+    for i in $(seq 1 60); do
+        local approved
+        approved=$(curl -fsS "http://localhost:$AURCACHE_PORT/api/workers" 2>/dev/null \
+            | jq -r '[.[] | select(.status == "approved")] | length' 2>/dev/null || echo 0)
+        if [ "${approved:-0}" -ge 1 ]; then
+            echo "    Worker approved and connected"
+            return 0
+        fi
+        [ "$i" -eq 60 ] && { log "ERROR: no worker approved in time"; return 1; }
+        sleep 2
+    done
 }
 
 # =============================================================================
-# Build trigger function
+# Steps
 # =============================================================================
+
+build_and_start() {
+    log "=== Building AURCache CLI ==="
+    ( cd "$PROJECT_DIR/backend" && cargo build -q -p aurcache-cli )
+
+    log "=== Building images (server + worker) ==="
+    dc build
+
+    log "=== Starting services ==="
+    dc up -d
+}
 
 request_package() {
     log "=== Adding package: $PACKAGE ==="
-    # We're starting from a fresh DB every time, so we know it'll be a new package.
-    # If we reused the DB test after test we'd need to delete the package before adding it again.
     if ! aurcache_cli pkg add aur "$PACKAGE" --platform x86_64; then
         echo "ERROR: Package request failed"
-        dc logs
+        dump_logs_on_failure
         exit 1
     fi
-    log "    Package request accepted (HTTP $HTTP_STATUS)"
 
     log "=== Waiting for build to complete (timeout: ${BUILD_TIMEOUT}s) ==="
-    local START_TIME
-    START_TIME=$(date +%s)
+    local start_time
+    start_time=$(date +%s)
     while true; do
-        local ELAPSED
-        ELAPSED=$(($(date +%s) - START_TIME))
-        if [ $ELAPSED -gt "$BUILD_TIMEOUT" ]; then
+        local elapsed
+        elapsed=$(($(date +%s) - start_time))
+        if [ "$elapsed" -gt "$BUILD_TIMEOUT" ]; then
             log "ERROR: Build timed out after ${BUILD_TIMEOUT}s"
-            # Show what we can to understand what went wrong.
             dump_logs_on_failure
             exit 1
         fi
 
-        local RESPONSE
-        RESPONSE=$(aurcache_cli --format json pkg list --limit 100)
-        local BUILD_STATUS
-        BUILD_STATUS=$(echo "$RESPONSE" | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "not_found")
+        local status
+        status=$(aurcache_cli --format json pkg list --limit 100 \
+            | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "")
 
-        log "    Build status: $BUILD_STATUS (elapsed: ${ELAPSED}s)"
-
-        case "$BUILD_STATUS" in
+        log "    Build status: ${status:-<none>} (elapsed: ${elapsed}s)"
+        case "$status" in
             1)  log "    Build completed successfully"; break ;;
             2)  log "ERROR: Build failed"; dump_logs_on_failure; exit 1 ;;
-            null|"") log "Package not found yet"; sleep 5 ;;
             *)  sleep 5 ;;
         esac
     done
 }
 
-
-# =============================================================================
-# Validation Functions
-# =============================================================================
-
 validate() {
-    log "=== Validating built package ==="
-
-    # Try to install the package just like a user would.
+    log "=== Validating built package by installing it from the repo ==="
+    # Derive the actual compose network name from the running server container so
+    # this doesn't depend on the compose project name.
+    local net
+    net=$(dc ps -q aurcache | head -1 \
+        | xargs docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+    log "    Using network: $net"
     docker run --rm \
-        --network aurcache_aurcache_network \
+        --network "$net" \
         archlinux:latest \
         sh -e -c '
-            # First setup the repo we want to test
             cat >> /etc/pacman.conf << EOF
 [repo]
 SigLevel = Optional TrustAll
-Server = http://aurcache-aurcache-1:'${AURCACHE_MIRROR_PORT}'/\$arch
+Server = http://aurcache:8081/$arch
 EOF
-
-            echo "Updating test container"
             (
-                # Just making sure we are up-to-date
                 pacman-key --init
                 pacman-key --populate archlinux
-                # Need to install this first so we can validate other updates
                 pacman -Syq archlinux-keyring --noconfirm
                 pacman -Suq --noconfirm
-            ) 2>/dev/null >/dev/null
-
-            echo "Installing package"
-            pacman -S --noconfirm '$PACKAGE'
-            pacman -Qi '$PACKAGE'
+            ) >/dev/null 2>&1
+            echo "Installing '"$PACKAGE"'"
+            pacman -S --noconfirm '"$PACKAGE"'
+            pacman -Qi '"$PACKAGE"'
         '
-
     log "=== End-to-end test complete ==="
 }
 
@@ -238,7 +177,8 @@ EOF
 
 trap cleanup EXIT
 
-setup_directories
-prepare
+build_and_start
+wait_for_service   || { dump_logs_on_failure; exit 1; }
+wait_for_worker    || { dump_logs_on_failure; exit 1; }
 request_package
 validate

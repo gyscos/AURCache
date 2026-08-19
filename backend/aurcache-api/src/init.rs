@@ -66,14 +66,12 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
 }
 
 #[must_use]
-pub fn init_api(db: DatabaseConnection, tx: Sender<Action>, ca: aurcache_ca::Ca) -> JoinHandle<()> {
+pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let tls = worker_tls_config(&ca);
         let config = Config {
             address: "0.0.0.0".parse().unwrap(),
             port: aurcache_types::ports::AURCACHE_HTTP_PORT,
             secret_key: get_secret_key(),
-            tls,
             ..Default::default()
         };
 
@@ -130,12 +128,11 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>, ca: aurcache_ca::Ca)
         let mut rock = rocket::custom(config)
             .manage(db.clone())
             .manage(tx)
-            .manage(ca)
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
             .manage(SnapshotStore::new())
             .mount("/api/", build_api())
-            .mount("/api/", crate::worker::worker_routes())
+            .mount("/api/", crate::worker::worker_admin_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))
             .mount("/", Redoc::with_url("/redoc", ApiDoc::openapi()));
 
@@ -157,6 +154,51 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>, ca: aurcache_ca::Ca)
         match rock {
             Ok(_) => info!("Rocket shut down gracefully."),
             Err(err) => error!("Rocket had an error: {err}"),
+        }
+    })
+}
+
+/// Dedicated remote-worker protocol listener: HTTPS with **optional** mutual TLS
+/// on `AURCACHE_WORKER_PORT` (default 8083). Enrollment endpoints are reachable
+/// without a client certificate; job endpoints require an approved worker's
+/// certificate. This is intentionally separate from [`init_api`] so the
+/// human-facing API/UI need no TLS of their own (front them with a reverse proxy
+/// if desired) while worker mTLS is scoped to exactly this surface.
+///
+/// If a server certificate cannot be issued from the internal CA, the listener
+/// is not started and a warning is logged (workers will be unable to connect).
+#[must_use]
+pub fn init_worker_api(db: DatabaseConnection, ca: aurcache_ca::Ca) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(tls) = worker_tls_config(&ca) else {
+            error!("Worker TLS could not be configured; worker protocol listener disabled");
+            return;
+        };
+
+        let port = env::var("AURCACHE_WORKER_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(aurcache_types::ports::AURCACHE_WORKER_PORT);
+
+        let config = Config {
+            address: "0.0.0.0".parse().unwrap(),
+            port,
+            secret_key: get_secret_key(),
+            tls: Some(tls),
+            ..Default::default()
+        };
+
+        info!("Starting remote-worker mTLS protocol listener on port {port}");
+        let launch_result = rocket::custom(config)
+            .manage(db)
+            .manage(ca)
+            .manage(SnapshotStore::new())
+            .mount("/api/", crate::worker::worker_protocol_routes())
+            .launch()
+            .await;
+        match launch_result {
+            Ok(_) => info!("Worker protocol listener shut down gracefully."),
+            Err(err) => error!("Worker protocol listener had an error: {err}"),
         }
     })
 }

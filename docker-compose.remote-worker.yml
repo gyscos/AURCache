@@ -32,8 +32,8 @@ services:
     image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
     environment:
       - RUST_LOG=info
-      # Public URL of the AURCache server's API (mutual TLS).
-      - AURCACHE_URL=https://aurcache.example.com:8080
+      # Public URL of the AURCache server's worker protocol port (HTTPS + mutual TLS).
+      - AURCACHE_URL=https://aurcache.example.com:8083
       # Pin the server's CA (strongly recommended over the public internet).
       - AURCACHE_SERVER_CA_FINGERPRINT=REPLACE_WITH_SERVER_CA_SHA256
       # Native architecture(s) of this machine; foreign-arch jobs route here.

@@ -25,3 +25,10 @@ aurcache-types = { path = "../aurcache-types" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+aurcache-api = { path = "../aurcache-api" }
+aurcache-db = { path = "../aurcache-db" }
+aurcache-ca = { path = "../aurcache-ca" }
+aurcache-utils = { path = "../aurcache-utils" }
+sea-orm = { workspace = true }
+sea-orm-migration = { version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+zstd = "0.13.3"

@@ -78,10 +78,12 @@ RUN mkdir -p "$WORKER_DATA_DIR" "$WORKER_CHROOT_DIR" "$WORKER_CACHE_DIR" \
 COPY --from=builder /usr/local/bin/aurcache-worker /usr/local/bin/aurcache-worker
 # Wrapper so devtools' systemd-nspawn works without a systemd manager (see script).
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
+# Entrypoint fixes shared-enroll-volume ownership before dropping to the worker.
+COPY --chmod=0755 docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 
 USER builder
 WORKDIR /home/builder
 
 # Default: enroll and poll for jobs. Override the command for `build-once`.
-ENTRYPOINT ["/usr/local/bin/aurcache-worker"]
+ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
 CMD ["run"]

@@ -57,6 +57,16 @@ contents.
   Docker daemon — both are removed.
 - HTTP API + token auth on **:8080**; pacman repo served on **:8081**.
 
+> **Transport update (implemented):** the worker protocol runs on its **own
+> dedicated listener** — HTTPS + mutual TLS on a configurable port (default
+> **:8083**, `AURCACHE_WORKER_PORT`) — kept separate from the human/tooling HTTP
+> API on **:8080**. This means the UI/API/CLI stay plain HTTP and need no TLS of
+> their own (front them with a reverse proxy if you want TLS there), while the
+> machine-to-machine mTLS trust model is scoped to exactly the `/api/worker/*`
+> surface. The worker *admin* endpoints (`/api/workers`, approve/revoke) use
+> operator/session auth and therefore live on the **:8080** plane, not the mTLS
+> port.
+
 ---
 
 ## Target architecture
@@ -69,6 +79,7 @@ contents.
 │ POST /api/worker/jobs/{id}/logs   ◄──────│◄───────│  build in own devtools chroot      │
 │ POST /api/worker/jobs/{id}/artifacts ◄───│◄───────│  upload *.pkg.tar.*                │
 │ POST /api/worker/jobs/{id}/complete ◄────│◄───────│  report success/fail               │
+│ worker mTLS listener :8083 ──────────────│◄──────►│  (enroll + all job endpoints)      │
 │ repo_add + files table (server side)     │        │  heartbeat / honor cancel          │
 │ pacman repo server :8081 ────────────────│───────►│  pacman [repo] resolves deps       │
 └──────────────────────────────────────────┘        └────────────────────────────────────┘
@@ -144,10 +155,12 @@ certificate:
    `workers` row that must be `approved` (not `revoked`). Revocation is an instant
    DB check — no CRL.
 
-The `register`/`register/status`/`ca` endpoints run on the optional-mTLS listener
-(no client cert required); all job endpoints require a valid, approved client
-cert. This resolves the chicken-and-egg of needing a trusted cert before one
-exists.
+The `register`/`register/status`/`ca` endpoints run on the dedicated worker
+listener (`:8083`) with mutual TLS *optional* (no client cert required for
+enrollment); all job endpoints on that same listener require a valid, approved
+client cert. This resolves the chicken-and-egg of needing a trusted cert before
+one exists. The human/tooling HTTP API on `:8080` carries no client-cert logic
+at all.
 
 **Server identity for the worker** (anti-MITM during enrollment): the worker
 pins the server via `AURCACHE_SERVER_CA_FINGERPRINT` (from `GET /ca` or the
@@ -454,12 +467,16 @@ Single mode everywhere — the host/dind split is gone.
    `hello` in a chroot and installs it from the repo. Mirrors the bundled compose
    and doubles as a smoke test of the shipped setup.
 
-`scripts/test-e2e.sh`: remove `E2E_MODE`, the `dc()` mode arg, the `registry`
-service, builder-image build/push, `docker.sock`, and `configure_aurcache_registry`;
-add `wait_for_worker` (poll `aurcache-cli worker list` until approved+active).
-CI keeps `./scripts/test-e2e.sh hello`. Add `just e2e` / `just test`. Replace the
-obsolete `test-builder` binary/`test-builder.sh` with `aurcache-worker
-build-once`.
+`scripts/test-e2e.sh` (**done**): single mode against `docker-compose.e2e.yaml`
+— no `E2E_MODE`, no `dc()` mode arg, no `registry` service, no builder-image
+build/push, no `docker.sock`. It builds the server + worker images, brings the
+stack up, waits for the API (plain HTTP `:8080`) and for a worker to enroll and
+auto-approve over mTLS (`:8083`) — `wait_for_worker` polls `/api/workers` until
+one reports `approved` — then requests the package, waits for the build, and
+installs it from the repo (`:8081`) in a throwaway container. Named volumes make
+teardown a plain `docker compose down -v`. CI keeps `./scripts/test-e2e.sh
+hello`. The obsolete `test-builder` binary/`test-builder.sh` are removed in
+favour of `aurcache-worker build-once`.
 
 ---
 

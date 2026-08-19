@@ -1,4 +1,4 @@
-name: Make helper containers
+name: Publish worker image
 on:
   workflow_dispatch:
   schedule:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    name: Build AUR enabled Arch containers
+    name: Build multi-arch AURCache worker image
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -32,12 +32,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       -
-        name: Build paru container
+        name: Build worker container
         uses: docker/build-push-action@v7
         with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/riscv64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           context: .
-          file: ./docker/builder.Dockerfile
+          file: ./docker/worker.Dockerfile
           tags: |
-            ghcr.io/lukas-heiligenbrunner/aurcache-builder:latest
+            ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest

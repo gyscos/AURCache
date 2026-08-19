@@ -651,12 +651,18 @@ name = "aurcache-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aurcache-api",
+ "aurcache-ca",
+ "aurcache-db",
  "aurcache-types",
+ "aurcache-utils",
  "clap",
  "flate2",
  "hex",
  "rcgen",
  "reqwest",
+ "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -665,6 +671,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

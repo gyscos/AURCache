@@ -11,7 +11,7 @@
 # no token and no manual approval are needed. Within a few seconds the worker
 # logs that it is connected and starts polling for build jobs.
 #
-# Web UI / API : https://localhost:8080  (self-signed cert — accept the warning)
+# Web UI / API : http://localhost:8080   (plain HTTP; put a reverse proxy in front for TLS)
 # Pacman repo  : http://localhost:8081   (add as a [repo] Server in pacman.conf)
 #
 # To scale local build throughput, raise WORKER_CONCURRENCY or run more workers:
@@ -29,8 +29,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     ports:
-      - "8080:8080"   # Web UI + API (mutual TLS; workers authenticate here)
+      - "8080:8080"   # Web UI + API (plain HTTP; front with a reverse proxy for TLS)
       - "8081:8081"   # Pacman repository (plain HTTP, for `pacman -Sy`)
+      - "8083:8083"   # Remote-worker protocol (HTTPS + mutual TLS)
     environment:
       - LOG_LEVEL=info
       # The server's TLS certificate must be valid for the hostname the worker
@@ -64,7 +65,7 @@ services:
       - RUST_LOG=info
       # Reach the server over the internal network. mTLS host must match a SAN
       # in AURCACHE_TLS_SANS above.
-      - AURCACHE_URL=https://aurcache:8080
+      - AURCACHE_URL=https://aurcache:8083
       # Same shared volume as the server -> this worker is auto-approved. This is
       # also the worker's default path, shown here for clarity.
       - AURCACHE_ENROLLMENT_DIR=/enroll
@@ -117,7 +118,7 @@ services:
       - binfmt
     environment:
       - RUST_LOG=info
-      - AURCACHE_URL=https://aurcache:8080
+      - AURCACHE_URL=https://aurcache:8083
       - AURCACHE_ENROLLMENT_DIR=/enroll
       # This worker builds aarch64 natively (from the emulated container's POV).
       - WORKER_ARCHES=aarch64

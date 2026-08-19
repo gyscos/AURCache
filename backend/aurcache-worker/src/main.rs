@@ -4,24 +4,14 @@
 //! for build jobs, builds each package in its own `devtools` chroot, and uploads
 //! the results. See `design/remote-workers.md`.
 
-mod build;
-mod cache;
-mod chroot;
-mod client;
-mod config;
-mod enroll;
-mod identity;
-mod job;
-mod oneshot;
-mod runner;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
-use crate::config::Config;
-use crate::identity::Identity;
-use crate::runner::Runner;
+use aurcache_worker::config::Config;
+use aurcache_worker::identity::Identity;
+use aurcache_worker::runner::Runner;
+use aurcache_worker::{enroll, oneshot};
 
 #[derive(Parser)]
 #[command(name = "aurcache-worker", version, about)]
@@ -76,7 +66,23 @@ async fn main() -> Result<()> {
 
 async fn run(cfg: Arc<Config>) -> Result<()> {
     let identity = Identity::load_or_create(&cfg.data_dir)?;
-    let client = enroll::ensure_enrolled(&cfg, &identity).await?;
+
+    // The server may not be reachable yet (e.g. still starting in the same
+    // compose stack) or may briefly go away. Retry enrollment with backoff
+    // instead of crashing, so the worker is resilient to server restarts.
+    let client = loop {
+        match enroll::ensure_enrolled(&cfg, &identity).await {
+            Ok(client) => break client,
+            Err(e) => {
+                tracing::warn!(
+                    "Enrollment not complete ({e:#}); retrying in {}s",
+                    cfg.poll_interval
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(cfg.poll_interval)).await;
+            }
+        }
+    };
+
     let runner = Runner::new(cfg, Arc::new(client));
     runner.run().await
 }

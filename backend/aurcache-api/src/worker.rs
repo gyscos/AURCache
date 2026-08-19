@@ -113,9 +113,12 @@ impl<'r> FromRequest<'r> for WorkerAuth {
 #[openapi(paths(register_worker, register_status, get_ca, list_workers, approve_worker, revoke_worker))]
 pub struct WorkerApi;
 
-/// All worker-protocol and admin worker-management routes (mounted under `/api`).
+/// Remote-worker **protocol** routes (mounted under `/api` on the dedicated
+/// mTLS worker listener). Enrollment (`register`, `ca`, status) is reachable
+/// without a client certificate; all job endpoints require an approved
+/// worker's certificate.
 #[must_use]
-pub fn worker_routes() -> Vec<rocket::Route> {
+pub fn worker_protocol_routes() -> Vec<rocket::Route> {
     rocket::routes![
         register_worker,
         register_status,
@@ -128,10 +131,15 @@ pub fn worker_routes() -> Vec<rocket::Route> {
         complete_job,
         heartbeat,
         job_status,
-        list_workers,
-        approve_worker,
-        revoke_worker,
     ]
+}
+
+/// Worker **admin** routes (mounted under `/api` on the main HTTP API listener).
+/// These use operator/session authentication, not mTLS, so they live on the
+/// human-facing plane alongside the rest of the REST API and the web UI.
+#[must_use]
+pub fn worker_admin_routes() -> Vec<rocket::Route> {
+    rocket::routes![list_workers, approve_worker, revoke_worker,]
 }
 
 // ----------------------------------------------------------------------------
