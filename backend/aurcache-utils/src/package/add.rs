@@ -228,6 +228,9 @@ async fn finalize_package_add(
     Ok(pkgbase)
 }
 
+// Each argument is an independent input to the add flow (services, targeting,
+// source, patches); bundling them into a struct would only move the same list.
+#[allow(clippy::too_many_arguments)]
 pub async fn package_add_with_client(
     client: &aurcache_deps::AurClient,
     store: &SnapshotStore,

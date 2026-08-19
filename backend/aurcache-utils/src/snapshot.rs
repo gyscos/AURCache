@@ -823,9 +823,9 @@ license=('MIT')
     }
 
     fn some_patch(new_pkgver: &str) -> SourcePatch {
-        let original = format!(
-            "pkgname=bar\npkgver=1.0\npkgrel=1\narch=('x86_64')\ndepends=()\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n"
-        );
+        let original =
+            "pkgname=bar\npkgver=1.0\npkgrel=1\narch=('x86_64')\ndepends=()\nsource=()\nsha256sums=()\npackage() {\n  :\n}\n"
+                .to_string();
         let patched = original.replace("pkgver=1.0", &format!("pkgver={new_pkgver}"));
         let mut patch = SourcePatch::default();
         patch.merge_file("PKGBUILD", &original, &patched);

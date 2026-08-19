@@ -60,10 +60,8 @@ ALTER TABLE builds ADD attempt_count INTEGER NOT NULL DEFAULT 0;
                     "CREATE INDEX idx_builds_status_platform ON builds (status, platform);",
                 )
                 .await?;
-                db.execute_unprepared(
-                    "CREATE INDEX idx_builds_worker_id ON builds (worker_id);",
-                )
-                .await?;
+                db.execute_unprepared("CREATE INDEX idx_builds_worker_id ON builds (worker_id);")
+                    .await?;
             }
             DbBackend::Postgres => {
                 db.execute_unprepared(
@@ -109,10 +107,8 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
                     "CREATE INDEX idx_builds_status_platform ON builds (status, platform);",
                 )
                 .await?;
-                db.execute_unprepared(
-                    "CREATE INDEX idx_builds_worker_id ON builds (worker_id);",
-                )
-                .await?;
+                db.execute_unprepared("CREATE INDEX idx_builds_worker_id ON builds (worker_id);")
+                    .await?;
             }
             _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
         }
@@ -228,7 +224,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_status_defaults_to_pending() {        let db = Database::connect("sqlite::memory:").await.unwrap();
+    async fn worker_status_defaults_to_pending() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
         db.execute_unprepared(
@@ -260,9 +257,7 @@ mod tests {
             let row = db
                 .query_one(sea_orm::Statement::from_string(
                     db.get_database_backend(),
-                    format!(
-                        "SELECT name FROM sqlite_master WHERE type='index' AND name='{idx}'"
-                    ),
+                    format!("SELECT name FROM sqlite_master WHERE type='index' AND name='{idx}'"),
                 ))
                 .await
                 .unwrap();

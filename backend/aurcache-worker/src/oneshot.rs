@@ -34,12 +34,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .unwrap_or("local");
     let srcdest = cache.srcdest(pkgbase);
 
-    let argv = build::build_command(
-        &cfg.chroot_dir,
-        "build-once",
-        srcdest.as_deref(),
-        flags,
-    );
+    let argv = build::build_command(&cfg.chroot_dir, "build-once", srcdest.as_deref(), flags);
     tracing::info!("$ sudo {}", argv.join(" "));
 
     let status = chroot::devtools(&argv[0])

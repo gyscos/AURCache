@@ -98,8 +98,13 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
         .with_context(|| format!("creating gnupg home {}", gnupg_home.display()))?;
     for key in keys {
         let mut cmd = Command::new("gpg");
-        cmd.env("GNUPGHOME", gnupg_home)
-            .args(["--batch", "--keyserver", keyserver, "--recv-keys", key]);
+        cmd.env("GNUPGHOME", gnupg_home).args([
+            "--batch",
+            "--keyserver",
+            keyserver,
+            "--recv-keys",
+            key,
+        ]);
         match run_capture(cmd).await {
             Ok((_, status)) if status.success() => {
                 tracing::info!("imported pgp key {key}");

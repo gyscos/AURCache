@@ -125,8 +125,8 @@ impl Ca {
         let fingerprint = fingerprint_from_csr_pem(csr_pem)?;
         let (ca_cert, ca_key) = self.issuer()?;
 
-        let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)
-            .context("parsing worker CSR")?;
+        let mut csr =
+            CertificateSigningRequestParams::from_pem(csr_pem).context("parsing worker CSR")?;
         let not_after = OffsetDateTime::now_utc() + Duration::days(validity_days);
         csr.params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
         csr.params.not_after = not_after;
@@ -167,9 +167,7 @@ pub fn fingerprint_from_csr_pem(csr_pem: &str) -> anyhow::Result<String> {
     let der = pem_to_der(csr_pem)?;
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(&der)
         .map_err(|e| anyhow!("parsing CSR: {e}"))?;
-    Ok(sha256_hex(
-        csr.certification_request_info.subject_pki.raw,
-    ))
+    Ok(sha256_hex(csr.certification_request_info.subject_pki.raw))
 }
 
 fn serial_from_cert_pem(cert_pem: &str) -> anyhow::Result<String> {

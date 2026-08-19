@@ -247,9 +247,7 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                                 onChanged: (_) => setState(() {}),
                                 maxLines: null,
                                 textAlignVertical: TextAlignVertical.top,
-                                style: GoogleFonts.jetBrainsMono(
-                                  fontSize: 12,
-                                ),
+                                style: GoogleFonts.jetBrainsMono(fontSize: 12),
                                 decoration: const InputDecoration(
                                   border: InputBorder.none,
                                   isDense: true,

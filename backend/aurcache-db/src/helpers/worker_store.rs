@@ -125,10 +125,7 @@ pub async fn approve_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<worke
 }
 
 /// Revoke a worker: it is immediately refused at the auth guard.
-pub async fn revoke_worker<C: ConnectionTrait>(
-    db: &C,
-    id: i32,
-) -> Result<workers::Model, DbErr> {
+pub async fn revoke_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<workers::Model, DbErr> {
     let worker = Workers::find_by_id(id)
         .one(db)
         .await?
@@ -220,16 +217,20 @@ mod tests {
     #[tokio::test]
     async fn lookup_by_fingerprint() {
         let db = setup().await;
-        assert!(find_worker_by_fingerprint(&db, "missing")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            find_worker_by_fingerprint(&db, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
         register_worker(&db, "w1", "fp-x", "x86_64", "", "0.1.0")
             .await
             .unwrap();
-        assert!(find_worker_by_fingerprint(&db, "fp-x")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            find_worker_by_fingerprint(&db, "fp-x")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -79,10 +79,7 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
       _error = null;
     });
     try {
-      final content = await API.getSourceFile(
-        id: widget.packageId,
-        path: path,
-      );
+      final content = await API.getSourceFile(id: widget.packageId, path: path);
       _originalContent = content.originalContent;
       _patchError = content.patchError;
       _isPatched = content.patchedContent != null;
@@ -211,9 +208,9 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
                                     : Container(
                                         decoration: BoxDecoration(
                                           border: Border.all(
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .outline,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.outline,
                                           ),
                                         ),
                                         child: SingleChildScrollView(
@@ -273,10 +270,7 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
   }
 }
 
-Future<void> showPackageSourcePatchPopup(
-  BuildContext context,
-  int packageId,
-) {
+Future<void> showPackageSourcePatchPopup(BuildContext context, int packageId) {
   return showDialog(
     context: context,
     builder: (context) => PackageSourcePatchPopup(packageId: packageId),

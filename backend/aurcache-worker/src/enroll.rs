@@ -98,7 +98,6 @@ fn try_finish_enrollment(
         return Ok(None);
     };
     identity.store_signed(cert, ca)?;
-    let client =
-        WorkerClient::authenticated(&cfg.aurcache_url, ca, cert, &identity.key_pem())?;
+    let client = WorkerClient::authenticated(&cfg.aurcache_url, ca, cert, &identity.key_pem())?;
     Ok(Some(client))
 }

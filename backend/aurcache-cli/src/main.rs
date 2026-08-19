@@ -577,7 +577,11 @@ async fn add_package_command(
     if !args.patches.is_empty() && args.packages.len() > 1 {
         bail!("--patch can only be used when adding a single package");
     }
-    let git_entries = args.packages.iter().filter(|p| looks_like_git_url(p)).count();
+    let git_entries = args
+        .packages
+        .iter()
+        .filter(|p| looks_like_git_url(p))
+        .count();
     if git_entries > 0 && args.git_ref.is_none() {
         bail!("--ref is required when adding a git repository URL");
     }
@@ -667,7 +671,6 @@ fn read_patch_files(
     }
     Ok(Some(files))
 }
-
 
 async fn update_package_command(
     client: &AurCacheClient,
@@ -1260,4 +1263,3 @@ mod tests {
         assert!(!looks_like_git_url("lab.git"));
     }
 }
-

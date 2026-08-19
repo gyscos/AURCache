@@ -57,8 +57,8 @@ impl Identity {
 
     /// Generate a PEM certificate signing request for this identity.
     pub fn generate_csr(&self, name: &str) -> Result<String> {
-        let params = CertificateParams::new(vec![name.to_string()])
-            .context("building CSR params")?;
+        let params =
+            CertificateParams::new(vec![name.to_string()]).context("building CSR params")?;
         let csr = params
             .serialize_request(&self.key)
             .context("serializing CSR")?;
@@ -109,8 +109,8 @@ impl Identity {
 
 #[cfg(unix)]
 fn write_private(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

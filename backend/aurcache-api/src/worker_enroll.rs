@@ -60,7 +60,11 @@ pub fn parse_preapproved(raw: &str) -> Vec<String> {
 pub fn auto_approve_from_env(fingerprint: &str, provided_token: Option<&str>) -> bool {
     let has_csr = env::var("AURCACHE_ENROLLMENT_DIR")
         .ok()
-        .map(|dir| PathBuf::from(dir).join(format!("{fingerprint}.csr")).is_file())
+        .map(|dir| {
+            PathBuf::from(dir)
+                .join(format!("{fingerprint}.csr"))
+                .is_file()
+        })
         .unwrap_or(false);
 
     let preapproved = env::var("AURCACHE_PREAPPROVED_WORKERS")
@@ -96,8 +100,20 @@ mod tests {
 
     #[test]
     fn matching_token_grants_approval() {
-        assert!(eval_auto_approve("fp", Some("s3cret"), Some("s3cret"), &[], false));
-        assert!(!eval_auto_approve("fp", Some("wrong"), Some("s3cret"), &[], false));
+        assert!(eval_auto_approve(
+            "fp",
+            Some("s3cret"),
+            Some("s3cret"),
+            &[],
+            false
+        ));
+        assert!(!eval_auto_approve(
+            "fp",
+            Some("wrong"),
+            Some("s3cret"),
+            &[],
+            false
+        ));
         // No configured token -> a provided token never approves.
         assert!(!eval_auto_approve("fp", Some("s3cret"), None, &[], false));
         // Empty configured token is treated as unset.

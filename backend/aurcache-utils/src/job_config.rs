@@ -1,5 +1,5 @@
-use aurcache_types::settings::{ApplicationSettings, Setting};
 use crate::settings::general::SettingsTraits;
+use aurcache_types::settings::{ApplicationSettings, Setting};
 use sea_orm::DatabaseConnection;
 use std::path::{Path, PathBuf};
 
@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 /// that serves it. Overridable via `AURCACHE_MIRRORLIST_DIR` (default `./repo`).
 #[must_use]
 pub fn mirrorlist_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()),
-    )
+    PathBuf::from(std::env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()))
 }
 
 /// Build the makepkg.conf for a build.

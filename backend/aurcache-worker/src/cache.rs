@@ -138,10 +138,12 @@ fn dir_size(path: &Path) -> u64 {
 /// Replace path-unsafe characters so a pkgbase maps to a single directory.
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
-            c
-        } else {
-            '_'
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
+                c
+            } else {
+                '_'
+            }
         })
         .collect()
 }
@@ -209,8 +211,16 @@ mod tests {
     #[test]
     fn evicts_aged_entries() {
         let entries = vec![
-            CacheEntry { pkgbase: "old".into(), size: 10, last_used: t(100) },
-            CacheEntry { pkgbase: "fresh".into(), size: 10, last_used: t(1) },
+            CacheEntry {
+                pkgbase: "old".into(),
+                size: 10,
+                last_used: t(100),
+            },
+            CacheEntry {
+                pkgbase: "fresh".into(),
+                size: 10,
+                last_used: t(1),
+            },
         ];
         let evict = plan_eviction(&entries, 0, Duration::from_secs(50), now(), &[]);
         assert_eq!(evict, vec!["old".to_string()]);
@@ -219,9 +229,21 @@ mod tests {
     #[test]
     fn evicts_lru_over_size_budget() {
         let entries = vec![
-            CacheEntry { pkgbase: "a".into(), size: 100, last_used: t(30) },
-            CacheEntry { pkgbase: "b".into(), size: 100, last_used: t(20) },
-            CacheEntry { pkgbase: "c".into(), size: 100, last_used: t(10) },
+            CacheEntry {
+                pkgbase: "a".into(),
+                size: 100,
+                last_used: t(30),
+            },
+            CacheEntry {
+                pkgbase: "b".into(),
+                size: 100,
+                last_used: t(20),
+            },
+            CacheEntry {
+                pkgbase: "c".into(),
+                size: 100,
+                last_used: t(10),
+            },
         ];
         // Budget 250 → must drop the oldest (a).
         let evict = plan_eviction(&entries, 250, Duration::ZERO, now(), &[]);
@@ -230,9 +252,11 @@ mod tests {
 
     #[test]
     fn never_evicts_in_use() {
-        let entries = vec![
-            CacheEntry { pkgbase: "busy".into(), size: 1000, last_used: t(999) },
-        ];
+        let entries = vec![CacheEntry {
+            pkgbase: "busy".into(),
+            size: 1000,
+            last_used: t(999),
+        }];
         let evict = plan_eviction(
             &entries,
             10,
@@ -245,9 +269,11 @@ mod tests {
 
     #[test]
     fn disabled_budgets_evict_nothing() {
-        let entries = vec![
-            CacheEntry { pkgbase: "a".into(), size: 10_000, last_used: t(10_000) },
-        ];
+        let entries = vec![CacheEntry {
+            pkgbase: "a".into(),
+            size: 10_000,
+            last_used: t(10_000),
+        }];
         assert!(plan_eviction(&entries, 0, Duration::ZERO, now(), &[]).is_empty());
     }
 

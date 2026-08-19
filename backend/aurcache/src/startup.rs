@@ -74,7 +74,10 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     // todo arm mirrorlists unsupported for now!
     let mirrorlist_dir = mirrorlist_dir();
     if let Err(e) = fs::create_dir_all(&mirrorlist_dir).await {
-        warn!("Failed to create mirrorlist dir {}: {e}", mirrorlist_dir.display());
+        warn!(
+            "Failed to create mirrorlist dir {}: {e}",
+            mirrorlist_dir.display()
+        );
     }
     let mirrorlist_path = mirrorlist_dir.display().to_string();
     let mirrorlist_file = mirrorlist_dir.join("mirrorlist");

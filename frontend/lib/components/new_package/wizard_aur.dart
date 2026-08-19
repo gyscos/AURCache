@@ -10,8 +10,7 @@ class AurWizard extends StatefulWidget {
   final void Function(String) onSelect;
 
   /// Called when the accumulated edits (from [SourcePatchEditor]) change.
-  final void Function(Map<String, String>? patchedFiles)?
-  onPatchedFilesChanged;
+  final void Function(Map<String, String>? patchedFiles)? onPatchedFilesChanged;
 
   @override
   State<AurWizard> createState() => _AurWizardState();

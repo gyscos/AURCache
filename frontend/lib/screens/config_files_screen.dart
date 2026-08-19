@@ -269,7 +269,9 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
           Expanded(
             child: Container(
               decoration: BoxDecoration(
-                border: Border.all(color: Theme.of(context).colorScheme.outline),
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.outline,
+                ),
               ),
               child: SingleChildScrollView(
                 padding: const EdgeInsets.all(12),

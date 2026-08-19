@@ -146,7 +146,9 @@ impl Config {
             heartbeat_interval: env_opt("WORKER_HEARTBEAT_INTERVAL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15),
-            lease_ttl: env_opt("LEASE_TTL").and_then(|s| s.parse().ok()).unwrap_or(60),
+            lease_ttl: env_opt("LEASE_TTL")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
             poll_interval: env_opt("WORKER_POLL_INTERVAL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
@@ -188,10 +190,7 @@ mod tests {
     #[test]
     fn parses_arch_lists() {
         assert_eq!(parse_arches("x86_64"), vec!["x86_64"]);
-        assert_eq!(
-            parse_arches("aarch64, armv7h"),
-            vec!["aarch64", "armv7h"]
-        );
+        assert_eq!(parse_arches("aarch64, armv7h"), vec!["aarch64", "armv7h"]);
         assert_eq!(parse_arches("a b,c  d"), vec!["a", "b", "c", "d"]);
         assert!(parse_arches("  ,  ").is_empty());
     }

@@ -110,7 +110,10 @@ impl Runner {
         let build_id = job.build_id;
         let pkgbase = job.pkgbase.clone();
         let cancel = Arc::new(AtomicBool::new(false));
-        self.active.lock().await.insert(build_id, Arc::clone(&cancel));
+        self.active
+            .lock()
+            .await
+            .insert(build_id, Arc::clone(&cancel));
         // Register before building so this job's own SRCDEST (and every sibling's)
         // is protected from the cache GC that runs at each job's start.
         self.active_pkgbases.lock().await.insert(pkgbase.clone());
