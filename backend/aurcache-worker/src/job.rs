@@ -20,6 +20,12 @@ use crate::client::WorkerClient;
 use crate::config::Config;
 
 /// Run one job to completion and return its terminal report.
+///
+/// The per-job workspace is removed here rather than at the end of the happy
+/// path, so every early exit — source download, chroot prep, build failure,
+/// artifact upload — drops its extracted sources and partial artifacts too.
+/// Build ids are per-attempt, so a leaked workdir would never be reclaimed by a
+/// later retry and `WORKER_DATA_DIR/work/` would grow without bound.
 pub async fn run_job(
     cfg: &Config,
     client: &WorkerClient,
@@ -27,14 +33,26 @@ pub async fn run_job(
     cancel: Arc<AtomicBool>,
     active_pkgbases: Arc<Mutex<HashSet<String>>>,
 ) -> CompleteReport {
-    match run_job_inner(cfg, client, &job, &cancel, &active_pkgbases).await {
+    let workdir = cfg.data_dir.join("work").join(job.build_id.to_string());
+
+    let report = match run_job_inner(cfg, client, &job, &cancel, &active_pkgbases, &workdir).await {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("build setup failed: {e:#}");
-            let _ = client.append_log(job.build_id, &format!("\n[worker] {msg}\n")).await;
+            let _ = client
+                .append_log(job.build_id, &format!("\n[worker] {msg}\n"))
+                .await;
             build::setup_failure(msg)
         }
+    };
+
+    // Keep the shared caches and base chroot; only this job's tree goes.
+    if let Err(e) = tokio::fs::remove_dir_all(&workdir).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to clean workdir {}: {e}", workdir.display());
     }
+    report
 }
 
 async fn run_job_inner(
@@ -43,6 +61,7 @@ async fn run_job_inner(
     job: &JobDescriptor,
     cancel: &Arc<AtomicBool>,
     active_pkgbases: &Arc<Mutex<HashSet<String>>>,
+    workdir: &Path,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let cache = Cache::new(&cfg.cache_dir, cfg.cache_max_size, cfg.cache_ttl);
@@ -50,18 +69,29 @@ async fn run_job_inner(
     // Opportunistic cache GC (never blocks the build). Pin every pkgbase that is
     // currently building — not just this job's — so a concurrent sibling's
     // in-progress SRCDEST is never wiped out from under it.
+    //
+    // The scan recurses the whole srcdest tree (up to `cache_max_size`) with
+    // blocking `read_dir`/`metadata`, so it runs on the blocking pool: with
+    // `concurrency` jobs starting at once it would otherwise tie up that many
+    // runtime worker threads and stall heartbeats, claims, and log streaming.
     let in_use: Vec<String> = {
         let guard = active_pkgbases.lock().await;
         guard.iter().cloned().collect()
     };
-    cache.evict(&in_use);
+    {
+        let cache = cache.clone();
+        let _ = tokio::task::spawn_blocking(move || cache.evict(&in_use)).await;
+    }
 
     // 1. Fetch + extract source.
     log(client, build_id, "[worker] downloading source\n").await;
-    let source = client.source(build_id).await.context("downloading source")?;
-    let workdir = cfg.data_dir.join("work").join(build_id.to_string());
-    let _ = std::fs::remove_dir_all(&workdir);
-    let pkgdir = build::extract_source(&source, &workdir).context("extracting source")?;
+    let source = client
+        .source(build_id)
+        .await
+        .context("downloading source")?;
+    // Defensive: a crash mid-job could have left a tree behind under this id.
+    let _ = std::fs::remove_dir_all(workdir);
+    let pkgdir = build::extract_source(&source, workdir).context("extracting source")?;
 
     // 2. Write per-package configs + ensure base chroot.
     let cfg_dir = workdir.join("config");
@@ -93,13 +123,12 @@ async fn run_job_inner(
     log(client, build_id, "[worker] starting build\n").await;
     let report = run_build(cfg, client, job, &pkgdir, &cache, cancel).await?;
 
-    // 5. Upload artifacts on success.
+    // 5. Upload artifacts on success. (The workspace is cleaned by `run_job`
+    // on every exit path, including the `?` above.)
     if report.success {
         upload_artifacts(client, build_id, &pkgdir).await?;
     }
 
-    // 6. Cleanup the per-job workspace (keep caches + base chroot).
-    let _ = std::fs::remove_dir_all(&workdir);
     Ok(report)
 }
 

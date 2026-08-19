@@ -15,8 +15,26 @@ use aurcache_types::worker::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{Certificate, Client, Identity, StatusCode};
 use std::time::Duration;
+
+/// Characters that must not appear raw in a URL path segment. Everything legal
+/// in a real makepkg artifact name (`.`, `-`, `_`, `+`, `:`, `~`) is left as-is
+/// so URLs stay readable in logs.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'\\')
+    .add(b'%');
 
 use crate::identity::spki_fingerprint;
 
@@ -229,9 +247,19 @@ impl WorkerClient {
     }
 
     /// Upload a single artifact file.
-    pub async fn upload_artifact(&self, build_id: i32, filename: &str, bytes: Vec<u8>) -> Result<()> {
+    ///
+    /// `filename` is percent-encoded: it originates from whatever the PKGBUILD
+    /// dropped in the build directory, and an unescaped `?` or `#` would be
+    /// parsed as a query/fragment separator and silently truncate the path.
+    pub async fn upload_artifact(
+        &self,
+        build_id: i32,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let encoded = percent_encoding::utf8_percent_encode(filename, PATH_SEGMENT);
         self.http
-            .post(self.url(&format!("/jobs/{build_id}/artifacts/{filename}")))
+            .post(self.url(&format!("/jobs/{build_id}/artifacts/{encoded}")))
             .body(bytes)
             .send()
             .await

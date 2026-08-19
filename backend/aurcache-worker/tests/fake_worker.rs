@@ -33,7 +33,9 @@ use aurcache_worker::client::{WorkerClient, fetch_and_pin_ca};
 use aurcache_worker::config::Config;
 use aurcache_worker::enroll::ensure_enrolled;
 use aurcache_worker::identity::Identity;
-use sea_orm::{ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
+};
 use sea_orm_migration::MigratorTrait;
 
 /// Craft a minimal but structurally valid `*.pkg.tar.zst`: a zstd-compressed
@@ -71,7 +73,8 @@ async fn seed_build(db: &DatabaseConnection, id: i32, platform: &str, start: i64
     // Nonexistent local git path -> the server's best-effort `.SRCINFO` fetch
     // during `claim` fails instantly (offline, empty pgp_keys) rather than
     // hitting the AUR.
-    let source = r#"{"type":"git","url":"/nonexistent-aurcache-fake-worker","ref":"HEAD","subfolder":""}"#;
+    let source =
+        r#"{"type":"git","url":"/nonexistent-aurcache-fake-worker","ref":"HEAD","subfolder":""}"#;
     db.execute_unprepared(&format!(
         "INSERT INTO packages (id, name, build_flags, source_type, source_data, platforms) \
          VALUES ({id}, 'p{id}', '', 'git', '{source}', '{platform}')"
@@ -130,7 +133,11 @@ async fn fake_worker_protocol_roundtrip() {
 
     // Boot the real worker protocol listener (HTTPS + optional mTLS).
     let ca = aurcache_ca::Ca::load_or_create(&ca_dir).unwrap();
-    let _server = aurcache_api::init::init_worker_api(db.clone(), ca);
+    let _server = aurcache_api::init::init_worker_api(
+        db.clone(),
+        ca,
+        std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::new()),
+    );
 
     // Wait for the TLS listener to accept and serve the CA.
     let base = format!("https://localhost:{port}");
@@ -168,10 +175,7 @@ async fn fake_worker_protocol_roundtrip() {
     assert_eq!(job.arch, "x86_64");
     assert!(job.pgp_keys.is_empty(), "offline source -> no pgp keys");
 
-    client
-        .append_log(1, "fake build starting\n")
-        .await
-        .unwrap();
+    client.append_log(1, "fake build starting\n").await.unwrap();
 
     let (fname, bytes) = make_pkg("p1", "1.0-1");
     client.upload_artifact(1, &fname, bytes).await.unwrap();
@@ -207,7 +211,10 @@ async fn fake_worker_protocol_roundtrip() {
     assert_eq!(job2.build_id, 2);
 
     let (bad_name, bad_bytes) = make_pkg("evil", "9.9-1");
-    client.upload_artifact(2, &bad_name, bad_bytes).await.unwrap();
+    client
+        .upload_artifact(2, &bad_name, bad_bytes)
+        .await
+        .unwrap();
     let rejected = client
         .complete(
             2,

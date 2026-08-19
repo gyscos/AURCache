@@ -124,10 +124,7 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
       cells: [
         if (context.desktop) DataCell(Text(worker.id.toString())),
         DataCell(
-          Tooltip(
-            message: worker.cert_fingerprint,
-            child: Text(worker.name),
-          ),
+          Tooltip(message: worker.cert_fingerprint, child: Text(worker.name)),
         ),
         DataCell(_statusChip(worker.status)),
         DataCell(Text(arches)),
@@ -175,11 +172,11 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
             onPressed: busy
                 ? null
                 : () => _run(
-                      worker.id,
-                      () => API.approveWorker(worker.id),
-                      "worker approved",
-                      "Failed to approve worker!",
-                    ),
+                    worker.id,
+                    () => API.approveWorker(worker.id),
+                    "worker approved",
+                    "Failed to approve worker!",
+                  ),
           ),
         if (!worker.isApproved && !worker.isRevoked) const SizedBox(width: 8),
         if (!worker.isRevoked)
@@ -189,11 +186,11 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
             onPressed: busy
                 ? null
                 : () => _run(
-                      worker.id,
-                      () => API.revokeWorker(worker.id),
-                      "worker revoked",
-                      "Failed to revoke worker!",
-                    ),
+                    worker.id,
+                    () => API.revokeWorker(worker.id),
+                    "worker revoked",
+                    "Failed to revoke worker!",
+                  ),
           ),
       ],
     );
@@ -208,9 +205,7 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
       style: OutlinedButton.styleFrom(
         backgroundColor: color,
         side: BorderSide(color: color, width: 0),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         padding: const EdgeInsets.symmetric(
           horizontal: defaultPadding,
           vertical: defaultPadding / 2,
@@ -230,11 +225,13 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
     if (_pending.contains(workerId)) return;
     setState(() => _pending.add(workerId));
     try {
-      await action();
+      // Dio only throws for status >= 300, so a non-200 "success" would
+      // otherwise be reported to the operator as a completed approve/revoke.
+      final ok = await action();
       toastification.show(
-        title: Text(successMessage),
-        autoCloseDuration: const Duration(seconds: 3),
-        type: ToastificationType.success,
+        title: Text(ok ? successMessage : errorMessage),
+        autoCloseDuration: Duration(seconds: ok ? 3 : 5),
+        type: ok ? ToastificationType.success : ToastificationType.error,
       );
     } on DioException {
       toastification.show(

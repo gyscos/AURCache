@@ -53,6 +53,35 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
     Ok(build)
 }
 
+/// Take a write lock on the build row while confirming the worker still owns an
+/// `ACTIVE` lease on it.
+///
+/// Unlike [`assert_owned_active`] — a plain read whose result is stale the
+/// instant it returns — this issues a no-op `UPDATE` pinned to
+/// `status = ACTIVE AND worker_id = ?`. That serializes against the reaper's
+/// requeue of the same row: called inside a transaction, the lock is held until
+/// commit, so a reaper cannot reclaim the build midway through the writes that
+/// follow. Returns [`lease_lost`] if the lease is already gone.
+pub async fn lock_lease<C: ConnectionTrait>(
+    db: &C,
+    build_id: i32,
+    worker_id: i32,
+) -> Result<(), DbErr> {
+    let res = Builds::update_many()
+        // Rewriting worker_id to itself keeps the row unchanged while still
+        // acquiring the row lock the guard depends on.
+        .col_expr(builds::Column::WorkerId, Some(worker_id).into())
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .exec(db)
+        .await?;
+    if res.rows_affected == 0 {
+        return Err(lease_lost(build_id, worker_id));
+    }
+    Ok(())
+}
+
 /// Record the authoritative built version (extracted from the uploaded package
 /// files) on the build and its package.
 ///
@@ -288,7 +317,7 @@ async fn promote_dependent<C: ConnectionTrait>(
 mod tests {
     use super::*;
     use aurcache_db::migration::Migrator;
-    use sea_orm::{ConnectionTrait as _, Database, DatabaseConnection};
+    use sea_orm::{Database, DatabaseConnection};
     use sea_orm_migration::MigratorTrait;
 
     async fn setup() -> DatabaseConnection {

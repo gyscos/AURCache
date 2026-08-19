@@ -30,6 +30,19 @@ struct ParsedPkg {
 /// A single built artifact: its filename and raw bytes.
 pub type Artifact = (String, Vec<u8>);
 
+/// The worker lease an ingest is running under.
+///
+/// Publishing artifacts is only legitimate while the uploading worker still
+/// holds the build's lease. The caller's up-front ownership check is a plain
+/// read that goes stale immediately, and ingest is slow (file writes +
+/// `repo_add`), so the lease is re-verified — under a row lock — as part of the
+/// transaction that commits the `files` rows. See [`ingest_pkgs_in`].
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseGuard {
+    pub build_id: i32,
+    pub worker_id: i32,
+}
+
 /// Ingest built package artifacts into the repo for `(pkg_id, platform)`.
 ///
 /// Writes each artifact to `./repo/{platform}/{filename}`, adds it to the
@@ -43,11 +56,28 @@ pub async fn ingest_pkgs(
     pkg_id: i32,
     platform: &Platform,
     artifacts: Vec<Artifact>,
+    lease: Option<LeaseGuard>,
 ) -> anyhow::Result<String> {
-    ingest_pkgs_in(db, logger, pkg_id, platform, artifacts, Path::new("./repo")).await
+    ingest_pkgs_in(
+        db,
+        logger,
+        pkg_id,
+        platform,
+        artifacts,
+        Path::new("./repo"),
+        lease,
+    )
+    .await
 }
 
 /// Same as [`ingest_pkgs`] but with an explicit repo root (used by tests).
+///
+/// When `lease` is set, the lease is checked before any file is written and
+/// again — holding a row lock, so the reaper cannot interleave — inside the
+/// transaction that commits the `files` rows. A lease lost in between aborts the
+/// ingest with the DB untouched; artifacts already written to the repo tree are
+/// left in place, since the build's new owner re-runs ingest and overwrites them
+/// (removing them would strand the matching `repo.db` entries).
 pub async fn ingest_pkgs_in(
     db: &DatabaseConnection,
     logger: &BuildLogger,
@@ -55,6 +85,7 @@ pub async fn ingest_pkgs_in(
     platform: &Platform,
     artifacts: Vec<Artifact>,
     repo_root: &Path,
+    lease: Option<LeaseGuard>,
 ) -> anyhow::Result<String> {
     if artifacts.is_empty() {
         bail!("No files found in build output");
@@ -132,6 +163,12 @@ pub async fn ingest_pkgs_in(
         txn.commit().await?;
     }
 
+    // Cheap early-out: don't touch the repo tree at all for a lease we have
+    // already lost. (The authoritative check is in PHASE 3, under a row lock.)
+    if let Some(g) = lease {
+        crate::worker_complete::assert_owned_active(db, g.worker_id, g.build_id).await?;
+    }
+
     // Ensure the repo directory exists.
     fs::create_dir_all(format!("{}/{platform}", repo_root.display()))?;
 
@@ -159,6 +196,17 @@ pub async fn ingest_pkgs_in(
     let mut new_file_ids: HashMap<String, i32> = HashMap::new();
     {
         let txn = db.begin().await?;
+
+        // Re-verify the lease *inside* the committing transaction, taking a
+        // write lock on the build row. From here until commit the reaper cannot
+        // reclaim this build, so these `files` rows cannot be committed on
+        // behalf of a lease that was reassigned while we wrote the repo.
+        if let Some(g) = lease
+            && let Err(e) = crate::worker_complete::lock_lease(&txn, g.build_id, g.worker_id).await
+        {
+            txn.rollback().await?;
+            return Err(e.into());
+        }
 
         for fi in &file_infos {
             let file_id = if let Some(existing_id) = fi.existing_id {

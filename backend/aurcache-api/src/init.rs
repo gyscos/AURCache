@@ -16,6 +16,7 @@ use rocket::{Config, routes};
 use rocket_oauth2::HyperRustlsAdapter;
 use sea_orm::DatabaseConnection;
 use std::env;
+use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -65,8 +66,17 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
     Some(tls)
 }
 
+/// Start the human-facing API/UI listener.
+///
+/// `store` is the process-wide [`SnapshotStore`]; it must be the same instance
+/// handed to the schedulers and the worker listener so every path shares one set
+/// of on-disk git checkouts (see `main.rs`).
 #[must_use]
-pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
+pub fn init_api(
+    db: DatabaseConnection,
+    tx: Sender<Action>,
+    store: Arc<SnapshotStore>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
             address: "0.0.0.0".parse().unwrap(),
@@ -130,7 +140,7 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
             .manage(tx)
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
-            .manage(SnapshotStore::new())
+            .manage(store)
             .mount("/api/", build_api())
             .mount("/api/", crate::worker::worker_admin_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))
@@ -167,8 +177,17 @@ pub fn init_api(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
 ///
 /// If a server certificate cannot be issued from the internal CA, the listener
 /// is not started and a warning is logged (workers will be unable to connect).
+///
+/// `store` is the process-wide [`SnapshotStore`], shared with [`init_api`] and
+/// the schedulers: job descriptors built during `claim` resolve sources through
+/// the same on-disk checkouts the version-check loop maintains, so the two never
+/// race on (or duplicate) a clone of the same package.
 #[must_use]
-pub fn init_worker_api(db: DatabaseConnection, ca: aurcache_ca::Ca) -> JoinHandle<()> {
+pub fn init_worker_api(
+    db: DatabaseConnection,
+    ca: aurcache_ca::Ca,
+    store: Arc<SnapshotStore>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Some(tls) = worker_tls_config(&ca) else {
             error!("Worker TLS could not be configured; worker protocol listener disabled");
@@ -192,7 +211,7 @@ pub fn init_worker_api(db: DatabaseConnection, ca: aurcache_ca::Ca) -> JoinHandl
         let launch_result = rocket::custom(config)
             .manage(db)
             .manage(ca)
-            .manage(SnapshotStore::new())
+            .manage(store)
             .mount("/api/", crate::worker::worker_protocol_routes())
             .launch()
             .await;

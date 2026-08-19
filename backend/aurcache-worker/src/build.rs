@@ -13,12 +13,10 @@ use std::process::ExitStatus;
 /// Extract a `tar.gz` source archive (top-level `{pkgbase}/…`) into `dest` and
 /// return the path to the extracted package directory.
 pub fn extract_source(archive: &[u8], dest: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
+    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let decoder = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(decoder);
-    tar.unpack(dest)
-        .context("unpacking source archive")?;
+    tar.unpack(dest).context("unpacking source archive")?;
 
     // The archive has a single top-level pkgbase directory.
     let mut top = None;
@@ -50,8 +48,20 @@ pub fn discover_artifacts(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// True for a built package artifact filename.
+///
+/// The character allow-list matters: these names come from whatever the
+/// PKGBUILD wrote into the build directory and are then used as a URL path
+/// segment and a repo-tree filename. Restricting to the set alpm actually
+/// produces (`pkgname-pkgver-pkgrel-arch.pkg.tar.*`, where epoch contributes
+/// `:` and pkgver may contain `+`, `.`, `_`, `~`) keeps a hostile or merely
+/// broken PKGBUILD from smuggling separators or traversal through either.
 pub fn is_artifact(name: &str) -> bool {
-    !name.starts_with('.') && name.contains(".pkg.tar") && !name.ends_with(".sig")
+    !name.starts_with('.')
+        && name.contains(".pkg.tar")
+        && !name.ends_with(".sig")
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | ':' | '~' | '@')
+        })
 }
 
 /// Map a build process exit status into a terminal report.
@@ -179,7 +189,8 @@ mod tests {
                 header.set_size(content.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                tar.append_data(&mut header, path, content.as_bytes()).unwrap();
+                tar.append_data(&mut header, path, content.as_bytes())
+                    .unwrap();
             }
             tar.finish().unwrap();
         }
@@ -209,7 +220,11 @@ mod tests {
         }
         let found = discover_artifacts(dir.path());
         assert_eq!(found.len(), 1);
-        assert!(found[0].to_string_lossy().ends_with("hello-1.0-1-x86_64.pkg.tar.zst"));
+        assert!(
+            found[0]
+                .to_string_lossy()
+                .ends_with("hello-1.0-1-x86_64.pkg.tar.zst")
+        );
     }
 
     #[test]
@@ -219,6 +234,23 @@ mod tests {
         assert!(!is_artifact("a-1-1-x86_64.pkg.tar.zst.sig"));
         assert!(!is_artifact(".x.pkg.tar.zst"));
         assert!(!is_artifact("PKGBUILD"));
+    }
+
+    /// Real alpm version syntax must survive the character allow-list.
+    #[test]
+    fn is_artifact_accepts_epoch_and_pkgver_punctuation() {
+        assert!(is_artifact("foo-2:1.0_beta+3~rc1-1-x86_64.pkg.tar.zst"));
+        assert!(is_artifact("lib32-gcc-libs-14.2-1-x86_64.pkg.tar.zst"));
+    }
+
+    /// Names that would corrupt the upload URL or escape the repo directory.
+    #[test]
+    fn is_artifact_rejects_url_and_path_hostile_names() {
+        assert!(!is_artifact("evil?x=1.pkg.tar.zst"));
+        assert!(!is_artifact("evil#frag.pkg.tar.zst"));
+        assert!(!is_artifact("../../etc/passwd.pkg.tar.zst"));
+        assert!(!is_artifact("a b-1-1-x86_64.pkg.tar.zst"));
+        assert!(!is_artifact("a%2f-1-1-x86_64.pkg.tar.zst"));
     }
 
     #[test]
@@ -263,12 +295,7 @@ mod tests {
 
     #[test]
     fn build_command_without_srcdest() {
-        let cmd = build_command(
-            Path::new("/chroot"),
-            "job-1",
-            None,
-            &[],
-        );
+        let cmd = build_command(Path::new("/chroot"), "job-1", None, &[]);
         assert_eq!(cmd[0], "makechrootpkg");
         assert!(!cmd.iter().any(|a| a == "-d"));
         assert!(!cmd.iter().any(|a| a == "--"));

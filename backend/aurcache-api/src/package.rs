@@ -33,6 +33,7 @@ use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
@@ -120,7 +121,7 @@ pub async fn package_add_endpoint(
 pub async fn package_update_entity_endpoint(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     input: Json<PackagePatchModel>,
     id: i32,
     _a: Authenticated,
@@ -183,7 +184,7 @@ pub async fn package_update_entity_endpoint(
 #[get("/package/<id>/source/files")]
 pub async fn package_source_files(
     db: &State<DatabaseConnection>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     id: i32,
     _a: Authenticated,
 ) -> Result<Json<SourceFileList>, Custom<String>> {
@@ -216,7 +217,7 @@ pub async fn package_source_files(
 #[get("/package/<id>/source/file?<path>")]
 pub async fn package_source_file(
     db: &State<DatabaseConnection>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     id: i32,
     path: String,
     _a: Authenticated,
@@ -256,7 +257,7 @@ pub async fn package_source_file(
 pub async fn package_source_file_update(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     id: i32,
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
@@ -335,7 +336,7 @@ pub async fn package_source_file_update(
 )]
 #[post("/package/source/preview/files", data = "<input>")]
 pub async fn package_source_preview_files(
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     input: Json<SourcePreviewRequest>,
     _a: Authenticated,
 ) -> Result<Json<SourceFileList>, Custom<String>> {
@@ -355,7 +356,7 @@ pub async fn package_source_preview_files(
 )]
 #[post("/package/source/preview/file", data = "<input>")]
 pub async fn package_source_preview_file(
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     input: Json<SourcePreviewFileRequest>,
     _a: Authenticated,
 ) -> Result<Json<SourceFileContent>, Custom<String>> {

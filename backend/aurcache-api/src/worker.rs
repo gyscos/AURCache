@@ -17,10 +17,10 @@ use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus, WorkerStatus,
 };
-use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
-use aurcache_utils::repo_ingest::{ingest_pkgs, validate_artifact_names};
-use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::build_logger::BuildLogger;
+use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
+use aurcache_utils::repo_ingest::{LeaseGuard, ingest_pkgs, validate_artifact_names};
+use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::worker_complete;
 use rocket::data::ToByteUnit;
 use rocket::http::Status;
@@ -32,6 +32,7 @@ use rocket::{Data, State, get, post};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// Lease/liveness tuning (env-overridable; see the design doc).
@@ -45,13 +46,19 @@ fn worker_cert_validity_days() -> i64 {
     env_i64("WORKER_CERT_VALIDITY_DAYS", 365)
 }
 fn env_i64(key: &str, default: i64) -> i64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Base URL workers should use for the public pacman repo (`[repo] Server`).
 fn public_repo_url() -> String {
     env::var("AURCACHE_PUBLIC_URL").unwrap_or_else(|_| {
-        format!("http://localhost:{}", aurcache_types::ports::AURCACHE_MIRROR_PORT)
+        format!(
+            "http://localhost:{}",
+            aurcache_types::ports::AURCACHE_MIRROR_PORT
+        )
     })
 }
 
@@ -110,7 +117,14 @@ impl<'r> FromRequest<'r> for WorkerAuth {
 }
 
 #[derive(OpenApi)]
-#[openapi(paths(register_worker, register_status, get_ca, list_workers, approve_worker, revoke_worker))]
+#[openapi(paths(
+    register_worker,
+    register_status,
+    get_ca,
+    list_workers,
+    approve_worker,
+    revoke_worker
+))]
 pub struct WorkerApi;
 
 /// Remote-worker **protocol** routes (mounted under `/api` on the dedicated
@@ -191,7 +205,10 @@ pub async fn register_worker(
 
     // Non-interactive enrollment: auto-approve when a configured mode matches.
     if worker.status != WorkerStatus::APPROVED
-        && crate::worker_enroll::auto_approve_from_env(&fingerprint, input.enrollment_token.as_deref())
+        && crate::worker_enroll::auto_approve_from_env(
+            &fingerprint,
+            input.enrollment_token.as_deref(),
+        )
     {
         worker_store::approve_worker(db, worker.id)
             .await
@@ -225,7 +242,10 @@ async fn register_status_for(
 
     // Only release the certificate + CA once the worker is approved.
     let (signed_cert, ca_cert) = if worker.status == WorkerStatus::APPROVED {
-        (worker.signed_cert.clone(), Some(ca.ca_cert_pem().to_string()))
+        (
+            worker.signed_cert.clone(),
+            Some(ca.ca_cert_pem().to_string()),
+        )
     } else {
         (None, None)
     };
@@ -261,7 +281,7 @@ pub async fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>
 #[post("/worker/jobs/claim", data = "<input>")]
 pub async fn claim_job(
     db: &State<DatabaseConnection>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     auth: WorkerAuth,
     input: Json<ClaimRequest>,
 ) -> Result<Option<Json<JobDescriptor>>, Custom<String>> {
@@ -343,7 +363,7 @@ async fn build_descriptor(
 #[get("/worker/jobs/<build_id>/source")]
 pub async fn job_source(
     db: &State<DatabaseConnection>,
-    store: &State<SnapshotStore>,
+    store: &State<Arc<SnapshotStore>>,
     auth: WorkerAuth,
     build_id: i32,
 ) -> Result<Vec<u8>, Custom<String>> {
@@ -476,9 +496,22 @@ pub async fn complete_job(
         }
 
         let logger = BuildLogger::new(build_id, db.clone());
-        let version = ingest_pkgs(db, &logger, build.pkg_id, &build.platform, files)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
+        // Publishing is guarded by the lease itself: `assert_owned_active` above
+        // is a stale read by the time the (slow) ingest runs, so the ingest
+        // re-checks ownership under a row lock before committing anything.
+        let version = ingest_pkgs(
+            db,
+            &logger,
+            build.pkg_id,
+            &build.platform,
+            files,
+            Some(LeaseGuard {
+                build_id,
+                worker_id: auth.worker.id,
+            }),
+        )
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
         worker_complete::record_built_version(db, build_id, auth.worker.id, &version)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;

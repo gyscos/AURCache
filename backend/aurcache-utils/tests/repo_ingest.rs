@@ -4,9 +4,9 @@
 //! `repo_add`, parses the version from the package filename, and records a row
 //! in the `files` table — the same output the legacy Docker path produced.
 
+use aurcache_db::files;
 use aurcache_db::migration::Migrator;
 use aurcache_db::prelude::Files;
-use aurcache_db::files;
 use aurcache_utils::build_logger::BuildLogger;
 use aurcache_utils::repo_ingest::ingest_pkgs_in;
 use pacman_mirrors::platforms::Platform;
@@ -65,6 +65,7 @@ async fn ingest_writes_repo_and_files_row_and_parses_version() {
         &Platform::X86_64,
         artifacts,
         repo_root.path(),
+        None,
     )
     .await
     .expect("ingest should succeed");

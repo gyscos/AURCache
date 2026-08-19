@@ -660,6 +660,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "percent-encoding",
  "rcgen",
  "reqwest",
  "sea-orm",

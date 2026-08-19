@@ -39,10 +39,14 @@ async fn main() {
         tracing::info!("Worker CA fingerprint (pin this on workers): {fp}");
     }
 
-    // A single, long-lived `SnapshotStore` is shared across the build queue,
-    // version-check loop, and auto-update job. Its persistent on-disk git
-    // checkouts and `refresh()` incremental-fetch model make this safe: repeat
-    // requests reuse the same checkout instead of re-cloning/re-downloading.
+    // A single, long-lived `SnapshotStore` shared by every path that resolves
+    // package sources: the version-check loop, the auto-update job, the API/UI
+    // listener (source browsing + patch editing), and the worker protocol
+    // listener (job descriptors built during `claim`). Its persistent on-disk
+    // git checkouts and `refresh()` incremental-fetch model make this safe:
+    // repeat requests reuse the same checkout instead of re-cloning/
+    // re-downloading. Handing any of these its own instance would put two
+    // stores on the same checkout directories with no shared locking.
     let store = Arc::new(SnapshotStore::new());
 
     let build_queue_handle = init_build_queue(db.clone(), tx.clone());
@@ -61,8 +65,8 @@ async fn main() {
     // Reclaim build jobs whose remote worker went silent (lease liveness).
     let lease_reaper_handle = start_lease_reaper(db.clone());
 
-    let api_handle = init_api(db.clone(), tx);
-    let worker_api_handle = init_worker_api(db, ca);
+    let api_handle = init_api(db.clone(), tx, store.clone());
+    let worker_api_handle = init_worker_api(db, ca, store);
     let repo_handle = init_repo();
 
     tokio::select! {
