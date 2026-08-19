@@ -240,12 +240,17 @@ class _SourcePatchEditorState extends State<SourcePatchEditor> {
                                 color: Theme.of(context).colorScheme.outline,
                               ),
                             ),
-                            child: SingleChildScrollView(
+                            // Scrolls internally; see the note in
+                            // package_source_patch_popup.dart and
+                            // flutter/flutter#79120.
+                            child: Padding(
                               padding: const EdgeInsets.all(8),
                               child: TextField(
                                 controller: _controller,
                                 onChanged: (_) => setState(() {}),
                                 maxLines: null,
+                                minLines: null,
+                                expands: true,
                                 textAlignVertical: TextAlignVertical.top,
                                 style: GoogleFonts.jetBrainsMono(fontSize: 12),
                                 decoration: const InputDecoration(

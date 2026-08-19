@@ -273,13 +273,17 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
                   color: Theme.of(context).colorScheme.outline,
                 ),
               ),
-              child: SingleChildScrollView(
+              // Scrolls internally; see the note in
+              // package_source_patch_popup.dart and flutter/flutter#79120.
+              child: Padding(
                 padding: const EdgeInsets.all(12),
                 child: TextField(
                   controller: controller,
                   enabled: !envLocking,
                   onChanged: (_) => onDirty(),
                   maxLines: null,
+                  minLines: null,
+                  expands: true,
                   textAlignVertical: TextAlignVertical.top,
                   style: GoogleFonts.jetBrainsMono(fontSize: 13),
                   decoration: const InputDecoration(

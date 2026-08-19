@@ -208,17 +208,28 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
                                     : Container(
                                         decoration: BoxDecoration(
                                           border: Border.all(
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.outline,
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .outline,
                                           ),
                                         ),
-                                        child: SingleChildScrollView(
+                                        // The TextField scrolls itself rather
+                                        // than growing unbounded inside a
+                                        // SingleChildScrollView. On web an
+                                        // unbounded editable in an ancestor
+                                        // scroller leaves Flutter's hidden DOM
+                                        // input misplaced, painting a second
+                                        // copy of the selection in the browser
+                                        // font at the wrong offset.
+                                        // See flutter/flutter#79120.
+                                        child: Padding(
                                           padding: const EdgeInsets.all(8),
                                           child: TextField(
                                             controller: _controller,
                                             onChanged: (_) => setState(() {}),
                                             maxLines: null,
+                                            minLines: null,
+                                            expands: true,
                                             textAlignVertical:
                                                 TextAlignVertical.top,
                                             style: GoogleFonts.jetBrainsMono(
