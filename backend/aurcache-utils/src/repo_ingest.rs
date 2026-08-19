@@ -292,6 +292,8 @@ fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
 /// a correctly-named package (see design non-goals). Signature sidecars
 /// (`*.sig`) and hidden helper files are ignored; every remaining file must be a
 /// `*.pkg.tar.*` whose parsed pkgname is in `expected`.
+///
+/// Debug packages are dropped before this runs — see [`is_debug_artifact`].
 pub fn validate_artifact_names(expected: &[String], filenames: &[String]) -> anyhow::Result<()> {
     if expected.is_empty() {
         bail!("no expected package names to validate against");
@@ -312,6 +314,30 @@ pub fn validate_artifact_names(expected: &[String], filenames: &[String]) -> any
         }
     }
     Ok(())
+}
+
+/// True for makepkg's split debug package of one of the `expected` pkgnames
+/// (`<pkgname>-debug`), which the server discards rather than publishing.
+///
+/// AURCache serves a single flat repo per architecture, so a debug package would
+/// appear in `pacman -Ss` right next to the real ones. Arch keeps them out of
+/// `core`/`extra`/`multilib` for exactly that reason — they live in separate,
+/// opt-in `*-debug` repos.
+///
+/// The server already forces `OPTIONS=(!debug)` so these are not built at all.
+/// This is the backstop for a worker whose user-supplied `makepkg.conf`
+/// re-enables `debug`: without it, the extra artifact fails
+/// [`validate_artifact_names`], the completion is rejected, and the build is
+/// requeued and rebuilt forever.
+#[must_use]
+pub fn is_debug_artifact(expected: &[String], filename: &str) -> bool {
+    let Ok(parsed) = parse_arch_pkg(filename) else {
+        return false;
+    };
+    parsed
+        .name
+        .strip_suffix("-debug")
+        .is_some_and(|base| expected.iter().any(|e| e == base))
 }
 
 #[cfg(test)]
@@ -362,5 +388,48 @@ mod tests {
         let expected = vec!["hello".to_string()];
         let files = vec!["evil.sh".to_string()];
         assert!(validate_artifact_names(&expected, &files).is_err());
+    }
+
+    #[test]
+    fn debug_artifact_detected_for_expected_package() {
+        let expected = vec!["hello".to_string(), "hello-docs".to_string()];
+        assert!(is_debug_artifact(
+            &expected,
+            "hello-debug-2.12.1-2-x86_64.pkg.tar.zst"
+        ));
+        assert!(is_debug_artifact(
+            &expected,
+            "hello-docs-debug-2.12.1-2-x86_64.pkg.tar.zst"
+        ));
+    }
+
+    /// Only the debug split of an *expected* package is dropped; a foreign
+    /// `-debug` upload must still reach `validate_artifact_names` and be rejected.
+    #[test]
+    fn debug_artifact_of_foreign_package_is_not_dropped() {
+        let expected = vec!["hello".to_string()];
+        let foreign = "openssh-debug-9.0-1-x86_64.pkg.tar.zst";
+        assert!(!is_debug_artifact(&expected, foreign));
+        assert!(validate_artifact_names(&expected, &[foreign.to_string()]).is_err());
+    }
+
+    #[test]
+    fn regular_package_is_not_a_debug_artifact() {
+        let expected = vec!["hello".to_string()];
+        assert!(!is_debug_artifact(
+            &expected,
+            "hello-2.12.1-2-x86_64.pkg.tar.zst"
+        ));
+    }
+
+    /// The build server forces this; a worker on Arch defaults would otherwise
+    /// emit `<pkgname>-debug` packages into the single flat repo.
+    #[tokio::test]
+    async fn makepkg_config_disables_debug_packages() {
+        let (conf, _) =
+            crate::job_config::create_makepkg_config(None, std::path::Path::new("/out"))
+                .await
+                .unwrap();
+        assert!(conf.contains("OPTIONS=(!debug)"), "got:\n{conf}");
     }
 }

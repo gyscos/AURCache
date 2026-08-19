@@ -116,6 +116,46 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
     Ok(())
 }
 
+/// This worker image's own makepkg defaults, used as the base layer for the
+/// job's `makepkg.conf`.
+const SYSTEM_MAKEPKG_CONF: &str = "/etc/makepkg.conf";
+
+/// Layer the server's makepkg settings on top of a full default `makepkg.conf`.
+///
+/// The server sends only what it wants to force (`PKGDEST`, `MAKEFLAGS`,
+/// `PACKAGER`, plus any user-provided `makepkg.conf` setting). That was fine
+/// when it was written to `~/.config/pacman/makepkg.conf`, which makepkg sources
+/// *after* the system file — but it is now handed to `mkarchroot -M`, which
+/// installs it as the chroot's **entire** `/etc/makepkg.conf`. On its own it
+/// leaves makepkg with no `PKGEXT`/`SRCEXT`/`CARCH`/compression settings, and
+/// every build dies with:
+///
+/// ```text
+/// ==> ERROR: $PKGEXT does not contain a valid package suffix (needs '.pkg.tar*', got '')
+/// ==> ERROR: Could not download sources.
+/// ```
+///
+/// The defaults have to come from the worker rather than the server: they are
+/// architecture-specific (`CARCH`, `CHOST`, `CFLAGS`), and the server may
+/// dispatch a job to a worker of a different architecture than its own.
+/// Overrides are appended last so they still win.
+fn merge_makepkg_conf(system_defaults: Option<&str>, overrides: &str) -> String {
+    let Some(base) = system_defaults else {
+        return overrides.to_string();
+    };
+    let mut out = String::with_capacity(base.len() + overrides.len() + 96);
+    out.push_str(base);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n# --- AURCache job overrides (applied last, win over defaults) ---\n");
+    out.push_str(overrides);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// Write the per-package `makepkg.conf` / `pacman.conf` / mirrorlist to a
 /// staging directory the caller seeds the base chroot from.
 pub fn write_configs(
@@ -128,10 +168,65 @@ pub fn write_configs(
         .with_context(|| format!("creating config dir {}", dir.display()))?;
     let makepkg = dir.join("makepkg.conf");
     let pacman = dir.join("pacman.conf");
-    std::fs::write(&makepkg, makepkg_conf).context("writing makepkg.conf")?;
+
+    let system_defaults = std::fs::read_to_string(SYSTEM_MAKEPKG_CONF).ok();
+    if system_defaults.is_none() {
+        tracing::warn!(
+            "{SYSTEM_MAKEPKG_CONF} not readable; using server-provided makepkg.conf alone \
+             (builds will fail if it lacks PKGEXT/SRCEXT)"
+        );
+    }
+    let merged = merge_makepkg_conf(system_defaults.as_deref(), makepkg_conf);
+
+    std::fs::write(&makepkg, merged).context("writing makepkg.conf")?;
     std::fs::write(&pacman, pacman_conf).context("writing pacman.conf")?;
     if let Some(list) = mirrorlist {
         std::fs::write(dir.join("mirrorlist"), list).context("writing mirrorlist")?;
     }
     Ok((makepkg, pacman))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trimmed stand-in for the distro file; PKGEXT/SRCEXT are the fields
+    /// whose absence makepkg rejects outright.
+    const DEFAULTS: &str = "CARCH=\"x86_64\"\nCHOST=\"x86_64-pc-linux-gnu\"\n\
+                            PKGEXT='.pkg.tar.zst'\nSRCEXT='.src.tar.gz'\n";
+
+    #[test]
+    fn merge_keeps_defaults_makepkg_requires() {
+        let merged = merge_makepkg_conf(Some(DEFAULTS), "PKGDEST=/output\n");
+        assert!(merged.contains("PKGEXT='.pkg.tar.zst'"));
+        assert!(merged.contains("SRCEXT='.src.tar.gz'"));
+        assert!(merged.contains("CARCH=\"x86_64\""));
+        assert!(merged.contains("PKGDEST=/output"));
+    }
+
+    /// Overrides must come after the defaults so they actually take effect —
+    /// makepkg.conf is sourced as bash, so the last assignment wins.
+    #[test]
+    fn overrides_are_appended_after_defaults() {
+        let merged = merge_makepkg_conf(
+            Some("PKGDEST=/system\nPKGEXT='.pkg.tar.zst'\n"),
+            "PKGDEST=/output\n",
+        );
+        let first = merged.find("PKGDEST=/system").expect("default present");
+        let last = merged.find("PKGDEST=/output").expect("override present");
+        assert!(last > first, "override must come after the default");
+    }
+
+    #[test]
+    fn merge_falls_back_to_overrides_when_no_system_file() {
+        let merged = merge_makepkg_conf(None, "PKGDEST=/output\n");
+        assert_eq!(merged, "PKGDEST=/output\n");
+    }
+
+    #[test]
+    fn merge_inserts_newline_between_sections() {
+        let merged = merge_makepkg_conf(Some("PKGEXT='.pkg.tar.zst'"), "PKGDEST=/output");
+        assert!(merged.contains("PKGEXT='.pkg.tar.zst'\n"));
+        assert!(merged.ends_with('\n'));
+    }
 }

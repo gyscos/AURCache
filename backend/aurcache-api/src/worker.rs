@@ -19,7 +19,9 @@ use aurcache_types::worker::{
 };
 use aurcache_utils::build_logger::BuildLogger;
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
-use aurcache_utils::repo_ingest::{LeaseGuard, ingest_pkgs, validate_artifact_names};
+use aurcache_utils::repo_ingest::{
+    LeaseGuard, ingest_pkgs, is_debug_artifact, validate_artifact_names,
+};
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::worker_complete;
 use rocket::data::ToByteUnit;
@@ -487,15 +489,33 @@ pub async fn complete_job(
             .map_err(|e| err(Status::InternalServerError, e))?
             .ok_or_else(|| err(Status::NotFound, "package not found"))?;
         let expected = expected_pkgnames(&pkg);
+
+        // Drop split debug packages before validating: they are not declared
+        // pkgnames, so they would fail validation and requeue the build forever.
+        // The server already sets OPTIONS=(!debug), so this only triggers for a
+        // worker whose user makepkg.conf re-enables it.
+        let logger = BuildLogger::new(build_id, db.clone());
+        let (files, debug_files): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|(name, _)| !is_debug_artifact(&expected, name));
+        for (name, _) in &debug_files {
+            logger
+                .append(format!("skipping debug package (not published): {name}\n"))
+                .await;
+        }
+        if files.is_empty() {
+            return Err(err(
+                Status::BadRequest,
+                "no publishable artifacts uploaded (only debug packages)",
+            ));
+        }
+
         let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
         if let Err(e) = validate_artifact_names(&expected, &names) {
-            BuildLogger::new(build_id, db.clone())
-                .append(format!("rejected artifacts: {e}\n"))
-                .await;
+            logger.append(format!("rejected artifacts: {e}\n")).await;
             return Err(err(Status::BadRequest, e));
         }
 
-        let logger = BuildLogger::new(build_id, db.clone());
         // Publishing is guarded by the lease itself: `assert_owned_active` above
         // is a stale read by the time the (slow) ingest runs, so the ingest
         // re-checks ownership under a row lock before committing anything.

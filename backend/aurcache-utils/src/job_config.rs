@@ -16,10 +16,18 @@ pub fn mirrorlist_dir() -> PathBuf {
 /// Build the makepkg.conf for a build.
 ///
 /// User-provided content (from the `makepkg_conf` setting) is written first.
-/// PKGDEST, MAKEFLAGS, and PACKAGER are always appended at the end so the
-/// user cannot accidentally override them — without the right PKGDEST the
+/// PKGDEST, MAKEFLAGS, PACKAGER, and OPTIONS are always appended at the end so
+/// the user cannot accidentally override them — without the right PKGDEST the
 /// build can't be collected from the shared mount, and without a valid
 /// PACKAGER the generated `desc` file cannot be parsed by libalpm.
+///
+/// `OPTIONS=(!debug)` suppresses makepkg's split `<pkgname>-debug` packages.
+/// Arch's stock `makepkg.conf` enables `debug`, so a worker on distro defaults
+/// emits one per package. AURCache serves a single flat repo per architecture,
+/// so those would show up in `pacman -Ss` alongside real packages — Arch itself
+/// keeps them out of `core`/`extra` and ships them in separate opt-in `*-debug`
+/// repos. Publishing debug symbols would mean a second repo, not extra entries
+/// in this one.
 ///
 /// Pass `None` for `db_ctx` when no database is available (e.g. the
 /// test-builder binary); user config is then skipped.
@@ -42,7 +50,7 @@ pub async fn create_makepkg_config(
     }
 
     config.push_str(&format!(
-        "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\nPACKAGER='AURCache <aurcache@localhost>'\n",
+        "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\nPACKAGER='AURCache <aurcache@localhost>'\nOPTIONS=(!debug)\n",
         pkgdest_dir_base.display()
     ));
 

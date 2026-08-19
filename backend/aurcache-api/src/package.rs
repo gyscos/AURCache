@@ -73,6 +73,7 @@ pub async fn package_add_endpoint(
     db: &State<DatabaseConnection>,
     input: Json<AddPackage>,
     tx: &State<Sender<Action>>,
+    store: &State<Arc<SnapshotStore>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), BadRequest<String>> {
@@ -87,6 +88,7 @@ pub async fn package_add_endpoint(
     };
 
     let new_pkg_name = package_add(
+        store,
         db,
         tx,
         platforms,
@@ -389,6 +391,7 @@ pub async fn package_update_endpoint(
     id: i32,
     input: Json<UpdatePackage>,
     tx: &State<Sender<Action>>,
+    store: &State<Arc<SnapshotStore>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<Json<Vec<i32>>, BadRequest<String>> {
@@ -400,7 +403,7 @@ pub async fn package_update_endpoint(
         .map_err(|e| BadRequest(e.to_string()))?
         .ok_or(BadRequest("id not found".to_string()))?;
 
-    let pkg_update = package_update(db, pkg_model.clone(), input.force, tx)
+    let pkg_update = package_update(store, db, pkg_model.clone(), input.force, tx)
         .await
         .map(|results| {
             Json(

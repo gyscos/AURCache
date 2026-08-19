@@ -113,6 +113,10 @@ pub async fn package_update_all_outdated(
 ///
 /// # Arguments
 ///
+/// * `store` - The process-wide [`SnapshotStore`]. It must be the shared instance
+///   (see `main.rs`), not a fresh one: a new store starts with an empty cache and
+///   re-resolves every source from scratch, and its cache never sees the
+///   refreshes the version-check scheduler performs.
 /// * `db` - A reference to the database connection.
 /// * `pkg_model` - The package model to update.
 /// * `force` - A boolean flag to force an update even if the package version is unchanged.
@@ -124,14 +128,14 @@ pub async fn package_update_all_outdated(
 ///   that was enqueued/promoted or left waiting on dependencies.
 /// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
 pub async fn package_update(
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     pkg_model: packages::Model,
     force: bool,
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let client = AurClient::new();
-    let store = SnapshotStore::new();
-    package_update_with_client(&client, &store, db, pkg_model, force, tx).await
+    package_update_with_client(&client, store, db, pkg_model, force, tx).await
 }
 
 /// Update a single package using a caller-provided AUR client.

@@ -245,7 +245,11 @@ pub async fn package_add_with_client(
     add_package_with_source(client, store, db, tx, &context, source_data, patched_files).await
 }
 
+// Each argument is an independent input to the add flow (services, targeting,
+// source, patches); bundling them into a struct would only move the same list.
+#[allow(clippy::too_many_arguments)]
 pub async fn package_add(
+    store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
     platforms: Option<Vec<Platform>>,
@@ -254,10 +258,9 @@ pub async fn package_add(
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let client = aurcache_deps::AurClient::new();
-    let store = SnapshotStore::new();
     package_add_with_client(
         &client,
-        &store,
+        store,
         db,
         tx,
         platforms,

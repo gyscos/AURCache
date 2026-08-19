@@ -9,10 +9,12 @@ use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
 use aurcache_types::builder::Action;
 use aurcache_utils::package::update::package_update;
+use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait,
 };
+use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
@@ -211,6 +213,7 @@ pub async fn cancel_build(
 pub async fn rery_build(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
+    store: &State<Arc<SnapshotStore>>,
     buildid: i32,
     _a: Authenticated,
 ) -> Result<Json<i32>, NotFound<String>> {
@@ -238,7 +241,7 @@ pub async fn rery_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let platform_results = package_update(db, package, true, tx)
+    let platform_results = package_update(store, db, package, true, tx)
         .await
         .map_err(|e| NotFound(e.to_string()))?;
 

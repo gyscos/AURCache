@@ -285,4 +285,33 @@ mod tests {
                 .contains("1.0")
         );
     }
+
+    /// A tag is a pin too: it must resolve, and must not drift to the branch
+    /// tip when upstream moves on.
+    #[test]
+    fn tag_ref_stays_at_the_tagged_commit() {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = Repository::init(upstream_dir.path()).unwrap();
+        commit(&upstream, "1.0");
+        let tagged = upstream.head().unwrap().target().unwrap();
+        let obj = upstream.find_object(tagged, None).unwrap();
+        upstream.tag_lightweight("v1.0", &obj, false).unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("pkg");
+        let url = upstream_dir.path().to_string_lossy().to_string();
+
+        let first = checkout_or_fetch_repo_ref(&url, "v1.0", &path).unwrap();
+        assert_eq!(first, tagged, "tag should resolve to the tagged commit");
+
+        commit(&upstream, "2.0");
+        let second = checkout_or_fetch_repo_ref(&url, "v1.0", &path).unwrap();
+
+        assert_eq!(second, tagged, "tag must not drift to the branch tip");
+        assert!(
+            std::fs::read_to_string(path.join("PKGBUILD"))
+                .unwrap()
+                .contains("1.0")
+        );
+    }
 }
