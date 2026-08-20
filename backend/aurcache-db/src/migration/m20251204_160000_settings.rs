@@ -45,7 +45,7 @@ CREATE TABLE public.settings
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -72,7 +72,7 @@ drop table settings;
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

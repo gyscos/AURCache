@@ -35,7 +35,7 @@ pub fn mirrorlist_dir() -> PathBuf {
 pub async fn create_makepkg_config(
     db_ctx: Option<(&DatabaseConnection, i32)>,
     pkgdest_dir_base: &Path,
-) -> anyhow::Result<(String, String)> {
+) -> String {
     let mut config = String::new();
 
     if let Some((db, pkg_id)) = db_ctx {
@@ -56,8 +56,7 @@ pub async fn create_makepkg_config(
         pkgdest_dir_base.display()
     );
 
-    let makepkg_config_path = "/var/ab/.config/pacman/makepkg.conf";
-    Ok((config, makepkg_config_path.to_string()))
+    config
 }
 
 /// Generate the standard pacman.conf written inside a build container.
@@ -135,10 +134,10 @@ pub async fn build_job_config(
     pkg_id: i32,
     pkgdest_dir: &Path,
     aurcache_repo_url: &str,
-) -> anyhow::Result<(String, String)> {
-    let (makepkg_conf, _path) = create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await?;
+) -> (String, String) {
+    let makepkg_conf = create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await;
     let pacman_conf = create_pacman_config(db, pkg_id, aurcache_repo_url).await;
-    Ok((makepkg_conf, pacman_conf))
+    (makepkg_conf, pacman_conf)
 }
 
 #[cfg(test)]

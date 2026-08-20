@@ -13,12 +13,13 @@ use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+#[must_use]
 pub fn start_auto_update_job(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
-) -> anyhow::Result<JoinHandle<()>> {
-    Ok(tokio::spawn(async move {
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             // check everytime in loop since it may change per user setting
             let interval: SettingsEntry<Option<String>> =
@@ -36,11 +37,11 @@ pub fn start_auto_update_job(
                     let mut upcoming = schedule.upcoming(Utc);
 
                     if let Some(next_time) = upcoming.next() {
-                        let now = Utc::now();
+                        // A negative delta (clock jump) just means "run now".
                         let duration = next_time
-                            .signed_duration_since(now)
+                            .signed_duration_since(Utc::now())
                             .to_std()
-                            .expect("Time went backwards?");
+                            .unwrap_or(Duration::ZERO);
 
                         info!(
                             "Waiting for scheduled update until {} ({} seconds)",
@@ -61,5 +62,5 @@ pub fn start_auto_update_job(
                 }
             }
         }
-    }))
+    })
 }

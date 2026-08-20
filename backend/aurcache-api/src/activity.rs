@@ -20,6 +20,6 @@ pub async fn activity(
     al: &State<ActivityLog>,
     limit: Option<u64>,
 ) -> Result<Json<Vec<Activity>>, NotFound<String>> {
-    let activities = al.list(limit).await;
-    Ok(Json(activities.map_err(|e| NotFound(e.to_string()))?))
+    let activities = al.list(limit).await.map_err(|e| NotFound(e.to_string()))?;
+    Ok(Json(activities))
 }

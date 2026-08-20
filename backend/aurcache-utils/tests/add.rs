@@ -40,7 +40,7 @@ struct TestEnv {
     _repo_root: std::path::PathBuf,
     official_cache_dir: std::path::PathBuf,
     aur_root: TempDir,
-    _checkout_dir: TempDir,
+    checkout_dir: TempDir,
 }
 
 async fn setup_env() -> TestEnv {
@@ -89,7 +89,7 @@ async fn setup_env() -> TestEnv {
         _repo_root: repo_root,
         official_cache_dir,
         aur_root,
-        _checkout_dir: checkout_dir,
+        checkout_dir,
     }
 }
 
@@ -97,7 +97,7 @@ async fn mock_rpc_info(server: &MockServer, pkgbase: &str, result: serde_json::V
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", pkgbase))
-        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![result])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[result])))
         .mount(server)
         .await;
 }
@@ -271,7 +271,7 @@ fn rpc_deps_json(
     })
 }
 
-fn multiinfo_json(results: Vec<serde_json::Value>) -> serde_json::Value {
+fn multiinfo_json(results: &[serde_json::Value]) -> serde_json::Value {
     json!({
         "type": "multiinfo",
         "resultcount": results.len(),
@@ -282,7 +282,7 @@ fn multiinfo_json(results: Vec<serde_json::Value>) -> serde_json::Value {
 async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
     let (tx, _) = tokio::sync::broadcast::channel(100);
     let store = SnapshotStore::with_checkout_root_and_aur_base(
-        env._checkout_dir.path().to_path_buf(),
+        env.checkout_dir.path().to_path_buf(),
         env.aur_root.path().to_string_lossy().to_string(),
     );
     package_add_with_client(
@@ -637,7 +637,7 @@ async fn scenario_f_system_deps_only() {
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "glibc"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
@@ -690,12 +690,10 @@ async fn scenario_g_split_package_constraints_are_merged_per_pkgbase() {
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "shared-base"))
         .and(query_param("arg[]", "shared-lib"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![
-                rpc_deps_json("shared-base", "shared-base", &[], &[], "3.0.0"),
-                rpc_deps_json("shared-lib", "shared-base", &[], &[], "3.0.0"),
-            ])),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[
+            rpc_deps_json("shared-base", "shared-base", &[], &[], "3.0.0"),
+            rpc_deps_json("shared-lib", "shared-base", &[], &[], "3.0.0"),
+        ])))
         .mount(&env.server)
         .await;
 
@@ -771,7 +769,7 @@ async fn scenario_h_provider_dependency_resolves_to_aur_package() {
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
     Mock::given(method("GET"))
@@ -835,7 +833,7 @@ async fn scenario_i_official_provider_prevents_aur_dependency_addition() {
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
@@ -906,7 +904,7 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
     Mock::given(method("GET"))
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "virtual-dep"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
     Mock::given(method("GET"))
@@ -977,7 +975,7 @@ async fn scenario_k_self_resolved_dependency_is_ignored() {
         .and(path("/rpc/v5/info"))
         .and(query_param("arg[]", "self-split"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![rpc_deps_json(
+            ResponseTemplate::new(200).set_body_json(multiinfo_json(&[rpc_deps_json(
                 "self-split",
                 "self-base",
                 &[],

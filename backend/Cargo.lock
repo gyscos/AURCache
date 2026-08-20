@@ -455,6 +455,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "tracing",
  "utoipa",
 ]
 

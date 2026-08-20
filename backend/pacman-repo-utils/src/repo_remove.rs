@@ -1,13 +1,10 @@
 use crate::repo_database::db::remove_from_db_file;
+use std::path::Path;
 
-pub fn repo_remove(
-    filename: String,
-    db_archive: String,
-    files_archive: String,
-) -> anyhow::Result<()> {
-    let (dir_name, _) = split_last_occurrence(filename.as_str(), '-');
-    remove_from_db_file(db_archive, dir_name.to_string())?;
-    remove_from_db_file(files_archive, dir_name.to_string())?;
+pub fn repo_remove(filename: &str, db_archive: &Path, files_archive: &Path) -> anyhow::Result<()> {
+    let (dir_name, _) = split_last_occurrence(filename, '-');
+    remove_from_db_file(db_archive, dir_name)?;
+    remove_from_db_file(files_archive, dir_name)?;
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use rcgen::{
     KeyUsagePurpose,
 };
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use time::{Duration, OffsetDateTime};
 
 const CA_CERT_FILE: &str = "ca-cert.pem";
@@ -198,7 +198,7 @@ pub fn fingerprint_from_spki_der(spki_der: &[u8]) -> String {
     sha256_hex(spki_der)
 }
 
-fn write_secret(path: &PathBuf, contents: &str) -> anyhow::Result<()> {
+fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents).context("writing secret")?;
     #[cfg(unix)]
     {

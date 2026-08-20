@@ -25,7 +25,7 @@ use utoipa::OpenApi;
     get_build,
     delete_build,
     cancel_build,
-    rery_build
+    retry_build
 ))]
 pub struct BuildApi;
 
@@ -45,7 +45,7 @@ pub async fn build_output(
     startline: Option<i32>,
     _a: Authenticated,
 ) -> Result<String, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let build = Builds::find_by_id(buildid)
         .one(db)
@@ -58,8 +58,8 @@ pub async fn build_output(
         Some(v) => match startline {
             None => Ok(v),
             Some(startline) => {
-                let output = v.lines().skip(startline as usize).join("\n");
-                Ok(output)
+                let skip = usize::try_from(startline).unwrap_or(0);
+                Ok(v.lines().skip(skip).join("\n"))
             }
         },
     }
@@ -83,7 +83,7 @@ pub async fn list_builds(
     page: Option<u64>,
     _a: Authenticated,
 ) -> Result<Json<Vec<ListBuildsModel>>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let basequery = Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
@@ -127,7 +127,7 @@ pub async fn get_build(
     buildid: i32,
     _a: Authenticated,
 ) -> Result<Json<ListBuildsModel>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let result = Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
@@ -164,7 +164,7 @@ pub async fn delete_build(
     buildid: i32,
     _a: Authenticated,
 ) -> Result<(), NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let build = Builds::find_by_id(buildid)
         .one(db)
@@ -194,8 +194,7 @@ pub async fn cancel_build(
     buildid: i32,
     _a: Authenticated,
 ) -> Result<(), NotFound<String>> {
-    let _ = tx
-        .send(Action::Cancel(buildid))
+    tx.send(Action::Cancel(buildid))
         .map_err(|e| NotFound(e.to_string()))?;
 
     Ok(())
@@ -210,14 +209,14 @@ pub async fn cancel_build(
     )
 )]
 #[post("/build/<buildid>/retry")]
-pub async fn rery_build(
+pub async fn retry_build(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
     buildid: i32,
     _a: Authenticated,
 ) -> Result<Json<i32>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     // Fetch the build details
     let old_build = Builds::find_by_id(buildid)

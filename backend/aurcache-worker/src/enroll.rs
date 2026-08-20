@@ -71,14 +71,11 @@ pub async fn ensure_enrolled(cfg: &Config, identity: &Identity) -> Result<Worker
             tracing::info!("Worker approved and enrolled");
             return Ok(client);
         }
-        match status.status.as_str() {
-            WorkerStatus::REVOKED => {
-                anyhow::bail!("worker was revoked by the server");
-            }
-            _ => {
-                tracing::info!("Awaiting approval (status: {})…", status.status);
-            }
-        }
+        anyhow::ensure!(
+            status.status != WorkerStatus::REVOKED,
+            "worker was revoked by the server"
+        );
+        tracing::info!("Awaiting approval (status: {})…", status.status);
         tokio::time::sleep(Duration::from_secs(cfg.poll_interval)).await;
         status = enroll_client
             .register_status(&identity.fingerprint)

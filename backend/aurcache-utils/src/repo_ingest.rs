@@ -17,7 +17,7 @@ use sea_orm::{
 };
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 struct ParsedPkg {
@@ -113,18 +113,20 @@ pub async fn ingest_pkgs_in(
     // hold a DB connection during the file-write / repo_add phase.
     struct FileInfo {
         archive_name: String,
-        pkg_path: String,
+        pkg_path: PathBuf,
         parsed_name: String,
         existing_id: Option<i32>,
         existing_package_id: Option<i32>,
     }
+
+    let platform_repo = repo_root.join(platform.as_str());
 
     let mut file_infos: Vec<FileInfo> = Vec::new();
     {
         let txn = db.begin().await?;
         for (filename, _bytes, parsed) in &build_pkgs {
             let archive_name = filename.clone();
-            let pkg_path = format!("{}/{platform}/{archive_name}", repo_root.display());
+            let pkg_path = platform_repo.join(&archive_name);
 
             let existing = Files::find()
                 .filter(files::Column::Filename.eq(&archive_name))
@@ -170,7 +172,7 @@ pub async fn ingest_pkgs_in(
     }
 
     // Ensure the repo directory exists.
-    fs::create_dir_all(format!("{}/{platform}", repo_root.display()))?;
+    fs::create_dir_all(&platform_repo)?;
 
     // PHASE 2: write files and update the pacman repo — no DB connection held.
     for (fi, (_filename, bytes, _parsed)) in file_infos.iter().zip(build_pkgs.iter()) {
@@ -187,8 +189,8 @@ pub async fn ingest_pkgs_in(
             .await;
         pacman_repo_utils::repo_add::repo_add(
             &fi.pkg_path,
-            format!("{}/{platform}/repo.db.tar.gz", repo_root.display()),
-            format!("{}/{platform}/repo.files.tar.gz", repo_root.display()),
+            &platform_repo.join("repo.db.tar.gz"),
+            &platform_repo.join("repo.files.tar.gz"),
         )?;
     }
 
@@ -426,10 +428,8 @@ mod tests {
     /// emit `<pkgname>-debug` packages into the single flat repo.
     #[tokio::test]
     async fn makepkg_config_disables_debug_packages() {
-        let (conf, _) =
-            crate::job_config::create_makepkg_config(None, std::path::Path::new("/out"))
-                .await
-                .unwrap();
+        let conf =
+            crate::job_config::create_makepkg_config(None, std::path::Path::new("/out")).await;
         assert!(conf.contains("OPTIONS=(!debug)"), "got:\n{conf}");
     }
 }

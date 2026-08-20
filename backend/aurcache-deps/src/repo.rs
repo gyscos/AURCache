@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -209,16 +210,17 @@ fn repo_archive_provides(archive_path: &Path, dep_name: &str) -> Result<bool, Er
 /// so it works for both signed and unsigned packages (no %PGPSIG% required).
 fn desc_matches_dependency(content: &str, dep_name: &str) -> bool {
     let sections = parse_desc_sections(content);
-    let name = sections
+    if sections
         .get("NAME")
         .and_then(|v| v.first())
-        .cloned()
-        .unwrap_or_default();
-    if name == dep_name {
+        .map(String::as_str)
+        == Some(dep_name)
+    {
         return true;
     }
-    let provides = sections.get("PROVIDES").cloned().unwrap_or_default();
-    provides.iter().any(|p| parse_dep(p).0 == dep_name)
+    sections
+        .get("PROVIDES")
+        .is_some_and(|provides| provides.iter().any(|p| parse_dep(p).0 == dep_name))
 }
 
 /// Extracts all sections from a pacman desc file into a map of section name → values.
@@ -230,8 +232,8 @@ fn desc_matches_dependency(content: &str, dep_name: &str) -> bool {
 /// `%PGPSIG%` is always absent and `alpm-repo-db` would fail on every local repo entry.
 /// Since we only need `%NAME%` and `%PROVIDES%` for dependency resolution, a lenient
 /// section extractor is both simpler and more robust.
-fn parse_desc_sections(content: &str) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map = std::collections::HashMap::new();
+fn parse_desc_sections(content: &str) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
     let mut current_key: Option<String> = None;
     let mut current_values: Vec<String> = Vec::new();
 
@@ -265,6 +267,7 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use std::fmt::Write as _;
     use tar::{Builder, Header};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -275,7 +278,7 @@ mod tests {
     fn build_repo_db_tar_gz(pkg_name: &str, provides_name: Option<&str>) -> Vec<u8> {
         let mut desc = format!("%NAME%\n{pkg_name}\n\n%VERSION%\n1.0-1\n\n");
         if let Some(provides) = provides_name {
-            desc.push_str(&format!("%PROVIDES%\n{provides}\n\n"));
+            let _ = write!(desc, "%PROVIDES%\n{provides}\n\n");
         }
 
         let gz = GzEncoder::new(Vec::new(), Compression::default());

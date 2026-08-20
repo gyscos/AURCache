@@ -184,7 +184,7 @@ fn token_state(token: Option<&str>) -> &'static str {
 }
 
 fn ensure_interactive(field_name: &str) -> Result<()> {
-    if stdin().is_terminal() && stdout().is_terminal() {
+    if is_interactive() {
         Ok(())
     } else {
         bail!(

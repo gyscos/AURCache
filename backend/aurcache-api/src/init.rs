@@ -1,7 +1,7 @@
 use crate::aur::AURApi;
 use crate::auth::{OauthUserInfo, oauth_callback, oauth_login};
 use crate::backend::build_api;
-use crate::cusom_file_server::CustomFileServer;
+use crate::custom_file_server::CustomFileServer;
 #[cfg(feature = "static")]
 use crate::embed::CustomHandler;
 use crate::models::authenticated::OauthEnabled;
@@ -16,6 +16,7 @@ use rocket::{Config, routes};
 use rocket_oauth2::HyperRustlsAdapter;
 use sea_orm::DatabaseConnection;
 use std::env;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
@@ -30,7 +31,11 @@ fn get_secret_key() -> SecretKey {
         SecretKey::from(secret_key.as_bytes())
     } else {
         warn!("`SECRET_KEY` env not set, generating random key.");
-        SecretKey::from(Key::try_generate().unwrap().master())
+        SecretKey::from(
+            Key::try_generate()
+                .expect("no secure RNG available to generate a cookie key")
+                .master(),
+        )
     }
 }
 
@@ -79,7 +84,7 @@ pub fn init_api(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
-            address: "0.0.0.0".parse().unwrap(),
+            address: Ipv4Addr::UNSPECIFIED.into(),
             port: aurcache_types::ports::AURCACHE_HTTP_PORT,
             secret_key: get_secret_key(),
             ..Default::default()
@@ -117,20 +122,21 @@ pub fn init_api(
 
         impl Modify for SecurityAddon {
             fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-                let components = openapi.components.as_mut().unwrap(); // we can unwrap safely since there already is components registered.
-                let oauth_config = oauth_config_from_env();
-                if let Ok(oauth_config) = oauth_config {
-                    components.add_security_scheme(
-                        "openid_connect",
-                        SecurityScheme::OAuth2(OAuth2::new([Flow::AuthorizationCode(
-                            AuthorizationCode::new(
-                                oauth_config.provider().auth_uri(),
-                                oauth_config.provider().token_uri(),
-                                Scopes::new(),
-                            ),
-                        )])),
-                    );
-                }
+                let (Some(components), Ok(oauth_config)) =
+                    (openapi.components.as_mut(), oauth_config_from_env())
+                else {
+                    return;
+                };
+                components.add_security_scheme(
+                    "openid_connect",
+                    SecurityScheme::OAuth2(OAuth2::new([Flow::AuthorizationCode(
+                        AuthorizationCode::new(
+                            oauth_config.provider().auth_uri(),
+                            oauth_config.provider().token_uri(),
+                            Scopes::new(),
+                        ),
+                    )])),
+                );
             }
         }
 
@@ -158,7 +164,7 @@ pub fn init_api(
         }
 
         #[cfg(feature = "static")]
-        let rock = rock.mount("/", CustomHandler {});
+        let rock = rock.mount("/", CustomHandler);
 
         let rock = rock.launch().await;
         match rock {
@@ -200,7 +206,7 @@ pub fn init_worker_api(
             .unwrap_or(aurcache_types::ports::AURCACHE_WORKER_PORT);
 
         let config = Config {
-            address: "0.0.0.0".parse().unwrap(),
+            address: Ipv4Addr::UNSPECIFIED.into(),
             port,
             secret_key: get_secret_key(),
             tls: Some(tls),
@@ -226,7 +232,7 @@ pub fn init_worker_api(
 pub fn init_repo() -> JoinHandle<()> {
     tokio::spawn(async {
         let config = Config {
-            address: "0.0.0.0".parse().unwrap(),
+            address: Ipv4Addr::UNSPECIFIED.into(),
             port: aurcache_types::ports::AURCACHE_MIRROR_PORT,
             secret_key: get_secret_key(),
             ..Default::default()

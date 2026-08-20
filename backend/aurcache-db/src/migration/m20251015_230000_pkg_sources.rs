@@ -49,7 +49,7 @@ SET source_data = json_build_object('type', 'aur', 'name', name);
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -89,7 +89,7 @@ DROP COLUMN source_data;
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

@@ -32,7 +32,7 @@ pub fn init_build_queue(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandl
         loop {
             match rx.recv().await {
                 // Workers poll for enqueued builds; the wakeup needs no action.
-                Ok(Action::Build(_, _)) => {}
+                Ok(Action::Build(..)) => {}
                 Ok(Action::Cancel(build_id)) => {
                     if let Err(e) = cancel_build(&db, build_id).await {
                         warn!("Failed to cancel build #{build_id}: {e}");

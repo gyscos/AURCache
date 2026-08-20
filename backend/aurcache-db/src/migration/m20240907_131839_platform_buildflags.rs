@@ -69,7 +69,7 @@ UPDATE public.files
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         // try to copy pkg files to new location
@@ -136,7 +136,7 @@ DROP COLUMN platform;
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

@@ -10,9 +10,7 @@ use tracing::log::LevelFilter;
 pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
     let db: DatabaseConnection = match database_type() {
         DbBackend::Sqlite => {
-            if fs::metadata("./db").is_err() {
-                fs::create_dir("./db")?;
-            }
+            fs::create_dir_all("./db")?;
 
             let db_name = env::var("DB_NAME").unwrap_or_else(|_| "db.sqlite".to_string());
 

@@ -6,8 +6,8 @@ pub enum Action {
     Cancel(i32),
 }
 
-#[derive(Clone, Debug)]
-pub struct BuildStates {}
+/// Values stored in the `builds.status` column.
+pub struct BuildStates;
 
 impl BuildStates {
     pub const ACTIVE_BUILD: i32 = 0;

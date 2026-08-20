@@ -4,9 +4,6 @@ use thiserror::Error;
 /// Errors that can occur when querying the AUR or resolving dependencies.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The requested package was not found in the AUR.
-    #[error("package not found: {0}")]
-    NotFound(String),
     /// The AUR RPC returned an error or an unexpected response.
     #[error("AUR RPC error: {0}")]
     Rpc(String),

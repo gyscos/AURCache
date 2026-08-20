@@ -19,15 +19,12 @@ pub fn extract_source(archive: &[u8], dest: &Path) -> Result<PathBuf> {
     tar.unpack(dest).context("unpacking source archive")?;
 
     // The archive has a single top-level pkgbase directory.
-    let mut top = None;
-    for entry in std::fs::read_dir(dest).context("reading extracted source")? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            top = Some(entry.path());
-            break;
-        }
-    }
-    top.context("source archive had no package directory")
+    std::fs::read_dir(dest)
+        .context("reading extracted source")?
+        .flatten()
+        .find(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|entry| entry.path())
+        .context("source archive had no package directory")
 }
 
 /// Find built package artifacts (`*.pkg.tar.*`, excluding detached `.sig`
@@ -160,9 +157,7 @@ pub fn build_command(
     // Separator, then makepkg args (if any).
     if !build_flags.is_empty() {
         argv.push("--".to_string());
-        for f in build_flags {
-            argv.push(f.clone());
-        }
+        argv.extend(build_flags.iter().cloned());
     }
     argv
 }

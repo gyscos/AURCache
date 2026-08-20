@@ -1,25 +1,6 @@
 use anyhow::anyhow;
-use aurcache_db::packages::GitSourceSpec;
 use git2::{Direction, Oid, Repository};
-use std::path::{Path, PathBuf};
-
-/// checkout git repo at specific ref
-/// parts of this are not 'Send' so they need to be scoped
-pub fn checkout_repo_ref(
-    git_repo: String,
-    git_ref: String,
-    path: PathBuf,
-) -> anyhow::Result<Repository> {
-    // checkout repo
-    let repo = Repository::clone(git_repo.as_str(), &path)?;
-    resolve_and_checkout(&repo, &git_ref)?;
-    Ok(repo)
-}
-
-/// Checkout a shared git source spec into the given path.
-pub fn checkout_git_source(spec: &GitSourceSpec, path: PathBuf) -> anyhow::Result<Repository> {
-    checkout_repo_ref(spec.url.clone(), spec.r#ref.clone(), path)
-}
+use std::path::Path;
 
 /// Resolve `git_ref` against the *fetched remote* state, falling back to a
 /// local resolve.

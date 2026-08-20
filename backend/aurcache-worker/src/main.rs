@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aurcache_worker::config::Config;
@@ -30,7 +31,7 @@ enum Command {
     BuildOnce {
         /// Path to a directory containing a PKGBUILD (defaults to cwd).
         #[arg(long, default_value = ".")]
-        path: String,
+        path: PathBuf,
         /// Extra makepkg flags (e.g. --nocheck).
         #[arg(long = "flag")]
         flags: Vec<String>,
@@ -57,9 +58,7 @@ async fn main() -> Result<()> {
             println!("Native arches: {}", cfg.native_arches.join(","));
             Ok(())
         }
-        Command::BuildOnce { path, flags } => {
-            oneshot::build_once(&cfg, std::path::Path::new(&path), &flags).await
-        }
+        Command::BuildOnce { path, flags } => oneshot::build_once(&cfg, &path, &flags).await,
         Command::Run => run(cfg).await,
     }
 }

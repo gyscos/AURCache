@@ -15,11 +15,11 @@ use tracing::error;
 struct Asset;
 
 #[derive(Clone)]
-pub struct CustomHandler {}
+pub struct CustomHandler;
 
-impl Into<Vec<Route>> for CustomHandler {
-    fn into(self) -> Vec<Route> {
-        vec![Route::ranked(-2, Method::Get, "/<path..>", self)]
+impl From<CustomHandler> for Vec<Route> {
+    fn from(handler: CustomHandler) -> Self {
+        vec![Route::ranked(-2, Method::Get, "/<path..>", handler)]
     }
 }
 
@@ -30,7 +30,7 @@ impl Handler for CustomHandler {
             return match Redirect::to("/api/login").respond_to(request) {
                 Ok(r) => Outcome::Success(r),
                 Err(e) => {
-                    error!("Failed to redirect: {:?}", e);
+                    error!("Failed to redirect: {e:?}");
                     Outcome::Error(Status::InternalServerError)
                 }
             };

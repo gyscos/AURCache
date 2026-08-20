@@ -4,18 +4,14 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 /// Serializes base-chroot creation/refresh across concurrent jobs so two builds
 /// never race to `mkarchroot`/`arch-nspawn` the same shared `<chroot_dir>/root`
-/// (which would corrupt it). Keyed by chroot dir so distinct dirs don't block.
-fn base_chroot_lock() -> Arc<Mutex<()>> {
-    use std::sync::OnceLock;
-    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
-    Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
-}
+/// (which would corrupt it). A worker only ever uses one chroot dir, so a
+/// single process-wide lock is enough.
+static BASE_CHROOT_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Run a command, returning combined stdout+stderr and the exit status.
 pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::ExitStatus)> {
@@ -54,14 +50,13 @@ pub async fn ensure_base_chroot(
 ) -> Result<PathBuf> {
     // Serialize base-chroot creation/refresh: concurrent jobs must not race to
     // build or `-Syu` the same shared root.
-    let lock = base_chroot_lock();
-    let _guard = lock.lock().await;
+    let _guard = BASE_CHROOT_LOCK.lock().await;
 
     std::fs::create_dir_all(chroot_dir)
         .with_context(|| format!("creating chroot dir {}", chroot_dir.display()))?;
     let root = chroot_dir.join("root");
 
-    if root.join(".arch-chroot").exists() || root.exists() && root.join("usr").exists() {
+    if root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists()) {
         // Refresh existing chroot; a failure here is non-fatal for the build.
         let mut cmd = devtools("arch-nspawn");
         cmd.arg(&root).args(["pacman", "-Syu", "--noconfirm"]);

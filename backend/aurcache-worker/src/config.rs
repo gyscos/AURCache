@@ -173,14 +173,18 @@ pub fn parse_size(raw: impl AsRef<str>) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num, mult) = match s.chars().last().unwrap().to_ascii_uppercase() {
-        'K' => (&s[..s.len() - 1], 1024u64),
-        'M' => (&s[..s.len() - 1], 1024 * 1024),
-        'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        'T' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+    // Split off the trailing unit by chars, so a multi-byte suffix can never
+    // slice mid-character.
+    let mut chars = s.chars();
+    let unit = chars.next_back()?.to_ascii_uppercase();
+    let (num, mult) = match unit {
+        'K' => (chars.as_str(), 1024u64),
+        'M' => (chars.as_str(), 1024 * 1024),
+        'G' => (chars.as_str(), 1024 * 1024 * 1024),
+        'T' => (chars.as_str(), 1024u64 * 1024 * 1024 * 1024),
         _ => (s, 1),
     };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
+    num.trim().parse::<u64>().ok()?.checked_mul(mult)
 }
 
 #[cfg(test)]

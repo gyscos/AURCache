@@ -59,7 +59,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     let build = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform_str))
-        .filter(builds::Column::Status.is_in(vec![
+        .filter(builds::Column::Status.is_in([
             Some(ACTIVE_BUILD_STATUS),
             Some(ENQUEUED_BUILD_STATUS),
             Some(WAITING_FOR_DEPS_STATUS),

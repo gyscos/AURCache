@@ -47,58 +47,55 @@ impl ActivityLog {
             data: Set(activity),
             user: Set(user),
             typ: Set(activity_type),
-            ..std::default::Default::default()
+            ..Default::default()
         }
         .save(&self.db)
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
+        .await?;
         Ok(())
     }
 
     pub async fn list(&self, limit: Option<u64>) -> anyhow::Result<Vec<Activity>> {
-        // List activities from database
         let activities = Activities::find()
             .order_by(activities::Column::Timestamp, Order::Desc)
             .limit(limit)
-            .into_model::<activities::Model>()
             .all(&self.db)
-            .await
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .await?;
 
-        let t: Vec<Activity> = activities
-            .iter()
-            .filter_map(|x| {
-                if let Ok(v) = self.deserialize_type(x.typ, &x.data) {
-                    Some(Activity {
-                        timestamp: x.timestamp,
-                        text: v.format(),
-                        user: x.user.clone(),
-                    })
-                } else {
-                    None
+        Ok(activities
+            .into_iter()
+            .filter_map(|activity| {
+                match Self::deserialize_type(activity.typ, &activity.data) {
+                    Ok(serializer) => Some(Activity {
+                        timestamp: activity.timestamp,
+                        text: serializer.format(),
+                        user: activity.user,
+                    }),
+                    Err(e) => {
+                        // A row we cannot render is skipped rather than failing the whole listing.
+                        tracing::warn!("Skipping unreadable activity row: {e}");
+                        None
+                    }
                 }
             })
-            .collect();
-        Ok(t)
+            .collect())
     }
 
     fn deserialize_type(
-        &self,
         activity_type: ActivityType,
         data: &str,
     ) -> anyhow::Result<Box<dyn ActivitySerializer>> {
-        match activity_type {
-            ActivityType::AddPackage => {
-                Ok(Box::from(serde_json::from_str::<PackageAddActivity>(data)?))
+        Ok(match activity_type {
+            ActivityType::AddPackage => Box::new(serde_json::from_str::<PackageAddActivity>(data)?),
+            ActivityType::RemovePackage => {
+                Box::new(serde_json::from_str::<PackageDeleteActivity>(data)?)
             }
-            ActivityType::RemovePackage => Ok(Box::from(serde_json::from_str::<
-                PackageDeleteActivity,
-            >(data)?)),
-            ActivityType::UpdatePackage => Ok(Box::from(serde_json::from_str::<
-                PackageUpdateActivity,
-            >(data)?)),
-            ActivityType::StartBuild => todo!("StartBuild"),
-            ActivityType::FinishBuild => todo!("FinishBuild"),
-        }
+            ActivityType::UpdatePackage => {
+                Box::new(serde_json::from_str::<PackageUpdateActivity>(data)?)
+            }
+            // Nothing writes these types yet; render them as unreadable instead of panicking.
+            ActivityType::StartBuild | ActivityType::FinishBuild => {
+                return Err(anyhow!("Unsupported activity type: {activity_type:?}"));
+            }
+        })
     }
 }

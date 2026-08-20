@@ -15,11 +15,11 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
         .ok_or_else(|| anyhow!("id not found"))?;
 
     // remove package db entry
-    pkg.clone().delete(&txn).await?;
+    pkg.delete(&txn).await?;
 
     // remove corresponding builds
     let builds = Builds::find()
-        .filter(builds::Column::PkgId.eq(pkg.id))
+        .filter(builds::Column::PkgId.eq(pkg_id))
         .all(&txn)
         .await?;
     for b in builds {
@@ -28,7 +28,7 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
 
     // remove package files
     let package_files: Vec<files::Model> = Files::find()
-        .filter(files::Column::PackageId.eq(pkg.id))
+        .filter(files::Column::PackageId.eq(pkg_id))
         .all(&txn)
         .await?;
 
@@ -38,7 +38,7 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
 
     // delete corresponding settings entries
     Settings::delete_many()
-        .filter(settings::Column::PkgId.eq(pkg.id))
+        .filter(settings::Column::PkgId.eq(pkg_id))
         .exec(&txn)
         .await?;
 
@@ -46,7 +46,7 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     // alone, since SQLite only enforces it when foreign_keys is on for the
     // connection actually issuing the DELETE)
     PackageVcsSources::delete_many()
-        .filter(package_vcs_sources::Column::PackageId.eq(pkg.id))
+        .filter(package_vcs_sources::Column::PackageId.eq(pkg_id))
         .exec(&txn)
         .await?;
 

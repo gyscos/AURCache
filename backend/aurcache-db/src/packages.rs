@@ -38,8 +38,7 @@ impl FromStr for SourceData {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: Self = serde_json::from_str(s)?;
-        Ok(value)
+        Ok(serde_json::from_str(s)?)
     }
 }
 

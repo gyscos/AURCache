@@ -46,7 +46,7 @@ async fn resolve_local_dependency_resolutions<C: ConnectionTrait>(
     dep_names: &[String],
 ) -> Result<HashMap<String, DependencyResolution>, DbErr> {
     let local_packages = packages::Entity::find()
-        .filter(packages::Column::Status.is_in(vec![
+        .filter(packages::Column::Status.is_in([
             ACTIVE_BUILD_STATUS,
             SUCCESSFUL_BUILD_STATUS,
             ENQUEUED_BUILD_STATUS,

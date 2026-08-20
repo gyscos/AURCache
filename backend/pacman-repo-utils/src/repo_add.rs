@@ -12,13 +12,13 @@ use tar::Archive;
 use tracing::{debug, error, warn};
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-pub fn repo_add(pkgfile: &str, db_archive: String, files_archive: String) -> anyhow::Result<()> {
+pub fn repo_add(pkgfile: &Path, db_archive: &Path, files_archive: &Path) -> anyhow::Result<()> {
     let mut files = vec![];
     let mut pkginfo = Pkginfo::new();
 
     // Path to the .tar.zst file
-    let file = File::open(Path::new(pkgfile))?;
-    let ext = Path::new(pkgfile).extension().and_then(|e| e.to_str());
+    let file = File::open(pkgfile)?;
+    let ext = pkgfile.extension().and_then(|e| e.to_str());
 
     // Select the appropriate decompression method
     let decompressor: Box<dyn Read> = match ext {
@@ -37,16 +37,17 @@ pub fn repo_add(pkgfile: &str, db_archive: String, files_archive: String) -> any
     let mut archive = Archive::new(decompressor);
 
     // Iterate over the entries in the tar archive
+    let pkgpath = pkgfile.display();
     for entry in archive.entries()? {
         match entry {
             Ok(entry) => {
                 if let Ok(path) = entry.path() {
                     if !path.display().to_string().starts_with('.') {
-                        files.push(format!("{}", path.display()));
+                        files.push(path.display().to_string());
                     }
 
                     if path == Path::new(".PKGINFO") {
-                        debug!("Found .PKGINFO file in '{pkgfile}'.");
+                        debug!("Found .PKGINFO file in '{pkgpath}'.");
                         pkginfo.parse(entry)?;
                     }
                 }
@@ -56,25 +57,24 @@ pub fn repo_add(pkgfile: &str, db_archive: String, files_archive: String) -> any
     }
 
     if !pkginfo.valid() {
-        error!("Invalid package file '{pkgfile}'.");
+        error!("Invalid package file '{pkgpath}'.");
         bail!("Invalid package file");
     }
 
     // Compute base64'd PGP signature
-    debug!("Setting signature for '{pkgfile}'.");
+    debug!("Setting signature for '{pkgpath}'.");
     pkginfo.set_signature(pkgfile)?;
 
-    debug!("Calculating compressed size for '{pkgfile}'.");
+    debug!("Calculating compressed size for '{pkgpath}'.");
     let csize = fs::metadata(pkgfile)?.len() as usize;
 
-    debug!("Calculating checksums for '{pkgfile}'.");
+    debug!("Calculating checksums for '{pkgpath}'.");
     let (md5sum, sha256sum) = calc_checksums(pkgfile)?;
 
-    let filename = Path::new(pkgfile)
+    let filename = pkgfile
         .file_name()
-        .ok_or_else(|| anyhow!("invalid path"))?
-        .to_str()
-        .ok_or_else(|| anyhow!("invalid path"))?
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("invalid package path: {pkgpath}"))?
         .to_string();
 
     let dir_name = format!("{}-{}", pkginfo.pkgname, pkginfo.pkgver);
@@ -88,27 +88,17 @@ pub fn repo_add(pkgfile: &str, db_archive: String, files_archive: String) -> any
     let desc_str = desc.to_string();
 
     debug!("Adding DESC and FILES entries to db archive");
-    add_to_db_file(
-        desc_str.clone(),
-        dir_name.clone(),
-        "desc".to_string(),
-        db_archive,
-    )?;
+    add_to_db_file(&desc_str, &dir_name, "desc", db_archive)?;
 
     files.sort();
     let files_comb = format!("%FILES%\n{}", files.join("\n"));
-    add_to_db_file(
-        desc_str,
-        dir_name.clone(),
-        "desc".to_string(),
-        files_archive.clone(),
-    )?;
-    add_to_db_file(files_comb, dir_name, "files".to_string(), files_archive)?;
+    add_to_db_file(&desc_str, &dir_name, "desc", files_archive)?;
+    add_to_db_file(&files_comb, &dir_name, "files", files_archive)?;
 
     Ok(())
 }
 
-fn calc_checksums(path: &str) -> anyhow::Result<(String, String)> {
+fn calc_checksums(path: &Path) -> anyhow::Result<(String, String)> {
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;

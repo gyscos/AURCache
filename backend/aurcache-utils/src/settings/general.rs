@@ -1,7 +1,9 @@
 use crate::settings::meta::SettingsMetaTrait;
 use crate::settings::parser::ParseSetting;
 use aurcache_db::settings;
-use aurcache_types::settings::{ApplicationSettings, Setting, SettingSource, SettingsEntry};
+use aurcache_types::settings::{
+    ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
+};
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::future::Future;
 
@@ -84,13 +86,11 @@ where
         match T::parse_setting(val) {
             Ok(parsed) => parsed,
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to parse {}: {}. Using default '{}'.",
-                    context, e, setting.default
+                tracing::warn!(
+                    "Failed to parse {context}: {e}. Using default '{}'.",
+                    setting.default
                 );
-                T::parse_setting(setting.default)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse setting {} {e}", setting.key))
-                    .unwrap() // safe because default is valid
+                parse_default(&setting)
             }
         }
     };
@@ -102,15 +102,16 @@ where
     //   3. Global row       — UI-set baseline.
     //   4. Static default.
 
-    // 1. Per-package row
+    // 1. Per-package row. Having no row is the common case and not an error;
+    // only a failed query is worth reporting.
     if let Some(pid) = pkg_id {
-        if let Ok(Some(pkg_entry)) = settings::Entity::find()
+        match settings::Entity::find()
             .filter(settings::Column::Key.eq(setting.key))
             .filter(settings::Column::PkgId.eq(pid))
             .one(db)
             .await
         {
-            if let Some(v) = pkg_entry.value {
+            Ok(Some(settings::Model { value: Some(v), .. })) => {
                 return SettingsEntry {
                     value: parse_or_default(
                         &v,
@@ -119,11 +120,11 @@ where
                     source: SettingSource::Package,
                 };
             }
-        } else {
-            eprintln!(
-                "Warning: Failed to fetch pkg-specific setting {} pkg={}. Using default.",
-                setting.key, pid
-            );
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "Failed to fetch pkg-specific setting {} pkg={pid}: {e}. Falling back.",
+                setting.key
+            ),
         }
     }
 
@@ -151,13 +152,22 @@ where
         };
     }
 
-    // 4. Static default. Unwrap is safe — meta default is type-checked.
+    // 4. Static default.
     SettingsEntry {
-        value: T::parse_setting(setting.default)
-            .map_err(|e| anyhow::anyhow!("Failed to parse setting {} {e}", setting.key))
-            .unwrap(),
+        value: parse_default(&setting),
         source: SettingSource::Default,
     }
+}
+
+/// Parse a setting's built-in default. The defaults are compile-time constants
+/// chosen to match each setting's type, so a failure here is a programming bug.
+fn parse_default<T: ParseSetting>(setting: &SettingsMeta) -> T {
+    T::parse_setting(setting.default).unwrap_or_else(|e| {
+        panic!(
+            "built-in default '{}' for setting {} is not parseable: {e}",
+            setting.default, setting.key
+        )
+    })
 }
 
 pub trait SettingsTraits {

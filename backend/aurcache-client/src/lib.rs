@@ -367,9 +367,14 @@ impl AurCacheClient {
         limit: Option<u64>,
         page: Option<u64>,
     ) -> Result<Vec<SimplePackage>> {
-        let query = optional_u64_query(&[("limit", limit), ("page", page)]);
-        self.request_json::<Vec<SimplePackage>, Value>(Method::GET, "/packages/list", &query, None)
-            .await
+        let query = Query::default().opt("limit", limit).opt("page", page);
+        self.request_json::<Vec<SimplePackage>, Value>(
+            Method::GET,
+            "/packages/list",
+            query.pairs(),
+            None,
+        )
+        .await
     }
 
     /// Fetches details for a single package id.
@@ -421,12 +426,11 @@ impl AurCacheClient {
         limit: Option<u64>,
         page: Option<u64>,
     ) -> Result<Vec<Build>> {
-        let query = with_optional_i32(
-            optional_u64_query(&[("limit", limit), ("page", page)]),
-            "pkgid",
-            package_id,
-        );
-        self.request_json::<Vec<Build>, Value>(Method::GET, "/builds", &query, None)
+        let query = Query::default()
+            .opt("limit", limit)
+            .opt("page", page)
+            .opt("pkgid", package_id);
+        self.request_json::<Vec<Build>, Value>(Method::GET, "/builds", query.pairs(), None)
             .await
     }
 
@@ -440,9 +444,14 @@ impl AurCacheClient {
     ///
     /// When `start_line` is provided, lines before that offset are skipped.
     pub async fn build_output(&self, id: i32, start_line: Option<i32>) -> Result<String> {
-        let query = optional_i32_query("startline", start_line);
-        self.request_text::<Value>(Method::GET, &format!("/build/{id}/output"), &query, None)
-            .await
+        let query = Query::default().opt("startline", start_line);
+        self.request_text::<Value>(
+            Method::GET,
+            &format!("/build/{id}/output"),
+            query.pairs(),
+            None,
+        )
+        .await
     }
 
     /// Retries the given build and returns the new build id.
@@ -515,7 +524,7 @@ impl AurCacheClient {
         B: Serialize + ?Sized,
     {
         let response = self.send(method, path, query, body).await?;
-        let _ = ensure_success(response).await?;
+        ensure_success(response).await?;
         Ok(())
     }
 
@@ -581,28 +590,22 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
     }
 }
 
-fn optional_u64_query(values: &[(&str, Option<u64>)]) -> Vec<(String, String)> {
-    values
-        .iter()
-        .filter_map(|(key, value)| value.map(|value| ((*key).to_string(), value.to_string())))
-        .collect()
-}
+/// Accumulates the `?key=value` pairs of a request, skipping absent values.
+#[derive(Default)]
+struct Query(Vec<(String, String)>);
 
-fn optional_i32_query(key: &str, value: Option<i32>) -> Vec<(String, String)> {
-    value
-        .map(|value| vec![(key.to_string(), value.to_string())])
-        .unwrap_or_default()
-}
-
-fn with_optional_i32(
-    mut query: Vec<(String, String)>,
-    key: &str,
-    value: Option<i32>,
-) -> Vec<(String, String)> {
-    if let Some(value) = value {
-        query.push((key.to_string(), value.to_string()));
+impl Query {
+    /// Append `key=value` if `value` is `Some`.
+    fn opt<T: ToString>(mut self, key: &str, value: Option<T>) -> Self {
+        if let Some(value) = value {
+            self.0.push((key.to_string(), value.to_string()));
+        }
+        self
     }
-    query
+
+    fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
 }
 
 async fn ensure_success(response: Response) -> Result<Response> {

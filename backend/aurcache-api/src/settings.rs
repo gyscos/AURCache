@@ -32,9 +32,7 @@ pub async fn settings(
     pkgid: Option<i32>,
     _a: Authenticated,
 ) -> Result<Json<ApplicationSettings>, Custom<String>> {
-    let db = db as &DatabaseConnection;
-
-    ApplicationSettings::get_all(db, pkgid)
+    ApplicationSettings::get_all(db.inner(), pkgid)
         .await
         .map(Json)
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))
@@ -59,9 +57,7 @@ pub async fn setting_get(
     _a: Authenticated,
 ) -> Result<Json<SettingResponse>, Custom<String>> {
     let setting = parse_setting(key)?;
-    let db = db as &DatabaseConnection;
-
-    let entry = ApplicationSettings::get::<String>(setting, pkgid, db).await;
+    let entry = ApplicationSettings::get::<String>(setting, pkgid, db.inner()).await;
     Ok(Json(SettingResponse {
         value: entry.value,
         source: entry.source,
@@ -87,9 +83,7 @@ pub async fn setting_patch(
     _a: Authenticated,
 ) -> Result<(), Custom<String>> {
     let setting = parse_setting(key)?;
-    let db = db as &DatabaseConnection;
-
-    ApplicationSettings::patch(db, [(setting, pkgid, Some(input.value.clone()))])
+    ApplicationSettings::patch(db.inner(), [(setting, pkgid, Some(input.value.clone()))])
         .await
         .map_err(|e| Custom(Status::BadRequest, e.to_string()))
 }
@@ -113,9 +107,7 @@ pub async fn setting_reset(
     _a: Authenticated,
 ) -> Result<(), Custom<String>> {
     let setting = parse_setting(key)?;
-    let db = db as &DatabaseConnection;
-
-    ApplicationSettings::patch(db, [(setting, pkgid, None)])
+    ApplicationSettings::patch(db.inner(), [(setting, pkgid, None)])
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))
 }

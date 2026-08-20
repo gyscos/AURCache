@@ -90,6 +90,28 @@ pub async fn find_worker_by_fingerprint<C: ConnectionTrait>(
         .await
 }
 
+/// Load a worker as an `ActiveModel` ready to be mutated and updated.
+async fn load_for_update<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+) -> Result<workers::ActiveModel, DbErr> {
+    Workers::find_by_id(id)
+        .one(db)
+        .await?
+        .map(Into::into)
+        .ok_or_else(|| DbErr::Custom(format!("worker {id} not found")))
+}
+
+async fn set_status<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+    status: &str,
+) -> Result<workers::Model, DbErr> {
+    let mut active = load_for_update(db, id).await?;
+    active.status = Set(status.to_string());
+    active.update(db).await
+}
+
 /// Store the CA-signed leaf certificate for a worker (done at registration time,
 /// before approval). The certificate chains to the CA but the worker is still
 /// refused at the auth guard until its status becomes `approved`.
@@ -100,11 +122,7 @@ pub async fn store_signed_cert<C: ConnectionTrait>(
     serial: &str,
     not_after: i64,
 ) -> Result<workers::Model, DbErr> {
-    let worker = Workers::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("worker {id} not found")))?;
-    let mut active: workers::ActiveModel = worker.into();
+    let mut active = load_for_update(db, id).await?;
     active.signed_cert = Set(Some(signed_cert.to_string()));
     active.cert_serial = Set(Some(serial.to_string()));
     active.not_after = Set(Some(not_after));
@@ -114,24 +132,12 @@ pub async fn store_signed_cert<C: ConnectionTrait>(
 /// Approve a worker so it may claim jobs. The signed certificate is issued at
 /// registration time; approval only flips the gating status.
 pub async fn approve_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<workers::Model, DbErr> {
-    let worker = Workers::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("worker {id} not found")))?;
-    let mut active: workers::ActiveModel = worker.into();
-    active.status = Set(STATUS_APPROVED.to_string());
-    active.update(db).await
+    set_status(db, id, STATUS_APPROVED).await
 }
 
 /// Revoke a worker: it is immediately refused at the auth guard.
 pub async fn revoke_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<workers::Model, DbErr> {
-    let worker = Workers::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("worker {id} not found")))?;
-    let mut active: workers::ActiveModel = worker.into();
-    active.status = Set(STATUS_REVOKED.to_string());
-    active.update(db).await
+    set_status(db, id, STATUS_REVOKED).await
 }
 
 /// List all workers, most recently seen first.

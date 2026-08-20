@@ -150,13 +150,13 @@ pub async fn package_update_with_client(
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let mut visited = HashSet::new();
-    let mut services = Services {
+    let services = Services {
         client,
         store,
         db,
         tx,
     };
-    package_update_with_client_inner(&mut services, pkg_model, force, &mut visited).await
+    package_update_with_client_inner(&services, pkg_model, force, &mut visited).await
 }
 
 /// Recompute and persist a package's dependency graph from its current
@@ -174,7 +174,7 @@ pub async fn package_resync_dependencies(
     tx: &Sender<Action>,
     pkg_model: &packages::Model,
 ) -> anyhow::Result<()> {
-    let mut services = Services {
+    let services = Services {
         client,
         store,
         db,
@@ -192,7 +192,7 @@ pub async fn package_resync_dependencies(
         .map_err(|e| anyhow!("Failed to resolve source info: {e}"))?;
     let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
 
-    sync_dependency_graph(&mut services, pkg_model, &deps).await?;
+    sync_dependency_graph(&services, pkg_model, &deps).await?;
 
     // The dependency change may have made some previously-required
     // dependency-only packages no longer needed.
@@ -205,7 +205,7 @@ pub async fn package_resync_dependencies(
 #[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn package_update_with_client_inner(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     pkg_model: packages::Model,
     force: bool,
     visited: &mut HashSet<i32>,
@@ -292,7 +292,7 @@ struct DependencyGraph {
 ///
 /// Does not care about builds at this point.
 async fn sync_dependency_graph(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<DependencyGraph> {
@@ -346,7 +346,7 @@ async fn sync_dependency_graph(
 
 /// Collect and resolve dependency constraints to pkgbase names.
 async fn resolve_dependency_constraints(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
@@ -363,7 +363,7 @@ async fn resolve_dependency_constraints(
 /// Ensure all resolved dependency packages exist in the database,
 /// adding them via the AUR if missing.
 async fn ensure_missing_dependency_packages(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     pkg_model: &packages::Model,
     dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
 ) -> anyhow::Result<()> {
@@ -539,14 +539,15 @@ async fn dependency_satisfies_constraint(
     Ok(constraint.is_satisfied(&version))
 }
 
-/// Check whether the dependencies for a package are satisfied on a single platform.
+/// Check whether every dependency in the graph is satisfied, or already has a
+/// pending build, on a single platform.
 ///
 /// If a dependency needs a rebuild and no build is pending, this triggers the
-/// recursive update so the dependency will be available when the dependent starts.
-/// Packages whose last build failed are never auto-retriggered — the user must
-/// Check whether all deps in the graph are satisfied or have pending builds on this platform.
+/// recursive update so the dependency will be available when the dependent
+/// starts. Packages whose last build failed are never auto-retriggered — the
+/// user has to retry those explicitly.
 async fn dependencies_ready_for_platform(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     platform: &Platform,
     graph: &DependencyGraph,
     visited: &mut HashSet<i32>,
@@ -566,7 +567,7 @@ async fn dependencies_ready_for_platform(
         let has_pending_build = Builds::find()
             .filter(builds::Column::PkgId.eq(dep_info.package.id))
             .filter(builds::Column::Platform.eq(platform.as_str()))
-            .filter(builds::Column::Status.is_in(vec![
+            .filter(builds::Column::Status.is_in([
                 Some(BuildStates::ENQUEUED_BUILD),
                 Some(BuildStates::ACTIVE_BUILD),
                 Some(BuildStates::WAITING_FOR_DEPS),
@@ -575,13 +576,10 @@ async fn dependencies_ready_for_platform(
             .await?
             > 0;
 
-        if !has_pending_build {
-            if dep_info.package.status == BuildStates::FAILED_BUILD {
-                // Last build failed — don't auto-retry.
-            } else {
-                package_update_with_client_inner(services, dep_info.package.clone(), true, visited)
-                    .await?;
-            }
+        // A dependency whose last build failed is not auto-retried.
+        if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
+            package_update_with_client_inner(services, dep_info.package.clone(), true, visited)
+                .await?;
         }
 
         return Ok(false);
@@ -621,7 +619,7 @@ pub struct PlatformUpdateResult {
 
 /// For each configured platform, check dep readiness and enqueue builds.
 async fn enqueue_platform_builds(
-    services: &mut Services<'_>,
+    services: &Services<'_>,
     request: BuildRequest<'_>,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
@@ -686,7 +684,7 @@ pub async fn update_platform(
 ) -> anyhow::Result<aurcache_db::helpers::build_enqueue::EnqueueBuildResult> {
     // Fast path: promote an existing WAITING_FOR_DEPS build if one is present.
     if let Some(promoted) = promote_waiting_build(db, pkg.id, platform).await? {
-        let _ = tx.send(Action::Build(Box::from(pkg), Box::from(promoted.clone())));
+        let _ = tx.send(Action::Build(Box::new(pkg), Box::new(promoted.clone())));
         return Ok(aurcache_db::helpers::build_enqueue::EnqueueBuildResult {
             build: promoted,
             inserted: true,
@@ -708,8 +706,8 @@ pub async fn update_platform(
 
     if enqueue_result.inserted {
         let _ = tx.send(Action::Build(
-            Box::from(pkg),
-            Box::from(enqueue_result.build.clone()),
+            Box::new(pkg),
+            Box::new(enqueue_result.build.clone()),
         ));
     }
     Ok(enqueue_result)

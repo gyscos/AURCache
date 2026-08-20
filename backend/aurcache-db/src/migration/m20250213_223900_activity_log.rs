@@ -42,7 +42,7 @@ CREATE TABLE public.activity (
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -60,7 +60,7 @@ CREATE TABLE public.activity (
                 db.execute_unprepared(r"DROP TABLE IF EXISTS activity;")
                     .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

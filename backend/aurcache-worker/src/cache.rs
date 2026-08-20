@@ -39,21 +39,20 @@ impl Cache {
     /// `SRCDEST` for a pkgbase; created on demand. Returns `None` only if the
     /// directory truly cannot be created (build falls back to an ephemeral dir).
     pub fn srcdest(&self, pkgbase: &str) -> Option<PathBuf> {
-        self.ensured(self.root.join("srcdest").join(sanitize(pkgbase)))
+        Self::ensured(self.root.join("srcdest").join(sanitize(pkgbase)))
     }
 
     /// Shared persistent GnuPG home for validpgpkeys.
     pub fn gnupg_home(&self) -> Option<PathBuf> {
-        self.ensured(self.root.join("gnupg"))
+        Self::ensured(self.root.join("gnupg"))
     }
 
     /// Shared pacman package cache (bind-mounted into the chroot copy).
-    #[allow(dead_code)]
     pub fn pacman_pkg(&self) -> Option<PathBuf> {
-        self.ensured(self.root.join("pacman-pkg"))
+        Self::ensured(self.root.join("pacman-pkg"))
     }
 
-    fn ensured(&self, path: PathBuf) -> Option<PathBuf> {
+    fn ensured(path: PathBuf) -> Option<PathBuf> {
         match std::fs::create_dir_all(&path) {
             Ok(()) => Some(path),
             Err(e) => {
@@ -159,7 +158,7 @@ pub fn plan_eviction(
 
     // Age-based eviction first.
     for e in entries {
-        if in_use.iter().any(|u| u == &e.pkgbase) {
+        if in_use.contains(&e.pkgbase) {
             kept.push(e);
             continue;
         }
@@ -176,14 +175,14 @@ pub fn plan_eviction(
         let mut total: u64 = kept.iter().map(|e| e.size).sum();
         // Oldest first.
         kept.sort_by_key(|e| e.last_used);
-        let mut i = 0;
-        while total > max_size && i < kept.len() {
-            let e = kept[i];
-            if !in_use.iter().any(|u| u == &e.pkgbase) {
+        for e in kept {
+            if total <= max_size {
+                break;
+            }
+            if !in_use.contains(&e.pkgbase) {
                 evict.push(e.pkgbase.clone());
                 total = total.saturating_sub(e.size);
             }
-            i += 1;
         }
     }
     evict

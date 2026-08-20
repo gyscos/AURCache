@@ -5,11 +5,13 @@
 //! (0=active, 1=success, 2=failed, 3=enqueued, 4=waiting-for-deps); the db
 //! crate keeps its own copy to avoid a dependency on the types crate here.
 
-use crate::builds;
-use crate::prelude::Builds;
+use crate::helpers::worker_store::STATUS_APPROVED;
+use crate::prelude::{Builds, Workers};
+use crate::{builds, workers};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const STATUS_ACTIVE: i32 = 0;
@@ -106,27 +108,20 @@ async fn claim_among<C: ConnectionTrait>(
 
 /// Set of platform strings that at least one *approved* worker can build
 /// natively — these are reserved from emulated claims.
-async fn arches_with_native_worker<C: ConnectionTrait>(
-    db: &C,
-) -> Result<std::collections::HashSet<String>, DbErr> {
-    use crate::prelude::Workers;
-    use crate::workers;
-
+async fn arches_with_native_worker<C: ConnectionTrait>(db: &C) -> Result<HashSet<String>, DbErr> {
     let rows: Vec<String> = Workers::find()
         .select_only()
         .column(workers::Column::NativeArches)
-        .filter(workers::Column::Status.eq("approved"))
+        .filter(workers::Column::Status.eq(STATUS_APPROVED))
         .into_tuple()
         .all(db)
         .await?;
 
-    let mut set = std::collections::HashSet::new();
-    for row in rows {
-        for a in row.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            set.insert(a.to_string());
-        }
-    }
-    Ok(set)
+    Ok(rows
+        .iter()
+        .flat_map(|row| row.split(',').map(str::trim).filter(|s| !s.is_empty()))
+        .map(ToString::to_string)
+        .collect())
 }
 
 /// Result of processing a heartbeat: builds that were reconciled away from the

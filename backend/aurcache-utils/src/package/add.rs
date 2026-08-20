@@ -11,6 +11,7 @@ use aurcache_deps::DependencyResolution;
 use aurcache_types::builder::{Action, BuildStates};
 use pacman_mirrors::platforms::{Platform, Platforms};
 use sea_orm::QueryFilter;
+use sea_orm::prelude::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
     TransactionTrait,
@@ -63,7 +64,7 @@ fn build_add_context(
 
     let platforms_str = platforms
         .iter()
-        .map(pacman_mirrors::platforms::Platform::as_str)
+        .map(Platform::as_str)
         .collect::<Vec<_>>()
         .join(";");
 
@@ -274,10 +275,7 @@ pub async fn package_add(
 
 async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<()> {
     packages::Entity::update_many()
-        .col_expr(
-            packages::Column::DirectlyRequested,
-            sea_orm::sea_query::SimpleExpr::Value(sea_orm::Value::Bool(Some(true))),
-        )
+        .col_expr(packages::Column::DirectlyRequested, Expr::value(true))
         .filter(packages::Column::Name.eq(pkgbase))
         .exec(db)
         .await?;
@@ -308,9 +306,7 @@ async fn add_package_with_source(
                 resolve_srcinfo_to_spec(store, client, &source_data, patched_files).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
-        SourceData::Upload { .. } => {
-            todo!("upload")
-        }
+        SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
     }
 }
 
@@ -544,7 +540,7 @@ pub(crate) fn provides_json(provides: &[String]) -> anyhow::Result<Option<String
     Ok(Some(serde_json::to_string(provides)?))
 }
 
-fn check_platforms(platforms: &Vec<Platform>) -> anyhow::Result<()> {
+fn check_platforms(platforms: &[Platform]) -> anyhow::Result<()> {
     for platform in platforms {
         if !Platforms.into_iter().any(|p| p == *platform) {
             bail!("Invalid platform: {platform}");

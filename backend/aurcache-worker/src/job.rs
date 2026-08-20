@@ -59,8 +59,8 @@ async fn run_job_inner(
     cfg: &Config,
     client: &WorkerClient,
     job: &JobDescriptor,
-    cancel: &Arc<AtomicBool>,
-    active_pkgbases: &Arc<Mutex<HashSet<String>>>,
+    cancel: &AtomicBool,
+    active_pkgbases: &Mutex<HashSet<String>>,
     workdir: &Path,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
@@ -141,7 +141,7 @@ async fn run_build(
     job: &JobDescriptor,
     pkgdir: &Path,
     cache: &Cache,
-    cancel: &Arc<AtomicBool>,
+    cancel: &AtomicBool,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let srcdest = cache.srcdest(&job.pkgbase);

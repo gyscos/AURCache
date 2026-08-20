@@ -110,7 +110,7 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
                 db.execute_unprepared("CREATE INDEX idx_builds_worker_id ON builds (worker_id);")
                     .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -146,7 +146,7 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
                     .await?;
                 db.execute_unprepared("DROP TABLE public.workers;").await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

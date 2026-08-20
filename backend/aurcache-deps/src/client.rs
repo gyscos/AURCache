@@ -138,7 +138,7 @@ impl AurClient {
             }
 
             if self.local_repo_dependency_exists(dep_name)?
-                || self.official_dependency_exists(dep_name).await?
+                || self.official_dependency_exists(dep_name).await
             {
                 resolutions.insert(dep_name.to_string(), DependencyResolution::Official);
                 continue;
@@ -227,11 +227,15 @@ impl AurClient {
         Ok(bytes)
     }
 
-    pub(crate) async fn official_dependency_exists(&self, dep_name: &str) -> Result<bool, Error> {
-        Ok(self
-            .cached_official_dependency_exists(dep_name)
+    /// Whether `dep_name` is satisfied by an official repository.
+    ///
+    /// A cache refresh/lookup failure (no mirrorlist yet, mirror unreachable)
+    /// answers `false` rather than aborting resolution: the dependency then
+    /// falls through to the AUR lookup, which is the desired behaviour.
+    pub(crate) async fn official_dependency_exists(&self, dep_name: &str) -> bool {
+        self.cached_official_dependency_exists(dep_name)
             .await
-            .unwrap_or(false))
+            .unwrap_or(false)
     }
 
     async fn provider_pkgbase(&self, dep_name: &str) -> Result<Option<String>, Error> {

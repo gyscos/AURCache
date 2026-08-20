@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,9 @@ use crate::pkgbuild::fix_source_urls;
 fn default_aur_git_base_url() -> String {
     "https://aur.archlinux.org".to_string()
 }
+
+/// Git's per-checkout metadata directory, excluded from source archives.
+const GIT_METADATA_DIR: &str = ".git";
 
 /// Maximum number of distinct sources kept in the in-memory cache at once.
 /// At roughly 5-20KB per entry (a small tar.gz of PKGBUILD/.SRCINFO/aux
@@ -124,13 +128,7 @@ impl SnapshotStore {
     }
 
     pub fn with_checkout_root(checkout_root: PathBuf) -> Self {
-        Self {
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY must be non-zero"),
-            )),
-            checkout_root,
-            aur_git_base_url: default_aur_git_base_url(),
-        }
+        Self::with_checkout_root_and_aur_base(checkout_root, default_aur_git_base_url())
     }
 
     /// Construct a store with an explicit checkout root and AUR git base URL
@@ -581,12 +579,12 @@ fn apply_patch_to_archive(
 /// directory) to their raw bytes.
 fn extract_tar_gz_to_memory(
     archive_bytes: &[u8],
-) -> anyhow::Result<(String, std::collections::BTreeMap<String, Vec<u8>>)> {
+) -> anyhow::Result<(String, BTreeMap<String, Vec<u8>>)> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
 
     let mut pkgbase = None;
-    let mut files = std::collections::BTreeMap::new();
+    let mut files = BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         if !entry.header().entry_type().is_file() {
@@ -613,7 +611,7 @@ fn extract_tar_gz_to_memory(
 /// tar.gz archive, matching the layout produced by [`extract_tar_gz_to_memory`].
 fn create_archive_from_memory(
     pkgbase: &str,
-    files: &std::collections::BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, Vec<u8>>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
@@ -629,15 +627,16 @@ fn create_archive_from_memory(
             content.as_slice(),
         )?;
     }
-    let enc = tar.into_inner()?;
-    drop(enc);
+    // Finish explicitly: dropping the encoder would swallow a compression error.
+    tar.into_inner()?.finish()?;
     Ok(buf)
 }
 
 /// List files (relative to the source root) available for viewing/editing.
 ///
-/// Excludes `.git` metadata and `.SRCINFO`, since the latter is always
-/// regenerated and never a meaningful patch target.
+/// Excludes `.SRCINFO`, which is always regenerated and so is never a
+/// meaningful patch target. Git metadata never reaches the archive in the
+/// first place (see [`create_archive_with_pkgbase_dir`]).
 fn list_files_in_archive(archive_bytes: &[u8], pkgbase: &str) -> anyhow::Result<Vec<String>> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -653,7 +652,7 @@ fn list_files_in_archive(archive_bytes: &[u8], pkgbase: &str) -> anyhow::Result<
         let Some(rel_path) = path.strip_prefix(&prefix) else {
             continue;
         };
-        if rel_path == ".SRCINFO" || rel_path.starts_with(".git/") {
+        if rel_path == ".SRCINFO" {
             continue;
         }
         files.push(rel_path.to_string());
@@ -684,13 +683,37 @@ fn read_file_from_archive(
     anyhow::bail!("File '{rel_path}' not found in source")
 }
 
+/// Package `source_dir` as a tar.gz whose single top-level directory is
+/// `pkgbase`, matching the layout of an AUR snapshot.
+///
+/// `source_dir` is the persistent git checkout, so its git metadata sits right
+/// next to the sources. `.git` is excluded: the archive is a source snapshot
+/// served to workers, and shipping it would attach the repository's entire
+/// history to every job download. Only the top level is filtered, which is
+/// sufficient because the checkout is a plain clone with no submodules.
 fn create_archive_with_pkgbase_dir(source_dir: &Path, pkgbase: &str) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(pkgbase, source_dir)?;
-    let enc = tar.into_inner()?;
-    drop(enc);
+
+    let root = Path::new(pkgbase);
+    tar.append_dir(root, source_dir)?;
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == GIT_METADATA_DIR {
+            continue;
+        }
+        let dest = root.join(&name);
+        if entry.file_type()?.is_dir() {
+            tar.append_dir_all(dest, entry.path())?;
+        } else {
+            tar.append_path_with_name(entry.path(), dest)?;
+        }
+    }
+
+    // Finish explicitly: dropping the encoder would swallow a compression error.
+    tar.into_inner()?.finish()?;
     Ok(buf)
 }
 
@@ -730,10 +753,28 @@ license=('MIT')
     /// guaranteed to be present inside the builder image (see
     /// `docker/Dockerfile`), not in plain `cargo test` environments. Skip
     /// tests that need it when it's missing instead of failing the suite.
+    ///
+    /// Anything that applies a `SourcePatch` needs it too: patching regenerates
+    /// `.SRCINFO` from the patched `PKGBUILD` via the same bridge.
     fn pkgbuild_bridge_available() -> bool {
         std::env::var_os("PATH").is_some_and(|paths| {
             std::env::split_paths(&paths).any(|dir| dir.join("alpm-pkgbuild-bridge").is_file())
         })
+    }
+
+    /// Every entry path in an archive, directories included.
+    ///
+    /// Deliberately raw rather than going through [`list_files_in_archive`],
+    /// which filters for the UI: the point is to assert on what the tarball
+    /// actually carries.
+    fn archive_entry_paths(archive_bytes: &[u8]) -> Vec<String> {
+        let decoder = flate2::read::GzDecoder::new(archive_bytes);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect()
     }
 
     fn parse_srcinfo_from_archive(archive_bytes: &[u8], pkgbase: &str) -> SourceInfoV1 {
@@ -874,6 +915,48 @@ license=('MIT')
         repo.checkout_head(None).unwrap();
     }
 
+    /// The source archive served to workers must not carry the checkout's git
+    /// metadata: `.git` holds the repository's entire history, and the archive
+    /// is downloaded fresh for every build job.
+    ///
+    /// This drives the real path — resolve source, clone into the persistent
+    /// checkout, build the archive — so a regression anywhere along it fails
+    /// here rather than only showing up as bloated job downloads.
+    #[tokio::test]
+    async fn fetched_archive_excludes_git_metadata() {
+        let aur_root = tempfile::tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "bar", "1.0");
+        let (store, checkout_dir) = test_store(aur_root.path());
+        let client = AurClient::new();
+        let source = SourceData::Aur {
+            name: "bar".to_string(),
+        };
+
+        let archive = store.archive_bytes(&client, &source, None).await.unwrap();
+
+        // Guard against the assertion below passing for the wrong reason: the
+        // checkout the archive was built from really does have a `.git` dir.
+        let checkout = checkout_dir
+            .path()
+            .join(sanitize_cache_key(&source.cache_key()));
+        assert!(
+            checkout.join(".git").is_dir(),
+            "fixture checkout has no git metadata to exclude"
+        );
+
+        let entries = archive_entry_paths(&archive);
+        assert!(
+            entries.iter().any(|path| path == "bar/PKGBUILD"),
+            "sources are missing from the archive: {entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|path| path == "bar/.git" || path.starts_with("bar/.git/")),
+            "archive must not carry git metadata: {entries:?}"
+        );
+    }
+
     /// Regression test for a bug introduced (and fixed) while reworking the
     /// cache to hold a single entry per source: `list_files`/`read_file`
     /// must reuse whatever is already cached for a source - regardless of
@@ -882,6 +965,11 @@ license=('MIT')
     /// re-fetch from the (in this test, local-only) git remote.
     #[tokio::test]
     async fn list_files_and_read_file_reuse_cache_regardless_of_active_patch() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            return;
+        }
+
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
         let (store, _checkout_dir) = test_store(aur_root.path());
@@ -932,6 +1020,11 @@ license=('MIT')
     /// be read back by mistake.
     #[tokio::test]
     async fn at_most_one_cache_entry_per_source_across_patch_changes() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            return;
+        }
+
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
         let (store, _checkout_dir) = test_store(aur_root.path());
@@ -976,6 +1069,11 @@ license=('MIT')
     /// refresh, rather than silently reverting the source to unpatched.
     #[tokio::test]
     async fn refresh_reapplies_previously_active_patch() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            return;
+        }
+
         // Use a plain Git source (rather than an AUR one) so the "main"
         // branch ref reliably reflects newly pushed commits, matching the
         // pattern used elsewhere in this crate for exercising

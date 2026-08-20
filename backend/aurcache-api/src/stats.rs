@@ -33,7 +33,7 @@ pub async fn stats(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
 ) -> Result<Json<ListStats>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     get_stats(db)
         .await
@@ -74,7 +74,7 @@ pub async fn dashboard_graph_data(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
 ) -> Result<Json<Vec<GraphDataPoint>>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     get_graph_datapoints(db)
         .await
@@ -159,8 +159,7 @@ async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
 
     Ok(unique
         .avg_build_time
-        .unwrap_or(BigDecimal::try_from(0.0)?)
-        .to_u32()
+        .and_then(|avg| avg.to_u32())
         .unwrap_or(0))
 }
 
@@ -232,18 +231,17 @@ async fn build_trends(db: &DatabaseConnection) -> anyhow::Result<BuildTrends> {
     .await?
     .ok_or_else(|| anyhow::anyhow!("No last build cnts"))?;
 
-    let count = match last_build_cnt.prev_30_days_builds {
-        0 => 0.0,
-        prev_30_days_builds => {
-            (last_build_cnt.last_30_days_builds as f32 / prev_30_days_builds as f32) - 1.0
-        }
+    let count = if last_build_cnt.prev_30_days_builds == 0 {
+        0.0
+    } else {
+        (last_build_cnt.last_30_days_builds as f32 / last_build_cnt.prev_30_days_builds as f32)
+            - 1.0
     };
 
-    let duration = match last_build_cnt.prev_30_days_avg_duration {
-        0.0 => 0.0,
-        prev_30_days_avg_duration => {
-            (last_build_cnt.last_30_days_avg_duration / prev_30_days_avg_duration) - 1.0
-        }
+    let duration = if last_build_cnt.prev_30_days_avg_duration == 0.0 {
+        0.0
+    } else {
+        (last_build_cnt.last_30_days_avg_duration / last_build_cnt.prev_30_days_avg_duration) - 1.0
     };
 
     Ok(BuildTrends { count, duration })

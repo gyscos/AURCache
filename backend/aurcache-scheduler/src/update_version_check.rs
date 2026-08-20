@@ -26,7 +26,7 @@ pub fn start_update_version_checking(
     tokio::spawn(async move {
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(db.clone(), &store).await {
+            if let Err(e) = check_versions(&db, &store).await {
                 error!("Failed to perform aur version check: {e}");
             }
 
@@ -37,8 +37,8 @@ pub fn start_update_version_checking(
     })
 }
 
-async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow::Result<()> {
-    let packages = Packages::find().all(&db).await?;
+async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyhow::Result<()> {
+    let packages = Packages::find().all(db).await?;
     let client = AurClient::new();
     let aur_query_names: Vec<String> = packages
         .iter()
@@ -65,7 +65,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
         client
             .multi_info_of(&aur_name_refs)
             .await
-            .map_err(|_| anyhow!("couldn't download version update"))?
+            .map_err(|e| anyhow!("couldn't download version update: {e}"))?
     };
 
     for package in packages {
@@ -81,7 +81,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
             .order_by(builds::Column::StartTime, Order::Desc)
             .limit(1)
             .into_tuple::<(String,)>()
-            .one(&db)
+            .one(db)
             .await?;
 
         let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
@@ -94,7 +94,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                         warn!("Couldn't find {} in AUR response", package.name);
                     }
                     Some(result) => {
-                        package_model.upstream_version = Set(Option::from(result.version.clone()));
+                        package_model.upstream_version = Set(Some(result.version.clone()));
                         // Only mark out of date when upstream is strictly newer than the
                         // locally built version.  This prevents VCS packages (-git etc.)
                         // from looping: the AUR-reported version is the one from when the
@@ -116,7 +116,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                             .await
                         {
                             Ok(sourceinfo) => {
-                                match sync_vcs_sources(&db, *package_id, &sourceinfo).await {
+                                match sync_vcs_sources(db, *package_id, &sourceinfo).await {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                                     Err(e) => warn!(
                                         "Failed to sync VCS sources for {}: {e}",
@@ -151,7 +151,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                 // against the persistent checkout, not a full re-clone.
                 if let Err(e) = store.refresh(&client, &source_data).await {
                     warn!("Failed to refresh git source for {}: {e}", package.name);
-                    let _ = package_model.update(&db).await;
+                    save_package(db, package_model, &package.name).await;
                     continue;
                 }
                 // A failure here (e.g. a patch that no longer applies
@@ -168,7 +168,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                     Ok(sourceinfo) => sourceinfo,
                     Err(e) => {
                         warn!("Failed to get sourceinfo for {}: {e}", package.name);
-                        let _ = package_model.update(&db).await;
+                        save_package(db, package_model, &package.name).await;
                         continue;
                     }
                 };
@@ -177,7 +177,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                 // by itself - the VCS-source check below covers that case.
                 let version = sourceinfo.base.version.to_string();
 
-                package_model.upstream_version = Set(Option::from(version.clone()));
+                package_model.upstream_version = Set(Some(version.clone()));
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
                 let mut is_outdated = match &latest_version {
@@ -185,7 +185,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
                     Some(built) => vercmp(&version, built) == std::cmp::Ordering::Greater,
                 };
 
-                match sync_vcs_sources(&db, *package_id, &sourceinfo).await {
+                match sync_vcs_sources(db, *package_id, &sourceinfo).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                     Err(e) => warn!("Failed to sync VCS sources for {}: {e}", package.name),
                 }
@@ -197,7 +197,15 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
             }
         }
 
-        let _ = package_model.update(&db).await;
+        save_package(db, package_model, &package.name).await;
     }
     Ok(())
+}
+
+/// Persist the version-check outcome for one package. A write failure only
+/// costs this package one round of tracking, so it is logged, not propagated.
+async fn save_package(db: &DatabaseConnection, model: packages::ActiveModel, name: &str) {
+    if let Err(e) = model.update(db).await {
+        warn!("Failed to store version check result for {name}: {e}");
+    }
 }

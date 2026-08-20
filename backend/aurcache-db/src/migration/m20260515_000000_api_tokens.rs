@@ -37,7 +37,7 @@ CREATE TABLE public.api_tokens
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -54,7 +54,7 @@ CREATE TABLE public.api_tokens
                 db.execute_unprepared("DROP TABLE public.api_tokens;")
                     .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

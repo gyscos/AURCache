@@ -128,23 +128,26 @@ fn lease_lost(build_id: i32, worker_id: i32) -> DbErr {
     ))
 }
 
-/// Mark a build (and its package) as successfully built, then promote any
-/// dependents whose dependencies are now satisfied.
-pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
+/// Move a build and its package to a terminal status in one transaction,
+/// releasing the lease. The build write is a compare-and-swap on
+/// `status = ACTIVE AND worker_id = ?`, so a completion arriving after the
+/// reaper reclaimed the build is discarded rather than clobbering the new owner.
+///
+/// Returns the completed build.
+async fn finish_build<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
     worker_id: i32,
-) -> Result<(), DbErr> {
+    status: i32,
+) -> Result<builds::Model, DbErr> {
     let build = Builds::find_by_id(build_id)
         .one(db)
         .await?
         .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-    let pkg_id = build.pkg_id;
-    let platform = build.platform;
 
     let txn = db.begin().await?;
     let res = Builds::update_many()
-        .col_expr(builds::Column::Status, STATUS_SUCCESS.into())
+        .col_expr(builds::Column::Status, status.into())
         .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
         .col_expr(builds::Column::EndTime, Some(now_secs()).into())
@@ -158,16 +161,32 @@ pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
         return Err(lease_lost(build_id, worker_id));
     }
 
-    if let Some(pkg) = Packages::find_by_id(pkg_id).one(&txn).await? {
+    if let Some(pkg) = Packages::find_by_id(build.pkg_id).one(&txn).await? {
         let mut pkg = pkg.into_active_model();
-        pkg.status = Set(STATUS_SUCCESS);
-        pkg.out_of_date = Set(i32::from(false));
+        pkg.status = Set(status);
+        if status == STATUS_SUCCESS {
+            pkg.out_of_date = Set(0);
+        }
         pkg.update(&txn).await?;
     }
     txn.commit().await?;
+    Ok(build)
+}
 
-    if let Err(e) = trigger_dependents(db, pkg_id, platform).await {
-        tracing::error!("Failed to trigger dependents of package {pkg_id}: {e}");
+/// Mark a build (and its package) as successfully built, then promote any
+/// dependents whose dependencies are now satisfied.
+pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    build_id: i32,
+    worker_id: i32,
+) -> Result<(), DbErr> {
+    let build = finish_build(db, build_id, worker_id, STATUS_SUCCESS).await?;
+
+    if let Err(e) = trigger_dependents(db, build.pkg_id, build.platform).await {
+        tracing::error!(
+            "Failed to trigger dependents of package {}: {e}",
+            build.pkg_id
+        );
     }
     Ok(())
 }
@@ -179,34 +198,7 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-    let pkg_id = build.pkg_id;
-
-    let txn = db.begin().await?;
-    let res = Builds::update_many()
-        .col_expr(builds::Column::Status, STATUS_FAILED.into())
-        .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
-        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
-        .col_expr(builds::Column::EndTime, Some(now_secs()).into())
-        .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
-        .filter(builds::Column::WorkerId.eq(worker_id))
-        .exec(&txn)
-        .await?;
-    if res.rows_affected == 0 {
-        txn.rollback().await?;
-        return Err(lease_lost(build_id, worker_id));
-    }
-
-    if let Some(pkg) = Packages::find_by_id(pkg_id).one(&txn).await? {
-        let mut pkg = pkg.into_active_model();
-        pkg.status = Set(STATUS_FAILED);
-        pkg.update(&txn).await?;
-    }
-    txn.commit().await?;
+    finish_build(db, build_id, worker_id, STATUS_FAILED).await?;
     Ok(())
 }
 
@@ -307,8 +299,6 @@ async fn promote_dependent<C: ConnectionTrait>(
     }
     Ok(())
 }
-
-// (module functions above)
 
 #[cfg(test)]
 mod tests {

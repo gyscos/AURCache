@@ -12,7 +12,7 @@ pub struct AURApi;
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Get all todos", body = [ApiPackage]),
+            (status = 200, description = "Matching AUR packages", body = [ApiPackage]),
     ),
     params(
         ("query", description = "AUR query"),

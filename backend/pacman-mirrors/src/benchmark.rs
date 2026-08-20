@@ -15,22 +15,45 @@ pub enum TargetDb {
 }
 
 trait Benchmark {
-    /// Measure time (in seconds) it took to connect (from user's geography)
-    /// and retrive the '[core,extra]/`os/x86_64`/[core,extra].db' file from the given URL.
-    async fn measure_duration(&mut self, target_db: TargetDb) -> anyhow::Result<f64>;
+    /// Measure how long it takes to connect (from the user's geography) and
+    /// download `[core,extra]/os/x86_64/[core,extra].db` in full.
+    ///
+    /// Every mirror is measured against the same file, so the elapsed time is
+    /// directly comparable between mirrors: lower is better.
+    async fn measure_duration(&self, target_db: TargetDb) -> anyhow::Result<Duration>;
 }
 
 pub trait Bench {
-    /// Rank the mirrors based on the score.
-    fn rank(&mut self) -> impl Future<Output = anyhow::Result<Vec<Mirror>>> + Send;
+    /// Rank the mirrors fastest-first.
+    fn rank(&self) -> impl Future<Output = anyhow::Result<Vec<Mirror>>> + Send;
+}
 
-    fn gen_mirrorlist(&self, mirrors: Vec<Mirror>) -> anyhow::Result<String>;
+/// Render a `pacman` mirrorlist from (at most) the first ten mirrors given.
+#[must_use]
+pub fn gen_mirrorlist(mirrors: &[Mirror]) -> String {
+    let mut body = format!(
+        r"##
+## Arch Linux repository mirrorlist
+## Created by aurcache
+## Generated on {}
+##
+",
+        Utc::now().date_naive()
+    );
+
+    for mirror in mirrors.iter().take(10) {
+        let _ = writeln!(body, "## {}", mirror.country.kind);
+        let _ = writeln!(body, "Server = {}$repo/os/$arch", mirror.url);
+        body.push('\n');
+    }
+
+    body
 }
 
 impl Bench for Mirrors {
-    async fn rank(&mut self) -> anyhow::Result<Vec<Mirror>> {
+    async fn rank(&self) -> anyhow::Result<Vec<Mirror>> {
         let mut durations = Vec::new();
-        for mirror in &mut self.0 {
+        for mirror in &self.0 {
             // Skip mirrors that are not active
             if !mirror.active {
                 continue;
@@ -43,75 +66,109 @@ impl Bench for Mirrors {
             }
 
             info!("Benchmarking {}", mirror.url);
-            let duration = mirror.measure_duration(TargetDb::Core).await;
-            match duration {
-                Ok(duration) => {
-                    durations.push((mirror, duration));
-                }
+            match mirror.measure_duration(TargetDb::Core).await {
+                Ok(duration) => durations.push((mirror, duration)),
                 Err(err) => {
                     info!("Failed to measure duration for {}: {}", mirror.url, err);
                 }
             }
         }
 
-        // Sort by duration (ascending order)
-        durations.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // Fastest first: every mirror served the same file, so the elapsed
+        // download time is directly comparable.
+        durations.sort_by_key(|(_, duration)| *duration);
 
-        // Extract only the sorted Mirror references
         Ok(durations
             .into_iter()
             .map(|(mirror, _)| mirror.clone())
             .collect())
     }
-
-    fn gen_mirrorlist(&self, mirrors: Vec<Mirror>) -> anyhow::Result<String> {
-        let mut body = format!(
-            r"##
-## Arch Linux repository mirrorlist
-## Created by aurcache
-## Generated on {}
-##
-",
-            Utc::now().date_naive()
-        );
-
-        for mirror in &mirrors[..10] {
-            let _ = writeln!(body, "## {}", mirror.country.kind);
-            let _ = writeln!(body, "Server = {}$repo/os/$arch", mirror.url);
-            body.push('\n');
-        }
-
-        Ok(body)
-    }
 }
 
 impl Benchmark for Mirror {
-    async fn measure_duration(&mut self, target_db: TargetDb) -> anyhow::Result<f64> {
-        let url = &self.url;
+    async fn measure_duration(&self, target_db: TargetDb) -> anyhow::Result<Duration> {
         let url: Url = match target_db {
-            TargetDb::Core => url.join("core/os/x86_64/core.db")?,
-            TargetDb::Extra => url.join("extra/os/x86_64/extra.db")?,
+            TargetDb::Core => self.url.join("core/os/x86_64/core.db")?,
+            TargetDb::Extra => self.url.join("extra/os/x86_64/extra.db")?,
         };
 
-        let start = Instant::now();
-
-        match Client::builder()
+        let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .build()?
+            .build()?;
+
+        // The measurement spans connect + headers + the whole body: stopping
+        // the clock at the response headers would time the handshake only and
+        // ignore how fast the mirror actually serves data.
+        let start = Instant::now();
+        let response = client
             .get(url.as_str())
             .send()
             .await
-        {
-            Ok(response) => {
-                let transfer_time: f64 = start.elapsed().as_secs_f64();
+            .map_err(|e| anyhow!(e))?;
+        let size = response.bytes().await?.len();
+        let elapsed = start.elapsed();
 
-                let file_size = response.bytes().await?.len();
-                let transfer_rate = (file_size as f64) / (transfer_time * 1024.0);
-                info!("Transfer Rate: {url} => {transfer_rate:.2} kb/s");
-                Ok(transfer_rate)
-            }
-            Err(err) => Err(anyhow!(err)),
+        let rate = size as f64 / elapsed.as_secs_f64().max(f64::EPSILON) / 1024.0;
+        info!(
+            "{url} => {:.2}s for {size} bytes ({rate:.0} KiB/s)",
+            elapsed.as_secs_f64()
+        );
+        Ok(elapsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gen_mirrorlist;
+    use crate::{Country, Mirror, Protocol};
+
+    fn mirror(host: &str) -> Mirror {
+        Mirror {
+            url: format!("https://{host}/archlinux/").parse().unwrap(),
+            protocol: Protocol::Https,
+            last_sync: None,
+            completion_pct: None,
+            duration_avg: None,
+            duration_stddev: None,
+            score: None,
+            active: true,
+            country: Country::new("Austria", "AT"),
+            isos: false,
+            ipv4: true,
+            ipv6: false,
+            details: String::new(),
         }
+    }
+
+    /// Ranking only returns the mirrors that actually responded, which is
+    /// routinely fewer than ten; slicing a fixed ten off the front used to
+    /// panic here.
+    #[test]
+    fn gen_mirrorlist_handles_fewer_than_ten_mirrors() {
+        let mirrors: Vec<Mirror> = (0..3).map(|i| mirror(&format!("m{i}.example"))).collect();
+        let list = gen_mirrorlist(&mirrors);
+
+        assert_eq!(list.matches("Server = ").count(), 3);
+        assert!(list.contains("Server = https://m0.example/archlinux/$repo/os/$arch"));
+        assert!(gen_mirrorlist(&[]).contains("Created by aurcache"));
+    }
+
+    /// The mirrorlist is capped, and keeps the ranking order it was given.
+    #[test]
+    fn gen_mirrorlist_keeps_the_first_ten_in_order() {
+        let mirrors: Vec<Mirror> = (0..15)
+            .map(|i| mirror(&format!("m{i:02}.example")))
+            .collect();
+        let list = gen_mirrorlist(&mirrors);
+
+        assert_eq!(list.matches("Server = ").count(), 10);
+        assert!(list.contains("m00.example"));
+        assert!(list.contains("m09.example"));
+        assert!(!list.contains("m10.example"));
+
+        let first = list.find("m00.example").unwrap();
+        let second = list.find("m01.example").unwrap();
+        assert!(first < second, "ranking order must be preserved");
     }
 }

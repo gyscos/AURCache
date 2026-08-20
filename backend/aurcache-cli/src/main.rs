@@ -13,6 +13,8 @@ use config::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -370,35 +372,17 @@ async fn run_health(client: &AurCacheClient) -> Result<()> {
 
 async fn render_user_info(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
     let user = client.user_info().await?;
-    match format {
-        OutputFormat::Json => print_json(&user),
-        OutputFormat::Text => {
-            print_user_info(&user);
-            Ok(())
-        }
-    }
+    render(format, &user, print_user_info)
 }
 
 async fn render_stats(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
     let stats = client.stats().await?;
-    match format {
-        OutputFormat::Json => print_json(&stats),
-        OutputFormat::Text => {
-            print_stats(&stats);
-            Ok(())
-        }
-    }
+    render(format, &stats, print_stats)
 }
 
 async fn render_graph(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
     let points = client.graph().await?;
-    match format {
-        OutputFormat::Json => print_json(&points),
-        OutputFormat::Text => {
-            print_graph(&points);
-            Ok(())
-        }
-    }
+    render(format, &points, |points| print_graph(points))
 }
 
 async fn render_search_results(
@@ -407,13 +391,7 @@ async fn render_search_results(
     query: &str,
 ) -> Result<()> {
     let results = client.search(query).await?;
-    match format {
-        OutputFormat::Json => print_json(&results),
-        OutputFormat::Text => {
-            print_search_results(&results);
-            Ok(())
-        }
-    }
+    render(format, &results, |results| print_search_results(results))
 }
 
 async fn run_token_command(
@@ -549,24 +527,12 @@ async fn render_packages_list(
     args: ListPackagesArgs,
 ) -> Result<()> {
     let packages = client.list_packages(args.limit, args.page).await?;
-    match format {
-        OutputFormat::Json => print_json(&packages),
-        OutputFormat::Text => {
-            print_package_list(&packages);
-            Ok(())
-        }
-    }
+    render(format, &packages, |packages| print_package_list(packages))
 }
 
 async fn render_package(client: &AurCacheClient, format: OutputFormat, id: i32) -> Result<()> {
     let package = client.get_package(id).await?;
-    match format {
-        OutputFormat::Json => print_json(&package),
-        OutputFormat::Text => {
-            print_package(&package);
-            Ok(())
-        }
-    }
+    render(format, &package, print_package)
 }
 
 async fn add_package_command(
@@ -643,7 +609,7 @@ fn parse_patch_arg(s: &str) -> Result<(String, String), String> {
             Ok((path.to_string(), file.to_string()))
         }
         None => {
-            let path = std::path::Path::new(s)
+            let path = Path::new(s)
                 .file_name()
                 .ok_or_else(|| format!("invalid --patch value `{s}`"))?
                 .to_string_lossy()
@@ -655,13 +621,11 @@ fn parse_patch_arg(s: &str) -> Result<(String, String), String> {
 
 /// Reads the local files referenced by `--patch` arguments into a
 /// path -> content map suitable for [`AddPackageRequest::patched_files`].
-fn read_patch_files(
-    patches: &[(String, String)],
-) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+fn read_patch_files(patches: &[(String, String)]) -> Result<Option<BTreeMap<String, String>>> {
     if patches.is_empty() {
         return Ok(None);
     }
-    let mut files = std::collections::BTreeMap::new();
+    let mut files = BTreeMap::new();
     for (source_path, local_file) in patches {
         let content = std::fs::read_to_string(local_file)
             .with_context(|| format!("failed to read patch file `{local_file}`"))?;
@@ -680,13 +644,7 @@ async fn update_package_command(
     let updated_ids = client
         .update_package(args.id, &UpdatePackageRequest { force: args.force })
         .await?;
-    match format {
-        OutputFormat::Json => print_json(&updated_ids),
-        OutputFormat::Text => {
-            print_updated_package_ids(&updated_ids);
-            Ok(())
-        }
-    }
+    render(format, &updated_ids, |ids| print_updated_package_ids(ids))
 }
 
 fn print_updated_package_ids(updated_ids: &[i32]) {
@@ -709,8 +667,8 @@ async fn patch_package_command(
     format: OutputFormat,
     args: PatchPackageArgs,
 ) -> Result<()> {
-    let body = build_patch_package_request(args)?;
-    client.patch_package(body.0, &body.1).await?;
+    let (id, body) = build_patch_package_request(args)?;
+    client.patch_package(id, &body).await?;
     print_done_message(format, "package updated");
     Ok(())
 }
@@ -757,24 +715,12 @@ async fn render_builds_list(
     let builds = client
         .list_builds(args.package_id, args.limit, args.page)
         .await?;
-    match format {
-        OutputFormat::Json => print_json(&builds),
-        OutputFormat::Text => {
-            print_build_list(&builds);
-            Ok(())
-        }
-    }
+    render(format, &builds, |builds| print_build_list(builds))
 }
 
 async fn render_build(client: &AurCacheClient, format: OutputFormat, id: i32) -> Result<()> {
     let build = client.get_build(id).await?;
-    match format {
-        OutputFormat::Json => print_json(&build),
-        OutputFormat::Text => {
-            print_build(&build);
-            Ok(())
-        }
-    }
+    render(format, &build, print_build)
 }
 
 async fn render_build_output(
@@ -831,13 +777,7 @@ fn print_done_message(format: OutputFormat, message: &str) {
 
 async fn render_workers_list(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
     let workers = client.list_workers().await?;
-    match format {
-        OutputFormat::Json => print_json(&workers),
-        OutputFormat::Text => {
-            print_worker_list(&workers);
-            Ok(())
-        }
-    }
+    render(format, &workers, |workers| print_worker_list(workers))
 }
 
 async fn approve_worker_command(
@@ -920,6 +860,21 @@ fn parse_key_val(input: &str) -> Result<(String, String), String> {
 
 fn some_vec<T>(values: Vec<T>) -> Option<Vec<T>> {
     (!values.is_empty()).then_some(values)
+}
+
+/// Print `value` as JSON, or hand it to `print_text` for the human-readable form.
+fn render<T: Serialize>(
+    format: OutputFormat,
+    value: &T,
+    print_text: impl FnOnce(&T),
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => print_json(value),
+        OutputFormat::Text => {
+            print_text(value);
+            Ok(())
+        }
+    }
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -1155,6 +1110,7 @@ fn build_status_label(status: i32) -> &'static str {
         1 => "successful",
         2 => "failed",
         3 => "enqueued",
+        4 => "waiting for deps",
         _ => "unknown",
     }
 }

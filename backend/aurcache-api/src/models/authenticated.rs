@@ -27,20 +27,14 @@ impl<'r> FromRequest<'r> for Authenticated {
             .state::<OauthEnabled>()
             .unwrap_or(&OauthEnabled(false));
         if oauth_enabled.0 {
-            if let Some(authenticated) = req
-                .cookies()
-                .get_private("token")
-                .and_then(|cookie| cookie.value().parse().ok())
-                .map(|_: String| {
-                    let username: Option<String> = req
-                        .cookies()
-                        .get_private("username")
-                        .and_then(|cookie| cookie.value().parse().ok());
-
-                    Self { username }
-                })
-            {
-                return Outcome::Success(authenticated);
+            // A valid session cookie authenticates on its own; the username
+            // cookie is only used to label the session.
+            if req.cookies().get_private("token").is_some() {
+                let username = req
+                    .cookies()
+                    .get_private("username")
+                    .map(|cookie| cookie.value().to_string());
+                return Outcome::Success(Self { username });
             }
 
             let bearer_token = req

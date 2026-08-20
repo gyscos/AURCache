@@ -3,7 +3,7 @@ use utoipa::ToSchema;
 
 /// Where a setting's resolved value came from in the lookup hierarchy.
 ///
-/// Resolution order (highest precedence first): `Env` → `Package` → `Global` → `Default`.
+/// Resolution order (highest precedence first): `Package` → `Env` → `Global` → `Default`.
 #[derive(ToSchema, Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingSource {

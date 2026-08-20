@@ -22,12 +22,14 @@ mod startup;
 async fn main() {
     _ = dotenv();
     init_logger();
-    pre_startup_tasks().await;
+    pre_startup_tasks();
 
     let (tx, _) = broadcast::channel::<Action>(32);
     let db = init_db().await.expect("failed to initialize database");
 
-    let _ = post_startup_tasks(&db).await;
+    if let Err(e) = post_startup_tasks(&db).await {
+        warn!("Startup cleanup did not complete: {e}");
+    }
 
     // Load (or create on first run) the internal CA used to authenticate remote
     // build workers over mutual TLS. Persisted under the data directory.
@@ -51,14 +53,12 @@ async fn main() {
 
     let build_queue_handle = init_build_queue(db.clone(), tx.clone());
     let version_check_handle = start_update_version_checking(db.clone(), store.clone());
-    if let Err(e) = start_auto_update_job(db.clone(), tx.clone(), store.clone()) {
-        warn!("auto_update job not properly configured: {e}");
-    }
+    let auto_update_handle = start_auto_update_job(db.clone(), tx.clone(), store.clone());
 
     let mirrorlist_override =
         env::var("MIRRORLIST_SERVERS_X86_64").is_ok_and(|s| !s.trim().is_empty());
 
-    if !mirrorlist_override && let Err(e) = start_mirror_rank_job(db.clone(), tx.clone()) {
+    if !mirrorlist_override && let Err(e) = start_mirror_rank_job() {
         warn!("mirror_rank job not properly configured: {e}");
     }
 
@@ -72,6 +72,9 @@ async fn main() {
     tokio::select! {
         _ = version_check_handle => {
             warn!("Version check handle exited");
+        }
+        _ = auto_update_handle => {
+            warn!("Auto update handle exited");
         }
         _ = build_queue_handle => {
             warn!("Build queue handle exited");

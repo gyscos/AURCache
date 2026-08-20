@@ -69,16 +69,11 @@ fn git_vcs_source_from(source: &Source) -> Option<VcsSource> {
         return None;
     };
 
-    // Pinned to an exact commit: never changes, nothing to track.
-    if matches!(fragment, Some(GitFragment::Commit(_))) {
-        return None;
-    }
-
     let git_ref = match fragment {
-        Some(GitFragment::Branch(name)) => name.clone(),
-        Some(GitFragment::Tag(name)) => name.clone(),
+        // Pinned to an exact commit: never changes, nothing to track.
+        Some(GitFragment::Commit(_)) => return None,
+        Some(GitFragment::Branch(name) | GitFragment::Tag(name)) => name.clone(),
         None => "HEAD".to_string(),
-        Some(GitFragment::Commit(_)) => unreachable!("filtered out above"),
     };
 
     Some(VcsSource {
@@ -128,11 +123,11 @@ pub async fn sync_vcs_sources(
         }
 
         upserts.push(package_vcs_sources::ActiveModel {
-            id: Default::default(),
             package_id: Set(package_id),
             source_url: Set(source_url),
             last_commit: Set(commit),
             updated_at: Set(now_unix()),
+            ..Default::default()
         });
     }
 

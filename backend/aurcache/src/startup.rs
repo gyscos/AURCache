@@ -1,12 +1,12 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::fs;
 
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, packages};
 use aurcache_types::builder::BuildStates;
 use aurcache_utils::job_config::mirrorlist_dir;
-use pacman_mirrors::benchmark::Bench;
+use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
 use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
@@ -22,7 +22,7 @@ const START_BANNER: &str = r"
  /_/    \_\____/|_|  \_\\_____\__,_|\___|_| |_|\___|
 ";
 
-pub async fn pre_startup_tasks() {
+pub fn pre_startup_tasks() {
     info!("{START_BANNER}");
     let latest_commit_sha = option_env!("LATEST_COMMIT_SHA").unwrap_or("dev");
     info!(
@@ -36,7 +36,7 @@ pub async fn pre_startup_tasks() {
 
     for platform in Platforms {
         if let Err(e) = pacman_repo_utils::repo_init::init_repo(
-            &PathBuf::from(format!("./repo/{platform}")),
+            Path::new(&format!("./repo/{platform}")),
             "repo",
         ) {
             error!("Failed to initialize pacman repo: {e:?}");
@@ -53,7 +53,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         )
         .filter(
             packages::Column::Status
-                .is_in(vec![BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
+                .is_in([BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
         )
         .exec(db)
         .await?;
@@ -65,8 +65,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             Expr::value(BuildStates::FAILED_BUILD),
         )
         .filter(
-            builds::Column::Status
-                .is_in(vec![BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
+            builds::Column::Status.is_in([BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
         )
         .exec(db)
         .await?;
@@ -79,8 +78,8 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             mirrorlist_dir.display()
         );
     }
-    let mirrorlist_path = mirrorlist_dir.display().to_string();
     let mirrorlist_file = mirrorlist_dir.join("mirrorlist");
+    let mirrorlist_path = mirrorlist_file.display().to_string();
 
     // Check if mirrorlist servers are provided via env var (semicolon-separated)
     // Treat an empty var the same way as an unset var.
@@ -95,13 +94,11 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             .collect::<String>();
         fs::write(&mirrorlist_file, mirrorlist).await?;
         info!("Wrote mirrorlist to {mirrorlist_path}");
-    } else if std::fs::metadata(&mirrorlist_file).is_err() {
+    } else if !fs::try_exists(&mirrorlist_file).await.unwrap_or(false) {
         info!("Perform initial load of pacman mirrorlist");
         match pacman_mirrors::get_status(Platform::X86_64).await {
             Ok(status) => {
-                let urls = status.urls;
-                let mirrorlist = urls.gen_mirrorlist(urls.0.clone())?;
-                fs::write(&mirrorlist_file, mirrorlist).await?;
+                fs::write(&mirrorlist_file, gen_mirrorlist(&status.urls.0)).await?;
                 info!("Wrote mirrorlist to {mirrorlist_path}");
             }
             Err(e) => {

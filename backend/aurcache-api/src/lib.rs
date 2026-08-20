@@ -3,7 +3,7 @@ mod aur;
 mod auth;
 pub mod backend;
 mod build;
-pub mod cusom_file_server;
+pub mod custom_file_server;
 #[cfg(feature = "static")]
 pub mod embed;
 mod health;

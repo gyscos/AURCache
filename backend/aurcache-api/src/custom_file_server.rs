@@ -125,17 +125,13 @@ fn parse_range_header(header: &str, file_size: u64) -> Option<(u64, u64)> {
     if !header.starts_with("bytes=") {
         return None;
     }
-    let range = &header[6..];
-    let parts: Vec<&str> = range.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let start: u64 = parts[0].parse().ok()?;
-    // If the end is omitted, use the file size.
-    let end: u64 = if let Ok(e) = parts[1].parse::<u64>() {
-        e + 1 // HTTP ranges are inclusive; our reading will use an exclusive end.
-    } else {
-        file_size
+    let (start, end) = header[6..].split_once('-')?;
+    let start: u64 = start.parse().ok()?;
+    // HTTP ranges are inclusive and ours is exclusive; an omitted end means
+    // "to the end of the file".
+    let end: u64 = match end.parse::<u64>() {
+        Ok(e) => e.checked_add(1)?,
+        Err(_) => file_size,
     };
     if start >= end || end > file_size {
         return None;

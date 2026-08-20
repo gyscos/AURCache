@@ -95,6 +95,11 @@ pub async fn fetch_and_pin_ca(base: &str, pin: Option<&str>) -> Result<String> {
 }
 
 /// SHA-256 fingerprint of a PEM certificate's DER body.
+///
+/// This hashes the whole certificate DER (matching the server's
+/// `ca_cert_fingerprint`, which also hashes the full DER — not the SPKI).
+/// [`spki_fingerprint`] simply hashes the bytes it is given, so passing the
+/// full cert DER yields the certificate fingerprint.
 fn ca_fingerprint(pem: &str) -> Result<String> {
     let der = pem_to_der(pem).context("decoding CA PEM")?;
     Ok(spki_fingerprint(&der))
@@ -120,10 +125,7 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     base64_decode(&b64)
 }
 
-/// The CA fingerprint is computed over the whole certificate DER (matching the
-/// server's `ca_cert_fingerprint`, which hashes the full DER — not the SPKI).
-/// Note: [`spki_fingerprint`] simply hashes the bytes it is given, so passing
-/// the full cert DER yields the certificate fingerprint.
+/// Decode a base64 body, tolerating embedded whitespace/line breaks.
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
     let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     STANDARD

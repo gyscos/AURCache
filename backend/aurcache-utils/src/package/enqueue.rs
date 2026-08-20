@@ -134,7 +134,7 @@ pub async fn enqueue_missing_buildable_packages(
                         pkg_active.status = Set(BuildStates::ENQUEUED_BUILD);
                         pkg_active.save(&txn).await?;
                         txn.commit().await?;
-                        let _ = tx.send(Action::Build(Box::from(pkg.clone()), Box::new(promoted)));
+                        let _ = tx.send(Action::Build(Box::new(pkg.clone()), Box::new(promoted)));
                         queued += 1;
                     }
                     // Deps still not satisfied – leave it waiting.
@@ -185,7 +185,7 @@ async fn pending_build_for_platform(
     Ok(Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.is_in(vec![
+        .filter(builds::Column::Status.is_in([
             Some(BuildStates::ACTIVE_BUILD),
             Some(BuildStates::ENQUEUED_BUILD),
             Some(BuildStates::WAITING_FOR_DEPS),
@@ -279,8 +279,8 @@ async fn trigger_build_for_package(
         txn.commit().await?;
         if enqueue_result.inserted && initial_status == BuildStates::ENQUEUED_BUILD {
             let _ = tx.send(Action::Build(
-                Box::from(pkg.clone()),
-                Box::from(enqueue_result.build),
+                Box::new(pkg.clone()),
+                Box::new(enqueue_result.build),
             ));
             queued += 1;
         }

@@ -17,7 +17,7 @@ use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus, WorkerStatus,
 };
-use aurcache_utils::build_logger::BuildLogger;
+use aurcache_utils::build_logger::{BuildLogger, append_build_output};
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
 use aurcache_utils::repo_ingest::{
     LeaseGuard, ingest_pkgs, is_debug_artifact, validate_artifact_names,
@@ -172,7 +172,7 @@ pub async fn register_worker(
     ca: &State<Ca>,
     input: Json<RegisterRequest>,
 ) -> Result<Json<RegisterStatus>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let input = input.into_inner();
 
     let fingerprint = aurcache_ca::fingerprint_from_csr_pem(&input.csr_pem)
@@ -229,7 +229,7 @@ pub async fn register_status(
     ca: &State<Ca>,
     fingerprint: &str,
 ) -> Result<Json<RegisterStatus>, Custom<String>> {
-    register_status_for(db as &DatabaseConnection, ca, fingerprint).await
+    register_status_for(db.inner(), ca, fingerprint).await
 }
 
 async fn register_status_for(
@@ -262,7 +262,7 @@ async fn register_status_for(
 /// Fetch the CA certificate so a worker can pin the server's identity.
 #[utoipa::path(get, path = "/worker/ca", responses((status = 200, description = "PEM CA certificate")))]
 #[get("/worker/ca")]
-pub async fn get_ca(ca: &State<Ca>) -> String {
+pub fn get_ca(ca: &State<Ca>) -> String {
     ca.ca_cert_pem().to_string()
 }
 
@@ -270,7 +270,7 @@ pub async fn get_ca(ca: &State<Ca>) -> String {
 /// server before trusting any issued certificate (anti-MITM during enrollment).
 #[utoipa::path(get, path = "/worker/ca/fingerprint", responses((status = 200, description = "CA fingerprint")))]
 #[get("/worker/ca/fingerprint")]
-pub async fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>> {
+pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>> {
     ca.ca_cert_fingerprint()
         .map_err(|e| err(Status::InternalServerError, e))
 }
@@ -287,7 +287,7 @@ pub async fn claim_job(
     auth: WorkerAuth,
     input: Json<ClaimRequest>,
 ) -> Result<Option<Json<JobDescriptor>>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let input = input.into_inner();
 
     let Some(build) = worker_jobs::claim_job(
@@ -320,7 +320,7 @@ async fn build_descriptor(
         .ok_or_else(|| anyhow::anyhow!("package {} not found", build.pkg_id))?;
 
     let (makepkg_conf, pacman_conf) =
-        build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST), &public_repo_url()).await?;
+        build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST), &public_repo_url()).await;
 
     let arch = build.platform.as_str().to_string();
     let mirrorlist = mirrorlist_for(&arch, &mirrorlist_dir()).await;
@@ -369,7 +369,7 @@ pub async fn job_source(
     auth: WorkerAuth,
     build_id: i32,
 ) -> Result<Vec<u8>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
@@ -400,7 +400,7 @@ pub async fn job_logs(
     build_id: i32,
     data: Data<'_>,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
@@ -411,8 +411,10 @@ pub async fn job_logs(
         .await
         .map_err(|e| err(Status::BadRequest, e))?;
 
-    let logger = BuildLogger::new(build_id, db.clone());
-    logger.append(text.to_string()).await;
+    // The worker posts whole chunks, so this needs no buffering task of its own.
+    append_build_output(db, build_id, &text)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(())
 }
 
@@ -425,7 +427,7 @@ pub async fn job_artifact(
     filename: &str,
     data: Data<'_>,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
@@ -465,7 +467,7 @@ pub async fn complete_job(
     build_id: i32,
     input: Json<CompleteReport>,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let report = input.into_inner();
 
     let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
@@ -539,10 +541,15 @@ pub async fn complete_job(
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     } else {
-        if let Some(reason) = &report.reason {
-            BuildLogger::new(build_id, db.clone())
-                .append(format!("worker reported failure: {reason}\n"))
-                .await;
+        if let Some(reason) = &report.reason
+            && let Err(e) = append_build_output(
+                db,
+                build_id,
+                &format!("worker reported failure: {reason}\n"),
+            )
+            .await
+        {
+            tracing::warn!("Failed to record failure reason for build {build_id}: {e}");
         }
         worker_complete::complete_failure(db, build_id, auth.worker.id)
             .await
@@ -592,7 +599,7 @@ pub async fn heartbeat(
     auth: WorkerAuth,
     input: Json<Heartbeat>,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let hb = input.into_inner();
     worker_store::touch_last_seen(db, auth.worker.id, Some(&hb.version))
         .await
@@ -616,7 +623,7 @@ pub async fn job_status(
     auth: WorkerAuth,
     build_id: i32,
 ) -> Result<Json<JobStatus>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let build = Builds::find_by_id(build_id)
         .one(db)
         .await
@@ -640,7 +647,7 @@ pub async fn list_workers(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
 ) -> Result<Json<Vec<workers::Model>>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let workers = worker_store::list_workers(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
@@ -654,7 +661,7 @@ pub async fn approve_worker(
     _a: Authenticated,
     id: i32,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     worker_store::approve_worker(db, id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
@@ -668,7 +675,7 @@ pub async fn revoke_worker(
     _a: Authenticated,
     id: i32,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     worker_store::revoke_worker(db, id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;

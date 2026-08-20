@@ -45,7 +45,7 @@ CREATE TABLE public.package_vcs_sources
                 )
                 .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())
@@ -63,7 +63,7 @@ CREATE TABLE public.package_vcs_sources
                 db.execute_unprepared("DROP TABLE public.package_vcs_sources;")
                     .await?;
             }
-            _ => Err(DbErr::Migration("Unsupported database type".to_string()))?,
+            _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
         }
 
         Ok(())

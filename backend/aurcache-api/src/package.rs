@@ -53,14 +53,12 @@ use utoipa::OpenApi;
 ))]
 pub struct PackageApi;
 
-fn normalize_build_flags(build_flags: Option<&[String]>) -> Option<Vec<String>> {
-    build_flags.map(|flags| {
-        flags
-            .iter()
-            .map(|flag| flag.trim().to_string())
-            .filter(|flag| !flag.is_empty())
-            .collect()
-    })
+fn normalize_build_flags(build_flags: &[String]) -> Vec<String> {
+    build_flags
+        .iter()
+        .map(|flag| flag.trim().to_string())
+        .filter(|flag| !flag.is_empty())
+        .collect()
 }
 
 #[utoipa::path(
@@ -92,7 +90,7 @@ pub async fn package_add_endpoint(
         db,
         tx,
         platforms,
-        normalize_build_flags(input.build_flags.as_deref()),
+        input.build_flags.as_deref().map(normalize_build_flags),
         input.source.clone(),
         input.patched_files.clone(),
     )
@@ -128,7 +126,7 @@ pub async fn package_update_entity_endpoint(
     id: i32,
     _a: Authenticated,
 ) -> Result<(), BadRequest<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     // We cannot move things out of Json<T>, but we can move it out of T.
     let input = input.into_inner();
@@ -145,8 +143,7 @@ pub async fn package_update_entity_endpoint(
         build_flags: input
             .build_flags
             .as_deref()
-            .and_then(|v| normalize_build_flags(Some(v)))
-            .map_or(NotSet, |v| Set(v.join(";"))),
+            .map_or(NotSet, |v| Set(normalize_build_flags(v).join(";"))),
         platforms: input.platforms.map_or(NotSet, |v| Set(v.join(";"))),
         source_type: NotSet,
         source_data: NotSet,
@@ -190,7 +187,7 @@ pub async fn package_source_files(
     id: i32,
     _a: Authenticated,
 ) -> Result<Json<SourceFileList>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let pkg = Packages::find_by_id(id)
         .one(db)
@@ -224,7 +221,7 @@ pub async fn package_source_file(
     path: String,
     _a: Authenticated,
 ) -> Result<Json<SourceFileContent>, Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let pkg = Packages::find_by_id(id)
         .one(db)
@@ -264,7 +261,7 @@ pub async fn package_source_file_update(
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
 ) -> Result<(), Custom<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
     let input = input.into_inner();
 
     let pkg = Packages::find_by_id(id)
@@ -395,7 +392,7 @@ pub async fn package_update_endpoint(
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<Json<Vec<i32>>, BadRequest<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     let pkg_model: packages::Model = Packages::find_by_id(id)
         .one(db)
@@ -444,7 +441,7 @@ pub async fn package_del(
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), BadRequest<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     // query this before removing package ownership!
     let pkg = Packages::find_by_id(id)
@@ -483,7 +480,7 @@ pub async fn package_list(
     page: Option<u64>,
     _a: Authenticated,
 ) -> Result<Json<Vec<SimplePackageModel>>, NotFound<String>> {
-    let db = db as &DatabaseConnection;
+    let db = db.inner();
 
     list_directly_requested_packages(db, limit, page)
         .await
@@ -561,6 +558,136 @@ async fn list_package_relations(
 enum RelationDirection {
     Dependencies,
     Dependents,
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Get package details
+This requires 1 API call to the AUR (rate limited 4000 per day)
+https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackageModel),
+    ),
+    params(
+            ("id", description = "Id of package")
+    )
+)]
+#[get("/package/<id>")]
+pub async fn get_package(
+    db: &State<DatabaseConnection>,
+    id: i32,
+    _a: Authenticated,
+) -> Result<Json<ExtendedPackageModel>, Custom<String>> {
+    let db = db.inner();
+
+    let pkg = Packages::find()
+        .filter(packages::Column::Id.eq(id))
+        .one(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .ok_or_else(|| Custom(Status::NotFound, "ID not found".to_string()))?;
+
+    // Query the latest build.version for this package (most recent by end_time then start_time)
+    let latest_version_row = Builds::find()
+        .select_only()
+        .column(builds::Column::Version)
+        .filter(builds::Column::PkgId.eq(pkg.id))
+        .order_by(builds::Column::EndTime, Order::Desc)
+        .order_by(builds::Column::StartTime, Order::Desc)
+        .limit(1)
+        .into_tuple::<(String,)>()
+        .one(db)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+    let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
+    let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+    let dependents = list_package_relations(db, pkg.id, RelationDirection::Dependents)
+        .await
+        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+    let has_patch = pkg.patch.is_some();
+    let source_data = pkg.source_data;
+
+    let (package_source, version) = match source_data {
+        SourceData::Aur { .. } => {
+            let query_name = pkg
+                .split_packages
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .and_then(|names| {
+                    let first = names.first()?;
+                    (names.len() > 1 || first != &pkg.name).then(|| first.clone())
+                })
+                .unwrap_or_else(|| pkg.name.clone());
+
+            let aur_info = get_package_info(&query_name)
+                .await
+                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+
+            match aur_info {
+                None => (
+                    PackageSource::AurNotFound(AurNotFoundPackage {}),
+                    pkg.upstream_version.unwrap_or_default(),
+                ),
+                Some(aur_info) => {
+                    let aur_url = format!("https://aur.archlinux.org/pkgbase/{}", pkg.name);
+
+                    (
+                        PackageSource::Aur(AurPackage {
+                            name: pkg.name.clone(),
+                            project_url: aur_info.url,
+                            description: aur_info.description,
+                            last_updated: aur_info.last_modified,
+                            first_submitted: aur_info.first_submitted,
+                            licenses: aur_info.license.map(|l| l.join(", ")),
+                            maintainer: aur_info.maintainer,
+                            aur_flagged_outdated: aur_info.out_of_date.unwrap_or(0) != 0,
+                            aur_url,
+                        }),
+                        aur_info.version,
+                    )
+                }
+            }
+        }
+        SourceData::Git { spec } => (
+            PackageSource::Git(spec),
+            // How current this version is depends on the version-check interval.
+            pkg.upstream_version.unwrap_or_default(),
+        ),
+        SourceData::Upload { .. } => {
+            return Err(Custom(
+                Status::NotImplemented,
+                "Upload sources are not yet supported".to_string(),
+            ));
+        }
+    };
+
+    let ext_pkg = ExtendedPackageModel {
+        id: pkg.id,
+        name: pkg.name,
+        directly_requested: pkg.directly_requested,
+        status: pkg.status,
+        outofdate: pkg.out_of_date,
+        latest_version,
+        package_source,
+        selected_platforms: pkg.platforms.split(';').map(ToString::to_string).collect(),
+        selected_build_flags: Some(
+            pkg.build_flags
+                .split(';')
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        upstream_version: version,
+        split_packages: pkg
+            .split_packages
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        dependencies,
+        dependents,
+        has_patch,
+    };
+
+    Ok(Json(ext_pkg))
 }
 
 #[cfg(test)]
@@ -762,131 +889,4 @@ mod tests {
         assert_eq!(dependents[0].name, "parent");
         assert_eq!(dependents[0].version_constraint, ">=1.0");
     }
-}
-
-#[utoipa::path(
-    responses(
-            (status = 200, description = "Get package details
-This requires 1 API call to the AUR (rate limited 4000 per day)
-https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackageModel),
-    ),
-    params(
-            ("id", description = "Id of package")
-    )
-)]
-#[get("/package/<id>")]
-pub async fn get_package(
-    db: &State<DatabaseConnection>,
-    id: i32,
-    _a: Authenticated,
-) -> Result<Json<ExtendedPackageModel>, Custom<String>> {
-    let db = db as &DatabaseConnection;
-
-    let pkg = Packages::find()
-        .filter(packages::Column::Id.eq(id))
-        .one(db)
-        .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| Custom(Status::NotFound, "ID not found".to_string()))?;
-
-    // Query the latest build.version for this package (most recent by end_time then start_time)
-    let latest_version_row = Builds::find()
-        .select_only()
-        .column(builds::Column::Version)
-        .filter(builds::Column::PkgId.eq(pkg.id))
-        .order_by(builds::Column::EndTime, Order::Desc)
-        .order_by(builds::Column::StartTime, Order::Desc)
-        .limit(1)
-        .into_tuple::<(String,)>()
-        .one(db)
-        .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
-
-    let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
-    let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
-        .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
-    let dependents = list_package_relations(db, pkg.id, RelationDirection::Dependents)
-        .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
-
-    let has_patch = pkg.patch.is_some();
-    let source_data = pkg.source_data;
-
-    let (package_source, version) = match source_data {
-        SourceData::Aur { .. } => {
-            let query_name = pkg
-                .split_packages
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                .and_then(|names| {
-                    let first = names.first()?;
-                    (names.len() > 1 || first != &pkg.name).then(|| first.clone())
-                })
-                .unwrap_or_else(|| pkg.name.clone());
-
-            let aur_info = get_package_info(&query_name)
-                .await
-                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
-
-            match aur_info {
-                None => (
-                    PackageSource::AurNotFound(AurNotFoundPackage {}),
-                    pkg.upstream_version.unwrap_or_default(),
-                ),
-                Some(aur_info) => {
-                    let aur_url = format!("https://aur.archlinux.org/pkgbase/{}", pkg.name);
-
-                    (
-                        PackageSource::Aur(AurPackage {
-                            name: pkg.name.clone(),
-                            project_url: aur_info.url,
-                            description: aur_info.description,
-                            last_updated: aur_info.last_modified,
-                            first_submitted: aur_info.first_submitted,
-                            licenses: aur_info.license.map(|l| l.join(", ")),
-                            maintainer: aur_info.maintainer,
-                            aur_flagged_outdated: aur_info.out_of_date.unwrap_or(0) != 0,
-                            aur_url,
-                        }),
-                        aur_info.version,
-                    )
-                }
-            }
-        }
-        SourceData::Git { spec } => (
-            PackageSource::Git(spec),
-            // This versions actuality dpendes on the update-version-check interval
-            pkg.upstream_version.unwrap_or(String::new()),
-        ),
-        SourceData::Upload { .. } => {
-            todo!("upload zip is not yet implemented")
-        }
-    };
-
-    let ext_pkg = ExtendedPackageModel {
-        id: pkg.id,
-        name: pkg.name,
-        directly_requested: pkg.directly_requested,
-        status: pkg.status,
-        outofdate: pkg.out_of_date,
-        latest_version,
-        package_source,
-        selected_platforms: pkg.platforms.split(';').map(ToString::to_string).collect(),
-        selected_build_flags: Some(
-            pkg.build_flags
-                .split(';')
-                .map(ToString::to_string)
-                .collect(),
-        ),
-        upstream_version: version,
-        split_packages: pkg
-            .split_packages
-            .and_then(|s| serde_json::from_str(&s).ok()),
-        dependencies,
-        dependents,
-        has_patch,
-    };
-
-    Ok(Json(ext_pkg))
 }
