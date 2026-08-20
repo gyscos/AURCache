@@ -2,6 +2,9 @@
 name = "aurcache-client"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }

@@ -16,9 +16,7 @@ pub fn init_logger() {
         .add_directive("rocket=warn".parse().unwrap())
         .add_directive("hyper::proto=warn".parse().unwrap());
 
-    let use_color = std::env::var("LOG_STYLE")
-        .map(|s| s != "never")
-        .unwrap_or(true);
+    let use_color = std::env::var("LOG_STYLE").map_or(true, |s| s != "never");
 
     #[cfg(debug_assertions)]
     let formatter = fmt::layer().with_target(true).with_ansi(use_color).pretty();

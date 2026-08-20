@@ -92,8 +92,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             .split(';')
             .filter(|s| !s.is_empty())
             .map(|s| format!("Server = {s}\n"))
-            .collect::<Vec<_>>()
-            .join("");
+            .collect::<String>();
         fs::write(&mirrorlist_file, mirrorlist).await?;
         info!("Wrote mirrorlist to {mirrorlist_path}");
     } else if std::fs::metadata(&mirrorlist_file).is_err() {

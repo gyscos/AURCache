@@ -14,7 +14,7 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
                 fs::create_dir("./db")?;
             }
 
-            let db_name = env::var("DB_NAME").unwrap_or("db.sqlite".to_string());
+            let db_name = env::var("DB_NAME").unwrap_or_else(|_| "db.sqlite".to_string());
 
             let mut conn_opts = ConnectOptions::new(format!("sqlite://db/{db_name}?mode=rwc"));
             conn_opts
@@ -39,7 +39,7 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
                 .map_err(|_| anyhow!("No DB_PWD envvar for POSTGRES Password specified"))?;
             let db_host = env::var("DB_HOST")
                 .map_err(|_| anyhow!("No DB_HOST envvar for POSTGRES HOST specified"))?;
-            let db_name = env::var("DB_NAME").unwrap_or("postgres".to_string());
+            let db_name = env::var("DB_NAME").unwrap_or_else(|_| "postgres".to_string());
 
             let conn_str = format!("postgres://{db_user}:{db_pwd}@{db_host}/{db_name}");
             let mut conn_opts = ConnectOptions::new(conn_str);

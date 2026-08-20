@@ -51,7 +51,7 @@ pub async fn build_output(
         .one(db)
         .await
         .map_err(|e| NotFound(e.to_string()))?
-        .ok_or(NotFound("couldn't find id".to_string()))?;
+        .ok_or_else(|| NotFound("couldn't find id".to_string()))?;
 
     match build.output {
         None => Err(NotFound("No Output".to_string())),
@@ -145,7 +145,7 @@ pub async fn get_build(
         .one(db)
         .await
         .map_err(|e| NotFound(e.to_string()))?
-        .ok_or(NotFound("no item with id found".to_string()))?;
+        .ok_or_else(|| NotFound("no item with id found".to_string()))?;
 
     Ok(Json(result))
 }
@@ -170,7 +170,7 @@ pub async fn delete_build(
         .one(db)
         .await
         .map_err(|e| NotFound(e.to_string()))?
-        .ok_or(NotFound("Id not found".to_string()))?;
+        .ok_or_else(|| NotFound("Id not found".to_string()))?;
 
     build
         .delete(db)
@@ -224,7 +224,7 @@ pub async fn rery_build(
         .one(db)
         .await
         .map_err(|e| NotFound(e.to_string()))?
-        .ok_or(NotFound("Build not found".to_string()))?;
+        .ok_or_else(|| NotFound("Build not found".to_string()))?;
 
     // Extract the platform and package ID
     let platform = old_build.platform;
@@ -235,7 +235,7 @@ pub async fn rery_build(
         .one(db)
         .await
         .map_err(|e| NotFound(e.to_string()))?
-        .ok_or(NotFound("Package not found".to_string()))?;
+        .ok_or_else(|| NotFound("Package not found".to_string()))?;
 
     // Route retries through the same path as "Force Rebuild": this re-fetches
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
@@ -252,7 +252,7 @@ pub async fn rery_build(
         .into_iter()
         .find(|r| r.platform == platform)
         .map(|r| r.build_id)
-        .ok_or(NotFound("No build was enqueued for retry".to_string()))?;
+        .ok_or_else(|| NotFound("No build was enqueued for retry".to_string()))?;
 
     Ok(Json(build_id))
 }

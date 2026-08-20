@@ -37,7 +37,7 @@ impl<'r> FromRequest<'r> for Authenticated {
                         .get_private("username")
                         .and_then(|cookie| cookie.value().parse().ok());
 
-                    Authenticated { username }
+                    Self { username }
                 })
             {
                 return Outcome::Success(authenticated);
@@ -59,14 +59,14 @@ impl<'r> FromRequest<'r> for Authenticated {
             };
 
             match username_for_api_token(db, bearer_token).await {
-                Ok(Some(username)) => Outcome::Success(Authenticated {
+                Ok(Some(username)) => Outcome::Success(Self {
                     username: Some(username),
                 }),
                 Ok(None) => Outcome::Error((Status::Unauthorized, LoginError::InvalidData)),
                 Err(_) => Outcome::Error((Status::InternalServerError, LoginError::InvalidData)),
             }
         } else {
-            Outcome::Success(Authenticated { username: None })
+            Outcome::Success(Self { username: None })
         }
     }
 }

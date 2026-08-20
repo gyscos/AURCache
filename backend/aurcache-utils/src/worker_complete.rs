@@ -26,8 +26,7 @@ const STATUS_FAILED: i32 = 2;
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Confirm the given worker currently holds the active lease on the build.
@@ -282,9 +281,7 @@ async fn dependency_satisfied<C: ConnectionTrait>(
         .into_tuple()
         .one(db)
         .await?;
-    Ok(latest_success
-        .map(|v| crate::pkg::satisfies_constraint(&v, constraint))
-        .unwrap_or(false))
+    Ok(latest_success.is_some_and(|v| crate::pkg::satisfies_constraint(&v, constraint)))
 }
 
 async fn promote_dependent<C: ConnectionTrait>(

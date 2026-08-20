@@ -12,7 +12,7 @@ where
 {
     fn get(&self) -> anyhow::Result<&T> {
         match self {
-            ActiveValue::Set(value) | ActiveValue::Unchanged(value) => Ok(value),
+            Self::Set(value) | Self::Unchanged(value) => Ok(value),
             _ => Err(anyhow!("Value is not set")),
         }
     }

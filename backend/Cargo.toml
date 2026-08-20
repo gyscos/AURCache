@@ -17,6 +17,40 @@ members = [
     "aurcache-ca",
     "aurcache-worker"]
 
+# Idioms enforced across the workspace. Every lint here is at zero warnings, so
+# these guard against regression rather than demanding a cleanup.
+#
+# To accommodate a specific site, add a local
+# #[expect(clippy::x, reason = "...")] there rather than dropping the lint from
+# this list. A rule is left out below only when we object to it generally, not
+# because of one awkward case.
+#
+# Pedantic/nursery lints deliberately not adopted:
+#   map_unwrap_or        - map_or_else puts the fallback before the transform,
+#                          inverting reading order.
+#   redundant_pub_crate  - contradicts rustc's own unreachable_pub; pub(crate)
+#                          in a private module documents intent.
+#   option_if_let_else, single_match_else
+#                        - point-free map_or is not clearer than an explicit
+#                          if let / match.
+#   assert_is_empty      - .is_empty() beats assert_eq!(x, "").
+#   missing_errors_doc   - 137 sites; not a convention this project follows.
+[workspace.lints.clippy]
+use_self = "warn"
+or_fun_call = "warn"
+unnecessary_wraps = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+manual_is_variant_and = "warn"
+redundant_clone = "warn"
+assigning_clones = "warn"
+needless_collect = "warn"
+uninlined_format_args = "warn"
+explicit_into_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+cloned_instead_of_copied = "warn"
+
 [workspace.dependencies]
 tokio = "1.52.3"
 anyhow = "1.0.103"

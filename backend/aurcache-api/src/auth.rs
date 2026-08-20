@@ -4,7 +4,7 @@ use aurcache_db::prelude::ApiTokens;
 use rand::RngCore;
 use reqwest::header::AUTHORIZATION;
 use rocket::get;
-use rocket::http::{Cookie, CookieJar, SameSite};
+use rocket::http::{Cookie, CookieJar, SameSite, Status};
 use rocket::response::Redirect;
 use rocket::response::status::Unauthorized;
 use rocket::serde::json::Json;
@@ -12,7 +12,7 @@ use rocket::{State, post};
 use rocket_oauth2::{OAuth2, TokenResponse};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, error};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
 
@@ -105,13 +105,20 @@ pub async fn regenerate_api_token(
 #[utoipa::path(
     responses(
             (status = 200, description = "Redirect to oidc login endpoint"),
+            (status = 500, description = "Failed to build the oidc redirect"),
     )
 )]
 #[get("/login")]
-pub fn oauth_login(oauth2: OAuth2<OauthUserInfo>, cookies: &CookieJar<'_>) -> Redirect {
+pub fn oauth_login(
+    oauth2: OAuth2<OauthUserInfo>,
+    cookies: &CookieJar<'_>,
+) -> Result<Redirect, Status> {
     oauth2
         .get_redirect(cookies, &["profile", "openid", "email"])
-        .unwrap()
+        .map_err(|e| {
+            error!("failed to build oauth redirect: {e}");
+            Status::InternalServerError
+        })
 }
 
 #[utoipa::path(
@@ -150,7 +157,7 @@ pub async fn oauth_callback(
 
     // Set a private cookie with the user's name, and redirect to the home page.
     cookies.add_private(
-        Cookie::build(("username", real_name.clone()))
+        Cookie::build(("username", real_name))
             .same_site(SameSite::Lax)
             .build(),
     );

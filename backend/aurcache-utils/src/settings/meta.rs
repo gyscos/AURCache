@@ -7,47 +7,47 @@ pub trait SettingsMetaTrait {
 impl SettingsMetaTrait for Setting {
     fn meta(&self) -> SettingsMeta {
         match self {
-            Setting::CpuLimit => SettingsMeta {
+            Self::CpuLimit => SettingsMeta {
                 key: "cpu_limit",
                 env_name: Some("CPU_LIMIT"),
                 default: "0",
             },
-            Setting::MemoryLimit => SettingsMeta {
+            Self::MemoryLimit => SettingsMeta {
                 key: "memory_limit",
                 env_name: Some("MEMORY_LIMIT"),
                 default: "-1",
             },
-            Setting::MaxConcurrentBuilds => SettingsMeta {
+            Self::MaxConcurrentBuilds => SettingsMeta {
                 key: "max_concurrent_builds",
                 env_name: Some("MAX_CONCURRENT_BUILDS"),
                 default: "1",
             },
-            Setting::VersionCheckInterval => SettingsMeta {
+            Self::VersionCheckInterval => SettingsMeta {
                 key: "version_check_interval",
                 env_name: Some("VERSION_CHECK_INTERVAL"),
                 default: "3600",
             },
-            Setting::AutoUpdateInterval => SettingsMeta {
+            Self::AutoUpdateInterval => SettingsMeta {
                 key: "auto_update_interval",
                 env_name: Some("AUTO_UPDATE_SCHEDULE"),
                 default: "", // parses to None
             },
-            Setting::JobTimeout => SettingsMeta {
+            Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
                 env_name: Some("JOB_TIMEOUT"),
                 default: "3600",
             },
-            Setting::BuilderImage => SettingsMeta {
+            Self::BuilderImage => SettingsMeta {
                 key: "builder_image",
                 env_name: Some("BUILDER_IMAGE"),
                 default: "ghcr.io/lukas-heiligenbrunner/aurcache-builder:latest",
             },
-            Setting::MakepkgConf => SettingsMeta {
+            Self::MakepkgConf => SettingsMeta {
                 key: "makepkg_conf",
                 env_name: None,
                 default: "",
             },
-            Setting::PacmanConf => SettingsMeta {
+            Self::PacmanConf => SettingsMeta {
                 key: "pacman_conf",
                 env_name: None,
                 default: "",

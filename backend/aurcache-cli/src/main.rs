@@ -711,7 +711,8 @@ async fn patch_package_command(
 ) -> Result<()> {
     let body = build_patch_package_request(args)?;
     client.patch_package(body.0, &body.1).await?;
-    print_done_message(format, "package updated")
+    print_done_message(format, "package updated");
+    Ok(())
 }
 
 fn build_patch_package_request(args: PatchPackageArgs) -> Result<(i32, PatchPackageRequest)> {
@@ -744,7 +745,8 @@ async fn delete_package_command(
     id: i32,
 ) -> Result<()> {
     client.delete_package(id).await?;
-    print_done_message(format, "package removed")
+    print_done_message(format, "package removed");
+    Ok(())
 }
 
 async fn render_builds_list(
@@ -807,7 +809,8 @@ async fn cancel_build_command(
     id: i32,
 ) -> Result<()> {
     client.cancel_build(id).await?;
-    print_done_message(format, "build cancelled")
+    print_done_message(format, "build cancelled");
+    Ok(())
 }
 
 async fn delete_build_command(
@@ -816,14 +819,14 @@ async fn delete_build_command(
     id: i32,
 ) -> Result<()> {
     client.delete_build(id).await?;
-    print_done_message(format, "build deleted")
+    print_done_message(format, "build deleted");
+    Ok(())
 }
 
-fn print_done_message(format: OutputFormat, message: &str) -> Result<()> {
+fn print_done_message(format: OutputFormat, message: &str) {
     if format == OutputFormat::Text {
         println!("{message}");
     }
-    Ok(())
 }
 
 async fn render_workers_list(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
@@ -843,7 +846,8 @@ async fn approve_worker_command(
     id: i32,
 ) -> Result<()> {
     client.approve_worker(id).await?;
-    print_done_message(format, &format!("worker {id} approved"))
+    print_done_message(format, &format!("worker {id} approved"));
+    Ok(())
 }
 
 async fn revoke_worker_command(
@@ -852,7 +856,8 @@ async fn revoke_worker_command(
     id: i32,
 ) -> Result<()> {
     client.revoke_worker(id).await?;
-    print_done_message(format, &format!("worker {id} revoked"))
+    print_done_message(format, &format!("worker {id} revoked"));
+    Ok(())
 }
 
 fn print_worker_list(workers: &[Worker]) {

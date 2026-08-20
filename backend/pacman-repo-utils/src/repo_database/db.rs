@@ -63,7 +63,7 @@ pub fn add_to_db_file(
             let mut tar_builder = Builder::new(enc);
 
             let target_dir = dir_name.clone();
-            let target_file = format!("{}/{}", dir_name, file_name);
+            let target_file = format!("{dir_name}/{file_name}");
 
             // Copy all entries *except* the ones we will replace
             for mut entry in archive.entries()?.flatten() {
@@ -95,7 +95,7 @@ pub fn add_to_db_file(
 
         // Add file (replacing old one)
         let mut header = Header::new_gnu();
-        header.set_path(format!("{}/{}", dir_name, file_name))?;
+        header.set_path(format!("{dir_name}/{file_name}"))?;
         header.set_size(content.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();

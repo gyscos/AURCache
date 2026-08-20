@@ -12,7 +12,7 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     let pkg = Packages::find_by_id(pkg_id)
         .one(&txn)
         .await?
-        .ok_or(anyhow!("id not found"))?;
+        .ok_or_else(|| anyhow!("id not found"))?;
 
     // remove package db entry
     pkg.clone().delete(&txn).await?;

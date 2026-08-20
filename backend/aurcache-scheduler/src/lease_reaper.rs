@@ -27,8 +27,7 @@ fn env_i64(key: &str, default: i64) -> i64 {
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Spawn the reaper loop. Runs every `REAP_INTERVAL` seconds (default 20s).
@@ -50,7 +49,7 @@ pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
             // `MAX_BUILD_DURATION` reuses the configurable JobTimeout setting.
             let job_timeout: SettingsEntry<u32> =
                 ApplicationSettings::get(Setting::JobTimeout, None, &db).await;
-            let max_build_age = job_timeout.value as i64 + grace;
+            let max_build_age = i64::from(job_timeout.value) + grace;
 
             match reap_expired_builds(&db, now_secs(), max_attempts, max_build_age).await {
                 Ok(out) => {

@@ -25,7 +25,7 @@ async fn main() {
     pre_startup_tasks().await;
 
     let (tx, _) = broadcast::channel::<Action>(32);
-    let db = init_db().await.unwrap();
+    let db = init_db().await.expect("failed to initialize database");
 
     let _ = post_startup_tasks(&db).await;
 

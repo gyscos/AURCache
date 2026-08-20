@@ -21,13 +21,13 @@ impl CustomFileServer {
 
     #[track_caller]
     pub fn from<P: AsRef<Path>>(path: P) -> Self {
-        CustomFileServer::new(path)
+        Self::new(path)
     }
 
     #[track_caller]
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
-        CustomFileServer {
+        Self {
             root: path.into(),
             rank: Self::DEFAULT_RANK,
         }
@@ -58,15 +58,14 @@ impl Handler for CustomFileServer {
             .and_then(|segments| segments.to_path_buf(true).ok());
 
         // Map uri to filepath
-        let file_path = match relative_path {
-            Some(p) => self.root.join(p),
-            None => return Outcome::forward(data, Status::NotFound),
+        let Some(relative_path) = relative_path else {
+            return Outcome::forward(data, Status::NotFound);
         };
+        let file_path = self.root.join(relative_path);
 
         // open file
-        let named_file = match NamedFile::open(&file_path).await {
-            Ok(f) => f,
-            Err(_) => return Outcome::forward(data, Status::NotFound),
+        let Ok(named_file) = NamedFile::open(&file_path).await else {
+            return Outcome::forward(data, Status::NotFound);
         };
 
         let metadata = named_file.metadata().await.ok();

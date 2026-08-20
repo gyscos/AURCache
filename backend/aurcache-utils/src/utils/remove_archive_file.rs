@@ -22,7 +22,7 @@ pub async fn try_remove_archive_file(
     if let Err(e) = fs::remove_file(&file_path) {
         warn!("Failed to remove package file {file_path}: {e}");
     } else {
-        info!("Removed old file: {file_path}")
+        info!("Removed old file: {file_path}");
     }
 
     file.delete(db).await?;

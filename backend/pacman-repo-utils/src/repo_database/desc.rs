@@ -67,13 +67,12 @@ impl Desc {
     }
 
     fn add_desc_entries(&self, header: &str, values: &[String]) -> String {
-        if values.is_empty()
-            || (values.len() == 1
-                && values
-                    .first()
-                    .expect("Must be populated bc. of short-circuit evaluation")
-                    .is_empty())
-        {
+        let is_blank = match values {
+            [] => true,
+            [value] => value.is_empty(),
+            _ => false,
+        };
+        if is_blank {
             String::new()
         } else {
             self.add_desc_entry(header, values.join("\n"))
@@ -83,7 +82,7 @@ impl Desc {
 
 impl From<Pkginfo> for Desc {
     fn from(value: Pkginfo) -> Self {
-        Desc {
+        Self {
             filename: String::new(),
             name: value.pkgname,
             base: value.pkgbase,

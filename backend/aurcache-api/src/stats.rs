@@ -135,27 +135,11 @@ async fn count_directly_requested_packages(db: &DatabaseConnection) -> anyhow::R
         .map_err(Into::into)
 }
 
-async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
-    // Count total builds
-    let total_builds: u32 = Builds::find().count(db).await?.try_into()?;
-
-    // Count failed builds
-    let failed_builds: u32 = Builds::find()
-        .filter(builds::Column::Status.eq(BuildStates::FAILED_BUILD))
-        .count(db)
-        .await?
-        .try_into()?;
-
-    // Count active builds
-    let successful_builds: u32 = Builds::find()
-        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
-        .count(db)
-        .await?
-        .try_into()?;
-
-    // Calculate repo storage size
-    let repo_size: u64 = dir_size("repo/").unwrap_or(0);
-
+/// Average duration of a successful build, in seconds.
+///
+/// The query is dialect-neutral, so it is issued with the SQLite backend on
+/// every database. Missing or unrepresentable averages read as `0`.
+async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
     #[derive(Debug, FromQueryResult)]
     struct BuildTimeStruct {
         avg_build_time: Option<BigDecimal>,
@@ -171,26 +155,25 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
         ))
         .one(db)
         .await?
-        .ok_or(anyhow::anyhow!("No Average build time"))?;
+        .ok_or_else(|| anyhow::anyhow!("No Average build time"))?;
 
-    let avg_build_time = unique
+    Ok(unique
         .avg_build_time
         .unwrap_or(BigDecimal::try_from(0.0)?)
         .to_u32()
-        .unwrap();
+        .unwrap_or(0))
+}
 
-    // Count total packages
-    let total_packages = count_directly_requested_packages(db).await?;
+/// Change over the last 30 days relative to the 30 days before it, as a
+/// fraction (`0.5` = up 50%). Each is `0.0` when the earlier window is empty.
+struct BuildTrends {
+    count: f32,
+    duration: f32,
+}
 
-    #[derive(Debug, FromQueryResult)]
-    struct LastBuildsStruct {
-        last_30_days_builds: i64,
-        prev_30_days_builds: i64,
-        last_30_days_avg_duration: f32,
-        prev_30_days_avg_duration: f32,
-    }
-
-    let query = match database_type() {
+/// The 60-day windowed aggregate behind [`BuildTrends`], per SQL dialect.
+fn build_trends_query() -> anyhow::Result<&'static str> {
+    Ok(match database_type() {
         DbBackend::Sqlite => "
 WITH build_stats AS (
     SELECT
@@ -230,38 +213,68 @@ SELECT
     COALESCE((SELECT avg_build_duration FROM build_stats WHERE period = 'prev_30_days'), 0.0) AS prev_30_days_avg_duration;
 ",
         _ => bail!("Unsupported database type"),
-    };
+    })
+}
+
+async fn build_trends(db: &DatabaseConnection) -> anyhow::Result<BuildTrends> {
+    #[derive(Debug, FromQueryResult)]
+    struct LastBuildsStruct {
+        last_30_days_builds: i64,
+        prev_30_days_builds: i64,
+        last_30_days_avg_duration: f32,
+        prev_30_days_avg_duration: f32,
+    }
 
     let last_build_cnt: LastBuildsStruct = LastBuildsStruct::find_by_statement(
-        Statement::from_sql_and_values(database_type(), query, []),
+        Statement::from_sql_and_values(database_type(), build_trends_query()?, []),
     )
     .one(db)
     .await?
-    .ok_or(anyhow::anyhow!("No last build cnts"))?;
+    .ok_or_else(|| anyhow::anyhow!("No last build cnts"))?;
 
-    let build_trend = match last_build_cnt.prev_30_days_builds {
+    let count = match last_build_cnt.prev_30_days_builds {
         0 => 0.0,
         prev_30_days_builds => {
             (last_build_cnt.last_30_days_builds as f32 / prev_30_days_builds as f32) - 1.0
         }
     };
 
-    let build_duration_trend = match last_build_cnt.prev_30_days_avg_duration {
+    let duration = match last_build_cnt.prev_30_days_avg_duration {
         0.0 => 0.0,
         prev_30_days_avg_duration => {
             (last_build_cnt.last_30_days_avg_duration / prev_30_days_avg_duration) - 1.0
         }
     };
 
+    Ok(BuildTrends { count, duration })
+}
+
+async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
+    let total_builds: u32 = Builds::find().count(db).await?.try_into()?;
+
+    let failed_builds: u32 = Builds::find()
+        .filter(builds::Column::Status.eq(BuildStates::FAILED_BUILD))
+        .count(db)
+        .await?
+        .try_into()?;
+
+    let successful_builds: u32 = Builds::find()
+        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+        .count(db)
+        .await?
+        .try_into()?;
+
+    let trends = build_trends(db).await?;
+
     Ok(ListStats {
         total_builds,
         successful_builds,
         failed_builds,
-        avg_build_time,
-        repo_size,
-        total_packages,
-        total_build_trend: build_trend,
-        avg_build_time_trend: build_duration_trend,
+        avg_build_time: avg_build_time(db).await?,
+        repo_size: dir_size("repo/").unwrap_or(0),
+        total_packages: count_directly_requested_packages(db).await?,
+        total_build_trend: trends.count,
+        avg_build_time_trend: trends.duration,
     })
 }
 

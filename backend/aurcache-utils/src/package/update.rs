@@ -241,10 +241,7 @@ async fn package_update_with_client_inner(
         && !force
         && build.version == upstream_version
     {
-        bail!(
-            "Latest build is already up to date (version {})",
-            upstream_version
-        );
+        bail!("Latest build is already up to date (version {upstream_version})");
     }
 
     let platform_results = enqueue_platform_builds(
@@ -397,14 +394,7 @@ async fn fetch_dep_packages_map(
     dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
 ) -> anyhow::Result<HashMap<String, packages::Model>> {
     Ok(Packages::find()
-        .filter(
-            packages::Column::Name.is_in(
-                dep_constraints_by_pkgbase
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            ),
-        )
+        .filter(packages::Column::Name.is_in(dep_constraints_by_pkgbase.keys().cloned()))
         .all(db)
         .await?
         .into_iter()
@@ -490,7 +480,7 @@ async fn sync_dependency_rows(
         };
         let serialized = constraint
             .as_ref()
-            .map(|c| c.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default();
 
         if let Some(existing) = Dependencies::find()

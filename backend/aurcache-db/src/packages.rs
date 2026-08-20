@@ -47,11 +47,11 @@ impl SourceData {
     /// Unique cache key for this source.
     pub fn cache_key(&self) -> String {
         match self {
-            SourceData::Aur { name } => format!("aur:{name}"),
-            SourceData::Git { spec } => {
+            Self::Aur { name } => format!("aur:{name}"),
+            Self::Git { spec } => {
                 format!("git:{}:{}:{}", spec.url, spec.r#ref, spec.subfolder)
             }
-            SourceData::Upload { .. } => "upload".to_string(),
+            Self::Upload { .. } => "upload".to_string(),
         }
     }
 }

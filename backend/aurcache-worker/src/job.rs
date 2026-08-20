@@ -216,8 +216,7 @@ async fn remote_cancel(client: &WorkerClient, build_id: i32) -> bool {
     client
         .job_status(build_id)
         .await
-        .map(|s| s.cancel_requested)
-        .unwrap_or(false)
+        .is_ok_and(|s| s.cancel_requested)
 }
 
 /// Upload every built artifact to the server's staging area.

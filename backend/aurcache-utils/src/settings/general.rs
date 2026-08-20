@@ -2,7 +2,8 @@ use crate::settings::meta::SettingsMetaTrait;
 use crate::settings::parser::ParseSetting;
 use aurcache_db::settings;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingSource, SettingsEntry};
-use sea_orm::*;
+use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use std::future::Future;
 
 const GLOBAL_PKG_ID: i32 = -1;
 
@@ -178,11 +179,8 @@ pub trait SettingsTraits {
 }
 
 impl SettingsTraits for ApplicationSettings {
-    async fn get_all(
-        db: &DatabaseConnection,
-        pkgid: Option<i32>,
-    ) -> anyhow::Result<ApplicationSettings> {
-        Ok(ApplicationSettings {
+    async fn get_all(db: &DatabaseConnection, pkgid: Option<i32>) -> anyhow::Result<Self> {
+        Ok(Self {
             cpu_limit: get_setting(Setting::CpuLimit, pkgid, db).await,
             memory_limit: get_setting(Setting::MemoryLimit, pkgid, db).await,
             max_concurrent_builds: get_setting(Setting::MaxConcurrentBuilds, pkgid, db).await,

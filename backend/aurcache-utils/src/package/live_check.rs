@@ -27,7 +27,7 @@ async fn live_check_with_visited(
     let pkg = Packages::find_by_id(pkg_id)
         .one(db)
         .await?
-        .ok_or(anyhow::anyhow!("Package id {pkg_id} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("Package id {pkg_id} not found"))?;
 
     // If directly requested by user, keep it
     if pkg.directly_requested {
@@ -68,7 +68,7 @@ pub async fn package_remove(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     let pkg = Packages::find_by_id(pkg_id)
         .one(db)
         .await?
-        .ok_or(anyhow::anyhow!("Package id {pkg_id} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("Package id {pkg_id} not found"))?;
 
     let mut active: packages::ActiveModel = pkg.into();
     active.directly_requested = Set(false);

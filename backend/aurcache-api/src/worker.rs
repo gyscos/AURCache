@@ -110,7 +110,7 @@ impl<'r> FromRequest<'r> for WorkerAuth {
         match worker_store::find_worker_by_fingerprint(db, &fingerprint).await {
             Ok(Some(worker)) if worker.status == WorkerStatus::APPROVED => {
                 let _ = worker_store::touch_last_seen(db, worker.id, None).await;
-                Outcome::Success(WorkerAuth { worker })
+                Outcome::Success(Self { worker })
             }
             Ok(_) => Outcome::Error((Status::Forbidden, "worker not approved".to_string())),
             Err(e) => Outcome::Error((Status::InternalServerError, e.to_string())),
@@ -336,7 +336,7 @@ async fn build_descriptor(
             .base
             .pgp_fingerprints
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(ToString::to_string)
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -346,7 +346,7 @@ async fn build_descriptor(
         .split(';')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
+        .map(ToString::to_string)
         .collect();
 
     Ok(JobDescriptor {

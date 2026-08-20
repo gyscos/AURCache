@@ -2,6 +2,9 @@
 name = "aurcache-utils"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 # "https" enables the OpenSSL-backed HTTPS transport (required to clone AUR/git
 # sources over https://); "vendored-openssl" builds OpenSSL from source so we

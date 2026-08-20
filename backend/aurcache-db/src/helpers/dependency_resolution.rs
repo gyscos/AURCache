@@ -31,7 +31,7 @@ pub async fn resolve_dependency_resolutions<C: ConnectionTrait>(
     let unresolved = dep_names
         .iter()
         .filter(|dep_name| !resolutions.contains_key(dep_name.as_str()))
-        .map(|dep_name| dep_name.as_str())
+        .map(String::as_str)
         .collect::<Vec<_>>();
     if unresolved.is_empty() {
         return Ok(resolutions);

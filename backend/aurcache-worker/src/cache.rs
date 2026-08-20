@@ -77,13 +77,7 @@ impl Cache {
     /// Evict LRU source-cache entries above the size/TTL budget, skipping any
     /// pkgbase currently in use. Returns the pkgbases evicted.
     pub fn evict(&self, in_use: &[String]) -> Vec<String> {
-        let entries = match self.scan_srcdest() {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!("cache scan skipped: {e}");
-                return Vec::new();
-            }
-        };
+        let entries = self.scan_srcdest();
         let plan = plan_eviction(&entries, self.max_size, self.ttl, SystemTime::now(), in_use);
         for pkgbase in &plan {
             self.wipe_srcdest(pkgbase);
@@ -92,14 +86,16 @@ impl Cache {
         plan
     }
 
-    fn scan_srcdest(&self) -> std::io::Result<Vec<CacheEntry>> {
+    /// Best-effort scan of the source cache directory; an unreadable or
+    /// missing directory yields no entries rather than an error.
+    fn scan_srcdest(&self) -> Vec<CacheEntry> {
         let dir = self.root.join("srcdest");
         let mut entries = Vec::new();
         let Ok(read) = std::fs::read_dir(&dir) else {
-            return Ok(entries);
+            return entries;
         };
         for ent in read.flatten() {
-            if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !ent.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let pkgbase = ent.file_name().to_string_lossy().to_string();
@@ -115,7 +111,7 @@ impl Cache {
                 last_used,
             });
         }
-        Ok(entries)
+        entries
     }
 }
 
@@ -167,11 +163,7 @@ pub fn plan_eviction(
             kept.push(e);
             continue;
         }
-        let aged = !ttl.is_zero()
-            && now
-                .duration_since(e.last_used)
-                .map(|age| age > ttl)
-                .unwrap_or(false);
+        let aged = !ttl.is_zero() && now.duration_since(e.last_used).is_ok_and(|age| age > ttl);
         if aged {
             evict.push(e.pkgbase.clone());
         } else {

@@ -1,6 +1,7 @@
 use crate::settings::general::SettingsTraits;
 use aurcache_types::settings::{ApplicationSettings, Setting};
 use sea_orm::DatabaseConnection;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Canonical directory AURCache stores/serves the pacman `mirrorlist` from.
@@ -49,10 +50,11 @@ pub async fn create_makepkg_config(
         }
     }
 
-    config.push_str(&format!(
+    let _ = write!(
+        config,
         "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\nPACKAGER='AURCache <aurcache@localhost>'\nOPTIONS=(!debug)\n",
         pkgdest_dir_base.display()
-    ));
+    );
 
     let makepkg_config_path = "/var/ab/.config/pacman/makepkg.conf";
     Ok((config, makepkg_config_path.to_string()))

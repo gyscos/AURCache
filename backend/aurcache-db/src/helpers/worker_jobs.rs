@@ -20,8 +20,7 @@ pub const STATUS_ENQUEUED: i32 = 3;
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Atomically claim the next buildable job, preferring native arches over

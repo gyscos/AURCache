@@ -124,7 +124,7 @@ impl SnapshotStore {
     }
 
     pub fn with_checkout_root(checkout_root: PathBuf) -> Self {
-        SnapshotStore {
+        Self {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY must be non-zero"),
             )),
@@ -139,7 +139,7 @@ impl SnapshotStore {
         checkout_root: PathBuf,
         aur_git_base_url: impl Into<String>,
     ) -> Self {
-        SnapshotStore {
+        Self {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY must be non-zero"),
             )),
@@ -486,7 +486,7 @@ async fn checkout_and_parse(
     let (commit, package_dir) = tokio::task::spawn_blocking(move || {
         let commit = checkout_or_fetch_repo_ref(&repo_url, &git_ref, &path)?;
         let package_dir = if subfolder.is_empty() {
-            path.clone()
+            path
         } else {
             path.join(&subfolder)
         };

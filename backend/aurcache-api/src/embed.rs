@@ -36,19 +36,17 @@ impl Handler for CustomHandler {
             };
         }
 
-        let mut path = request
+        let Some(mut path) = request
             .segments::<Segments<'_, Path>>(0..)
             .ok()
             .and_then(|segments| segments.to_path_buf(true).ok())
-            .unwrap();
+        else {
+            return Outcome::Error(Status::BadRequest);
+        };
 
         if path.is_dir() || path.to_str() == Some("") {
-            path = path.join("index.html")
+            path = path.join("index.html");
         }
-
-        // if let None =  path.extension()  {
-        //     path = "index.html".into();
-        // }
 
         match <Asset as RustEmbed>::get(path.to_string_lossy().as_ref()) {
             None => Outcome::Error(Status::NotFound),

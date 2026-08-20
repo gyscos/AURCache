@@ -83,7 +83,7 @@ pub async fn package_add_endpoint(
             v.into_iter()
                 .map(|s| Platform::from_str(&s).ok())
                 .collect::<Option<Vec<Platform>>>()
-                .ok_or(BadRequest("Invalid Platform name".to_string()))?,
+                .ok_or_else(|| BadRequest("Invalid Platform name".to_string()))?,
         ),
     };
 
@@ -196,7 +196,7 @@ pub async fn package_source_files(
         .one(db)
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
 
     let client = AurClient::new();
     let files = store
@@ -230,7 +230,7 @@ pub async fn package_source_file(
         .one(db)
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
 
     let client = AurClient::new();
 
@@ -271,7 +271,7 @@ pub async fn package_source_file_update(
         .one(db)
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or(Custom(Status::NotFound, "id not found".to_string()))?;
+        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
 
     let client = AurClient::new();
 
@@ -401,7 +401,7 @@ pub async fn package_update_endpoint(
         .one(db)
         .await
         .map_err(|e| BadRequest(e.to_string()))?
-        .ok_or(BadRequest("id not found".to_string()))?;
+        .ok_or_else(|| BadRequest("id not found".to_string()))?;
 
     let pkg_update = package_update(store, db, pkg_model.clone(), input.force, tx)
         .await
@@ -451,7 +451,7 @@ pub async fn package_del(
         .one(db)
         .await
         .map_err(|e| BadRequest(e.to_string()))?
-        .ok_or(BadRequest("id not found".to_string()))?;
+        .ok_or_else(|| BadRequest("id not found".to_string()))?;
 
     package_remove(db, id)
         .await
@@ -787,7 +787,7 @@ pub async fn get_package(
         .one(db)
         .await
         .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or(Custom(Status::NotFound, "ID not found".to_string()))?;
+        .ok_or_else(|| Custom(Status::NotFound, "ID not found".to_string()))?;
 
     // Query the latest build.version for this package (most recent by end_time then start_time)
     let latest_version_row = Builds::find()
@@ -823,7 +823,7 @@ pub async fn get_package(
                     let first = names.first()?;
                     (names.len() > 1 || first != &pkg.name).then(|| first.clone())
                 })
-                .unwrap_or(pkg.name.clone());
+                .unwrap_or_else(|| pkg.name.clone());
 
             let aur_info = get_package_info(&query_name)
                 .await

@@ -3,6 +3,7 @@ use crate::mirror::Mirrors;
 use anyhow::anyhow;
 use chrono::Utc;
 use reqwest::Client;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use tracing::info;
 use url::Url;
@@ -49,13 +50,12 @@ impl Bench for Mirrors {
                 }
                 Err(err) => {
                     info!("Failed to measure duration for {}: {}", mirror.url, err);
-                    continue;
                 }
             }
         }
 
         // Sort by duration (ascending order)
-        durations.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("Failed to compare durations"));
+        durations.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         // Extract only the sorted Mirror references
         Ok(durations
@@ -76,8 +76,8 @@ impl Bench for Mirrors {
         );
 
         for mirror in &mirrors[..10] {
-            body.push_str(&format!("## {}\n", mirror.country.kind));
-            body.push_str(&format!("Server = {}$repo/os/$arch\n", mirror.url));
+            let _ = writeln!(body, "## {}", mirror.country.kind);
+            let _ = writeln!(body, "Server = {}$repo/os/$arch", mirror.url);
             body.push('\n');
         }
 

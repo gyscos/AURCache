@@ -58,14 +58,11 @@ pub fn parse_preapproved(raw: &str) -> Vec<String> {
 /// best-effort: a missing/unreadable dir simply means that mode doesn't match.
 #[must_use]
 pub fn auto_approve_from_env(fingerprint: &str, provided_token: Option<&str>) -> bool {
-    let has_csr = env::var("AURCACHE_ENROLLMENT_DIR")
-        .ok()
-        .map(|dir| {
-            PathBuf::from(dir)
-                .join(format!("{fingerprint}.csr"))
-                .is_file()
-        })
-        .unwrap_or(false);
+    let has_csr = env::var("AURCACHE_ENROLLMENT_DIR").is_ok_and(|dir| {
+        PathBuf::from(dir)
+            .join(format!("{fingerprint}.csr"))
+            .is_file()
+    });
 
     let preapproved = env::var("AURCACHE_PREAPPROVED_WORKERS")
         .map(|raw| parse_preapproved(&raw))

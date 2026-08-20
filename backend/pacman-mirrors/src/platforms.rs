@@ -16,9 +16,9 @@ impl Platform {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Platform::X86_64 => "x86_64",
-            Platform::Aarch64 => "aarch64",
-            Platform::Armv7h => "armv7h",
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+            Self::Armv7h => "armv7h",
         }
     }
 
@@ -47,9 +47,9 @@ impl FromStr for Platform {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "x86_64" => Ok(Platform::X86_64),
-            "aarch64" => Ok(Platform::Aarch64),
-            "armv7h" => Ok(Platform::Armv7h),
+            "x86_64" => Ok(Self::X86_64),
+            "aarch64" => Ok(Self::Aarch64),
+            "armv7h" => Ok(Self::Armv7h),
             _ => Err("Unknown platform"),
         }
     }

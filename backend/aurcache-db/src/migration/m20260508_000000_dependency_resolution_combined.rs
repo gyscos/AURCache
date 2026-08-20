@@ -631,13 +631,10 @@ async fn ensure_deps(
                 tracing::warn!("Failed to insert placeholder for {pkgbase}: {e}");
                 e
             })?;
-            let saved_id = match saved.id {
-                ActiveValue::Set(id) | ActiveValue::Unchanged(id) => id,
-                _ => {
-                    return Err(DbErr::Migration(format!(
-                        "placeholder package insert for {pkgbase} did not return an id"
-                    )));
-                }
+            let (ActiveValue::Set(saved_id) | ActiveValue::Unchanged(saved_id)) = saved.id else {
+                return Err(DbErr::Migration(format!(
+                    "placeholder package insert for {pkgbase} did not return an id"
+                )));
             };
             refresh_package_provides(db, saved_id, pkgbase, client).await?;
             saved_id

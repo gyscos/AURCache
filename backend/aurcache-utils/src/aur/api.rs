@@ -13,7 +13,7 @@ pub async fn query_aur(query: &str) -> anyhow::Result<Vec<aurcache_deps::Package
         .search_by_name(query)
         .await
         .map_err(|e| anyhow!("failed to query AUR: {e}"))?;
-    results.sort_by(|x, x1| x.popularity.partial_cmp(&x1.popularity).unwrap().reverse());
+    results.sort_by(|x, x1| x.popularity.total_cmp(&x1.popularity).reverse());
     Ok(results)
 }
 

@@ -72,19 +72,19 @@ pub fn repo_add(pkgfile: &str, db_archive: String, files_archive: String) -> any
 
     let filename = Path::new(pkgfile)
         .file_name()
-        .ok_or(anyhow!("invalid path"))?
+        .ok_or_else(|| anyhow!("invalid path"))?
         .to_str()
-        .ok_or(anyhow!("invalid path"))?
+        .ok_or_else(|| anyhow!("invalid path"))?
         .to_string();
 
     let dir_name = format!("{}-{}", pkginfo.pkgname, pkginfo.pkgver);
 
     debug!("Creating DESC file for db entry");
     let mut desc = Desc::from(pkginfo);
-    desc.filename = filename.clone();
-    desc.md5sum = md5sum.clone();
+    desc.filename = filename;
+    desc.md5sum = md5sum;
     desc.csize = csize.to_string();
-    desc.sha256sum = sha256sum.clone();
+    desc.sha256sum = sha256sum;
     let desc_str = desc.to_string();
 
     debug!("Adding DESC and FILES entries to db archive");
@@ -118,7 +118,7 @@ fn calc_checksums(path: &str) -> anyhow::Result<(String, String)> {
     let sha256sum = hasher
         .finalize()
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
     Ok((md5sum, sha256sum))

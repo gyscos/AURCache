@@ -91,7 +91,7 @@ fn detect_hostname() -> String {
 
 fn detect_nproc() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(1)
 }
 
@@ -125,7 +125,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/cache/aurcache-worker"));
 
-        Config {
+        Self {
             aurcache_url: env_opt("AURCACHE_URL")
                 .unwrap_or_else(|| "https://localhost:8080".to_string())
                 .trim_end_matches('/')

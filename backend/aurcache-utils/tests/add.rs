@@ -1088,7 +1088,7 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
     dependencies::ActiveModel {
         dependent_id: Set(root.id),
         dependee_id: Set(mid.id),
-        version_constraint: Set("".to_string()),
+        version_constraint: Set(String::new()),
         ..Default::default()
     }
     .save(&env.db)
@@ -1098,7 +1098,7 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
     dependencies::ActiveModel {
         dependent_id: Set(mid.id),
         dependee_id: Set(leaf.id),
-        version_constraint: Set("".to_string()),
+        version_constraint: Set(String::new()),
         ..Default::default()
     }
     .save(&env.db)
@@ -1207,7 +1207,7 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
     dependencies::ActiveModel {
         dependent_id: Set(root.id),
         dependee_id: Set(mid.id),
-        version_constraint: Set("".to_string()),
+        version_constraint: Set(String::new()),
         ..Default::default()
     }
     .save(&env.db)

@@ -3,6 +3,7 @@ use crate::patch::SourcePatch;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
+use aurcache_db::helpers::active_value_ext::ActiveValueExt;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
@@ -490,7 +491,7 @@ async fn insert_package_with_deps(
         )?;
     }
 
-    let pkgbase_strs: Vec<&str> = dep_pkgbases.iter().map(|s| s.as_str()).collect();
+    let pkgbase_strs: Vec<&str> = dep_pkgbases.iter().map(String::as_str).collect();
     let dependees: HashMap<String, packages::Model> = Packages::find()
         .filter(packages::Column::Name.is_in(pkgbase_strs))
         .all(&txn)
@@ -509,7 +510,7 @@ async fn insert_package_with_deps(
                 .unwrap_or_default();
 
             aurcache_db::dependencies::ActiveModel {
-                dependent_id: Set(saved.id.clone().unwrap()),
+                dependent_id: Set(*saved.id.get()?),
                 dependee_id: Set(dependee.id),
                 version_constraint: Set(constraint),
                 ..Default::default()

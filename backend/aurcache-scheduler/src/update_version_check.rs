@@ -57,7 +57,7 @@ async fn check_versions(db: DatabaseConnection, store: &SnapshotStore) -> anyhow
         })
         .collect();
 
-    let aur_name_refs: Vec<&str> = aur_query_names.iter().map(|s| s.as_str()).collect();
+    let aur_name_refs: Vec<&str> = aur_query_names.iter().map(String::as_str).collect();
 
     let results = if aur_name_refs.is_empty() {
         vec![]
