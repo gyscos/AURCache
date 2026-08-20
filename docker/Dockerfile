@@ -21,7 +21,11 @@ RUN flutter pub get
 RUN flutter pub run build_runner build --delete-conflicting-outputs
 RUN flutter build web --release --wasm --dart-define APP_VERSION=$(grep '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
 
-FROM --platform=linux/amd64 rust:1.96.1 AS builder
+# Must stay on the same Debian release as the runtime stage below: the default
+# `rust:1.96.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
+# runtime (glibc 2.36) cannot load - it dies at startup with
+# "GLIBC_2.38 not found".
+FROM --platform=linux/amd64 rust:1.96.1-bookworm AS builder
 ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # Install necessary tools and dependencies
@@ -38,9 +42,10 @@ RUN bash /root/build-rust.sh $TARGET_ARCH
 
 FROM --platform=$TARGET_ARCH debian:bookworm-slim
 # Podman/Docker is no longer used at runtime (remote workers build packages),
-# so the server just needs a minimal glibc base matching its build image
-# (debian bookworm). Runtime deps: ca-certificates (HTTPS to the AUR) and bash
-# (the alpm-pkgbuild-bridge PKGBUILD parser is a bash script).
+# so the server just needs a minimal glibc base. This must stay on the same
+# Debian release as the builder stage above (see the note there). Runtime deps:
+# ca-certificates (HTTPS to the AUR) and bash (the alpm-pkgbuild-bridge PKGBUILD
+# parser is a bash script).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates bash \
     && rm -rf /var/lib/apt/lists/*

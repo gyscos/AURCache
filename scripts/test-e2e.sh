@@ -39,12 +39,81 @@ dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 aurcache_cli() { "$CLI_BIN" "$@"; }
 
+# Fail early with an actionable message instead of an obscure error 3 minutes in.
+preflight() {
+    local missing=0
+    for tool in docker jq curl cargo; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is required but not installed"; missing=1; }
+    done
+    docker compose version >/dev/null 2>&1 || { echo "ERROR: 'docker compose' (v2) is required"; missing=1; }
+    docker info >/dev/null 2>&1 || { echo "ERROR: cannot talk to the Docker daemon"; missing=1; }
+    [ "$missing" -eq 0 ] || exit 1
+}
+
+# Build status codes -> names, so progress reads as "enqueued" not "3".
+status_name() {
+    case "${1:-}" in
+        0) echo "active" ;;
+        1) echo "success" ;;
+        2) echo "failed" ;;
+        3) echo "enqueued" ;;
+        4) echo "waiting-for-deps" ;;
+        "") echo "<none>" ;;
+        *) echo "unknown($1)" ;;
+    esac
+}
+
+# True if a service container has exited. A dead container will never satisfy
+# any wait loop, so polling it for the full timeout just delays the diagnosis.
+service_exited() {
+    local svc="$1" cid
+    cid=$(dc ps -aq "$svc" 2>/dev/null | head -1)
+    [ -n "$cid" ] || return 1
+    [ "$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)" = "exited" ]
+}
+
+# Abort as soon as either container dies, naming the culprit and its last words.
+assert_services_alive() {
+    local svc
+    for svc in aurcache builder; do
+        if service_exited "$svc"; then
+            log "ERROR: container '$svc' exited unexpectedly"
+            echo "--- last 40 lines from '$svc' ---"
+            dc logs "$svc" 2>&1 | filter_noise | tail -n 40
+            dump_logs_on_failure
+            exit 1
+        fi
+    done
+}
+
+# The services log at debug, and hyper/h2/rustls emit a frame line per I/O op,
+# which buries the handful of lines that explain a failure. Drop that unless
+# VERBOSE=1.
+filter_noise() {
+    if [ "${VERBOSE:-0}" = "1" ]; then
+        cat
+    else
+        grep -viE 'h2::|hyper_util::|hyper::proto|rustls::|framed_read|framed_write|Ping \{|tower::buffer' || true
+    fi
+}
+
+# AURCache's own build log is what actually explains a failed build; container
+# logs mostly show the plumbing around it.
+dump_build_log() {
+    local build_id="$1"
+    [ -n "$build_id" ] || return 0
+    echo "--- AURCache build log (build $build_id) ---"
+    aurcache_cli builds output "$build_id" 2>&1 | tail -n 100 || echo "    (build log unavailable)"
+}
+
 dump_logs_on_failure() {
     dc logs -t > "$LOG_FILE" 2>&1 || true
-    echo "--- aurcache service logs (tail; full multi-service logs in $LOG_FILE) ---"
-    dc logs aurcache 2>&1 | tail -n 150
+    dump_build_log "${CURRENT_BUILD_ID:-}"
+    echo "--- aurcache service logs (tail; full unfiltered logs in $LOG_FILE) ---"
+    dc logs aurcache 2>&1 | filter_noise | tail -n 60
     echo "--- builder (worker) logs (tail) ---"
-    dc logs builder 2>&1 | tail -n 150
+    dc logs builder 2>&1 | filter_noise | tail -n 60
+    echo "--- hint: re-run with VERBOSE=1 for unfiltered logs, CLEANUP=0 to keep containers ---"
 }
 
 cleanup() {
@@ -80,27 +149,33 @@ cleanup() {
 
 wait_for_service() {
     log "=== Waiting for AURCache API to be ready ==="
+    local started; started=$(date +%s)
     for i in $(seq 1 60); do
         if aurcache_cli health > /dev/null 2>&1; then
-            echo "    AURCache is ready"
+            echo "    AURCache is ready (after $(($(date +%s) - started))s)"
             return 0
         fi
-        [ "$i" -eq 60 ] && return 1
+        # A crashed server (bad image, port clash, migration failure) will never
+        # become ready; say so now instead of after the full 120s.
+        assert_services_alive
+        [ "$i" -eq 60 ] && { log "ERROR: AURCache API not ready after 120s"; return 1; }
         sleep 2
     done
 }
 
 wait_for_worker() {
     log "=== Waiting for a worker to enroll and be approved ==="
+    local started; started=$(date +%s)
     # OAuth is disabled in this setup, so /api/workers is readable without auth.
     for i in $(seq 1 60); do
         local approved
         approved=$(curl -fsS "http://localhost:$AURCACHE_PORT/api/workers" 2>/dev/null \
             | jq -r '[.[] | select(.status == "approved")] | length' 2>/dev/null || echo 0)
         if [ "${approved:-0}" -ge 1 ]; then
-            echo "    Worker approved and connected"
+            echo "    Worker approved and connected (after $(($(date +%s) - started))s)"
             return 0
         fi
+        assert_services_alive
         [ "$i" -eq 60 ] && { log "ERROR: no worker approved in time"; return 1; }
         sleep 2
     done
@@ -123,20 +198,24 @@ build_and_start() {
 
 request_package() {
     log "=== Adding package: $PACKAGE ==="
-    if ! aurcache_cli pkg add aur "$PACKAGE" --platform x86_64; then
+    # `pkg add` takes package names positionally and auto-detects git URLs; the
+    # old `add aur <name>` / `add git <url>` subcommands are gone. Passing `aur`
+    # here made it the *first package name*, so the run died trying to add a
+    # nonexistent AUR package called "aur".
+    if ! aurcache_cli pkg add "$PACKAGE" --platform x86_64; then
         echo "ERROR: Package request failed"
         dump_logs_on_failure
         exit 1
     fi
 
     log "=== Waiting for build to complete (timeout: ${BUILD_TIMEOUT}s) ==="
-    local start_time
+    local start_time prev_status="" reached_active=0
     start_time=$(date +%s)
     while true; do
         local elapsed
         elapsed=$(($(date +%s) - start_time))
         if [ "$elapsed" -gt "$BUILD_TIMEOUT" ]; then
-            log "ERROR: Build timed out after ${BUILD_TIMEOUT}s"
+            log "ERROR: Build timed out after ${BUILD_TIMEOUT}s (last status: $(status_name "$prev_status"))"
             dump_logs_on_failure
             exit 1
         fi
@@ -145,11 +224,33 @@ request_package() {
         status=$(aurcache_cli --format json pkg list --limit 100 \
             | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "")
 
-        log "    Build status: ${status:-<none>} (elapsed: ${elapsed}s)"
+        # Track the build id so failures can dump AURCache's own build log.
+        CURRENT_BUILD_ID=$(aurcache_cli --format json builds list --limit 20 2>/dev/null \
+            | jq -r "[.[] | select(.pkg_name == \"$PACKAGE\")] | max_by(.id) | .id // empty" 2>/dev/null || echo "")
+
+        # Only speak when something changes: this loop polls every 5s and used
+        # to print an identical line each time, burying real events.
+        if [ "$status" != "$prev_status" ]; then
+            log "    Build status: $(status_name "$status") (elapsed: ${elapsed}s)"
+            [ "$status" = "0" ] && reached_active=1
+
+            # A build that goes back to enqueued after being active was requeued,
+            # which means the worker's completion was refused. Without this the
+            # run just loops build->reject->rebuild until the timeout, showing
+            # nothing but a steady "enqueued".
+            if [ "$reached_active" = "1" ] && [ "$status" = "3" ]; then
+                log "ERROR: build was requeued after running - the server rejected the worker's completion"
+                log "       (this loops forever; failing now rather than at the ${BUILD_TIMEOUT}s timeout)"
+                dump_logs_on_failure
+                exit 1
+            fi
+            prev_status="$status"
+        fi
+
         case "$status" in
-            1)  log "    Build completed successfully"; break ;;
+            1)  log "    Build completed successfully (in ${elapsed}s)"; break ;;
             2)  log "ERROR: Build failed"; dump_logs_on_failure; exit 1 ;;
-            *)  sleep 5 ;;
+            *)  assert_services_alive; sleep 5 ;;
         esac
     done
 }
@@ -166,10 +267,14 @@ validate() {
         --network "$net" \
         archlinux:latest \
         sh -e -c '
+            # `\$arch` must reach pacman.conf literally for pacman to expand it
+            # to the repo`s arch subdirectory. The heredoc delimiter is unquoted,
+            # so an unescaped $arch would be eaten by this shell and leave
+            # `Server = http://aurcache:8081/`, which has no repo.db.
             cat >> /etc/pacman.conf << EOF
 [repo]
 SigLevel = Optional TrustAll
-Server = http://aurcache:8081/$arch
+Server = http://aurcache:8081/\$arch
 EOF
             (
                 pacman-key --init
@@ -190,8 +295,13 @@ EOF
 
 trap cleanup EXIT
 
+RUN_STARTED=$(date +%s)
+
+preflight
 build_and_start
 wait_for_service   || { dump_logs_on_failure; exit 1; }
 wait_for_worker    || { dump_logs_on_failure; exit 1; }
 request_package
 validate
+
+log "=== Total runtime: $(($(date +%s) - RUN_STARTED))s ==="

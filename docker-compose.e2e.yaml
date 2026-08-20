@@ -19,7 +19,10 @@ services:
       - "${AURCACHE_MIRROR_PORT:-8081}:8081"   # Pacman repo (plain HTTP)
       - "${AURCACHE_WORKER_PORT:-8083}:8083"   # Worker protocol (HTTPS + mTLS)
     environment:
-      - LOG_LEVEL=debug
+      # Debug for our own crates only. A bare `debug` turns on hyper/h2/rustls
+      # too, which emit a line per protocol frame and bury the few lines that
+      # actually explain a failure.
+      - LOG_LEVEL=info,aurcache=debug,aurcache_api=debug,aurcache_utils=debug,aurcache_db=debug
       # The worker dials `aurcache` on the compose network; the server's TLS
       # cert must be valid for that name (plus localhost for host-side probing).
       - AURCACHE_TLS_SANS=aurcache,localhost
@@ -43,7 +46,9 @@ services:
     depends_on:
       - aurcache
     environment:
-      - RUST_LOG=debug
+      # See the note on the server's LOG_LEVEL: scope debug to our own crates so
+      # the build output stays readable.
+      - RUST_LOG=info,aurcache_worker=debug
       - AURCACHE_URL=https://aurcache:8083
       - AURCACHE_ENROLLMENT_DIR=/enroll
       - WORKER_CONCURRENCY=2
