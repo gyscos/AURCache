@@ -1,6 +1,7 @@
 mod client;
 mod deps;
 mod model;
+pub mod paths;
 mod repo;
 
 pub use client::AurClient;

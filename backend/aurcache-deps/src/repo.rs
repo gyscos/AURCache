@@ -19,26 +19,26 @@ pub(crate) fn default_repo_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("./repo"))
 }
 
+/// Mirrorlist used to locate official repo databases.
+///
+/// Official repo DBs are fetched for `x86_64` only today (see
+/// [`official_repo_db_url`], which substitutes `$arch` with `x86_64`), so this
+/// asks for that architecture explicitly rather than guessing the host's.
+/// `OFFICIAL_MIRRORLIST_PATH` still overrides it outright.
+///
+/// This resolves through [`crate::paths`] so it cannot drift from where the
+/// mirrorlist is actually written — it previously defaulted to
+/// `./config/pacman_x86_64/mirrorlist`, a path nothing ever wrote, which made
+/// dependency resolution fail for every package that had dependencies.
 pub(crate) fn default_official_mirrorlist_path() -> PathBuf {
     if let Ok(path) = std::env::var("OFFICIAL_MIRRORLIST_PATH") {
         return PathBuf::from(path);
     }
-
-    let base = std::env::var("MIRRORLIST_PATH_X86_64")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./config/pacman_x86_64"));
-    base.join("mirrorlist")
+    crate::paths::mirrorlist_path("x86_64")
 }
 
 pub(crate) fn default_official_repo_cache_dir() -> PathBuf {
-    if let Ok(path) = std::env::var("OFFICIAL_REPO_CACHE_DIR") {
-        return PathBuf::from(path);
-    }
-
-    default_official_mirrorlist_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("official_repo_cache")
+    crate::paths::official_repo_cache_dir()
 }
 
 impl AurClient {
@@ -48,8 +48,8 @@ impl AurClient {
         }
 
         let mut archives = Vec::new();
-        for entry in fs::read_dir(&self.repo_root).map_err(|e| Error::Rpc(e.to_string()))? {
-            let entry = entry.map_err(|e| Error::Rpc(e.to_string()))?;
+        for entry in fs::read_dir(&self.repo_root)? {
+            let entry = entry?;
             archives.push(entry.path().join("repo.db.tar.gz"));
         }
 
@@ -69,7 +69,7 @@ impl AurClient {
     }
 
     async fn refresh_official_repo_cache_if_needed(&self) -> Result<(), Error> {
-        fs::create_dir_all(&self.official_repo_cache_dir).map_err(|e| Error::Rpc(e.to_string()))?;
+        fs::create_dir_all(&self.official_repo_cache_dir)?;
         let mirrors = mirror_servers(&self.official_mirrorlist_path)?;
         if mirrors.is_empty() {
             return Err(Error::Rpc(
@@ -130,7 +130,7 @@ impl AurClient {
             .bytes()
             .await
             .map_err(Error::Http)?;
-        fs::write(archive_path, bytes).map_err(|e| Error::Rpc(e.to_string()))?;
+        fs::write(archive_path, bytes)?;
         Ok(())
     }
 }
@@ -139,9 +139,9 @@ fn cache_is_stale(path: &Path) -> Result<bool, Error> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(err) => return Err(Error::Rpc(err.to_string())),
+        Err(err) => return Err(err.into()),
     };
-    let modified = metadata.modified().map_err(|e| Error::Rpc(e.to_string()))?;
+    let modified = metadata.modified()?;
     let age = SystemTime::now()
         .duration_since(modified)
         .map_err(|e| Error::Rpc(e.to_string()))?;
@@ -149,7 +149,7 @@ fn cache_is_stale(path: &Path) -> Result<bool, Error> {
 }
 
 fn mirror_servers(path: &Path) -> Result<Vec<String>, Error> {
-    let content = fs::read_to_string(path).map_err(|e| Error::Rpc(e.to_string()))?;
+    let content = fs::read_to_string(path)?;
     Ok(content
         .lines()
         .map(str::trim)
@@ -164,7 +164,7 @@ fn official_repo_db_url(mirror: &str, repo_name: &str) -> Result<Url, Error> {
         .replace("$repo", repo_name)
         .replace("$arch", "x86_64");
     let separator = if base.ends_with('/') { "" } else { "/" };
-    Url::parse(&format!("{base}{separator}{repo_name}.db")).map_err(|e| Error::Rpc(e.to_string()))
+    Ok(Url::parse(&format!("{base}{separator}{repo_name}.db"))?)
 }
 
 fn cache_file_name(repo_name: &str) -> String {
@@ -188,17 +188,21 @@ fn any_archive_provides(
     Ok(false)
 }
 
+/// Wrap a repo-database decoding failure, keeping the original as the source.
+fn repo_db_error(e: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Error::RepoDb(Box::new(e))
+}
+
 fn repo_archive_provides(archive_path: &Path, dep_name: &str) -> Result<bool, Error> {
-    let mut reader =
-        TarballReader::try_from(archive_path).map_err(|e| Error::Rpc(e.to_string()))?;
-    for entry in reader.entries().map_err(|e| Error::Rpc(e.to_string()))? {
-        let mut entry = entry.map_err(|e| Error::Rpc(e.to_string()))?;
+    let mut reader = TarballReader::try_from(archive_path).map_err(repo_db_error)?;
+    for entry in reader.entries().map_err(repo_db_error)? {
+        let mut entry = entry.map_err(repo_db_error)?;
         if entry.path().file_name().and_then(|name| name.to_str()) != Some("desc") {
             continue;
         }
 
-        let content = String::from_utf8(entry.content().map_err(|e| Error::Rpc(e.to_string()))?)
-            .map_err(|e| Error::Rpc(e.to_string()))?;
+        let content =
+            String::from_utf8(entry.content().map_err(repo_db_error)?).map_err(repo_db_error)?;
         if desc_matches_dependency(&content, dep_name) {
             return Ok(true);
         }

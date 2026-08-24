@@ -2,17 +2,17 @@ use crate::settings::general::SettingsTraits;
 use aurcache_types::settings::{ApplicationSettings, Setting};
 use sea_orm::DatabaseConnection;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Canonical directory AURCache stores/serves the pacman `mirrorlist` from.
+/// Canonical mirrorlist locations, re-exported from `aurcache-deps`.
 ///
-/// Single source of truth shared by the mirrorlist writers (startup mirrorlist
-/// bootstrap, the mirror-ranking scheduler) and the worker job-config endpoint
-/// that serves it. Overridable via `AURCACHE_MIRRORLIST_DIR` (default `./repo`).
-#[must_use]
-pub fn mirrorlist_dir() -> PathBuf {
-    PathBuf::from(std::env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()))
-}
+/// They are defined there rather than here because `aurcache-db`'s
+/// dependency-backfill migration builds an `AurClient`, so `aurcache-deps`
+/// cannot depend on this crate. Re-exporting keeps one import path for
+/// everyone else.
+pub use aurcache_deps::paths::{
+    mirrorlist_dir, mirrorlist_file_name, mirrorlist_path, native_arch, shared_mirrorlist_path,
+};
 
 /// Build the makepkg.conf for a build.
 ///
@@ -104,19 +104,15 @@ pub async fn create_pacman_config(
 
 /// Resolve the mirrorlist content AURCache holds for a given architecture.
 ///
-/// Only `x86_64` is populated today (by the mirror-ranking scheduler job). Other
-/// architectures return `None`, in which case a worker falls back to its image's
-/// built-in mirrorlist. This is forward-ready: once AURCache stores a per-arch
-/// mirrorlist, this function simply returns `Some` for that arch with no change
-/// to callers or the worker protocol.
+/// Reads `mirrorlist_dir/mirrorlist.<arch>`; a missing or empty file yields
+/// `None` (the worker then falls back to its image's built-in mirrorlist),
+/// never an error.
 ///
-/// Reads from `mirrorlist_dir/mirrorlist`; a missing file yields `None`
-/// (graceful fallback), never an error.
+/// No architecture is special-cased: an arch is supported exactly when its file
+/// exists. Only `x86_64` is written today, so every other arch returns `None` on
+/// its own, and adding one later needs no change here.
 pub async fn mirrorlist_for(arch: &str, mirrorlist_dir: &Path) -> Option<String> {
-    if arch != "x86_64" {
-        return None;
-    }
-    let path = mirrorlist_dir.join("mirrorlist");
+    let path = mirrorlist_dir.join(mirrorlist_file_name(arch));
     match tokio::fs::read_to_string(&path).await {
         Ok(content) if !content.trim().is_empty() => Some(content),
         _ => None,
@@ -162,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirrorlist_for_non_x86_is_none() {
+    async fn mirrorlist_for_unpopulated_arch_is_none() {
         let dir = std::env::temp_dir();
         assert!(mirrorlist_for("aarch64", &dir).await.is_none());
     }
@@ -173,11 +169,28 @@ mod tests {
         assert!(mirrorlist_for("x86_64", dir.path()).await.is_none());
     }
 
+    /// The layout must be genuinely arch-keyed, not x86_64 with extra steps:
+    /// writing another arch's file is all it should take to support it.
+    #[tokio::test]
+    async fn mirrorlist_for_reads_any_populated_arch() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("mirrorlist.aarch64"),
+            "Server = https://arm.example/$repo/os/$arch\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(mirrorlist_for("aarch64", dir.path()).await.is_some());
+        // ...and it must not leak across architectures.
+        assert!(mirrorlist_for("x86_64", dir.path()).await.is_none());
+    }
+
     #[tokio::test]
     async fn mirrorlist_for_reads_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(
-            dir.path().join("mirrorlist"),
+            dir.path().join("mirrorlist.x86_64"),
             "Server = https://mirror/$repo/os/$arch\n",
         )
         .await
