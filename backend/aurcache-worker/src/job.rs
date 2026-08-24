@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use aurcache_types::worker::{CompleteReport, JobDescriptor};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -18,6 +18,7 @@ use crate::cache::Cache;
 use crate::chroot;
 use crate::client::WorkerClient;
 use crate::config::Config;
+use crate::credentials;
 
 /// Run one job to completion and return its terminal report.
 ///
@@ -93,11 +94,25 @@ async fn run_job_inner(
     let _ = std::fs::remove_dir_all(workdir);
     let pkgdir = build::extract_source(&source, workdir).context("extracting source")?;
 
-    // 2. Write per-package configs + ensure base chroot.
+    // 2. Stage build credentials, then write per-package configs + ensure base
+    //    chroot. The key is read now rather than at worker start, so replacing
+    //    it on the host takes effect on the next build without a restart.
+    let secrets_dir = workdir.join("secrets");
+    let git_ssh_command =
+        credentials::stage_for_job(cfg, &secrets_dir).context("staging build credentials")?;
+    if git_ssh_command.is_some() {
+        log(
+            client,
+            build_id,
+            "[worker] build ssh credential available\n",
+        )
+        .await;
+    }
+
     let cfg_dir = workdir.join("config");
     let (makepkg_conf, pacman_conf) = chroot::write_configs(
         &cfg_dir,
-        &job.makepkg_conf,
+        &credentials::augment_makepkg_conf(&job.makepkg_conf, git_ssh_command.as_deref()),
         &job.pacman_conf,
         job.mirrorlist.as_deref(),
     )
@@ -121,7 +136,22 @@ async fn run_job_inner(
 
     // 4. Build under a resource-limited scope, honoring cancel.
     log(client, build_id, "[worker] starting build\n").await;
-    let report = run_build(cfg, client, job, &pkgdir, &cache, cancel).await?;
+    let secrets_bind = git_ssh_command.is_some().then(|| {
+        (
+            secrets_dir.clone(),
+            PathBuf::from(credentials::CHROOT_SECRETS_DIR),
+        )
+    });
+    let report = run_build(
+        cfg,
+        client,
+        job,
+        &pkgdir,
+        &cache,
+        secrets_bind.as_ref(),
+        cancel,
+    )
+    .await?;
 
     // 5. Upload artifacts on success. (The workspace is cleaned by `run_job`
     // on every exit path, including the `?` above.)
@@ -141,14 +171,19 @@ async fn run_build(
     job: &JobDescriptor,
     pkgdir: &Path,
     cache: &Cache,
+    secrets_bind: Option<&(PathBuf, PathBuf)>,
     cancel: &AtomicBool,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let srcdest = cache.srcdest(&job.pkgbase);
+    // Operator-configured mounts first, then the per-job secrets mount.
+    let mut binds = cfg.bind_mounts.clone();
+    binds.extend(secrets_bind.cloned());
     let argv = build::build_command(
         &cfg.chroot_dir,
         &format!("job-{build_id}"),
         srcdest.as_deref(),
+        &binds,
         &job.build_flags,
     );
 

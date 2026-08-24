@@ -74,7 +74,11 @@ pub async fn ensure_base_chroot(
         .arg("-M")
         .arg(makepkg_conf)
         .arg(&root)
-        .arg("base-devel");
+        .arg("base-devel")
+        // git+ssh sources are fetched by makepkg *inside* the chroot, and
+        // base-devel carries neither git nor an ssh client.
+        .arg("git")
+        .arg("openssh");
     let (log, status) = run_capture(cmd).await?;
     if !status.success() {
         bail!("mkarchroot failed:\n{log}");

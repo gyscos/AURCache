@@ -140,6 +140,7 @@ pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
     srcdest: Option<&Path>,
+    binds: &[(PathBuf, PathBuf)],
     build_flags: &[String],
 ) -> Vec<String> {
     let mut argv = vec![
@@ -153,6 +154,11 @@ pub fn build_command(
     if let Some(src) = srcdest {
         argv.push("-d".to_string());
         argv.push(format!("{}:/srcdest", src.display()));
+    }
+    // Credentials and any operator-configured extras, exposed the same way.
+    for (host, chroot) in binds {
+        argv.push("-d".to_string());
+        argv.push(format!("{}:{}", host.display(), chroot.display()));
     }
     // Separator, then makepkg args (if any).
     if !build_flags.is_empty() {
@@ -277,6 +283,7 @@ mod tests {
             Path::new("/chroot"),
             "job-42",
             Some(Path::new("/cache/src")),
+            &[],
             &["--nocheck".to_string()],
         );
         let joined = cmd.join(" ");
@@ -290,9 +297,34 @@ mod tests {
 
     #[test]
     fn build_command_without_srcdest() {
-        let cmd = build_command(Path::new("/chroot"), "job-1", None, &[]);
+        let cmd = build_command(Path::new("/chroot"), "job-1", None, &[], &[]);
         assert_eq!(cmd[0], "makechrootpkg");
         assert!(!cmd.iter().any(|a| a == "-d"));
+        assert!(!cmd.iter().any(|a| a == "--"));
+    }
+
+    /// Credentials reach the build as an extra bind mount, alongside SRCDEST.
+    #[test]
+    fn build_command_adds_bind_mounts() {
+        let binds = vec![
+            (
+                PathBuf::from("/job/secrets"),
+                PathBuf::from("/build-secrets"),
+            ),
+            (PathBuf::from("/host/netrc"), PathBuf::from("/etc/netrc")),
+        ];
+        let cmd = build_command(
+            Path::new("/chroot"),
+            "job-7",
+            Some(Path::new("/cache/src")),
+            &binds,
+            &[],
+        );
+        let joined = cmd.join(" ");
+        assert!(joined.contains("/cache/src:/srcdest"));
+        assert!(joined.contains("/job/secrets:/build-secrets"));
+        assert!(joined.contains("/host/netrc:/etc/netrc"));
+        // Bind mounts are not makepkg flags; no separator should appear.
         assert!(!cmd.iter().any(|a| a == "--"));
     }
 

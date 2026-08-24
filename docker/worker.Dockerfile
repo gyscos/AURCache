@@ -63,7 +63,7 @@ FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
-        base-devel devtools sudo git fakeroot \
+        base-devel devtools sudo git fakeroot openssh \
     && pacman-key --init \
     && pacman-key --populate \
     && systemd-machine-id-setup

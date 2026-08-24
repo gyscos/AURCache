@@ -9,6 +9,7 @@ pub mod cache;
 pub mod chroot;
 pub mod client;
 pub mod config;
+pub mod credentials;
 pub mod enroll;
 pub mod identity;
 pub mod job;
