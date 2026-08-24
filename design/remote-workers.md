@@ -284,7 +284,7 @@ main path.
 ## Server-side changes
 
 - **DB** (`db-schema`): new `workers` table
-  `(id, name, status[pending|approved|revoked], cert_fingerprint, cert_serial,
+  `(id, name, status[pending|approved|revoked], cert_fingerprint,
   signed_cert, not_after, native_arches, emulated_arches, last_seen, version)`;
   `builds` gains `worker_id` + `lease_expires_at` + `attempt_count` (bounded
   requeue budget). `lease_expires_at` (= `now + LEASE_TTL` on each heartbeat) is
