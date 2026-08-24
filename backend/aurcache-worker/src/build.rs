@@ -136,10 +136,14 @@ pub fn timeout_failure(secs: u64) -> CompleteReport {
 /// directory**, so the caller sets `cwd` to the desired destination (there is
 /// no `--pkgdest` flag on `makepkg`). Any `build_flags` are forwarded to
 /// `makepkg` after the `--` separator.
+///
+/// `binds` become `-d src:dest` arguments. devtools appends these *after* its
+/// own binds, so a bind here overrides one devtools made for the same target —
+/// which is how the per-job pacman cache replaces the shared one. There is no
+/// supported flag for that; `SRCDEST`, which does have one, uses it instead.
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
-    srcdest: Option<&Path>,
     binds: &[(PathBuf, PathBuf)],
     build_flags: &[String],
 ) -> Vec<String> {
@@ -151,11 +155,9 @@ pub fn build_command(
         "-l".to_string(),
         copy_label.to_string(),
     ];
-    if let Some(src) = srcdest {
-        argv.push("-d".to_string());
-        argv.push(format!("{}:/srcdest", src.display()));
-    }
-    // Credentials and any operator-configured extras, exposed the same way.
+    // `SRCDEST` is passed through the environment instead of a bind mount:
+    // devtools reads it directly and binds it itself, which avoids competing
+    // with its own `--bind=$SRCDEST:/srcdest`.
     for (host, chroot) in binds {
         argv.push("-d".to_string());
         argv.push(format!("{}:{}", host.display(), chroot.display()));
@@ -278,11 +280,10 @@ mod tests {
     }
 
     #[test]
-    fn build_command_includes_srcdest_and_flags() {
+    fn build_command_includes_flags() {
         let cmd = build_command(
             Path::new("/chroot"),
             "job-42",
-            Some(Path::new("/cache/src")),
             &[],
             &["--nocheck".to_string()],
         );
@@ -291,14 +292,15 @@ mod tests {
         assert!(!cmd.iter().any(|a| a == "systemd-run"));
         assert!(!cmd.iter().any(|a| a == "--pkgdest"));
         assert!(joined.contains("makechrootpkg -c -r /chroot -l job-42"));
-        assert!(joined.contains("/cache/src:/srcdest"));
         assert!(joined.contains("-- --nocheck"));
     }
 
+    /// `SRCDEST` travels in the environment, not as a bind: devtools binds it
+    /// itself, so adding one here would compete with devtools' own bind.
     #[test]
-    fn build_command_without_srcdest() {
-        let cmd = build_command(Path::new("/chroot"), "job-1", None, &[], &[]);
-        assert_eq!(cmd[0], "makechrootpkg");
+    fn build_command_does_not_bind_srcdest() {
+        let cmd = build_command(Path::new("/chroot"), "job-1", &[], &[]);
+        assert!(!cmd.join(" ").contains("/srcdest"));
         assert!(!cmd.iter().any(|a| a == "-d"));
         assert!(!cmd.iter().any(|a| a == "--"));
     }
@@ -313,15 +315,8 @@ mod tests {
             ),
             (PathBuf::from("/host/netrc"), PathBuf::from("/etc/netrc")),
         ];
-        let cmd = build_command(
-            Path::new("/chroot"),
-            "job-7",
-            Some(Path::new("/cache/src")),
-            &binds,
-            &[],
-        );
+        let cmd = build_command(Path::new("/chroot"), "job-7", &binds, &[]);
         let joined = cmd.join(" ");
-        assert!(joined.contains("/cache/src:/srcdest"));
         assert!(joined.contains("/job/secrets:/build-secrets"));
         assert!(joined.contains("/host/netrc:/etc/netrc"));
         // Bind mounts are not makepkg flags; no separator should appear.

@@ -65,7 +65,13 @@ async fn run_job_inner(
     workdir: &Path,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
-    let cache = Cache::new(&cfg.cache_dir, cfg.cache_max_size, cfg.cache_ttl);
+    let cache = Cache::new(
+        &cfg.cache_dir,
+        cfg.cache_max_size,
+        cfg.cache_ttl,
+        cfg.pkgcache_max_size,
+        cfg.pkgcache_ttl,
+    );
 
     // Opportunistic cache GC (never blocks the build). Pin every pkgbase that is
     // currently building — not just this job's — so a concurrent sibling's
@@ -97,10 +103,10 @@ async fn run_job_inner(
     // 2. Stage build credentials, then write per-package configs + ensure base
     //    chroot. The key is read now rather than at worker start, so replacing
     //    it on the host takes effect on the next build without a restart.
-    let secrets_dir = workdir.join("secrets");
-    let git_ssh_command =
+    let secrets_dir = credentials::secrets_dir(&cfg.data_dir);
+    let credential =
         credentials::stage_for_job(cfg, &secrets_dir).context("staging build credentials")?;
-    if git_ssh_command.is_some() {
+    if credential.is_some() {
         log(
             client,
             build_id,
@@ -112,9 +118,10 @@ async fn run_job_inner(
     let cfg_dir = workdir.join("config");
     let (makepkg_conf, pacman_conf) = chroot::write_configs(
         &cfg_dir,
-        &credentials::augment_makepkg_conf(&job.makepkg_conf, git_ssh_command.as_deref()),
+        &credentials::augment_makepkg_conf(&job.makepkg_conf, credential.as_ref()),
         &job.pacman_conf,
         job.mirrorlist.as_deref(),
+        cache.pacman_pkg().as_deref(),
     )
     .context("writing job configs")?;
 
@@ -136,24 +143,48 @@ async fn run_job_inner(
 
     // 4. Build under a resource-limited scope, honoring cancel.
     log(client, build_id, "[worker] starting build\n").await;
-    let secrets_bind = git_ssh_command.is_some().then(|| {
-        (
-            secrets_dir.clone(),
-            PathBuf::from(credentials::CHROOT_SECRETS_DIR),
-        )
-    });
-    let report = run_build(
-        cfg,
-        client,
-        job,
-        &pkgdir,
-        &cache,
-        secrets_bind.as_ref(),
-        cancel,
-    )
-    .await?;
+    // Private writable pacman cache for this job. Concurrent builds otherwise
+    // share one writable cache directory and race on the same partial
+    // download; the shared cache remains available read-only for hits.
+    let job_label = format!("job-{build_id}");
+    let pkg_cache_bind = cache
+        .pacman_pkg_job(&job_label)
+        .map(|dir| (dir, PathBuf::from(chroot::PER_JOB_CACHE_MOUNT)));
 
-    // 5. Upload artifacts on success. (The workspace is cleaned by `run_job`
+    // Operator-configured mounts, then this job's private pacman cache. Ours
+    // land last on the systemd-nspawn command line, which is what lets the
+    // per-job cache override arch-nspawn's own bind of the shared one.
+    //
+    // The build credential is deliberately *not* here. `makepkg` fetches
+    // sources on the worker before the chroot is entered, so the key is never
+    // needed inside it — and binding it in would hand it to whatever the
+    // PKGBUILD chooses to run there.
+    let mut binds = cfg.bind_mounts.clone();
+    binds.extend(pkg_cache_bind);
+
+    let report = run_build(cfg, client, job, &pkgdir, &cache, &binds, cancel).await?;
+
+    // 5. Fold this job's downloads into the shared cache, then bound it. Only
+    //    after `makechrootpkg` has exited: promoting mid-build would move
+    //    packages out from under the running pacman.
+    {
+        let cache = cache.clone();
+        let label = job_label.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let promoted = cache.promote_job_pkgs(&label);
+            cache.wipe_pacman_pkg_job(&label);
+            let evicted = cache.evict_pkgs();
+            if promoted > 0 || !evicted.is_empty() {
+                tracing::info!(
+                    "package cache: promoted {promoted}, evicted {}",
+                    evicted.len()
+                );
+            }
+        })
+        .await;
+    }
+
+    // 6. Upload artifacts on success. (The workspace is cleaned by `run_job`
     // on every exit path, including the `?` above.)
     if report.success {
         upload_artifacts(client, build_id, &pkgdir).await?;
@@ -171,25 +202,27 @@ async fn run_build(
     job: &JobDescriptor,
     pkgdir: &Path,
     cache: &Cache,
-    secrets_bind: Option<&(PathBuf, PathBuf)>,
+    binds: &[(PathBuf, PathBuf)],
     cancel: &AtomicBool,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let srcdest = cache.srcdest(&job.pkgbase);
-    // Operator-configured mounts first, then the per-job secrets mount.
-    let mut binds = cfg.bind_mounts.clone();
-    binds.extend(secrets_bind.cloned());
     let argv = build::build_command(
         &cfg.chroot_dir,
         &format!("job-{build_id}"),
-        srcdest.as_deref(),
-        &binds,
+        binds,
         &job.build_flags,
     );
 
+    tracing::debug!("$ sudo {}", argv.join(" "));
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
+        // devtools binds `$SRCDEST` into the chroot itself; without it set, it
+        // falls back to the PKGBUILD directory and nothing is cached.
+        if let Some(dir) = srcdest.as_deref() {
+            cmd.env("SRCDEST", dir);
+        }
         cmd.spawn()
     };
 

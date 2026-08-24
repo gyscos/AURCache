@@ -56,10 +56,21 @@ pub struct Config {
     pub build_timeout: u64,
     /// Keyserver for `gpg --recv-keys`.
     pub keyserver: String,
-    /// Cache eviction budget in bytes (`0` disables size-based eviction).
+    /// Source (`SRCDEST`) cache budget in bytes (`0` disables size-based
+    /// eviction).
     pub cache_max_size: u64,
     /// Cache entry TTL in seconds (`0` disables age-based eviction).
     pub cache_ttl: u64,
+    /// Shared pacman package cache budget in bytes (`0` disables size-based
+    /// eviction). Kept separate from the source budget: the two pools have
+    /// very different sizes and refill costs, and a shared budget would let
+    /// large VCS checkouts starve the package cache (or vice versa).
+    pub pkgcache_max_size: u64,
+    /// Package cache TTL in seconds. Defaults to `0` (disabled) because a
+    /// cached package's mtime is its *download* time — pacman does not touch
+    /// it on a cache hit — so age-evicting would discard a package used daily
+    /// simply for being old. Size pressure is the honest bound for this pool.
+    pub pkgcache_ttl: u64,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -135,6 +146,12 @@ impl Config {
 
         let name = env_opt("WORKER_NAME").unwrap_or_else(detect_hostname);
 
+        let (src_budget, pkg_budget) = split_cache_budgets(
+            env_opt("WORKER_CACHE_MAX_SIZE").and_then(parse_size),
+            env_opt("WORKER_SRCCACHE_MAX_SIZE").and_then(parse_size),
+            env_opt("WORKER_PKGCACHE_MAX_SIZE").and_then(parse_size),
+        );
+
         let data_dir = env_opt("WORKER_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/aurcache-worker"));
@@ -186,14 +203,37 @@ impl Config {
                 .unwrap_or(3 * 60 * 60),
             keyserver: env_opt("WORKER_KEYSERVER")
                 .unwrap_or_else(|| "hkps://keyserver.ubuntu.com".to_string()),
-            cache_max_size: env_opt("WORKER_CACHE_MAX_SIZE")
-                .and_then(parse_size)
-                .unwrap_or(20 * 1024 * 1024 * 1024),
+            cache_max_size: src_budget,
             cache_ttl: env_opt("WORKER_CACHE_TTL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30 * 24 * 60 * 60),
+            pkgcache_max_size: pkg_budget,
+            pkgcache_ttl: env_opt("WORKER_PKGCACHE_TTL")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
         }
     }
+}
+
+/// Total worker cache budget when nothing is configured.
+const DEFAULT_TOTAL_CACHE_SIZE: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Resolve the source and package cache budgets.
+///
+/// `WORKER_CACHE_MAX_SIZE` is the **total** disk the worker's caches may use,
+/// split evenly between sources and packages — one number is what most
+/// deployments actually want to think about, and the name reads as a total.
+///
+/// Either pool can be pinned with `WORKER_SRCCACHE_MAX_SIZE` /
+/// `WORKER_PKGCACHE_MAX_SIZE`, which also makes the split ratio configurable
+/// without a separate knob for it. A pinned pool wins outright: the total is a
+/// default for whatever is left unset, not a cap enforced over explicit values,
+/// because silently shrinking a number the operator wrote down is worse than
+/// exceeding one they did not.
+#[must_use]
+pub fn split_cache_budgets(total: Option<u64>, src: Option<u64>, pkg: Option<u64>) -> (u64, u64) {
+    let half = total.unwrap_or(DEFAULT_TOTAL_CACHE_SIZE) / 2;
+    (src.unwrap_or(half), pkg.unwrap_or(half))
 }
 
 /// Parse a human size like `20G`, `500M`, `1024` (bytes) into a byte count.
@@ -226,6 +266,35 @@ mod tests {
         assert_eq!(parse_arches("aarch64, armv7h"), vec!["aarch64", "armv7h"]);
         assert_eq!(parse_arches("a b,c  d"), vec!["a", "b", "c", "d"]);
         assert!(parse_arches("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn total_budget_is_split_evenly() {
+        assert_eq!(split_cache_budgets(Some(1000), None, None), (500, 500));
+    }
+
+    /// Pinning one pool must not silently redistribute the other: setting the
+    /// package budget should not change how much the source cache may use.
+    #[test]
+    fn a_pinned_pool_wins_and_leaves_the_other_alone() {
+        assert_eq!(split_cache_budgets(Some(1000), None, Some(900)), (500, 900));
+        assert_eq!(split_cache_budgets(Some(1000), Some(900), None), (900, 500));
+        assert_eq!(split_cache_budgets(Some(10), Some(1), Some(2)), (1, 2));
+    }
+
+    #[test]
+    fn defaults_split_the_default_total() {
+        let (src, pkg) = split_cache_budgets(None, None, None);
+        assert_eq!(src, pkg);
+        assert_eq!(src + pkg, DEFAULT_TOTAL_CACHE_SIZE);
+    }
+
+    /// `0` disables a budget, and must survive as `0` rather than being
+    /// mistaken for "unset" and replaced by a default.
+    #[test]
+    fn zero_disables_rather_than_defaulting() {
+        assert_eq!(split_cache_budgets(Some(1000), Some(0), None), (0, 500));
+        assert_eq!(split_cache_budgets(Some(0), None, None), (0, 0));
     }
 
     #[test]

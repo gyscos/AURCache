@@ -17,6 +17,8 @@ pub struct Cache {
     root: PathBuf,
     max_size: u64,
     ttl: Duration,
+    pkg_max_size: u64,
+    pkg_ttl: Duration,
 }
 
 /// A per-pkgbase source cache entry considered for eviction.
@@ -28,11 +30,19 @@ pub struct CacheEntry {
 }
 
 impl Cache {
-    pub fn new(root: &Path, max_size: u64, ttl_secs: u64) -> Self {
+    pub fn new(
+        root: &Path,
+        max_size: u64,
+        ttl_secs: u64,
+        pkg_max_size: u64,
+        pkg_ttl_secs: u64,
+    ) -> Self {
         Self {
             root: root.to_path_buf(),
             max_size,
             ttl: Duration::from_secs(ttl_secs),
+            pkg_max_size,
+            pkg_ttl: Duration::from_secs(pkg_ttl_secs),
         }
     }
 
@@ -47,9 +57,99 @@ impl Cache {
         Self::ensured(self.root.join("gnupg"))
     }
 
-    /// Shared pacman package cache (bind-mounted into the chroot copy).
+    /// Shared pacman package cache, bound **read-only** into every chroot as
+    /// the second `CacheDir`, so builds get hits without being able to write.
     pub fn pacman_pkg(&self) -> Option<PathBuf> {
         Self::ensured(self.root.join("pacman-pkg"))
+    }
+
+    /// Private writable pacman cache for one job, bound over
+    /// `/var/cache/pacman/pkg` so downloads cannot collide.
+    ///
+    /// Concurrent builds otherwise share one writable cache — `arch-nspawn`
+    /// bind-mounts the host's first `CacheDir` read-write into every chroot —
+    /// and two jobs downloading the same dependency race on the same
+    /// `<pkg>.part` file, leaving a corrupt archive behind.
+    pub fn pacman_pkg_job(&self, label: &str) -> Option<PathBuf> {
+        Self::ensured(self.root.join(format!("pacman-pkg-{label}")))
+    }
+
+    /// Discard a job's private pacman cache once its packages are promoted.
+    pub fn wipe_pacman_pkg_job(&self, label: &str) {
+        let path = self.root.join(format!("pacman-pkg-{label}"));
+        if let Err(e) = std::fs::remove_dir_all(&path)
+            && path.exists()
+        {
+            tracing::warn!("could not wipe job pkg cache {}: {e}", path.display());
+        }
+    }
+
+    /// Move a job's freshly downloaded packages into the shared cache so the
+    /// next build gets them as hits.
+    ///
+    /// `rename` within one filesystem is atomic, so a concurrent build reading
+    /// the shared cache sees either the old file or the complete new one, never
+    /// a partial write — which is the whole failure this design exists to
+    /// avoid. Both directories live under the cache root, so the same-filesystem
+    /// requirement holds.
+    ///
+    /// Runs only after `makechrootpkg` has exited. Promoting mid-build would
+    /// move a package out from under the running pacman; a hard link would be
+    /// needed instead, and there is no reason to promote early.
+    pub fn promote_job_pkgs(&self, label: &str) -> usize {
+        let (Some(shared), Some(job)) = (self.pacman_pkg(), self.pacman_pkg_job(label)) else {
+            return 0;
+        };
+        let Ok(read) = std::fs::read_dir(&job) else {
+            return 0;
+        };
+        let mut promoted = 0;
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Only finished artifacts: `.part` files are interrupted downloads.
+            if !is_package_artifact(name) {
+                continue;
+            }
+            match std::fs::rename(entry.path(), shared.join(name)) {
+                Ok(()) => promoted += 1,
+                Err(e) => tracing::warn!("could not promote {name} to the shared cache: {e}"),
+            }
+        }
+        promoted
+    }
+
+    /// Evict shared-cache packages over the package budget.
+    ///
+    /// Deliberately a separate pool from `SRCDEST`: the two differ by orders of
+    /// magnitude in size and in refill cost, and one shared budget would let a
+    /// few large VCS checkouts starve the package cache — every build then
+    /// re-downloading its dependencies — or a big package cache evict sources
+    /// that are expensive to re-clone.
+    ///
+    /// No `in_use` set is needed. Unlinking a file another chroot has open is
+    /// safe on POSIX: the reader keeps its descriptor, and the worst case is a
+    /// re-download.
+    pub fn evict_pkgs(&self) -> Vec<String> {
+        let Some(dir) = self.pacman_pkg() else {
+            return Vec::new();
+        };
+        let entries = scan_pkgcache(&dir);
+        let plan = plan_eviction(
+            &entries,
+            self.pkg_max_size,
+            self.pkg_ttl,
+            SystemTime::now(),
+            &[],
+        );
+        for name in &plan {
+            if let Err(e) = std::fs::remove_file(dir.join(name)) {
+                tracing::warn!("could not evict cached package {name}: {e}");
+            }
+            // Detached signatures follow their package.
+            let _ = std::fs::remove_file(dir.join(format!("{name}.sig")));
+        }
+        plan
     }
 
     fn ensured(path: PathBuf) -> Option<PathBuf> {
@@ -112,6 +212,36 @@ impl Cache {
         }
         entries
     }
+}
+
+/// True for a finished package archive (not an in-flight `.part` download,
+/// and not a detached signature, which is evicted with its package).
+fn is_package_artifact(name: &str) -> bool {
+    name.contains(".pkg.tar") && !name.ends_with(".part") && !name.ends_with(".sig")
+}
+
+/// One cache entry per package file. `last_used` is the file's mtime, which for
+/// a package is its *download* time — pacman does not touch it on a cache hit.
+/// That is why the package pool defaults to size-bounded only: age would evict
+/// a package used daily just for having been fetched a while ago.
+fn scan_pkgcache(dir: &Path) -> Vec<CacheEntry> {
+    let mut entries = Vec::new();
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return entries;
+    };
+    for ent in read.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if !is_package_artifact(&name) {
+            continue;
+        }
+        let Ok(md) = ent.metadata() else { continue };
+        entries.push(CacheEntry {
+            pkgbase: name,
+            size: md.len(),
+            last_used: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+    entries
 }
 
 /// Recursively compute a directory's size in bytes (best-effort).
@@ -273,5 +403,94 @@ mod tests {
         assert_eq!(sanitize("ttf-google-fonts-git"), "ttf-google-fonts-git");
         assert_eq!(sanitize("../etc/passwd"), ".._etc_passwd");
         assert_eq!(sanitize("a/b"), "a_b");
+    }
+}
+
+#[cfg(test)]
+mod pkgcache_tests {
+    use super::*;
+
+    fn cache(dir: &Path, pkg_max: u64) -> Cache {
+        Cache::new(dir, 0, 0, pkg_max, 0)
+    }
+
+    fn write(path: &Path, bytes: usize) {
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn only_finished_archives_are_promoted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let job = c.pacman_pkg_job("job-1").unwrap();
+        write(&job.join("foo-1.0-1-x86_64.pkg.tar.zst"), 10);
+        // An interrupted download must not be published as a real package.
+        write(&job.join("bar-2.0-1-x86_64.pkg.tar.zst.part"), 10);
+
+        assert_eq!(c.promote_job_pkgs("job-1"), 1);
+        let shared = c.pacman_pkg().unwrap();
+        assert!(shared.join("foo-1.0-1-x86_64.pkg.tar.zst").exists());
+        assert!(!shared.join("bar-2.0-1-x86_64.pkg.tar.zst.part").exists());
+        // The partial stays behind and goes with the job directory.
+        assert!(job.join("bar-2.0-1-x86_64.pkg.tar.zst.part").exists());
+    }
+
+    /// Two jobs downloading the same dependency both promote it. The second
+    /// overwrites the first with identical content; `rename` makes that atomic,
+    /// so no reader can observe a half-written file.
+    #[test]
+    fn promoting_the_same_package_twice_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        for label in ["job-1", "job-2"] {
+            let job = c.pacman_pkg_job(label).unwrap();
+            write(&job.join("cmake-1.0-1-x86_64.pkg.tar.zst"), 10);
+            assert_eq!(c.promote_job_pkgs(label), 1);
+        }
+        assert!(
+            c.pacman_pkg()
+                .unwrap()
+                .join("cmake-1.0-1-x86_64.pkg.tar.zst")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn evicts_packages_over_the_package_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 150);
+        let shared = c.pacman_pkg().unwrap();
+        write(&shared.join("a-1.0-1-x86_64.pkg.tar.zst"), 100);
+        write(&shared.join("b-1.0-1-x86_64.pkg.tar.zst"), 100);
+
+        let evicted = c.evict_pkgs();
+        assert_eq!(evicted.len(), 1, "one package should be dropped");
+    }
+
+    /// The package budget is separate from the source budget on purpose: a
+    /// shared one lets large VCS checkouts starve the package cache.
+    #[test]
+    fn source_budget_does_not_evict_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Source budget of 1 byte, package budget generous.
+        let c = Cache::new(tmp.path(), 1, 0, 10_000, 0);
+        let shared = c.pacman_pkg().unwrap();
+        write(&shared.join("a-1.0-1-x86_64.pkg.tar.zst"), 100);
+
+        assert!(c.evict_pkgs().is_empty());
+        assert!(shared.join("a-1.0-1-x86_64.pkg.tar.zst").exists());
+    }
+
+    #[test]
+    fn signatures_follow_their_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 1);
+        let shared = c.pacman_pkg().unwrap();
+        write(&shared.join("a-1.0-1-x86_64.pkg.tar.zst"), 100);
+        write(&shared.join("a-1.0-1-x86_64.pkg.tar.zst.sig"), 10);
+
+        c.evict_pkgs();
+        assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst").exists());
+        assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst.sig").exists());
     }
 }

@@ -27,28 +27,30 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .await
         .context("preparing base chroot")?;
 
-    let cache = Cache::new(&cfg.cache_dir, cfg.cache_max_size, cfg.cache_ttl);
+    let cache = Cache::new(
+        &cfg.cache_dir,
+        cfg.cache_max_size,
+        cfg.cache_ttl,
+        cfg.pkgcache_max_size,
+        cfg.pkgcache_ttl,
+    );
     let pkgbase = pkgdir
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("local");
     let srcdest = cache.srcdest(pkgbase);
 
-    let argv = build::build_command(
-        &cfg.chroot_dir,
-        "build-once",
-        srcdest.as_deref(),
-        &cfg.bind_mounts,
-        flags,
-    );
+    let argv = build::build_command(&cfg.chroot_dir, "build-once", &cfg.bind_mounts, flags);
     tracing::info!("$ sudo {}", argv.join(" "));
 
-    let status = chroot::devtools(&argv[0])
-        .args(&argv[1..])
-        .current_dir(&pkgdir)
-        .status()
-        .await
-        .context("running build")?;
+    let mut cmd = chroot::devtools(&argv[0]);
+    cmd.args(&argv[1..]).current_dir(&pkgdir);
+    // devtools binds `$SRCDEST` itself; unset, it falls back to the PKGBUILD
+    // directory and downloads are not cached between runs.
+    if let Some(dir) = srcdest.as_deref() {
+        cmd.env("SRCDEST", dir);
+    }
+    let status = cmd.status().await.context("running build")?;
 
     let report = build::classify_exit(status, false);
     if report.success {

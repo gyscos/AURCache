@@ -34,7 +34,10 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 /// so preserving them here would be a no-op.
 pub fn devtools(program: &str) -> Command {
     let mut cmd = Command::new("sudo");
-    cmd.arg("--preserve-env=GNUPGHOME").arg(program);
+    // `SRCDEST` is how `makechrootpkg` is told where to keep downloaded
+    // sources; sudo would otherwise strip it and devtools would silently fall
+    // back to the PKGBUILD directory, losing the cache.
+    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST").arg(program);
     cmd
 }
 
@@ -157,11 +160,49 @@ fn merge_makepkg_conf(system_defaults: Option<&str>, overrides: &str) -> String 
 
 /// Write the per-package `makepkg.conf` / `pacman.conf` / mirrorlist to a
 /// staging directory the caller seeds the base chroot from.
+/// Append the worker's cache layout to a server-rendered `pacman.conf`.
+///
+/// `arch-nspawn` reads `CacheDir` from the chroot's own `pacman.conf` and
+/// bind-mounts the **first** entry read-write into the container, the rest
+/// read-only. Listing a private job directory first and the shared cache second
+/// gives each build somewhere private to download to while still reading hits
+/// from the shared pool.
+///
+/// The first path is a fixed mount point rather than the real per-job
+/// directory: the build's `pacman.conf` is inherited from the base chroot and
+/// is therefore identical for every job, so the per-job part is supplied as a
+/// bind mount over that path instead (see `job.rs`).
+///
+/// Written worker-side rather than by the server because cache paths are
+/// worker-local — the same reasoning that keeps `GIT_SSH_COMMAND` out of the
+/// job descriptor.
+fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String {
+    let Some(shared) = shared_pkg_cache else {
+        return pacman_conf.to_string();
+    };
+    let mut out = pacman_conf.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("# Added by aurcache-worker: per-job writable cache first (bound over by\n");
+    out.push_str("# the job's private directory), shared read-only cache second.\n");
+    out.push_str(&format!(
+        "[options]\nCacheDir = {PER_JOB_CACHE_MOUNT} {}\n",
+        shared.display()
+    ));
+    out
+}
+
+/// Mount point a job's private pacman cache is bound over. Matches pacman's
+/// default so nothing else has to change.
+pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
+
 pub fn write_configs(
     dir: &Path,
     makepkg_conf: &str,
     pacman_conf: &str,
     mirrorlist: Option<&str>,
+    shared_pkg_cache: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
@@ -178,7 +219,8 @@ pub fn write_configs(
     let merged = merge_makepkg_conf(system_defaults.as_deref(), makepkg_conf);
 
     std::fs::write(&makepkg, merged).context("writing makepkg.conf")?;
-    std::fs::write(&pacman, pacman_conf).context("writing pacman.conf")?;
+    std::fs::write(&pacman, with_cache_dirs(pacman_conf, shared_pkg_cache))
+        .context("writing pacman.conf")?;
     if let Some(list) = mirrorlist {
         std::fs::write(dir.join("mirrorlist"), list).context("writing mirrorlist")?;
     }
