@@ -29,12 +29,41 @@ use tokio::process::Command;
 
 use crate::config::Config;
 
-/// Directory the per-job secrets bind-mount is exposed at inside the chroot.
-pub const CHROOT_SECRETS_DIR: &str = "/build-secrets";
+/// Directory the staged credential lives in — on the worker only.
+///
+/// `makechrootpkg` downloads sources **outside** the chroot: its
+/// `download_sources()` runs `makepkg --verifysource` as the build user on the
+/// worker, using the chroot's `makepkg.conf` but not its filesystem. So this is
+/// where the key must be readable, and deliberately the *only* place it is.
+///
+/// It is never bind-mounted into the chroot. Everything a PKGBUILD executes —
+/// `prepare`, `build`, `package` — runs in there, and a hostile or merely
+/// careless one could read and exfiltrate any credential within reach. Sources
+/// are already fetched by the time the chroot is entered, so exposing it there
+/// would buy nothing.
+///
+/// The path is stable across jobs: `GIT_SSH_COMMAND` is written into the *base*
+/// chroot's `makepkg.conf` when that chroot is created, and every later build
+/// reads a copy of it, so a per-job path would be stale for every job after the
+/// first.
+pub fn secrets_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("secrets")
+}
 /// Key filename within that directory.
 pub const KEY_FILE: &str = "id_ed25519";
 /// `known_hosts` filename within that directory.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
+
+/// A credential staged for a build: where the key ended up, and the
+/// `GIT_SSH_COMMAND` that uses it.
+///
+/// The path is kept alongside the command because `makepkg.conf` guards the
+/// export on that file being readable — see [`augment_makepkg_conf`].
+#[derive(Debug, Clone)]
+pub struct StagedCredential {
+    pub key: PathBuf,
+    pub git_ssh_command: String,
+}
 
 /// Which SSH key a build should use, and where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,17 +169,33 @@ pub fn git_ssh_command(key: &str, known_hosts: Option<&str>) -> String {
 /// `makepkg.conf` is sourced by `makepkg`, so an `export` here reaches `git`
 /// without `makechrootpkg` having to forward environment variables. Keeping it
 /// worker-side means credentials never enter the server's job configuration.
+///
+/// The export is **guarded on the key being readable**, because one file serves
+/// two environments: `download_sources()` runs on the worker, where the key
+/// exists, while the same `makepkg.conf` is also read inside the chroot, where
+/// it deliberately does not. Unguarded, an in-chroot git operation over SSH
+/// would be handed `-i <missing file> -o IdentitiesOnly=yes`, which both warns
+/// confusingly and suppresses every other identity it might have used. Guarded,
+/// the export simply does not apply in there and git behaves as if AURCache had
+/// never touched the config.
 #[must_use]
-pub fn augment_makepkg_conf(base: &str, git_ssh_command: Option<&str>) -> String {
-    let Some(cmd) = git_ssh_command else {
+pub fn augment_makepkg_conf(base: &str, credential: Option<&StagedCredential>) -> String {
+    let Some(cred) = credential else {
         return base.to_string();
     };
     let mut out = base.to_string();
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str("# Added by aurcache-worker: build credentials (see credentials.rs)\n");
-    out.push_str(&format!("export GIT_SSH_COMMAND=\"{cmd}\"\n"));
+    out.push_str("# Added by aurcache-worker: build credentials (see credentials.rs).\n");
+    out.push_str("# Guarded so ordinary git operations still work inside the chroot, where\n");
+    out.push_str("# the key deliberately is not present: the export applies on the worker\n");
+    out.push_str("# (which is where makepkg fetches sources) and nowhere else.\n");
+    out.push_str(&format!(
+        "if [ -r \"{}\" ]; then\n    export GIT_SSH_COMMAND=\"{}\"\nfi\n",
+        cred.key.display(),
+        cred.git_ssh_command
+    ));
     out
 }
 
@@ -184,8 +229,9 @@ pub fn parse_bind_mounts(raw: &str) -> Vec<(PathBuf, PathBuf)> {
 /// is the same user `makechrootpkg` runs `makepkg` as.
 ///
 /// Read at job time rather than worker start, so replacing the key on the host
-/// takes effect on the next build with no restart.
-pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<String>> {
+/// takes effect on the next build with no restart. The destination is shared by
+/// every job (see [`secrets_dir`]) and simply overwritten each time.
+pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<StagedCredential>> {
     let source = resolve(cfg);
     let key = source.path();
     if !key.exists() {
@@ -203,15 +249,15 @@ pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<String>> {
         Some(src) if src.exists() => {
             let staged = dir.join(KNOWN_HOSTS_FILE);
             std::fs::copy(src, &staged).context("copying known_hosts")?;
-            Some(format!("{CHROOT_SECRETS_DIR}/{KNOWN_HOSTS_FILE}"))
+            Some(staged.display().to_string())
         }
         _ => None,
     };
 
-    Ok(Some(git_ssh_command(
-        &format!("{CHROOT_SECRETS_DIR}/{KEY_FILE}"),
-        known_hosts.as_deref(),
-    )))
+    Ok(Some(StagedCredential {
+        git_ssh_command: git_ssh_command(&staged_key.display().to_string(), known_hosts.as_deref()),
+        key: staged_key,
+    }))
 }
 
 #[cfg(unix)]
@@ -274,13 +320,10 @@ mod tests {
 
     #[test]
     fn git_ssh_command_pins_the_key_and_host_policy() {
-        let with_hosts = git_ssh_command(
-            "/build-secrets/id_ed25519",
-            Some("/build-secrets/known_hosts"),
-        );
-        assert!(with_hosts.contains("-i /build-secrets/id_ed25519"));
+        let with_hosts = git_ssh_command("/staged/id_ed25519", Some("/staged/known_hosts"));
+        assert!(with_hosts.contains("-i /staged/id_ed25519"));
         assert!(with_hosts.contains("IdentitiesOnly=yes"));
-        assert!(with_hosts.contains("UserKnownHostsFile=/build-secrets/known_hosts"));
+        assert!(with_hosts.contains("UserKnownHostsFile=/staged/known_hosts"));
         // No known_hosts must not leave ssh prompting, which would hang a build.
         let without = git_ssh_command("/k", None);
         assert!(without.contains("StrictHostKeyChecking=accept-new"));
@@ -291,9 +334,34 @@ mod tests {
         let base = "PKGDEST=/output";
         assert_eq!(augment_makepkg_conf(base, None), base);
 
-        let augmented = augment_makepkg_conf(base, Some("ssh -i /k"));
+        let cred = StagedCredential {
+            key: PathBuf::from("/staged/id_ed25519"),
+            git_ssh_command: "ssh -i /staged/id_ed25519".to_string(),
+        };
+        let augmented = augment_makepkg_conf(base, Some(&cred));
         assert!(augmented.starts_with("PKGDEST=/output\n"));
-        assert!(augmented.contains("export GIT_SSH_COMMAND=\"ssh -i /k\""));
+        assert!(augmented.contains("export GIT_SSH_COMMAND=\"ssh -i /staged/id_ed25519\""));
+    }
+
+    /// The export must be guarded on the key being readable. The same
+    /// `makepkg.conf` is read on the worker (where the key is) and inside the
+    /// chroot (where it deliberately is not); unguarded, ordinary git
+    /// operations in a PKGBUILD would be handed a missing identity file plus
+    /// `IdentitiesOnly=yes`, which also suppresses any identity they did have.
+    #[test]
+    fn the_export_is_guarded_so_it_does_not_apply_in_the_chroot() {
+        let cred = StagedCredential {
+            key: PathBuf::from("/staged/id_ed25519"),
+            git_ssh_command: "ssh -i /staged/id_ed25519".to_string(),
+        };
+        let conf = augment_makepkg_conf("PKGDEST=/output", Some(&cred));
+
+        assert!(conf.contains("if [ -r \"/staged/id_ed25519\" ]; then"));
+        assert!(conf.trim_end().ends_with("fi"));
+        // The guard must wrap the export, not sit beside it.
+        let guard = conf.find("if [ -r").expect("guard present");
+        let export = conf.find("export GIT_SSH_COMMAND").expect("export present");
+        assert!(guard < export, "export must be inside the guard");
     }
 
     #[test]
@@ -326,12 +394,16 @@ mod tests {
             std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
 
-        let dest = tmp.path().join("job/secrets");
+        let dest = secrets_dir(tmp.path());
         let cfg = cfg_with(key.to_str(), tmp.path().to_str().unwrap());
-        let cmd = stage_for_job(&cfg, &dest).unwrap().expect("staged");
+        let cred = stage_for_job(&cfg, &dest).unwrap().expect("staged");
 
-        assert!(cmd.contains("/build-secrets/id_ed25519"));
+        // The command must name the staged path itself: `makechrootpkg`
+        // downloads sources outside the chroot, so a chroot-only path would be
+        // invisible exactly when the fetch happens.
         let staged = dest.join(KEY_FILE);
+        assert_eq!(cred.key, staged);
+        assert!(cred.git_ssh_command.contains(&staged.display().to_string()));
         assert_eq!(std::fs::read_to_string(&staged).unwrap(), "PRIVATE");
         #[cfg(unix)]
         {
