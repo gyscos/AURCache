@@ -33,6 +33,22 @@ pub struct RegisterRequest {
     /// auto-approved without an admin click.
     #[serde(default)]
     pub enrollment_token: Option<String>,
+    /// Exact pkgbase names this worker is specially provisioned for
+    /// (`WORKER_PACKAGES`). Reserves those packages to workers that name them.
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Scheduling preference, higher wins (`WORKER_PRIORITY`).
+    #[serde(default)]
+    pub priority: i32,
+    /// Maximum concurrent builds (`WORKER_CONCURRENCY`), so the server can tell
+    /// whether this worker still has capacity.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
+}
+
+/// A worker that does not report its concurrency is assumed to run one build.
+fn default_concurrency() -> u32 {
+    1
 }
 
 /// Enrollment status returned while a worker polls for approval.

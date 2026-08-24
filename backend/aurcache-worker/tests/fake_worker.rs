@@ -233,7 +233,9 @@ async fn fake_worker_protocol_roundtrip() {
     // --- Safety rail: a revoked worker is refused at the mTLS auth guard.
     let workers = worker_store::list_workers(&db).await.unwrap();
     let worker_id = workers.first().expect("one enrolled worker").id;
-    worker_store::revoke_worker(&db, worker_id).await.unwrap();
+    worker_store::revoke_worker(&db, worker_id, 3)
+        .await
+        .unwrap();
     let after_revoke = client.claim(&claim_req).await;
     assert!(
         after_revoke.is_err(),

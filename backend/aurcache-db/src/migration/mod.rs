@@ -12,6 +12,7 @@ mod m20260515_000000_api_tokens;
 mod m20260601_000000_package_patch;
 mod m20260814_000000_package_vcs_sources;
 mod m20260818_000000_remote_workers;
+mod m20260824_000000_worker_routing;
 
 pub struct Migrator;
 
@@ -33,6 +34,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260515_000000_api_tokens::Migration),
             Box::new(m20260814_000000_package_vcs_sources::Migration),
             Box::new(m20260818_000000_remote_workers::Migration),
+            Box::new(m20260824_000000_worker_routing::Migration),
         ]
     }
 }

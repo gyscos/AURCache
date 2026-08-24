@@ -5,6 +5,9 @@
 //! (see design doc §"One worker command, four enrollment paths"); the fourth
 //! path is the default interactive approval, which needs no code here.
 //!
+//! Every mode below only ever applies to a `pending` worker: see
+//! [`eval_auto_approve`] for why re-approving a revoked worker must not happen.
+//!
 //! Modes, highest trust first:
 //! 1. **Capability enrollment volume** (`AURCACHE_ENROLLMENT_DIR`): the worker
 //!    drops `<fingerprint>.csr` (public only) into a volume the backend mounts
@@ -14,18 +17,37 @@
 //! 3. **Shared enrollment token** (`AURCACHE_ENROLLMENT_TOKEN`): fallback for
 //!    setups without a shared volume; the worker presents the token.
 
+use aurcache_types::worker::WorkerStatus;
 use std::env;
 use std::path::PathBuf;
 
 /// Pure decision core (env/filesystem inputs passed in), so it is unit-testable.
+///
+/// `status` is the worker's *current* status, and gates everything else: only a
+/// `pending` worker is eligible. Auto-approval answers "should I trust a machine
+/// I have never seen?"; it must never answer "should I re-trust a machine an
+/// operator explicitly revoked?".
+///
+/// This matters because every auto-approve mode below is durable ambient policy
+/// that revocation cannot touch — the worker's CSR stays in the enrollment
+/// volume, its fingerprint stays in `AURCACHE_PREAPPROVED_WORKERS`, and it keeps
+/// the shared token in its own environment. Workers re-register on startup, so
+/// without this gate revoking a worker would be undone by its next restart.
+/// Authorization is the `workers` row (the certificate itself proves nothing —
+/// see `design/worker-routing.md`), which makes any write of `approved` an
+/// immediate, complete re-grant.
 #[must_use]
 pub fn eval_auto_approve(
+    status: &str,
     fingerprint: &str,
     provided_token: Option<&str>,
     expected_token: Option<&str>,
     preapproved_fingerprints: &[String],
     enrollment_dir_has_csr: bool,
 ) -> bool {
+    if status != WorkerStatus::PENDING {
+        return false;
+    }
     if enrollment_dir_has_csr {
         return true;
     }
@@ -57,7 +79,11 @@ pub fn parse_preapproved(raw: &str) -> Vec<String> {
 /// `AURCACHE_ENROLLMENT_TOKEN`. Filesystem access for the enrollment volume is
 /// best-effort: a missing/unreadable dir simply means that mode doesn't match.
 #[must_use]
-pub fn auto_approve_from_env(fingerprint: &str, provided_token: Option<&str>) -> bool {
+pub fn auto_approve_from_env(
+    status: &str,
+    fingerprint: &str,
+    provided_token: Option<&str>,
+) -> bool {
     let has_csr = env::var("AURCACHE_ENROLLMENT_DIR").is_ok_and(|dir| {
         PathBuf::from(dir)
             .join(format!("{fingerprint}.csr"))
@@ -71,6 +97,7 @@ pub fn auto_approve_from_env(fingerprint: &str, provided_token: Option<&str>) ->
     let expected_token = env::var("AURCACHE_ENROLLMENT_TOKEN").ok();
 
     eval_auto_approve(
+        status,
         fingerprint,
         provided_token,
         expected_token.as_deref(),
@@ -83,21 +110,24 @@ pub fn auto_approve_from_env(fingerprint: &str, provided_token: Option<&str>) ->
 mod tests {
     use super::*;
 
+    const PENDING: &str = WorkerStatus::PENDING;
+
     #[test]
     fn enrollment_volume_grants_approval() {
-        assert!(eval_auto_approve("fp", None, None, &[], true));
+        assert!(eval_auto_approve(PENDING, "fp", None, None, &[], true));
     }
 
     #[test]
     fn preapproved_fingerprint_grants_approval() {
         let pre = vec!["aaa".to_string(), "bbb".to_string()];
-        assert!(eval_auto_approve("bbb", None, None, &pre, false));
-        assert!(!eval_auto_approve("ccc", None, None, &pre, false));
+        assert!(eval_auto_approve(PENDING, "bbb", None, None, &pre, false));
+        assert!(!eval_auto_approve(PENDING, "ccc", None, None, &pre, false));
     }
 
     #[test]
     fn matching_token_grants_approval() {
         assert!(eval_auto_approve(
+            PENDING,
             "fp",
             Some("s3cret"),
             Some("s3cret"),
@@ -105,6 +135,7 @@ mod tests {
             false
         ));
         assert!(!eval_auto_approve(
+            PENDING,
             "fp",
             Some("wrong"),
             Some("s3cret"),
@@ -112,14 +143,71 @@ mod tests {
             false
         ));
         // No configured token -> a provided token never approves.
-        assert!(!eval_auto_approve("fp", Some("s3cret"), None, &[], false));
+        assert!(!eval_auto_approve(
+            PENDING,
+            "fp",
+            Some("s3cret"),
+            None,
+            &[],
+            false
+        ));
         // Empty configured token is treated as unset.
-        assert!(!eval_auto_approve("fp", Some(""), Some(""), &[], false));
+        assert!(!eval_auto_approve(
+            PENDING,
+            "fp",
+            Some(""),
+            Some(""),
+            &[],
+            false
+        ));
     }
 
     #[test]
     fn no_mode_matches_stays_pending() {
-        assert!(!eval_auto_approve("fp", None, None, &[], false));
+        assert!(!eval_auto_approve(PENDING, "fp", None, None, &[], false));
+    }
+
+    /// A revoked worker re-registering must stay revoked even when *every*
+    /// auto-approve mode matches. Workers re-register on startup, so without
+    /// this a revoke would be undone by the worker's next restart.
+    #[test]
+    fn revoked_worker_is_never_auto_approved() {
+        let pre = vec!["fp".to_string()];
+        assert!(!eval_auto_approve(
+            WorkerStatus::REVOKED,
+            "fp",
+            Some("s3cret"),
+            Some("s3cret"),
+            &pre,
+            true
+        ));
+    }
+
+    /// An already-approved worker needs no re-approval; skipping the write
+    /// keeps re-registration idempotent.
+    #[test]
+    fn approved_worker_is_not_reapproved() {
+        assert!(!eval_auto_approve(
+            WorkerStatus::APPROVED,
+            "fp",
+            None,
+            None,
+            &[],
+            true
+        ));
+    }
+
+    /// An unknown status is refused rather than defaulted into approval.
+    #[test]
+    fn unknown_status_is_refused() {
+        assert!(!eval_auto_approve(
+            "something-else",
+            "fp",
+            None,
+            None,
+            &[],
+            true
+        ));
     }
 
     #[test]

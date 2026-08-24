@@ -19,6 +19,21 @@ pub struct Config {
     pub native_arches: Vec<String>,
     /// Architectures this worker can build via emulation.
     pub emulated_arches: Vec<String>,
+    /// Exact pkgbase names this worker is specially provisioned for
+    /// (credentials, licensed toolchain, scratch space). Packages named here
+    /// are reserved to workers that name them.
+    pub packages: Vec<String>,
+    /// Scheduling preference; higher wins. Lower-priority workers hold back
+    /// while a higher-priority one has capacity.
+    pub priority: i32,
+    /// Explicit SSH key for authenticated sources. When set, no key is
+    /// generated — see `credentials.rs`.
+    pub git_ssh_key: Option<PathBuf>,
+    /// Optional `known_hosts` to trust inside the build chroot.
+    pub ssh_known_hosts: Option<PathBuf>,
+    /// Extra `host:chroot` bind mounts exposed to every build, for credentials
+    /// that are not SSH (a `.netrc`, an API token, a licence file).
+    pub bind_mounts: Vec<(PathBuf, PathBuf)>,
     /// Maximum concurrent builds.
     pub concurrency: usize,
     /// Human-friendly worker name (defaults to hostname).
@@ -108,6 +123,11 @@ impl Config {
             .map(|s| parse_arches(&s))
             .unwrap_or_default();
 
+        // Reuses `parse_arches`: both are comma/space separated token lists.
+        let packages = env_opt("WORKER_PACKAGES")
+            .map(|s| parse_arches(&s))
+            .unwrap_or_default();
+
         let concurrency = env_opt("WORKER_CONCURRENCY")
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|n| *n > 0)
@@ -138,6 +158,15 @@ impl Config {
             enrollment_token: env_opt("AURCACHE_ENROLLMENT_TOKEN"),
             native_arches,
             emulated_arches,
+            packages,
+            priority: env_opt("WORKER_PRIORITY")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            git_ssh_key: env_opt("WORKER_GIT_SSH_KEY").map(PathBuf::from),
+            ssh_known_hosts: env_opt("WORKER_SSH_KNOWN_HOSTS").map(PathBuf::from),
+            bind_mounts: env_opt("WORKER_BIND_MOUNTS")
+                .map(|raw| crate::credentials::parse_bind_mounts(&raw))
+                .unwrap_or_default(),
             concurrency,
             name,
             data_dir,

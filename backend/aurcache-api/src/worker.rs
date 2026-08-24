@@ -8,11 +8,11 @@
 //! can bootstrap; all job endpoints require an *approved* worker's certificate.
 
 use crate::models::authenticated::Authenticated;
+use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::workers;
-use aurcache_deps::AurClient;
 use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus, WorkerStatus,
@@ -28,7 +28,6 @@ use rocket::data::ToByteUnit;
 use rocket::http::Status;
 use rocket::mtls::Certificate;
 use rocket::request::{FromRequest, Outcome, Request};
-use rocket::response::status::Custom;
 use rocket::serde::json::Json;
 use rocket::{Data, State, get, post};
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -44,8 +43,27 @@ fn lease_ttl_secs() -> i64 {
 fn max_attempts() -> i32 {
     env_i64("MAX_ATTEMPTS", 3) as i32
 }
+/// How long a build must sit `ENQUEUED` before worker priority stops holding it
+/// back. A backstop: `available()` is inferred from heartbeats and lease state,
+/// so a worker can look healthy while never actually claiming (full disk, a bug).
+/// This bounds the damage at one delay per job.
+fn spill_delay_secs() -> i64 {
+    env_i64("WORKER_SPILL_DELAY", 60)
+}
+/// How stale `last_seen` may be before a worker stops counting as available and
+/// therefore stops holding jobs back. ~4x the 15s default heartbeat.
+pub(crate) fn liveness_timeout_secs() -> i64 {
+    env_i64("WORKER_LIVENESS_TIMEOUT", 60)
+}
+/// Worker certificates are transport plumbing, not a credential: authorization
+/// is the `workers` row, so holding a valid certificate grants nothing on its
+/// own. There is therefore nothing to gain from short validity, and no renewal
+/// path exists (`ensure_enrolled` reuses a persisted certificate and the server
+/// only signs when it has none) — so a short lifetime would simply brick the
+/// worker. Match the server certificate's 10 years. See
+/// `design/worker-routing.md` (Appendix).
 fn worker_cert_validity_days() -> i64 {
-    env_i64("WORKER_CERT_VALIDITY_DAYS", 365)
+    env_i64("WORKER_CERT_VALIDITY_DAYS", 3650)
 }
 fn env_i64(key: &str, default: i64) -> i64 {
     env::var(key)
@@ -77,10 +95,6 @@ const WORKER_PKGDEST: &str = "/output";
 /// the build complete, at which point they are ingested atomically.
 fn staging_dir(build_id: i32) -> PathBuf {
     PathBuf::from("./worker-staging").join(build_id.to_string())
-}
-
-fn err(status: Status, e: impl std::fmt::Display) -> Custom<String> {
-    Custom(status, e.to_string())
 }
 
 /// Request guard: a verified, CA-signed client certificate mapped to an
@@ -171,7 +185,7 @@ pub async fn register_worker(
     db: &State<DatabaseConnection>,
     ca: &State<Ca>,
     input: Json<RegisterRequest>,
-) -> Result<Json<RegisterStatus>, Custom<String>> {
+) -> Result<Json<RegisterStatus>, ApiError> {
     let db = db.inner();
     let input = input.into_inner();
 
@@ -180,11 +194,19 @@ pub async fn register_worker(
 
     let worker = worker_store::register_worker(
         db,
-        &input.name,
-        &fingerprint,
-        &input.native_arches.join(","),
-        &input.emulated_arches.join(","),
-        &input.version,
+        &worker_store::WorkerRegistration {
+            name: &input.name,
+            fingerprint: &fingerprint,
+            native_arches: &input.native_arches.join(","),
+            emulated_arches: &input.emulated_arches.join(","),
+            version: &input.version,
+            package_affinity: &input.packages.join(","),
+            priority: input.priority,
+            // Clamped to at least 1: a worker reporting 0 would be treated as
+            // permanently full and could never block a lower-priority worker,
+            // silently defeating its own priority.
+            concurrency: i32::try_from(input.concurrency.max(1)).unwrap_or(i32::MAX),
+        },
     )
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
@@ -194,24 +216,19 @@ pub async fn register_worker(
         let signed = ca
             .sign_worker_csr(&input.csr_pem, worker_cert_validity_days())
             .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_store::store_signed_cert(
-            db,
-            worker.id,
-            &signed.cert_pem,
-            &signed.serial_hex,
-            signed.not_after,
-        )
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        worker_store::store_signed_cert(db, worker.id, &signed.cert_pem, signed.not_after)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
     }
 
     // Non-interactive enrollment: auto-approve when a configured mode matches.
-    if worker.status != WorkerStatus::APPROVED
-        && crate::worker_enroll::auto_approve_from_env(
-            &fingerprint,
-            input.enrollment_token.as_deref(),
-        )
-    {
+    // Eligibility (pending only) is enforced inside `auto_approve_from_env`, so
+    // a revoked worker is never re-approved by re-registering.
+    if crate::worker_enroll::auto_approve_from_env(
+        &worker.status,
+        &fingerprint,
+        input.enrollment_token.as_deref(),
+    ) {
         worker_store::approve_worker(db, worker.id)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
@@ -228,7 +245,7 @@ pub async fn register_status(
     db: &State<DatabaseConnection>,
     ca: &State<Ca>,
     fingerprint: &str,
-) -> Result<Json<RegisterStatus>, Custom<String>> {
+) -> Result<Json<RegisterStatus>, ApiError> {
     register_status_for(db.inner(), ca, fingerprint).await
 }
 
@@ -236,7 +253,7 @@ async fn register_status_for(
     db: &DatabaseConnection,
     ca: &Ca,
     fingerprint: &str,
-) -> Result<Json<RegisterStatus>, Custom<String>> {
+) -> Result<Json<RegisterStatus>, ApiError> {
     let worker = worker_store::find_worker_by_fingerprint(db, fingerprint)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
@@ -270,7 +287,7 @@ pub fn get_ca(ca: &State<Ca>) -> String {
 /// server before trusting any issued certificate (anti-MITM during enrollment).
 #[utoipa::path(get, path = "/worker/ca/fingerprint", responses((status = 200, description = "CA fingerprint")))]
 #[get("/worker/ca/fingerprint")]
-pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>> {
+pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, ApiError> {
     ca.ca_cert_fingerprint()
         .map_err(|e| err(Status::InternalServerError, e))
 }
@@ -279,23 +296,29 @@ pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, Custom<String>> {
 // Job lifecycle (approved worker certificate required)
 // ----------------------------------------------------------------------------
 
-/// Claim the next buildable job for the worker's arches, or 204 if none.
-#[post("/worker/jobs/claim", data = "<input>")]
+/// Claim the next buildable job for this worker, or 204 if none.
+///
+/// The [`ClaimRequest`] body is accepted for wire compatibility but its contents
+/// are **not** used: routing reads arches, package affinity and priority from
+/// the worker's stored row. Each worker's decision depends on what every *other*
+/// worker declared, so those values must come from one consistent source rather
+/// than from whatever the caller asserts about itself. The row is refreshed on
+/// every re-registration, which happens on each worker boot.
+#[post("/worker/jobs/claim", data = "<_claim>")]
 pub async fn claim_job(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
     auth: WorkerAuth,
-    input: Json<ClaimRequest>,
-) -> Result<Option<Json<JobDescriptor>>, Custom<String>> {
+    _claim: Json<ClaimRequest>,
+) -> Result<Option<Json<JobDescriptor>>, ApiError> {
     let db = db.inner();
-    let input = input.into_inner();
 
     let Some(build) = worker_jobs::claim_job(
         db,
         auth.worker.id,
-        &input.native_arches,
-        &input.emulated_arches,
         lease_ttl_secs(),
+        spill_delay_secs(),
+        liveness_timeout_secs(),
     )
     .await
     .map_err(|e| err(Status::InternalServerError, e))?
@@ -327,9 +350,8 @@ async fn build_descriptor(
 
     // Best-effort PGP keys from the parsed .SRCINFO; the worker can still
     // self-extract if parsing failed.
-    let client = AurClient::new();
     let pgp_keys = match store
-        .sourceinfo(&client, &pkg.source_data, pkg.patch.as_deref())
+        .sourceinfo(&pkg.source_data, pkg.patch.as_deref())
         .await
     {
         Ok(si) => si
@@ -368,7 +390,7 @@ pub async fn job_source(
     store: &State<Arc<SnapshotStore>>,
     auth: WorkerAuth,
     build_id: i32,
-) -> Result<Vec<u8>, Custom<String>> {
+) -> Result<Vec<u8>, ApiError> {
     let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
@@ -385,9 +407,8 @@ pub async fn job_source(
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "package not found"))?;
 
-    let client = AurClient::new();
     store
-        .archive_bytes(&client, &pkg.source_data, pkg.patch.as_deref())
+        .archive_bytes(&pkg.source_data, pkg.patch.as_deref())
         .await
         .map_err(|e| err(Status::InternalServerError, e))
 }
@@ -399,7 +420,7 @@ pub async fn job_logs(
     auth: WorkerAuth,
     build_id: i32,
     data: Data<'_>,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
@@ -426,7 +447,7 @@ pub async fn job_artifact(
     build_id: i32,
     filename: &str,
     data: Data<'_>,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
@@ -466,7 +487,7 @@ pub async fn complete_job(
     auth: WorkerAuth,
     build_id: i32,
     input: Json<CompleteReport>,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     let report = input.into_inner();
 
@@ -598,7 +619,7 @@ pub async fn heartbeat(
     db: &State<DatabaseConnection>,
     auth: WorkerAuth,
     input: Json<Heartbeat>,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     let hb = input.into_inner();
     worker_store::touch_last_seen(db, auth.worker.id, Some(&hb.version))
@@ -622,7 +643,7 @@ pub async fn job_status(
     db: &State<DatabaseConnection>,
     auth: WorkerAuth,
     build_id: i32,
-) -> Result<Json<JobStatus>, Custom<String>> {
+) -> Result<Json<JobStatus>, ApiError> {
     let db = db.inner();
     let build = Builds::find_by_id(build_id)
         .one(db)
@@ -646,7 +667,7 @@ pub async fn job_status(
 pub async fn list_workers(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
-) -> Result<Json<Vec<workers::Model>>, Custom<String>> {
+) -> Result<Json<Vec<workers::Model>>, ApiError> {
     let db = db.inner();
     let workers = worker_store::list_workers(db)
         .await
@@ -660,7 +681,7 @@ pub async fn approve_worker(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
     id: i32,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     worker_store::approve_worker(db, id)
         .await
@@ -674,9 +695,9 @@ pub async fn revoke_worker(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
     id: i32,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
-    worker_store::revoke_worker(db, id)
+    worker_store::revoke_worker(db, id, max_attempts())
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(())

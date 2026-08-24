@@ -15,8 +15,6 @@ pub struct Model {
     /// SHA-256 fingerprint of the worker's self-generated certificate/CSR.
     /// Stable identity used for enrollment and mTLS mapping.
     pub cert_fingerprint: String,
-    /// Serial of the CA-signed leaf certificate (set on approval).
-    pub cert_serial: Option<String>,
     /// PEM of the CA-signed leaf certificate (set on approval).
     pub signed_cert: Option<String>,
     /// Epoch seconds when the signed certificate expires.
@@ -29,6 +27,17 @@ pub struct Model {
     pub last_seen: Option<i64>,
     /// Worker software version reported at enrollment/heartbeat.
     pub version: Option<String>,
+    /// Comma-separated exact pkgbase names this worker is specially provisioned
+    /// for (credentials, licensed toolchain, scratch space). A package named by
+    /// *any* approved worker may only be built by workers that name it.
+    pub package_affinity: String,
+    /// Scheduling preference; higher wins. A worker declines a job only while a
+    /// *strictly* higher-priority worker could take it, so the default of 0
+    /// means nothing is ever held back.
+    pub priority: i32,
+    /// Maximum concurrent builds the worker reported at registration, used to
+    /// decide whether it still has capacity.
+    pub concurrency: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -1,10 +1,13 @@
 use itertools::Itertools;
-use rocket::response::status::NotFound;
+use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, post};
 
 use crate::models::authenticated::Authenticated;
 use crate::models::builds::ListBuildsModel;
+use crate::utils::error::{ApiError, err};
+use crate::worker::liveness_timeout_secs;
+use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
 use aurcache_types::builder::Action;
@@ -29,13 +32,33 @@ use utoipa::OpenApi;
 ))]
 pub struct BuildApi;
 
+/// Slice a build's stored output for the caller.
+///
+/// `startline` is how many lines the caller already holds, so the response
+/// carries only what is new; an out-of-range or negative offset simply skips
+/// nothing or everything rather than erroring.
+///
+/// A build that exists but has not written anything yet yields an empty string.
+/// "No output yet" is the normal state of a freshly started build, and the log
+/// view polls this endpoint from the moment it opens — reporting that as an
+/// error would make every new build's first poll fail.
+fn slice_output(output: Option<String>, startline: Option<i32>) -> String {
+    let output = output.unwrap_or_default();
+    let Some(startline) = startline else {
+        return output;
+    };
+    let skip = usize::try_from(startline).unwrap_or(0);
+    output.lines().skip(skip).join("\n")
+}
+
 #[utoipa::path(
     responses(
-            (status = 200, description = "get build output of specified build"),
+            (status = 200, description = "Build output from `startline` onwards; empty if the build has not logged anything yet"),
+            (status = 404, description = "No build with that id"),
     ),
     params(
             ("buildid", description = "Id of build"),
-            ("startline", description = "Startline to fetch from (only content from this line on)")
+            ("startline", description = "Number of leading lines to skip (i.e. how many the caller already has)")
     )
 )]
 #[get("/build/<buildid>/output?<startline>")]
@@ -44,25 +67,16 @@ pub async fn build_output(
     buildid: i32,
     startline: Option<i32>,
     _a: Authenticated,
-) -> Result<String, NotFound<String>> {
+) -> Result<String, ApiError> {
     let db = db.inner();
 
     let build = Builds::find_by_id(buildid)
         .one(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?
-        .ok_or_else(|| NotFound("couldn't find id".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
 
-    match build.output {
-        None => Err(NotFound("No Output".to_string())),
-        Some(v) => match startline {
-            None => Ok(v),
-            Some(startline) => {
-                let skip = usize::try_from(startline).unwrap_or(0);
-                Ok(v.lines().skip(skip).join("\n"))
-            }
-        },
-    }
+    Ok(slice_output(build.output, startline))
 }
 
 #[utoipa::path(
@@ -82,7 +96,7 @@ pub async fn list_builds(
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
-) -> Result<Json<Vec<ListBuildsModel>>, NotFound<String>> {
+) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
     let db = db.inner();
 
     let basequery = Builds::find()
@@ -100,7 +114,7 @@ pub async fn list_builds(
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
 
-    let build = match pkgid {
+    let mut build = match pkgid {
         None => basequery.into_model::<ListBuildsModel>().all(db),
         Some(pkgid) => basequery
             .filter(builds::Column::PkgId.eq(pkgid))
@@ -108,9 +122,35 @@ pub async fn list_builds(
             .all(db),
     }
     .await
-    .map_err(|e| NotFound(e.to_string()))?;
+    .map_err(|e| err(Status::InternalServerError, e))?;
 
+    annotate_waiting(db, &mut build).await?;
     Ok(Json(build))
+}
+
+/// Attach [`WaitingReason`]s to any listed build that no approved worker can
+/// currently claim, so a stalled build is distinguishable from a queued one.
+///
+/// Best-effort by design: this is diagnostic decoration, and failing to compute
+/// it must never turn a working build list into an error page.
+async fn annotate_waiting(
+    db: &DatabaseConnection,
+    builds: &mut [ListBuildsModel],
+) -> Result<(), ApiError> {
+    if builds.is_empty() {
+        return Ok(());
+    }
+    let reasons = match worker_jobs::waiting_reasons(db, liveness_timeout_secs()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("could not compute build waiting reasons: {e}");
+            return Ok(());
+        }
+    };
+    for build in builds {
+        build.waiting_reason = reasons.get(&build.id).cloned();
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -126,7 +166,7 @@ pub async fn get_build(
     db: &State<DatabaseConnection>,
     buildid: i32,
     _a: Authenticated,
-) -> Result<Json<ListBuildsModel>, NotFound<String>> {
+) -> Result<Json<ListBuildsModel>, ApiError> {
     let db = db.inner();
 
     let result = Builds::find()
@@ -144,9 +184,12 @@ pub async fn get_build(
         .into_model::<ListBuildsModel>()
         .one(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?
-        .ok_or_else(|| NotFound("no item with id found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
 
+    let mut result = [result];
+    annotate_waiting(db, &mut result).await?;
+    let [result] = result;
     Ok(Json(result))
 }
 
@@ -163,19 +206,19 @@ pub async fn delete_build(
     db: &State<DatabaseConnection>,
     buildid: i32,
     _a: Authenticated,
-) -> Result<(), NotFound<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
 
     let build = Builds::find_by_id(buildid)
         .one(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?
-        .ok_or_else(|| NotFound("Id not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
 
     build
         .delete(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(())
 }
@@ -193,9 +236,9 @@ pub async fn cancel_build(
     tx: &State<Sender<Action>>,
     buildid: i32,
     _a: Authenticated,
-) -> Result<(), NotFound<String>> {
+) -> Result<(), ApiError> {
     tx.send(Action::Cancel(buildid))
-        .map_err(|e| NotFound(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(())
 }
@@ -215,15 +258,15 @@ pub async fn retry_build(
     store: &State<Arc<SnapshotStore>>,
     buildid: i32,
     _a: Authenticated,
-) -> Result<Json<i32>, NotFound<String>> {
+) -> Result<Json<i32>, ApiError> {
     let db = db.inner();
 
     // Fetch the build details
     let old_build = Builds::find_by_id(buildid)
         .one(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?
-        .ok_or_else(|| NotFound("Build not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
 
     // Extract the platform and package ID
     let platform = old_build.platform;
@@ -233,8 +276,8 @@ pub async fn retry_build(
     let package = packages::Entity::find_by_id(pkg_id)
         .one(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))?
-        .ok_or_else(|| NotFound("Package not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     // Route retries through the same path as "Force Rebuild": this re-fetches
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
@@ -242,7 +285,7 @@ pub async fn retry_build(
     // build's stored version with a stale dependency graph.
     let platform_results = package_update(store, db, package, true, tx)
         .await
-        .map_err(|e| NotFound(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     // Pick out the build explicitly reported for the platform that was
     // retried; it may have been enqueued/promoted or left waiting on a
@@ -251,7 +294,51 @@ pub async fn retry_build(
         .into_iter()
         .find(|r| r.platform == platform)
         .map(|r| r.build_id)
-        .ok_or_else(|| NotFound("No build was enqueued for retry".to_string()))?;
+        .ok_or_else(|| {
+            err(
+                Status::InternalServerError,
+                "no build was enqueued for retry",
+            )
+        })?;
 
     Ok(Json(build_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slice_output;
+
+    /// A build that exists but has not logged anything is not an error: the log
+    /// view opens (and starts polling) before the first line is ever written.
+    #[test]
+    fn missing_output_reads_as_empty() {
+        assert_eq!(slice_output(None, None), "");
+        assert_eq!(slice_output(None, Some(0)), "");
+        assert_eq!(slice_output(None, Some(5)), "");
+    }
+
+    #[test]
+    fn without_a_startline_the_whole_output_is_returned() {
+        assert_eq!(
+            slice_output(Some("a\nb\nc\n".to_string()), None),
+            "a\nb\nc\n"
+        );
+    }
+
+    #[test]
+    fn startline_skips_the_lines_the_caller_already_has() {
+        let output = Some("a\nb\nc\n".to_string());
+        assert_eq!(slice_output(output.clone(), Some(0)), "a\nb\nc");
+        assert_eq!(slice_output(output.clone(), Some(2)), "c");
+        // Caller is already up to date.
+        assert_eq!(slice_output(output.clone(), Some(3)), "");
+        assert_eq!(slice_output(output, Some(99)), "");
+    }
+
+    /// A nonsensical offset skips nothing rather than wrapping around to a huge
+    /// one, which `as usize` would have done.
+    #[test]
+    fn negative_startline_skips_nothing() {
+        assert_eq!(slice_output(Some("a\nb\n".to_string()), Some(-1)), "a\nb");
+    }
 }

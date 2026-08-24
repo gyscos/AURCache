@@ -26,18 +26,63 @@ pub fn publish_csr_to_enrollment_dir(cfg: &Config, fingerprint: &str, csr_pem: &
     }
 }
 
+/// Assemble the registration payload from the current configuration.
+///
+/// Registration is how a worker reports its configuration, and *all* of it can
+/// have changed since the machine last booted, so this is rebuilt from `cfg`
+/// every time rather than cached.
+fn register_request(cfg: &Config, csr_pem: String) -> RegisterRequest {
+    RegisterRequest {
+        name: cfg.name.clone(),
+        native_arches: cfg.native_arches.clone(),
+        emulated_arches: cfg.emulated_arches.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        csr_pem,
+        enrollment_token: cfg.enrollment_token.clone(),
+        packages: cfg.packages.clone(),
+        priority: cfg.priority,
+        concurrency: cfg.concurrency as u32,
+    }
+}
+
 /// Ensure the worker is enrolled and return an authenticated mTLS client.
 ///
-/// If a signed certificate is already persisted it is reused; otherwise the
-/// worker pins the CA, registers, and polls until approved.
+/// The worker registers on **every** startup, not only the first. Registration
+/// carries its name, arches, concurrency, priority and package affinity — all of
+/// which come from the environment and any of which may have been edited since
+/// the last boot — so skipping it would let the server's picture of the fleet
+/// drift from reality. Registration is idempotent: it is keyed on the stable
+/// SPKI fingerprint of the persisted keypair, and it never alters approval
+/// state, so a revoked worker that comes back stays revoked (it does refresh
+/// `last_seen`, which is how the UI can show that the machine is asking again).
+///
+/// When a signed certificate is already persisted, re-registration is
+/// **best-effort**: the bundled topology starts the worker and the backend from
+/// one `docker compose up`, so a worker will regularly reach the server before
+/// it is listening. Failing to register then must not stop a worker that is
+/// already able to build — it proceeds on its persisted configuration.
 pub async fn ensure_enrolled(cfg: &Config, identity: &Identity) -> Result<WorkerClient> {
     tracing::info!("Worker fingerprint: {}", identity.fingerprint);
 
+    let csr_pem = identity.generate_csr(&cfg.name)?;
+
     if identity.is_enrolled() {
+        // Reuse the CA we already pinned rather than re-running trust-on-first-use.
+        let ca_pem = identity.ca_pem()?;
+        match WorkerClient::enrollment(&cfg.aurcache_url, &ca_pem) {
+            Ok(client) => match client.register(&register_request(cfg, csr_pem)).await {
+                Ok(status) => tracing::info!("Re-registered (status: {})", status.status),
+                Err(e) => tracing::warn!(
+                    "Re-registration failed, continuing with the persisted configuration: {e:#}"
+                ),
+            },
+            Err(e) => tracing::warn!("Could not build enrollment client: {e:#}"),
+        }
+
         tracing::info!("Reusing persisted worker certificate");
         return WorkerClient::authenticated(
             &cfg.aurcache_url,
-            &identity.ca_pem()?,
+            &ca_pem,
             &identity.cert_pem()?,
             &identity.key_pem(),
         );
@@ -51,19 +96,12 @@ pub async fn ensure_enrolled(cfg: &Config, identity: &Identity) -> Result<Worker
     let enroll_client = WorkerClient::enrollment(&cfg.aurcache_url, &ca_pem)?;
 
     // 2. Submit our CSR and publish it for co-located auto-approval.
-    let csr_pem = identity.generate_csr(&cfg.name)?;
     publish_csr_to_enrollment_dir(cfg, &identity.fingerprint, &csr_pem);
 
-    let req = RegisterRequest {
-        name: cfg.name.clone(),
-        native_arches: cfg.native_arches.clone(),
-        emulated_arches: cfg.emulated_arches.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        csr_pem,
-        enrollment_token: cfg.enrollment_token.clone(),
-    };
-
-    let mut status = enroll_client.register(&req).await.context("registering")?;
+    let mut status = enroll_client
+        .register(&register_request(cfg, csr_pem))
+        .await
+        .context("registering")?;
 
     // 3. Poll until approved.
     loop {

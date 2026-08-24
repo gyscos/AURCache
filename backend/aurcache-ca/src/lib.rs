@@ -29,8 +29,6 @@ pub struct Ca {
 pub struct SignedWorkerCert {
     /// PEM of the signed leaf certificate.
     pub cert_pem: String,
-    /// Hex-encoded serial number of the issued certificate.
-    pub serial_hex: String,
     /// Epoch seconds when the certificate expires.
     pub not_after: i64,
     /// SHA-256 fingerprint of the worker's public key.
@@ -134,12 +132,8 @@ impl Ca {
         let cert = csr
             .signed_by(&ca_cert, &ca_key)
             .context("signing worker CSR")?;
-        let cert_pem = cert.pem();
-        let serial_hex = serial_from_cert_pem(&cert_pem)?;
-
         Ok(SignedWorkerCert {
-            cert_pem,
-            serial_hex,
+            cert_pem: cert.pem(),
             not_after: not_after.unix_timestamp(),
             fingerprint,
         })
@@ -168,13 +162,6 @@ pub fn fingerprint_from_csr_pem(csr_pem: &str) -> anyhow::Result<String> {
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(&der)
         .map_err(|e| anyhow!("parsing CSR: {e}"))?;
     Ok(sha256_hex(csr.certification_request_info.subject_pki.raw))
-}
-
-fn serial_from_cert_pem(cert_pem: &str) -> anyhow::Result<String> {
-    let der = pem_to_der(cert_pem)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&der)
-        .map_err(|e| anyhow!("parsing certificate: {e}"))?;
-    Ok(cert.tbs_certificate.raw_serial_as_string().replace(':', ""))
 }
 
 fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
@@ -248,7 +235,6 @@ mod tests {
 
         let signed = ca.sign_worker_csr(&csr_pem, 365).unwrap();
         assert!(signed.cert_pem.contains("BEGIN CERTIFICATE"));
-        assert!(!signed.serial_hex.is_empty());
         assert!(signed.not_after > 0);
 
         // The fingerprint is stable across CSR -> issued cert.
@@ -271,6 +257,6 @@ mod tests {
         let a = ca.sign_worker_csr(&make_csr(), 365).unwrap();
         let b = ca.sign_worker_csr(&make_csr(), 365).unwrap();
         assert_ne!(a.fingerprint, b.fingerprint);
-        assert_ne!(a.serial_hex, b.serial_hex);
+        assert_ne!(a.cert_pem, b.cert_pem);
     }
 }

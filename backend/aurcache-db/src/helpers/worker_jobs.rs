@@ -5,88 +5,288 @@
 //! (0=active, 1=success, 2=failed, 3=enqueued, 4=waiting-for-deps); the db
 //! crate keeps its own copy to avoid a dependency on the types crate here.
 
+use crate::helpers::time::now_secs;
 use crate::helpers::worker_store::STATUS_APPROVED;
-use crate::prelude::{Builds, Workers};
-use crate::{builds, workers};
+use crate::prelude::{Builds, Packages, Workers};
+use crate::{builds, packages, workers};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
-use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use utoipa::ToSchema;
 
 pub const STATUS_ACTIVE: i32 = 0;
 pub const STATUS_SUCCESS: i32 = 1;
 pub const STATUS_FAILED: i32 = 2;
 pub const STATUS_ENQUEUED: i32 = 3;
 
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+/// One approved worker's routing-relevant configuration, plus its live state.
+#[derive(Debug)]
+struct WorkerCap {
+    id: i32,
+    name: String,
+    priority: i32,
+    concurrency: i32,
+    native: Vec<String>,
+    emulated: Vec<String>,
+    last_seen: Option<i64>,
+    /// Builds this worker currently holds in the ACTIVE state.
+    active: i32,
 }
 
-/// Atomically claim the next buildable job, preferring native arches over
-/// emulated ones and reserving foreign-arch jobs for native workers.
+/// A snapshot of the approved fleet, taken once per claim.
 ///
-/// Routing (see design doc §Arch-aware routing):
-/// 1. Try the worker's **native** arches first (oldest job wins).
-/// 2. Only if none, try **emulated** arches — but skip any platform that some
-///    approved worker can build *natively*, so a foreign-arch job stays reserved
-///    for the native worker instead of being emulated slowly elsewhere.
+/// Deliberately *not* a long-lived cache. The fleet splits into a stable half
+/// (affinity, priority, concurrency, arches — changes only on
+/// re-register/approve/revoke) and a volatile half (`last_seen`, active build
+/// counts — changes on every heartbeat and every claim). [`Fleet::available`]
+/// needs the volatile half, so a round trip happens on every claim regardless;
+/// caching the stable half separately would save nothing while adding
+/// invalidation hooks, each a chance to route a job to a worker that cannot
+/// build it.
+#[derive(Debug, Default)]
+struct Fleet {
+    workers: Vec<WorkerCap>,
+    /// Arches at least one approved worker builds *natively*; these are
+    /// reserved from emulated claims.
+    native_arches: HashSet<String>,
+    /// pkgbase -> the approved workers that named it. Because affinity entries
+    /// are exact names, this is a direct inversion of the worker rows: one pass,
+    /// no matching, and no dependency on which builds are queued.
+    affinity: HashMap<String, HashSet<i32>>,
+}
+
+/// The `workers` columns the router actually needs, as a named struct rather
+/// than a wide tuple.
+#[derive(Debug, FromQueryResult)]
+struct WorkerRow {
+    id: i32,
+    name: String,
+    priority: i32,
+    concurrency: i32,
+    native_arches: String,
+    emulated_arches: String,
+    package_affinity: String,
+    last_seen: Option<i64>,
+}
+
+/// Split a stored comma-separated list column into its entries.
+fn split_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+impl Fleet {
+    /// Load every approved worker plus its current ACTIVE build count.
+    async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, DbErr> {
+        let rows: Vec<WorkerRow> = Workers::find()
+            .select_only()
+            .column(workers::Column::Id)
+            .column(workers::Column::Name)
+            .column(workers::Column::Priority)
+            .column(workers::Column::Concurrency)
+            .column(workers::Column::NativeArches)
+            .column(workers::Column::EmulatedArches)
+            .column(workers::Column::PackageAffinity)
+            .column(workers::Column::LastSeen)
+            .filter(workers::Column::Status.eq(STATUS_APPROVED))
+            .into_model()
+            .all(db)
+            .await?;
+
+        let counts: Vec<(Option<i32>, i64)> = Builds::find()
+            .select_only()
+            .column(builds::Column::WorkerId)
+            .column_as(builds::Column::Id.count(), "cnt")
+            .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+            .group_by(builds::Column::WorkerId)
+            .into_tuple()
+            .all(db)
+            .await?;
+        let active: HashMap<i32, i32> = counts
+            .into_iter()
+            .filter_map(|(id, n)| id.map(|id| (id, i32::try_from(n).unwrap_or(i32::MAX))))
+            .collect();
+
+        let mut fleet = Self::default();
+        for row in rows {
+            let native = split_list(&row.native_arches);
+            fleet.native_arches.extend(native.iter().cloned());
+            for pkg in split_list(&row.package_affinity) {
+                fleet.affinity.entry(pkg).or_default().insert(row.id);
+            }
+            fleet.workers.push(WorkerCap {
+                id: row.id,
+                name: row.name,
+                priority: row.priority,
+                concurrency: row.concurrency,
+                native,
+                emulated: split_list(&row.emulated_arches),
+                last_seen: row.last_seen,
+                active: active.get(&row.id).copied().unwrap_or(0),
+            });
+        }
+        Ok(fleet)
+    }
+
+    /// Names of the approved workers that declared affinity for a package,
+    /// sorted so the explanation is stable between requests.
+    fn affinity_holders(&self, pkg: &str) -> Vec<String> {
+        let Some(ids) = self.affinity.get(pkg) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|w| ids.contains(&w.id))
+            .map(|w| w.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn worker(&self, id: i32) -> Option<&WorkerCap> {
+        self.workers.iter().find(|w| w.id == id)
+    }
+
+    /// True when some approved worker has claimed affinity for this package, in
+    /// which case only those workers may build it.
+    fn reserved(&self, pkg: &str) -> bool {
+        self.affinity.get(pkg).is_some_and(|ws| !ws.is_empty())
+    }
+
+    fn affine(&self, worker_id: i32, pkg: &str) -> bool {
+        self.affinity
+            .get(pkg)
+            .is_some_and(|ws| ws.contains(&worker_id))
+    }
+
+    /// Native arches first; an emulated arch is only claimable when *no*
+    /// approved worker builds it natively, so foreign-arch work stays reserved
+    /// for the native worker rather than crawling through emulation elsewhere.
+    fn arch_ok(&self, w: &WorkerCap, platform: &str) -> bool {
+        w.native.iter().any(|a| a == platform)
+            || (w.emulated.iter().any(|a| a == platform) && !self.native_arches.contains(platform))
+    }
+
+    /// Whether this worker may build this job at all — a hard filter combining
+    /// architecture routing with package affinity.
+    fn capable(&self, w: &WorkerCap, platform: &str, pkg: &str) -> bool {
+        self.arch_ok(w, platform) && (!self.reserved(pkg) || self.affine(w.id, pkg))
+    }
+
+    /// Whether this worker could pick a job up *right now*: recently seen and
+    /// not already at its concurrency limit.
+    fn available(&self, w: &WorkerCap, now: i64, liveness_timeout: i64) -> bool {
+        w.last_seen.is_some_and(|t| t >= now - liveness_timeout) && w.active < w.concurrency
+    }
+
+    /// Whether a strictly higher-priority worker could take this job right now.
+    ///
+    /// Only *strictly* higher blocks, so equal-priority workers never hold each
+    /// other back and an all-default fleet never blocks at all.
+    fn blocked(
+        &self,
+        me: &WorkerCap,
+        platform: &str,
+        pkg: &str,
+        now: i64,
+        liveness_timeout: i64,
+    ) -> bool {
+        self.workers.iter().any(|w| {
+            w.id != me.id
+                && w.priority > me.priority
+                && self.capable(w, platform, pkg)
+                && self.available(w, now, liveness_timeout)
+        })
+    }
+}
+
+/// Atomically claim the next buildable job for `worker_id`.
 ///
-/// The transition is a conditional `UPDATE ... WHERE status = ENQUEUED`, so two
-/// workers racing for the same build see exactly one `rows_affected == 1`.
+/// Routing has three layers (see `design/worker-routing.md`):
+///
+/// 1. **Affinity** (hard) — a package named by any approved worker may only be
+///    built by workers that name it. Ignores liveness: handing an affine job to
+///    a worker without the credential fails, where waiting merely waits.
+/// 2. **Architecture** (hard) — native arches first, foreign arches reserved for
+///    a worker that builds them natively.
+/// 3. **Priority** (soft) — a worker declines a job while a strictly
+///    higher-priority worker is live and under its concurrency limit, until the
+///    job has waited `spill_delay_secs`.
+///
+/// Arches, affinity and priority all come from the worker's stored row rather
+/// than from the request, because each worker's decision depends on what *other*
+/// workers declared: they must be read from one consistent source.
+///
+/// The final transition is a conditional `UPDATE ... WHERE status = ENQUEUED`,
+/// so two workers racing for the same build see exactly one `rows_affected == 1`.
 pub async fn claim_job<C: ConnectionTrait>(
     db: &C,
     worker_id: i32,
-    native_arches: &[String],
-    emulated_arches: &[String],
     lease_ttl_secs: i64,
+    spill_delay_secs: i64,
+    liveness_timeout_secs: i64,
 ) -> Result<Option<builds::Model>, DbErr> {
-    // 1. Native work first.
-    if let Some(build) = claim_among(db, worker_id, native_arches, lease_ttl_secs).await? {
-        return Ok(Some(build));
-    }
+    let fleet = Fleet::load(db).await?;
+    // Not approved (or vanished mid-request): nothing is claimable.
+    let Some(me) = fleet.worker(worker_id) else {
+        return Ok(None);
+    };
 
-    // 2. Emulated work, minus any arch reserved for a native worker.
-    if !emulated_arches.is_empty() {
-        let reserved = arches_with_native_worker(db).await?;
-        let emulatable: Vec<String> = emulated_arches
-            .iter()
-            .filter(|a| !reserved.contains(*a))
-            .cloned()
-            .collect();
-        if let Some(build) = claim_among(db, worker_id, &emulatable, lease_ttl_secs).await? {
-            return Ok(Some(build));
-        }
-    }
-    Ok(None)
-}
-
-/// Claim the oldest enqueued build among the given platforms, atomically.
-async fn claim_among<C: ConnectionTrait>(
-    db: &C,
-    worker_id: i32,
-    arches: &[String],
-    lease_ttl_secs: i64,
-) -> Result<Option<builds::Model>, DbErr> {
-    if arches.is_empty() {
+    let candidates: Vec<builds::Model> = Builds::find()
+        .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
+        .all(db)
+        .await?;
+    if candidates.is_empty() {
         return Ok(None);
     }
 
-    let candidates: Vec<i32> = Builds::find()
+    // Resolve pkgbase names for the queued builds in one query.
+    let pkg_ids: Vec<i32> = candidates.iter().map(|b| b.pkg_id).collect();
+    let names: HashMap<i32, String> = Packages::find()
         .select_only()
-        .column(builds::Column::Id)
-        .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
-        .filter(builds::Column::Platform.is_in(arches.iter().map(String::as_str)))
-        .order_by_asc(builds::Column::StartTime)
-        .order_by_asc(builds::Column::Id)
-        .into_tuple()
+        .column(packages::Column::Id)
+        .column(packages::Column::Name)
+        .filter(packages::Column::Id.is_in(pkg_ids))
+        .into_tuple::<(i32, String)>()
         .all(db)
-        .await?;
+        .await?
+        .into_iter()
+        .collect();
 
     let now = now_secs();
-    for id in candidates {
+    let mut ranked: Vec<(bool, bool, i64, i32)> = Vec::new();
+    for build in &candidates {
+        let Some(pkg) = names.get(&build.pkg_id) else {
+            continue;
+        };
+        let platform = build.platform.as_str();
+        if !fleet.capable(me, platform, pkg) {
+            continue;
+        }
+        let age = now - build.start_time.unwrap_or(now);
+        if age < spill_delay_secs && fleet.blocked(me, platform, pkg, now, liveness_timeout_secs) {
+            continue;
+        }
+        // Keys are negated because `false < true`: affine jobs first, then
+        // native ones, then oldest. A worker that *is* affine for a package
+        // should take that job ahead of one anybody could have taken, since it
+        // may be the only worker that can.
+        ranked.push((
+            !fleet.affine(me.id, pkg),
+            !me.native.iter().any(|a| a == platform),
+            build.start_time.unwrap_or(0),
+            build.id,
+        ));
+    }
+    ranked.sort_unstable();
+
+    for (_, _, _, id) in ranked {
         let res = Builds::update_many()
             .col_expr(builds::Column::Status, STATUS_ACTIVE.into())
             .col_expr(builds::Column::WorkerId, worker_id.into())
@@ -104,24 +304,6 @@ async fn claim_among<C: ConnectionTrait>(
         }
     }
     Ok(None)
-}
-
-/// Set of platform strings that at least one *approved* worker can build
-/// natively — these are reserved from emulated claims.
-async fn arches_with_native_worker<C: ConnectionTrait>(db: &C) -> Result<HashSet<String>, DbErr> {
-    let rows: Vec<String> = Workers::find()
-        .select_only()
-        .column(workers::Column::NativeArches)
-        .filter(workers::Column::Status.eq(STATUS_APPROVED))
-        .into_tuple()
-        .all(db)
-        .await?;
-
-    Ok(rows
-        .iter()
-        .flat_map(|row| row.split(',').map(str::trim).filter(|s| !s.is_empty()))
-        .map(ToString::to_string)
-        .collect())
 }
 
 /// Result of processing a heartbeat: builds that were reconciled away from the
@@ -248,6 +430,123 @@ pub async fn requeue_or_fail<C: ConnectionTrait>(
     })
 }
 
+/// Why an `ENQUEUED` build is not being picked up by anyone.
+///
+/// Only ever set for builds that *no approved worker can currently take*.
+/// Ordinary queueing behind a busy worker is not a reason and yields `None`;
+/// otherwise every queued build would carry a scary-looking explanation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitingReason {
+    /// Reserved by package affinity to workers that are not currently live.
+    /// Revoking a listed worker releases the reservation.
+    Affinity { workers: Vec<String> },
+    /// No approved worker builds this architecture, natively or emulated.
+    Arch { arch: String },
+    /// A capable worker exists but none has been seen recently.
+    Offline,
+}
+
+/// Explain every `ENQUEUED` build that no approved worker can currently claim.
+///
+/// Without this an affinity-reserved build that is stalled because its worker is
+/// offline looks exactly like a build waiting behind a busy queue — which is the
+/// single most likely way package affinity wastes someone's afternoon.
+pub async fn waiting_reasons<C: ConnectionTrait>(
+    db: &C,
+    liveness_timeout_secs: i64,
+) -> Result<HashMap<i32, WaitingReason>, DbErr> {
+    let queued: Vec<builds::Model> = Builds::find()
+        .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
+        .all(db)
+        .await?;
+    if queued.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let fleet = Fleet::load(db).await?;
+    let names: HashMap<i32, String> = Packages::find()
+        .select_only()
+        .column(packages::Column::Id)
+        .column(packages::Column::Name)
+        .filter(packages::Column::Id.is_in(queued.iter().map(|b| b.pkg_id)))
+        .into_tuple::<(i32, String)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+
+    let now = now_secs();
+    let mut out = HashMap::new();
+    for build in &queued {
+        let Some(pkg) = names.get(&build.pkg_id) else {
+            continue;
+        };
+        let platform = build.platform.as_str();
+        let capable: Vec<&WorkerCap> = fleet
+            .workers
+            .iter()
+            .filter(|w| fleet.capable(w, platform, pkg))
+            .collect();
+
+        let reason = if capable.is_empty() {
+            if fleet.reserved(pkg) {
+                // Reserved, and nothing that can take it: name the holders so an
+                // operator knows which machine to bring back or revoke.
+                WaitingReason::Affinity {
+                    workers: fleet.affinity_holders(pkg),
+                }
+            } else {
+                WaitingReason::Arch {
+                    arch: platform.to_string(),
+                }
+            }
+        } else if capable.iter().any(|w| {
+            w.last_seen
+                .is_some_and(|t| t >= now - liveness_timeout_secs)
+        }) {
+            // Someone capable is alive; this is just a queue.
+            continue;
+        } else if fleet.reserved(pkg) {
+            WaitingReason::Affinity {
+                workers: fleet.affinity_holders(pkg),
+            }
+        } else {
+            WaitingReason::Offline
+        };
+        out.insert(build.id, reason);
+    }
+    Ok(out)
+}
+
+/// Requeue every build a worker still holds in the `ACTIVE` state.
+///
+/// Called when a worker is revoked: from that moment the auth guard refuses it,
+/// so it can never report those builds complete. Without this they would sit
+/// `ACTIVE` until the lease reaper noticed, up to `LEASE_TTL`. Returns the ids
+/// that actually moved.
+pub async fn requeue_worker_builds<C: ConnectionTrait>(
+    db: &C,
+    worker_id: i32,
+    max_attempts: i32,
+) -> Result<Vec<i32>, DbErr> {
+    let owned: Vec<builds::Model> = Builds::find()
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .all(db)
+        .await?;
+
+    let mut moved = Vec::new();
+    for build in owned {
+        // Same optimistic CAS as the reaper, so a build that completed between
+        // the select above and this write is left alone.
+        if requeue_or_fail(db, &build, max_attempts).await? != RequeueOutcome::Unchanged {
+            moved.push(build.id);
+        }
+    }
+    Ok(moved)
+}
+
 /// Result of a reaper pass: which owned+active builds were requeued vs. given up.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReapOutcome {
@@ -311,17 +610,66 @@ mod tests {
     use sea_orm::{Database, DatabaseConnection};
     use sea_orm_migration::MigratorTrait;
 
+    const LEASE: i64 = 60;
+    const SPILL: i64 = 60;
+    const LIVENESS: i64 = 60;
+
     async fn setup() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         db
     }
 
-    async fn enqueue(db: &DatabaseConnection, id: i32, platform: &str, start: i64) {
+    /// An approved worker row. Defaults are a live, idle, native-x86_64 worker
+    /// with no affinity and no priority — i.e. one that neither reserves
+    /// anything nor blocks anyone.
+    struct W {
+        id: i32,
+        native: &'static str,
+        emulated: &'static str,
+        affinity: &'static str,
+        priority: i32,
+        concurrency: i32,
+        status: &'static str,
+        /// `None` means "never seen", which reads as not live.
+        last_seen: Option<i64>,
+    }
+
+    impl Default for W {
+        fn default() -> Self {
+            Self {
+                id: 1,
+                native: "x86_64",
+                emulated: "",
+                affinity: "",
+                priority: 0,
+                concurrency: 1,
+                status: STATUS_APPROVED,
+                last_seen: Some(now_secs()),
+            }
+        }
+    }
+
+    async fn worker(db: &DatabaseConnection, w: W) {
+        let last_seen = w
+            .last_seen
+            .map_or_else(|| "NULL".to_string(), |t| t.to_string());
+        db.execute_unprepared(&format!(
+            "INSERT INTO workers (id, name, status, cert_fingerprint, native_arches, \
+             emulated_arches, package_affinity, priority, concurrency, last_seen) \
+             VALUES ({}, 'w{}', '{}', 'fp{}', '{}', '{}', '{}', {}, {}, {last_seen})",
+            w.id, w.id, w.status, w.id, w.native, w.emulated, w.affinity, w.priority, w.concurrency
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Enqueue a build of package `name` at `start` (epoch seconds).
+    async fn enqueue_pkg(db: &DatabaseConnection, id: i32, name: &str, platform: &str, start: i64) {
         // A partial unique index forbids two pending builds for the same
         // (pkg_id, platform); give every build its own package.
         db.execute_unprepared(&format!(
-            "INSERT INTO packages (id, name) VALUES ({id}, 'p{id}')"
+            "INSERT INTO packages (id, name) VALUES ({id}, '{name}')"
         ))
         .await
         .unwrap();
@@ -333,118 +681,630 @@ mod tests {
         .unwrap();
     }
 
+    async fn enqueue(db: &DatabaseConnection, id: i32, platform: &str, start: i64) {
+        enqueue_pkg(db, id, &format!("p{id}"), platform, start).await;
+    }
+
+    async fn claim(db: &DatabaseConnection, worker_id: i32) -> Option<builds::Model> {
+        claim_job(db, worker_id, LEASE, SPILL, LIVENESS)
+            .await
+            .unwrap()
+    }
+
+    // ---------------------------------------------------------------- arches
+
     #[tokio::test]
     async fn claims_oldest_matching_arch() {
         let db = setup().await;
+        worker(&db, W::default()).await;
         enqueue(&db, 10, "x86_64", 200).await;
         enqueue(&db, 11, "x86_64", 100).await;
         enqueue(&db, 12, "aarch64", 50).await;
 
-        let claimed = claim_job(&db, 7, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap()
-            .unwrap();
+        let claimed = claim(&db, 1).await.unwrap();
         // Oldest x86_64 job wins; the older aarch64 job is not buildable.
         assert_eq!(claimed.id, 11);
         assert_eq!(claimed.status, Some(STATUS_ACTIVE));
-        assert_eq!(claimed.worker_id, Some(7));
+        assert_eq!(claimed.worker_id, Some(1));
         assert!(claimed.lease_expires_at.is_some());
     }
 
     #[tokio::test]
     async fn claim_is_atomic_no_double_handout() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 20, "x86_64", 100).await;
-        let a = claim_job(&db, 1, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
-        let b = claim_job(&db, 2, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
-        assert!(a.is_some());
-        assert!(b.is_none());
+
+        assert!(claim(&db, 1).await.is_some());
+        assert!(claim(&db, 2).await.is_none());
     }
 
-    async fn approved_worker(db: &DatabaseConnection, id: i32, native: &str) {
-        db.execute_unprepared(&format!(
-            "INSERT INTO workers (id, name, status, cert_fingerprint, native_arches, emulated_arches) \
-             VALUES ({id}, 'w{id}', 'approved', 'fp{id}', '{native}', '')"
-        ))
-        .await
-        .unwrap();
+    #[tokio::test]
+    async fn unknown_or_unapproved_worker_claims_nothing() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                status: "revoked",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 21, "x86_64", 100).await;
+
+        assert!(claim(&db, 1).await.is_none(), "revoked worker claimed");
+        assert!(claim(&db, 99).await.is_none(), "unknown worker claimed");
     }
 
     #[tokio::test]
     async fn native_preferred_over_emulated() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                emulated: "aarch64",
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 30, "aarch64", 50).await; // older, emulatable
         enqueue(&db, 31, "x86_64", 100).await; // newer, native
 
-        // Worker is native x86_64 and can emulate aarch64. No native aarch64
-        // worker exists, so it *may* emulate — but native work comes first.
-        let claimed = claim_job(
-            &db,
-            1,
-            &["x86_64".to_string()],
-            &["aarch64".to_string()],
-            60,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(claimed.id, 31);
+        // No native aarch64 worker exists, so it *may* emulate — but native
+        // work comes first.
+        assert_eq!(claim(&db, 1).await.unwrap().id, 31);
     }
 
     #[tokio::test]
     async fn foreign_arch_reserved_for_native_worker() {
         let db = setup().await;
-        enqueue(&db, 40, "aarch64", 50).await;
-        // A native aarch64 worker is registered (id=2) -> aarch64 is reserved.
-        approved_worker(&db, 2, "aarch64").await;
-
-        // An x86_64 worker that can emulate aarch64 must NOT grab the reserved job.
-        let claimed = claim_job(
+        worker(
             &db,
-            1,
-            &["x86_64".to_string()],
-            &["aarch64".to_string()],
-            60,
+            W {
+                id: 1,
+                emulated: "aarch64",
+                ..W::default()
+            },
         )
-        .await
-        .unwrap();
-        assert!(claimed.is_none());
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                native: "aarch64",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 40, "aarch64", 50).await;
 
-        // The native aarch64 worker claims it.
-        let native = claim_job(&db, 2, &["aarch64".to_string()], &[], 60)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(native.id, 40);
+        // The emulating worker must not grab the reserved job...
+        assert!(claim(&db, 1).await.is_none());
+        // ...the native one does.
+        assert_eq!(claim(&db, 2).await.unwrap().id, 40);
     }
 
     #[tokio::test]
     async fn emulated_claim_when_no_native_worker() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                emulated: "armv7h",
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 50, "armv7h", 50).await;
-        // No native armv7h worker -> an emulating worker may take it.
-        let claimed = claim_job(&db, 1, &["x86_64".to_string()], &["armv7h".to_string()], 60)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.id, 50);
+
+        assert_eq!(claim(&db, 1).await.unwrap().id, 50);
     }
+
+    // -------------------------------------------------------------- affinity
+
+    #[tokio::test]
+    async fn affinity_reserves_package_to_declaring_worker() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 60, "unreal-engine", "x86_64", 100).await;
+
+        assert!(claim(&db, 1).await.is_none(), "non-affine worker claimed");
+        assert_eq!(claim(&db, 2).await.unwrap().id, 60);
+    }
+
+    #[tokio::test]
+    async fn package_nobody_claims_is_unaffected_by_affinity_lists() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 61, "hello", "x86_64", 100).await;
+
+        assert_eq!(claim(&db, 1).await.unwrap().id, 61);
+    }
+
+    /// Exact matching only: no wildcards, and no accidental prefix reservation.
+    #[tokio::test]
+    async fn affinity_matches_package_names_exactly() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 62, "unreal-engine-bin", "x86_64", 100).await;
+        enqueue_pkg(&db, 63, "unreal", "x86_64", 200).await;
+
+        // Neither neighbouring name is reserved.
+        assert_eq!(claim(&db, 1).await.unwrap().id, 62);
+        assert_eq!(claim(&db, 1).await.unwrap().id, 63);
+    }
+
+    /// An affine worker should take its affine job ahead of an older job that
+    /// anybody could have taken — it may be the only worker that can.
+    #[tokio::test]
+    async fn affine_worker_prefers_its_affine_job() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 70, "hello", "x86_64", 100).await; // older, general
+        enqueue_pkg(&db, 71, "unreal-engine", "x86_64", 200).await; // newer, affine
+
+        assert_eq!(claim(&db, 1).await.unwrap().id, 71);
+    }
+
+    /// Liveness is deliberately not part of the affinity rule: handing the job
+    /// elsewhere fails, where waiting merely waits.
+    #[tokio::test]
+    async fn offline_approved_affine_worker_still_reserves() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                last_seen: Some(now_secs() - 86_400),
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 72, "unreal-engine", "x86_64", 100).await;
+
+        assert!(claim(&db, 1).await.is_none());
+    }
+
+    /// Revoking is the documented escape hatch for a reservation held by a
+    /// machine that is never coming back.
+    #[tokio::test]
+    async fn revoked_affine_worker_does_not_reserve() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                status: "revoked",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 73, "unreal-engine", "x86_64", 100).await;
+
+        assert_eq!(claim(&db, 1).await.unwrap().id, 73);
+    }
+
+    #[tokio::test]
+    async fn affinity_and_arch_reservation_compose() {
+        let db = setup().await;
+        // Affine but wrong arch.
+        worker(
+            &db,
+            W {
+                id: 1,
+                native: "x86_64",
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        // Right arch but not affine.
+        worker(
+            &db,
+            W {
+                id: 2,
+                native: "aarch64",
+                ..W::default()
+            },
+        )
+        .await;
+        // Both.
+        worker(
+            &db,
+            W {
+                id: 3,
+                native: "aarch64",
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 74, "unreal-engine", "aarch64", 100).await;
+
+        assert!(claim(&db, 1).await.is_none(), "wrong arch claimed");
+        assert!(claim(&db, 2).await.is_none(), "non-affine claimed");
+        assert_eq!(claim(&db, 3).await.unwrap().id, 74);
+    }
+
+    // -------------------------------------------------------------- priority
+
+    /// A fresh job, and a live idle faster worker exists: hold back.
+    #[tokio::test]
+    async fn lower_priority_worker_is_blocked_while_faster_one_is_available() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 80, "x86_64", now_secs()).await;
+
+        assert!(claim(&db, 2).await.is_none(), "fallback jumped the queue");
+        assert_eq!(claim(&db, 1).await.unwrap().id, 80);
+    }
+
+    /// Saturated fast worker: the fallback takes over immediately, with no
+    /// delay — the case a fixed hold-back would have penalised.
+    #[tokio::test]
+    async fn spills_immediately_when_faster_worker_is_full() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                concurrency: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 81, "x86_64", now_secs()).await;
+        enqueue(&db, 82, "x86_64", now_secs()).await;
+
+        // Worker 1 fills its single slot...
+        assert!(claim(&db, 1).await.is_some());
+        // ...so worker 2 is free to take the other job right away.
+        assert!(claim(&db, 2).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn spills_immediately_when_faster_worker_is_stale() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                last_seen: Some(now_secs() - 3600),
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 83, "x86_64", now_secs()).await;
+
+        assert_eq!(claim(&db, 2).await.unwrap().id, 83);
+    }
+
+    /// The backstop: a faster worker that looks healthy but never claims must
+    /// not stall a job forever.
+    #[tokio::test]
+    async fn spills_once_the_job_is_older_than_the_spill_delay() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 84, "x86_64", now_secs() - SPILL - 1).await;
+
+        assert_eq!(claim(&db, 2).await.unwrap().id, 84);
+    }
+
+    #[tokio::test]
+    async fn equal_priority_workers_do_not_block_each_other() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 85, "x86_64", now_secs()).await;
+
+        assert_eq!(claim(&db, 2).await.unwrap().id, 85);
+    }
+
+    /// A faster worker that cannot build the job at all must not hold it back.
+    #[tokio::test]
+    async fn incapable_faster_worker_does_not_block() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                native: "aarch64",
+                priority: 10,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 86, "x86_64", now_secs()).await;
+
+        assert_eq!(claim(&db, 2).await.unwrap().id, 86);
+    }
+
+    /// Priority must not override affinity: a faster worker without the
+    /// affinity cannot take the job, and must not block the affine one either.
+    #[tokio::test]
+    async fn priority_does_not_override_affinity() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 87, "unreal-engine", "x86_64", now_secs()).await;
+
+        assert!(claim(&db, 1).await.is_none());
+        assert_eq!(claim(&db, 2).await.unwrap().id, 87);
+    }
+
+    // -------------------------------------------------- waiting reasons
+
+    #[tokio::test]
+    async fn no_reason_when_a_live_worker_could_take_the_job() {
+        let db = setup().await;
+        worker(&db, W::default()).await;
+        enqueue(&db, 100, "x86_64", now_secs()).await;
+
+        // Ordinary queueing is not a "reason" — otherwise every queued build
+        // would carry an alarming explanation.
+        assert!(waiting_reasons(&db, LIVENESS).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explains_a_build_reserved_to_an_offline_worker() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                affinity: "unreal-engine",
+                last_seen: Some(now_secs() - 86_400),
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue_pkg(&db, 101, "unreal-engine", "x86_64", now_secs()).await;
+
+        let reasons = waiting_reasons(&db, LIVENESS).await.unwrap();
+        assert_eq!(
+            reasons.get(&101),
+            Some(&WaitingReason::Affinity {
+                workers: vec!["w2".to_string()]
+            })
+        );
+    }
+
+    /// Closes a pre-existing blind spot: a foreign-arch build with no worker
+    /// for that arch stalls silently today.
+    #[tokio::test]
+    async fn explains_an_arch_no_worker_can_build() {
+        let db = setup().await;
+        worker(&db, W::default()).await;
+        enqueue(&db, 102, "aarch64", now_secs()).await;
+
+        let reasons = waiting_reasons(&db, LIVENESS).await.unwrap();
+        assert_eq!(
+            reasons.get(&102),
+            Some(&WaitingReason::Arch {
+                arch: "aarch64".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn explains_a_fleet_that_is_entirely_offline() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                last_seen: Some(now_secs() - 86_400),
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 103, "x86_64", now_secs()).await;
+
+        let reasons = waiting_reasons(&db, LIVENESS).await.unwrap();
+        assert_eq!(reasons.get(&103), Some(&WaitingReason::Offline));
+    }
+
+    // ------------------------------------------------- leases and reaping
 
     #[tokio::test]
     async fn heartbeat_renews_reported_and_requeues_dropped() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 5,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 30, "x86_64", 100).await;
         enqueue(&db, 31, "x86_64", 100).await;
-        claim_job(&db, 5, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
-        claim_job(&db, 5, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 5, 60, SPILL, LIVENESS).await.unwrap();
+        claim_job(&db, 5, 60, SPILL, LIVENESS).await.unwrap();
 
         // Report only build 30 as active -> 31 was dropped and should requeue.
         let out = heartbeat(&db, 5, &[30], 60, 3).await.unwrap();
@@ -460,10 +1320,16 @@ mod tests {
     #[tokio::test]
     async fn requeue_budget_eventually_fails() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 9,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 40, "x86_64", 100).await;
-        claim_job(&db, 9, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 9, 60, SPILL, LIVENESS).await.unwrap();
 
         // attempts 0 -> requeue (count 1), claim again, etc.
         for expected in [
@@ -473,9 +1339,7 @@ mod tests {
             RequeueOutcome::Failed,
         ] {
             // ensure it's active + owned before requeue
-            claim_job(&db, 9, &["x86_64".to_string()], &[], 60)
-                .await
-                .unwrap();
+            claim_job(&db, 9, 60, SPILL, LIVENESS).await.unwrap();
             let observed = Builds::find_by_id(40).one(&db).await.unwrap().unwrap();
             let outcome = requeue_or_fail(&db, &observed, 3).await.unwrap();
             assert_eq!(outcome, expected);
@@ -487,15 +1351,19 @@ mod tests {
     #[tokio::test]
     async fn reaper_requeues_expired_lease_only() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 3,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 60, "x86_64", 100).await;
         enqueue(&db, 61, "x86_64", 100).await;
         // Claim both with a 60s lease so lease_expires_at = claim_now + 60.
-        claim_job(&db, 3, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
-        claim_job(&db, 3, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 3, 60, SPILL, LIVENESS).await.unwrap();
+        claim_job(&db, 3, 60, SPILL, LIVENESS).await.unwrap();
 
         // "now" far in the future: both leases are expired -> both requeued.
         let far = now_secs() + 10_000;
@@ -515,10 +1383,16 @@ mod tests {
     #[tokio::test]
     async fn requeue_skips_build_resolved_after_observation() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 7,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 90, "x86_64", 100).await;
-        claim_job(&db, 7, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 7, 60, SPILL, LIVENESS).await.unwrap();
 
         // What the reaper would have seen in its candidate select.
         let observed = Builds::find_by_id(90).one(&db).await.unwrap().unwrap();
@@ -546,10 +1420,16 @@ mod tests {
     #[tokio::test]
     async fn requeue_skips_build_whose_lease_was_renewed() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 8,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 91, "x86_64", 100).await;
-        claim_job(&db, 8, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 8, 60, SPILL, LIVENESS).await.unwrap();
         let observed = Builds::find_by_id(91).one(&db).await.unwrap().unwrap();
 
         // Worker heartbeats: lease pushed out, build still ACTIVE and owned.
@@ -566,10 +1446,16 @@ mod tests {
     #[tokio::test]
     async fn reaper_leaves_fresh_leases_alone() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 4,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 70, "x86_64", 100).await;
-        claim_job(&db, 4, &["x86_64".to_string()], &[], 600)
-            .await
-            .unwrap();
+        claim_job(&db, 4, 600, SPILL, LIVENESS).await.unwrap();
 
         // "now" is right after the claim: lease is fresh, build is young.
         let out = reap_expired_builds(&db, now_secs(), 3, 100_000)
@@ -584,11 +1470,17 @@ mod tests {
     #[tokio::test]
     async fn reaper_backstop_fires_despite_fresh_lease() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 6,
+                ..W::default()
+            },
+        )
+        .await;
         // start_time = 100 (long ago); claim gives a fresh far-future lease.
         enqueue(&db, 80, "x86_64", 100).await;
-        claim_job(&db, 6, &["x86_64".to_string()], &[], 1_000_000)
-            .await
-            .unwrap();
+        claim_job(&db, 6, 1_000_000, SPILL, LIVENESS).await.unwrap();
 
         // Backstop: max_build_age small so start_time(=claim now) is "too old"
         // relative to a `now` well past it, even though the lease is fresh.
@@ -600,10 +1492,16 @@ mod tests {
     #[tokio::test]
     async fn reaper_gives_up_after_budget() {
         let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
         enqueue(&db, 90, "x86_64", 100).await;
-        claim_job(&db, 2, &["x86_64".to_string()], &[], 60)
-            .await
-            .unwrap();
+        claim_job(&db, 2, 60, SPILL, LIVENESS).await.unwrap();
         // Pre-exhaust the budget.
         db.execute_unprepared("UPDATE builds SET attempt_count = 3 WHERE id = 90")
             .await
