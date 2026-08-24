@@ -48,8 +48,11 @@ class WorkersScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  "Workers must be approved before they can build. Revoke to "
-                  "immediately refuse a worker's certificate.",
+                  "Workers must be approved before they can build. Revoking "
+                  "refuses a worker's certificate, releases any packages it "
+                  "reserved, and requeues its in-flight builds — it is also how "
+                  "a machine is retired, since worker rows are kept so build "
+                  "history stays readable.",
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 SizedBox(
@@ -90,8 +93,40 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
   /// buttons are disabled to prevent double-tap races.
   final Set<int> _pending = {};
 
+  /// Revoked workers are kept forever so build history keeps resolving to the
+  /// machine that produced it, which means the list would otherwise grow
+  /// without bound. Hide them behind a toggle instead of deleting rows.
+  bool _showRetired = false;
+
   @override
   Widget build(BuildContext context) {
+    final retired = widget.data.where((e) => e.isRevoked).length;
+    final visible = _showRetired
+        ? widget.data
+        : widget.data.where((e) => !e.isRevoked).toList(growable: false);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (retired > 0)
+          TextButton.icon(
+            onPressed: () => setState(() => _showRetired = !_showRetired),
+            icon: Icon(
+              _showRetired ? Icons.visibility_off : Icons.visibility,
+              size: 18,
+            ),
+            label: Text(
+              _showRetired
+                  ? "Hide retired ($retired)"
+                  : "Show retired ($retired)",
+            ),
+          ),
+        _table(visible, context),
+      ],
+    );
+  }
+
+  Widget _table(List<Worker> data, BuildContext context) {
     return DataTable(
       horizontalMargin: 12,
       columnSpacing: defaultPadding,
@@ -106,14 +141,16 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
         DataColumn(label: Skeleton.keep(child: const Text("Status"))),
         DataColumn(label: Skeleton.keep(child: const Text("Arches"))),
         if (context.desktop)
+          DataColumn(label: Skeleton.keep(child: const Text("Packages"))),
+        if (context.desktop)
+          DataColumn(label: Skeleton.keep(child: const Text("Priority"))),
+        if (context.desktop)
           DataColumn(label: Skeleton.keep(child: const Text("Version"))),
         if (context.desktop)
           DataColumn(label: Skeleton.keep(child: const Text("Last Seen"))),
         DataColumn(label: Skeleton.keep(child: const Text("Action"))),
       ],
-      rows: widget.data
-          .map((e) => buildDataRow(e, context))
-          .toList(growable: false),
+      rows: data.map((e) => buildDataRow(e, context)).toList(growable: false),
     );
   }
 
@@ -128,6 +165,8 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
         ),
         DataCell(_statusChip(worker.status)),
         DataCell(Text(arches)),
+        if (context.desktop) DataCell(_affinityChips(worker)),
+        if (context.desktop) DataCell(_priorityCell(worker)),
         if (context.desktop) DataCell(Text(worker.version ?? "-")),
         if (context.desktop) DataCell(Text(_formatLastSeen(worker.last_seen))),
         DataCell(_actionButtons(worker)),
@@ -142,6 +181,41 @@ class _WorkersTableState extends ConsumerState<WorkersTable> {
     if (emulated.isEmpty) return native;
     if (native.isEmpty) return "(+$emulated)";
     return "$native (+$emulated)";
+  }
+
+  /// Packages reserved to this worker. Spelled out rather than counted: which
+  /// packages are restricted is the whole point of the column.
+  Widget _affinityChips(Worker worker) {
+    final packages = worker.affinityPackages;
+    if (packages.isEmpty) return const Text("-");
+    return Wrap(
+      spacing: 4,
+      runSpacing: 4,
+      children: packages
+          .map(
+            (p) => Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2A2D3E),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(p, style: const TextStyle(fontSize: 12)),
+            ),
+          )
+          .toList(growable: false),
+    );
+  }
+
+  /// `0` is the default and means "no preference", so show it as a dash to keep
+  /// the column quiet until someone actually tunes the fleet.
+  Widget _priorityCell(Worker worker) {
+    if (worker.priority == 0) return const Text("-");
+    return Tooltip(
+      message:
+          "Higher priority workers get jobs first; lower ones take over when "
+          "these are full or offline.",
+      child: Text("${worker.priority}"),
+    );
   }
 
   Widget _statusChip(String status) {

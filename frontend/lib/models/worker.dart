@@ -20,6 +20,16 @@ class Worker {
   final DateTime? last_seen;
   final String? version;
 
+  /// Comma-separated exact pkgbase names this worker is provisioned for.
+  /// Packages listed here can only be built by workers that list them.
+  final String package_affinity;
+
+  /// Scheduling preference; higher wins. 0 means "no preference".
+  final int priority;
+
+  /// Maximum concurrent builds the worker reported.
+  final int concurrency;
+
   Worker({
     required this.id,
     required this.name,
@@ -29,6 +39,9 @@ class Worker {
     required this.emulated_arches,
     required this.last_seen,
     required this.version,
+    required this.package_affinity,
+    required this.priority,
+    required this.concurrency,
   });
 
   factory Worker.fromJson(Map<String, dynamic> json) => Worker(
@@ -42,11 +55,21 @@ class Worker {
         ? DateTime.fromMillisecondsSinceEpoch((json['last_seen'] as int) * 1000)
         : null,
     version: json['version'] as String?,
+    package_affinity: json['package_affinity'] as String? ?? "",
+    priority: json['priority'] as int? ?? 0,
+    concurrency: json['concurrency'] as int? ?? 1,
   );
 
   bool get isPending => status == "pending";
   bool get isApproved => status == "approved";
   bool get isRevoked => status == "revoked";
+
+  /// Packages this worker is provisioned for, as a list.
+  List<String> get affinityPackages => package_affinity
+      .split(",")
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList(growable: false);
 
   factory Worker.dummy() => Worker(
     id: 1,
@@ -57,5 +80,8 @@ class Worker {
     emulated_arches: "",
     last_seen: DateTime.now(),
     version: "0.1.0",
+    package_affinity: "",
+    priority: 0,
+    concurrency: 1,
   );
 }

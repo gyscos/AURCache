@@ -62,15 +62,31 @@ class BuildsTable extends StatelessWidget {
         DataCell(Text(build.version)),
         if (context.desktop) DataCell(Text(build.platform)),
         DataCell(
-          IconButton(
-            icon: Icon(
-              switchSuccessIcon(build.status),
-              color: switchSuccessColor(build.status),
-            ),
-            tooltip: statusLabel(build.status),
-            onPressed: () {
-              context.push("/build/${build.id}");
-            },
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                icon: Icon(
+                  switchSuccessIcon(build.status),
+                  color: switchSuccessColor(build.status),
+                ),
+                tooltip: statusLabel(build.status),
+                onPressed: () {
+                  context.push("/build/${build.id}");
+                },
+              ),
+              // A stalled build is otherwise indistinguishable from one queued
+              // behind a busy worker: same status, same icon, forever.
+              if (build.waitingMessage != null)
+                Tooltip(
+                  message: build.waitingMessage!,
+                  child: const Icon(
+                    Icons.warning_amber_rounded,
+                    color: Color(0xFFE0A800),
+                    size: 20,
+                  ),
+                ),
+            ],
           ),
         ),
       ],
