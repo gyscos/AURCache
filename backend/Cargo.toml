@@ -20,10 +20,9 @@ members = [
 # Idioms enforced across the workspace. Every lint here is at zero warnings, so
 # these guard against regression rather than demanding a cleanup.
 #
-# To accommodate a specific site, add a local
-# #[expect(clippy::x, reason = "...")] there rather than dropping the lint from
-# this list. A rule is left out below only when we object to it generally, not
-# because of one awkward case.
+# To accommodate a specific site, suppress it locally there rather than dropping
+# the lint from this list. A rule is left out below only when we object to it
+# generally, not because of one awkward case.
 #
 # Pedantic/nursery lints deliberately not adopted:
 #   map_unwrap_or        - map_or_else puts the fallback before the transform,

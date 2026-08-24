@@ -7,6 +7,7 @@ use crate::models::package::{
     AurNotFoundPackage, AurPackage, ExtendedPackageModel, PackageDependencyModel, PackageSource,
     SimplePackageModel,
 };
+use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
@@ -25,7 +26,7 @@ use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
-use rocket::response::status::{BadRequest, Custom, NotFound};
+
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
@@ -74,14 +75,14 @@ pub async fn package_add_endpoint(
     store: &State<Arc<SnapshotStore>>,
     a: Authenticated,
     al: &State<ActivityLog>,
-) -> Result<(), BadRequest<String>> {
+) -> Result<(), ApiError> {
     let platforms = match input.platforms.clone() {
         None => None,
         Some(v) => Some(
             v.into_iter()
                 .map(|s| Platform::from_str(&s).ok())
                 .collect::<Option<Vec<Platform>>>()
-                .ok_or_else(|| BadRequest("Invalid Platform name".to_string()))?,
+                .ok_or_else(|| err(Status::BadRequest, "Invalid platform name"))?,
         ),
     };
 
@@ -95,7 +96,11 @@ pub async fn package_add_endpoint(
         input.patched_files.clone(),
     )
     .await
-    .map_err(|e| BadRequest(e.to_string()))?;
+    // Adding is driven by user input: an unknown AUR name, an unreachable git
+    // remote or an unparseable PKGBUILD are all "this request cannot be
+    // fulfilled" rather than a server fault, and the flow reports them as an
+    // untyped `anyhow` error we cannot tell apart from an internal one.
+    .map_err(|e| err(Status::BadRequest, e))?;
 
     al.add(
         PackageAddActivity {
@@ -105,7 +110,7 @@ pub async fn package_add_endpoint(
         a.username,
     )
     .await
-    .map_err(|e| BadRequest(e.to_string()))?;
+    .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(())
 }
 
@@ -125,7 +130,7 @@ pub async fn package_update_entity_endpoint(
     input: Json<PackagePatchModel>,
     id: i32,
     _a: Authenticated,
-) -> Result<(), BadRequest<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
 
     // We cannot move things out of Json<T>, but we can move it out of T.
@@ -157,7 +162,7 @@ pub async fn package_update_entity_endpoint(
     let updated = update_pkg
         .update(db)
         .await
-        .map_err(|e| BadRequest(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     // A patch being set or cleared here (e.g. via the "reset patch" action)
     // can change `depends`/`makedepends` without bumping the package's
@@ -166,7 +171,7 @@ pub async fn package_update_entity_endpoint(
         let client = AurClient::new();
         package_resync_dependencies(&client, store, db, tx, &updated)
             .await
-            .map_err(|e| BadRequest(e.to_string()))?;
+            .map_err(|e| err(Status::InternalServerError, e))?;
     }
 
     Ok(())
@@ -186,20 +191,19 @@ pub async fn package_source_files(
     store: &State<Arc<SnapshotStore>>,
     id: i32,
     _a: Authenticated,
-) -> Result<Json<SourceFileList>, Custom<String>> {
+) -> Result<Json<SourceFileList>, ApiError> {
     let db = db.inner();
 
     let pkg = Packages::find_by_id(id)
         .one(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
-    let client = AurClient::new();
     let files = store
-        .list_files(&client, &pkg.source_data)
+        .list_files(&pkg.source_data)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(Json(SourceFileList { files }))
 }
@@ -220,21 +224,19 @@ pub async fn package_source_file(
     id: i32,
     path: String,
     _a: Authenticated,
-) -> Result<Json<SourceFileContent>, Custom<String>> {
+) -> Result<Json<SourceFileContent>, ApiError> {
     let db = db.inner();
 
     let pkg = Packages::find_by_id(id)
         .one(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
-
-    let client = AurClient::new();
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     let (original_content, patched_content, patch_error) = store
-        .read_file_with_patch_status(&client, &pkg.source_data, pkg.patch.as_deref(), &path)
+        .read_file_with_patch_status(&pkg.source_data, pkg.patch.as_deref(), &path)
         .await
-        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+        .map_err(|e| err(Status::NotFound, e))?;
 
     Ok(Json(SourceFileContent {
         path,
@@ -260,31 +262,31 @@ pub async fn package_source_file_update(
     id: i32,
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
     let input = input.into_inner();
 
     let pkg = Packages::find_by_id(id)
         .one(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| Custom(Status::NotFound, "id not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     let client = AurClient::new();
 
     // Diff against the pristine (unpatched) file, not the currently effective
     // one, so re-saving the same edit twice is idempotent.
     let original = store
-        .read_file(&client, &pkg.source_data, None, &input.path)
+        .read_file(&pkg.source_data, None, &input.path)
         .await
-        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+        .map_err(|e| err(Status::NotFound, e))?;
 
     let mut patch = pkg
         .patch
         .as_deref()
         .map(SourcePatch::parse)
         .transpose()
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
+        .map_err(|e| err(Status::InternalServerError, e))?
         .unwrap_or_default();
     patch.merge_file(&input.path, &original, &input.content);
 
@@ -294,7 +296,7 @@ pub async fn package_source_file_update(
         Some(
             patch
                 .to_json()
-                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?,
+                .map_err(|e| err(Status::InternalServerError, e))?,
         )
     };
 
@@ -309,7 +311,7 @@ pub async fn package_source_file_update(
     update_pkg
         .update(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     // A patch can change `depends`/`makedepends` without bumping the
     // package's version, so resync the dependency graph immediately rather
@@ -319,7 +321,7 @@ pub async fn package_source_file_update(
     package_resync_dependencies(&client, store, db, tx, &resynced_pkg)
         .await
         .map_err(|e| {
-            Custom(
+            err(
                 Status::InternalServerError,
                 format!("Patch saved, but failed to resync dependencies: {e}"),
             )
@@ -338,12 +340,11 @@ pub async fn package_source_preview_files(
     store: &State<Arc<SnapshotStore>>,
     input: Json<SourcePreviewRequest>,
     _a: Authenticated,
-) -> Result<Json<SourceFileList>, Custom<String>> {
-    let client = AurClient::new();
+) -> Result<Json<SourceFileList>, ApiError> {
     let files = store
-        .list_files(&client, &input.source)
+        .list_files(&input.source)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(Json(SourceFileList { files }))
 }
@@ -358,13 +359,11 @@ pub async fn package_source_preview_file(
     store: &State<Arc<SnapshotStore>>,
     input: Json<SourcePreviewFileRequest>,
     _a: Authenticated,
-) -> Result<Json<SourceFileContent>, Custom<String>> {
-    let client = AurClient::new();
-
+) -> Result<Json<SourceFileContent>, ApiError> {
     let original_content = store
-        .read_file(&client, &input.source, None, &input.path)
+        .read_file(&input.source, None, &input.path)
         .await
-        .map_err(|e| Custom(Status::NotFound, e.to_string()))?;
+        .map_err(|e| err(Status::NotFound, e))?;
 
     Ok(Json(SourceFileContent {
         path: input.path.clone(),
@@ -391,14 +390,14 @@ pub async fn package_update_endpoint(
     store: &State<Arc<SnapshotStore>>,
     a: Authenticated,
     al: &State<ActivityLog>,
-) -> Result<Json<Vec<i32>>, BadRequest<String>> {
+) -> Result<Json<Vec<i32>>, ApiError> {
     let db = db.inner();
 
     let pkg_model: packages::Model = Packages::find_by_id(id)
         .one(db)
         .await
-        .map_err(|e| BadRequest(e.to_string()))?
-        .ok_or_else(|| BadRequest("id not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     let pkg_update = package_update(store, db, pkg_model.clone(), input.force, tx)
         .await
@@ -411,7 +410,9 @@ pub async fn package_update_endpoint(
                     .collect::<Vec<_>>(),
             )
         })
-        .map_err(|e| BadRequest(e.to_string()))?;
+        // Same as adding: "already up to date", an unresolvable source, or a
+        // patch that no longer applies are all caller-visible conditions.
+        .map_err(|e| err(Status::BadRequest, e))?;
 
     al.add(
         PackageUpdateActivity {
@@ -422,7 +423,7 @@ pub async fn package_update_endpoint(
         a.username,
     )
     .await
-    .map_err(|e| BadRequest(e.to_string()))?;
+    .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(pkg_update)
 }
 
@@ -440,19 +441,19 @@ pub async fn package_del(
     id: i32,
     a: Authenticated,
     al: &State<ActivityLog>,
-) -> Result<(), BadRequest<String>> {
+) -> Result<(), ApiError> {
     let db = db.inner();
 
     // query this before removing package ownership!
     let pkg = Packages::find_by_id(id)
         .one(db)
         .await
-        .map_err(|e| BadRequest(e.to_string()))?
-        .ok_or_else(|| BadRequest("id not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     package_remove(db, id)
         .await
-        .map_err(|e| BadRequest(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     al.add(
         PackageDeleteActivity { package: pkg.name },
@@ -460,7 +461,7 @@ pub async fn package_del(
         a.username,
     )
     .await
-    .map_err(|e| BadRequest(e.to_string()))?;
+    .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(())
 }
@@ -479,13 +480,13 @@ pub async fn package_list(
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
-) -> Result<Json<Vec<SimplePackageModel>>, NotFound<String>> {
+) -> Result<Json<Vec<SimplePackageModel>>, ApiError> {
     let db = db.inner();
 
     list_directly_requested_packages(db, limit, page)
         .await
         .map(Json)
-        .map_err(|e| NotFound(e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
 }
 
 async fn list_directly_requested_packages(
@@ -575,15 +576,15 @@ pub async fn get_package(
     db: &State<DatabaseConnection>,
     id: i32,
     _a: Authenticated,
-) -> Result<Json<ExtendedPackageModel>, Custom<String>> {
+) -> Result<Json<ExtendedPackageModel>, ApiError> {
     let db = db.inner();
 
     let pkg = Packages::find()
         .filter(packages::Column::Id.eq(id))
         .one(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| Custom(Status::NotFound, "ID not found".to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
 
     // Query the latest build.version for this package (most recent by end_time then start_time)
     let latest_version_row = Builds::find()
@@ -596,15 +597,15 @@ pub async fn get_package(
         .into_tuple::<(String,)>()
         .one(db)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
     let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
     let dependents = list_package_relations(db, pkg.id, RelationDirection::Dependents)
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     let has_patch = pkg.patch.is_some();
     let source_data = pkg.source_data;
@@ -623,7 +624,7 @@ pub async fn get_package(
 
             let aur_info = get_package_info(&query_name)
                 .await
-                .map_err(|e| Custom(Status::InternalServerError, e.to_string()))?;
+                .map_err(|e| err(Status::InternalServerError, e))?;
 
             match aur_info {
                 None => (
@@ -656,9 +657,9 @@ pub async fn get_package(
             pkg.upstream_version.unwrap_or_default(),
         ),
         SourceData::Upload { .. } => {
-            return Err(Custom(
+            return Err(err(
                 Status::NotImplemented,
-                "Upload sources are not yet supported".to_string(),
+                "Upload sources are not yet supported",
             ));
         }
     };

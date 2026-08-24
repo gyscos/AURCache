@@ -239,7 +239,7 @@ pub fn init_repo() -> JoinHandle<()> {
         };
 
         let launch_result = rocket::custom(config)
-            .mount("/", CustomFileServer::from("./repo"))
+            .mount("/", CustomFileServer::new("./repo"))
             .launch()
             .await;
         match launch_result {

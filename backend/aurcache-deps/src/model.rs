@@ -10,6 +10,18 @@ pub enum Error {
     /// An underlying HTTP error from `reqwest`.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// Reading or writing the local repo / official-repo DB cache failed.
+    #[error("repository cache I/O failed")]
+    Io(#[from] std::io::Error),
+    /// A repository or RPC URL could not be constructed.
+    #[error("invalid URL")]
+    Url(#[from] url::ParseError),
+    /// The AUR RPC returned a body that is not the JSON we expect.
+    #[error("malformed AUR RPC response")]
+    Json(#[from] serde_json::Error),
+    /// A cached repository database could not be read.
+    #[error("malformed repository database")]
+    RepoDb(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Dependency lists extracted from a package's metadata.

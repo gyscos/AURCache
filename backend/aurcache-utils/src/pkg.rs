@@ -22,12 +22,16 @@ impl std::fmt::Display for Constraint {
 }
 
 /// Pacman-style version comparison using `alpm-types`.
-pub fn vercmp(a: &str, b: &str) -> Ordering {
-    let a_ver = Version::from_str(a);
-    let b_ver = Version::from_str(b);
-    match (a_ver, b_ver) {
-        (Ok(a), Ok(b)) => a.cmp(&b),
-        _ => Ordering::Equal,
+///
+/// Returns `None` when either side is not a valid alpm version, so callers have
+/// to decide what an uncomparable pair means for them. Reporting that as
+/// `Equal` would be worse than useless: "not newer" is exactly what suppresses
+/// an update, so an unparseable version would silently freeze a package
+/// forever.
+pub fn vercmp(a: &str, b: &str) -> Option<Ordering> {
+    match (Version::from_str(a), Version::from_str(b)) {
+        (Ok(a), Ok(b)) => Some(a.cmp(&b)),
+        _ => None,
     }
 }
 
@@ -102,39 +106,47 @@ mod tests {
 
     #[test]
     fn test_vercmp_equal() {
-        assert_eq!(vercmp("1.0", "1.0"), Ordering::Equal);
-        assert_eq!(vercmp("2.0.1", "2.0.1"), Ordering::Equal);
-        assert_eq!(vercmp("1.0-1", "1.0-1"), Ordering::Equal);
+        assert_eq!(vercmp("1.0", "1.0"), Some(Ordering::Equal));
+        assert_eq!(vercmp("2.0.1", "2.0.1"), Some(Ordering::Equal));
+        assert_eq!(vercmp("1.0-1", "1.0-1"), Some(Ordering::Equal));
     }
 
     #[test]
     fn test_vercmp_less() {
-        assert_eq!(vercmp("1.0", "2.0"), Ordering::Less);
-        assert_eq!(vercmp("1.0", "1.1"), Ordering::Less);
-        assert_eq!(vercmp("1.0", "1.0.1"), Ordering::Less);
-        assert_eq!(vercmp("1.0-1", "1.0-2"), Ordering::Less);
+        assert_eq!(vercmp("1.0", "2.0"), Some(Ordering::Less));
+        assert_eq!(vercmp("1.0", "1.1"), Some(Ordering::Less));
+        assert_eq!(vercmp("1.0", "1.0.1"), Some(Ordering::Less));
+        assert_eq!(vercmp("1.0-1", "1.0-2"), Some(Ordering::Less));
     }
 
     #[test]
     fn test_vercmp_greater() {
-        assert_eq!(vercmp("2.0", "1.0"), Ordering::Greater);
-        assert_eq!(vercmp("1.1", "1.0"), Ordering::Greater);
-        assert_eq!(vercmp("1.10", "1.9"), Ordering::Greater);
+        assert_eq!(vercmp("2.0", "1.0"), Some(Ordering::Greater));
+        assert_eq!(vercmp("1.1", "1.0"), Some(Ordering::Greater));
+        assert_eq!(vercmp("1.10", "1.9"), Some(Ordering::Greater));
     }
 
     #[test]
     fn test_vercmp_epoch() {
-        assert_eq!(vercmp("1:1.0", "1:1.0"), Ordering::Equal);
-        assert_eq!(vercmp("2:1.0", "1:1.0"), Ordering::Greater);
-        assert_eq!(vercmp("1:2.0", "1:1.0"), Ordering::Greater);
+        assert_eq!(vercmp("1:1.0", "1:1.0"), Some(Ordering::Equal));
+        assert_eq!(vercmp("2:1.0", "1:1.0"), Some(Ordering::Greater));
+        assert_eq!(vercmp("1:2.0", "1:1.0"), Some(Ordering::Greater));
     }
 
     #[test]
     fn test_vercmp_pkgrel() {
-        assert_eq!(vercmp("1.0-1", "1.0"), Ordering::Greater);
-        assert_eq!(vercmp("1.0", "1.0-1"), Ordering::Less);
-        assert_eq!(vercmp("1.0-2", "1.0-1"), Ordering::Greater);
-        assert_eq!(vercmp("1.0-1", "1.0-2"), Ordering::Less);
+        assert_eq!(vercmp("1.0-1", "1.0"), Some(Ordering::Greater));
+        assert_eq!(vercmp("1.0", "1.0-1"), Some(Ordering::Less));
+        assert_eq!(vercmp("1.0-2", "1.0-1"), Some(Ordering::Greater));
+        assert_eq!(vercmp("1.0-1", "1.0-2"), Some(Ordering::Less));
+    }
+
+    /// An unparseable version is reported as uncomparable rather than as
+    /// "equal", which callers would read as "not newer" and never update.
+    #[test]
+    fn test_vercmp_unparseable_is_uncomparable() {
+        assert_eq!(vercmp("not a version!", "1.0"), None);
+        assert_eq!(vercmp("1.0", "not a version!"), None);
     }
 
     #[test]

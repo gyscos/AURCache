@@ -1,6 +1,7 @@
 use crate::models::authenticated::Authenticated;
+use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::{Activity, ActivityLog};
-use rocket::response::status::NotFound;
+use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get};
 use utoipa::OpenApi;
@@ -19,7 +20,10 @@ pub async fn activity(
     _a: Authenticated,
     al: &State<ActivityLog>,
     limit: Option<u64>,
-) -> Result<Json<Vec<Activity>>, NotFound<String>> {
-    let activities = al.list(limit).await.map_err(|e| NotFound(e.to_string()))?;
+) -> Result<Json<Vec<Activity>>, ApiError> {
+    let activities = al
+        .list(limit)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(Json(activities))
 }

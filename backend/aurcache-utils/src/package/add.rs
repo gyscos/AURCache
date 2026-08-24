@@ -9,7 +9,7 @@ use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
 use aurcache_deps::DependencyResolution;
 use aurcache_types::builder::{Action, BuildStates};
-use pacman_mirrors::platforms::{Platform, Platforms};
+use pacman_mirrors::platforms::Platform;
 use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
 use sea_orm::{
@@ -53,14 +53,11 @@ fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
 fn build_add_context(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
-) -> anyhow::Result<AddContext> {
-    let platforms = match platforms {
-        None => vec![Platform::X86_64],
-        Some(platforms) => {
-            check_platforms(&platforms)?;
-            platforms
-        }
-    };
+) -> AddContext {
+    // Platform names are validated where they enter as strings (the API's
+    // `Platform::from_str`); by the time they are `Platform` values there is
+    // nothing left to check.
+    let platforms = platforms.unwrap_or_else(|| vec![Platform::X86_64]);
 
     let platforms_str = platforms
         .iter()
@@ -77,11 +74,11 @@ fn build_add_context(
     }))
     .join(";");
 
-    Ok(AddContext {
+    AddContext {
         platforms,
         platforms_str,
         build_flags_str,
-    })
+    }
 }
 
 fn collect_dependency_requirements<'a>(
@@ -138,13 +135,12 @@ async fn resolve_aur_pkgbase(
 /// no separate "does it apply" validation is needed.
 async fn build_patch_from_files(
     store: &SnapshotStore,
-    client: &aurcache_deps::AurClient,
     source_data: &SourceData,
     patched_files: BTreeMap<String, String>,
 ) -> anyhow::Result<Option<String>> {
     let mut patch = SourcePatch::default();
     for (path, new_content) in patched_files {
-        let original = store.read_file(client, source_data, None, &path).await?;
+        let original = store.read_file(source_data, None, &path).await?;
         patch.merge_file(&path, &original, &new_content);
     }
     if patch.is_empty() {
@@ -156,21 +152,18 @@ async fn build_patch_from_files(
 
 async fn resolve_srcinfo_to_spec(
     store: &SnapshotStore,
-    client: &aurcache_deps::AurClient,
     source_data: &SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<PackageInsertSpec> {
     let patch = match patched_files {
-        Some(files) => build_patch_from_files(store, client, source_data, files).await?,
+        Some(files) => build_patch_from_files(store, source_data, files).await?,
         None => None,
     };
 
     // Resolve dependencies/version off of the (possibly initial-patched)
     // source, so a patch supplied to fix an otherwise-unparseable PKGBUILD
     // (e.g. ogdf) is taken into account right away.
-    let sourceinfo = store
-        .sourceinfo(client, source_data, patch.as_deref())
-        .await?;
+    let sourceinfo = store.sourceinfo(source_data, patch.as_deref()).await?;
     let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
     let pkgbase = sourceinfo.base.name.to_string();
     let requirements =
@@ -243,7 +236,7 @@ pub async fn package_add_with_client(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
-    let context = build_add_context(platforms, build_flags)?;
+    let context = build_add_context(platforms, build_flags);
     add_package_with_source(client, store, db, tx, &context, source_data, patched_files).await
 }
 
@@ -297,13 +290,11 @@ async fn add_package_with_source(
             let aur_data = SourceData::Aur {
                 name: pkgbase.clone(),
             };
-            let package_spec =
-                resolve_srcinfo_to_spec(store, client, &aur_data, patched_files).await?;
+            let package_spec = resolve_srcinfo_to_spec(store, &aur_data, patched_files).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Git { .. } => {
-            let package_spec =
-                resolve_srcinfo_to_spec(store, client, &source_data, patched_files).await?;
+            let package_spec = resolve_srcinfo_to_spec(store, &source_data, patched_files).await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
@@ -332,7 +323,7 @@ async fn add_dependency_recursive(
     let source_data = SourceData::Aur {
         name: pkgbase.to_string(),
     };
-    let package_spec = resolve_srcinfo_to_spec(store, client, &source_data, None).await?;
+    let package_spec = resolve_srcinfo_to_spec(store, &source_data, None).await?;
     insert_package_with_deps(
         client,
         store,
@@ -538,13 +529,4 @@ pub(crate) fn provides_json(provides: &[String]) -> anyhow::Result<Option<String
     }
 
     Ok(Some(serde_json::to_string(provides)?))
-}
-
-fn check_platforms(platforms: &[Platform]) -> anyhow::Result<()> {
-    for platform in platforms {
-        if !Platforms.into_iter().any(|p| p == *platform) {
-            bail!("Invalid platform: {platform}");
-        }
-    }
-    Ok(())
 }

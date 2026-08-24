@@ -10,12 +10,12 @@
 //! `Action::Build` is just a low-latency wakeup hint; workers also poll on an
 //! interval, so there is nothing to do for it here.
 
+use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::Builds;
 use aurcache_types::builder::{Action, BuildStates};
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -65,10 +65,4 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
     active.update(db).await?;
     info!("Cancelled build #{build_id}");
     Ok(())
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }

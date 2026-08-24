@@ -41,10 +41,19 @@ jobs:
           sudo install -m 755 "$RUNNER_TEMP/alpm-pkgbuild-bridge" /usr/local/bin/alpm-pkgbuild-bridge
           command -v alpm-pkgbuild-bridge
 
+      # `aurcache-api`'s `static` feature embeds the built web UI via
+      # `#[derive(RustEmbed)] #[folder = "web"]`, which fails to compile unless
+      # that directory exists. Only the Docker build populates it, so without a
+      # placeholder the whole `embed` module is invisible to clippy. An empty
+      # directory is enough for the derive.
+      - name: Create placeholder web assets
+        run: mkdir -p aurcache-api/web
+
       - name: Lint
         run: |
           cargo fmt -- --check
-          cargo clippy -- -D warnings          
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features static -p aurcache-api -- -D warnings
 
       - name: Test
         run: |

@@ -78,8 +78,7 @@ impl AurClient {
     }
 
     fn rpc_info_url(&self, args: &[&str]) -> Result<Url, Error> {
-        let mut url =
-            Url::parse(&format!("{}/info", self.rpc_url)).map_err(|e| Error::Rpc(e.to_string()))?;
+        let mut url = Url::parse(&format!("{}/info", self.rpc_url))?;
         for arg in args {
             url.query_pairs_mut().append_pair("arg[]", arg);
         }
@@ -163,8 +162,7 @@ impl AurClient {
     }
 
     fn rpc_search_url(&self, query: &str, by: &str) -> Result<Url, Error> {
-        let mut url = Url::parse(&format!("{}/search", self.rpc_url))
-            .map_err(|e| Error::Rpc(e.to_string()))?;
+        let mut url = Url::parse(&format!("{}/search", self.rpc_url))?;
         url.path_segments_mut()
             .map_err(|_| Error::Rpc("Invalid RPC search URL".to_string()))?
             .push(query);
@@ -175,8 +173,7 @@ impl AurClient {
     async fn rpc_fetch(&self, url: Url) -> Result<Vec<Package>, Error> {
         let resp = self.retry_get(url).await?;
         let text = resp.text().await?;
-        let response: PackageResponse =
-            serde_json::from_str(&text).map_err(|e| Error::Rpc(e.to_string()))?;
+        let response: PackageResponse = serde_json::from_str(&text)?;
         if response.response_type == "error" {
             return Err(Error::Rpc(
                 response

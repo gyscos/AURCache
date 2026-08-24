@@ -67,11 +67,11 @@ class _BuildOutputState extends ConsumerState<BuildOutput> {
         print("refreshing output");
         final value = await API.getOutput(
           buildID: widget.build.id,
-          line: output.split("\n").length,
+          line: linesHeld(),
         );
         if (value.isNotEmpty) {
           setState(() {
-            output += "\n$value";
+            output = output.isEmpty ? value : "$output\n$value";
           });
         }
 
@@ -82,6 +82,11 @@ class _BuildOutputState extends ConsumerState<BuildOutput> {
       });
     }
   }
+
+  /// How many lines we already hold, which the server skips when sending the
+  /// next chunk. `"".split("\n")` yields `[""]`, so an empty log has to be
+  /// special-cased: reporting 1 line there would skip the build's first line.
+  int linesHeld() => output.isEmpty ? 0 : output.split("\n").length;
 
   @override
   void dispose() {

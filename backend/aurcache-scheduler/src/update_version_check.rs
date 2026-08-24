@@ -100,19 +100,18 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                         // from looping: the AUR-reported version is the one from when the
                         // PKGBUILD was last touched, which may be *older* than what was
                         // actually built from the live VCS source.
-                        let mut is_outdated = match &latest_version {
-                            None => true,
-                            Some(built) => {
-                                vercmp(&result.version, built) == std::cmp::Ordering::Greater
-                            }
-                        };
+                        let mut is_outdated = upstream_is_newer(
+                            &result.version,
+                            latest_version.as_deref(),
+                            &package.name,
+                        );
 
                         // `pkgver` alone doesn't catch VCS packages (-git etc.)
                         // whose upstream repo moved without the AUR PKGBUILD's
                         // version being bumped. Resolve any git+ VCS sources
                         // and flag out-of-date if any of them changed.
                         match store
-                            .sourceinfo(&client, &source_data, package.patch.as_deref())
+                            .sourceinfo(&source_data, package.patch.as_deref())
                             .await
                         {
                             Ok(sourceinfo) => {
@@ -139,7 +138,7 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                         // `git fetch` -- when it looks like something changed,
                         // instead of unconditionally re-fetching every package
                         // on every check.
-                        if is_outdated && let Err(e) = store.refresh(&client, &source_data).await {
+                        if is_outdated && let Err(e) = store.refresh(&source_data).await {
                             warn!("Failed to refresh snapshot cache for {}: {e}", package.name);
                         }
                     }
@@ -149,7 +148,7 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                 // No cheap upstream-metadata API for arbitrary git remotes,
                 // so always refresh: this is an incremental `git fetch`
                 // against the persistent checkout, not a full re-clone.
-                if let Err(e) = store.refresh(&client, &source_data).await {
+                if let Err(e) = store.refresh(&source_data).await {
                     warn!("Failed to refresh git source for {}: {e}", package.name);
                     save_package(db, package_model, &package.name).await;
                     continue;
@@ -162,7 +161,7 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                 // package will separately fail later with the same error,
                 // which is the desired outcome for an unapplicable patch.
                 let sourceinfo = match store
-                    .sourceinfo(&client, &source_data, package.patch.as_deref())
+                    .sourceinfo(&source_data, package.patch.as_deref())
                     .await
                 {
                     Ok(sourceinfo) => sourceinfo,
@@ -180,10 +179,8 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                 package_model.upstream_version = Set(Some(version.clone()));
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
-                let mut is_outdated = match &latest_version {
-                    None => true,
-                    Some(built) => vercmp(&version, built) == std::cmp::Ordering::Greater,
-                };
+                let mut is_outdated =
+                    upstream_is_newer(&version, latest_version.as_deref(), &package.name);
 
                 match sync_vcs_sources(db, *package_id, &sourceinfo).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
@@ -200,6 +197,29 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
         save_package(db, package_model, &package.name).await;
     }
     Ok(())
+}
+
+/// Whether `upstream` is a newer version than what was last built.
+///
+/// A package that has never been built counts as outdated. When the two
+/// versions cannot be compared (either side is not valid alpm syntax) we fall
+/// back to "did the string change", which errs towards scheduling a build:
+/// reporting "not newer" would silently freeze the package forever, whereas a
+/// spurious rebuild is merely wasted work.
+fn upstream_is_newer(upstream: &str, built: Option<&str>, package: &str) -> bool {
+    let Some(built) = built else {
+        return true;
+    };
+    match vercmp(upstream, built) {
+        Some(ordering) => ordering == std::cmp::Ordering::Greater,
+        None => {
+            warn!(
+                "Cannot compare versions for {package}: upstream '{upstream}' vs built '{built}'; \
+                 falling back to a plain difference check"
+            );
+            upstream != built
+        }
+    }
 }
 
 /// Persist the version-check outcome for one package. A write failure only

@@ -1,9 +1,9 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::settings::{SettingResponse, SettingValue};
+use crate::utils::error::{ApiError, err};
 use aurcache_types::settings::{ApplicationSettings, Setting};
 use aurcache_utils::settings::general::SettingsTraits;
 use rocket::http::Status;
-use rocket::response::status::Custom;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch};
 use sea_orm::DatabaseConnection;
@@ -13,9 +13,9 @@ use utoipa::OpenApi;
 #[openapi(paths(settings, setting_get, setting_patch, setting_reset))]
 pub struct SettingsApi;
 
-fn parse_setting(key: &str) -> Result<Setting, Custom<String>> {
+fn parse_setting(key: &str) -> Result<Setting, ApiError> {
     Setting::from_key(key)
-        .ok_or_else(|| Custom(Status::NotFound, format!("Unknown setting key: {key}")))
+        .ok_or_else(|| err(Status::NotFound, format!("Unknown setting key: {key}")))
 }
 
 #[utoipa::path(
@@ -31,11 +31,11 @@ pub async fn settings(
     db: &State<DatabaseConnection>,
     pkgid: Option<i32>,
     _a: Authenticated,
-) -> Result<Json<ApplicationSettings>, Custom<String>> {
+) -> Result<Json<ApplicationSettings>, ApiError> {
     ApplicationSettings::get_all(db.inner(), pkgid)
         .await
         .map(Json)
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
 }
 
 /// Fetch a single setting (any key, including the large config-file blobs).
@@ -55,7 +55,7 @@ pub async fn setting_get(
     key: &str,
     pkgid: Option<i32>,
     _a: Authenticated,
-) -> Result<Json<SettingResponse>, Custom<String>> {
+) -> Result<Json<SettingResponse>, ApiError> {
     let setting = parse_setting(key)?;
     let entry = ApplicationSettings::get::<String>(setting, pkgid, db.inner()).await;
     Ok(Json(SettingResponse {
@@ -81,11 +81,11 @@ pub async fn setting_patch(
     pkgid: Option<i32>,
     input: Json<SettingValue>,
     _a: Authenticated,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let setting = parse_setting(key)?;
     ApplicationSettings::patch(db.inner(), [(setting, pkgid, Some(input.value.clone()))])
         .await
-        .map_err(|e| Custom(Status::BadRequest, e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
 }
 
 /// Reset a setting back to its default by deleting any stored override.
@@ -105,9 +105,9 @@ pub async fn setting_reset(
     key: &str,
     pkgid: Option<i32>,
     _a: Authenticated,
-) -> Result<(), Custom<String>> {
+) -> Result<(), ApiError> {
     let setting = parse_setting(key)?;
     ApplicationSettings::patch(db.inner(), [(setting, pkgid, None)])
         .await
-        .map_err(|e| Custom(Status::InternalServerError, e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
 }

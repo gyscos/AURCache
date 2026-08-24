@@ -8,12 +8,13 @@
 //! the retry budget is exhausted. Explicit failures are handled synchronously in
 //! the `complete` endpoint and are never seen here.
 
+use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::reap_expired_builds;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::settings::general::SettingsTraits;
 use sea_orm::DatabaseConnection;
 use std::env;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -22,12 +23,6 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Spawn the reaper loop. Runs every `REAP_INTERVAL` seconds (default 20s).

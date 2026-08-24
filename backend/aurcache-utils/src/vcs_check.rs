@@ -13,6 +13,7 @@ use alpm_types::Source;
 use alpm_types::url::{GitFragment, VcsInfo};
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
+use aurcache_db::helpers::time::now_secs;
 use aurcache_db::package_vcs_sources::{self, Entity as PackageVcsSources};
 
 use crate::git::checkout::ls_remote;
@@ -126,7 +127,7 @@ pub async fn sync_vcs_sources(
             package_id: Set(package_id),
             source_url: Set(source_url),
             last_commit: Set(commit),
-            updated_at: Set(now_unix()),
+            updated_at: Set(now_secs()),
             ..Default::default()
         });
     }
@@ -164,11 +165,4 @@ pub async fn sync_vcs_sources(
     }
 
     Ok(changed)
-}
-
-fn now_unix() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }

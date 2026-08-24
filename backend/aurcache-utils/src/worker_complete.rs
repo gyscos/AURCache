@@ -9,6 +9,7 @@
 use aurcache_db::builds;
 use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::promote_waiting_build;
+use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
@@ -17,17 +18,10 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATUS_ACTIVE: i32 = 0;
 const STATUS_SUCCESS: i32 = 1;
 const STATUS_FAILED: i32 = 2;
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
 
 /// Confirm the given worker currently holds the active lease on the build.
 /// Uploads and completions are only accepted from the owning worker while the

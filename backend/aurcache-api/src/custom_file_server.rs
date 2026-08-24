@@ -20,11 +20,6 @@ impl CustomFileServer {
     const DEFAULT_RANK: isize = 10;
 
     #[track_caller]
-    pub fn from<P: AsRef<Path>>(path: P) -> Self {
-        Self::new(path)
-    }
-
-    #[track_caller]
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         let path = path.as_ref();
         Self {

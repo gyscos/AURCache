@@ -2,16 +2,17 @@ use crate::auth::has_api_token;
 use anyhow::bail;
 use bigdecimal::ToPrimitive;
 
-use rocket::response::status::NotFound;
 use rocket::serde::json::Json;
 
 use crate::models::authenticated::Authenticated;
 use crate::models::stats::{GraphDataPoint, ListStats, UserInfo};
+use crate::utils::error::{ApiError, err};
 use aurcache_db::builds;
 use aurcache_db::helpers::dbtype::database_type;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_types::builder::BuildStates;
 use aurcache_utils::utils::dir_size::dir_size;
+use rocket::http::Status;
 use rocket::{State, get};
 use sea_orm::prelude::BigDecimal;
 use sea_orm::{ColumnTrait, QueryFilter};
@@ -32,12 +33,12 @@ pub struct StatsApi;
 pub async fn stats(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
-) -> Result<Json<ListStats>, NotFound<String>> {
+) -> Result<Json<ListStats>, ApiError> {
     let db = db.inner();
 
     get_stats(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
         .map(Json)
 }
 
@@ -50,12 +51,12 @@ pub async fn stats(
 pub async fn user_info(
     db: &State<DatabaseConnection>,
     a: Authenticated,
-) -> Result<Json<UserInfo>, NotFound<String>> {
+) -> Result<Json<UserInfo>, ApiError> {
     let username = a.username;
     let has_api_token = match &username {
         Some(username) => has_api_token(db, username)
             .await
-            .map_err(|e| NotFound(e.to_string()))?,
+            .map_err(|e| err(Status::InternalServerError, e))?,
         None => false,
     };
     Ok(Json(UserInfo {
@@ -73,12 +74,12 @@ pub async fn user_info(
 pub async fn dashboard_graph_data(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
-) -> Result<Json<Vec<GraphDataPoint>>, NotFound<String>> {
+) -> Result<Json<Vec<GraphDataPoint>>, ApiError> {
     let db = db.inner();
 
     get_graph_datapoints(db)
         .await
-        .map_err(|e| NotFound(e.to_string()))
+        .map_err(|e| err(Status::InternalServerError, e))
         .map(Json)
 }
 

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use alpm_srcinfo::SourceInfoV1;
 use aurcache_db::packages::SourceData;
-use aurcache_deps::AurClient;
 use git2::Oid;
 use lru::LruCache;
 use tokio::sync::Mutex;
@@ -159,11 +158,10 @@ impl SnapshotStore {
     /// so a patch can be authored to fix the parse failure.
     pub async fn sourceinfo(
         &self,
-        client: &AurClient,
         source_data: &SourceData,
         patch: Option<&str>,
     ) -> anyhow::Result<SourceInfoV1> {
-        let entry = self.get_or_fetch(client, source_data, patch).await?;
+        let entry = self.get_or_fetch(source_data, patch).await?;
         entry
             .active
             .sourceinfo
@@ -176,23 +174,18 @@ impl SnapshotStore {
     /// See [`SnapshotStore::sourceinfo`] for the meaning of `patch`.
     pub async fn archive_bytes(
         &self,
-        client: &AurClient,
         source_data: &SourceData,
         patch: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
-        let entry = self.get_or_fetch(client, source_data, patch).await?;
+        let entry = self.get_or_fetch(source_data, patch).await?;
         Ok(entry.active.archive_bytes.clone())
     }
 
     /// List the (unpatched) source files available for editing, relative to
     /// the source root (e.g. `PKGBUILD`, `foo.install`). Works even if the
     /// source's `.SRCINFO`/PKGBUILD fails to parse.
-    pub async fn list_files(
-        &self,
-        client: &AurClient,
-        source_data: &SourceData,
-    ) -> anyhow::Result<Vec<String>> {
-        let entry = self.get_or_fetch_any(client, source_data).await?;
+    pub async fn list_files(&self, source_data: &SourceData) -> anyhow::Result<Vec<String>> {
+        let entry = self.get_or_fetch_any(source_data).await?;
         let original = entry.original();
         list_files_in_archive(&original.archive_bytes, &original.pkgbase)
     }
@@ -203,7 +196,6 @@ impl SnapshotStore {
     /// `.SRCINFO`/PKGBUILD fails to parse.
     pub async fn read_file(
         &self,
-        client: &AurClient,
         source_data: &SourceData,
         patch: Option<&str>,
         rel_path: &str,
@@ -211,7 +203,7 @@ impl SnapshotStore {
         // Always read the pristine content, regardless of whatever patch (if
         // any) happens to already be cached for this source, since `patch`
         // here is applied fresh on top of it below.
-        let entry = self.get_or_fetch_any(client, source_data).await?;
+        let entry = self.get_or_fetch_any(source_data).await?;
         let original_snapshot = entry.original();
         let original = read_file_from_archive(
             &original_snapshot.archive_bytes,
@@ -235,12 +227,11 @@ impl SnapshotStore {
     /// stale.
     pub async fn read_file_with_patch_status(
         &self,
-        client: &AurClient,
         source_data: &SourceData,
         patch: Option<&str>,
         rel_path: &str,
     ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
-        let entry = self.get_or_fetch_any(client, source_data).await?;
+        let entry = self.get_or_fetch_any(source_data).await?;
         let original_snapshot = entry.original();
         let original = read_file_from_archive(
             &original_snapshot.archive_bytes,
@@ -270,11 +261,7 @@ impl SnapshotStore {
     /// unconditionally re-downloading/re-cloning on every check. If a patch
     /// was previously active for this source it is re-applied on top of the
     /// freshly fetched raw source, so the cache entry stays consistent.
-    pub async fn refresh(
-        &self,
-        client: &AurClient,
-        source_data: &SourceData,
-    ) -> anyhow::Result<bool> {
+    pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<bool> {
         let cache_key = source_data.cache_key();
         let previous = {
             let mut cache = self.cache.lock().await;
@@ -324,13 +311,11 @@ impl SnapshotStore {
             };
             self.cache.lock().await.put(cache_key, entry);
         }
-        let _ = client; // reserved for future use (e.g. AUR metadata cross-check)
         Ok(changed)
     }
 
     async fn get_or_fetch(
         &self,
-        client: &AurClient,
         source_data: &SourceData,
         patch: Option<&str>,
     ) -> anyhow::Result<Arc<CacheEntry>> {
@@ -385,7 +370,6 @@ impl SnapshotStore {
         };
 
         self.cache.lock().await.put(cache_key, Arc::clone(&entry));
-        let _ = client;
         Ok(entry)
     }
 
@@ -395,11 +379,7 @@ impl SnapshotStore {
     /// which only ever need the pristine source (`entry.original()`) and
     /// must not force a redundant re-fetch just because a different/no
     /// patch is currently active in the cache.
-    async fn get_or_fetch_any(
-        &self,
-        client: &AurClient,
-        source_data: &SourceData,
-    ) -> anyhow::Result<Arc<CacheEntry>> {
+    async fn get_or_fetch_any(&self, source_data: &SourceData) -> anyhow::Result<Arc<CacheEntry>> {
         let cache_key = source_data.cache_key();
 
         {
@@ -409,7 +389,7 @@ impl SnapshotStore {
             }
         }
 
-        self.get_or_fetch(client, source_data, None).await
+        self.get_or_fetch(source_data, None).await
     }
 
     /// Whether a cached entry already reflects the given patch state (both
@@ -927,12 +907,11 @@ license=('MIT')
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
         let (store, checkout_dir) = test_store(aur_root.path());
-        let client = AurClient::new();
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
 
-        let archive = store.archive_bytes(&client, &source, None).await.unwrap();
+        let archive = store.archive_bytes(&source, None).await.unwrap();
 
         // Guard against the assertion below passing for the wrong reason: the
         // checkout the archive was built from really does have a `.git` dir.
@@ -973,7 +952,6 @@ license=('MIT')
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let client = AurClient::new();
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -981,10 +959,7 @@ license=('MIT')
         // Prime the cache with a *patched* entry (active = patched content).
         let patch = some_patch("2.0");
         let patch_json = patch.to_json().unwrap();
-        let sourceinfo = store
-            .sourceinfo(&client, &source, Some(&patch_json))
-            .await
-            .unwrap();
+        let sourceinfo = store.sourceinfo(&source, Some(&patch_json)).await.unwrap();
         assert_eq!(sourceinfo.base.version.to_string(), "2.0-1");
 
         // Once the upstream git remote is gone, any code path that would
@@ -992,23 +967,20 @@ license=('MIT')
         // here - proving list_files/read_file only ever reuse the cache.
         std::fs::remove_dir_all(aur_root.path().join("bar.git")).unwrap();
 
-        let files = store.list_files(&client, &source).await.unwrap();
+        let files = store.list_files(&source).await.unwrap();
         assert!(files.contains(&"PKGBUILD".to_string()));
 
         // read_file(patch=None) must return the *pristine* content (pkgver
         // 1.0), not the currently-active patched content (pkgver 2.0),
         // proving `original` was correctly preserved alongside `active`.
-        let pristine = store
-            .read_file(&client, &source, None, "PKGBUILD")
-            .await
-            .unwrap();
+        let pristine = store.read_file(&source, None, "PKGBUILD").await.unwrap();
         assert!(pristine.contains("pkgver=1.0"));
         assert!(!pristine.contains("pkgver=2.0"));
 
         // read_file with the same patch re-applied must return the patched
         // content, computed from the still-cached pristine original.
         let patched = store
-            .read_file(&client, &source, Some(&patch_json), "PKGBUILD")
+            .read_file(&source, Some(&patch_json), "PKGBUILD")
             .await
             .unwrap();
         assert!(patched.contains("pkgver=2.0"));
@@ -1028,22 +1000,18 @@ license=('MIT')
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let client = AurClient::new();
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
 
         // No patch: active == pristine.
-        let unpatched = store.sourceinfo(&client, &source, None).await.unwrap();
+        let unpatched = store.sourceinfo(&source, None).await.unwrap();
         assert_eq!(unpatched.base.version.to_string(), "1.0-1");
         assert_eq!(store.cache.lock().await.len(), 1);
 
         // Apply patch A: single entry now reflects patch A.
         let patch_a = some_patch("2.0").to_json().unwrap();
-        let a = store
-            .sourceinfo(&client, &source, Some(&patch_a))
-            .await
-            .unwrap();
+        let a = store.sourceinfo(&source, Some(&patch_a)).await.unwrap();
         assert_eq!(a.base.version.to_string(), "2.0-1");
         assert_eq!(store.cache.lock().await.len(), 1);
 
@@ -1051,16 +1019,13 @@ license=('MIT')
         // with patch B must not somehow see stale patch-A content, and only
         // one entry must exist for this source.
         let patch_b = some_patch("3.0").to_json().unwrap();
-        let b = store
-            .sourceinfo(&client, &source, Some(&patch_b))
-            .await
-            .unwrap();
+        let b = store.sourceinfo(&source, Some(&patch_b)).await.unwrap();
         assert_eq!(b.base.version.to_string(), "3.0-1");
         assert_eq!(store.cache.lock().await.len(), 1);
 
         // Clearing the patch must revert to the pristine content, not
         // whatever the last-active patch happened to produce.
-        let cleared = store.sourceinfo(&client, &source, None).await.unwrap();
+        let cleared = store.sourceinfo(&source, None).await.unwrap();
         assert_eq!(cleared.base.version.to_string(), "1.0-1");
         assert_eq!(store.cache.lock().await.len(), 1);
     }
@@ -1083,7 +1048,6 @@ license=('MIT')
         commit_to_repo(&repo, "v1", "init");
 
         let (store, _checkout_dir) = test_store(Path::new("unused"));
-        let client = AurClient::new();
         let source = SourceData::Git {
             spec: aurcache_db::packages::GitSourceSpec {
                 url: repo_dir.path().to_string_lossy().to_string(),
@@ -1093,23 +1057,17 @@ license=('MIT')
         };
 
         let patch = some_patch("2.0").to_json().unwrap();
-        store
-            .sourceinfo(&client, &source, Some(&patch))
-            .await
-            .unwrap();
+        store.sourceinfo(&source, Some(&patch)).await.unwrap();
 
         // Upstream moves to a new commit (still parseable as version 1.0,
         // since the patch bumps it to 2.0 - if refresh dropped the patch,
         // this would come back as 1.0 instead of 2.0).
         commit_to_repo(&repo, "v2", "bump");
 
-        let changed = store.refresh(&client, &source).await.unwrap();
+        let changed = store.refresh(&source).await.unwrap();
         assert!(changed, "refresh should detect the new upstream commit");
 
-        let after_refresh = store
-            .sourceinfo(&client, &source, Some(&patch))
-            .await
-            .unwrap();
+        let after_refresh = store.sourceinfo(&source, Some(&patch)).await.unwrap();
         assert_eq!(after_refresh.base.version.to_string(), "2.0-1");
     }
 }
