@@ -48,17 +48,53 @@ KEYDIR="$(mktemp -d -t aurcache-ssh-keys-XXXXXX)"
 export SSH_TEST_KEYS="$KEYDIR"
 
 cleanup() {
-    local code=$?
-    if [ "${CLEANUP:-1}" = "1" ]; then
-        log "=== Cleaning up ==="
-        dc down -v --remove-orphans >/dev/null 2>&1 || true
+    local exit_code=$?
+    # Match scripts/test-e2e.sh: tear down on success, preserve on failure so a
+    # failed run can actually be inspected. CLEANUP=1/0 forces either way.
+    local do_cleanup
+    if [ "${CLEANUP:-}" = "1" ]; then
+        do_cleanup=1
+    elif [ "${CLEANUP:-}" = "0" ]; then
+        do_cleanup=0
+    elif [ "$exit_code" -eq 0 ]; then
+        do_cleanup=1
     else
-        log "=== Leaving containers up (exit $code) ==="
+        do_cleanup=0
     fi
+
+    if [ "$do_cleanup" = "0" ]; then
+        echo "=== Leaving containers up (exit $exit_code) ==="
+        echo "    Full logs:  $LOG_FILE"
+        echo "    Inspect:    docker compose ${COMPOSE[*]} logs -f"
+        echo "    Tear down:  docker compose ${COMPOSE[*]} down -v --remove-orphans"
+        # The keypair is deliberately kept when preserving state: without it the
+        # surviving containers cannot be driven by hand.
+        echo "    Keypair:    $KEYDIR  (delete when done)"
+        exit $exit_code
+    fi
+
+    log "=== Cleaning up ==="
+    dc down -v --remove-orphans >/dev/null 2>&1 || true
     rm -rf "$KEYDIR"
-    exit $code
+    exit $exit_code
 }
 trap cleanup EXIT
+
+# Concise by default: the lines that explain the failure, then pointers. See the
+# same rationale in scripts/test-e2e.sh.
+dump_failure() {
+    dc logs -t > "$LOG_FILE" 2>&1 || true
+    echo "--- build errors ---"
+    cli builds output 1 2>/dev/null \
+        | grep -E "^==> ERROR|error:|Permission denied|No such file|not accessible" \
+        | tail -n 15 \
+        || echo "    (no error lines matched)"
+    echo "--- worker log (errors) ---"
+    dc logs builder 2>&1 | grep -iE "error|warn|denied" | tail -n 10 || echo "    (none)"
+    echo
+    echo "    Full logs:      $LOG_FILE"
+    echo "    Full build log: $CLI_BIN builds output 1"
+}
 
 status_name() {
     case "${1:-}" in
@@ -117,6 +153,7 @@ except Exception: print(0)')" -gt 0 ] && break
     echo "timeout"
 }
 
+log "Full container logs will be written to: $LOG_FILE"
 log "=== Building the CLI ==="
 (cd "$PROJECT_DIR/backend" && cargo build -q -p aurcache-cli)
 
@@ -135,7 +172,7 @@ result="$(run_phase "unauthorised (expect failure)" "")"
 if [ "$result" != "failed" ]; then
     log "ERROR: build was '$result' without an authorised key; the test would"
     log "       prove nothing — the source may be cached or the fetch skipped."
-    dc logs builder 2>&1 | tail -30
+    dump_failure
     exit 1
 fi
 log "    build failed as required"
@@ -144,8 +181,7 @@ log "    build failed as required"
 result="$(run_phase "authorised (expect success)" "/keys/id_ed25519")"
 if [ "$result" != "success" ]; then
     log "ERROR: build was '$result' with the authorised key"
-    cli builds output 1 2>&1 | tail -40 || true
-    dc logs builder 2>&1 | tail -40
+    dump_failure
     exit 1
 fi
 log "    build succeeded"

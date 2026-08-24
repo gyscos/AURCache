@@ -35,6 +35,10 @@ LOG_FILE="$(mktemp -t aurcache-e2e-XXXXXX.log)"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+# Printed at the start, not only on failure: if the run is being captured and
+# truncated, the pointer to the complete log has to appear before the noise.
+announce_log() { log "Full container logs will be written to: $LOG_FILE"; }
+
 dc() { docker compose -f "$COMPOSE_FILE" "$@"; }
 
 aurcache_cli() { "$CLI_BIN" "$@"; }
@@ -50,18 +54,6 @@ preflight() {
     [ "$missing" -eq 0 ] || exit 1
 }
 
-# Build status codes -> names, so progress reads as "enqueued" not "3".
-status_name() {
-    case "${1:-}" in
-        0) echo "active" ;;
-        1) echo "success" ;;
-        2) echo "failed" ;;
-        3) echo "enqueued" ;;
-        4) echo "waiting-for-deps" ;;
-        "") echo "<none>" ;;
-        *) echo "unknown($1)" ;;
-    esac
-}
 
 # True if a service container has exited. A dead container will never satisfy
 # any wait loop, so polling it for the full timeout just delays the diagnosis.
@@ -106,14 +98,49 @@ dump_build_log() {
     aurcache_cli builds output "$build_id" 2>&1 | tail -n 100 || echo "    (build log unavailable)"
 }
 
+# Show every build's state, not just the one being waited on. A package stuck
+# in waiting-for-deps is almost always waiting on a *dependency* that failed, and
+# without this the run reports "waiting-for-deps" and says nothing about why.
+dump_build_states() {
+    echo "--- builds ---"
+    # The CLI already renders status labels, so this script does not re-encode
+    # them. Anything it cannot reach is reported by the caller.
+    aurcache_cli builds list --limit 20 2>/dev/null || echo "    (unavailable)"
+}
+
+# Concise by default: the lines that explain the failure, then where to look for
+# everything else. Dumping hundreds of lines of pacman chatter buries the one
+# line that matters and gets truncated by whatever is capturing the output.
 dump_logs_on_failure() {
     dc logs -t > "$LOG_FILE" 2>&1 || true
-    dump_build_log "${CURRENT_BUILD_ID:-}"
-    echo "--- aurcache service logs (tail; full unfiltered logs in $LOG_FILE) ---"
-    dc logs aurcache 2>&1 | filter_noise | tail -n 60
-    echo "--- builder (worker) logs (tail) ---"
-    dc logs builder 2>&1 | filter_noise | tail -n 60
-    echo "--- hint: re-run with VERBOSE=1 for unfiltered logs, CLEANUP=0 to keep containers ---"
+
+    dump_build_states
+
+    local build_id="${CURRENT_BUILD_ID:-}"
+    if [ -n "$build_id" ]; then
+        echo "--- build $build_id: errors ---"
+        aurcache_cli builds output "$build_id" 2>/dev/null \
+            | grep -E "^==> ERROR|error:|failed|Permission denied|No such file" \
+            | tail -n 15 \
+            || echo "    (no error lines matched; see the full log)"
+        echo "--- build $build_id: last 20 lines ---"
+        aurcache_cli builds output "$build_id" 2>/dev/null | tail -n 20 \
+            || echo "    (build log unavailable)"
+    fi
+
+    echo "--- service errors ---"
+    dc logs 2>&1 | filter_noise | grep -iE "error|panic|fatal" | tail -n 15 \
+        || echo "    (none)"
+
+    echo
+    echo "    Full logs:      $LOG_FILE"
+    echo "    Full build log: $CLI_BIN builds output ${build_id:-<id>}"
+    echo "    Containers are left running; inspect with:"
+    echo "        docker compose -f '$COMPOSE_FILE' logs -f"
+    echo "        docker compose -f '$COMPOSE_FILE' exec builder bash"
+    echo "    Tear down with:"
+    echo "        docker compose -f '$COMPOSE_FILE' down -v --remove-orphans"
+    echo "    Re-run against these containers without rebuilding: REUSE=1 $0 <pkg>"
 }
 
 cleanup() {
@@ -186,8 +213,19 @@ wait_for_worker() {
 # =============================================================================
 
 build_and_start() {
+    announce_log
+
     log "=== Building AURCache CLI ==="
     ( cd "$PROJECT_DIR/backend" && cargo build -q -p aurcache-cli )
+
+    # REUSE=1 keeps whatever is already running: no image rebuild, no teardown,
+    # no re-enrollment. Diagnosing a failure usually means changing one variable
+    # and re-adding one package, and a full cycle costs minutes for nothing.
+    # It deliberately does not rebuild, so it will NOT pick up source changes.
+    if [ "${REUSE:-0}" = "1" ] && [ -n "$(dc ps -q aurcache 2>/dev/null)" ]; then
+        log "=== Reusing the running stack (REUSE=1; images not rebuilt) ==="
+        return
+    fi
 
     log "=== Building images (server + worker) ==="
     dc build
@@ -208,51 +246,32 @@ request_package() {
         exit 1
     fi
 
+    # Report what the add actually produced. Dependency resolution is recursive,
+    # so one request can create many packages, and the count is the first sign
+    # that resolution went wrong — a mis-resolved dependency tree shows up here
+    # as an implausible number long before any build fails.
+    local pkgs builds
+    pkgs=$(aurcache_cli --format json pkg list --limit 500 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
+    builds=$(aurcache_cli --format json builds list --limit 500 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
+    log "    tracked packages: $pkgs, builds queued: $builds"
+
     log "=== Waiting for build to complete (timeout: ${BUILD_TIMEOUT}s) ==="
-    local start_time prev_status="" reached_active=0
-    start_time=$(date +%s)
-    while true; do
-        local elapsed
-        elapsed=$(($(date +%s) - start_time))
-        if [ "$elapsed" -gt "$BUILD_TIMEOUT" ]; then
-            log "ERROR: Build timed out after ${BUILD_TIMEOUT}s (last status: $(status_name "$prev_status"))"
-            dump_logs_on_failure
-            exit 1
-        fi
-
-        local status
-        status=$(aurcache_cli --format json pkg list --limit 100 \
-            | jq -r ".[] | select(.name == \"$PACKAGE\") | .status" 2>/dev/null || echo "")
-
-        # Track the build id so failures can dump AURCache's own build log.
+    # Progress reporting, stall detection and requeue detection live in the CLI
+    # (`builds watch`), not here: they are useful to anyone watching a queue, and
+    # keeping them there avoids this script re-encoding build status codes and
+    # re-parsing `waiting_reason` by hand.
+    if ! aurcache_cli builds watch \
+        --timeout "$BUILD_TIMEOUT" \
+        --stall-after "${STALL_AFTER:-120}" \
+        --fail-on-requeue; then
+        # A dead container explains a failure better than the build log does, so
+        # check that first.
+        assert_services_alive
         CURRENT_BUILD_ID=$(aurcache_cli --format json builds list --limit 20 2>/dev/null \
             | jq -r "[.[] | select(.pkg_name == \"$PACKAGE\")] | max_by(.id) | .id // empty" 2>/dev/null || echo "")
-
-        # Only speak when something changes: this loop polls every 5s and used
-        # to print an identical line each time, burying real events.
-        if [ "$status" != "$prev_status" ]; then
-            log "    Build status: $(status_name "$status") (elapsed: ${elapsed}s)"
-            [ "$status" = "0" ] && reached_active=1
-
-            # A build that goes back to enqueued after being active was requeued,
-            # which means the worker's completion was refused. Without this the
-            # run just loops build->reject->rebuild until the timeout, showing
-            # nothing but a steady "enqueued".
-            if [ "$reached_active" = "1" ] && [ "$status" = "3" ]; then
-                log "ERROR: build was requeued after running - the server rejected the worker's completion"
-                log "       (this loops forever; failing now rather than at the ${BUILD_TIMEOUT}s timeout)"
-                dump_logs_on_failure
-                exit 1
-            fi
-            prev_status="$status"
-        fi
-
-        case "$status" in
-            1)  log "    Build completed successfully (in ${elapsed}s)"; break ;;
-            2)  log "ERROR: Build failed"; dump_logs_on_failure; exit 1 ;;
-            *)  assert_services_alive; sleep 5 ;;
-        esac
-    done
+        dump_logs_on_failure
+        exit 1
+    fi
 }
 
 validate() {
