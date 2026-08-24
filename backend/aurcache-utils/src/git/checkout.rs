@@ -24,13 +24,16 @@ fn resolve_remote_ref<'a>(
     git_ref: &str,
 ) -> anyhow::Result<(git2::Object<'a>, Option<git2::Reference<'a>>)> {
     let candidates: Vec<String> = if git_ref == "HEAD" {
-        // `origin/HEAD` is only set if the remote advertised it; fall back to
-        // the conventional default branch names (AUR uses `master`).
-        vec![
-            "refs/remotes/origin/HEAD".to_string(),
-            "refs/remotes/origin/master".to_string(),
-            "refs/remotes/origin/main".to_string(),
-        ]
+        // The clone left HEAD on whatever the remote's default branch is, and
+        // we keep it there (see `resolve_and_checkout`), so ask the checkout
+        // rather than guessing at `master`/`main` — plenty of repos use
+        // neither. `origin/HEAD` is the fallback for a checkout that is
+        // detached because it previously resolved a tag or pinned SHA.
+        head_branch(repo)
+            .map(|(_, shorthand)| format!("refs/remotes/origin/{shorthand}"))
+            .into_iter()
+            .chain(["refs/remotes/origin/HEAD".to_string()])
+            .collect()
     } else {
         // A caller-supplied `origin/foo` is already remote-tracking.
         vec![
@@ -48,6 +51,19 @@ fn resolve_remote_ref<'a>(
         .map_err(|e| anyhow!("could not resolve git ref '{git_ref}': {e}"))
 }
 
+/// The branch HEAD is on, as `(full ref name, shorthand)`, or `None` when the
+/// checkout is detached.
+fn head_branch(repo: &Repository) -> Option<(String, String)> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    Some((
+        head.name().ok()?.to_string(),
+        head.shorthand().ok()?.to_string(),
+    ))
+}
+
 /// Resolve `git_ref` to an object in `repo` and checkout its tree, updating HEAD.
 /// Shared between a fresh clone and a re-used, freshly-fetched repo.
 fn resolve_and_checkout(repo: &Repository, git_ref: &str) -> anyhow::Result<Oid> {
@@ -61,17 +77,32 @@ fn resolve_and_checkout(repo: &Repository, git_ref: &str) -> anyhow::Result<Oid>
     checkout_builder.force();
     repo.checkout_tree(&object, Some(&mut checkout_builder))?;
 
-    // If it's a local branch or tag, make HEAD point to it. A remote-tracking
-    // ref must not become HEAD (git would treat the checkout as being "on"
-    // origin/master), so detach onto the commit instead — this is a read-only
-    // source cache, nothing commits here.
+    // A remote-tracking ref must not become HEAD — git would treat the checkout
+    // as being "on" origin/master. Three cases, in order:
     let local_ref_name = reference
         .as_ref()
         .and_then(|r| r.name().ok())
-        .filter(|name| !name.starts_with("refs/remotes/"));
-    match local_ref_name {
-        Some(name) => repo.set_head(name)?,
-        None => repo.set_head_detached(object.id())?,
+        .filter(|name| !name.starts_with("refs/remotes/"))
+        .map(ToString::to_string);
+    // Only when following the default branch: advancing HEAD's branch to some
+    // *other* ref's commit would silently rewrite it.
+    let tracked_branch = (git_ref == "HEAD").then(|| head_branch(repo)).flatten();
+
+    match (local_ref_name, tracked_branch) {
+        // Resolved to a local branch or tag: point HEAD at it directly.
+        (Some(name), _) => repo.set_head(&name)?,
+        // Following the default branch: fast-forward it to what we fetched and
+        // stay on it. `fetch` only moves `refs/remotes/*`, so without this the
+        // branch would lag forever — and keeping HEAD on a branch is what lets
+        // the next call read the default branch's name back off the checkout
+        // instead of guessing it.
+        (None, Some((branch_ref, _))) => {
+            repo.reference(&branch_ref, object.id(), true, "follow upstream")?;
+            repo.set_head(&branch_ref)?;
+        }
+        // A tag or pinned SHA: nothing to track, so detach. This is a
+        // read-only source cache; nothing commits here.
+        (None, None) => repo.set_head_detached(object.id())?,
     }
     Ok(object.id())
 }
@@ -220,6 +251,145 @@ mod tests {
     }
 
     /// A named branch must track upstream across re-fetches too.
+    /// Rewrite history on the upstream branch, as a force-push does: the new
+    /// tip is not a descendant of the old one.
+    fn force_push_unrelated_history(repo: &Repository, pkgver: &str) {
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join("PKGBUILD"), format!("pkgver={pkgver}\n")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("PKGBUILD")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        // No parents: an orphan commit, so it cannot be reached from the old tip.
+        let rewritten = repo.commit(None, &sig, &sig, pkgver, &tree, &[]).unwrap();
+        let branch = repo.head().unwrap().name().unwrap().to_string();
+        repo.reference(&branch, rewritten, true, "force push")
+            .unwrap();
+    }
+
+    /// A force-pushed upstream must be adopted, not treated as an error or
+    /// quietly ignored. The cache is read-only and disposable, so the right
+    /// behaviour is to hard-reset onto whatever the remote now says, even
+    /// though it is not a fast-forward.
+    #[test]
+    fn reused_checkout_follows_a_force_pushed_branch() {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = Repository::init(upstream_dir.path()).unwrap();
+        commit(&upstream, "1.0");
+
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("pkg");
+        let url = upstream_dir.path().to_string_lossy().to_string();
+
+        let first = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+
+        force_push_unrelated_history(&upstream, "9.9");
+        let rewritten = upstream.head().unwrap().target().unwrap();
+        assert_ne!(first, rewritten, "test did not actually rewrite history");
+
+        let second = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+        assert_eq!(
+            second, rewritten,
+            "checkout did not reset onto the force-pushed commit"
+        );
+        assert!(
+            std::fs::read_to_string(path.join("PKGBUILD"))
+                .unwrap()
+                .contains("9.9"),
+            "working tree still holds the pre-force-push PKGBUILD"
+        );
+    }
+
+    /// Some remotes do not advertise a `HEAD` symref, so the clone gets no
+    /// `refs/remotes/origin/HEAD`. Resolving `HEAD` then fell back to a
+    /// hardcoded `master`/`main` guess, and a repo using neither was left
+    /// pinned to whatever commit it first cloned. Reading the branch name off
+    /// the checkout works regardless of what the branch is called.
+    #[test]
+    fn reused_checkout_follows_upstream_without_an_origin_head_ref() {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = Repository::init(upstream_dir.path()).unwrap();
+        commit(&upstream, "1.0");
+        let original = upstream.head().unwrap().shorthand().unwrap().to_string();
+        let head_commit = upstream.head().unwrap().peel_to_commit().unwrap();
+        upstream.branch("trunk", &head_commit, true).unwrap();
+        upstream.set_head("refs/heads/trunk").unwrap();
+        upstream
+            .find_branch(&original, git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("pkg");
+        let url = upstream_dir.path().to_string_lossy().to_string();
+
+        let first = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+
+        // Drop the symref the clone recorded, leaving only `origin/trunk`.
+        Repository::open(&path)
+            .unwrap()
+            .find_reference("refs/remotes/origin/HEAD")
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        commit(&upstream, "2.0");
+
+        let second = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+        assert_ne!(
+            first, second,
+            "checkout did not advance without an origin/HEAD to follow"
+        );
+        assert!(
+            std::fs::read_to_string(path.join("PKGBUILD"))
+                .unwrap()
+                .contains("2.0")
+        );
+    }
+
+    /// The default branch is whatever the remote says it is — not necessarily
+    /// `master` or `main`. Resolving `HEAD` used to try a hardcoded list of
+    /// those two names, so a repo using anything else fell through to whatever
+    /// the stale local ref happened to be.
+    #[test]
+    fn reused_checkout_follows_an_unconventionally_named_default_branch() {
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = Repository::init(upstream_dir.path()).unwrap();
+        commit(&upstream, "1.0");
+        // Rename the default branch to something neither hardcoded name would
+        // match, and drop the original so it cannot be resolved instead.
+        let original = upstream.head().unwrap().shorthand().unwrap().to_string();
+        let head_commit = upstream.head().unwrap().peel_to_commit().unwrap();
+        upstream.branch("trunk", &head_commit, true).unwrap();
+        upstream.set_head("refs/heads/trunk").unwrap();
+        upstream
+            .find_branch(&original, git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join("pkg");
+        let url = upstream_dir.path().to_string_lossy().to_string();
+
+        let first = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+
+        commit(&upstream, "2.0");
+
+        let second = checkout_or_fetch_repo_ref(&url, "HEAD", &path).unwrap();
+        assert_ne!(
+            first, second,
+            "checkout did not follow a default branch named `trunk`"
+        );
+        assert!(
+            std::fs::read_to_string(path.join("PKGBUILD"))
+                .unwrap()
+                .contains("2.0")
+        );
+    }
+
     #[test]
     fn reused_checkout_follows_named_branch() {
         let upstream_dir = tempfile::tempdir().unwrap();
