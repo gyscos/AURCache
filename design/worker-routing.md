@@ -697,11 +697,50 @@ Implemented (2026-08-24):
 
 Not yet implemented: user-facing docs (step 7).
 
-**Step 6 is unvalidated against a real credentialed build.** The pure parts are
-unit-tested, but whether the staged `0600` key is readable by `makepkg`'s build
-user depends on `makechrootpkg`'s uid mapping, which needs a real chroot and a
-real authenticated source to confirm. If it turns out the uid does not line up,
-the fix is in `credentials::stage_for_job` alone.
+**Step 6 is validated end-to-end** by `scripts/test-e2e-ssh.sh`, which stands up
+a throwaway git server, authorises a per-run keypair, and builds a fixture whose
+source is fetched over `git+ssh`. It runs the build twice — once without the
+credential, asserting failure — so a pass cannot come from a cached source or a
+skipped fetch, and checks that a marker from the SSH-only repository ends up
+inside the built package.
+
+That test changed the design. Three things were wrong, and none was reachable by
+unit tests:
+
+* **Sources are fetched outside the chroot.** `makechrootpkg`'s
+  `download_sources()` runs `makepkg --verifysource -o` on the *worker*, as the
+  build user, before the container is entered — using the chroot's
+  `makepkg.conf` but the worker's filesystem. A credential bind-mounted into the
+  chroot is therefore invisible at exactly the moment the fetch happens.
+* **The credential path must be stable across jobs.** `GIT_SSH_COMMAND` is
+  written into the *base* chroot's `makepkg.conf` when that chroot is created,
+  and every later build reads a copy of it, so a per-job path would be correct
+  for the first build and stale for every one after.
+* **The credential must not be exposed to the chroot at all.** Everything a
+  PKGBUILD runs — `prepare`, `build`, `package` — executes in there, so anything
+  reachable can be exfiltrated by a hostile package. Since the fetch already
+  happened on the worker, exposing it buys nothing.
+
+The key is therefore staged once at `<data_dir>/secrets`, never bind-mounted
+into the chroot, and the `makepkg.conf` export is **guarded** on the key being
+readable:
+
+```sh
+if [ -r "/var/lib/aurcache-worker/secrets/id_ed25519" ]; then
+    export GIT_SSH_COMMAND="ssh -i … -o IdentitiesOnly=yes …"
+fi
+```
+
+One file serves both environments: the export applies on the worker, and inside
+the chroot it simply does not. Without the guard, ordinary git operations in a
+PKGBUILD would be handed `-i <missing file> -o IdentitiesOnly=yes`, which also
+suppresses any identity they would otherwise have used — breaking git operations
+that have nothing to do with our credential.
+
+The uid question this section previously flagged turned out fine:
+`makechrootpkg` maps `builduser` to the same uid the worker runs as, so the
+staged `0600` key is readable where it needs to be. That only matters for the
+`-d` binds that remain (the per-job pacman cache), not for the credential.
 
 Two decisions taken during implementation that the design did not specify:
 
