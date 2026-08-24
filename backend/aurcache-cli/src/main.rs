@@ -246,6 +246,36 @@ enum BuildsCommand {
         /// Build id.
         id: i32,
     },
+    /// Follow builds until they finish, reporting progress.
+    Watch(WatchArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct WatchArgs {
+    /// Only follow builds of this package.
+    #[arg(long)]
+    package: Option<String>,
+    /// Give up after this many seconds.
+    #[arg(long, default_value_t = 900)]
+    timeout: u64,
+    /// Fail if nothing changes for this long while nothing is building.
+    ///
+    /// A queue that is stuck cannot recover on its own, so waiting out the full
+    /// timeout only delays the diagnosis. A running build is never treated as a
+    /// stall, however slow it is.
+    #[arg(long = "stall-after", default_value_t = 120)]
+    stall_after: u64,
+    /// Seconds between progress lines while work is in flight.
+    #[arg(long, default_value_t = 60)]
+    heartbeat: u64,
+    /// Fail if a build returns to the queue after running.
+    ///
+    /// That means the server refused the worker's completion, which repeats
+    /// indefinitely — the build runs, is rejected, and is queued again. Normal
+    /// operation can requeue a build whose worker was lost, so this is opt-in
+    /// and intended for tests.
+    #[arg(long = "fail-on-requeue")]
+    fail_on_requeue: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -456,6 +486,7 @@ async fn run_builds_command(
         BuildsCommand::Retry { id } => retry_build_command(client, format, id).await,
         BuildsCommand::Cancel { id } => cancel_build_command(client, format, id).await,
         BuildsCommand::Delete { id } => delete_build_command(client, format, id).await,
+        BuildsCommand::Watch(args) => watch_builds_command(client, args).await,
     }
 }
 
@@ -1102,6 +1133,132 @@ fn print_raw_response(text: &str) -> Result<()> {
         print!("{text}");
     }
     Ok(())
+}
+
+/// Terminal build states: nothing further will happen to these on its own.
+const STATUS_SUCCESS: i32 = 1;
+const STATUS_FAILED: i32 = 2;
+const STATUS_ACTIVE: i32 = 0;
+
+/// Follow builds until they settle, printing transitions and detecting stalls.
+///
+/// Written for humans watching a queue and for scripts driving one: it reports
+/// what changed rather than repeating the current state, and it fails fast when
+/// the queue cannot progress instead of waiting out the timeout.
+async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Result<()> {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let mut last_change = Instant::now();
+    let mut last_beat = Instant::now();
+    let mut seen: HashMap<i32, i32> = HashMap::new();
+
+    loop {
+        let builds: Vec<_> = client
+            .list_builds(None, Some(100), None)
+            .await?
+            .into_iter()
+            .filter(|b| args.package.as_ref().is_none_or(|name| &b.pkg_name == name))
+            .collect();
+
+        const STATUS_ENQUEUED: i32 = 3;
+        let mut changed = false;
+        for build in &builds {
+            if seen.get(&build.id) != Some(&build.status) {
+                if args.fail_on_requeue
+                    && seen.get(&build.id) == Some(&STATUS_ACTIVE)
+                    && build.status == STATUS_ENQUEUED
+                {
+                    bail!(
+                        "{} #{} was requeued after running: the server refused the \
+                         worker's completion, which will repeat indefinitely",
+                        build.pkg_name,
+                        build.id
+                    );
+                }
+                let elapsed = start.elapsed().as_secs();
+                let reason = build
+                    .waiting_reason
+                    .as_ref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default();
+                println!(
+                    "[{elapsed:>4}s] {} #{}: {}{reason}",
+                    build.pkg_name,
+                    build.id,
+                    build_status_label(build.status),
+                );
+                seen.insert(build.id, build.status);
+                changed = true;
+            }
+        }
+        if changed {
+            last_change = Instant::now();
+        }
+
+        // Settled when every build has reached a terminal state. An empty list
+        // is not settled: the caller may be watching for a build that has not
+        // been queued yet.
+        let settled = !builds.is_empty()
+            && builds
+                .iter()
+                .all(|b| b.status == STATUS_SUCCESS || b.status == STATUS_FAILED);
+        if settled {
+            let failed: Vec<&str> = builds
+                .iter()
+                .filter(|b| b.status == STATUS_FAILED)
+                .map(|b| b.pkg_name.as_str())
+                .collect();
+            if failed.is_empty() {
+                println!("all builds succeeded in {}s", start.elapsed().as_secs());
+                return Ok(());
+            }
+            bail!("build failed: {}", failed.join(", "));
+        }
+
+        let anything_running = builds.iter().any(|b| b.status == STATUS_ACTIVE);
+
+        if !anything_running && last_change.elapsed() >= Duration::from_secs(args.stall_after) {
+            for build in builds.iter().filter(|b| b.status != STATUS_SUCCESS) {
+                let reason = build
+                    .waiting_reason
+                    .as_ref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  {} #{}: {}{reason}",
+                    build.pkg_name,
+                    build.id,
+                    build_status_label(build.status)
+                );
+            }
+            bail!(
+                "no progress for {}s and nothing is building; the queue cannot advance",
+                last_change.elapsed().as_secs()
+            );
+        }
+
+        if last_beat.elapsed() >= Duration::from_secs(args.heartbeat) {
+            let active = builds.iter().filter(|b| b.status == STATUS_ACTIVE).count();
+            println!(
+                "[{:>4}s] {} building, {} of {} finished",
+                start.elapsed().as_secs(),
+                active,
+                builds
+                    .iter()
+                    .filter(|b| b.status == STATUS_SUCCESS || b.status == STATUS_FAILED)
+                    .count(),
+                builds.len()
+            );
+            last_beat = Instant::now();
+        }
+
+        if start.elapsed() >= Duration::from_secs(args.timeout) {
+            bail!("timed out after {}s", args.timeout);
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 fn build_status_label(status: i32) -> &'static str {

@@ -202,6 +202,45 @@ pub struct Build {
     pub end_time: Option<i64>,
     /// Target platform for the build.
     pub platform: String,
+    /// Why an enqueued build cannot be claimed by any approved worker.
+    ///
+    /// Absent for everything else, including a build merely queued behind a
+    /// busy worker — so its presence always means something needs attention.
+    #[serde(default)]
+    pub waiting_reason: Option<WaitingReason>,
+}
+
+/// Why an enqueued build is not being picked up.
+///
+/// Mirrors the server's `aurcache_db::helpers::worker_jobs::WaitingReason`; the
+/// tag names are part of the HTTP contract.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitingReason {
+    /// Reserved by package affinity to workers that are not currently live.
+    Affinity {
+        /// Workers that declared affinity for this package.
+        workers: Vec<String>,
+    },
+    /// No approved worker builds this architecture.
+    Arch {
+        /// The architecture nothing can build.
+        arch: String,
+    },
+    /// A capable worker exists but none has been seen recently.
+    Offline,
+}
+
+impl std::fmt::Display for WaitingReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Affinity { workers } => {
+                write!(f, "reserved for {} (offline)", workers.join(", "))
+            }
+            Self::Arch { arch } => write!(f, "no worker builds {arch}"),
+            Self::Offline => write!(f, "all capable workers are offline"),
+        }
+    }
 }
 
 /// Remote build worker record returned by the worker-admin endpoints.
