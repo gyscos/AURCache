@@ -1,0 +1,79 @@
+---
+sidebar_position: 4
+---
+
+# Managing workers
+
+The **Workers** page lists every worker that has ever enrolled, with its status,
+architectures, reserved packages and priority.
+
+## Approving
+
+A newly enrolled worker is `pending` and cannot build until approved. Approve it
+from the Workers page, or let one of the non-interactive paths do it: a shared
+enrollment volume (`AURCACHE_ENROLLMENT_DIR`, used by the bundled compose
+setup), a pre-approved fingerprint list, or a shared token
+(`AURCACHE_ENROLLMENT_TOKEN`).
+
+Auto-approval only ever applies to a worker that has never been approved. It
+will not re-approve one you revoked — an explicit decision outranks a
+convenience setting.
+
+## Retiring a worker
+
+**Revoke it.** Revoking refuses the worker's certificate from that moment,
+releases any packages it had reserved through `WORKER_PACKAGES`, and requeues
+whatever it was building so another worker picks the job up.
+
+There is no delete. Worker rows are kept so a build from two years ago still
+shows which machine produced it, with what architectures and what version.
+Revoked workers move behind a **Show retired** toggle so the list stays useful.
+
+A retired machine that comes back re-enrolls and appears as revoked with a
+recent "last seen", which is the signal to approve it again if you want it back.
+Its certificate is still on file, so that is one click.
+
+## Why is a build not starting?
+
+`aurcache-cli builds watch` follows the queue and explains what it sees:
+
+```
+$ aurcache-cli builds watch
+[   0s] turso #3: waiting-for-deps
+[   0s] libaegis #1: active
+[  47s] libaegis #1: successful
+[  95s] simsimd #2: successful
+[  96s] turso #3: active
+```
+
+It reports changes rather than repeating the current state, prints a heartbeat
+while work is in flight, and **fails fast on a stall**: if nothing has changed
+for a while and nothing is building, the queue cannot advance on its own, so it
+says so instead of waiting out the timeout.
+
+`--package NAME` narrows it to one package; `--timeout` and `--stall-after`
+adjust the limits.
+
+## What the Builds page is telling you
+
+An enqueued build that no worker can claim is flagged with the reason:
+
+| Reason | Meaning | What to do |
+|---|---|---|
+| Reserved for *worker* (offline) | Package affinity ties it to a worker that is not online | Start that worker, or revoke it to release the reservation |
+| No worker builds *arch* | No approved worker handles that architecture | Enroll one, or remove the architecture from the package |
+| All capable workers are offline | Workers exist for the job but none is online | Start one |
+
+A build without a reason is simply queued behind other work — that is normal and
+needs nothing.
+
+## Builds that never finish
+
+A worker sends a heartbeat every `WORKER_HEARTBEAT_INTERVAL` seconds. If one
+stops, its builds are requeued after `LEASE_TTL` and retried, up to
+`MAX_ATTEMPTS` times before being failed for good. A build that runs
+implausibly long is reclaimed the same way even if its worker is still
+heartbeating, which covers a hung build on a healthy machine.
+
+If a build is genuinely just slow, raise `WORKER_BUILD_TIMEOUT` on the worker —
+the default kills a build after three hours.

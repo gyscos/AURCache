@@ -27,7 +27,7 @@ Use `MIRRORLIST_SERVERS_X86_64` with semicolon-separated mirror URLs:
 ```yaml
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
     environment:
       - MIRRORLIST_SERVERS_X86_64=https://mirror.rackspace.com/archlinux/$$repo/os/$$arch;https://mirrors.kernel.org/archlinux/$$repo/os/$$arch
     # ... rest of config
@@ -47,7 +47,7 @@ To manually set a mirrorlist mount a directory containing your `mirrorlist` to t
 ```ỳaml
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
     ports:
       - "8080:8080" # Frontend
       - "8081:8081" # Repository
@@ -87,7 +87,7 @@ networks:
 ```ỳaml
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
     ports:
       - "8080:8080" # Frontend
       - "8081:8081" # Repository
@@ -122,6 +122,16 @@ networks:
     driver: bridge
 ```
 
-If you use host build mode things get more complicated since your mirrorlist must be accessible from the builder containers.
-The default `MIRRORLIST_PATH_X86_64` in host build mode is `BUILD_ARTIFACT_DIR/config/pacman_x86_64`, so just overwrite this directory with your dir containing the mirrorlist or mount another path to this location.
-Remember this path has to be within the `BUILD_ARTIFACT_DIR/` directory to be accessible by the builder.
+The mirrorlist is configured on the **server** only. Workers do not need a copy:
+the server ships the effective mirrorlist to each worker as part of the build
+job, so a mirrorlist set here applies to every worker, including remote and
+foreign-architecture ones.
+
+:::note Hybrid image
+In the [hybrid compatibility
+image](../setup/docker.md#backward-compatibility-the-hybrid-image) running the
+legacy container builder, the mirrorlist must live where the spawned build
+containers can reach it — the default `MIRRORLIST_PATH_X86_64` is then
+`BUILD_ARTIFACT_DIR/config/pacman_x86_64`, and any path you mount instead has to
+be inside `BUILD_ARTIFACT_DIR/`.
+:::

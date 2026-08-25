@@ -19,4 +19,4 @@ AURCache is a build server and repository for Archlinux packages sourced from th
 ## Getting Started
 Get started with [Quick Start](/docs/overview/quick-start) to try it out.
 
-For advanced setup, see the [Configuration](/docs/configuration) page.
+For advanced setup, see the [Configuration](/docs/Configuration/environment-variables) page.

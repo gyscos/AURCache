@@ -209,8 +209,8 @@ makepkg-produced filenames.
   and the cache-eviction sizing logic (`plan_eviction`) itself.
 - `docker/entrypoint.sh`, `docker/nspawn-wrapper.sh`,
   `docker/worker-entrypoint.sh`, `docker/worker.Dockerfile`,
-  `docker/Dockerfile`, `docker-compose.yml`, `docker-compose.e2e.yaml`,
-  `docker-compose.remote-worker.yml`.
+  `docker/Dockerfile`, `docker-compose.yaml`, `docker-compose.e2e.yaml`,
+  `docker-compose.remote-worker.yaml`.
 - `frontend/lib/models/worker.dart`, `frontend/lib/providers/workers.dart`,
   `frontend/lib/components/routing/router.dart`,
   `frontend/lib/components/routing/side_menu.dart`.

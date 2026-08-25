@@ -28,7 +28,7 @@ To disable Authentiation leave all `OAUTH_*` variables undefined.
 services:
   aurcache:
     restart: unless-stopped
-    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
     ports:
       - "9091:8080"
       - "9090:8081"

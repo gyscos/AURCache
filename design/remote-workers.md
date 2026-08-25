@@ -419,12 +419,12 @@ in-use entries.
 
 ### A. Bundled single-host (primary, turnkey)
 
-Ship a canonical `docker-compose.yml` (this *is* the default config). Backend +
+Ship a canonical `docker-compose.yaml` (this *is* the default config). Backend +
 one privileged worker share an `enroll` volume (backend read-only, worker
 read-write) on an internal network. No secret, no approval, no required env.
 
 ```
-curl -O https://raw.githubusercontent.com/.../docker-compose.yml
+curl -O https://raw.githubusercontent.com/.../docker-compose.yaml
 docker compose up -d
 ```
 

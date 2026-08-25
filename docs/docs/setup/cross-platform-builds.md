@@ -8,18 +8,32 @@ Cross-platform builds are a bit tricky to setup, especially inside virtualizatio
 This is still a bit work in progress, so expect some bugs.
 
 ## How it works
-This feature depends on Qemu binfmt_misc support (QEMU user space emulation)(https://www.qemu.org/docs/master/user/main.html). 
+This feature depends on Qemu binfmt_misc support ([QEMU user space emulation](https://www.qemu.org/docs/master/user/main.html)).
 
-For every build a new buildcontainer is spawned, either on docker host or inside the aurcache-container with the selected target platform. 
-Docker uses binfmt_misc to register the qemu interpreter for the target platform. This should happen automatically when the container is started.
+A foreign-architecture worker is the *same* worker image run emulated, with
+`platform: linux/arm64` (or `linux/arm/v7`). Docker uses binfmt_misc to register
+the qemu interpreter for that platform, so from the worker's point of view it is
+building natively and the build path is identical to a native worker's.
+
+The bundled compose file ships this behind a profile:
+
+```bash
+docker compose --profile arm up -d
+```
+
+which also runs `tonistiigi/binfmt` once to register the handlers on the host
+kernel. Emulated builds are slow, so that worker is configured with
+`WORKER_CONCURRENCY=1`; if you later add a native aarch64 machine, give it a
+higher [priority](../workers/routing.md) and aarch64 jobs will prefer it,
+falling back to emulation only when it is busy or offline.
 
 ## Supported platforms
 * x86_64 (default)
 * aarch64
 * armv7
 
-Those platforms are limited to those 3 for now, because the archlinux baseimage is only available for those platforms.
-Which is required for the build container.
+Those platforms are limited to those 3 for now, because the Arch Linux base
+image the worker is built on is only available for those platforms.
 
 ## Limitations
 qemu-binfmt only supports x86_64. So this can only be used to cross compile from an x86_64 host to other platforms.
@@ -28,7 +42,7 @@ qemu-binfmt only supports x86_64. So this can only be used to cross compile from
 
 If your output looks like this:
 ```
-Pulling image: ghcr.io/lukas-heiligenbrunner/aurcache-builder:latest
+Pulling image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
 {"msg":"exec container process (missing dynamic library?) `/usr/sbin/sh`: No such file or directory","level":"error","time":"2024-10-25T19:56:14.842412Z"}
 Docker container wait error
 ```
