@@ -1,0 +1,19 @@
+# Paths a PKGBUILD must never read.
+#
+# Consulted by aurcache-sandbox when confining the two places makechrootpkg
+# executes a PKGBUILD on the worker, outside the chroot. A file rather than an
+# environment variable because makechrootpkg reaches the build through
+# `sudo --preserve-env=GNUPGHOME,SSH_AUTH_SOCK`, which strips everything else.
+#
+# Landlock grants are positive only, so these are expanded into "grant every
+# sibling on the way down, never the path itself". Everything not listed here
+# stays readable, which is the intended trade: the list of secrets is short and
+# known, while the set of files a build legitimately reads is neither.
+
+# Build credentials (the SSH key used to fetch authenticated sources).
+/var/lib/aurcache-worker/secrets
+
+# The worker's mTLS identity. Stealing it allows impersonating this worker to
+# the server, so it is protected here as well as by file ownership.
+/var/lib/aurcache-worker/identity.pem
+/var/lib/aurcache-worker/identity.key

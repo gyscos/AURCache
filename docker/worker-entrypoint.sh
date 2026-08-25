@@ -14,4 +14,10 @@ if [ -n "${AURCACHE_ENROLLMENT_DIR:-}" ]; then
     sudo chown "$(id -u):$(id -g)" "${AURCACHE_ENROLLMENT_DIR}" 2>/dev/null || true
 fi
 
+# Hold the build credential in an agent rather than handing builds the key
+# file, which they cannot read (see docker/ssh-agent-setup.sh).
+# shellcheck source=/dev/null
+. /usr/local/bin/aurcache-ssh-agent-setup
+start_build_agent
+
 exec /usr/local/bin/aurcache-worker "$@"

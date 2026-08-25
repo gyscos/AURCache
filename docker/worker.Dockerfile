@@ -4,7 +4,7 @@
 #
 # The worker runs one long-lived process per architecture and builds every
 # package in a `devtools` chroot. Foreign architectures are supported by running
-# this same image emulated via qemu-user + binfmt (see docker-compose.yml), so
+# this same image emulated via qemu-user + binfmt (see docker-compose.yaml), so
 # the build path is uniform across arches — an aarch64 worker is just this image
 # run with `--platform linux/arm64`.
 #
@@ -39,8 +39,9 @@ RUN set -eux; \
                         CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
                         AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar ;; \
     esac; \
-    cargo build --release -p aurcache-worker --target "$RUST_TARGET"; \
-    cp "target/$RUST_TARGET/release/aurcache-worker" /usr/local/bin/aurcache-worker
+    cargo build --release --target "$RUST_TARGET" -p aurcache-worker -p aurcache-sandbox; \
+    cp "target/$RUST_TARGET/release/aurcache-worker" \
+       "target/$RUST_TARGET/release/aurcache-sandbox" /usr/local/bin/
 
 ########## Stage 2: per-arch Arch Linux runtime base ##########
 # Official Arch is x86_64-only; Arch Linux ARM images cover arm64 / armv7.
@@ -68,27 +69,75 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     && pacman-key --populate \
     && systemd-machine-id-setup
 
-# Unprivileged build user with passwordless sudo. `makechrootpkg` must not run
-# as root (makepkg refuses); sudo sets SUDO_USER=builder so makepkg drops to it.
-RUN useradd --create-home --shell /bin/bash builder \
+# Two unprivileged users, deliberately separate:
+#
+#   aurcache - runs the worker process. Owns the mTLS identity and the build
+#              credentials, and is the only user that can read them.
+#   builder  - runs each package build. `makechrootpkg -U builder` names it
+#              explicitly, so a build never inherits the worker's user through
+#              SUDO_USER and never reaches the worker's secrets by file
+#              permissions.
+#
+# They share a group so both can use the caches: builds write SRCDEST, and the
+# worker garbage-collects it. sudo is what lets the unprivileged worker start a
+# build as another user, so the worker itself never needs to be root.
+# `aurbuild` is builder's *primary* group, not a supplementary one. That
+# matters: makechrootpkg carries only the build user's primary uid/gid into the
+# chroot, so a supplementary group does not exist in there and group-write on
+# the bind-mounted caches silently fails with "no write permission for $SRCDEST"
+# — from inside the chroot, after the host-side checks have already passed.
+RUN groupadd aurbuild \
+    && useradd --create-home --shell /bin/bash --gid aurbuild builder \
+    && useradd --create-home --shell /bin/bash --groups aurbuild aurcache \
     && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
-    && chmod 0440 /etc/sudoers.d/builder
+    && echo 'aurcache ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/aurcache \
+    && chmod 0440 /etc/sudoers.d/builder /etc/sudoers.d/aurcache
 
 # Data / chroot / cache locations, writable by the build user.
 ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
     WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot \
     WORKER_CACHE_DIR=/var/cache/aurcache-worker
-RUN mkdir -p "$WORKER_DATA_DIR" "$WORKER_CHROOT_DIR" "$WORKER_CACHE_DIR" \
-    && chown -R builder:builder "$WORKER_DATA_DIR" "$WORKER_CACHE_DIR"
+# Ownership is the second half of the uid split, and it is what protects the
+# worker's secrets even if the Landlock policy is never applied:
+#
+#   data dir   - owned by aurcache, traversable so builds can reach work/,
+#                but identity and secrets inside are aurcache-only.
+#   work/      - owned by *builder*, shared to aurcache by group.
+#   cache dir  - likewise.
+#
+# The build dirs are owned by the build user rather than the worker because
+# makechrootpkg copies only the build user's primary uid/gid into the chroot:
+# supplementary groups do not exist in the chroot's /etc/group, so group-based
+# write access silently fails inside it with "no write permission for $SRCDEST".
+# Ownership by uid is the only form that survives. The worker reaches these
+# through the shared group, which it does not need inside any chroot.
+RUN mkdir -p "$WORKER_DATA_DIR/work" "$WORKER_DATA_DIR/secrets" \
+        "$WORKER_CHROOT_DIR" "$WORKER_CACHE_DIR" \
+    && chown -R aurcache:aurcache "$WORKER_DATA_DIR" \
+    && chmod 0755 "$WORKER_DATA_DIR" \
+    && chmod 0700 "$WORKER_DATA_DIR/secrets" \
+    && chown builder:aurbuild "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR" \
+    && chmod 2775 "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR"
 
 COPY --from=builder /usr/local/bin/aurcache-worker /usr/local/bin/aurcache-worker
+# Confines the two places makechrootpkg executes a PKGBUILD outside the chroot.
+# Without it those calls fail with "env: 'aurcache-sandbox': No such file", and
+# every build dies at source download.
+COPY --from=builder /usr/local/bin/aurcache-sandbox /usr/local/bin/aurcache-sandbox
 # Wrapper so devtools' systemd-nspawn works without a systemd manager (see script).
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
+# Confine the two places makechrootpkg executes a PKGBUILD on the worker,
+# outside the chroot. See backend/aurcache-sandbox.
+COPY --chmod=0755 docker/patch-makechrootpkg.py /usr/local/bin/patch-makechrootpkg
+# Paths a PKGBUILD must never read; see the file for why it is not an env var.
+COPY docker/sandbox-protected /etc/aurcache/sandbox-protected
+COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
+RUN pacman -S --noconfirm --needed python && /usr/local/bin/patch-makechrootpkg
 # Entrypoint fixes shared-enroll-volume ownership before dropping to the worker.
 COPY --chmod=0755 docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 
-USER builder
-WORKDIR /home/builder
+USER aurcache
+WORKDIR /home/aurcache
 
 # Default: enroll and poll for jobs. Override the command for `build-once`.
 ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
