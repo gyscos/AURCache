@@ -3,7 +3,7 @@ import 'package:aurcache/models/activity.dart';
 import 'api_client.dart';
 
 extension ActivityAPI on ApiClient {
-  Future<List<Activity>> listActivities({int? pkgID, int? limit}) async {
+  Future<List<Activity>> listActivities({String? pkgbase, int? limit}) async {
     String uri = "/activity?";
 
     if (limit != null) {

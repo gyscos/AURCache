@@ -10,7 +10,16 @@ use sea_orm::DatabaseConnection;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
-#[openapi(paths(settings, setting_get, setting_patch, setting_reset))]
+#[openapi(paths(
+    settings,
+    package_settings,
+    setting_get,
+    package_setting_get,
+    setting_patch,
+    package_setting_patch,
+    setting_reset,
+    package_setting_reset
+))]
 pub struct SettingsApi;
 
 fn parse_setting(key: &str) -> Result<Setting, ApiError> {
@@ -18,24 +27,82 @@ fn parse_setting(key: &str) -> Result<Setting, ApiError> {
         .ok_or_else(|| err(Status::NotFound, format!("Unknown setting key: {key}")))
 }
 
-#[utoipa::path(
-    responses(
-        (status = 200, description = "Get all settings", body = ApplicationSettings),
-    ),
-    params(
-        ("pkgid" = Option<i32>, Query, description = "Optional package id for per-package settings"),
-    )
-)]
-#[get("/settings?<pkgid>")]
-pub async fn settings(
-    db: &State<DatabaseConnection>,
-    pkgid: Option<i32>,
-    _a: Authenticated,
+// Per-package settings are a sub-resource of the package rather than a
+// `?pkgbase=` filter. That is not only tidier: a pkgbase may contain `+` (187
+// AUR packages do, such as `aewm++`), and a `+` in a query value decodes to a
+// space, so the filter form silently looked up the wrong name unless every
+// caller remembered to percent-encode. In a path segment `+` is literal.
+//
+// Each operation therefore has one implementation and two thin routes: the
+// global one, and the package-scoped one.
+
+async fn settings_impl(
+    db: &DatabaseConnection,
+    pkg_id: Option<i32>,
 ) -> Result<Json<ApplicationSettings>, ApiError> {
-    ApplicationSettings::get_all(db.inner(), pkgid)
+    ApplicationSettings::get_all(db, pkg_id)
         .await
         .map(Json)
         .map_err(|e| err(Status::InternalServerError, e))
+}
+
+async fn setting_get_impl(
+    db: &DatabaseConnection,
+    key: &str,
+    pkg_id: Option<i32>,
+) -> Result<Json<SettingResponse>, ApiError> {
+    let setting = parse_setting(key)?;
+    let entry = ApplicationSettings::get::<String>(setting, pkg_id, db).await;
+    Ok(Json(SettingResponse {
+        value: entry.value,
+        source: entry.source,
+    }))
+}
+
+async fn setting_patch_impl(
+    db: &DatabaseConnection,
+    key: &str,
+    pkg_id: Option<i32>,
+    value: String,
+) -> Result<(), ApiError> {
+    let setting = parse_setting(key)?;
+    ApplicationSettings::patch(db, [(setting, pkg_id, Some(value))])
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))
+}
+
+async fn setting_reset_impl(
+    db: &DatabaseConnection,
+    key: &str,
+    pkg_id: Option<i32>,
+) -> Result<(), ApiError> {
+    let setting = parse_setting(key)?;
+    ApplicationSettings::patch(db, [(setting, pkg_id, None)])
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))
+}
+
+#[utoipa::path(responses((status = 200, description = "Get all settings", body = ApplicationSettings)))]
+#[get("/settings")]
+pub async fn settings(
+    db: &State<DatabaseConnection>,
+    _a: Authenticated,
+) -> Result<Json<ApplicationSettings>, ApiError> {
+    settings_impl(db.inner(), None).await
+}
+
+#[utoipa::path(
+    responses((status = 200, description = "Get all settings for a package", body = ApplicationSettings)),
+    params(("pkgbase" = String, Path, description = "pkgbase of the package"))
+)]
+#[get("/package/<pkgbase>/settings")]
+pub async fn package_settings(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    _a: Authenticated,
+) -> Result<Json<ApplicationSettings>, ApiError> {
+    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    settings_impl(db.inner(), pkg_id).await
 }
 
 /// Fetch a single setting (any key, including the large config-file blobs).
@@ -44,24 +111,36 @@ pub async fn settings(
         (status = 200, description = "Get a single setting", body = SettingResponse),
         (status = 404, description = "Unknown setting key"),
     ),
-    params(
-        ("key" = String, Path, description = "Setting key"),
-        ("pkgid" = Option<i32>, Query, description = "Optional package id"),
-    )
+    params(("key" = String, Path, description = "Setting key"))
 )]
-#[get("/settings/<key>?<pkgid>")]
+#[get("/settings/<key>")]
 pub async fn setting_get(
     db: &State<DatabaseConnection>,
     key: &str,
-    pkgid: Option<i32>,
     _a: Authenticated,
 ) -> Result<Json<SettingResponse>, ApiError> {
-    let setting = parse_setting(key)?;
-    let entry = ApplicationSettings::get::<String>(setting, pkgid, db.inner()).await;
-    Ok(Json(SettingResponse {
-        value: entry.value,
-        source: entry.source,
-    }))
+    setting_get_impl(db.inner(), key, None).await
+}
+
+#[utoipa::path(
+    responses(
+        (status = 200, description = "Get a single setting for a package", body = SettingResponse),
+        (status = 404, description = "Unknown setting key or package"),
+    ),
+    params(
+        ("pkgbase" = String, Path, description = "pkgbase of the package"),
+        ("key" = String, Path, description = "Setting key"),
+    )
+)]
+#[get("/package/<pkgbase>/settings/<key>")]
+pub async fn package_setting_get(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    key: &str,
+    _a: Authenticated,
+) -> Result<Json<SettingResponse>, ApiError> {
+    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    setting_get_impl(db.inner(), key, pkg_id).await
 }
 
 #[utoipa::path(
@@ -69,23 +148,38 @@ pub async fn setting_get(
         (status = 200, description = "Update a single setting"),
         (status = 404, description = "Unknown setting key"),
     ),
-    params(
-        ("key" = String, Path, description = "Setting key"),
-        ("pkgid" = Option<i32>, Query, description = "Optional package id"),
-    )
+    params(("key" = String, Path, description = "Setting key"))
 )]
-#[patch("/settings/<key>?<pkgid>", data = "<input>")]
+#[patch("/settings/<key>", data = "<input>")]
 pub async fn setting_patch(
     db: &State<DatabaseConnection>,
     key: &str,
-    pkgid: Option<i32>,
     input: Json<SettingValue>,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    let setting = parse_setting(key)?;
-    ApplicationSettings::patch(db.inner(), [(setting, pkgid, Some(input.value.clone()))])
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))
+    setting_patch_impl(db.inner(), key, None, input.value.clone()).await
+}
+
+#[utoipa::path(
+    responses(
+        (status = 200, description = "Update a single setting for a package"),
+        (status = 404, description = "Unknown setting key or package"),
+    ),
+    params(
+        ("pkgbase" = String, Path, description = "pkgbase of the package"),
+        ("key" = String, Path, description = "Setting key"),
+    )
+)]
+#[patch("/package/<pkgbase>/settings/<key>", data = "<input>")]
+pub async fn package_setting_patch(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    key: &str,
+    input: Json<SettingValue>,
+    _a: Authenticated,
+) -> Result<(), ApiError> {
+    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    setting_patch_impl(db.inner(), key, pkg_id, input.value.clone()).await
 }
 
 /// Reset a setting back to its default by deleting any stored override.
@@ -94,20 +188,34 @@ pub async fn setting_patch(
         (status = 200, description = "Reset a setting to its default"),
         (status = 404, description = "Unknown setting key"),
     ),
-    params(
-        ("key" = String, Path, description = "Setting key"),
-        ("pkgid" = Option<i32>, Query, description = "Optional package id"),
-    )
+    params(("key" = String, Path, description = "Setting key"))
 )]
-#[delete("/settings/<key>?<pkgid>")]
+#[delete("/settings/<key>")]
 pub async fn setting_reset(
     db: &State<DatabaseConnection>,
     key: &str,
-    pkgid: Option<i32>,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    let setting = parse_setting(key)?;
-    ApplicationSettings::patch(db.inner(), [(setting, pkgid, None)])
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))
+    setting_reset_impl(db.inner(), key, None).await
+}
+
+#[utoipa::path(
+    responses(
+        (status = 200, description = "Reset a package setting to its default"),
+        (status = 404, description = "Unknown setting key or package"),
+    ),
+    params(
+        ("pkgbase" = String, Path, description = "pkgbase of the package"),
+        ("key" = String, Path, description = "Setting key"),
+    )
+)]
+#[delete("/package/<pkgbase>/settings/<key>")]
+pub async fn package_setting_reset(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    key: &str,
+    _a: Authenticated,
+) -> Result<(), ApiError> {
+    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    setting_reset_impl(db.inner(), key, pkg_id).await
 }

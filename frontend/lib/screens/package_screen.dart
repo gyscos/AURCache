@@ -19,9 +19,9 @@ import '../providers/activity_log.dart';
 import '../providers/statistics.dart';
 
 class PackageScreen extends ConsumerStatefulWidget {
-  const PackageScreen({super.key, required this.pkgID});
+  const PackageScreen({super.key, required this.pkgbase});
 
-  final int pkgID;
+  final String pkgbase;
 
   @override
   ConsumerState<PackageScreen> createState() => _PackageScreenState();
@@ -36,7 +36,7 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
         interval: Duration(minutes: 1),
         onLoad: () => _build(ExtendedPackage.dummy()),
         onData: (ExtendedPackage pkg) => _build(pkg),
-        provider: getPackageProvider(widget.pkgID),
+        provider: getPackageProvider(widget.pkgbase),
       ),
     );
   }
@@ -122,7 +122,7 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
               "Force Rebuild Package",
               "Are you sure to force an Package rebuild?\nIf the Package is outdated, the newest version is built.",
               () async {
-                await API.updatePackage(force: true, id: pkg.id);
+                await API.updatePackage(force: true, pkgbase: pkg.name);
                 // invalidate all dashboard providers
                 ref.invalidate(listActivitiesProvider);
                 ref.invalidate(listPackagesProvider);
@@ -146,7 +146,7 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
               "Delete Package",
               "Are you sure to delete this Package?",
               () async {
-                final succ = await API.deletePackage(pkg.id);
+                final succ = await API.deletePackage(pkg.name);
                 if (succ) {
                   // invalidate all dashboard providers
                   ref.invalidate(listActivitiesProvider);
@@ -171,10 +171,10 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
         const SizedBox(width: 10),
         ElevatedButton(
           onPressed: () async {
-            await showPackageSourcePatchPopup(context, pkg.id);
+            await showPackageSourcePatchPopup(context, pkg.name);
             // A saved/reverted edit can change dependencies/version without
             // bumping the upstream version, so refresh everything relevant.
-            ref.invalidate(getPackageProvider(pkg.id));
+            ref.invalidate(getPackageProvider(pkg.name));
             ref.invalidate(listPackagesProvider);
             ref.invalidate(getGraphDataProvider);
           },
@@ -463,7 +463,7 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
                         return BuildsTable(data: data);
                       },
                       onLoad: () => const Text("no data"),
-                      provider: listBuildsProvider(pkgID: pkg.id),
+                      provider: listBuildsProvider(pkgbase: pkg.name),
                     ),
                   ),
                 ),

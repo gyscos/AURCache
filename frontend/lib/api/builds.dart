@@ -2,11 +2,12 @@ import '../models/build.dart';
 import 'api_client.dart';
 
 extension BuildsAPI on ApiClient {
-  Future<List<Build>> listAllBuilds({int? pkgID, int? limit}) async {
-    String uri = "/builds?";
-    if (pkgID != null) {
-      uri += "pkgid=$pkgID";
-    }
+  Future<List<Build>> listAllBuilds({String? pkgbase, int? limit}) async {
+    // Builds for a package are a sub-resource, not a query filter: `+` is
+    // literal in a path segment but decodes to a space in a query value.
+    String uri = pkgbase == null
+        ? "/builds?"
+        : "/package/${Uri.encodeComponent(pkgbase)}/builds?";
 
     if (limit != null) {
       uri += "limit=$limit";

@@ -18,9 +18,9 @@ import 'package:go_router/go_router.dart';
 import 'package:toastification/toastification.dart';
 
 class Packagesettingsscreen extends ConsumerWidget {
-  const Packagesettingsscreen({super.key, required this.pkgID});
+  const Packagesettingsscreen({super.key, required this.pkgbase});
 
-  final int pkgID;
+  final String pkgbase;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -28,7 +28,7 @@ class Packagesettingsscreen extends ConsumerWidget {
       appBar: AppBar(
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
-          onPressed: () => context.go('/package/$pkgID'),
+          onPressed: () => context.go('/package/$pkgbase'),
         ),
         title: const Text('Package Settings'),
       ),
@@ -39,13 +39,13 @@ class Packagesettingsscreen extends ConsumerWidget {
           onData: (settings) => _Body(
             pkg: pkg,
             settings: settings,
-            onPackageChanged: () => ref.invalidate(getPackageProvider(pkgID)),
+            onPackageChanged: () => ref.invalidate(getPackageProvider(pkgbase)),
             onSettingChanged: () =>
-                ref.invalidate(getSettingsProvider(pkgid: pkgID)),
+                ref.invalidate(getSettingsProvider(pkgbase: pkgbase)),
           ),
-          provider: getSettingsProvider(pkgid: pkgID),
+          provider: getSettingsProvider(pkgbase: pkgbase),
         ),
-        provider: getPackageProvider(pkgID),
+        provider: getPackageProvider(pkgbase),
       ),
     );
   }
@@ -69,7 +69,7 @@ class _Body extends StatelessWidget {
     List<String>? buildFlags,
   }) async {
     final ok = await API.patchPackage(
-      id: pkg.id,
+      pkgbase: pkg.name,
       platforms: platforms,
       build_flags: buildFlags,
     );
@@ -80,8 +80,8 @@ class _Body extends StatelessWidget {
 
   Future<void> _applySetting(String key, SettingsResult result) async {
     final ok = result.action == SettingsAction.reset
-        ? await API.resetSetting(key, pkgid: pkg.id)
-        : await API.patchSetting(key, result.value ?? "", pkgid: pkg.id);
+        ? await API.resetSetting(key, pkgbase: pkg.name)
+        : await API.patchSetting(key, result.value ?? "", pkgbase: pkg.name);
     _toast(ok, 'Setting saved!', 'Failed to save setting!');
     if (ok) onSettingChanged();
   }

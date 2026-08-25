@@ -38,6 +38,38 @@ use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
+/// Resolve a package by its pkgbase, the public identifier.
+///
+/// Row ids are deliberately absent from the public API — they are an
+/// implementation detail. The two also cannot be accepted interchangeably:
+/// some real pkgbases are entirely numeric (`1337` and `67` both exist in the
+/// AUR), so a route taking either would resolve those names to whatever rows
+/// happened to hold those ids — a wrong-package bug rather than a not-found
+/// error. Hence no id fallback.
+/// Resolve an optional pkgbase to its row id, for endpoints whose per-package
+/// scope is optional (settings). `None` means "global", not "not found".
+pub(crate) async fn package_id_for(
+    db: &DatabaseConnection,
+    pkgbase: Option<&str>,
+) -> Result<Option<i32>, ApiError> {
+    match pkgbase {
+        Some(pkgbase) => Ok(Some(package_by_pkgbase(db, pkgbase).await?.id)),
+        None => Ok(None),
+    }
+}
+
+async fn package_by_pkgbase(
+    db: &DatabaseConnection,
+    pkgbase: &str,
+) -> Result<packages::Model, ApiError> {
+    Packages::find()
+        .filter(packages::Column::Name.eq(pkgbase))
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, format!("no package '{pkgbase}'")))
+}
+
 #[derive(OpenApi)]
 #[openapi(paths(
     package_add_endpoint,
@@ -119,16 +151,16 @@ pub async fn package_add_endpoint(
             (status = 200, description = "Update parts of package"),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[patch("/package/<id>", data = "<input>")]
+#[patch("/package/<pkgbase>", data = "<input>")]
 pub async fn package_update_entity_endpoint(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
     input: Json<PackagePatchModel>,
-    id: i32,
+    pkgbase: &str,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
     let db = db.inner();
@@ -136,10 +168,11 @@ pub async fn package_update_entity_endpoint(
     // We cannot move things out of Json<T>, but we can move it out of T.
     let input = input.into_inner();
     let patch_changed = input.patch.is_some();
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     // Start building the update operation
     let update_pkg = packages::ActiveModel {
-        id: Set(id),
+        id: Set(pkg.id),
         name: input.name.map_or(NotSet, Set),
         status: input.status.map_or(NotSet, Set),
         out_of_date: input.out_of_date.map_or(NotSet, Set),
@@ -182,23 +215,19 @@ pub async fn package_update_entity_endpoint(
             (status = 200, description = "List the files in a package's source, available for viewing/editing", body = SourceFileList),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[get("/package/<id>/source/files")]
+#[get("/package/<pkgbase>/source/files")]
 pub async fn package_source_files(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
-    id: i32,
+    pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<SourceFileList>, ApiError> {
     let db = db.inner();
 
-    let pkg = Packages::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     let files = store
         .list_files(&pkg.source_data)
@@ -213,25 +242,21 @@ pub async fn package_source_files(
             (status = 200, description = "Get the pristine content, and (if applicable) patched content, of a source file", body = SourceFileContent),
     ),
     params(
-            ("id", description = "Id of package"),
+            ("pkgbase", description = "pkgbase of the package"),
             ("path", description = "File path relative to the source root, e.g. 'PKGBUILD'")
     )
 )]
-#[get("/package/<id>/source/file?<path>")]
+#[get("/package/<pkgbase>/source/file?<path>")]
 pub async fn package_source_file(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
-    id: i32,
+    pkgbase: &str,
     path: String,
     _a: Authenticated,
 ) -> Result<Json<SourceFileContent>, ApiError> {
     let db = db.inner();
 
-    let pkg = Packages::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     let (original_content, patched_content, patch_error) = store
         .read_file_with_patch_status(&pkg.source_data, pkg.patch.as_deref(), &path)
@@ -251,26 +276,22 @@ pub async fn package_source_file(
             (status = 200, description = "Save an edit to a source file as part of the package's patch"),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[put("/package/<id>/source/file", data = "<input>")]
+#[put("/package/<pkgbase>/source/file", data = "<input>")]
 pub async fn package_source_file_update(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
-    id: i32,
+    pkgbase: &str,
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
     let db = db.inner();
     let input = input.into_inner();
 
-    let pkg = Packages::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     let client = AurClient::new();
 
@@ -304,7 +325,7 @@ pub async fn package_source_file_update(
     // diffed fresh against the current pristine content above, so applying
     // it back is guaranteed to succeed.
     let update_pkg = packages::ActiveModel {
-        id: Set(id),
+        id: Set(pkg.id),
         patch: Set(new_patch.clone()),
         ..Default::default()
     };
@@ -378,13 +399,13 @@ pub async fn package_source_preview_file(
             (status = 200, description = "Update package to newest AUR version"),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[post("/package/<id>/update", data = "<input>")]
+#[post("/package/<pkgbase>/update", data = "<input>")]
 pub async fn package_update_endpoint(
     db: &State<DatabaseConnection>,
-    id: i32,
+    pkgbase: &str,
     input: Json<UpdatePackage>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
@@ -393,11 +414,7 @@ pub async fn package_update_endpoint(
 ) -> Result<Json<Vec<i32>>, ApiError> {
     let db = db.inner();
 
-    let pkg_model: packages::Model = Packages::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg_model: packages::Model = package_by_pkgbase(db, pkgbase).await?;
 
     let pkg_update = package_update(store, db, pkg_model.clone(), input.force, tx)
         .await
@@ -432,26 +449,22 @@ pub async fn package_update_endpoint(
             (status = 200, description = "Remove direct request flag from package and live-check it"),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[delete("/package/<id>")]
+#[delete("/package/<pkgbase>")]
 pub async fn package_del(
     db: &State<DatabaseConnection>,
-    id: i32,
+    pkgbase: &str,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
     let db = db.inner();
 
     // query this before removing package ownership!
-    let pkg = Packages::find_by_id(id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
-    package_remove(db, id)
+    package_remove(db, pkg.id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
@@ -568,23 +581,18 @@ This requires 1 API call to the AUR (rate limited 4000 per day)
 https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackageModel),
     ),
     params(
-            ("id", description = "Id of package")
+            ("pkgbase", description = "pkgbase of the package")
     )
 )]
-#[get("/package/<id>")]
+#[get("/package/<pkgbase>")]
 pub async fn get_package(
     db: &State<DatabaseConnection>,
-    id: i32,
+    pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<ExtendedPackageModel>, ApiError> {
     let db = db.inner();
 
-    let pkg = Packages::find()
-        .filter(packages::Column::Id.eq(id))
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no package with that id"))?;
+    let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     // Query the latest build.version for this package (most recent by end_time then start_time)
     let latest_version_row = Builds::find()

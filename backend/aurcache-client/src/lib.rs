@@ -417,10 +417,10 @@ impl AurCacheClient {
     }
 
     /// Fetches details for a single package id.
-    pub async fn get_package(&self, id: i32) -> Result<ExtendedPackage> {
+    pub async fn get_package(&self, pkgbase: &str) -> Result<ExtendedPackage> {
         self.request_json::<ExtendedPackage, Value>(
             Method::GET,
-            &format!("/package/{id}"),
+            &format!("/package/{pkgbase}"),
             &[],
             None,
         )
@@ -436,10 +436,14 @@ impl AurCacheClient {
     /// Triggers an update check for the given package id.
     ///
     /// Returns any package ids queued as a result of the update.
-    pub async fn update_package(&self, id: i32, body: &UpdatePackageRequest) -> Result<Vec<i32>> {
+    pub async fn update_package(
+        &self,
+        pkgbase: &str,
+        body: &UpdatePackageRequest,
+    ) -> Result<Vec<i32>> {
         self.request_json(
             Method::POST,
-            &format!("/package/{id}/update"),
+            &format!("/package/{pkgbase}/update"),
             &[],
             Some(body),
         )
@@ -447,29 +451,38 @@ impl AurCacheClient {
     }
 
     /// Partially updates package metadata.
-    pub async fn patch_package(&self, id: i32, body: &PatchPackageRequest) -> Result<()> {
-        self.request_empty(Method::PATCH, &format!("/package/{id}"), &[], Some(body))
-            .await
+    pub async fn patch_package(&self, pkgbase: &str, body: &PatchPackageRequest) -> Result<()> {
+        self.request_empty(
+            Method::PATCH,
+            &format!("/package/{pkgbase}"),
+            &[],
+            Some(body),
+        )
+        .await
     }
 
     /// Removes the direct-request flag from the given package.
-    pub async fn delete_package(&self, id: i32) -> Result<()> {
-        self.request_empty::<Value>(Method::DELETE, &format!("/package/{id}"), &[], None)
+    pub async fn delete_package(&self, pkgbase: &str) -> Result<()> {
+        self.request_empty::<Value>(Method::DELETE, &format!("/package/{pkgbase}"), &[], None)
             .await
     }
 
     /// Lists builds, optionally filtered by package id.
     pub async fn list_builds(
         &self,
-        package_id: Option<i32>,
+        pkgbase: Option<&str>,
         limit: Option<u64>,
         page: Option<u64>,
     ) -> Result<Vec<Build>> {
-        let query = Query::default()
-            .opt("limit", limit)
-            .opt("page", page)
-            .opt("pkgid", package_id);
-        self.request_json::<Vec<Build>, Value>(Method::GET, "/builds", query.pairs(), None)
+        let query = Query::default().opt("limit", limit).opt("page", page);
+        // Builds for one package are a sub-resource, not a query filter: a
+        // pkgbase may contain `+`, which is literal in a path but decodes to a
+        // space in a query value.
+        let path = match pkgbase {
+            Some(pkgbase) => format!("/package/{pkgbase}/builds"),
+            None => "/builds".to_string(),
+        };
+        self.request_json::<Vec<Build>, Value>(Method::GET, &path, query.pairs(), None)
             .await
     }
 

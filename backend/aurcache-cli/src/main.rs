@@ -134,8 +134,8 @@ enum PackagesCommand {
     List(ListPackagesArgs),
     /// Get one package.
     Get {
-        /// Package id.
-        id: i32,
+        /// Package name (pkgbase).
+        pkgbase: String,
     },
     /// Add a package. Each entry is treated as a git repository URL if it
     /// looks like one (contains `@` or a URL scheme like `https://`),
@@ -147,8 +147,8 @@ enum PackagesCommand {
     Patch(PatchPackageArgs),
     /// Remove the direct-request flag from a package.
     Delete {
-        /// Package id.
-        id: i32,
+        /// Package name (pkgbase).
+        pkgbase: String,
     },
 }
 
@@ -198,8 +198,8 @@ struct AddPackageArgs {
 
 #[derive(Args, Debug, Clone)]
 struct UpdatePackageArgs {
-    /// Package id.
-    id: i32,
+    /// Package name (pkgbase).
+    pkgbase: String,
 
     /// Force the update even when the version did not change.
     #[arg(long)]
@@ -208,8 +208,8 @@ struct UpdatePackageArgs {
 
 #[derive(Args, Debug, Clone)]
 struct PatchPackageArgs {
-    /// Package id.
-    id: i32,
+    /// Package name (pkgbase).
+    pkgbase: String,
 
     /// Platform selection. Repeat to replace with multiple values.
     #[arg(long = "platform")]
@@ -280,9 +280,9 @@ struct WatchArgs {
 
 #[derive(Args, Debug, Clone)]
 struct ListBuildsArgs {
-    /// Optional package id to filter by.
-    #[arg(long = "package-id")]
-    package_id: Option<i32>,
+    /// Optional package name (pkgbase) to filter by.
+    #[arg(long = "package")]
+    pkgbase: Option<String>,
 
     /// Maximum number of builds to return.
     #[arg(long)]
@@ -466,11 +466,13 @@ async fn run_packages_command(
 ) -> Result<()> {
     match command {
         PackagesCommand::List(args) => render_packages_list(client, format, args).await,
-        PackagesCommand::Get { id } => render_package(client, format, id).await,
+        PackagesCommand::Get { pkgbase } => render_package(client, format, &pkgbase).await,
         PackagesCommand::Add(args) => add_package_command(client, format, args).await,
         PackagesCommand::Update(args) => update_package_command(client, format, args).await,
         PackagesCommand::Patch(args) => patch_package_command(client, format, args).await,
-        PackagesCommand::Delete { id } => delete_package_command(client, format, id).await,
+        PackagesCommand::Delete { pkgbase } => {
+            delete_package_command(client, format, &pkgbase).await
+        }
     }
 }
 
@@ -561,8 +563,12 @@ async fn render_packages_list(
     render(format, &packages, |packages| print_package_list(packages))
 }
 
-async fn render_package(client: &AurCacheClient, format: OutputFormat, id: i32) -> Result<()> {
-    let package = client.get_package(id).await?;
+async fn render_package(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    pkgbase: &str,
+) -> Result<()> {
+    let package = client.get_package(pkgbase).await?;
     render(format, &package, print_package)
 }
 
@@ -673,7 +679,7 @@ async fn update_package_command(
     args: UpdatePackageArgs,
 ) -> Result<()> {
     let updated_ids = client
-        .update_package(args.id, &UpdatePackageRequest { force: args.force })
+        .update_package(&args.pkgbase, &UpdatePackageRequest { force: args.force })
         .await?;
     render(format, &updated_ids, |ids| print_updated_package_ids(ids))
 }
@@ -698,13 +704,13 @@ async fn patch_package_command(
     format: OutputFormat,
     args: PatchPackageArgs,
 ) -> Result<()> {
-    let (id, body) = build_patch_package_request(args)?;
-    client.patch_package(id, &body).await?;
+    let (pkgbase, body) = build_patch_package_request(args)?;
+    client.patch_package(&pkgbase, &body).await?;
     print_done_message(format, "package updated");
     Ok(())
 }
 
-fn build_patch_package_request(args: PatchPackageArgs) -> Result<(i32, PatchPackageRequest)> {
+fn build_patch_package_request(args: PatchPackageArgs) -> Result<(String, PatchPackageRequest)> {
     let body = PatchPackageRequest {
         // `name`, `status`, `out_of_date`, and `latest_build` are internal,
         // server-managed fields (set by the add/build/version-check flows),
@@ -718,7 +724,7 @@ fn build_patch_package_request(args: PatchPackageArgs) -> Result<(i32, PatchPack
         platforms: some_vec(args.platforms),
     };
     ensure_patch_has_changes(&body)?;
-    Ok((args.id, body))
+    Ok((args.pkgbase, body))
 }
 
 fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
@@ -731,9 +737,9 @@ fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
 async fn delete_package_command(
     client: &AurCacheClient,
     format: OutputFormat,
-    id: i32,
+    pkgbase: &str,
 ) -> Result<()> {
-    client.delete_package(id).await?;
+    client.delete_package(pkgbase).await?;
     print_done_message(format, "package removed");
     Ok(())
 }
@@ -744,7 +750,7 @@ async fn render_builds_list(
     args: ListBuildsArgs,
 ) -> Result<()> {
     let builds = client
-        .list_builds(args.package_id, args.limit, args.page)
+        .list_builds(args.pkgbase.as_deref(), args.limit, args.page)
         .await?;
     render(format, &builds, |builds| print_build_list(builds))
 }

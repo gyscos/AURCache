@@ -222,7 +222,7 @@ class _BuildScreenState extends ConsumerState<BuildScreen> {
                 await API.deleteBuild(widget.buildID);
 
                 // invalidate package page provider
-                ref.invalidate(getPackageProvider(build.pkg_id));
+                ref.invalidate(getPackageProvider(build.pkg_name));
 
                 if (mounted) {
                   context.pop();

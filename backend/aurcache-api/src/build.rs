@@ -25,6 +25,7 @@ use utoipa::OpenApi;
 #[openapi(paths(
     build_output,
     list_builds,
+    list_package_builds,
     get_build,
     delete_build,
     cancel_build,
@@ -84,21 +85,51 @@ pub async fn build_output(
             (status = 200, description = "List of all builds"),
     ),
     params(
-            ("pkgid", description = "Id of Package"),
             ("limit", description = "Limit of items to fetch"),
             ("page", description = "Page to fetch")
     )
 )]
-#[get("/builds?<pkgid>&<limit>&<page>")]
+#[get("/builds?<limit>&<page>")]
 pub async fn list_builds(
     db: &State<DatabaseConnection>,
-    pkgid: Option<i32>,
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
 ) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
-    let db = db.inner();
+    list_builds_impl(db.inner(), None, limit, page).await
+}
 
+/// Builds for one package.
+///
+/// A sub-resource of the package rather than a `?pkgbase=` filter: a pkgbase
+/// may contain `+`, which decodes to a space in a query value but is literal in
+/// a path segment.
+#[utoipa::path(
+    responses((status = 200, description = "List builds for a package", body = Vec<ListBuildsModel>)),
+    params(
+        ("pkgbase" = String, Path, description = "pkgbase of the package"),
+        ("limit", description = "Limit of items to fetch"),
+        ("page", description = "Page to fetch"),
+    )
+)]
+#[get("/package/<pkgbase>/builds?<limit>&<page>")]
+pub async fn list_package_builds(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    limit: Option<u64>,
+    page: Option<u64>,
+    _a: Authenticated,
+) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
+    let pkg = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    list_builds_impl(db.inner(), pkg, limit, page).await
+}
+
+async fn list_builds_impl(
+    db: &DatabaseConnection,
+    pkg_id: Option<i32>,
+    limit: Option<u64>,
+    page: Option<u64>,
+) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
     let basequery = Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
         .select_only()
@@ -114,10 +145,10 @@ pub async fn list_builds(
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
 
-    let mut build = match pkgid {
+    let mut build = match pkg_id {
         None => basequery.into_model::<ListBuildsModel>().all(db),
-        Some(pkgid) => basequery
-            .filter(builds::Column::PkgId.eq(pkgid))
+        Some(pkg_id) => basequery
+            .filter(builds::Column::PkgId.eq(pkg_id))
             .into_model::<ListBuildsModel>()
             .all(db),
     }

@@ -64,24 +64,24 @@ final appRouter = GoRouter(
           builder: (context, state) => const ConfigFilesScreen(),
         ),
         GoRoute(
-          path: '/package/:id',
+          path: '/package/:pkgbase',
           builder: (context, state) {
-            final id = int.parse(state.pathParameters['id']!);
-            return PackageScreen(pkgID: id);
+            final pkgbase = state.pathParameters['pkgbase']!;
+            return PackageScreen(pkgbase: pkgbase);
           },
         ),
         GoRoute(
-          path: '/package/:id/settings',
+          path: '/package/:pkgbase/settings',
           builder: (context, state) {
-            final id = int.parse(state.pathParameters['id']!);
-            return Packagesettingsscreen(pkgID: id);
+            final pkgbase = state.pathParameters['pkgbase']!;
+            return Packagesettingsscreen(pkgbase: pkgbase);
           },
         ),
         GoRoute(
-          path: '/package/:id/config-files',
+          path: '/package/:pkgbase/config-files',
           builder: (context, state) {
-            final id = int.parse(state.pathParameters['id']!);
-            return ConfigFilesScreen(pkgid: id);
+            final pkgbase = state.pathParameters['pkgbase']!;
+            return ConfigFilesScreen(pkgbase: pkgbase);
           },
         ),
       ],

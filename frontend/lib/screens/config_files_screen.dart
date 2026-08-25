@@ -9,11 +9,11 @@ import 'package:toastification/toastification.dart';
 import '../models/settings.dart';
 
 class ConfigFilesScreen extends StatefulWidget {
-  const ConfigFilesScreen({super.key, this.pkgid, this.packageName});
+  const ConfigFilesScreen({super.key, this.pkgbase, this.packageName});
 
   /// When non-null, edits per-package overrides; reset reverts to the global
   /// value. When null, edits the global rows.
-  final int? pkgid;
+  final String? pkgbase;
 
   /// Optional name to render in the AppBar for context.
   final String? packageName;
@@ -36,7 +36,7 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
   bool _makepkgDirty = false;
   bool _pacmanDirty = false;
 
-  bool get _isPackageScope => widget.pkgid != null;
+  bool get _isPackageScope => widget.pkgbase != null;
 
   @override
   void initState() {
@@ -56,8 +56,14 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
   Future<void> _loadFiles() async {
     setState(() => _loading = true);
     try {
-      final makepkg = await API.getSetting('makepkg_conf', pkgid: widget.pkgid);
-      final pacman = await API.getSetting('pacman_conf', pkgid: widget.pkgid);
+      final makepkg = await API.getSetting(
+        'makepkg_conf',
+        pkgbase: widget.pkgbase,
+      );
+      final pacman = await API.getSetting(
+        'pacman_conf',
+        pkgbase: widget.pkgbase,
+      );
       _makepkgController.text = makepkg.value;
       _pacmanController.text = pacman.value;
       setState(() {
@@ -82,7 +88,7 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
     final success = await API.patchSetting(
       key,
       controller.text,
-      pkgid: widget.pkgid,
+      pkgbase: widget.pkgbase,
     );
     _showToast(
       success ? 'Saved $filename' : 'Failed to save $filename',
@@ -115,7 +121,7 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
     );
     if (confirmed != true) return;
 
-    final ok = await API.resetSetting(key, pkgid: widget.pkgid);
+    final ok = await API.resetSetting(key, pkgbase: widget.pkgbase);
     _showToast(
       ok ? 'Reset $filename' : 'Failed to reset $filename',
       success: ok,
@@ -143,7 +149,7 @@ class _ConfigFilesScreenState extends State<ConfigFilesScreen>
   @override
   Widget build(BuildContext context) {
     final backRoute = _isPackageScope
-        ? '/package/${widget.pkgid}/settings'
+        ? '/package/${widget.pkgbase}/settings'
         : '/settings';
     final title = _isPackageScope
         ? widget.packageName == null

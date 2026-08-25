@@ -29,29 +29,31 @@ class SourceFileContent {
 
 /// Client for browsing/editing the source files of an already-added package.
 extension SourceEditAPI on ApiClient {
-  Future<List<String>> getSourceFiles(int id) async {
-    final resp = await getRawClient().get("/package/$id/source/files");
+  Future<List<String>> getSourceFiles(String pkgbase) async {
+    final resp = await getRawClient().get(
+      "/package/${Uri.encodeComponent(pkgbase)}/source/files",
+    );
     return (resp.data['files'] as List).cast<String>();
   }
 
   Future<SourceFileContent> getSourceFile({
-    required int id,
+    required String pkgbase,
     required String path,
   }) async {
     final resp = await getRawClient().get(
-      "/package/$id/source/file",
+      "/package/${Uri.encodeComponent(pkgbase)}/source/file",
       queryParameters: {'path': path},
     );
     return SourceFileContent.fromJson(resp.data);
   }
 
   Future<void> updateSourceFile({
-    required int id,
+    required String pkgbase,
     required String path,
     required String content,
   }) async {
     await getRawClient().put(
-      "/package/$id/source/file",
+      "/package/${Uri.encodeComponent(pkgbase)}/source/file",
       data: {'path': path, 'content': content},
     );
   }

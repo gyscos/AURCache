@@ -17,15 +17,17 @@ extension PackagesAPI on ApiClient {
     return packages;
   }
 
-  Future<ExtendedPackage> getPackage(int id) async {
-    final resp = await getRawClient().get("/package/$id");
+  Future<ExtendedPackage> getPackage(String pkgbase) async {
+    final resp = await getRawClient().get(
+      "/package/${Uri.encodeComponent(pkgbase)}",
+    );
 
     final package = ExtendedPackage.fromJson(resp.data);
     return package;
   }
 
   Future<bool> patchPackage({
-    required int id,
+    required String pkgbase,
     String? name,
     bool? outofdate,
     int? status,
@@ -34,7 +36,7 @@ extension PackagesAPI on ApiClient {
     List<String>? build_flags,
   }) async {
     final resp = await getRawClient().patch(
-      "/package/$id",
+      "/package/${Uri.encodeComponent(pkgbase)}",
       data: {
         "name": name,
         "status": status,
@@ -86,9 +88,12 @@ extension PackagesAPI on ApiClient {
     print(resp.data);
   }
 
-  Future<List<int>> updatePackage({bool force = false, required int id}) async {
+  Future<List<int>> updatePackage({
+    bool force = false,
+    required String pkgbase,
+  }) async {
     final resp = await getRawClient().post(
-      "/package/$id/update",
+      "/package/${Uri.encodeComponent(pkgbase)}/update",
       data: {'force': force},
     );
     print(resp.data);
@@ -98,8 +103,10 @@ extension PackagesAPI on ApiClient {
     return ids;
   }
 
-  Future<bool> deletePackage(int id) async {
-    final resp = await getRawClient().delete("/package/$id");
+  Future<bool> deletePackage(String pkgbase) async {
+    final resp = await getRawClient().delete(
+      "/package/${Uri.encodeComponent(pkgbase)}",
+    );
     return resp.statusCode == 200;
   }
 }

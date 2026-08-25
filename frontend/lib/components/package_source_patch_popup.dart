@@ -11,9 +11,9 @@ import '../api/source_edit.dart';
 /// error (if it's part of the patch but no longer applies cleanly, e.g.
 /// after an upstream update).
 class PackageSourcePatchPopup extends StatefulWidget {
-  const PackageSourcePatchPopup({super.key, required this.packageId});
+  const PackageSourcePatchPopup({super.key, required this.pkgbase});
 
-  final int packageId;
+  final String pkgbase;
 
   @override
   State<PackageSourcePatchPopup> createState() =>
@@ -56,7 +56,7 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
       _error = null;
     });
     try {
-      final files = await API.getSourceFiles(widget.packageId);
+      final files = await API.getSourceFiles(widget.pkgbase);
       setState(() => _files = files);
       final preferred = files.firstWhere(
         (f) => f == 'PKGBUILD',
@@ -79,7 +79,10 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
       _error = null;
     });
     try {
-      final content = await API.getSourceFile(id: widget.packageId, path: path);
+      final content = await API.getSourceFile(
+        pkgbase: widget.pkgbase,
+        path: path,
+      );
       _originalContent = content.originalContent;
       _patchError = content.patchError;
       _isPatched = content.patchedContent != null;
@@ -100,7 +103,7 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
     });
     try {
       await API.updateSourceFile(
-        id: widget.packageId,
+        pkgbase: widget.pkgbase,
         path: path,
         content: _controller.text,
       );
@@ -208,9 +211,9 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
                                     : Container(
                                         decoration: BoxDecoration(
                                           border: Border.all(
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .outline,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.outline,
                                           ),
                                         ),
                                         // The TextField scrolls itself rather
@@ -281,9 +284,9 @@ class _PackageSourcePatchPopupState extends State<PackageSourcePatchPopup> {
   }
 }
 
-Future<void> showPackageSourcePatchPopup(BuildContext context, int packageId) {
+Future<void> showPackageSourcePatchPopup(BuildContext context, String pkgbase) {
   return showDialog(
     context: context,
-    builder: (context) => PackageSourcePatchPopup(packageId: packageId),
+    builder: (context) => PackageSourcePatchPopup(pkgbase: pkgbase),
   );
 }

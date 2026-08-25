@@ -22,8 +22,10 @@ Future<List<SimplePackage>> listPackages(Ref ref, {int? limit}) async {
 }
 
 @riverpod
-Future<ExtendedPackage> getPackage(Ref ref, int id) async {
-  final resp = await API.getRawClient().get("/package/$id");
+Future<ExtendedPackage> getPackage(Ref ref, String pkgbase) async {
+  final resp = await API.getRawClient().get(
+    "/package/${Uri.encodeComponent(pkgbase)}",
+  );
 
   final package = ExtendedPackage.fromJson(resp.data);
   return package;

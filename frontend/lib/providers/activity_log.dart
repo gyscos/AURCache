@@ -7,7 +7,11 @@ import '../models/activity.dart';
 part 'activity_log.g.dart';
 
 @riverpod
-Future<List<Activity>> listActivities(Ref ref, {int? pkgID, int? limit}) async {
+Future<List<Activity>> listActivities(
+  Ref ref, {
+  String? pkgbase,
+  int? limit,
+}) async {
   String uri = "/activity?";
 
   if (limit != null) {

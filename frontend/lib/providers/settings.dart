@@ -7,10 +7,11 @@ import '../models/settings.dart';
 part 'settings.g.dart';
 
 @riverpod
-Future<ApplicationSettings> getSettings(Ref ref, {int? pkgid}) async {
+Future<ApplicationSettings> getSettings(Ref ref, {String? pkgbase}) async {
   final resp = await API.getRawClient().get(
-    "/settings",
-    queryParameters: {'pkgid': pkgid},
+    pkgbase == null
+        ? "/settings"
+        : "/package/${Uri.encodeComponent(pkgbase)}/settings",
   );
 
   return ApplicationSettings.fromJson(resp.data);

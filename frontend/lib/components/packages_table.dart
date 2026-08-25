@@ -31,8 +31,6 @@ class PackagesTable extends ConsumerWidget {
       }),
       headingRowHeight: 50,
       columns: [
-        if (context.desktop)
-          DataColumn(label: Skeleton.keep(child: Text("ID"))),
         DataColumn(label: Skeleton.keep(child: Text("Package Name"))),
         DataColumn(label: Skeleton.keep(child: Text("Version"))),
         if (context.desktop)
@@ -54,12 +52,11 @@ class PackagesTable extends ConsumerWidget {
   ) {
     return DataRow(
       cells: [
-        if (context.desktop) DataCell(Text(package.id.toString())),
         DataCell(
           Text(package.name),
           onTap: context.mobile
               ? () {
-                  context.push("/package/${package.id}");
+                  context.push("/package/${package.name}");
                 }
               : null,
         ),
@@ -76,7 +73,7 @@ class PackagesTable extends ConsumerWidget {
               onPressed: package.outofdate
                   ? () async {
                       try {
-                        await API.updatePackage(id: package.id);
+                        await API.updatePackage(pkgbase: package.name);
                       } on DioException {
                         toastification.show(
                           title: Text('Failed to update package!'),
@@ -118,7 +115,7 @@ class PackagesTable extends ConsumerWidget {
                 ),
               ),
               onPressed: () {
-                context.push("/package/${package.id}");
+                context.push("/package/${package.name}");
               },
               child: const Text(
                 "View",
