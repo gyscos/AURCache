@@ -42,6 +42,17 @@ PATCHES = [
         '\t\taurcache-sandbox --allow-build-env -- makepkg --config="$copydir/etc/makepkg.conf" --verifysource -o',
     ),
     (
+        "download_sources: keep temp files inside the job's own directory",
+        # makepkg's signature verification does `statusfile=$(mktemp)`, which
+        # lands in /tmp — outside the sandbox's allow-list, so every package
+        # with signed sources fails with "mktemp: Permission denied" followed
+        # by a confusing "No such file or directory" from gpg's status parser.
+        # Pointing TMPDIR at $WORKDIR keeps those files in a directory the job
+        # already owns, so /tmp stays unwritable.
+        '\t\tenv SRCDEST="$SRCDEST" BUILDDIR="$WORKDIR" \\',
+        '\t\tenv SRCDEST="$SRCDEST" BUILDDIR="$WORKDIR" TMPDIR="$WORKDIR" \\',
+    ),
+    (
         "direct `source PKGBUILD` for pkgbase/pkgname",
         '} < <(sudo -u "$makepkg_user" bash -c \'',
         '} < <(sudo -u "$makepkg_user" aurcache-sandbox --allow-build-env -- bash -c \'',

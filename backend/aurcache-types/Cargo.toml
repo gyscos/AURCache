@@ -10,7 +10,15 @@ workspace = true
 serde = { workspace = true, features = ["derive"] }
 utoipa = { workspace = true }
 
-aurcache-db = {path = "../aurcache-db"}
+aurcache-db = { path = "../aurcache-db", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[features]
+# The build-queue `Action` carries database models, which drags sea-orm and
+# sqlx in with it. Everything else here is plain serde types that a browser
+# frontend can use, so the database half is optional: wasm consumers take
+# `default-features = false` and still get the API types and enums.
+default = ["db"]
+db = ["dep:aurcache-db"]

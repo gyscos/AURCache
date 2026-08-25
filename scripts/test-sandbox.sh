@@ -90,6 +90,9 @@ echo "srcdest=$(cat /shared/srcdest-other/victim-source)"
 echo "workdir=$([ -e /shared/work-other/EVIL_pkgbuild ] && echo written || echo blocked)"
 # The payloads redirect into the (writable) package dir, so a non-empty file
 # means the READ succeeded — this measures reads, not writes.
+# Not a payload: a capability the sandbox must allow. Signature verification
+# needs a temp file, and denying it breaks signed packages only.
+echo "mktemp=$([ -s /job/pkg/mktemp-ok ] && echo works || echo broken)"
 echo "sshkey=$([ -s /job/pkg/stolen-ssh ] && echo read || echo blocked)"
 echo "mtlskey=$([ -s /job/pkg/stolen-mtls ] && echo read || echo blocked)"
 EOF
@@ -126,6 +129,7 @@ check "confined:   other srcdest intact"    legit   "$(get srcdest  "$confined")
 check "confined:   other workdir untouched" blocked "$(get workdir  "$confined")"
 check "confined:   ssh key unreadable"     blocked "$(get sshkey   "$confined")"
 check "confined:   mTLS identity unreadable" blocked "$(get mtlskey "$confined")"
+check "confined:   mktemp still works"     works   "$(get mktemp    "$confined")"
 check "confined:   build still succeeds"    0       "$(get build_exit "$confined")"
 
 if (( fail )); then
