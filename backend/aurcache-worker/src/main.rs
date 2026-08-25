@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aurcache_worker::config::Config;
-use aurcache_worker::identity::Identity;
-use aurcache_worker::runner::Runner;
-use aurcache_worker::{credentials, enroll, oneshot};
+use aurcache_worker::executor::ChrootExecutor;
+use aurcache_worker::{credentials, oneshot};
+use aurcache_worker_core::identity::Identity;
+use aurcache_worker_core::runner::Runner;
+use aurcache_worker_core::{config::CoreConfig, enroll};
 
 #[derive(Parser)]
 #[command(name = "aurcache-worker", version, about)]
@@ -52,10 +54,10 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Prepare => {
-            let identity = Identity::load_or_create(&cfg.data_dir)?;
+            let identity = Identity::load_or_create(&cfg.core.data_dir)?;
             println!("Worker fingerprint: {}", identity.fingerprint);
-            println!("Name: {}", cfg.name);
-            println!("Native arches: {}", cfg.native_arches.join(","));
+            println!("Name: {}", cfg.core.name);
+            println!("Native arches: {}", cfg.core.native_arches.join(","));
             Ok(())
         }
         Command::BuildOnce { path, flags } => oneshot::build_once(&cfg, &path, &flags).await,
@@ -92,25 +94,27 @@ async fn announce_build_credential(cfg: &Config) {
 }
 
 async fn run(cfg: Arc<Config>) -> Result<()> {
-    let identity = Identity::load_or_create(&cfg.data_dir)?;
+    let identity = Identity::load_or_create(&cfg.core.data_dir)?;
     announce_build_credential(&cfg).await;
+    let core: Arc<CoreConfig> = Arc::new(cfg.core.clone());
 
     // The server may not be reachable yet (e.g. still starting in the same
     // compose stack) or may briefly go away. Retry enrollment with backoff
     // instead of crashing, so the worker is resilient to server restarts.
     let client = loop {
-        match enroll::ensure_enrolled(&cfg, &identity).await {
+        match enroll::ensure_enrolled(&core, &identity).await {
             Ok(client) => break client,
             Err(e) => {
                 tracing::warn!(
                     "Enrollment not complete ({e:#}); retrying in {}s",
-                    cfg.poll_interval
+                    core.poll_interval
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(cfg.poll_interval)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(core.poll_interval)).await;
             }
         }
     };
 
-    let runner = Runner::new(cfg, Arc::new(client));
+    let executor = Arc::new(ChrootExecutor::new(cfg));
+    let runner = Runner::new(core, Arc::new(client), executor);
     runner.run().await
 }

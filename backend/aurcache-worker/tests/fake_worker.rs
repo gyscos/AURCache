@@ -29,10 +29,10 @@ use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_SUCCESS};
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
 use aurcache_types::worker::{ClaimRequest, CompleteReport};
-use aurcache_worker::client::{WorkerClient, fetch_and_pin_ca};
-use aurcache_worker::config::Config;
-use aurcache_worker::enroll::ensure_enrolled;
-use aurcache_worker::identity::Identity;
+use aurcache_worker_core::client::{WorkerClient, fetch_and_pin_ca};
+use aurcache_worker_core::config::CoreConfig;
+use aurcache_worker_core::enroll::ensure_enrolled;
+use aurcache_worker_core::identity::Identity;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
 };
@@ -153,7 +153,7 @@ async fn fake_worker_protocol_roundtrip() {
 
     // Enroll a synthetic worker with the production client + enrollment flow.
     // The shared enrollment token makes the server auto-approve it.
-    let cfg = Config::from_env();
+    let cfg = CoreConfig::from_env();
     let identity = Identity::load_or_create(&cfg.data_dir).unwrap();
     let client: WorkerClient = ensure_enrolled(&cfg, &identity)
         .await

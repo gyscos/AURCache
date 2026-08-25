@@ -6,12 +6,12 @@ use aurcache_types::worker::{RegisterRequest, RegisterStatus, WorkerStatus};
 use std::time::Duration;
 
 use crate::client::{WorkerClient, fetch_and_pin_ca};
-use crate::config::Config;
+use crate::config::CoreConfig;
 use crate::identity::Identity;
 
 /// Drop the CSR into the shared enrollment volume so a co-located backend can
 /// auto-approve this worker (bundled single-host topology). Best-effort.
-pub fn publish_csr_to_enrollment_dir(cfg: &Config, fingerprint: &str, csr_pem: &str) {
+pub fn publish_csr_to_enrollment_dir(cfg: &CoreConfig, fingerprint: &str, csr_pem: &str) {
     let Some(dir) = &cfg.enrollment_dir else {
         return;
     };
@@ -31,7 +31,7 @@ pub fn publish_csr_to_enrollment_dir(cfg: &Config, fingerprint: &str, csr_pem: &
 /// Registration is how a worker reports its configuration, and *all* of it can
 /// have changed since the machine last booted, so this is rebuilt from `cfg`
 /// every time rather than cached.
-fn register_request(cfg: &Config, csr_pem: String) -> RegisterRequest {
+fn register_request(cfg: &CoreConfig, csr_pem: String) -> RegisterRequest {
     RegisterRequest {
         name: cfg.name.clone(),
         native_arches: cfg.native_arches.clone(),
@@ -61,7 +61,7 @@ fn register_request(cfg: &Config, csr_pem: String) -> RegisterRequest {
 /// one `docker compose up`, so a worker will regularly reach the server before
 /// it is listening. Failing to register then must not stop a worker that is
 /// already able to build — it proceeds on its persisted configuration.
-pub async fn ensure_enrolled(cfg: &Config, identity: &Identity) -> Result<WorkerClient> {
+pub async fn ensure_enrolled(cfg: &CoreConfig, identity: &Identity) -> Result<WorkerClient> {
     tracing::info!("Worker fingerprint: {}", identity.fingerprint);
 
     let csr_pem = identity.generate_csr(&cfg.name)?;
@@ -125,7 +125,7 @@ pub async fn ensure_enrolled(cfg: &Config, identity: &Identity) -> Result<Worker
 /// If the status carries a signed certificate, persist it and build the
 /// authenticated client. Returns `None` while still pending.
 fn try_finish_enrollment(
-    cfg: &Config,
+    cfg: &CoreConfig,
     identity: &Identity,
     status: &RegisterStatus,
 ) -> Result<Option<WorkerClient>> {
@@ -133,6 +133,23 @@ fn try_finish_enrollment(
         return Ok(None);
     };
     identity.store_signed(cert, ca)?;
-    let client = WorkerClient::authenticated(&cfg.aurcache_url, ca, cert, &identity.key_pem())?;
+    let mut client = WorkerClient::authenticated(&cfg.aurcache_url, ca, cert, &identity.key_pem())?;
+
+    // Render the server's `[repo]` template with the host we actually reach it
+    // on. Done here, once, because it describes the deployment rather than any
+    // one build.
+    let section = crate::repo::render(
+        &status.repo_template,
+        &cfg.aurcache_url,
+        cfg.repo_host.as_deref(),
+    );
+    match section.lines().find(|l| l.starts_with("Server =")) {
+        Some(server) => tracing::info!("Package repository for this worker: {server}"),
+        None => tracing::warn!(
+            "No usable [repo] section for this worker; builds cannot resolve \
+             AURCache-built dependencies"
+        ),
+    }
+    client.set_repo_section(section);
     Ok(Some(client))
 }

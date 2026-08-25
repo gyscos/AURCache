@@ -51,6 +51,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct WorkerClient {
     http: Client,
     base: String,
+    /// `[repo]` section rendered for this worker from the server's template,
+    /// set once enrollment completes. Empty when this server publishes no
+    /// repository, or no host could be determined.
+    repo_section: String,
 }
 
 /// Fetch the server CA (PEM + fingerprint) using a deliberately
@@ -134,6 +138,17 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
 }
 
 impl WorkerClient {
+    /// Record the `[repo]` section this worker should append to job configs.
+    pub fn set_repo_section(&mut self, section: String) {
+        self.repo_section = section;
+    }
+
+    /// The `[repo]` section for this worker; empty when there is none.
+    #[must_use]
+    pub fn repo_section(&self) -> &str {
+        &self.repo_section
+    }
+
     /// Build an enrollment client that trusts only the pinned CA and carries no
     /// client identity (job endpoints will 401/403 until authenticated).
     pub fn enrollment(base: &str, ca_pem: &str) -> Result<Self> {
@@ -146,6 +161,7 @@ impl WorkerClient {
             .build()
             .context("building enrollment client")?;
         Ok(Self {
+            repo_section: String::new(),
             http,
             base: base.to_string(),
         })
@@ -167,6 +183,7 @@ impl WorkerClient {
             .build()
             .context("building authenticated client")?;
         Ok(Self {
+            repo_section: String::new(),
             http,
             base: base.to_string(),
         })

@@ -88,7 +88,7 @@ impl KeySource {
 pub fn resolve(cfg: &Config) -> KeySource {
     match &cfg.git_ssh_key {
         Some(path) => KeySource::Provided(path.clone()),
-        None => KeySource::Generated(cfg.data_dir.join("ssh").join(KEY_FILE)),
+        None => KeySource::Generated(cfg.core.data_dir.join("ssh").join(KEY_FILE)),
     }
 }
 
@@ -148,12 +148,22 @@ async fn generate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The `GIT_SSH_COMMAND` a build should use, given in-chroot paths.
+/// The `GIT_SSH_COMMAND` a build should use.
 ///
-/// `IdentitiesOnly` stops ssh from offering any agent key ahead of this one.
+/// The key is **not** named here, and `IdentitiesOnly` is deliberately absent:
+/// authentication goes through the ssh-agent the worker runs, reached via
+/// `SSH_AUTH_SOCK`. The build user cannot read the key file at all — it belongs
+/// to the worker's user and is listed in the sandbox's protected paths — so a
+/// `-i` pointing at it would simply fail.
+///
+/// This is what makes the credential survive the uid split: the agent lets a
+/// build *use* the key without ever being able to read it. A hostile PKGBUILD
+/// can still ask the agent to authenticate during its own build (agent
+/// hijacking is inherent and accepted), but it cannot obtain the key material,
+/// so nothing it steals outlives the build.
 #[must_use]
-pub fn git_ssh_command(key: &str, known_hosts: Option<&str>) -> String {
-    let mut cmd = format!("ssh -i {key} -o IdentitiesOnly=yes");
+pub fn git_ssh_command(known_hosts: Option<&str>) -> String {
+    let mut cmd = String::from("ssh");
     match known_hosts {
         Some(path) => cmd.push_str(&format!(" -o UserKnownHostsFile={path}")),
         // Without a known_hosts file ssh would prompt, which hangs a
@@ -170,14 +180,13 @@ pub fn git_ssh_command(key: &str, known_hosts: Option<&str>) -> String {
 /// without `makechrootpkg` having to forward environment variables. Keeping it
 /// worker-side means credentials never enter the server's job configuration.
 ///
-/// The export is **guarded on the key being readable**, because one file serves
-/// two environments: `download_sources()` runs on the worker, where the key
-/// exists, while the same `makepkg.conf` is also read inside the chroot, where
-/// it deliberately does not. Unguarded, an in-chroot git operation over SSH
-/// would be handed `-i <missing file> -o IdentitiesOnly=yes`, which both warns
-/// confusingly and suppresses every other identity it might have used. Guarded,
-/// the export simply does not apply in there and git behaves as if AURCache had
-/// never touched the config.
+/// The export is **guarded on the agent socket being present**, because one
+/// file serves two environments: `download_sources()` runs on the worker, where
+/// `SSH_AUTH_SOCK` is set and the agent is reachable, while the same
+/// `makepkg.conf` is also read inside the chroot, where it deliberately is not.
+/// Guarded, the export simply does not apply in there and ordinary git
+/// operations inside the chroot behave as if AURCache had never touched the
+/// config.
 #[must_use]
 pub fn augment_makepkg_conf(base: &str, credential: Option<&StagedCredential>) -> String {
     let Some(cred) = credential else {
@@ -188,12 +197,12 @@ pub fn augment_makepkg_conf(base: &str, credential: Option<&StagedCredential>) -
         out.push('\n');
     }
     out.push_str("# Added by aurcache-worker: build credentials (see credentials.rs).\n");
-    out.push_str("# Guarded so ordinary git operations still work inside the chroot, where\n");
-    out.push_str("# the key deliberately is not present: the export applies on the worker\n");
+    out.push_str("# Guarded on the agent socket so ordinary git operations still work inside\n");
+    out.push_str("# the chroot, where no agent is reachable: the export applies on the worker\n");
     out.push_str("# (which is where makepkg fetches sources) and nowhere else.\n");
     out.push_str(&format!(
-        "if [ -r \"{}\" ]; then\n    export GIT_SSH_COMMAND=\"{}\"\nfi\n",
-        cred.key.display(),
+        "if [ -n \"${{SSH_AUTH_SOCK:-}}\" ] && [ -S \"$SSH_AUTH_SOCK\" ]; then\n    \
+         export GIT_SSH_COMMAND=\"{}\"\nfi\n",
         cred.git_ssh_command
     ));
     out
@@ -255,7 +264,7 @@ pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<StagedCredential
     };
 
     Ok(Some(StagedCredential {
-        git_ssh_command: git_ssh_command(&staged_key.display().to_string(), known_hosts.as_deref()),
+        git_ssh_command: git_ssh_command(known_hosts.as_deref()),
         key: staged_key,
     }))
 }
@@ -279,7 +288,7 @@ mod tests {
     fn cfg_with(key: Option<&str>, data_dir: &str) -> Config {
         let mut cfg = Config::from_env();
         cfg.git_ssh_key = key.map(PathBuf::from);
-        cfg.data_dir = PathBuf::from(data_dir);
+        cfg.core.data_dir = PathBuf::from(data_dir);
         cfg.ssh_known_hosts = None;
         cfg
     }
@@ -318,14 +327,17 @@ mod tests {
         );
     }
 
+    /// Authentication goes through the agent, so the command must name no key
+    /// and must not set `IdentitiesOnly`, which would suppress agent identities
+    /// and break authenticated fetches outright.
     #[test]
-    fn git_ssh_command_pins_the_key_and_host_policy() {
-        let with_hosts = git_ssh_command("/staged/id_ed25519", Some("/staged/known_hosts"));
-        assert!(with_hosts.contains("-i /staged/id_ed25519"));
-        assert!(with_hosts.contains("IdentitiesOnly=yes"));
+    fn git_ssh_command_uses_the_agent_and_sets_host_policy() {
+        let with_hosts = git_ssh_command(Some("/staged/known_hosts"));
+        assert!(!with_hosts.contains("-i "), "must not name a key file");
+        assert!(!with_hosts.contains("IdentitiesOnly"));
         assert!(with_hosts.contains("UserKnownHostsFile=/staged/known_hosts"));
         // No known_hosts must not leave ssh prompting, which would hang a build.
-        let without = git_ssh_command("/k", None);
+        let without = git_ssh_command(None);
         assert!(without.contains("StrictHostKeyChecking=accept-new"));
     }
 
@@ -336,32 +348,36 @@ mod tests {
 
         let cred = StagedCredential {
             key: PathBuf::from("/staged/id_ed25519"),
-            git_ssh_command: "ssh -i /staged/id_ed25519".to_string(),
+            git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
         let augmented = augment_makepkg_conf(base, Some(&cred));
         assert!(augmented.starts_with("PKGDEST=/output\n"));
-        assert!(augmented.contains("export GIT_SSH_COMMAND=\"ssh -i /staged/id_ed25519\""));
+        assert!(
+            augmented
+                .contains("export GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=accept-new\"")
+        );
     }
 
-    /// The export must be guarded on the key being readable. The same
-    /// `makepkg.conf` is read on the worker (where the key is) and inside the
-    /// chroot (where it deliberately is not); unguarded, ordinary git
-    /// operations in a PKGBUILD would be handed a missing identity file plus
-    /// `IdentitiesOnly=yes`, which also suppresses any identity they did have.
+    /// The export must be guarded on the agent socket. The same `makepkg.conf`
+    /// is read on the worker (where the agent is reachable) and inside the
+    /// chroot (where it is not); unguarded, ordinary git operations in a
+    /// PKGBUILD would be pointed at a socket that does not exist there.
     #[test]
     fn the_export_is_guarded_so_it_does_not_apply_in_the_chroot() {
         let cred = StagedCredential {
             key: PathBuf::from("/staged/id_ed25519"),
-            git_ssh_command: "ssh -i /staged/id_ed25519".to_string(),
+            git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
         let conf = augment_makepkg_conf("PKGDEST=/output", Some(&cred));
 
-        assert!(conf.contains("if [ -r \"/staged/id_ed25519\" ]; then"));
+        assert!(conf.contains("SSH_AUTH_SOCK"));
         assert!(conf.trim_end().ends_with("fi"));
         // The guard must wrap the export, not sit beside it.
-        let guard = conf.find("if [ -r").expect("guard present");
+        let guard = conf.find("if [ -n").expect("guard present");
         let export = conf.find("export GIT_SSH_COMMAND").expect("export present");
         assert!(guard < export, "export must be inside the guard");
+        // The key path must not leak into a config the chroot also reads.
+        assert!(!conf.contains("/staged/id_ed25519"));
     }
 
     #[test]
@@ -398,12 +414,13 @@ mod tests {
         let cfg = cfg_with(key.to_str(), tmp.path().to_str().unwrap());
         let cred = stage_for_job(&cfg, &dest).unwrap().expect("staged");
 
-        // The command must name the staged path itself: `makechrootpkg`
-        // downloads sources outside the chroot, so a chroot-only path would be
-        // invisible exactly when the fetch happens.
+        // The key is still staged at a stable path — that is where the worker's
+        // ssh-agent loads it from — but the command must not name it: the build
+        // user cannot read it, and authentication goes through the agent.
         let staged = dest.join(KEY_FILE);
         assert_eq!(cred.key, staged);
-        assert!(cred.git_ssh_command.contains(&staged.display().to_string()));
+        assert!(!cred.git_ssh_command.contains(&staged.display().to_string()));
+        assert!(!cred.git_ssh_command.contains("-i "));
         assert_eq!(std::fs::read_to_string(&staged).unwrap(), "PRIVATE");
         #[cfg(unix)]
         {

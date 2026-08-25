@@ -60,7 +60,28 @@ pub struct RegisterStatus {
     pub signed_cert: Option<String>,
     /// PEM of the CA certificate, present once approved (for the worker to pin).
     pub ca_cert: Option<String>,
+    /// A `pacman.conf` `[repo]` section for this AURCache instance, with the
+    /// host left as the placeholder [`REPO_HOST_PLACEHOLDER`] for the worker
+    /// to fill in. Empty when this instance publishes no repository.
+    ///
+    /// The host cannot be decided server-side: workers reach the same server by
+    /// different addresses — a compose service name, a LAN address, `localhost`
+    /// for a worker embedded alongside it — and one baked-in value is wrong for
+    /// all but one of them. Everything else about the section (its name, the
+    /// port, `SigLevel`) stays the server's to choose, so it is sent rendered
+    /// except for that one field.
+    ///
+    /// Sent at registration rather than per job because it describes the
+    /// deployment, not the build.
+    #[serde(default)]
+    pub repo_template: String,
 }
+
+/// Placeholder the worker replaces with the host it reaches the server on.
+///
+/// Chosen so pacman never interprets it: `$` would collide with pacman's own
+/// `$arch` / `$repo` substitution.
+pub const REPO_HOST_PLACEHOLDER: &str = "%AURCACHE_HOST%";
 
 /// A worker's request to claim a job, advertising the arches it can build so
 /// the server can route native vs emulated work.

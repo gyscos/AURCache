@@ -5,6 +5,8 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+use aurcache_worker_core::{artifacts, report};
+
 use crate::build;
 use crate::cache::Cache;
 use crate::chroot;
@@ -40,7 +42,13 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .unwrap_or("local");
     let srcdest = cache.srcdest(pkgbase);
 
-    let argv = build::build_command(&cfg.chroot_dir, "build-once", &cfg.bind_mounts, flags);
+    let argv = build::build_command(
+        &cfg.chroot_dir,
+        "build-once",
+        &cfg.bind_mounts,
+        flags,
+        &cfg.build_user,
+    );
     tracing::info!("$ sudo {}", argv.join(" "));
 
     let mut cmd = chroot::devtools(&argv[0]);
@@ -52,9 +60,9 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     }
     let status = cmd.status().await.context("running build")?;
 
-    let report = build::classify_exit(status, false);
+    let report = report::classify_exit(status, false);
     if report.success {
-        let artifacts = build::discover_artifacts(&pkgdir);
+        let artifacts = artifacts::discover_artifacts(&pkgdir);
         tracing::info!("Build succeeded: {} artifact(s)", artifacts.len());
         for a in artifacts {
             println!("{}", a.display());

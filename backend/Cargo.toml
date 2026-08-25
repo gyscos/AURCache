@@ -15,7 +15,8 @@ members = [
     "aurcache-scheduler",
     "aurcache-types",
     "aurcache-ca",
-    "aurcache-worker"]
+    "aurcache-worker",
+    "aurcache-worker-core"]
 
 # Idioms enforced across the workspace. Every lint here is at zero warnings, so
 # these guard against regression rather than demanding a cleanup.

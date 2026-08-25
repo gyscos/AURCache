@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use aurcache_worker_core::client::WorkerClient;
+use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};
+use aurcache_worker_core::{artifacts, report};
+
 use crate::build;
 use crate::cache::Cache;
 use crate::chroot;
-use crate::client::WorkerClient;
 use crate::config::Config;
 use crate::credentials;
 
@@ -34,7 +37,11 @@ pub async fn run_job(
     cancel: Arc<AtomicBool>,
     active_pkgbases: Arc<Mutex<HashSet<String>>>,
 ) -> CompleteReport {
-    let workdir = cfg.data_dir.join("work").join(job.build_id.to_string());
+    let workdir = cfg
+        .core
+        .data_dir
+        .join("work")
+        .join(job.build_id.to_string());
 
     let report = match run_job_inner(cfg, client, &job, &cancel, &active_pkgbases, &workdir).await {
         Ok(report) => report,
@@ -43,7 +50,7 @@ pub async fn run_job(
             let _ = client
                 .append_log(job.build_id, &format!("\n[worker] {msg}\n"))
                 .await;
-            build::setup_failure(msg)
+            report::setup_failure(msg)
         }
     };
 
@@ -98,12 +105,12 @@ async fn run_job_inner(
         .context("downloading source")?;
     // Defensive: a crash mid-job could have left a tree behind under this id.
     let _ = std::fs::remove_dir_all(workdir);
-    let pkgdir = build::extract_source(&source, workdir).context("extracting source")?;
+    let pkgdir = artifacts::extract_source(&source, workdir).context("extracting source")?;
 
     // 2. Stage build credentials, then write per-package configs + ensure base
     //    chroot. The key is read now rather than at worker start, so replacing
     //    it on the host takes effect on the next build without a restart.
-    let secrets_dir = credentials::secrets_dir(&cfg.data_dir);
+    let secrets_dir = credentials::secrets_dir(&cfg.core.data_dir);
     let credential =
         credentials::stage_for_job(cfg, &secrets_dir).context("staging build credentials")?;
     if credential.is_some() {
@@ -116,10 +123,14 @@ async fn run_job_inner(
     }
 
     let cfg_dir = workdir.join("config");
+    // The server sends no `[repo]` section; the worker appends one rendered for
+    // the host it reaches the server on (see aurcache_worker_core::repo).
+    let pacman_conf =
+        aurcache_worker_core::repo::append_to_pacman_conf(&job.pacman_conf, client.repo_section());
     let (makepkg_conf, pacman_conf) = chroot::write_configs(
         &cfg_dir,
         &credentials::augment_makepkg_conf(&job.makepkg_conf, credential.as_ref()),
-        &job.pacman_conf,
+        &pacman_conf,
         job.mirrorlist.as_deref(),
         cache.pacman_pkg().as_deref(),
     )
@@ -138,7 +149,7 @@ async fn run_job_inner(
     }
 
     if cancel.load(Ordering::SeqCst) {
-        return Ok(build::classify_exit_canceled());
+        return Ok(report::classify_exit_canceled());
     }
 
     // 4. Build under a resource-limited scope, honoring cancel.
@@ -212,6 +223,7 @@ async fn run_build(
         &format!("job-{build_id}"),
         binds,
         &job.build_flags,
+        &cfg.build_user,
     );
 
     tracing::debug!("$ sudo {}", argv.join(" "));
@@ -243,7 +255,7 @@ async fn run_build(
     // the server, and — now that the client carries connect/read timeouts — can
     // no longer block this loop indefinitely.
     let started = std::time::Instant::now();
-    let timeout = cfg.build_timeout;
+    let timeout = cfg.core.build_timeout;
     let remote_poll = Duration::from_secs(30);
     let mut last_remote_poll = std::time::Instant::now();
     let mut canceled = false;
@@ -274,46 +286,7 @@ async fn run_build(
     };
 
     if timed_out {
-        return Ok(build::timeout_failure(started.elapsed().as_secs()));
+        return Ok(report::timeout_failure(started.elapsed().as_secs()));
     }
-    Ok(build::classify_exit(status, canceled))
-}
-
-/// Check the server for a cancel request (best-effort; failure = not canceled).
-async fn remote_cancel(client: &WorkerClient, build_id: i32) -> bool {
-    client
-        .job_status(build_id)
-        .await
-        .is_ok_and(|s| s.cancel_requested)
-}
-
-/// Upload every built artifact to the server's staging area.
-async fn upload_artifacts(client: &WorkerClient, build_id: i32, pkgdir: &Path) -> Result<()> {
-    let artifacts = build::discover_artifacts(pkgdir);
-    if artifacts.is_empty() {
-        anyhow::bail!("build produced no artifacts");
-    }
-    for path in artifacts {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("artifact has no filename")?
-            .to_string();
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
-        log(client, build_id, &format!("[worker] uploading {name}\n")).await;
-        client
-            .upload_artifact(build_id, &name, bytes)
-            .await
-            .with_context(|| format!("uploading {name}"))?;
-    }
-    Ok(())
-}
-
-/// Append a log line, ignoring transport errors.
-async fn log(client: &WorkerClient, build_id: i32, text: &str) {
-    if let Err(e) = client.append_log(build_id, text).await {
-        tracing::debug!("log append failed: {e}");
-    }
+    Ok(report::classify_exit(status, canceled))
 }

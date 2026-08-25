@@ -1,17 +1,17 @@
-//! AURCache remote build worker library.
+//! AURCache `devtools` chroot build worker.
 //!
-//! Exposes the worker's internal modules so they can be reused by the binary
-//! (`main.rs`) and by integration tests (e.g. the hermetic fake-worker protocol
-//! test in `tests/`). See `design/remote-workers.md`.
+//! Builds each package in its own clean chroot via Arch's `devtools`. The
+//! worker protocol itself — identity, enrollment, claiming, heartbeats — lives
+//! in `aurcache-worker-core`; this crate is only the executor plus the
+//! chroot-specific configuration, caches and credential handling.
+//!
+//! See `design/remote-workers.md`.
 
 pub mod build;
 pub mod cache;
 pub mod chroot;
-pub mod client;
 pub mod config;
 pub mod credentials;
-pub mod enroll;
-pub mod identity;
+pub mod executor;
 pub mod job;
 pub mod oneshot;
-pub mod runner;

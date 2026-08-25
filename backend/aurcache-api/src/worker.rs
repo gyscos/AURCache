@@ -82,6 +82,38 @@ fn public_repo_url() -> String {
     })
 }
 
+/// A `[repo]` section for this instance with the host left as a placeholder.
+///
+/// Scheme, port and path come from `AURCACHE_PUBLIC_URL` because those describe
+/// how the repository is *published*; only the host is replaced, because that
+/// is the one part each worker knows better than the server does. A worker in
+/// the compose network, one on the LAN and one embedded in this very container
+/// all reach the same repository by different names.
+fn repo_template() -> String {
+    render_repo_template(&public_repo_url())
+}
+
+/// Pure form of [`repo_template`].
+fn render_repo_template(public_url: &str) -> String {
+    let trimmed = public_url.trim_end_matches('/');
+    // Split off the scheme, then replace only the host portion of the
+    // authority, keeping any port and path intact.
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("http", trimmed),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    let port = authority.rsplit_once(':').map_or_else(
+        || format!(":{}", aurcache_types::ports::AURCACHE_MIRROR_PORT),
+        |(_, port)| format!(":{port}"),
+    );
+    let placeholder = aurcache_types::worker::REPO_HOST_PLACEHOLDER;
+    format!("[repo]\nSigLevel = Never\nServer = {scheme}://{placeholder}{port}{path}/$arch\n")
+}
+
 /// Directory the server reads per-arch mirrorlists from (x86_64 only today).
 fn mirrorlist_dir() -> PathBuf {
     PathBuf::from(env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()))
@@ -273,6 +305,7 @@ async fn register_status_for(
         status: worker.status,
         signed_cert,
         ca_cert,
+        repo_template: repo_template(),
     }))
 }
 
@@ -343,7 +376,10 @@ async fn build_descriptor(
         .ok_or_else(|| anyhow::anyhow!("package {} not found", build.pkg_id))?;
 
     let (makepkg_conf, pacman_conf) =
-        build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST), &public_repo_url()).await;
+        // No `[repo]` section here: the worker appends one rendered from the
+        // template it received at registration, using the host it actually
+        // reaches this server on.
+        build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST)).await;
 
     let arch = build.platform.as_str().to_string();
     let mirrorlist = mirrorlist_for(&arch, &mirrorlist_dir()).await;
@@ -701,4 +737,40 @@ pub async fn revoke_worker(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod repo_template_tests {
+    use super::render_repo_template;
+    use aurcache_types::worker::REPO_HOST_PLACEHOLDER;
+
+    /// Only the host is replaced: the scheme, port and path describe how the
+    /// repository is published and remain the server's decision.
+    #[test]
+    fn replaces_only_the_host() {
+        let t = render_repo_template("http://aurcache.example.com:9000/repo");
+        assert!(t.contains(&format!(
+            "Server = http://{REPO_HOST_PLACEHOLDER}:9000/repo/$arch"
+        )));
+        assert!(t.starts_with("[repo]\nSigLevel = Never\n"));
+    }
+
+    /// A URL without an explicit port still needs one, or the worker would
+    /// render `http://host/$arch` and reach the web UI instead of the repo.
+    #[test]
+    fn supplies_the_repository_port_when_the_url_omits_it() {
+        let t = render_repo_template("http://aurcache.example.com");
+        assert!(t.contains(&format!(
+            "Server = http://{REPO_HOST_PLACEHOLDER}:{}/$arch",
+            aurcache_types::ports::AURCACHE_MIRROR_PORT
+        )));
+    }
+
+    #[test]
+    fn keeps_https_and_ignores_a_trailing_slash() {
+        let t = render_repo_template("https://aurcache.example.com:8081/");
+        assert!(t.contains(&format!(
+            "Server = https://{REPO_HOST_PLACEHOLDER}:8081/$arch"
+        )));
+    }
 }

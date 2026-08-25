@@ -1,11 +1,7 @@
 [package]
-name = "aurcache-worker"
+name = "aurcache-worker-core"
 version = "0.1.0"
 edition = "2024"
-
-[[bin]]
-name = "aurcache-worker"
-path = "src/main.rs"
 
 [lints]
 workspace = true
@@ -14,7 +10,6 @@ workspace = true
 tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = "0.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
@@ -22,20 +17,10 @@ rcgen = { version = "0.13", features = ["pem"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22.1"
-clap = { version = "4", features = ["derive", "env"] }
 flate2 = { workspace = true }
 tar = { workspace = true }
 percent-encoding = "2.3"
 aurcache-types = { path = "../aurcache-types" }
-aurcache-worker-core = { path = "../aurcache-worker-core" }
 
 [dev-dependencies]
-aurcache-worker-core = { path = "../aurcache-worker-core" }
 tempfile = { workspace = true }
-aurcache-api = { path = "../aurcache-api" }
-aurcache-db = { path = "../aurcache-db" }
-aurcache-ca = { path = "../aurcache-ca" }
-aurcache-utils = { path = "../aurcache-utils" }
-sea-orm = { workspace = true }
-sea-orm-migration = { version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
-zstd = "0.13.3"

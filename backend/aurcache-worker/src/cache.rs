@@ -152,12 +152,44 @@ impl Cache {
         plan
     }
 
+    /// Create a cache directory, group-writable.
+    ///
+    /// These directories are created by the worker but written by *builds*,
+    /// which run as a different user (see `Config::build_user`). The parent is
+    /// setgid so the group is inherited, but the mode is not: with a default
+    /// umask the new directory would be `rwxr-xr-x` and owned by the worker,
+    /// and devtools would fail with "You do not have write permission for the
+    /// directory $SRCDEST". Group write is what bridges the two users.
     fn ensured(path: PathBuf) -> Option<PathBuf> {
         match std::fs::create_dir_all(&path) {
-            Ok(()) => Some(path),
+            Ok(()) => {
+                Self::make_group_writable(&path);
+                Some(path)
+            }
             Err(e) => {
                 tracing::warn!("cache dir {} unavailable: {e}", path.display());
                 None
+            }
+        }
+    }
+
+    /// Best-effort `chmod g+rwx`. A failure is not fatal on its own: the
+    /// directory may already be owned by the build user, in which case it is
+    /// writable anyway.
+    fn make_group_writable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let Ok(meta) = std::fs::metadata(path) else {
+                return;
+            };
+            let mode = meta.permissions().mode();
+            let wanted = mode | 0o070;
+            if mode != wanted
+                && let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted))
+            {
+                tracing::debug!("could not make {} group-writable: {e}", path.display());
             }
         }
     }

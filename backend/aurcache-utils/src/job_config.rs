@@ -70,35 +70,28 @@ pub async fn create_makepkg_config(
 /// inside the unprivileged/nested build chroot and aborts every `pacman -Sy`.
 /// Disabling it is required for pacman to run there; it only relaxes pacman's
 /// own download isolation, not the surrounding `makechrootpkg` chroot.
-pub fn base_pacman_config(aurcache_repo_url: Option<&str>) -> String {
-    let base = "[options]\nDisableSandbox\nSigLevel = Never\nHoldPkg = pacman glibc\nArchitecture = auto\n\n\
-                [core]\nInclude = /etc/pacman.d/mirrorlist\n\n\
-                [extra]\nInclude = /etc/pacman.d/mirrorlist\n\n\
-                [multilib]\nInclude = /etc/pacman.d/mirrorlist\n";
-    match aurcache_repo_url {
-        Some(url) => format!("{base}\n[repo]\nSigLevel = Never\nServer = {url}/$arch\n"),
-        None => base.to_string(),
-    }
+pub fn base_pacman_config() -> String {
+    "[options]\nDisableSandbox\nSigLevel = Never\nHoldPkg = pacman glibc\nArchitecture = auto\n\n\
+     [core]\nInclude = /etc/pacman.d/mirrorlist\n\n\
+     [extra]\nInclude = /etc/pacman.d/mirrorlist\n\n\
+     [multilib]\nInclude = /etc/pacman.d/mirrorlist\n"
+        .to_string()
 }
 
 /// Build the pacman.conf written inside the build container.
 ///
-/// User-provided content replaces the stock repo sections but still gets the
-/// AURCache repo appended so makepkg can resolve previously built packages.
-pub async fn create_pacman_config(
-    db: &DatabaseConnection,
-    pkg_id: i32,
-    aurcache_repo_url: &str,
-) -> String {
+/// No `[repo]` section is emitted: the worker appends one rendered from the
+/// template it received at registration, because only the worker knows which
+/// address it reaches this server on.
+pub async fn create_pacman_config(db: &DatabaseConnection, pkg_id: i32) -> String {
     let user_conf = ApplicationSettings::get::<String>(Setting::PacmanConf, Some(pkg_id), db)
         .await
         .value;
 
     if user_conf.trim().is_empty() {
-        base_pacman_config(Some(aurcache_repo_url))
+        base_pacman_config()
     } else {
-        let repo_conf = format!("\n[repo]\nSigLevel = Never\nServer = {aurcache_repo_url}/$arch\n");
-        format!("[options]\nDisableSandbox\n{user_conf}{repo_conf}")
+        format!("[options]\nDisableSandbox\n{user_conf}")
     }
 }
 
@@ -129,10 +122,9 @@ pub async fn build_job_config(
     db: &DatabaseConnection,
     pkg_id: i32,
     pkgdest_dir: &Path,
-    aurcache_repo_url: &str,
 ) -> (String, String) {
     let makepkg_conf = create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await;
-    let pacman_conf = create_pacman_config(db, pkg_id, aurcache_repo_url).await;
+    let pacman_conf = create_pacman_config(db, pkg_id).await;
     (makepkg_conf, pacman_conf)
 }
 
@@ -140,20 +132,14 @@ pub async fn build_job_config(
 mod tests {
     use super::*;
 
+    /// The server never emits a `[repo]` section any more; the worker appends
+    /// one for the host it actually reaches this server on.
     #[test]
-    fn base_pacman_config_has_expected_markers() {
-        let conf = base_pacman_config(Some("https://aur.example.com"));
+    fn base_pacman_config_has_expected_markers_and_no_repo() {
+        let conf = base_pacman_config();
         assert!(conf.contains("DisableSandbox"));
         assert!(conf.contains("SigLevel = Never"));
         assert!(conf.contains("Include = /etc/pacman.d/mirrorlist"));
-        assert!(conf.contains("[repo]"));
-        assert!(conf.contains("Server = https://aur.example.com/$arch"));
-    }
-
-    #[test]
-    fn base_pacman_config_without_repo_omits_repo_section() {
-        let conf = base_pacman_config(None);
-        assert!(conf.contains("DisableSandbox"));
         assert!(!conf.contains("[repo]"));
     }
 
