@@ -1,12 +1,24 @@
-name: Publish worker image
+name: Publish Arch-based images
+
+# The Arch-based images: the worker, the hybrid compatibility image, and the
+# legacy builder image the hybrid's compatibility executor spawns.
+#
+# All three must be published for every release tag: a release whose server and
+# worker images come from different commits can disagree about the worker
+# protocol. The weekly cron additionally refreshes `latest`, which these images
+# need more than most — an Arch image that is never rebuilt eventually fails its
+# own `pacman -Syu` as the keyring and base packages go stale.
 on:
+  push:
+    tags:
+      - '*'
   workflow_dispatch:
   schedule:
     - cron: "0 1 * * 1"
 
 jobs:
   build:
-    name: Build multi-arch AURCache worker image
+    name: Build multi-arch AURCache Arch images
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -32,6 +44,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       -
+        name: Determine image tags
+        id: vars
+        run: |
+          REPO=ghcr.io/lukas-heiligenbrunner
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION=""
+          fi
+          emit() {
+            # $1 = output name, $2 = image
+            {
+              echo "$1<<EOF"
+              # An `&&` list here would return 1 on non-tag builds and, under
+              # the default `bash -e`, abort the whole step.
+              if [ -n "$VERSION" ]; then echo "$2:$VERSION"; fi
+              echo "$2:latest"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          }
+          emit worker_tags "$REPO/aurcache-worker"
+          emit hybrid_tags "$REPO/aurcache"
+          emit builder_tags "$REPO/aurcache-builder"
+      -
         name: Build worker container
         uses: docker/build-push-action@v7
         with:
@@ -39,5 +75,23 @@ jobs:
           push: true
           context: .
           file: ./docker/worker.Dockerfile
-          tags: |
-            ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+          tags: ${{ steps.vars.outputs.worker_tags }}
+      -
+        name: Build hybrid compatibility container
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          context: .
+          file: ./docker/hybrid.Dockerfile
+          tags: ${{ steps.vars.outputs.hybrid_tags }}
+      -
+        # Spawned per build by the hybrid image's compatibility executor.
+        name: Build legacy builder container
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          context: .
+          file: ./docker/builder.Dockerfile
+          tags: ${{ steps.vars.outputs.builder_tags }}

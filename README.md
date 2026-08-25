@@ -29,18 +29,23 @@ Bring up the server plus a local build worker with a single command — no edits
 no secrets, no approval clicks:
 
 ```bash
-curl -O https://raw.githubusercontent.com/Lukas-Heiligenbrunner/AURCache/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/Lukas-Heiligenbrunner/AURCache/master/docker-compose.yaml
 docker compose up -d
 ```
 
-- Web UI / API: `https://localhost:8080` (self-signed cert — accept the warning)
+- Web UI / API: `http://localhost:8080` (plain HTTP; front with a reverse proxy for TLS)
 - Pacman repo: `http://localhost:8081` (add as a `[repo] Server` in `pacman.conf`)
 
 The bundled worker auto-enrolls via a shared volume and starts polling for jobs
 within seconds. Scale local build throughput with `docker compose up -d --scale
 builder=3` or raise `WORKER_CONCURRENCY`. To attach a worker on separate
 hardware or a foreign architecture (e.g. aarch64), see
-[`docker-compose.remote-worker.yml`](docker-compose.remote-worker.yml).
+[`docker-compose.remote-worker.yaml`](docker-compose.remote-worker.yaml).
+
+Already running AURCache as a single container? It keeps working — the
+`aurcache` image now bundles a build worker for exactly that case. It is
+deprecated, so migrate to the split setup when convenient; see
+[Backward compatibility](https://lukas-heiligenbrunner.github.io/AURCache/docs/setup/docker#backward-compatibility-the-hybrid-image).
 
 ## CLI client
 

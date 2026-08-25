@@ -26,7 +26,12 @@ CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
 export AURCACHE_URL="http://localhost:$AURCACHE_PORT/api"
 export AURCACHE_TOKEN="${AURCACHE_TOKEN:-}"
 
-COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e.yaml"
+# Overridable so the same harness can drive an alternative topology — see
+# scripts/test-e2e-hybrid.sh, which points it at the single-container image.
+COMPOSE_FILE="${E2E_COMPOSE_FILE:-$PROJECT_DIR/docker-compose.e2e.yaml}"
+# Services that must stay alive for the run to be meaningful. The hybrid image
+# runs both roles in one container, so it overrides this to a single name.
+E2E_SERVICES="${E2E_SERVICES:-aurcache builder}"
 LOG_FILE="$(mktemp -t aurcache-e2e-XXXXXX.log)"
 
 # =============================================================================
@@ -67,7 +72,7 @@ service_exited() {
 # Abort as soon as either container dies, naming the culprit and its last words.
 assert_services_alive() {
     local svc
-    for svc in aurcache builder; do
+    for svc in $E2E_SERVICES; do
         if service_exited "$svc"; then
             log "ERROR: container '$svc' exited unexpectedly"
             echo "--- last 40 lines from '$svc' ---"
@@ -137,7 +142,7 @@ dump_logs_on_failure() {
     echo "    Full build log: $CLI_BIN builds output ${build_id:-<id>}"
     echo "    Containers are left running; inspect with:"
     echo "        docker compose -f '$COMPOSE_FILE' logs -f"
-    echo "        docker compose -f '$COMPOSE_FILE' exec builder bash"
+    echo "        docker compose -f '$COMPOSE_FILE' exec ${E2E_SERVICES%% *} bash"
     echo "    Tear down with:"
     echo "        docker compose -f '$COMPOSE_FILE' down -v --remove-orphans"
     echo "    Re-run against these containers without rebuilding: REUSE=1 $0 <pkg>"

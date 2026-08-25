@@ -1,7 +1,7 @@
 # =============================================================================
 # AURCache end-to-end test topology (remote-worker architecture).
 # =============================================================================
-# Mirrors the bundled `docker-compose.yml`: the AURCache server plus one real
+# Mirrors the bundled `docker-compose.yaml`: the AURCache server plus one real
 # privileged build worker that enrolls over mTLS, claims a job, builds the
 # package in a devtools chroot, and uploads it. Driven by scripts/test-e2e.sh.
 #

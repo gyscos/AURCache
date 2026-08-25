@@ -1,5 +1,10 @@
 name: Build and Push Docker Images
 
+# Publishes the backend-only image as `aurcache-server`. The `aurcache`
+# name is reserved for the hybrid (server + embedded worker) compatibility
+# image, so existing single-container compose files keep working when they
+# pull `aurcache:latest`. New setups use `aurcache-server` + `aurcache-worker`.
+
 on:
   push:
     branches:
@@ -63,7 +68,7 @@ jobs:
             echo "tag=unknown" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build and push Docker image (${{ matrix.tag_suffix }})
+      - name: Build and push aurcache-server (${{ matrix.tag_suffix }})
         if: steps.vars.outputs.tag != 'unknown'
         run: |
           docker buildx build \
@@ -71,12 +76,12 @@ jobs:
             --build-arg LATEST_COMMIT_SHA=${{ github.event.head_commit.id }} \
             --build-arg TARGET_ARCH=linux/${{ matrix.arch }} \
             -f ./docker/Dockerfile \
-            -t ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}:${{ steps.vars.outputs.tag }}${{ matrix.tag_suffix }} \
+            -t ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}-server:${{ steps.vars.outputs.tag }}${{ matrix.tag_suffix }} \
             --push .
 
-      - name: Also tag and push latest${{ matrix.tag_suffix }} (for tags only)
+      - name: Also tag and push aurcache-server:latest${{ matrix.tag_suffix }} (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           docker buildx imagetools create \
-            ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}:${{ steps.vars.outputs.tag }}${{ matrix.tag_suffix }} \
-            --tag ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}:latest${{ matrix.tag_suffix }}
+            ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}-server:${{ steps.vars.outputs.tag }}${{ matrix.tag_suffix }} \
+            --tag ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}-server:latest${{ matrix.tag_suffix }}

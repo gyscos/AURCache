@@ -18,12 +18,14 @@
 #     docker compose up -d --scale builder=3
 #
 # For a worker on separate hardware / a foreign architecture (e.g. aarch64), see
-# docker-compose.remote-worker.yml.
+# docker-compose.remote-worker.yaml.
 # =============================================================================
 
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache:latest
+    # Backend only. The `aurcache` image (without `-server`) is the hybrid
+    # compatibility image, which bundles its own worker — do not use it here.
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
     # Prefer a published image; uncomment to build locally instead:
     # build:
     #   context: .
@@ -107,7 +109,9 @@ services:
     restart: "no"
 
   aarch64-builder:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest-arm64
+    # Same multi-arch image as the native builder; `platform` selects the
+    # arm64 variant from the manifest list. There is no `-arm64` tag.
+    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
     profiles: ["arm"]
     platform: linux/arm64
     build:
