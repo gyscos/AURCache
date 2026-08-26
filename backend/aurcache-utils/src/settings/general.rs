@@ -1,4 +1,3 @@
-use crate::settings::meta::SettingsMetaTrait;
 use crate::settings::parser::ParseSetting;
 use aurcache_db::settings;
 use aurcache_types::settings::{
@@ -199,6 +198,7 @@ impl SettingsTraits for ApplicationSettings {
             job_timeout: get_setting(Setting::JobTimeout, pkgid, db).await,
             builder_image: get_setting(Setting::BuilderImage, pkgid, db).await,
             date_format: get_setting(Setting::DateFormat, pkgid, db).await,
+            build_on_new_version: get_setting(Setting::BuildOnNewVersion, pkgid, db).await,
         })
     }
 

@@ -15,8 +15,12 @@ pub use aurcache_types::api::package::{
 };
 pub use aurcache_types::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
 pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
+pub use aurcache_types::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_types::api::stats::{GraphDataPoint, UserInfo};
 pub use aurcache_types::api::waiting::WaitingReason;
+pub use aurcache_types::settings::{
+    ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
+};
 pub use aurcache_types::source::GitSourceSpec;
 use reqwest::Response;
 use serde::de::DeserializeOwned;
@@ -411,6 +415,62 @@ impl AurCacheClient {
             None,
         )
         .await
+    }
+
+    /// Fetches every setting with the value in force and where it came from.
+    ///
+    /// Pass a `pkgbase` for the per-package view, where a setting the package
+    /// does not override reports the global value it inherits.
+    pub async fn settings(&self, pkgbase: Option<&str>) -> Result<ApplicationSettings> {
+        self.request_json::<ApplicationSettings, Value>(
+            Method::GET,
+            &self.settings_path(pkgbase, None),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Stores a value for one setting, overriding whatever it inherits.
+    ///
+    /// The value is sent as a string whatever its type: the server owns the
+    /// parsing, so a client that formats a number differently cannot store
+    /// something the server would reject on read.
+    pub async fn patch_setting(&self, pkgbase: Option<&str>, key: &str, value: &str) -> Result<()> {
+        self.request_empty(
+            Method::PATCH,
+            &self.settings_path(pkgbase, Some(key)),
+            &[],
+            Some(&SettingValue {
+                value: value.to_string(),
+            }),
+        )
+        .await
+    }
+
+    /// Drops this scope's stored value, so the setting inherits again.
+    pub async fn reset_setting(&self, pkgbase: Option<&str>, key: &str) -> Result<()> {
+        self.request_empty::<Value>(
+            Method::DELETE,
+            &self.settings_path(pkgbase, Some(key)),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Settings are a sub-resource of the package in the per-package scope, so
+    /// every one of the calls above has the same two shapes.
+    fn settings_path(&self, pkgbase: Option<&str>, key: Option<&str>) -> String {
+        let mut path = match pkgbase {
+            Some(pkgbase) => format!("/package/{pkgbase}/settings"),
+            None => "/settings".to_string(),
+        };
+        if let Some(key) = key {
+            path.push('/');
+            path.push_str(key);
+        }
+        path
     }
 
     /// Lists all enrolled remote build workers and their status.
