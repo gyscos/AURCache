@@ -286,18 +286,61 @@ fn store_override(style: DateStyle) {
 }
 
 /// The style in force, shared by every screen that shows a date.
+///
+/// A browser that has chosen a style keeps it; one that has not follows the
+/// server's `date_format` setting, which is the point of that setting existing.
+/// The server value arrives a request later than the first render, so the
+/// built-in default fills the gap — and is overwritten only while no local
+/// choice exists, or a preference would be undone by a page load.
 pub fn use_date_style_provider() -> Signal<DateStyle> {
-    use_context_provider(|| Signal::new(stored_override().unwrap_or_default()))
+    let mut style = use_context_provider(|| Signal::new(stored_override().unwrap_or_default()));
+
+    use_future(move || async move {
+        if stored_override().is_some() {
+            return;
+        }
+        let Ok(client) = crate::api::client() else {
+            return;
+        };
+        // A server that cannot be reached is not worth reporting here: every
+        // screen shows dates, and none of them is about this setting.
+        if let Ok(settings) = client.settings(None).await {
+            style.set(DateStyle::from_id(&settings.date_format.value));
+        }
+    });
+
+    style
 }
 
 pub fn use_date_style() -> Signal<DateStyle> {
     use_context()
 }
 
+/// The browser's own date preference, stored locally.
 #[component]
 pub fn DateStylePicker() -> Element {
     let mut style = use_date_style();
     let current = style();
+
+    rsx! {
+        DateStyleControls {
+            value: current,
+            onchange: move |next| {
+                store_override(next);
+                style.set(next);
+            },
+        }
+    }
+}
+
+/// The three controls that make up a date style, without deciding where the
+/// choice is kept.
+///
+/// The same widget edits two different things: this browser's local override,
+/// and the server-wide default on the settings page. Only the destination
+/// differs, so only the destination is the caller's business.
+#[component]
+pub fn DateStyleControls(value: DateStyle, onchange: EventHandler<DateStyle>) -> Element {
     // Shown against a fixed instant so the options read as examples rather
     // than as abstract patterns.
     let sample = DateParts {
@@ -314,20 +357,18 @@ pub fn DateStylePicker() -> Element {
                 span { class: "text-xs opacity-60", "Date order" }
                 select {
                     class: "select select-bordered select-sm w-full",
-                    onchange: move |e| {
+                    onchange: move |e: FormEvent| {
                         let order = DateOrder::ALL
                             .into_iter()
                             .find(|o| o.id() == e.value())
                             .unwrap_or(DateOrder::Ymd);
-                        let next = DateStyle { order, ..style() };
-                        store_override(next);
-                        style.set(next);
+                        onchange.call(DateStyle { order, ..value });
                     },
                     for order in DateOrder::ALL {
                         option {
                             key: "{order.id()}",
                             value: order.id(),
-                            selected: current.order == order,
+                            selected: value.order == order,
                             "{order.label()}"
                         }
                     }
@@ -338,20 +379,18 @@ pub fn DateStylePicker() -> Element {
                 span { class: "text-xs opacity-60", "Time" }
                 select {
                     class: "select select-bordered select-sm w-full",
-                    onchange: move |e| {
+                    onchange: move |e: FormEvent| {
                         let clock = Clock::ALL
                             .into_iter()
                             .find(|c| c.id() == e.value())
                             .unwrap_or(Clock::H24);
-                        let next = DateStyle { clock, ..style() };
-                        store_override(next);
-                        style.set(next);
+                        onchange.call(DateStyle { clock, ..value });
                     },
                     for clock in Clock::ALL {
                         option {
                             key: "{clock.id()}",
                             value: clock.id(),
-                            selected: current.clock == clock,
+                            selected: value.clock == clock,
                             "{clock.label()}"
                         }
                     }
@@ -362,17 +401,15 @@ pub fn DateStylePicker() -> Element {
                 input {
                     r#type: "checkbox",
                     class: "checkbox checkbox-sm",
-                    checked: current.pad,
-                    onchange: move |e| {
-                        let next = DateStyle { pad: e.checked(), ..style() };
-                        store_override(next);
-                        style.set(next);
+                    checked: value.pad,
+                    onchange: move |e: FormEvent| {
+                        onchange.call(DateStyle { pad: e.checked(), ..value });
                     },
                 }
                 span { class: "text-sm", "Pad day and month with zeros" }
             }
 
-            span { class: "text-xs opacity-50 font-mono", {render(sample, current)} }
+            span { class: "text-xs opacity-50 font-mono", {render(sample, value)} }
         }
     }
 }

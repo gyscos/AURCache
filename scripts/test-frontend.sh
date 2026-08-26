@@ -146,7 +146,18 @@ ROUTES=(
     "/package/yay|too old|a dependency built to an unsatisfying version"
     "/package/my-tool-git|github.com/example/my-tool|a git package links to its repository"
     "/package/my-tool-git|A tool built straight from git|a git package has metadata from its checkout"
-    "/settings|card-title\">Settings|settings"
+    "/settings|Version check interval|settings"
+    # The fixture server runs with VERSION_CHECK_INTERVAL set, so this row is
+    # env-locked. Naming the variable proves the source made it all the way
+    # from the API to the screen, and the wording has to say what to do about
+    # it — the field is disabled and the variable is not set from this page.
+    "/settings|unset \$VERSION_CHECK_INTERVAL|an env-pinned setting says how to take it back"
+    # Named on every row, set or not, so the page documents what a deployment
+    # can pin rather than only reporting what it already pinned.
+    "/settings|\$JOB_TIMEOUT|settings document their environment variables"
+    "/settings|Builder image|settings covers every section"
+    # Seeded as a stored global value, which is the only state offering a Reset.
+    "/settings|>Reset<|settings can undo a stored value"
     "/config-files|card-title\">Config files|config files"
     "/workers|card-title\">Workers|workers"
     "/activities|card-title\">Activities|activities"
@@ -193,12 +204,18 @@ for entry in "${ROUTES[@]}"; do
     fi
 done
 
+# Two shots at widths the default 1440 does not cover.
+#
 # The narrow layout drops columns rather than scrolling them, and that rule has
-# broken twice. Worth one shot rather than only a class-name assertion.
+# broken twice. Settings splits into two columns only above 1440, so the shape
+# most people actually see it in is not the shape the run above captured.
 if [ -n "$SHOTS" ]; then
     "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
         --window-size=420,900 --virtual-time-budget=8000 \
         --screenshot="$SHOTS/packages-narrow.png" "http://localhost:$UI_PORT/packages" >/dev/null 2>&1
+    "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
+        --window-size=1920,1200 --virtual-time-budget=8000 \
+        --screenshot="$SHOTS/settings-wide.png" "http://localhost:$UI_PORT/settings" >/dev/null 2>&1
     echo "==> screenshots in $SHOTS"
 fi
 

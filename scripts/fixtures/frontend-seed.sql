@@ -138,3 +138,10 @@ JOIN packages e ON e.name = v.dependee;
 
 UPDATE packages
 SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER BY b.id DESC LIMIT 1);
+
+-- A setting stored globally, so the settings page has one row in each of the
+-- three states it renders differently: env-locked (VERSION_CHECK_INTERVAL is
+-- set for the fixture server), stored, and never set. Stored is the state a
+-- user is in the moment after they save one, and the only one that offers a
+-- Reset. `-1` is the global scope; a real package id would make it per-package.
+INSERT INTO settings (key, value, pkg_id) VALUES ('max_concurrent_builds', '4', -1);

@@ -11,6 +11,7 @@ mod package_builds;
 mod package_source;
 mod packages;
 mod placeholder;
+mod settings;
 
 pub use build::Build;
 pub use builds::Builds;
@@ -20,6 +21,7 @@ pub use package_builds::PackageBuilds;
 pub use package_source::PackageSource;
 pub use packages::Packages;
 pub use placeholder::NotPorted;
+pub use settings::Settings;
 
 use dioxus::prelude::*;
 
@@ -49,11 +51,6 @@ pub fn Workers() -> Element {
 #[component]
 pub fn Activities() -> Element {
     rsx! { NotPorted { title: "Activities", note: "" } }
-}
-
-#[component]
-pub fn Settings() -> Element {
-    rsx! { NotPorted { title: "Settings", note: "" } }
 }
 
 #[component]
