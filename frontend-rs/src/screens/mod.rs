@@ -4,12 +4,14 @@
 //! the menu is honest about what the Rust frontend does and does not cover.
 
 mod build;
+mod builds;
 mod not_found;
 mod package_source;
 mod packages;
 mod placeholder;
 
 pub use build::Build;
+pub use builds::Builds;
 pub use not_found::NotFound;
 pub use package_source::PackageSource;
 pub use packages::Packages;
@@ -34,11 +36,6 @@ pub fn Dashboard() -> Element {
             note: "Needs a charting story — the Dart version uses fl_chart for the build history graph, which has no direct equivalent here.",
         }
     }
-}
-
-#[component]
-pub fn Builds() -> Element {
-    rsx! { NotPorted { title: "Builds", note: "Next up: the same table shape as Packages, linking into the build log." } }
 }
 
 #[component]

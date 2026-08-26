@@ -98,6 +98,7 @@ dependencies = [
  "dioxus",
  "dioxus-ssr",
  "gloo-timers",
+ "js-sys",
  "wasm-bindgen",
  "web-sys",
 ]

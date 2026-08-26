@@ -11,6 +11,9 @@ use crate::status::StatusBadge;
 use aurcache_client::SimplePackage;
 use dioxus::prelude::*;
 
+/// Columns that only appear once there is room for them.
+const WIDE_ONLY: &str = "hidden md:table-cell";
+
 async fn load_packages() -> Result<Vec<SimplePackage>, String> {
     client()?
         .list_packages(Some(100), None)
@@ -52,9 +55,15 @@ pub fn Packages() -> Element {
                                     tr {
                                         th { "Package" }
                                         th { "Version" }
-                                        th { "Upstream" }
+                                        // Upstream and Actions are dropped on a
+                                        // narrow screen rather than scrolled to.
+                                        // With all five columns the status badge
+                                        // is clipped mid-word on a phone, which
+                                        // reads as missing data. The Dart table
+                                        // drops the same two below 700px.
+                                        th { class: "{WIDE_ONLY}", "Upstream" }
                                         th { "Status" }
-                                        th { class: "text-right", "Actions" }
+                                        th { class: "{WIDE_ONLY} text-right", "Actions" }
                                     }
                                 }
                                 tbody {
@@ -71,11 +80,11 @@ pub fn Packages() -> Element {
                                             td { class: "font-mono text-sm",
                                                 {pkg.latest_version.clone().unwrap_or_else(|| "—".into())}
                                             }
-                                            td { class: "font-mono text-sm opacity-70",
+                                            td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 "{pkg.upstream_version}"
                                             }
                                             td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
-                                            td { class: "text-right",
+                                            td { class: "{WIDE_ONLY} text-right",
                                                 button { class: "btn btn-ghost btn-xs", "Update" }
                                             }
                                         }
