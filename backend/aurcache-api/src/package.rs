@@ -172,6 +172,17 @@ pub async fn package_update_entity_endpoint(
     let patch_changed = input.patch.is_some();
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
+    // Dependencies are read per architecture — a PKGBUILD can declare
+    // `depends_aarch64` separately — and the graph is the union across the
+    // platforms a package is built for. Changing that set therefore changes
+    // which dependencies are required, so it needs the same resync a patch
+    // gets. Compared against the stored value so a no-op write does not
+    // trigger a needless source checkout.
+    let platforms_changed = input
+        .platforms
+        .as_ref()
+        .is_some_and(|requested| requested.join(";") != pkg.platforms);
+
     // Start building the update operation
     let update_pkg = packages::ActiveModel {
         id: Set(pkg.id),
@@ -210,8 +221,11 @@ pub async fn package_update_entity_endpoint(
 
     // A patch being set or cleared here (e.g. via the "reset patch" action)
     // can change `depends`/`makedepends` without bumping the package's
-    // version, so keep the dependency graph in sync immediately.
-    if patch_changed {
+    // version, and so can a change to the platform set, so keep the dependency
+    // graph in sync immediately. `package_resync_dependencies` recomputes the
+    // whole graph from source, which both adds newly-required dependencies and
+    // drops ones no longer needed.
+    if patch_changed || platforms_changed {
         let client = AurClient::new();
         package_resync_dependencies(&client, store, db, tx, &updated)
             .await

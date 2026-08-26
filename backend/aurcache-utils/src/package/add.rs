@@ -1,6 +1,7 @@
 use crate::package::aur_metadata::refresh_aur_metadata;
 use crate::package::enqueue::trigger_initial_builds;
 use crate::patch::SourcePatch;
+use crate::pkg::architectures_for_platforms;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
@@ -209,6 +210,7 @@ async fn resolve_srcinfo_to_spec(
     store: &SnapshotStore,
     source_data: &SourceData,
     patched_files: Option<BTreeMap<String, String>>,
+    architectures: &[alpm_types::SystemArchitecture],
 ) -> anyhow::Result<PackageInsertSpec> {
     let patch = match patched_files {
         Some(files) => build_patch_from_files(store, source_data, files).await?,
@@ -219,7 +221,7 @@ async fn resolve_srcinfo_to_spec(
     // source, so a patch supplied to fix an otherwise-unparseable PKGBUILD
     // (e.g. ogdf) is taken into account right away.
     let sourceinfo = store.sourceinfo(source_data, patch.as_deref()).await?;
-    let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo);
+    let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo, architectures);
     let pkgbase = sourceinfo.base.name.to_string();
     let requirements =
         collect_dependency_requirements(deps.depends.iter().chain(deps.make_depends.iter()))?;
@@ -367,11 +369,23 @@ async fn add_package_with_source(
             let aur_data = SourceData::Aur {
                 name: pkgbase.clone(),
             };
-            let package_spec = resolve_srcinfo_to_spec(store, &aur_data, patched_files).await?;
+            let package_spec = resolve_srcinfo_to_spec(
+                store,
+                &aur_data,
+                patched_files,
+                &architectures_for_platforms(&context.platforms_str),
+            )
+            .await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Git { .. } => {
-            let package_spec = resolve_srcinfo_to_spec(store, &source_data, patched_files).await?;
+            let package_spec = resolve_srcinfo_to_spec(
+                store,
+                &source_data,
+                patched_files,
+                &architectures_for_platforms(&context.platforms_str),
+            )
+            .await?;
             finalize_package_add(client, store, db, tx, context, package_spec).await
         }
         SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
@@ -402,7 +416,13 @@ async fn plan_dependency_recursive(
     let source_data = SourceData::Aur {
         name: pkgbase.to_string(),
     };
-    let package_spec = resolve_srcinfo_to_spec(store, &source_data, None).await?;
+    let package_spec = resolve_srcinfo_to_spec(
+        store,
+        &source_data,
+        None,
+        &architectures_for_platforms(&context.platforms_str),
+    )
+    .await?;
     plan_package_with_deps(client, store, db, package_spec, context, visited, plan).await
 }
 
