@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use aurcache_types::worker::{CompleteReport, JobDescriptor};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -32,7 +33,7 @@ use crate::credentials;
 /// later retry and `WORKER_DATA_DIR/work/` would grow without bound.
 pub async fn run_job(
     cfg: &Config,
-    client: &WorkerClient,
+    client: &Arc<WorkerClient>,
     job: JobDescriptor,
     cancel: Arc<AtomicBool>,
     active_pkgbases: Arc<Mutex<HashSet<String>>>,
@@ -65,7 +66,7 @@ pub async fn run_job(
 
 async fn run_job_inner(
     cfg: &Config,
-    client: &WorkerClient,
+    client: &Arc<WorkerClient>,
     job: &JobDescriptor,
     cancel: &AtomicBool,
     active_pkgbases: &Mutex<HashSet<String>>,
@@ -204,12 +205,71 @@ async fn run_job_inner(
     Ok(report)
 }
 
+/// stdout and stderr differ in type but not in handling.
+enum Either {
+    Out(tokio::process::ChildStdout),
+    Err(tokio::process::ChildStderr),
+}
+
+/// How much output to accumulate before sending, and how long to hold a
+/// partial batch. A build emits thousands of lines; one request per line would
+/// swamp the server, and one request at the end would defeat the purpose.
+const LOG_BATCH_BYTES: usize = 4096;
+const LOG_BATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Forward a child stream to the build log, batched.
+///
+/// Batches flush on size or age, whichever comes first, and always on EOF — so
+/// the last lines of a failed build, which are the ones that explain it, are
+/// never left in the buffer.
+async fn pump_output<R>(reader: R, client: Arc<WorkerClient>, build_id: i32)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut batch = String::new();
+    let mut line = String::new();
+    let mut last_flush = std::time::Instant::now();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                batch.push_str(&line);
+                if batch.len() >= LOG_BATCH_BYTES || last_flush.elapsed() >= LOG_BATCH_INTERVAL {
+                    log(&client, build_id, &batch).await;
+                    batch.clear();
+                    last_flush = std::time::Instant::now();
+                }
+            }
+            // A read error ends the stream; the build's own exit status is
+            // what determines success, so this is not escalated.
+            Err(e) => {
+                tracing::debug!("build {build_id}: reading output ended: {e}");
+                break;
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        log(&client, build_id, &batch).await;
+    }
+}
+
 /// Spawn `makechrootpkg`, stream its output as logs, and poll for local
 /// self-abort, a remote cancel request, and the build timeout — killing the
 /// child in any of those cases.
+///
+/// The output really is streamed: stdout and stderr are piped and forwarded in
+/// batches. Letting the child inherit the worker's stdio instead sends the
+/// build's output to the worker's own container logs, where the user reading
+/// the build page cannot see it.
 async fn run_build(
     cfg: &Config,
-    client: &WorkerClient,
+    client: &Arc<WorkerClient>,
     job: &JobDescriptor,
     pkgdir: &Path,
     cache: &Cache,
@@ -230,6 +290,12 @@ async fn run_build(
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
+        // Capture the build's output instead of letting it inherit the
+        // worker's stdio. Without this the log a user sees ends at
+        // "[worker] starting build" and everything makepkg prints — including
+        // the error that explains a failure — only reaches the worker's
+        // container logs.
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // devtools binds `$SRCDEST` into the chroot itself; without it set, it
         // falls back to the PKGBUILD directory and nothing is cached.
         if let Some(dir) = srcdest.as_deref() {
@@ -255,6 +321,25 @@ async fn run_build(
     // the server, and — now that the client carries connect/read timeouts — can
     // no longer block this loop indefinitely.
     let started = std::time::Instant::now();
+    // Forward both streams to the build log. Held so they can be awaited after
+    // the child exits, which is what guarantees the final lines are sent.
+    let pumps = [
+        child.stdout.take().map(Either::Out),
+        child.stderr.take().map(Either::Err),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|stream| {
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            match stream {
+                Either::Out(r) => pump_output(r, client, build_id).await,
+                Either::Err(r) => pump_output(r, client, build_id).await,
+            }
+        })
+    })
+    .collect::<Vec<_>>();
+
     let timeout = cfg.core.build_timeout;
     let remote_poll = Duration::from_secs(30);
     let mut last_remote_poll = std::time::Instant::now();
@@ -284,6 +369,12 @@ async fn run_build(
             }
         }
     };
+
+    // Drain the output before reporting: the pumps hold whatever the build
+    // printed last, which is exactly what a failure report needs.
+    for pump in pumps {
+        let _ = pump.await;
+    }
 
     if timed_out {
         return Ok(report::timeout_failure(started.elapsed().as_secs()));
