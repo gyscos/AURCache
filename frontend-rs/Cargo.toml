@@ -1,0 +1,36 @@
+[package]
+name = "aurcache-frontend"
+version = "0.1.0"
+edition = "2024"
+
+# Its own workspace on purpose: this crate only builds for
+# wasm32-unknown-unknown, so including it in the backend workspace would break
+# `cargo build --workspace` on the host target.
+[workspace]
+
+[dependencies]
+dioxus = { version = "0.7.10", features = ["web", "router"] }
+# The same client the CLI uses, and the same types the server defines. This is
+# the point of the exercise: no hand-maintained duplicate of the API shapes.
+aurcache-client = { path = "../backend/aurcache-client" }
+# The status enum the server defines, so the frontend matches on names rather
+# than on integers it would otherwise have to guess.
+# `default-features = false` drops the build-queue types that carry database
+# models, and with them sea-orm/sqlx — which do not build for wasm.
+aurcache-types = { path = "../backend/aurcache-types", default-features = false }
+wasm-bindgen = "0.2"
+# Timers: the build log polls, so it needs a sleep that works in the browser.
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "History", "EventTarget"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+# Renders components to an HTML string, so presentational logic can be tested
+# without a browser or a running backend.
+dioxus-ssr = "0.7"

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AURCache</title>
+    <!-- Prototype only: CDN Tailwind + daisyUI. A real port would run a
+         Tailwind build so unused classes are purged. -->
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.14/dist/full.min.css" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body>
+    <div id="main"></div>
+    <script type="module">
+      // Absolute, not "./": the app routes on real paths, so this document is
+      // served at /build/12 and /package/foo/source/PKGBUILD as well as /. A
+      // relative specifier would resolve against those, ask for
+      // /build/aurcache-frontend.js, and get the app shell back instead of the
+      // module — which fails silently as a blank page.
+      import init from "/aurcache-frontend.js";
+      init();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,150 @@
+//! A build's log output.
+
+use crate::api::api_base;
+use aurcache_client::AurCacheClient;
+use aurcache_types::build_state::BuildState;
+use dioxus::prelude::*;
+
+/// The screen behind `/build/:id`.
+#[component]
+pub fn Build(id: i32) -> Element {
+    rsx! { BuildLog { build_id: id } }
+}
+
+// ---------------------------------------------------------------------------
+// Build log
+//
+// The interesting screen: output arrives while the build runs. The API is
+// incremental rather than streaming — `?startline=N` returns everything from
+// line N on — so this polls, appends, and stops once the build reaches a
+// terminal state. That is the same contract the Dart component uses; the
+// point here is to see what it costs to express in Dioxus.
+// ---------------------------------------------------------------------------
+
+/// How often to ask for more output while a build is running.
+const POLL_INTERVAL_MS: u32 = 3_000;
+
+#[component]
+pub fn BuildLog(build_id: i32) -> Element {
+    // One string, one text node. Per-line elements would only earn their keep
+    // for per-line features — ANSI colour, line numbers, deep links — and a
+    // build emits thousands of lines, so the browser would lay out thousands
+    // of elements and the VirtualDom would walk them on every poll.
+    let mut log = use_signal(String::new);
+    // Tracked rather than recounted: the API takes "how many lines I already
+    // have", and counting a growing string on every poll is wasted work.
+    let mut line_count = use_signal(|| 0i32);
+    let mut finished = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    // "Follow" pins the view to the bottom as output arrives; switching it off
+    // is what lets someone read back through a long log while it is still
+    // being written.
+    let mut following = use_signal(|| true);
+
+    use_future(move || async move {
+        let client = match AurCacheClient::new(api_base(), None) {
+            Ok(c) => c,
+            Err(e) => {
+                error.set(Some(e.to_string()));
+                return;
+            }
+        };
+
+        loop {
+            // Ask only for what we do not already have.
+            let have = line_count();
+            match client.build_output(build_id, Some(have)).await {
+                Ok(chunk) if !chunk.is_empty() => {
+                    let added = chunk.lines().count() as i32;
+                    log.with_mut(|text| {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push_str(&chunk);
+                    });
+                    line_count += added;
+                    if following() {
+                        scroll_log_to_bottom();
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error.set(Some(e.to_string()));
+                    return;
+                }
+            }
+
+            // Stop polling once the build reaches a terminal state, but only
+            // after the fetch above, so the last lines are never missed.
+            if let Ok(build) = client.get_build(build_id).await
+                && !matches!(BuildState::from_i32(build.status), Some(BuildState::Active))
+            {
+                finished.set(true);
+                return;
+            }
+
+            gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+        }
+    });
+
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body",
+                div { class: "flex items-center gap-3",
+                    h2 { class: "card-title", "Build #{build_id}" }
+                    if finished() {
+                        span { class: "badge badge-ghost badge-sm", "finished" }
+                    } else {
+                        span { class: "badge badge-info badge-sm gap-1",
+                            span { class: "loading loading-spinner loading-xs" }
+                            "running"
+                        }
+                    }
+                    div { class: "flex-1" }
+                    label { class: "label cursor-pointer gap-2",
+                        span { class: "label-text text-sm", "Follow" }
+                        input {
+                            r#type: "checkbox",
+                            class: "toggle toggle-sm toggle-primary",
+                            checked: following(),
+                            oninput: move |e| {
+                                let on = e.value() == "true";
+                                following.set(on);
+                                if on { scroll_log_to_bottom(); }
+                            },
+                        }
+                    }
+                }
+
+                if let Some(e) = error() {
+                    div { class: "alert alert-error", span { "{e}" } }
+                }
+
+                pre {
+                    id: "build-log",
+                    class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
+                            overflow-auto max-h-[70vh] whitespace-pre-wrap font-mono",
+                    if line_count() == 0 {
+                        span { class: "opacity-60", "waiting for output…" }
+                    } else {
+                        "{log}"
+                    }
+                }
+                div { class: "text-sm opacity-60", "{line_count} lines" }
+            }
+        }
+    }
+}
+
+/// Pin the log view to the newest output.
+///
+/// Done through the DOM rather than a Dioxus abstraction because the element
+/// scrolls itself; there is no reactive value to bind to.
+fn scroll_log_to_bottom() {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("build-log"))
+    {
+        el.set_scroll_top(el.scroll_height());
+    }
+}
