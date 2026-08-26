@@ -25,6 +25,7 @@ pub fn PlatformChecklist(
     selected: Vec<String>,
     onchange: EventHandler<Vec<String>>,
     #[props(default = String::from("checkbox-xs"))] size: String,
+    #[props(default = false)] disabled: bool,
 ) -> Element {
     rsx! {
         div { class: "flex flex-col gap-1",
@@ -33,6 +34,7 @@ pub fn PlatformChecklist(
                     input {
                         r#type: "checkbox",
                         class: "checkbox {size}",
+                        disabled,
                         checked: selected.iter().any(|p| p == platform),
                         onchange: {
                             let selected = selected.clone();

@@ -203,6 +203,12 @@ fn AddPackageDialog(q: String) -> Element {
     let mut platforms_selected = use_signal(|| vec![platforms::DEFAULT.to_string()]);
     let mut busy = use_signal(|| false);
     let mut failures = use_signal(Vec::<(String, String)>::new);
+    // Which source is in flight, and which are already through. Resolving a
+    // package's dependencies can take a while, and adds are sequential, so a
+    // single spinner on the button leaves someone watching a list of five with
+    // no idea which one is holding things up.
+    let mut adding = use_signal(|| Option::<String>::None);
+    let mut added = use_signal(Vec::<String>::new);
 
     // What the server already has. Adding one again is a silent no-op — the
     // server exits early and returns 200 — which is the worst of both: the
@@ -285,6 +291,8 @@ fn AddPackageDialog(q: String) -> Element {
         let from_queue = !queued().is_empty();
         busy.set(true);
         failures.set(Vec::new());
+        added.set(Vec::new());
+        adding.set(None);
 
         let client = match crate::api::client() {
             Ok(client) => client,
@@ -303,6 +311,7 @@ fn AddPackageDialog(q: String) -> Element {
         let mut failed = Vec::new();
         for source in sources {
             let label = source_label(&source);
+            adding.set(Some(label.clone()));
             let result = client
                 .add_package(&AddPackageRequest {
                     platforms: Some(platforms_selected()),
@@ -311,11 +320,15 @@ fn AddPackageDialog(q: String) -> Element {
                     patched_files: None,
                 })
                 .await;
-            if let Err(e) = result {
-                failed.push((label, e.to_string()));
-                remaining.push(source);
+            match result {
+                Ok(()) => added.push(label),
+                Err(e) => {
+                    failed.push((label, e.to_string()));
+                    remaining.push(source);
+                }
             }
         }
+        adding.set(None);
         busy.set(false);
 
         if failed.is_empty() {
@@ -347,6 +360,10 @@ fn AddPackageDialog(q: String) -> Element {
                             class: "input input-bordered w-full font-mono text-sm",
                             placeholder: "hello   ·   https://github.com/user/repo.git",
                             autofocus: true,
+                            // A run is under way and the queue is fixed for its
+                            // duration; typing into a field that no longer
+                            // feeds it would be a dead end.
+                            disabled: busy(),
                             value: "{entry}",
                             oninput: move |e| {
                                 let typed = e.value();
@@ -430,6 +447,8 @@ fn AddPackageDialog(q: String) -> Element {
 
                     QueuedList {
                         queued: queued(),
+                        adding: adding(),
+                        added: added(),
                         onremove: move |label: String| {
                             queued.retain(|s| source_label(s) != label);
                         },
@@ -441,6 +460,10 @@ fn AddPackageDialog(q: String) -> Element {
                             selected: platforms_selected(),
                             onchange: move |next| platforms_selected.set(next),
                             size: "checkbox-sm",
+                            // Adds are sequential, so a change part way through
+                            // would reach only the packages not yet sent, and
+                            // the queue would end up split across two sets.
+                            disabled: busy(),
                         }
                         // Whether a package builds for an architecture is the
                         // PKGBUILD's business, not ours, so this offers rather
@@ -471,8 +494,10 @@ fn AddPackageDialog(q: String) -> Element {
                         onclick: move |_| submit(()),
                         if busy() {
                             span { class: "loading loading-spinner loading-xs" }
+                            {progress_label(added().len(), sources_to_add().len())}
+                        } else {
+                            {add_button_label(sources_to_add().len())}
                         }
-                        {add_button_label(sources_to_add().len())}
                     }
                 }
             }
@@ -496,9 +521,53 @@ fn add_button_label(count: usize) -> String {
     }
 }
 
-/// The sources queued so far, each removable.
+/// Where one queued source has got to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChipState {
+    /// Not started. Removable, because nothing has happened to it yet.
+    Waiting,
+    /// The request for this one is in flight.
+    Adding,
+    /// The server has taken it.
+    Added,
+}
+
+/// What to show against a chip, given what the run has reached.
+fn chip_state(label: &str, adding: Option<&str>, added: &[String]) -> ChipState {
+    if added.iter().any(|done| done == label) {
+        ChipState::Added
+    } else if adding == Some(label) {
+        ChipState::Adding
+    } else {
+        ChipState::Waiting
+    }
+}
+
+/// How the button reads while a run is under way.
+///
+/// Counts rather than a bare spinner: resolving dependencies takes long enough
+/// that a still spinner and a stuck one look the same, and with several queued
+/// the only question is how far it has got.
+fn progress_label(done: usize, total: usize) -> String {
+    if total > 1 {
+        format!("Adding… {done} of {total}")
+    } else {
+        "Adding…".to_string()
+    }
+}
+
+/// The sources queued so far, each removable until the run reaches it.
 #[component]
-fn QueuedList(queued: Vec<SourceData>, onremove: EventHandler<String>) -> Element {
+fn QueuedList(
+    queued: Vec<SourceData>,
+    /// The source currently being added, if a run is under way.
+    #[props(default)]
+    adding: Option<String>,
+    /// Sources this run has already added.
+    #[props(default)]
+    added: Vec<String>,
+    onremove: EventHandler<String>,
+) -> Element {
     if queued.is_empty() {
         return rsx! {};
     }
@@ -507,23 +576,49 @@ fn QueuedList(queued: Vec<SourceData>, onremove: EventHandler<String>) -> Elemen
             for source in queued.iter() {
                 {
                     let label = source_label(source);
+                    let state = chip_state(&label, adding.as_deref(), &added);
                     rsx! {
-                        span { key: "{label}", class: "badge badge-neutral gap-1 py-3",
-                            span { class: "font-mono text-xs", "{label}" }
-                            button {
-                                class: "btn btn-ghost btn-xs px-1",
-                                "aria-label": "Remove {label}",
-                                onclick: {
-                                    let label = label.clone();
-                                    move |_| onremove.call(label.clone())
+                        span {
+                            key: "{label}",
+                            class: "badge gap-1 py-3 {chip_class(state)}",
+                            match state {
+                                ChipState::Adding => rsx! {
+                                    span { class: "loading loading-spinner loading-xs" }
                                 },
-                                "✕"
+                                ChipState::Added => rsx! {
+                                    span { "aria-label": "added", "✓" }
+                                },
+                                ChipState::Waiting => rsx! {},
+                            }
+                            span { class: "font-mono text-xs", "{label}" }
+                            // Only while it can still be taken back. Removing
+                            // one mid-flight would not stop the request, and
+                            // removing one already added would not undo it.
+                            if state == ChipState::Waiting {
+                                button {
+                                    class: "btn btn-ghost btn-xs px-1",
+                                    "aria-label": "Remove {label}",
+                                    onclick: {
+                                        let label = label.clone();
+                                        move |_| onremove.call(label.clone())
+                                    },
+                                    "✕"
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// The colour a chip carries for its state.
+fn chip_class(state: ChipState) -> &'static str {
+    match state {
+        ChipState::Waiting => "badge-neutral",
+        ChipState::Adding => "badge-primary",
+        ChipState::Added => "badge-success",
     }
 }
 
@@ -599,8 +694,8 @@ fn SearchResults(
 #[cfg(test)]
 mod tests {
     use super::{
-        QueuedList, SearchResults, add_button_label, git_source, rank_results, source_at,
-        source_for, source_label, to_add,
+        ChipState, QueuedList, SearchResults, add_button_label, chip_state, git_source,
+        progress_label, rank_results, source_at, source_for, source_label, to_add,
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
@@ -641,16 +736,37 @@ mod tests {
     /// runtime, so the list is rendered through a component rather than handed
     /// props from outside.
     #[component]
-    fn QueueHarness(queued: Vec<SourceData>) -> Element {
+    fn QueueHarness(
+        queued: Vec<SourceData>,
+        adding: Option<String>,
+        added: Vec<String>,
+    ) -> Element {
         rsx! {
-            QueuedList { queued, onremove: move |_| {} }
+            QueuedList { queued, adding, added, onremove: move |_| {} }
         }
     }
 
     fn render_queue(queued: Vec<SourceData>) -> String {
-        let mut dom = VirtualDom::new_with_props(QueueHarness, QueueHarnessProps { queued });
+        render_run(queued, None, Vec::new())
+    }
+
+    fn render_run(queued: Vec<SourceData>, adding: Option<&str>, added: Vec<String>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            QueueHarness,
+            QueueHarnessProps {
+                queued,
+                adding: adding.map(ToString::to_string),
+                added,
+            },
+        );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn aur(name: &str) -> SourceData {
+        SourceData::Aur {
+            name: name.to_string(),
+        }
     }
 
     fn found(names: &[(&str, &str)]) -> Option<Result<Vec<SearchResult>, String>> {
@@ -859,6 +975,69 @@ mod tests {
             .collect();
         rank_results("  HELLO  ", &mut results);
         assert_eq!(results[0].name, "Hello");
+    }
+
+    /// Resolving dependencies is slow enough that a run of several packages
+    /// needs to say where it has got to. A single spinner cannot distinguish
+    /// "working on the fourth" from "stuck on the first".
+    #[test]
+    fn a_run_shows_which_package_it_is_on() {
+        let html = render_run(
+            vec![aur("hello"), aur("neofetch"), aur("yay")],
+            Some("neofetch"),
+            vec!["hello".to_string()],
+        );
+
+        // Done, in flight, and not started are three different things.
+        assert!(html.contains("badge-success"), "hello is done: {html}");
+        assert!(
+            html.contains("loading-spinner"),
+            "neofetch is in flight: {html}"
+        );
+        assert!(
+            html.contains("badge-neutral"),
+            "yay has not started: {html}"
+        );
+    }
+
+    /// Removing one mid-flight would not stop its request, and removing one
+    /// already added would not undo it — so only the untouched ones offer it.
+    #[test]
+    fn only_a_package_still_waiting_can_be_removed() {
+        let html = render_run(
+            vec![aur("hello"), aur("neofetch"), aur("yay")],
+            Some("neofetch"),
+            vec!["hello".to_string()],
+        );
+        assert!(html.contains("Remove yay"), "still waiting: {html}");
+        assert!(!html.contains("Remove neofetch"), "in flight: {html}");
+        assert!(!html.contains("Remove hello"), "already added: {html}");
+    }
+
+    #[test]
+    fn chip_state_reports_where_each_package_is() {
+        let added = vec!["hello".to_string()];
+        assert_eq!(
+            chip_state("hello", Some("neofetch"), &added),
+            ChipState::Added
+        );
+        assert_eq!(
+            chip_state("neofetch", Some("neofetch"), &added),
+            ChipState::Adding
+        );
+        assert_eq!(
+            chip_state("yay", Some("neofetch"), &added),
+            ChipState::Waiting
+        );
+        // Nothing running: everything not yet added is waiting.
+        assert_eq!(chip_state("yay", None, &added), ChipState::Waiting);
+    }
+
+    /// A count is only worth showing when there is more than one to count.
+    #[test]
+    fn the_progress_label_counts_only_a_real_queue() {
+        assert_eq!(progress_label(0, 1), "Adding…");
+        assert_eq!(progress_label(2, 5), "Adding… 2 of 5");
     }
 
     /// Nothing queued is not an empty box with a heading, it is nothing.
