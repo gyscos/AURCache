@@ -24,6 +24,7 @@ use aurcache_client::{
     AddPackageRequest, GitSourceSpec, SearchResult, SourceData, looks_like_git_url,
 };
 use dioxus::prelude::*;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// How long to wait after the last keystroke before searching.
@@ -210,6 +211,13 @@ fn AddPackageDialog(q: String) -> Element {
     let mut adding = use_signal(|| Option::<String>::None);
     let mut added = use_signal(Vec::<String>::new);
 
+    // Edits made before the package exists, as whole files rather than a diff:
+    // the server diffs each against the pristine source when the add arrives.
+    // One package at a time, like `--patch` on the CLI — the paths name files
+    // inside a source, and with two sources there is no way to say whose.
+    let mut patched = use_signal(BTreeMap::<String, String>::new);
+    let mut editing_sources = use_signal(|| false);
+
     // What the server already has. Adding one again is a silent no-op — the
     // server exits early and returns 200 — which is the worst of both: the
     // dialog closes, nothing happens, and nothing says why. Marking them is how
@@ -269,6 +277,11 @@ fn AddPackageDialog(q: String) -> Element {
             return;
         }
         queued.push(source);
+        // The edits belonged to whatever the field described; queueing a second
+        // source means they can no longer be attributed, and a stale PKGBUILD
+        // silently attached to the wrong package is worse than losing the edit.
+        patched.set(BTreeMap::new());
+        editing_sources.set(false);
         entry.set(String::new());
         debounced.set(String::new());
         git_ref.set("master".to_string());
@@ -317,7 +330,9 @@ fn AddPackageDialog(q: String) -> Element {
                     platforms: Some(platforms_selected()),
                     build_flags: None,
                     source: source.clone(),
-                    patched_files: None,
+                    // Only ever one source when there are edits, so they
+                    // cannot be attached to the wrong one.
+                    patched_files: (!patched().is_empty()).then(&*patched),
                 })
                 .await;
             match result {
@@ -347,7 +362,9 @@ fn AddPackageDialog(q: String) -> Element {
 
     rsx! {
         div { class: "modal modal-open",
-            div { class: "modal-box max-w-2xl",
+            // The editor needs room for two panes; without it the file list
+            // and the text would each get half of a narrow column.
+            div { class: "modal-box {dialog_width(editing_sources())}",
                 h3 { class: "font-bold text-lg", "Add packages" }
 
                 div { class: "py-4 space-y-3",
@@ -454,6 +471,40 @@ fn AddPackageDialog(q: String) -> Element {
                         },
                     }
 
+                    // Only for a single source, and only before anything is
+                    // sent. The paths name files inside one source, so with two
+                    // queued there is no way to say which they belong to —
+                    // `--patch` on the CLI refuses the same case for the same
+                    // reason.
+                    if let Some(source) = single_source(&sources_to_add()) {
+                        if editing_sources() {
+                            AddSourceEditor {
+                                source: source.clone(),
+                                patched,
+                                onclose: move |_| editing_sources.set(false),
+                            }
+                        } else {
+                            div {
+                                button {
+                                    class: "btn btn-sm btn-ghost",
+                                    disabled: busy(),
+                                    onclick: move |_| editing_sources.set(true),
+                                    if patched().is_empty() {
+                                        "Edit sources before adding"
+                                    } else {
+                                        {edited_label(patched().len())}
+                                    }
+                                }
+                                // The reason this exists at all: a package whose
+                                // PKGBUILD does not parse cannot be added and
+                                // then fixed, because the add never completes.
+                                p { class: "text-xs opacity-50 pt-1",
+                                    "Fix a PKGBUILD that does not parse, before it is ever parsed."
+                                }
+                            }
+                        }
+                    }
+
                     div {
                         span { class: "label-text text-sm", "Platforms" }
                         PlatformChecklist {
@@ -541,6 +592,31 @@ fn chip_state(label: &str, adding: Option<&str>, added: &[String]) -> ChipState 
     } else {
         ChipState::Waiting
     }
+}
+
+/// The one source, when there is exactly one.
+///
+/// Editing is offered only then. The edits are paths inside a source, so with
+/// two queued there is nothing to attach them to; `--patch` on the CLI refuses
+/// the same case.
+fn single_source(sources: &[SourceData]) -> Option<&SourceData> {
+    match sources {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// How the "edit sources" button reads once something has been edited.
+fn edited_label(count: usize) -> String {
+    match count {
+        1 => "1 file edited".to_string(),
+        n => format!("{n} files edited"),
+    }
+}
+
+/// How wide the dialog is, which depends on whether the editor is open.
+fn dialog_width(editing: bool) -> &'static str {
+    if editing { "max-w-6xl" } else { "max-w-2xl" }
 }
 
 /// How the button reads while a run is under way.
@@ -694,8 +770,9 @@ fn SearchResults(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChipState, QueuedList, SearchResults, add_button_label, chip_state, git_source,
-        progress_label, rank_results, source_at, source_for, source_label, to_add,
+        ChipState, QueuedList, SearchResults, add_button_label, chip_state, dialog_width,
+        edited_label, git_source, progress_label, rank_results, single_source, source_at,
+        source_for, source_label, to_add,
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
@@ -1040,6 +1117,28 @@ mod tests {
         assert_eq!(progress_label(2, 5), "Adding… 2 of 5");
     }
 
+    /// Edits are paths inside one source, so with two queued there is nothing
+    /// to attach them to. The CLI refuses `--patch` with several packages for
+    /// the same reason.
+    #[test]
+    fn sources_can_only_be_edited_one_at_a_time() {
+        assert!(single_source(&[]).is_none());
+        assert!(single_source(&[aur("hello")]).is_some());
+        assert!(single_source(&[aur("hello"), aur("yay")]).is_none());
+    }
+
+    /// Two panes need room a modal does not have by default.
+    #[test]
+    fn the_dialog_widens_for_the_editor() {
+        assert_ne!(dialog_width(true), dialog_width(false));
+    }
+
+    #[test]
+    fn the_edit_button_counts_the_files() {
+        assert_eq!(edited_label(1), "1 file edited");
+        assert_eq!(edited_label(3), "3 files edited");
+    }
+
     /// Nothing queued is not an empty box with a heading, it is nothing.
     #[test]
     fn an_empty_queue_renders_nothing() {
@@ -1188,5 +1287,146 @@ mod tests {
         let html = render("hello", Some(Err("connection refused".to_string())));
         assert!(html.contains("connection refused"), "{html}");
         assert!(!html.contains("Nothing in the AUR"), "{html}");
+    }
+}
+
+/// Editing a not-yet-added package's sources.
+///
+/// Reads the pristine files through the preview endpoints, which take the
+/// source in the request body because there is no package to name yet. Edits
+/// are kept here as whole files and travel with the add; the server diffs each
+/// against the upstream it fetches, so nothing is stored until the package is.
+#[component]
+fn AddSourceEditor(
+    source: SourceData,
+    patched: Signal<BTreeMap<String, String>>,
+    onclose: EventHandler<()>,
+) -> Element {
+    let mut patched = patched;
+    let files = use_resource({
+        let source = source.clone();
+        move || {
+            let source = source.clone();
+            async move {
+                crate::api::client()?
+                    .preview_source_files(&source)
+                    .await
+                    .map(|list| list.files)
+                    .map_err(|e| e.to_string())
+            }
+        }
+    });
+
+    let mut selected = use_signal(|| Option::<String>::None);
+    // What the file looks like upstream, so an edit can be measured against it
+    // and reverted to it.
+    let mut pristine = use_signal(String::new);
+    let mut draft = use_signal(String::new);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    let open_file = move |source: SourceData, path: String| async move {
+        error.set(None);
+        let client = match crate::api::client() {
+            Ok(client) => client,
+            Err(e) => return error.set(Some(e)),
+        };
+        match client.preview_source_file(&source, &path).await {
+            Ok(content) => {
+                pristine.set(content.original_content.clone());
+                // An edit already made to this file wins over the upstream
+                // copy, so reopening it shows the work rather than losing it.
+                draft.set(
+                    patched
+                        .peek()
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or(content.original_content),
+                );
+                selected.set(Some(path));
+            }
+            Err(e) => error.set(Some(e.to_string())),
+        }
+    };
+
+    // The point of opening the editor is nearly always the PKGBUILD, so it is
+    // opened rather than offered.
+    use_effect({
+        let source = source.clone();
+        move || {
+            if selected.peek().is_some() {
+                return;
+            }
+            let Some(Ok(list)) = &*files.read_unchecked() else {
+                return;
+            };
+            let Some(first) = list
+                .iter()
+                .find(|p| p.as_str() == "PKGBUILD")
+                .or_else(|| list.first())
+                .cloned()
+            else {
+                return;
+            };
+            let source = source.clone();
+            spawn(async move { open_file(source, first).await });
+        }
+    });
+
+    let dirty = draft() != pristine();
+    // Recorded when it differs from upstream and dropped when it matches again,
+    // so typing a change and undoing it by hand leaves nothing behind.
+    let mut keep = move || {
+        let Some(path) = selected() else { return };
+        if draft() == pristine() {
+            patched.write().remove(&path);
+        } else {
+            patched.write().insert(path, draft());
+        }
+    };
+
+    rsx! {
+        div { class: "space-y-2",
+            crate::source_editor::SourcePane {
+                title: source_label(&source),
+                files: files.read_unchecked().clone(),
+                selected: selected(),
+                onselect: {
+                    let source = source.clone();
+                    move |path: String| {
+                        // Hold what is on screen before leaving it, so moving
+                        // between files does not quietly discard an edit.
+                        keep();
+                        let source = source.clone();
+                        spawn(async move { open_file(source, path).await });
+                    }
+                },
+                modified: patched().keys().cloned().collect(),
+                draft,
+                dirty,
+                // A modal has less room than a page.
+                height: "h-64",
+                actions: rsx! {
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        disabled: !dirty,
+                        onclick: move |_| draft.set(pristine()),
+                        "Revert to upstream"
+                    }
+                    button {
+                        class: "btn btn-primary btn-sm",
+                        onclick: move |_| {
+                            keep();
+                            onclose.call(());
+                        },
+                        "Done"
+                    }
+                },
+                notices: rsx! {
+                    if let Some(message) = error() {
+                        div { class: "alert alert-error text-sm", span { "{message}" } }
+                    }
+                },
+            }
+        }
     }
 }

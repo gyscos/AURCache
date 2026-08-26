@@ -184,6 +184,9 @@ if [ "$ONLINE" = "1" ]; then
     # one noticed because these routes only run with --online.
     ROUTES+=("/package/hello/source/PKGBUILD|href=\"/package/hello\"|the editor offers a way back")
     ROUTES+=("/package/hello/source/PKGBUILD|>Sources<|the editor says where it is")
+    # The add dialog offers the same editor for a package that does not exist
+    # yet, which is the only way to add one whose PKGBUILD will not parse.
+    ROUTES+=("/packages/add#hello|Edit sources before adding|the add dialog can patch one source")
 fi
 
 [ -n "$SHOTS" ] && mkdir -p "$SHOTS"
