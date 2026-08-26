@@ -19,6 +19,7 @@ mod routes;
 mod screens;
 mod shell;
 mod status;
+mod theme;
 
 use dioxus::prelude::*;
 use routes::Route;

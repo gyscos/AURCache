@@ -5,6 +5,7 @@
 //! `MenuShell`, without needing to measure the viewport in Rust.
 
 use crate::routes::{MenuEntry, Route};
+use crate::theme::ThemePicker;
 use dioxus::prelude::*;
 
 /// Where the docs and the source live. Rendered as real links rather than
@@ -116,6 +117,9 @@ fn SideMenu() -> Element {
                         icon: rsx! { ConfigFilesIcon {} },
                     }
                     ExternalMenuLink { href: DOCS_URL, label: "Help" }
+                    // Client-side only: a display preference, kept in the
+                    // browser rather than in server settings. See `crate::theme`.
+                    ThemePicker {}
                 }
 
                 div { class: "flex-1" }

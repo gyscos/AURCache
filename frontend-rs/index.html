@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -10,6 +10,27 @@
     <script src="https://cdn.tailwindcss.com"></script>
   </head>
   <body>
+    <script>
+      // Apply the saved theme before anything paints. The wasm takes a moment
+      // to load, and without this the page renders in the default palette and
+      // visibly flips once the app mounts.
+      //
+      // This mirrors `resolve`/`normalise` in src/theme.rs -- keep the two in
+      // step. Unknown values fall through to following the system, because
+      // daisyUI has no rules for them and the page would render unstyled.
+      (function () {
+        try {
+          var choice = localStorage.getItem("aurcache-theme") || "system";
+          var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var theme = choice === "system" ? (dark ? "dark" : "light") : choice;
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          // Storage can be unavailable (private mode, blocked cookies). A
+          // readable default beats failing to boot over a preference.
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
     <div id="main"></div>
     <script type="module">
       // Absolute, not "./": the app routes on real paths, so this document is

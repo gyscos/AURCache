@@ -23,7 +23,7 @@ wasm-bindgen = "0.2"
 js-sys = "0.3"
 # Timers: the build log polls, so it needs a sleep that works in the browser.
 gloo-timers = { version = "0.3", features = ["futures"] }
-web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "History", "EventTarget"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "History", "EventTarget", "Storage", "MediaQueryList"] }
 
 [profile.release]
 opt-level = "z"
