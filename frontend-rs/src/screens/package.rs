@@ -186,7 +186,7 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
                             h1 { class: "card-title block leading-8 break-all",
                                 Link {
                                     class: "opacity-60 link-hover",
-                                    to: Route::Packages {},
+                                    to: Route::Packages { q: String::new() },
                                     "Packages"
                                 }
                                 span { class: "opacity-30 mx-2", "/" }

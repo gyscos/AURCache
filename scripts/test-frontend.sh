@@ -138,6 +138,13 @@ ROUTES=(
     "/packages|Upstream|packages list"
     "/packages|—|missing version shows a placeholder"
     "/packages/add|AUR package name or git URL|the add dialog (depth 2)"
+    # A search in the URL is applied on arrival, so a link to one opens with it
+    # already narrowed rather than showing everything.
+    # A search in the URL is applied on arrival, so a link to one opens
+    # narrowed rather than showing everything. `1 of 10` is the proof it
+    # filtered: the name alone would render on the unfiltered page too.
+    "/packages#hello|1 of 10|a linked search opens applied"
+    "/packages#aewm%2B%2B|1 of 10|a term needing escapes survives the URL"
     "/packages/add|Applied to every package above|one platform choice covers the whole queue"
     # The list stays mounted behind the dialog, so dismissing it reveals the
     # page as it was rather than reloading it.

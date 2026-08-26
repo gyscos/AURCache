@@ -16,7 +16,6 @@
 mod api;
 mod dates;
 mod format;
-mod legacy_hash;
 mod listing;
 mod platforms;
 mod routes;
@@ -29,10 +28,6 @@ use dioxus::prelude::*;
 use routes::Route;
 
 fn main() {
-    // Before the router reads the URL, so a `#/builds` bookmark from the Dart
-    // frontend resolves to `/builds` instead of quietly showing the dashboard.
-    legacy_hash::migrate_legacy_hash_url();
-
     dioxus::launch(App);
 }
 

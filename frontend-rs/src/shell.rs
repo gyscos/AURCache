@@ -80,13 +80,13 @@ fn SideMenu() -> Element {
                         icon: rsx! { DashboardIcon {} },
                     }
                     MenuLink {
-                        to: Route::Packages {},
+                        to: Route::Packages { q: String::new() },
                         label: "Packages",
     active: active == Some(MenuEntry::Packages),
                         icon: rsx! { PackagesIcon {} },
                     }
                     MenuLink {
-                        to: Route::Builds {},
+                        to: Route::Builds { q: String::new() },
                         label: "Builds",
     active: active == Some(MenuEntry::Builds),
                         icon: rsx! { BuildsIcon {} },

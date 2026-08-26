@@ -5,7 +5,7 @@ use crate::dates::DateOnly;
 use crate::format::format_duration;
 use crate::listing::{
     ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_builds,
-    sort_builds,
+    sort_builds, use_url_search,
 };
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
@@ -24,9 +24,9 @@ async fn load_builds() -> Result<Vec<Build>, String> {
 }
 
 #[component]
-pub fn Builds() -> Element {
+pub fn Builds(q: String) -> Element {
     let builds = use_resource(load_builds);
-    let query = use_signal(String::new);
+    let query = use_url_search(q, true, |q| Route::Builds { q });
     let status = use_signal(|| StatusFilter::ANY);
     // Newest first: a build list is a log.
     let sort = use_signal(|| Sort {

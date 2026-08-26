@@ -165,20 +165,25 @@ fn source_at(source: &SourceData) -> Option<&str> {
 }
 
 #[component]
-pub fn PackageAdd() -> Element {
+pub fn PackageAdd(q: String) -> Element {
     // The list stays mounted behind the dialog, so dismissing it reveals the
-    // page as it was rather than reloading it.
+    // page as it was rather than reloading it. Unfiltered and not syncing the
+    // URL: the fragment here is the dialog's search, not the list's filter.
     rsx! {
-        super::Packages {}
-        AddPackageDialog {}
+        super::Packages { q: String::new(), sync_url: false }
+        AddPackageDialog { q }
     }
 }
 
 #[component]
-fn AddPackageDialog() -> Element {
+fn AddPackageDialog(q: String) -> Element {
     // The one field: a package name or a git remote, told apart by their shape.
-    let mut entry = use_signal(String::new);
-    let mut debounced = use_signal(String::new);
+    // Seeded from `?q=` and written back as it changes, so a search can be
+    // linked to — `/packages/add?q=hello` opens with the results already up.
+    let mut entry = crate::listing::use_url_search(q.clone(), true, |q| Route::PackageAdd { q });
+    // Starts equal to the entry so a URL-seeded search runs immediately, rather
+    // than waiting for a keystroke that may never come.
+    let mut debounced = use_signal(|| q);
 
     // Only meaningful once the entry is a remote, which is when they appear.
     let mut git_ref = use_signal(|| "master".to_string());
@@ -225,7 +230,7 @@ fn AddPackageDialog() -> Element {
     });
 
     let close = move |_| {
-        navigator().push(Route::Packages {});
+        navigator().push(Route::Packages { q: String::new() });
     };
 
     let pending = move || source_for(&entry(), &git_ref(), &git_subfolder());
@@ -305,7 +310,7 @@ fn AddPackageDialog() -> Element {
         if failed.is_empty() {
             // The list behind the dialog is where the new packages appear, and
             // closing is what refetches it.
-            navigator().push(Route::Packages {});
+            navigator().push(Route::Packages { q: String::new() });
         } else {
             // A failure from the field stays in the field, which still holds
             // it; moving it into the queue would show it twice.

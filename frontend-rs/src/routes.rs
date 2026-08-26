@@ -18,16 +18,24 @@ pub enum Route {
         #[route("/")]
         Dashboard {},
 
-        #[route("/builds")]
-        Builds {},
+        // `#:q` carries the filter. In the fragment rather than a query string
+        // because dioxus's query handling has two defects a search term walks
+        // straight into: an empty value still writes `?q=`, so every unfiltered
+        // URL grows a dangling marker, and the value is not escaped on write
+        // while being split on `&` on read, so a term containing one is
+        // truncated. A fragment writes nothing when empty and is one opaque
+        // string. Nothing here is server-rendered and the filtering is
+        // client-side, so keeping the term out of the request costs nothing.
+        #[route("/builds#:q")]
+        Builds { q: String },
 
 
-        #[route("/packages")]
-        Packages {},
+        #[route("/packages#:q")]
+        Packages { q: String },
         // A dialog over the list rather than a page, but with a URL of its own
         // so it can be linked to and Back closes it.
-        #[route("/packages/add")]
-        PackageAdd {},
+        #[route("/packages/add#:q")]
+        PackageAdd { q: String },
         #[route("/package/:pkgbase")]
         Package { pkgbase: String },
         #[route("/package/:pkgbase/builds")]
@@ -128,6 +136,32 @@ mod tests {
         );
     }
 
+    /// A page with no search must not carry a marker for one. This is the
+    /// concrete reason the term is in the fragment: dioxus writes `?q=` even
+    /// for an empty value, so every unfiltered URL would have grown one.
+    #[test]
+    fn an_empty_search_leaves_no_trace_in_the_url() {
+        assert_eq!(
+            Route::Packages { q: String::new() }.to_string(),
+            "/packages"
+        );
+        assert_eq!(Route::Builds { q: String::new() }.to_string(), "/builds");
+        assert_eq!(
+            Route::PackageAdd { q: String::new() }.to_string(),
+            "/packages/add"
+        );
+    }
+
+    /// A URL with no fragment is the same page as one with an empty search,
+    /// which is what makes a plain `/packages` link work.
+    #[test]
+    fn a_url_without_a_fragment_is_an_empty_search() {
+        assert_eq!(
+            Route::from_str("/packages").unwrap(),
+            Route::Packages { q: String::new() }
+        );
+    }
+
     /// `/` is the landing route, and hash routing depends on it: an empty
     /// fragment is turned into `/`, so this is what a first visit renders.
     #[test]
@@ -148,12 +182,24 @@ mod tests {
     fn routes_round_trip_through_their_url() {
         for route in [
             Route::Dashboard {},
-            Route::Builds {},
+            Route::Builds { q: String::new() },
+            // A search term goes in the fragment, and these are the shapes that
+            // broke it as a query parameter: `&` split the value in two, and an
+            // empty one still wrote a marker into every unfiltered URL.
+            Route::Builds {
+                q: "a&b".to_string(),
+            },
+            Route::Packages {
+                q: "aewm++".to_string(),
+            },
+            Route::PackageAdd {
+                q: "two words".to_string(),
+            },
             Route::Build {
                 pkgbase: "hello".into(),
                 number: 42,
             },
-            Route::Packages {},
+            Route::Packages { q: String::new() },
             Route::Package {
                 pkgbase: "hello".into(),
             },

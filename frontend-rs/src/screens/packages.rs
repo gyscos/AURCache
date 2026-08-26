@@ -8,7 +8,7 @@
 use crate::api::client;
 use crate::listing::{
     ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
-    filter_packages, sort_packages,
+    filter_packages, sort_packages, use_url_search,
 };
 use crate::routes::Route;
 use crate::status::StatusBadge;
@@ -26,9 +26,18 @@ async fn load_packages() -> Result<Vec<SimplePackage>, String> {
 }
 
 #[component]
-pub fn Packages() -> Element {
+pub fn Packages(
+    q: String,
+    /// Whether this list owns the URL's fragment.
+    ///
+    /// False behind the add dialog, which owns it there — two components
+    /// writing the same fragment would fight, and the list would win by
+    /// clearing the dialog's search on every keystroke.
+    #[props(default = true)]
+    sync_url: bool,
+) -> Element {
     let packages = use_resource(load_packages);
-    let query = use_signal(String::new);
+    let query = use_url_search(q, sync_url, |q| Route::Packages { q });
     let status = use_signal(|| StatusFilter::ANY);
     let sort = use_signal(|| Sort {
         key: SortKey::Name,
@@ -39,7 +48,7 @@ pub fn Packages() -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 ListHeader { title: "Packages",
-                    Link { class: "btn btn-primary btn-sm", to: Route::PackageAdd {},
+                    Link { class: "btn btn-primary btn-sm", to: Route::PackageAdd { q: String::new() },
                         "Add package"
                     }
                 }

@@ -385,6 +385,7 @@ mod tests {
 // Shared controls
 // ---------------------------------------------------------------------------
 
+use crate::routes::Route;
 use aurcache_types::build_state::BuildState as State;
 use dioxus::prelude::*;
 
@@ -405,6 +406,54 @@ pub fn ListHeader(title: String, children: Element) -> Element {
     }
 }
 
+/// How long the box has to be still before the address bar follows it.
+///
+/// The list filters on every keystroke; only the URL waits. Browsers rate-limit
+/// history writes — Safari at roughly a hundred per thirty seconds — and typing
+/// a word is easily a dozen.
+const URL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// A search term that lives in the URL fragment, so a search can be linked to.
+///
+/// Seeded from the route on the way in and written back as it changes, always
+/// with `replace` rather than `push`: one history entry per keystroke would turn
+/// Back into a backspace.
+///
+/// `to_route` builds the route for a given term, which is all that differs
+/// between the pages doing this — keeping it in one place is what stops the
+/// fragment meaning something different on each.
+///
+/// `sync` is a parameter rather than the caller skipping this hook, because a
+/// hook that is sometimes called breaks the order Dioxus identifies them by.
+/// The packages list passes `false` when it is rendered behind the add dialog,
+/// which owns the fragment there.
+pub fn use_url_search(
+    initial: String,
+    sync: bool,
+    to_route: fn(String) -> Route,
+) -> Signal<String> {
+    let term = use_signal(|| initial);
+
+    use_effect(move || {
+        if !sync {
+            return;
+        }
+        // Reads `term`, so it re-runs when the box changes and not on every
+        // unrelated render.
+        let value = term();
+        spawn(async move {
+            gloo_timers::future::sleep(URL_DEBOUNCE).await;
+            // Only the last keystroke of a burst writes: the earlier timers find
+            // the box has moved on and do nothing.
+            if *term.peek() == value {
+                navigator().replace(to_route(value));
+            }
+        });
+    });
+
+    term
+}
+
 /// Search box and status filter, shared by both lists.
 #[component]
 pub fn ListControls(
@@ -419,6 +468,10 @@ pub fn ListControls(
 
     rsx! {
         div { class: "flex flex-wrap items-center gap-2",
+            span { id: "probe-search",
+                "HREF[{web_sys::window().map(|w| w.location().href().unwrap_or_default()).unwrap_or_default()}]"
+                "QUERY[{query}]"
+            }
             input {
                 class: "input input-bordered input-sm w-full sm:w-64",
                 r#type: "search",
