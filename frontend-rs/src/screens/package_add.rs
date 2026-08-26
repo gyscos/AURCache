@@ -32,8 +32,17 @@ use std::time::Duration;
 /// request someone else pays for.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Shorter than this and the result set is the whole AUR.
-const MIN_QUERY: usize = 3;
+/// Up to this many bytes, the server looks the name up exactly instead of
+/// searching — see `aurcache_api::aur::search`, which switches on the same
+/// number. A substring search for `a` would match most of the AUR; an exact
+/// lookup for it finds the package genuinely called `a`, which exists, as does
+/// `zz`. Short names are addable because of this, so nothing here may gate them
+/// out.
+///
+/// Bytes rather than characters, to switch where the server switches: the two
+/// agree for every package name the AUR allows, and disagreeing about a
+/// mistyped multi-byte query would only mislabel the "no results" wording.
+const EXACT_LOOKUP_MAX: usize = 2;
 
 /// What pressing Add will actually add.
 ///
@@ -217,8 +226,10 @@ fn AddPackageDialog(q: String) -> Element {
     let results = use_resource(move || async move {
         let q = debounced();
         // Nothing to look up for a remote: the AUR does not know about it, and
-        // asking would spend a request to be told so.
-        if q.chars().count() < MIN_QUERY || looks_like_git_url(q.trim()) {
+        // asking would spend a request to be told so. An empty box is not a
+        // search either — but one character is, and the server answers it with
+        // an exact lookup.
+        if q.trim().is_empty() || looks_like_git_url(q.trim()) {
             return Ok(Vec::new());
         }
         let mut found = crate::api::client()?
@@ -531,9 +542,12 @@ fn SearchResults(
     taken: Vec<String>,
     onpick: EventHandler<String>,
 ) -> Element {
-    if query.chars().count() < MIN_QUERY {
+    let query = query.trim();
+    if query.is_empty() {
         return rsx! {
-            p { class: "text-sm opacity-60 py-2", "Type at least {MIN_QUERY} characters to search." }
+            p { class: "text-sm opacity-60 py-2",
+                "Type a package name to search the AUR, or paste a git URL."
+            }
         };
     }
 
@@ -543,6 +557,12 @@ fn SearchResults(
         },
         Some(Err(e)) => rsx! {
             div { class: "alert alert-error text-sm", span { "Search failed: {e}" } }
+        },
+        // Two different questions were asked, so they get two different
+        // answers. A short query was looked up by exact name, and reporting
+        // "nothing matches" for it would suggest a search that never happened.
+        Some(Ok(found)) if found.is_empty() && query.len() <= EXACT_LOOKUP_MAX => rsx! {
+            p { class: "text-sm opacity-60 py-2", "No AUR package is called “{query}”." }
         },
         Some(Ok(found)) if found.is_empty() => rsx! {
             p { class: "text-sm opacity-60 py-2", "Nothing in the AUR matches “{query}”." }
@@ -643,21 +663,43 @@ mod tests {
             .collect()))
     }
 
-    /// Two letters is not a failed search, it is an unfinished one. Reporting
-    /// "nothing matches" there tells someone their package does not exist when
-    /// nothing has been looked up yet.
+    /// An empty box has not asked anything, so it gets a prompt rather than a
+    /// verdict.
     #[test]
-    fn a_short_query_is_not_a_failed_search() {
-        let html = render("he", Some(Ok(Vec::new())));
-        assert!(html.contains("Type at least"), "{html}");
-        assert!(!html.contains("Nothing in the AUR"), "{html}");
+    fn an_empty_box_is_not_a_failed_search() {
+        for query in ["", "   "] {
+            let html = render(query, Some(Ok(Vec::new())));
+            assert!(html.contains("Type a package name"), "{html}");
+            assert!(!html.contains("Nothing in the AUR"), "{html}");
+        }
     }
 
-    /// Once the query is long enough, an empty result really is an answer.
+    /// Short names are real: `a` and `zz` are both AUR packages. The server
+    /// answers a query this short by looking the name up exactly, so nothing
+    /// here may refuse to ask — a package nobody can add is worse than a
+    /// needless request.
     #[test]
-    fn a_long_query_with_no_results_says_so() {
-        let html = render("nonesuch", Some(Ok(Vec::new())));
-        assert!(html.contains("Nothing in the AUR"), "{html}");
+    fn a_one_or_two_character_name_is_still_searched() {
+        for query in ["a", "zz"] {
+            let html = render(query, found(&[(query, "1.0-1")]));
+            assert!(html.contains(query), "{query} should be listed: {html}");
+            assert!(!html.contains("Type a package name"), "{html}");
+        }
+    }
+
+    /// The two lookups asked different questions, so an empty answer means
+    /// different things. "Nothing matches" implies a search that, for a short
+    /// query, never happened.
+    #[test]
+    fn an_empty_answer_says_which_question_was_asked() {
+        let exact = render("ab", Some(Ok(Vec::new())));
+        assert!(exact.contains("No AUR package is called"), "{exact}");
+
+        let searched = render("nonesuch", Some(Ok(Vec::new())));
+        assert!(
+            searched.contains("Nothing in the AUR matches"),
+            "{searched}"
+        );
     }
 
     /// A search that is still running must not look like one that came back
