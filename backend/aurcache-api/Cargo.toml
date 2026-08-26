@@ -43,6 +43,9 @@ default = []
 static = []
 
 [dev-dependencies]
+# Lets the routing tests assert that client and server share one type per
+# API shape, rather than two structs that silently drift apart.
+aurcache-client = { path = "../aurcache-client" }
 sea-orm-migration = {version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls"]}
 tempfile = { workspace = true }
 

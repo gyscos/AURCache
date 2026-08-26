@@ -1,31 +1,28 @@
-use aurcache_db::packages::{GitSourceSpec, SourceData};
-use rocket::serde::{Deserialize, Serialize};
-use sea_orm::FromQueryResult;
+use crate::source::{GitSourceSpec, SourceData};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
-#[derive(Deserialize, ToSchema, Clone)]
-#[serde(crate = "rocket::serde")]
+#[derive(Deserialize, Serialize, ToSchema, Clone)]
 pub struct AddPackage {
-    pub(crate) platforms: Option<Vec<String>>,
-    pub(crate) build_flags: Option<Vec<String>>,
-    pub(crate) source: SourceData,
+    pub platforms: Option<Vec<String>>,
+    pub build_flags: Option<Vec<String>>,
+    pub source: SourceData,
     /// Optional initial patch, expressed as full file contents (path -> new
     /// content) rather than a diff - the backend diffs each entry against
     /// the source's pristine content itself. Lets a package that fails to
     /// parse upstream (e.g. a malformed PKGBUILD) be fixed up and added in
     /// one step, instead of having to add it broken and edit it afterwards.
     #[serde(default)]
-    pub(crate) patched_files: Option<BTreeMap<String, String>>,
+    pub patched_files: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Deserialize, ToSchema)]
-#[serde(crate = "rocket::serde")]
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct UpdatePackage {
-    pub(crate) force: bool,
+    pub force: bool,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct SourceFileList {
     pub files: Vec<String>,
 }
@@ -34,7 +31,7 @@ pub struct SourceFileList {
 /// The pristine content is always included so the UI can fall back to it
 /// (and offer a "revert" action) even if the stored patch no longer applies
 /// cleanly to the current upstream source.
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct SourceFileContent {
     pub path: String,
     pub original_content: String,
@@ -50,8 +47,7 @@ pub struct SourceFileContent {
     pub patch_error: Option<String>,
 }
 
-#[derive(Deserialize, ToSchema)]
-#[serde(crate = "rocket::serde")]
+#[derive(Deserialize, Serialize, ToSchema)]
 pub struct SourceFileUpdate {
     pub path: String,
     pub content: String,
@@ -60,22 +56,21 @@ pub struct SourceFileUpdate {
 /// Request body for the pre-add source preview endpoints: identifies a
 /// not-yet-added source so its (pristine) files can be listed/read before
 /// `POST /package` is ever called.
-#[derive(Deserialize, ToSchema, Clone)]
-#[serde(crate = "rocket::serde")]
+#[derive(Deserialize, Serialize, ToSchema, Clone)]
 pub struct SourcePreviewRequest {
     pub source: SourceData,
 }
 
 /// Request body to read a single pristine file of a not-yet-added source.
-#[derive(Deserialize, ToSchema, Clone)]
-#[serde(crate = "rocket::serde")]
+#[derive(Deserialize, Serialize, ToSchema, Clone)]
 pub struct SourcePreviewFileRequest {
     pub source: SourceData,
     pub path: String,
 }
 
-#[derive(FromQueryResult, Deserialize, ToSchema, Serialize, Default)]
-pub struct PackagePatchModel {
+#[derive(Deserialize, ToSchema, Serialize, Default)]
+#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
+pub struct PackagePatch {
     pub name: Option<String>,
     pub status: Option<i32>,
     pub out_of_date: Option<i32>,
@@ -87,8 +82,9 @@ pub struct PackagePatchModel {
     pub patch: Option<Option<String>>,
 }
 
-#[derive(FromQueryResult, Deserialize, ToSchema, Serialize)]
-pub struct SimplePackageModel {
+#[derive(Deserialize, ToSchema, Serialize)]
+#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
+pub struct SimplePackage {
     pub id: i32,
     pub name: String,
     pub status: i32,
@@ -98,7 +94,7 @@ pub struct SimplePackageModel {
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone)]
-pub struct ExtendedPackageModel {
+pub struct ExtendedPackage {
     pub id: i32,
     pub name: String,
     pub directly_requested: bool,
@@ -111,20 +107,21 @@ pub struct ExtendedPackageModel {
     pub upstream_version: String,
     pub package_source: PackageSource,
     pub split_packages: Option<Vec<String>>,
-    pub dependencies: Vec<PackageDependencyModel>,
-    pub dependents: Vec<PackageDependencyModel>,
+    pub dependencies: Vec<PackageDependency>,
+    pub dependents: Vec<PackageDependency>,
     /// Whether the package currently has a source patch applied.
     pub has_patch: bool,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, sea_orm::FromQueryResult)]
-pub struct PackageDependencyModel {
+#[derive(Deserialize, ToSchema, Serialize, Clone)]
+#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
+pub struct PackageDependency {
     pub id: i32,
     pub name: String,
     pub version_constraint: String,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "package_type", rename_all = "PascalCase")]
 pub enum PackageSource {
     Aur(AurPackage),
@@ -134,15 +131,15 @@ pub enum PackageSource {
 }
 
 // todo upload package
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct UploadPackage {}
 
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct AurNotFoundPackage {}
 
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct AurPackage {
-    pub(crate) name: String,
+    pub name: String,
     pub project_url: Option<String>,
     pub description: Option<String>,
     pub last_updated: u32,

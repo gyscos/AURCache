@@ -6,6 +6,7 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+aurcache-types = { path = "../aurcache-types" }
 anyhow = {workspace = true}
 async-recursion = "1.1.1"
 flate2 = {workspace = true}

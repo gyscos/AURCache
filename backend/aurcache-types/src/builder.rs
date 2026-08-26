@@ -1,10 +1,7 @@
-use aurcache_db::{builds, packages};
+//! Build states.
+//!
+//! The build-queue `Action` used to live here; it moved to `aurcache-db`
+//! because it carries database models and this crate must stay usable from a
+//! browser.
 
-#[derive(Clone)]
-pub enum Action {
-    Build(Box<packages::Model>, Box<builds::Model>),
-    Cancel(i32),
-}
-
-/// Values stored in the `builds.status` column.
 pub use crate::build_state::{BuildState, BuildStates};

@@ -1304,7 +1304,7 @@ fn describe_source(source: &PackageSource) -> String {
         PackageSource::Git(git) => {
             format!(
                 "git (url={}, ref={}, subfolder={})",
-                git.git_url, git.git_ref, git.subfolder
+                git.url, git.r#ref, git.subfolder
             )
         }
         PackageSource::Upload(_) => "upload".to_string(),

@@ -1,23 +1,23 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::package::{
-    AddPackage, PackagePatchModel, SourceFileContent, SourceFileList, SourceFileUpdate,
+    AddPackage, PackagePatch, SourceFileContent, SourceFileList, SourceFileUpdate,
     SourcePreviewFileRequest, SourcePreviewRequest, UpdatePackage,
 };
 use crate::models::package::{
-    AurNotFoundPackage, AurPackage, ExtendedPackageModel, PackageDependencyModel, PackageSource,
-    SimplePackageModel,
+    AurNotFoundPackage, AurPackage, ExtendedPackage, PackageDependency, PackageSource,
+    SimplePackage,
 };
 use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
 use aurcache_deps::AurClient;
-use aurcache_types::builder::Action;
 use aurcache_utils::aur::api::get_package_info;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
@@ -159,7 +159,7 @@ pub async fn package_update_entity_endpoint(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
-    input: Json<PackagePatchModel>,
+    input: Json<PackagePatch>,
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
@@ -480,7 +480,7 @@ pub async fn package_del(
 }
 #[utoipa::path(
     responses(
-            (status = 200, description = "List of all packages", body = [SimplePackageModel]),
+            (status = 200, description = "List of all packages", body = [SimplePackage]),
     ),
     params(
             ("limit", description = "limit of packages"),
@@ -493,7 +493,7 @@ pub async fn package_list(
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
-) -> Result<Json<Vec<SimplePackageModel>>, ApiError> {
+) -> Result<Json<Vec<SimplePackage>>, ApiError> {
     let db = db.inner();
 
     list_directly_requested_packages(db, limit, page)
@@ -506,7 +506,7 @@ async fn list_directly_requested_packages(
     db: &DatabaseConnection,
     limit: Option<u64>,
     page: Option<u64>,
-) -> Result<Vec<SimplePackageModel>, sea_orm::DbErr> {
+) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
     // correlated subquery: picks the version from builds for the package ordered by most
     // recent timestamp (end_time preferred, fallback to start_time)
     let latest_version_subquery = "(SELECT version \
@@ -515,7 +515,7 @@ async fn list_directly_requested_packages(
         ORDER BY COALESCE(b.end_time, b.start_time) DESC \
         LIMIT 1)";
 
-    let all: Vec<SimplePackageModel> = Packages::find()
+    let all: Vec<SimplePackage> = Packages::find()
         .select_only()
         .column(packages::Column::Name)
         .column(packages::Column::Id)
@@ -532,7 +532,7 @@ async fn list_directly_requested_packages(
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit))
-        .into_model::<SimplePackageModel>()
+        .into_model::<SimplePackage>()
         .all(db)
         .await?;
 
@@ -543,7 +543,7 @@ async fn list_package_relations(
     db: &DatabaseConnection,
     pkg_id: i32,
     direction: RelationDirection,
-) -> Result<Vec<PackageDependencyModel>, sea_orm::DbErr> {
+) -> Result<Vec<PackageDependency>, sea_orm::DbErr> {
     let (filter_col, relation) = match direction {
         RelationDirection::Dependencies => (
             dependencies::Column::DependentId,
@@ -563,7 +563,7 @@ async fn list_package_relations(
         .join(JoinType::InnerJoin, relation)
         .filter(filter_col.eq(pkg_id))
         .order_by_asc(dependencies::Column::Id)
-        .into_model::<PackageDependencyModel>()
+        .into_model::<PackageDependency>()
         .all(db)
         .await
 }
@@ -578,7 +578,7 @@ enum RelationDirection {
     responses(
             (status = 200, description = "Get package details
 This requires 1 API call to the AUR (rate limited 4000 per day)
-https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackageModel),
+https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackage),
     ),
     params(
             ("pkgbase", description = "pkgbase of the package")
@@ -589,7 +589,7 @@ pub async fn get_package(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     _a: Authenticated,
-) -> Result<Json<ExtendedPackageModel>, ApiError> {
+) -> Result<Json<ExtendedPackage>, ApiError> {
     let db = db.inner();
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
@@ -672,7 +672,7 @@ pub async fn get_package(
         }
     };
 
-    let ext_pkg = ExtendedPackageModel {
+    let ext_pkg = ExtendedPackage {
         id: pkg.id,
         name: pkg.name,
         directly_requested: pkg.directly_requested,

@@ -12,9 +12,8 @@ use crate::{builds, packages, workers};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
-use serde::{Deserialize, Serialize};
+
 use std::collections::{HashMap, HashSet};
-use utoipa::ToSchema;
 
 pub const STATUS_ACTIVE: i32 = 0;
 pub const STATUS_SUCCESS: i32 = 1;
@@ -435,17 +434,9 @@ pub async fn requeue_or_fail<C: ConnectionTrait>(
 /// Only ever set for builds that *no approved worker can currently take*.
 /// Ordinary queueing behind a busy worker is not a reason and yields `None`;
 /// otherwise every queued build would carry a scary-looking explanation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WaitingReason {
-    /// Reserved by package affinity to workers that are not currently live.
-    /// Revoking a listed worker releases the reservation.
-    Affinity { workers: Vec<String> },
-    /// No approved worker builds this architecture, natively or emulated.
-    Arch { arch: String },
-    /// A capable worker exists but none has been seen recently.
-    Offline,
-}
+/// Re-exported from `aurcache-types`, where it lives so the API and a
+/// frontend can share it.
+pub use aurcache_types::api::waiting::WaitingReason;
 
 /// Explain every `ENQUEUED` build that no approved worker can currently claim.
 ///

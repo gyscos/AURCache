@@ -8,12 +8,12 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-utoipa = { workspace = true }
-
-aurcache-db = { path = "../aurcache-db", optional = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
+anyhow = { workspace = true }
+utoipa = { workspace = true }
+sea-orm = { workspace = true, optional = true }
+
+
 
 [features]
 # The build-queue `Action` carries database models, which drags sea-orm and
@@ -21,4 +21,7 @@ serde_json = { workspace = true }
 # frontend can use, so the database half is optional: wasm consumers take
 # `default-features = false` and still get the API types and enums.
 default = ["db"]
-db = ["dep:aurcache-db"]
+# Enables the sea-orm derives on types that are also stored in the database.
+# A browser frontend takes `default-features = false` and gets the same shapes
+# without a database driver.
+db = ["dep:sea-orm"]

@@ -14,11 +14,11 @@
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
-use aurcache_types::builder::Action;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
@@ -157,4 +157,64 @@ async fn an_unknown_pkgbase_is_not_found() {
     // form-urlencoded decoding, so this is the failure mode being guarded.
     let response = client.get("/api/package/aewm%20%20").dispatch().await;
     assert_eq!(response.status(), Status::NotFound);
+}
+
+/// The client and the server must use *one* type per API shape, not two that
+/// happen to look alike.
+///
+/// Hand-mirrored copies drift silently: before these shapes were shared, the
+/// client's git variant expected `git_url`/`git_ref` while the server sent
+/// `url`/`ref`, so `pkg get` failed outright for every git-sourced package —
+/// and the client's `ExtendedPackage` was missing `has_patch` entirely. Both
+/// were invisible because nothing deserialised a git package.
+#[test]
+fn client_and_server_share_one_type_per_shape() {
+    // Compiles only if these are the *same* type, not merely the same fields.
+    // The left side is what the server serialises, the right what the client
+    // deserialises: naming both is what makes this catch drift. Comparing
+    // `aurcache_types` against the client would be near-tautological, since
+    // the client re-exports it.
+    fn _same<T>(x: T) -> T {
+        x
+    }
+    let _: fn(aurcache_api::models::package::SimplePackage) -> aurcache_client::SimplePackage =
+        _same;
+    let _: fn(aurcache_api::models::package::ExtendedPackage) -> aurcache_client::ExtendedPackage =
+        _same;
+    let _: fn(aurcache_api::models::builds::BuildSummary) -> aurcache_client::Build = _same;
+    let _: fn(aurcache_api::models::package::PackageSource) -> aurcache_client::PackageSource =
+        _same;
+    let _: fn(
+        aurcache_api::models::package::PackageDependency,
+    ) -> aurcache_client::PackageDependency = _same;
+}
+
+/// A git source round-trips through the wire format the server actually emits.
+///
+/// Pins the field names — `url`, `ref`, `subfolder` — that the client had
+/// wrong.
+#[test]
+fn a_git_source_round_trips_through_json() {
+    use aurcache_types::api::package::PackageSource;
+    use aurcache_types::source::GitSourceSpec;
+
+    let source = PackageSource::Git(GitSourceSpec {
+        url: "https://aur.archlinux.org/hello.git".to_string(),
+        r#ref: "master".to_string(),
+        subfolder: String::new(),
+    });
+
+    let json = serde_json::to_string(&source).expect("serialise");
+    assert!(
+        json.contains(r#""url":"https://aur.archlinux.org/hello.git""#),
+        "{json}"
+    );
+    assert!(json.contains(r#""ref":"master""#), "{json}");
+    assert!(
+        !json.contains("git_url"),
+        "field renamed on the wire: {json}"
+    );
+
+    let back: PackageSource = serde_json::from_str(&json).expect("deserialise");
+    assert_eq!(back, source);
 }

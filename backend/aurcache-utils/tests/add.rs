@@ -1,9 +1,10 @@
+use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
 use aurcache_deps::AurClient;
-use aurcache_types::builder::{Action, BuildStates};
+use aurcache_types::builder::BuildStates;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
 use aurcache_utils::pkg::satisfies_constraint;
 use flate2::{Compression, write::GzEncoder};

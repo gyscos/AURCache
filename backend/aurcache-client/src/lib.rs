@@ -4,6 +4,20 @@
 //! [`AurCacheClient`], a small async wrapper around the most common endpoints.
 
 use anyhow::{Context, Result};
+// The API shapes are defined once, in aurcache-types, and used by the server,
+// this client, and the browser frontend alike. Types still declared below are
+// ones whose server-side counterpart has a different shape or name; converging
+// those is the remaining half of the job.
+pub use aurcache_types::api::aur::ApiPackage;
+pub use aurcache_types::api::builds::BuildSummary as Build;
+pub use aurcache_types::api::package::{
+    AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
+};
+pub use aurcache_types::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
+pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
+pub use aurcache_types::api::stats::{GraphDataPoint, UserInfo};
+pub use aurcache_types::api::waiting::WaitingReason;
+pub use aurcache_types::source::GitSourceSpec;
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,13 +27,25 @@ use std::collections::BTreeMap;
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
 
-/// Information about the currently authenticated user.
+/// A registered build worker.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct UserInfo {
-    /// Username resolved from the configured authentication backend.
-    pub username: Option<String>,
-    /// Whether this user currently has an API token stored server-side.
-    pub has_api_token: bool,
+pub struct Worker {
+    /// Internal worker id.
+    pub id: i32,
+    /// Operator-facing worker name reported at enrollment.
+    pub name: String,
+    /// Enrollment status: `pending`, `approved`, or `revoked`.
+    pub status: String,
+    /// SHA-256 fingerprint of the worker's certificate/CSR (stable identity).
+    pub cert_fingerprint: String,
+    /// Comma-separated architectures the worker builds natively.
+    pub native_arches: String,
+    /// Comma-separated architectures the worker can build via emulation.
+    pub emulated_arches: String,
+    /// Unix seconds of the last heartbeat/contact, if ever seen.
+    pub last_seen: Option<i64>,
+    /// Worker software version reported at enrollment/heartbeat.
+    pub version: Option<String>,
 }
 
 /// Response returned when a personal API token is regenerated.
@@ -52,17 +78,6 @@ pub struct ListStats {
     pub avg_build_time_trend: f32,
 }
 
-/// A single graph datapoint for monthly build activity.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GraphDataPoint {
-    /// Calendar month, in the range `1..=12`.
-    pub month: i32,
-    /// Calendar year.
-    pub year: i32,
-    /// Number of builds for the month.
-    pub count: i32,
-}
-
 /// Search result returned from the AUR search proxy endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -70,201 +85,6 @@ pub struct SearchResult {
     pub name: String,
     /// Upstream version string reported by the search backend.
     pub version: String,
-}
-
-/// Lightweight package listing entry.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SimplePackage {
-    /// Internal package id.
-    pub id: i32,
-    /// Package name.
-    pub name: String,
-    /// Package/build status code.
-    pub status: i32,
-    /// Out-of-date flag encoded as an integer.
-    pub outofdate: i32,
-    /// Most recent built version, if any.
-    pub latest_version: Option<String>,
-    /// Latest upstream version known to AURCache.
-    pub upstream_version: String,
-}
-
-/// Dependency edge between two tracked packages.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PackageDependency {
-    /// Internal id of the related package.
-    pub id: i32,
-    /// Package name.
-    pub name: String,
-    /// Recorded version constraint for this relation.
-    pub version_constraint: String,
-}
-
-/// Detailed package-source metadata.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "package_type", rename_all = "PascalCase")]
-pub enum PackageSource {
-    /// Source metadata for an AUR-backed package.
-    Aur(AurPackage),
-    /// Source metadata for a package that is expected in AUR but currently missing.
-    AurNotFound(EmptyPackageSource),
-    /// Source metadata for a git-backed package.
-    Git(GitPackage),
-    /// Source metadata for an uploaded archive package.
-    Upload(EmptyPackageSource),
-}
-
-/// Metadata for a package fetched from the AUR.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AurPackage {
-    /// Package name.
-    pub name: String,
-    /// Upstream project URL, when available.
-    pub project_url: Option<String>,
-    /// Human-readable package description.
-    pub description: Option<String>,
-    /// First-seen/update timestamp for the package in AUR.
-    pub last_updated: u32,
-    /// Initial submission timestamp.
-    pub first_submitted: u32,
-    /// License list flattened into a single string.
-    pub licenses: Option<String>,
-    /// AUR maintainer, if present.
-    pub maintainer: Option<String>,
-    /// Whether AUR reports the package as flagged out of date.
-    pub aur_flagged_outdated: bool,
-    /// Canonical AUR package page URL.
-    pub aur_url: String,
-}
-
-/// Metadata for a git-backed package source.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitPackage {
-    /// Remote git repository URL.
-    pub git_url: String,
-    /// Git reference used by AURCache.
-    pub git_ref: String,
-    /// Subdirectory containing the build files.
-    pub subfolder: String,
-}
-
-/// Empty marker payload used for source variants without extra fields.
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct EmptyPackageSource {}
-
-/// Full package details returned by the package detail endpoint.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExtendedPackage {
-    /// Internal package id.
-    pub id: i32,
-    /// Package name.
-    pub name: String,
-    /// Whether the package was directly requested by a user.
-    pub directly_requested: bool,
-    /// Package/build status code.
-    pub status: i32,
-    /// Out-of-date flag encoded as an integer.
-    pub outofdate: i32,
-    /// Most recent built version, if any.
-    pub latest_version: Option<String>,
-    /// Platforms selected for this package.
-    pub selected_platforms: Vec<String>,
-    /// Build flags selected for this package.
-    pub selected_build_flags: Option<Vec<String>>,
-    /// Latest upstream version known to AURCache.
-    pub upstream_version: String,
-    /// Detailed source information.
-    pub package_source: PackageSource,
-    /// Split-package names generated from this package base.
-    pub split_packages: Option<Vec<String>>,
-    /// Packages this package depends on.
-    pub dependencies: Vec<PackageDependency>,
-    /// Packages depending on this package.
-    pub dependents: Vec<PackageDependency>,
-}
-
-/// Build record returned by build-related endpoints.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Build {
-    /// Internal build id.
-    pub id: i32,
-    /// Internal package id.
-    pub pkg_id: i32,
-    /// Package name.
-    pub pkg_name: String,
-    /// Build version string.
-    pub version: String,
-    /// Build status code.
-    pub status: i32,
-    /// Start timestamp as Unix seconds.
-    pub start_time: Option<i64>,
-    /// End timestamp as Unix seconds.
-    pub end_time: Option<i64>,
-    /// Target platform for the build.
-    pub platform: String,
-    /// Why an enqueued build cannot be claimed by any approved worker.
-    ///
-    /// Absent for everything else, including a build merely queued behind a
-    /// busy worker — so its presence always means something needs attention.
-    #[serde(default)]
-    pub waiting_reason: Option<WaitingReason>,
-}
-
-/// Why an enqueued build is not being picked up.
-///
-/// Mirrors the server's `aurcache_db::helpers::worker_jobs::WaitingReason`; the
-/// tag names are part of the HTTP contract.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WaitingReason {
-    /// Reserved by package affinity to workers that are not currently live.
-    Affinity {
-        /// Workers that declared affinity for this package.
-        workers: Vec<String>,
-    },
-    /// No approved worker builds this architecture.
-    Arch {
-        /// The architecture nothing can build.
-        arch: String,
-    },
-    /// A capable worker exists but none has been seen recently.
-    Offline,
-}
-
-impl std::fmt::Display for WaitingReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Affinity { workers } => {
-                write!(f, "reserved for {} (offline)", workers.join(", "))
-            }
-            Self::Arch { arch } => write!(f, "no worker builds {arch}"),
-            Self::Offline => write!(f, "all capable workers are offline"),
-        }
-    }
-}
-
-/// Remote build worker record returned by the worker-admin endpoints.
-///
-/// Mirrors the server's `workers` row; extra fields (signed certificate, etc.)
-/// are ignored on decode as they are not needed for CLI/UI management.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Worker {
-    /// Internal worker id.
-    pub id: i32,
-    /// Operator-facing worker name reported at enrollment.
-    pub name: String,
-    /// Enrollment status: `pending`, `approved`, or `revoked`.
-    pub status: String,
-    /// SHA-256 fingerprint of the worker's certificate/CSR (stable identity).
-    pub cert_fingerprint: String,
-    /// Comma-separated architectures the worker builds natively.
-    pub native_arches: String,
-    /// Comma-separated architectures the worker can build via emulation.
-    pub emulated_arches: String,
-    /// Unix seconds of the last heartbeat/contact, if ever seen.
-    pub last_seen: Option<i64>,
-    /// Worker software version reported at enrollment/heartbeat.
-    pub version: Option<String>,
 }
 
 /// Request payload for adding a package to AURCache.
@@ -484,6 +304,46 @@ impl AurCacheClient {
         };
         self.request_json::<Vec<Build>, Value>(Method::GET, &path, query.pairs(), None)
             .await
+    }
+
+    /// Lists the files in a package's source tree.
+    pub async fn list_source_files(&self, pkgbase: &str) -> Result<SourceFileList> {
+        self.request_json::<SourceFileList, Value>(
+            Method::GET,
+            &format!("/package/{pkgbase}/source/files"),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Reads one source file, pristine and patched.
+    pub async fn get_source_file(&self, pkgbase: &str, path: &str) -> Result<SourceFileContent> {
+        let query = Query::default().opt("path", Some(path));
+        self.request_json::<SourceFileContent, Value>(
+            Method::GET,
+            &format!("/package/{pkgbase}/source/file"),
+            query.pairs(),
+            None,
+        )
+        .await
+    }
+
+    /// Replaces one source file's content. The server stores the difference
+    /// from the pristine source as the package's patch; writing back the
+    /// original content is therefore how a file is un-patched.
+    pub async fn put_source_file(&self, pkgbase: &str, path: &str, content: &str) -> Result<()> {
+        let body = SourceFileUpdate {
+            path: path.to_string(),
+            content: content.to_string(),
+        };
+        self.request_empty(
+            Method::PUT,
+            &format!("/package/{pkgbase}/source/file"),
+            &[],
+            Some(&body),
+        )
+        .await
     }
 
     /// Fetches details for a single build id.

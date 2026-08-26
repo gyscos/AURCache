@@ -1,5 +1,5 @@
-use aurcache_types::settings::SettingSource;
-use rocket::serde::{Deserialize, Serialize};
+use crate::settings::SettingSource;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, Debug)]

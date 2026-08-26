@@ -467,6 +467,7 @@ dependencies = [
  "aurcache-activitylog",
  "aurcache-builder",
  "aurcache-ca",
+ "aurcache-client",
  "aurcache-db",
  "aurcache-deps",
  "aurcache-types",
@@ -540,6 +541,7 @@ name = "aurcache-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aurcache-types",
  "reqwest",
  "serde",
  "serde_json",
@@ -552,6 +554,7 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "aurcache-deps",
+ "aurcache-types",
  "flate2",
  "pacman-mirrors",
  "sea-orm",
@@ -572,6 +575,7 @@ dependencies = [
  "alpm-compress",
  "alpm-srcinfo",
  "alpm-types",
+ "aurcache-types",
  "backon",
  "flate2",
  "reqwest",
@@ -617,7 +621,8 @@ dependencies = [
 name = "aurcache-types"
 version = "0.1.0"
 dependencies = [
- "aurcache-db",
+ "anyhow",
+ "sea-orm",
  "serde",
  "serde_json",
  "utoipa",

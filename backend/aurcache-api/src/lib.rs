@@ -8,7 +8,9 @@ pub mod custom_file_server;
 pub mod embed;
 mod health;
 pub mod init;
-mod models;
+// Public so the HTTP client can be type-checked against the exact shapes
+// the server serialises, instead of a hand-mirrored copy.
+pub mod models;
 mod package;
 mod settings;
 mod stats;

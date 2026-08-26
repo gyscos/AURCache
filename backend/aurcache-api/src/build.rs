@@ -4,13 +4,13 @@ use rocket::serde::json::Json;
 use rocket::{State, delete, get, post};
 
 use crate::models::authenticated::Authenticated;
-use crate::models::builds::ListBuildsModel;
+use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
+use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
-use aurcache_types::builder::Action;
 use aurcache_utils::package::update::package_update;
 use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::{
@@ -95,7 +95,7 @@ pub async fn list_builds(
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
-) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
+) -> Result<Json<Vec<BuildSummary>>, ApiError> {
     list_builds_impl(db.inner(), None, limit, page).await
 }
 
@@ -105,7 +105,7 @@ pub async fn list_builds(
 /// may contain `+`, which decodes to a space in a query value but is literal in
 /// a path segment.
 #[utoipa::path(
-    responses((status = 200, description = "List builds for a package", body = Vec<ListBuildsModel>)),
+    responses((status = 200, description = "List builds for a package", body = Vec<BuildSummary>)),
     params(
         ("pkgbase" = String, Path, description = "pkgbase of the package"),
         ("limit", description = "Limit of items to fetch"),
@@ -119,7 +119,7 @@ pub async fn list_package_builds(
     limit: Option<u64>,
     page: Option<u64>,
     _a: Authenticated,
-) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
+) -> Result<Json<Vec<BuildSummary>>, ApiError> {
     let pkg = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
     list_builds_impl(db.inner(), pkg, limit, page).await
 }
@@ -129,7 +129,7 @@ async fn list_builds_impl(
     pkg_id: Option<i32>,
     limit: Option<u64>,
     page: Option<u64>,
-) -> Result<Json<Vec<ListBuildsModel>>, ApiError> {
+) -> Result<Json<Vec<BuildSummary>>, ApiError> {
     let basequery = Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
         .select_only()
@@ -146,10 +146,10 @@ async fn list_builds_impl(
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
 
     let mut build = match pkg_id {
-        None => basequery.into_model::<ListBuildsModel>().all(db),
+        None => basequery.into_model::<BuildSummary>().all(db),
         Some(pkg_id) => basequery
             .filter(builds::Column::PkgId.eq(pkg_id))
-            .into_model::<ListBuildsModel>()
+            .into_model::<BuildSummary>()
             .all(db),
     }
     .await
@@ -166,7 +166,7 @@ async fn list_builds_impl(
 /// it must never turn a working build list into an error page.
 async fn annotate_waiting(
     db: &DatabaseConnection,
-    builds: &mut [ListBuildsModel],
+    builds: &mut [BuildSummary],
 ) -> Result<(), ApiError> {
     if builds.is_empty() {
         return Ok(());
@@ -197,7 +197,7 @@ pub async fn get_build(
     db: &State<DatabaseConnection>,
     buildid: i32,
     _a: Authenticated,
-) -> Result<Json<ListBuildsModel>, ApiError> {
+) -> Result<Json<BuildSummary>, ApiError> {
     let db = db.inner();
 
     let result = Builds::find()
@@ -212,7 +212,7 @@ pub async fn get_build(
         .column(builds::Column::EndTime)
         .column(builds::Column::StartTime)
         .column(builds::Column::Platform)
-        .into_model::<ListBuildsModel>()
+        .into_model::<BuildSummary>()
         .one(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?

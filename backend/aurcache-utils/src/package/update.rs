@@ -8,12 +8,13 @@ use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
 use aurcache_deps::{AurClient, DependencyResolution, PkgDeps};
-use aurcache_types::builder::{Action, BuildStates};
+use aurcache_types::builder::BuildStates;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
@@ -709,12 +710,13 @@ pub async fn update_platform(
 mod tests {
     use super::package_update_with_client;
     use crate::snapshot::SnapshotStore;
+    use aurcache_db::action::Action;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
     use aurcache_db::prelude::{Dependencies, Packages};
     use aurcache_db::{builds, dependencies, packages};
     use aurcache_deps::AurClient;
-    use aurcache_types::builder::{Action, BuildStates};
+    use aurcache_types::builder::BuildStates;
     use git2::{Repository, Signature};
     use pacman_mirrors::platforms::Platform;
     use sea_orm::{

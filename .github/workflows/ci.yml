@@ -59,6 +59,28 @@ jobs:
         run: |
           cargo check
           cargo test --all
+
+      # The Dockerfiles build a subset of the workspace, not all of it. Cargo
+      # unifies features across whatever is selected, and `cargo test --all`
+      # also pulls in dev-dependencies -- so a crate can under-declare a
+      # feature, compile fine here, and still fail in the image. Checking the
+      # exact package sets the Dockerfiles use is what catches that.
+      - name: Check Docker build shapes
+        run: |
+          # docker/worker.Dockerfile
+          cargo check -p aurcache-worker -p aurcache-sandbox
+          # docker/hybrid.Dockerfile
+          cargo check -p aurcache -p aurcache-worker -p aurcache-worker-docker -p aurcache-sandbox
+          # docker/build-rust.sh
+          cargo check --features static
+
+      # `aurcache-types` exists so a browser frontend can share the API shapes
+      # without a database driver. Every workspace build turns the `db` feature
+      # on, so only an explicit no-default-features check proves that still holds.
+      - name: Check driver-free types
+        run: |
+          cargo check -p aurcache-types --no-default-features
+          cargo check -p aurcache-client
   lintFlutter:
     runs-on: ubuntu-latest
     defaults:
