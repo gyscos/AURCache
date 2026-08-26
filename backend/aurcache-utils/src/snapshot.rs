@@ -261,6 +261,86 @@ impl SnapshotStore {
     /// unconditionally re-downloading/re-cloning on every check. If a patch
     /// was previously active for this source it is re-applied on top of the
     /// freshly fetched raw source, so the cache entry stays consistent.
+    /// Metadata about a package read from its checkout: the `.SRCINFO`
+    /// fields, the maintainer comment in the PKGBUILD, and the packaging
+    /// history from git.
+    ///
+    /// Everything here is already on disk — this store cloned the repository
+    /// to resolve the source in the first place — so it replaces what used to
+    /// be a live AUR lookup per request.
+    pub async fn source_metadata(
+        &self,
+        source_data: &SourceData,
+        patch: Option<&str>,
+    ) -> anyhow::Result<crate::package::source_metadata::SourceMetadata> {
+        use crate::package::source_metadata::{from_sourceinfo, maintainer_from_pkgbuild};
+
+        let entry = self.get_or_fetch(source_data, patch).await?;
+        let mut metadata = entry
+            .active
+            .sourceinfo
+            .as_ref()
+            .map(from_sourceinfo)
+            .unwrap_or_default();
+
+        // Best-effort: a PKGBUILD that cannot be read still leaves the
+        // `.SRCINFO`-derived fields usable.
+        if let Ok(pkgbuild) = read_file_from_archive(
+            &entry.active.archive_bytes,
+            &entry.active.pkgbase,
+            "PKGBUILD",
+        ) {
+            metadata.maintainer = maintainer_from_pkgbuild(&pkgbuild);
+        }
+
+        let (first, last) = self.packaging_history(source_data);
+        metadata.first_submitted = first;
+        metadata.last_modified = last;
+
+        Ok(metadata)
+    }
+
+    /// When a package's packaging was first and last touched, from the commit
+    /// history of its checkout.
+    ///
+    /// This is the packaging repository's history, not the upstream project's:
+    /// for an AUR package it is exactly "first submitted" and "last modified".
+    ///
+    /// Returns `(None, None)` rather than failing — a shallow or unreadable
+    /// repository should cost two display fields, not the whole lookup.
+    fn packaging_history(&self, source_data: &SourceData) -> (Option<i64>, Option<i64>) {
+        let path = self
+            .checkout_root
+            .join(sanitize_cache_key(&source_data.cache_key()));
+
+        let Ok(repo) = git2::Repository::open(&path) else {
+            return (None, None);
+        };
+        let Ok(mut walk) = repo.revwalk() else {
+            return (None, None);
+        };
+        if walk.push_head().is_err() {
+            return (None, None);
+        }
+
+        let mut newest = None;
+        let mut oldest = None;
+        for oid in walk.flatten() {
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
+            };
+            let time = commit.time().seconds();
+            // The walk starts at HEAD and goes back, so the first commit seen
+            // is the newest and the last is the initial one.
+            if newest.is_none() {
+                newest = Some(time);
+            }
+            oldest = Some(time);
+        }
+
+        (oldest, newest)
+    }
+
     pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<bool> {
         let cache_key = source_data.cache_key();
         let previous = {
