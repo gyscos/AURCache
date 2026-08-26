@@ -51,6 +51,19 @@ pub struct Model {
     /// the (possibly patched) `PKGBUILD` when a patch is present, so it never
     /// needs to be included in the patch itself.
     pub patch: Option<String>,
+    // Metadata mirrored from the AUR by the version-check scheduler, so the
+    // package route can answer without a live lookup. All nullable: a package
+    // that has not been checked since these columns were added has none yet.
+    pub aur_description: Option<String>,
+    pub aur_maintainer: Option<String>,
+    pub aur_project_url: Option<String>,
+    /// The AUR reports a list; stored joined with ", " for display.
+    pub aur_licenses: Option<String>,
+    pub aur_first_submitted: Option<i64>,
+    pub aur_last_modified: Option<i64>,
+    /// The AUR's own "flagged out of date" marker. Not [`Self::out_of_date`],
+    /// which means upstream is newer than what we last built.
+    pub aur_flagged_outdated: Option<bool>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

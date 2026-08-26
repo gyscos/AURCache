@@ -57,6 +57,29 @@ JOIN (
   SELECT 'python-3.11',                    93600,         900
 ) offs ON offs.name = p.name;
 
+-- AUR metadata as the version-check scheduler mirrors it. Seeding it keeps the
+-- fixture offline: without it the package route falls back to a live AUR
+-- lookup for every package.
+UPDATE packages SET
+  aur_description      = 'Prints Hello World and more',
+  aur_maintainer       = 'someone',
+  aur_project_url      = 'https://www.gnu.org/software/hello/',
+  aur_licenses         = 'GPL-3.0-or-later',
+  aur_first_submitted  = 1425168000,
+  aur_last_modified    = 1755000000,
+  aur_flagged_outdated = 0
+WHERE name = 'hello';
+
+UPDATE packages SET
+  aur_description      = 'Yet another yogurt. Pacman wrapper and AUR helper written in go.',
+  aur_maintainer       = 'jguer',
+  aur_project_url      = 'https://github.com/Jguer/yay',
+  aur_licenses         = 'GPL-3.0-or-later',
+  aur_first_submitted  = 1470000000,
+  aur_last_modified    = 1756000000,
+  aur_flagged_outdated = 0
+WHERE name = 'yay';
+
 -- The builds above take their status from the package row, which is right for
 -- everything except `hello`: its package status reflects the failed build added
 -- below, while the build that produced what is in the repository succeeded.

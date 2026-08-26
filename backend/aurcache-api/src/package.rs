@@ -19,7 +19,6 @@ use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
 use aurcache_deps::AurClient;
 use aurcache_types::build_state::BuildStates;
-use aurcache_utils::aur::api::get_package_info;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
 use aurcache_utils::package::update::{package_resync_dependencies, package_update};
@@ -180,6 +179,15 @@ pub async fn package_update_entity_endpoint(
         status: input.status.map_or(NotSet, Set),
         out_of_date: input.out_of_date.map_or(NotSet, Set),
         upstream_version: NotSet,
+        // Mirrored AUR metadata is owned by the version-check scheduler; a
+        // package patch must not clear it.
+        aur_description: NotSet,
+        aur_maintainer: NotSet,
+        aur_project_url: NotSet,
+        aur_licenses: NotSet,
+        aur_first_submitted: NotSet,
+        aur_last_modified: NotSet,
+        aur_flagged_outdated: NotSet,
         latest_build: input.latest_build.map_or(NotSet, Set),
         build_flags: input
             .build_flags
@@ -683,47 +691,24 @@ pub async fn get_package(
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     let has_patch = pkg.patch.is_some();
-    let source_data = pkg.source_data;
+    let source_data = pkg.source_data.clone();
 
     let (package_source, version) = match source_data {
         SourceData::Aur { .. } => {
-            let query_name = pkg
-                .split_packages
-                .as_deref()
-                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                .and_then(|names| {
-                    let first = names.first()?;
-                    (names.len() > 1 || first != &pkg.name).then(|| first.clone())
-                })
-                .unwrap_or_else(|| pkg.name.clone());
-
-            let aur_info = get_package_info(&query_name)
-                .await
-                .map_err(|e| err(Status::InternalServerError, e))?;
-
-            match aur_info {
+            // Read straight from the row. The version-check scheduler mirrors
+            // this metadata, and `package::add` fills it in immediately for a
+            // new package, so there is no live AUR lookup on this path at all —
+            // it used to be ~128ms of a ~130ms response, and one of the AUR's
+            // 4000 daily calls per page view.
+            //
+            // A package with nothing mirrored is one the AUR did not return:
+            // reported as not found, which is what a live lookup concluded too.
+            match cached_aur_package(&pkg) {
+                Some(cached) => (PackageSource::Aur(cached), pkg.upstream_version.clone()),
                 None => (
                     PackageSource::AurNotFound(AurNotFoundPackage {}),
-                    pkg.upstream_version,
+                    pkg.upstream_version.clone(),
                 ),
-                Some(aur_info) => {
-                    let aur_url = format!("https://aur.archlinux.org/pkgbase/{}", pkg.name);
-
-                    (
-                        PackageSource::Aur(AurPackage {
-                            name: pkg.name.clone(),
-                            project_url: aur_info.url,
-                            description: aur_info.description,
-                            last_updated: aur_info.last_modified,
-                            first_submitted: aur_info.first_submitted,
-                            licenses: aur_info.license.map(|l| l.join(", ")),
-                            maintainer: aur_info.maintainer,
-                            aur_flagged_outdated: aur_info.out_of_date.unwrap_or(0) != 0,
-                            aur_url,
-                        }),
-                        Some(aur_info.version),
-                    )
-                }
             }
         }
         SourceData::Git { spec } => (
@@ -765,6 +750,40 @@ pub async fn get_package(
     };
 
     Ok(Json(ext_pkg))
+}
+
+/// The AUR page for a pkgbase. Derived, never fetched.
+fn aur_pkgbase_url(pkgbase: &str) -> String {
+    format!("https://aur.archlinux.org/pkgbase/{pkgbase}")
+}
+
+/// The AUR metadata mirrored onto the package row, if it has been checked.
+///
+/// `aur_last_modified` is the sentinel: the version-check scheduler always
+/// writes it alongside the rest, while any individual field may legitimately be
+/// null because the AUR reports no value for it.
+///
+/// Known limitation: a package later removed from the AUR keeps its last-known
+/// metadata here, where a live lookup would report it as gone. The version
+/// checker logs that case, and the alternative — re-querying the AUR on every
+/// page view to detect a rare event — is the cost this exists to avoid.
+fn cached_aur_package(pkg: &packages::Model) -> Option<AurPackage> {
+    let last_modified = pkg.aur_last_modified?;
+
+    Some(AurPackage {
+        name: pkg.name.clone(),
+        project_url: pkg.aur_project_url.clone(),
+        description: pkg.aur_description.clone(),
+        last_updated: u32::try_from(last_modified).unwrap_or(0),
+        first_submitted: pkg
+            .aur_first_submitted
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0),
+        licenses: pkg.aur_licenses.clone(),
+        maintainer: pkg.aur_maintainer.clone(),
+        aur_flagged_outdated: pkg.aur_flagged_outdated.unwrap_or(false),
+        aur_url: aur_pkgbase_url(&pkg.name),
+    })
 }
 
 #[cfg(test)]

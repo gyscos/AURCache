@@ -6,6 +6,7 @@ use aurcache_db::{builds, packages};
 use aurcache_deps::AurClient;
 use aurcache_types::build_state::BuildStates;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
+use aurcache_utils::package::aur_metadata::apply_aur_metadata;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
@@ -71,13 +72,13 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
 
     for package in packages {
         let mut package_model: packages::ActiveModel = package.clone().into();
-        let package_id = package_model.id.get()?;
+        let package_id = *package_model.id.get()?;
 
         // Query the latest build.version for this package (most recent by end_time then start_time)
         let latest_version_row = Builds::find()
             .select_only()
             .column(builds::Column::Version)
-            .filter(builds::Column::PkgId.eq(*package_id))
+            .filter(builds::Column::PkgId.eq(package_id))
             // Successful builds only: this is compared against the upstream
             // version to decide whether the package is out of date, and a
             // failed build of a new version is not that version being built.
@@ -103,6 +104,10 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                     }
                     Some(result) => {
                         package_model.upstream_version = Set(Some(result.version.clone()));
+                        // The rest of the same response, written down so the
+                        // package route can render without its own AUR call.
+                        // No extra AUR traffic: `result` is already here.
+                        apply_aur_metadata(&mut package_model, result);
                         // Only mark out of date when upstream is strictly newer than the
                         // locally built version.  This prevents VCS packages (-git etc.)
                         // from looping: the AUR-reported version is the one from when the
@@ -123,7 +128,7 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                             .await
                         {
                             Ok(sourceinfo) => {
-                                match sync_vcs_sources(db, *package_id, &sourceinfo).await {
+                                match sync_vcs_sources(db, package_id, &sourceinfo).await {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                                     Err(e) => warn!(
                                         "Failed to sync VCS sources for {}: {e}",
@@ -190,7 +195,7 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
                 let mut is_outdated =
                     upstream_is_newer(&version, latest_version.as_deref(), &package.name);
 
-                match sync_vcs_sources(db, *package_id, &sourceinfo).await {
+                match sync_vcs_sources(db, package_id, &sourceinfo).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                     Err(e) => warn!("Failed to sync VCS sources for {}: {e}", package.name),
                 }

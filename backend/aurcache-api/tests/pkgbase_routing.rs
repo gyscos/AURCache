@@ -27,6 +27,7 @@ use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::tokio::sync::broadcast;
+use sea_orm::ActiveModelTrait;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -593,4 +594,64 @@ async fn an_unconstrained_dependency_only_needs_to_have_built() {
         .await
         .expect("body");
     assert!(body.contains(r#""satisfied":true"#), "{body}");
+}
+
+/// The package route answers from the row, with no AUR request.
+///
+/// It used to fetch live on every call: ~128ms of a ~130ms response, and one
+/// of the AUR's 4000 daily calls per page view. These tests have no network,
+/// so a route that still reached for the AUR would fail here.
+#[rocket::async_test]
+async fn package_metadata_is_served_from_the_row() {
+    let (client, db) = test_client().await;
+    let pkg_id = seed(&db, "hello").await;
+
+    // What the version-check scheduler mirrors onto the row.
+    packages::ActiveModel {
+        id: Set(pkg_id),
+        aur_description: Set(Some("Prints Hello World and more".to_string())),
+        aur_maintainer: Set(Some("someone".to_string())),
+        aur_project_url: Set(Some("https://www.gnu.org/software/hello/".to_string())),
+        aur_licenses: Set(Some("GPL-3.0-or-later".to_string())),
+        aur_first_submitted: Set(Some(1_425_168_000)),
+        aur_last_modified: Set(Some(1_755_000_000)),
+        aur_flagged_outdated: Set(Some(false)),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .expect("store metadata");
+
+    let body = client
+        .get("/api/package/hello")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("body");
+
+    assert!(body.contains("Prints Hello World and more"), "{body}");
+    assert!(body.contains(r#""maintainer":"someone""#), "{body}");
+    assert!(body.contains("GPL-3.0-or-later"), "{body}");
+    assert!(
+        body.contains(r#""package_type":"Aur""#),
+        "should report an AUR source: {body}"
+    );
+}
+
+/// A package the AUR did not return has nothing mirrored, and is reported as
+/// not found rather than as an AUR package with every field blank.
+#[rocket::async_test]
+async fn a_package_with_no_mirrored_metadata_reads_as_not_found() {
+    let (client, db) = test_client().await;
+    seed(&db, "hello").await;
+
+    let body = client
+        .get("/api/package/hello")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("body");
+    assert!(body.contains(r#""package_type":"AurNotFound""#), "{body}");
 }
