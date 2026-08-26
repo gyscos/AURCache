@@ -48,6 +48,7 @@ pub enum Setting {
     MaxConcurrentBuilds,
     VersionCheckInterval,
     AutoUpdateInterval,
+    BuildOnNewVersion,
     JobTimeout,
     BuilderImage,
     MakepkgConf,

@@ -32,6 +32,19 @@ impl SettingsMetaTrait for Setting {
                 env_name: Some("AUTO_UPDATE_SCHEDULE"),
                 default: "", // parses to None
             },
+            // Queue the rebuild the moment a new version is detected, rather
+            // than waiting for the `auto_update_interval` window. The version
+            // check is the only thing that knows a package is out of date —
+            // including VCS packages whose upstream moved without a pkgver
+            // bump — so that is where the build belongs.
+            //
+            // Off by default: the existing behaviour is to flag a package and
+            // leave rebuilding to an opt-in schedule.
+            Self::BuildOnNewVersion => SettingsMeta {
+                key: "build_on_new_version",
+                env_name: Some("BUILD_ON_NEW_VERSION"),
+                default: "false",
+            },
             Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
                 env_name: Some("JOB_TIMEOUT"),

@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use aurcache_db::action::Action;
 use aurcache_db::helpers::active_value_ext::ActiveValueExt;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::{Builds, Packages};
@@ -7,6 +8,7 @@ use aurcache_deps::AurClient;
 use aurcache_types::build_state::BuildStates;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::aur_metadata::apply_aur_metadata;
+use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
@@ -17,18 +19,20 @@ use sea_orm::{
 use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 #[must_use]
 pub fn start_update_version_checking(
     db: DatabaseConnection,
+    tx: Sender<Action>,
     store: Arc<SnapshotStore>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(&db, &store).await {
+            if let Err(e) = check_versions(&db, &store, &tx).await {
                 error!("Failed to perform aur version check: {e}");
             }
 
@@ -39,7 +43,11 @@ pub fn start_update_version_checking(
     })
 }
 
-async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyhow::Result<()> {
+async fn check_versions(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    tx: &Sender<Action>,
+) -> anyhow::Result<()> {
     let packages = Packages::find().all(db).await?;
     let client = AurClient::new();
     let aur_query_names: Vec<String> = packages
@@ -209,6 +217,23 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
 
         save_package(db, package_model, &package.name).await;
     }
+
+    // Detection is the only thing that knows a package went out of date —
+    // including a VCS package whose upstream moved without a pkgver bump — so
+    // with this on, the rebuild is queued here rather than waiting for the
+    // separate `auto_update_interval` window, which could be a day away.
+    //
+    // Reuses the auto-update job's own selection rather than restating it:
+    // out-of-date packages whose last build succeeded. A package whose build
+    // is failing stays flagged for a human instead of being retried in a loop.
+    let build_now: SettingsEntry<bool> =
+        ApplicationSettings::get(Setting::BuildOnNewVersion, None, db).await;
+    if build_now.value
+        && let Err(e) = package_update_all_outdated(db, store, tx).await
+    {
+        warn!("Failed to queue builds for newly outdated packages: {e}");
+    }
+
     Ok(())
 }
 
