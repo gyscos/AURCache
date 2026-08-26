@@ -43,9 +43,30 @@ flutter test test/widget_test.dart
 cd frontend && flutter build web
 cd docs && yarn install --frozen-lockfile && yarn build
 
+# Rust frontend in a real browser: asserts every route mounts (~1 min)
+./scripts/test-frontend.sh
+./scripts/test-frontend.sh --shots /tmp/shots   # also write screenshots
+./scripts/test-frontend.sh --online             # include routes that fetch from the AUR
+
 # end-to-end smoke test
 ./scripts/test-e2e.sh hello
 ```
+
+### Which end-to-end suite to run
+
+`scripts/test-e2e.sh` (the split server/worker path, ~4 min) is the default and
+is what CI runs. Reach for the others only when a change touches what they
+cover, rather than running all four as a matter of course:
+
+- `test-e2e-hybrid.sh` / `test-e2e-hybrid-legacy.sh` — only for changes to the
+  hybrid image, the chroot builder, or the docker builder.
+- `test-sandbox.sh` — only for changes to `aurcache-sandbox` or the PKGBUILD
+  sourcing path.
+
+Unit and integration tests are cheap (backend ~8s, frontend <1s) and should be
+the reflex. They render components directly, though, so they cannot see whether
+the page boots — `test-frontend.sh` is what covers that, and every rendering
+defect this frontend has had was of that kind.
 
 ## High-level architecture
 
