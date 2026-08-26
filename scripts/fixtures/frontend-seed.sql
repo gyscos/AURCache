@@ -14,7 +14,7 @@ DELETE FROM builds;
 DELETE FROM packages;
 
 INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, platforms, source_type, source_data, directly_requested) VALUES
-  ('hello',                  1, 0, '2.12.1-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"hello"}',                  1),
+  ('hello',                  2, 0, '2.12.1-2',  '', 'x86_64', 'aur', '{"type":"aur","name":"hello"}',                  1),
   ('neofetch',               1, 1, '7.1.0-2',   '', 'x86_64', 'aur', '{"type":"aur","name":"neofetch"}',               1),
   ('yay',                    0, 0, '12.4.2-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"yay"}',                    1),
   ('paru',                   2, 0, '2.0.4-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"paru"}',                   1),
@@ -56,6 +56,26 @@ JOIN (
   SELECT 'aewm++',                         45,            12          UNION ALL
   SELECT 'python-3.11',                    93600,         900
 ) offs ON offs.name = p.name;
+
+-- The builds above take their status from the package row, which is right for
+-- everything except `hello`: its package status reflects the failed build added
+-- below, while the build that produced what is in the repository succeeded.
+UPDATE builds SET status = 1, version = '2.12.1-1'
+WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');
+
+-- A second, newer build of `hello` that failed. The package page shows both
+-- "Latest" and "In repo" only when they differ, and that gap -- newest attempt
+-- broken, repository still serving something older -- is the case worth having
+-- on screen.
+INSERT INTO builds (pkg_id, output, status, start_time, end_time, platform, version)
+SELECT p.id,
+       '==> Making package: hello' || char(10) || 'error: build failed',
+       2,
+       CAST(strftime('%s','now') AS INTEGER) - 60,
+       CAST(strftime('%s','now') AS INTEGER) - 4,
+       'x86_64',
+       '2.12.1-2'
+FROM packages p WHERE p.name = 'hello';
 
 UPDATE packages
 SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER BY b.id DESC LIMIT 1);

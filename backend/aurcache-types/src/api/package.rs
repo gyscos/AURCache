@@ -98,7 +98,7 @@ pub struct SimplePackage {
     pub upstream_version: Option<String>,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 pub struct ExtendedPackage {
     pub id: i32,
     pub name: String,
@@ -121,7 +121,7 @@ pub struct ExtendedPackage {
     pub has_patch: bool,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct PackageDependency {
     pub id: i32,

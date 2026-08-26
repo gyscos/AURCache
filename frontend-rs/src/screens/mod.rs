@@ -6,6 +6,8 @@
 mod build;
 mod builds;
 mod not_found;
+mod package;
+mod package_builds;
 mod package_source;
 mod packages;
 mod placeholder;
@@ -13,11 +15,12 @@ mod placeholder;
 pub use build::Build;
 pub use builds::Builds;
 pub use not_found::NotFound;
+pub use package::Package;
+pub use package_builds::PackageBuilds;
 pub use package_source::PackageSource;
 pub use packages::Packages;
 pub use placeholder::NotPorted;
 
-use crate::routes::Route;
 use dioxus::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -34,24 +37,6 @@ pub fn Dashboard() -> Element {
         NotPorted {
             title: "Dashboard",
             note: "Needs a charting story — the Dart version uses fl_chart for the build history graph, which has no direct equivalent here.",
-        }
-    }
-}
-
-#[component]
-pub fn Package(pkgbase: String) -> Element {
-    rsx! {
-        div { class: "space-y-4",
-            h1 { class: "text-2xl font-bold font-mono", "{pkgbase}" }
-            NotPorted {
-                title: "Package detail",
-                note: "Being redesigned rather than ported — the Dart screen is not the target layout.",
-            }
-            Link {
-                class: "btn btn-sm",
-                to: Route::PackageSource { pkgbase: pkgbase.clone(), path: vec![] },
-                "Edit sources"
-            }
         }
     }
 }

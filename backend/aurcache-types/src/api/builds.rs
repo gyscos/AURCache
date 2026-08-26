@@ -2,7 +2,7 @@ use crate::api::waiting::WaitingReason;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Deserialize, ToSchema, Serialize)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct BuildSummary {
     pub id: i32,

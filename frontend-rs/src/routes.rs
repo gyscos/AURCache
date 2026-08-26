@@ -27,6 +27,8 @@ pub enum Route {
         Packages {},
         #[route("/package/:pkgbase")]
         Package { pkgbase: String },
+        #[route("/package/:pkgbase/builds")]
+        PackageBuilds { pkgbase: String },
         // `:..path` is a catch-all: source paths contain slashes, so a single
         // segment would only ever match files at the top level.
         #[route("/package/:pkgbase/source/:..path")]
@@ -70,9 +72,10 @@ impl Route {
         match self {
             Route::Dashboard { .. } => Some(MenuEntry::Dashboard),
             Route::Builds { .. } | Route::Build { .. } => Some(MenuEntry::Builds),
-            Route::Packages { .. } | Route::Package { .. } | Route::PackageSource { .. } => {
-                Some(MenuEntry::Packages)
-            }
+            Route::Packages { .. }
+            | Route::Package { .. }
+            | Route::PackageBuilds { .. }
+            | Route::PackageSource { .. } => Some(MenuEntry::Packages),
             Route::Activities { .. } => Some(MenuEntry::Activities),
             Route::Workers { .. } => Some(MenuEntry::Workers),
             Route::Settings { .. } => Some(MenuEntry::Settings),

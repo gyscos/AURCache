@@ -1,4 +1,7 @@
-//! The builds list.
+//! Every build of one package.
+//!
+//! The package page shows only the latest build and the one currently in the
+//! repository; this is where the rest of the history lives.
 
 use crate::api::client;
 use crate::format::{format_age, format_duration, now_secs};
@@ -7,28 +10,36 @@ use crate::status::BuildStatusBadge;
 use aurcache_client::Build;
 use dioxus::prelude::*;
 
-/// Columns that only appear once there is room for them, matching the Dart
-/// table, which drops the same ones below 700px.
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
-async fn load_builds() -> Result<Vec<Build>, String> {
+async fn load(pkgbase: String) -> Result<Vec<Build>, String> {
     client()?
-        .list_builds(None, Some(100), None)
+        // A sub-resource rather than a query filter: a pkgbase may contain `+`,
+        // which is literal in a path but decodes to a space in a query value.
+        .list_builds(Some(&pkgbase), Some(100), None)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[component]
-pub fn Builds() -> Element {
-    let builds = use_resource(load_builds);
-    // Read once per render rather than per row, so every age on the page is
-    // measured from the same instant.
+pub fn PackageBuilds(pkgbase: String) -> Element {
+    let builds = use_resource({
+        let pkgbase = pkgbase.clone();
+        move || load(pkgbase.clone())
+    });
     let now = now_secs();
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                h2 { class: "card-title", "Builds" }
+                div { class: "flex items-center gap-3 flex-wrap",
+                    h2 { class: "card-title", "Builds of " }
+                    Link {
+                        class: "link link-primary font-mono",
+                        to: Route::Package { pkgbase: pkgbase.clone() },
+                        "{pkgbase}"
+                    }
+                }
 
                 match &*builds.read_unchecked() {
                     None => rsx! {
@@ -40,7 +51,7 @@ pub fn Builds() -> Element {
                         div { class: "alert alert-error", span { "Could not load builds: {e}" } }
                     },
                     Some(Ok(list)) if list.is_empty() => rsx! {
-                        div { class: "alert", span { "No builds yet." } }
+                        div { class: "alert", span { "This package has never been built." } }
                     },
                     Some(Ok(list)) => rsx! {
                         div { class: "overflow-x-auto",
@@ -48,7 +59,6 @@ pub fn Builds() -> Element {
                                 thead {
                                     tr {
                                         th { "Build" }
-                                        th { "Package" }
                                         th { class: "{WIDE_ONLY}", "Version" }
                                         th { class: "{WIDE_ONLY}", "Started" }
                                         th { class: "{WIDE_ONLY}", "Duration" }
@@ -64,13 +74,6 @@ pub fn Builds() -> Element {
                                                     class: "link link-primary font-mono",
                                                     to: Route::Build { id: build.id },
                                                     "#{build.id}"
-                                                }
-                                            }
-                                            td {
-                                                Link {
-                                                    class: "link font-medium",
-                                                    to: Route::Package { pkgbase: build.pkg_name.clone() },
-                                                    "{build.pkg_name}"
                                                 }
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm", "{build.version}" }

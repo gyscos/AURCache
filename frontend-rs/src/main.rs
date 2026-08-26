@@ -14,6 +14,7 @@
 #![allow(clippy::useless_format)]
 
 mod api;
+mod format;
 mod legacy_hash;
 mod routes;
 mod screens;
