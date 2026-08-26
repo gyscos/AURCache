@@ -70,8 +70,12 @@ pub fn Builds() -> Element {
                             table { class: "table table-zebra",
                                 thead {
                                     tr {
-                                        th { "Build" }
-                                        SortableHeader { label: "Package", column: SortKey::Name, sort, class: "" }
+                                        // Sorting by build is sorting by
+                                        // package: the package is the first
+                                        // and most significant part of the
+                                        // name now that there is no separate
+                                        // column for it.
+                                        SortableHeader { label: "Build", column: SortKey::Name, sort, class: "" }
                                         th { class: "{WIDE_ONLY}", "Version" }
                                         SortableHeader { label: "Started", column: SortKey::Time, sort, class: "{WIDE_ONLY}" }
                                         th { class: "{WIDE_ONLY}", "Duration" }
@@ -96,6 +100,13 @@ pub fn Builds() -> Element {
                                                     });
                                                 }
                                             },
+                                            // A build's name already contains
+                                            // its package, so a Package column
+                                            // beside it said the same thing
+                                            // twice. Every cell in the row now
+                                            // leads to the same place, and the
+                                            // package is one more click away,
+                                            // from the build's own page.
                                             td {
                                                 Link {
                                                     class: "font-mono",
@@ -104,26 +115,7 @@ pub fn Builds() -> Element {
                                                         number: build.number,
                                                     },
                                                     onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    // The package is its own
-                                                    // column here, so repeating
-                                                    // it in the build cell would
-                                                    // say it twice.
-                                                    "{build.number}"
-                                                }
-                                            }
-                                            // The one cell that goes somewhere
-                                            // else, so it gets its own hover
-                                            // colour: the row highlight alone
-                                            // would suggest the whole row shares
-                                            // a single destination.
-                                            td {
-                                                class: "hover:bg-primary/20 transition-colors",
-                                                title: "Open package",
-                                                Link {
-                                                    class: "font-mono",
-                                                    to: Route::Package { pkgbase: build.pkg_name.clone() },
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    "{build.pkg_name}"
+                                                    "{build.pkg_name}/{build.number}"
                                                 }
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm", "{build.version}" }
