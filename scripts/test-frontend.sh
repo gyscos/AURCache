@@ -136,6 +136,7 @@ ROUTES=(
     "/builds|Duration|builds list"
     "/build/1|Build #1|build log (depth 2)"
     "/packages|Upstream|packages list"
+    "/packages|—|missing version shows a placeholder"
     "/package/hello|Package detail|package detail (depth 2)"
     "/settings|card-title\">Settings|settings"
     "/config-files|card-title\">Config files|config files"

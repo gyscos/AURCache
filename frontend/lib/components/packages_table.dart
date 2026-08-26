@@ -60,7 +60,7 @@ class PackagesTable extends ConsumerWidget {
                 }
               : null,
         ),
-        DataCell(Text(package.latest_version.toString())),
+        DataCell(Text(package.latest_version ?? '—')),
         if (context.desktop)
           DataCell(
             IconButton(

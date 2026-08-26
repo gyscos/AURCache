@@ -509,7 +509,10 @@ async fn list_directly_requested_packages(
 ) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
     // correlated subquery: picks the version from builds for the package ordered by most
     // recent timestamp (end_time preferred, fallback to start_time)
-    let latest_version_subquery = "(SELECT version \
+    // `NULLIF` because `builds.version` is NOT NULL DEFAULT '': a build that
+    // has been enqueued but has not determined a version yet holds an empty
+    // string, which means "not known", not "the empty version".
+    let latest_version_subquery = "(SELECT NULLIF(b.version, '') \
         FROM builds b \
         WHERE b.pkg_id = packages.id \
         ORDER BY COALESCE(b.end_time, b.start_time) DESC \
@@ -523,11 +526,12 @@ async fn list_directly_requested_packages(
         .column_as(packages::Column::OutOfDate, "outofdate")
         .column_as(packages::Column::UpstreamVersion, "upstream_version")
         .filter(packages::Column::DirectlyRequested.eq(true))
-        // wrap the correlated subquery in COALESCE -> fallback to empty string
-        .column_as(
-            Expr::cust(format!("COALESCE({latest_version_subquery}, '')")),
-            "latest_version",
-        )
+        // No COALESCE to an empty string: a package with no build has no
+        // version, and `null` says that where `""` is indistinguishable from a
+        // build that produced a blank one. The detail endpoint below already
+        // reported it this way, so coercing here made one field mean two
+        // different things depending on which route you asked.
+        .column_as(Expr::cust(latest_version_subquery), "latest_version")
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
@@ -607,7 +611,9 @@ pub async fn get_package(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
+    // Same rule as the list query: an enqueued build's empty version is not a
+    // version.
+    let latest_version: Option<String> = latest_version_row.map(|(v,)| v).filter(|v| !v.is_empty());
     let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;

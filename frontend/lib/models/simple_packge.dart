@@ -8,7 +8,12 @@ class SimplePackage {
   @JsonKey(fromJson: _fromJson)
   final bool outofdate;
   final int status;
-  final String latest_version, upstream_version;
+
+  /// Null when the package has never produced a build, or when the only build
+  /// so far has not worked out a version yet. A non-nullable String here made
+  /// the whole list fail to deserialise on the null the server sends.
+  final String? latest_version;
+  final String upstream_version;
 
   SimplePackage({
     required this.id,

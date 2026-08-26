@@ -15,11 +15,14 @@ use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
+use aurcache_db::builds;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
-use aurcache_db::prelude::Packages;
+use aurcache_db::prelude::{Builds, Packages};
+use aurcache_types::build_state::BuildStates;
 use aurcache_utils::snapshot::SnapshotStore;
+use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use rocket::tokio::sync::broadcast;
@@ -44,6 +47,9 @@ async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
         name: Set(name.to_string()),
         status: Set(0),
         out_of_date: Set(0),
+        // `package::add` always records this, and `SimplePackage` types it as a
+        // plain String — a row without it makes the list route fail to decode.
+        upstream_version: Set(Some("1.0-1".to_string())),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
         source_type: Set(SourceType::Aur),
@@ -217,4 +223,111 @@ fn a_git_source_round_trips_through_json() {
 
     let back: PackageSource = serde_json::from_str(&json).expect("deserialise");
     assert_eq!(back, source);
+}
+
+/// `latest_version` must mean the same thing on both routes.
+///
+/// The list query used to wrap the lookup in `COALESCE(..., '')` while the
+/// detail route returned the column as-is, so a package with no build was `""`
+/// from one and `null` from the other — one field with two representations of
+/// "no version", depending on which URL you asked.
+#[rocket::async_test]
+async fn a_package_with_no_build_has_no_version_on_either_route() {
+    let (client, db) = test_client().await;
+    seed(&db, "hello").await;
+
+    let listed = client
+        .get("/api/packages/list?limit=10")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("list body");
+    assert!(
+        listed.contains(r#""latest_version":null"#),
+        "list should report no version as null: {listed}"
+    );
+
+    let detail = client
+        .get("/api/package/hello")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("detail body");
+    assert!(
+        detail.contains(r#""latest_version":null"#),
+        "detail should report no version as null: {detail}"
+    );
+}
+
+/// A build exists but has not worked out a version yet.
+///
+/// `builds.version` is NOT NULL DEFAULT '', so an enqueued build stores an
+/// empty string. That is "not known", and must not read as a real version.
+#[rocket::async_test]
+async fn an_enqueued_builds_empty_version_is_not_a_version() {
+    let (client, db) = test_client().await;
+    let pkg_id = seed(&db, "hello").await;
+
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::ENQUEUED_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set(String::new()),
+        start_time: Set(Some(1)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert build");
+
+    for path in ["/api/packages/list?limit=10", "/api/package/hello"] {
+        let body = client
+            .get(path)
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            body.contains(r#""latest_version":null"#),
+            "GET {path} reported an empty version as a version: {body}"
+        );
+    }
+}
+
+/// The version of a finished build is still reported, so the change above did
+/// not simply blank the field out.
+#[rocket::async_test]
+async fn a_completed_builds_version_is_reported() {
+    let (client, db) = test_client().await;
+    let pkg_id = seed(&db, "hello").await;
+
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set("2.12.1-1".to_string()),
+        start_time: Set(Some(1)),
+        end_time: Set(Some(2)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert build");
+
+    for path in ["/api/packages/list?limit=10", "/api/package/hello"] {
+        let body = client
+            .get(path)
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            body.contains(r#""latest_version":"2.12.1-1""#),
+            "GET {path} lost the build version: {body}"
+        );
+    }
 }
