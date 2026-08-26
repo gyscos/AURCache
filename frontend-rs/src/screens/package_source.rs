@@ -130,158 +130,110 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
             // page is for, and they load independently.
             _ => rsx! {},
         }
-        div { class: "flex gap-4",
-            // File list
-            div { class: "card bg-base-100 shadow-xl w-72 shrink-0",
-                div { class: "card-body p-4",
-                    h2 { class: "card-title text-base", "{pkgbase}" }
-                    match &*files.read_unchecked() {
-                        None => rsx! { span { class: "loading loading-spinner loading-sm" } },
-                        Some(Err(e)) => rsx! { div { class: "alert alert-error text-xs", "{e}" } },
-                        Some(Ok(list)) => rsx! {
-                            ul { class: "menu menu-sm p-0",
-                                for path in list.iter() {
-                                    li { key: "{path}",
-                                        a {
-                                            class: if selected().as_deref() == Some(path.as_str()) { "active font-mono" } else { "font-mono" },
-                                            onclick: {
-                                                let pkgbase = pkgbase.clone();
-                                                let path = path.clone();
-                                                move |_| open_file(pkgbase.clone(), path.clone())
-                                            },
-                                            "{path}"
-                                        }
+        crate::source_editor::SourcePane {
+            title: pkgbase.clone(),
+            files: files.read_unchecked().clone(),
+            selected: selected(),
+            onselect: {
+                let pkgbase = pkgbase.clone();
+                move |path: String| {
+                    let pkgbase = pkgbase.clone();
+                    spawn(async move { open_file(pkgbase, path).await });
+                }
+            },
+            draft,
+            dirty,
+            patched,
+            actions: rsx! {
+                button {
+                    class: "btn btn-ghost btn-sm",
+                    disabled: !dirty,
+                    onclick: move |_| {
+                        if let Some(c) = loaded.read().as_ref() {
+                            draft.set(c.original_content.clone());
+                        }
+                    },
+                    "Revert to upstream"
+                }
+                button {
+                    class: "btn btn-sm",
+                    disabled: !dirty,
+                    onclick: {
+                        let pkgbase = pkgbase.clone();
+                        move |_| {
+                            let pkgbase = pkgbase.clone();
+                            async move {
+                                let Some(path) = selected() else { return };
+                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
+                                match client.put_source_file(&pkgbase, &path, &draft()).await {
+                                    Ok(()) => {
+                                        navigator().push(Route::Package { pkgbase: pkgbase.clone() });
                                     }
+                                    Err(e) => status.set(Some((e.to_string(), false))),
                                 }
                             }
-                        },
+                        }
+                    },
+                    "Save"
+                }
+                button {
+                    class: "btn btn-primary btn-sm",
+                    disabled: !dirty,
+                    // Editing a PKGBUILD is nearly always a prelude to building
+                    // it; without this the next step is a save, a navigation
+                    // back, and a second button.
+                    onclick: {
+                        let pkgbase = pkgbase.clone();
+                        move |_| {
+                            let pkgbase = pkgbase.clone();
+                            async move {
+                                let Some(path) = selected() else { return };
+                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
+                                // The rebuild is only queued if the save
+                                // worked: rebuilding the old source would
+                                // report success for a change never stored.
+                                match client.put_source_file(&pkgbase, &path, &draft()).await {
+                                    Err(e) => status.set(Some((e.to_string(), false))),
+                                    Ok(()) => match client
+                                        .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
+                                        .await
+                                    {
+                                        // Back to the package, which is where
+                                        // the build just queued will appear.
+                                        Ok(_) => {
+                                            navigator().push(Route::Package { pkgbase: pkgbase.clone() });
+                                        }
+                                        // Stay put on a partial failure: the
+                                        // edit is saved but the build is not
+                                        // queued, and leaving would hide that.
+                                        Err(e) => status.set(Some((
+                                            format!("Saved, but the rebuild could not be queued: {e}"),
+                                            false,
+                                        ))),
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "Save & Rebuild"
+                }
+            },
+            notices: rsx! {
+                // A patch that no longer applies is shown, not hidden: the
+                // editor is falling back to pristine content and the user needs
+                // to know before saving over it.
+                if let Some(err) = loaded.read().as_ref().and_then(|c| c.patch_error.clone()) {
+                    div { class: "alert alert-warning text-sm",
+                        span { "Stored patch no longer applies: {err}. Showing upstream content." }
                     }
                 }
-            }
-
-            // Editor
-            div { class: "card bg-base-100 shadow-xl flex-1",
-                div { class: "card-body",
-                    match selected() {
-                        None => rsx! { p { class: "opacity-60", "Select a file to edit." } },
-                        Some(path) => rsx! {
-                            div { class: "flex items-center gap-2",
-                                h3 { class: "font-mono font-medium", "{path}" }
-                                if patched { span { class: "badge badge-warning badge-sm", "patched" } }
-                                if dirty { span { class: "badge badge-info badge-sm", "unsaved" } }
-                                div { class: "flex-1" }
-                                button {
-                                    class: "btn btn-ghost btn-sm",
-                                    disabled: !dirty,
-                                    onclick: move |_| {
-                                        if let Some(c) = loaded.read().as_ref() {
-                                            draft.set(c.original_content.clone());
-                                        }
-                                    },
-                                    "Revert to upstream"
-                                }
-                                button {
-                                    class: "btn btn-primary btn-sm",
-                                    disabled: !dirty,
-                                    onclick: {
-                                        let pkgbase = pkgbase.clone();
-                                        let path = path.clone();
-                                        move |_| {
-                                            let pkgbase = pkgbase.clone();
-                                            let path = path.clone();
-                                            async move {
-                                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
-                                                match client.put_source_file(&pkgbase, &path, &draft()).await {
-                                                    Ok(()) => {
-                                                        navigator().push(Route::Package {
-                                                            pkgbase: pkgbase.clone(),
-                                                        });
-                                                    }
-                                                    Err(e) => status.set(Some((e.to_string(), false))),
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "Save"
-                                }
-                                button {
-                                    class: "btn btn-primary btn-sm",
-                                    disabled: !dirty,
-                                    // Editing a PKGBUILD is nearly always a
-                                    // prelude to building it; without this the
-                                    // next step is a save, a navigation back,
-                                    // and a second button.
-                                    onclick: {
-                                        let pkgbase = pkgbase.clone();
-                                        let path = path.clone();
-                                        move |_| {
-                                            let pkgbase = pkgbase.clone();
-                                            let path = path.clone();
-                                            async move {
-                                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
-                                                // The rebuild is only queued if
-                                                // the save worked: rebuilding
-                                                // the old source would report
-                                                // success for a change that was
-                                                // never stored.
-                                                match client.put_source_file(&pkgbase, &path, &draft()).await {
-                                                    Err(e) => status.set(Some((e.to_string(), false))),
-                                                    Ok(()) => match client
-                                                        .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
-                                                        .await
-                                                    {
-                                                        // Back to the package,
-                                                        // which is where the
-                                                        // build just queued will
-                                                        // appear.
-                                                        Ok(_) => {
-                                                            navigator().push(Route::Package {
-                                                                pkgbase: pkgbase.clone(),
-                                                            });
-                                                        }
-                                                        // Stay put on a partial
-                                                        // failure: the edit is
-                                                        // saved but the build is
-                                                        // not queued, and leaving
-                                                        // would hide that.
-                                                        Err(e) => status.set(Some((
-                                                            format!("Saved, but the rebuild could not be queued: {e}"),
-                                                            false,
-                                                        ))),
-                                                    },
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "Save & Rebuild"
-                                }
-                            }
-
-                            // A patch that no longer applies is shown, not hidden:
-                            // the editor is falling back to pristine content and the
-                            // user needs to know before they save over it.
-                            if let Some(err) = loaded.read().as_ref().and_then(|c| c.patch_error.clone()) {
-                                div { class: "alert alert-warning text-sm",
-                                    span { "Stored patch no longer applies: {err}. Showing upstream content." }
-                                }
-                            }
-                            if let Some((msg, ok)) = status() {
-                                div {
-                                    class: if ok { "alert alert-success text-sm" } else { "alert alert-error text-sm" },
-                                    span { "{msg}" }
-                                }
-                            }
-
-                            textarea {
-                                class: "textarea textarea-bordered font-mono text-xs w-full h-[60vh] leading-snug",
-                                spellcheck: "false",
-                                value: "{draft}",
-                                oninput: move |e| draft.set(e.value()),
-                            }
-                        },
+                if let Some((msg, ok)) = status() {
+                    div {
+                        class: if ok { "alert alert-success text-sm" } else { "alert alert-error text-sm" },
+                        span { "{msg}" }
                     }
                 }
-            }
+            },
         }
         }
     }

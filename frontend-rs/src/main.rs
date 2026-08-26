@@ -21,6 +21,7 @@ mod platforms;
 mod routes;
 mod screens;
 mod shell;
+mod source_editor;
 mod status;
 mod theme;
 

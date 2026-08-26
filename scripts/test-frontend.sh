@@ -179,7 +179,11 @@ if [ "$ONLINE" = "1" ]; then
     # Fetches the PKGBUILD from the AUR, so it needs network.
     ROUTES+=("/package/hello/source/PKGBUILD|Revert to upstream|source editor (depth 4)")
     ROUTES+=("/package/hello/source/PKGBUILD|Save &amp; Rebuild|save and queue in one step")
-    ROUTES+=("/package/hello/source/PKGBUILD|← hello|the editor offers a way back")
+    # The way back is the breadcrumb's package link. It used to be a "← hello"
+    # button; this marker went stale when the heading became the trail, and no
+    # one noticed because these routes only run with --online.
+    ROUTES+=("/package/hello/source/PKGBUILD|href=\"/package/hello\"|the editor offers a way back")
+    ROUTES+=("/package/hello/source/PKGBUILD|>Sources<|the editor says where it is")
 fi
 
 [ -n "$SHOTS" ] && mkdir -p "$SHOTS"
