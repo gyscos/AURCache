@@ -21,6 +21,10 @@ aurcache-types = { path = "../backend/aurcache-types", default-features = false 
 wasm-bindgen = "0.2"
 # Wall clock, for "3h ago" on the builds list.
 js-sys = "0.3"
+# Joining the two requests the package page makes, so they overlap rather than
+# queue. `default-features = false` keeps the executor out: the browser is the
+# executor here.
+futures-util = { version = "0.3", default-features = false, features = ["async-await"] }
 # Timers: the build log polls, so it needs a sleep that works in the browser.
 gloo-timers = { version = "0.3", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Window", "Location", "Document", "Element", "History", "EventTarget", "Storage", "MediaQueryList"] }

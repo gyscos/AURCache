@@ -16,10 +16,11 @@ use std::sync::Arc;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::builds;
+use aurcache_db::dependencies;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
-use aurcache_db::prelude::{Builds, Packages};
+use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_types::build_state::BuildStates;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
@@ -41,6 +42,21 @@ const NAMES: [&str; 6] = [
     "gtk_theme-git",
     "1337",
 ];
+
+async fn insert_build(db: &DatabaseConnection, pkg_id: i32, status: i32, version: &str) {
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(status)),
+        platform: Set(Platform::X86_64),
+        version: Set(version.to_string()),
+        start_time: Set(Some(100)),
+        end_time: Set(Some(200)),
+        ..Default::default()
+    })
+    .exec(db)
+    .await
+    .expect("insert build");
+}
 
 async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
     let model = packages::ActiveModel {
@@ -374,4 +390,207 @@ async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
         body.contains(r#""upstream_version":null"#),
         "an undetermined upstream version should be null: {body}"
     );
+}
+
+/// A failed build is not a version that got built.
+///
+/// `latest_version` is read everywhere as "what is in the repository". Taking
+/// the newest build regardless of outcome meant a failed build of a new
+/// version reported that version as built — and since the version check
+/// compares upstream against this field, an upstream release whose first build
+/// failed silently stopped being flagged as out of date.
+#[rocket::async_test]
+async fn a_failed_build_does_not_become_the_reported_version() {
+    let (client, db) = test_client().await;
+    let pkg_id = seed(&db, "hello").await;
+
+    // The version that is actually in the repository.
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set("2.12.1-1".to_string()),
+        start_time: Set(Some(100)),
+        end_time: Set(Some(200)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert successful build");
+
+    // A newer attempt at the next version that failed.
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::FAILED_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set("2.12.1-2".to_string()),
+        start_time: Set(Some(300)),
+        end_time: Set(Some(310)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert failed build");
+
+    for path in ["/api/packages/list?limit=10", "/api/package/hello"] {
+        let body = client
+            .get(path)
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            body.contains(r#""latest_version":"2.12.1-1""#),
+            "GET {path} should report the version in the repo: {body}"
+        );
+        assert!(
+            !body.contains(r#""latest_version":"2.12.1-2""#),
+            "GET {path} reported a version whose build failed: {body}"
+        );
+    }
+}
+
+/// A build still running is not in the repository either.
+#[rocket::async_test]
+async fn an_in_progress_build_does_not_become_the_reported_version() {
+    let (client, db) = test_client().await;
+    let pkg_id = seed(&db, "hello").await;
+
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set("1.0-1".to_string()),
+        start_time: Set(Some(100)),
+        end_time: Set(Some(200)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert successful build");
+
+    Builds::insert(builds::ActiveModel {
+        pkg_id: Set(pkg_id),
+        status: Set(Some(BuildStates::ACTIVE_BUILD)),
+        platform: Set(Platform::X86_64),
+        version: Set("2.0-1".to_string()),
+        start_time: Set(Some(300)),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert running build");
+
+    for path in ["/api/packages/list?limit=10", "/api/package/hello"] {
+        let body = client
+            .get(path)
+            .dispatch()
+            .await
+            .into_string()
+            .await
+            .expect("body");
+        assert!(
+            body.contains(r#""latest_version":"1.0-1""#),
+            "GET {path}: a running build must not count as built: {body}"
+        );
+    }
+}
+
+/// A dependency reports whether it is holding the build back.
+///
+/// The builder promotes a dependent only once every dependency has a
+/// successful build whose version satisfies the recorded constraint. Without
+/// that on the package page there is no way to see *which* relation is the
+/// reason a package will not build.
+#[rocket::async_test]
+async fn dependencies_report_whether_they_are_satisfied() {
+    let (client, db) = test_client().await;
+    let app = seed(&db, "app").await;
+    let ready = seed(&db, "ready-dep").await;
+    let stale = seed(&db, "stale-dep").await;
+    let unbuilt = seed(&db, "unbuilt-dep").await;
+
+    // Built at a version that meets the constraint.
+    insert_build(&db, ready, BuildStates::SUCCESSFUL_BUILD, "2.0-1").await;
+    // Built, but too old for what `app` requires.
+    insert_build(&db, stale, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
+    // `unbuilt` has no build at all.
+
+    for (dependee, constraint) in [(ready, ">=2.0"), (stale, ">=2.0"), (unbuilt, ">=2.0")] {
+        Dependencies::insert(dependencies::ActiveModel {
+            dependent_id: Set(app),
+            dependee_id: Set(dependee),
+            version_constraint: Set(constraint.to_string()),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await
+        .expect("insert dependency");
+    }
+
+    let body = client
+        .get("/api/package/app")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let deps = value["dependencies"].as_array().expect("dependencies");
+    assert_eq!(deps.len(), 3, "{body}");
+
+    let by_name = |name: &str| {
+        deps.iter()
+            .find(|d| d["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {body}"))
+            .clone()
+    };
+
+    let ready = by_name("ready-dep");
+    assert_eq!(ready["satisfied"], true, "{ready}");
+    assert_eq!(ready["built_version"], "2.0-1", "{ready}");
+
+    // Built, but not to a version that satisfies the constraint — this is the
+    // case a bare status badge cannot express.
+    let stale = by_name("stale-dep");
+    assert_eq!(stale["satisfied"], false, "{stale}");
+    assert_eq!(stale["built_version"], "1.0-1", "{stale}");
+
+    let unbuilt = by_name("unbuilt-dep");
+    assert_eq!(unbuilt["satisfied"], false, "{unbuilt}");
+    assert_eq!(
+        unbuilt["built_version"],
+        serde_json::Value::Null,
+        "{unbuilt}"
+    );
+}
+
+/// An unconstrained dependency is satisfied by any successful build, and by
+/// none at all only because there is nothing in the repository to use.
+#[rocket::async_test]
+async fn an_unconstrained_dependency_only_needs_to_have_built() {
+    let (client, db) = test_client().await;
+    let app = seed(&db, "app").await;
+    let dep = seed(&db, "any-version").await;
+    insert_build(&db, dep, BuildStates::SUCCESSFUL_BUILD, "0.0.1-1").await;
+
+    Dependencies::insert(dependencies::ActiveModel {
+        dependent_id: Set(app),
+        dependee_id: Set(dep),
+        version_constraint: Set(String::new()),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert dependency");
+
+    let body = client
+        .get("/api/package/app")
+        .dispatch()
+        .await
+        .into_string()
+        .await
+        .expect("body");
+    assert!(body.contains(r#""satisfied":true"#), "{body}");
 }

@@ -1083,9 +1083,17 @@ fn print_dependency_section(title: &str, dependencies: &[PackageDependency]) {
         return;
     }
     for dependency in dependencies {
+        let state = if dependency.satisfied {
+            String::new()
+        } else {
+            match dependency.built_version.as_deref() {
+                Some(built) => format!(" BLOCKING: has {built}"),
+                None => " BLOCKING: never built".to_string(),
+            }
+        };
         println!(
-            "  - {} ({}) [id={}]",
-            dependency.name, dependency.version_constraint, dependency.id
+            "  - {} ({}) [id={}]{}",
+            dependency.name, dependency.version_constraint, dependency.id, state
         );
     }
 }

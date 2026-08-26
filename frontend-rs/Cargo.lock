@@ -97,6 +97,7 @@ dependencies = [
  "aurcache-types",
  "dioxus",
  "dioxus-ssr",
+ "futures-util",
  "gloo-timers",
  "js-sys",
  "wasm-bindgen",

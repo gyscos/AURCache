@@ -18,14 +18,17 @@ use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
 use aurcache_deps::AurClient;
+use aurcache_types::build_state::BuildStates;
 use aurcache_utils::aur::api::get_package_info;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
 use aurcache_utils::package::update::{package_resync_dependencies, package_update};
 use aurcache_utils::patch::SourcePatch;
+use aurcache_utils::pkg::satisfies_constraint;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
+use sea_orm::FromQueryResult;
 
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
@@ -509,14 +512,24 @@ async fn list_directly_requested_packages(
 ) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
     // correlated subquery: picks the version from builds for the package ordered by most
     // recent timestamp (end_time preferred, fallback to start_time)
+    // Successful builds only. This is the version that is *in the repository*,
+    // which is what the field is read as everywhere it is shown. Taking the
+    // newest attempt regardless of outcome meant a failed build of a new
+    // version reported that version as built, and the version check then
+    // compared upstream against it and cleared the out-of-date flag — so an
+    // upstream release whose first build failed stopped being flagged at all.
+    //
     // `NULLIF` because `builds.version` is NOT NULL DEFAULT '': a build that
     // has been enqueued but has not determined a version yet holds an empty
     // string, which means "not known", not "the empty version".
-    let latest_version_subquery = "(SELECT NULLIF(b.version, '') \
+    let latest_version_subquery = format!(
+        "(SELECT NULLIF(b.version, '') \
         FROM builds b \
-        WHERE b.pkg_id = packages.id \
+        WHERE b.pkg_id = packages.id AND b.status = {successful} \
         ORDER BY COALESCE(b.end_time, b.start_time) DESC \
-        LIMIT 1)";
+        LIMIT 1)",
+        successful = BuildStates::SUCCESSFUL_BUILD
+    );
 
     let all: Vec<SimplePackage> = Packages::find()
         .select_only()
@@ -531,7 +544,7 @@ async fn list_directly_requested_packages(
         // build that produced a blank one. The detail endpoint below already
         // reported it this way, so coercing here made one field mean two
         // different things depending on which route you asked.
-        .column_as(Expr::cust(latest_version_subquery), "latest_version")
+        .column_as(Expr::cust(&latest_version_subquery), "latest_version")
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
@@ -559,17 +572,63 @@ async fn list_package_relations(
         ),
     };
 
-    Dependencies::find()
+    // The version in the repository for the joined package, on the same
+    // "successful builds only" rule the rest of this module uses.
+    let built_version_subquery = format!(
+        "(SELECT NULLIF(b.version, '') \
+        FROM builds b \
+        WHERE b.pkg_id = packages.id AND b.status = {successful} \
+        ORDER BY COALESCE(b.end_time, b.start_time) DESC \
+        LIMIT 1)",
+        successful = BuildStates::SUCCESSFUL_BUILD
+    );
+
+    let rows = Dependencies::find()
         .select_only()
         .column_as(packages::Column::Id, "id")
         .column_as(packages::Column::Name, "name")
         .column(dependencies::Column::VersionConstraint)
+        .column_as(packages::Column::Status, "status")
+        .column_as(Expr::cust(&built_version_subquery), "built_version")
         .join(JoinType::InnerJoin, relation)
         .filter(filter_col.eq(pkg_id))
         .order_by_asc(dependencies::Column::Id)
-        .into_model::<PackageDependency>()
+        .into_model::<DependencyRow>()
         .all(db)
-        .await
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            // Deliberately the same rule the builder applies when it decides
+            // whether to promote a dependent, so the page cannot disagree with
+            // what the queue actually does. Unlike the builder this is not
+            // scoped to one platform: the page is not either, and a package
+            // built for several reports the newest success across them.
+            let satisfied = row
+                .built_version
+                .as_deref()
+                .is_some_and(|built| satisfies_constraint(built, &row.version_constraint));
+            PackageDependency {
+                id: row.id,
+                name: row.name,
+                version_constraint: row.version_constraint,
+                status: row.status,
+                built_version: row.built_version,
+                satisfied,
+            }
+        })
+        .collect())
+}
+
+/// The columns behind [`PackageDependency`]; `satisfied` is derived, not stored.
+#[derive(FromQueryResult)]
+struct DependencyRow {
+    id: i32,
+    name: String,
+    version_constraint: String,
+    status: i32,
+    built_version: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -603,6 +662,8 @@ pub async fn get_package(
         .select_only()
         .column(builds::Column::Version)
         .filter(builds::Column::PkgId.eq(pkg.id))
+        // Successful only; see the list query above.
+        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
         .order_by(builds::Column::EndTime, Order::Desc)
         .order_by(builds::Column::StartTime, Order::Desc)
         .limit(1)

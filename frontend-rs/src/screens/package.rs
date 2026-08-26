@@ -77,17 +77,24 @@ fn produced_names(pkg: &ExtendedPackage) -> Vec<String> {
 
 async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), String> {
     let client = client()?;
-    let package = client
-        .get_package(&pkgbase)
-        .await
-        .map_err(|e| e.to_string())?;
-    // A failure here should not lose the package itself: the build summary is
-    // secondary, and the rest of the page is still worth showing.
-    let builds = client
-        .list_builds(Some(&pkgbase), Some(BUILD_SAMPLE), None)
-        .await
-        .unwrap_or_default();
-    Ok((package, builds))
+
+    // Issued together rather than one after the other. They share no data, and
+    // the package request is the slow one — it makes a live AUR lookup
+    // server-side — so running them in sequence added the build query's latency
+    // on top of it for no reason. The browser is the executor; this is
+    // concurrency, not threads.
+    let (package, builds) = futures_util::future::join(
+        client.get_package(&pkgbase),
+        client.list_builds(Some(&pkgbase), Some(BUILD_SAMPLE), None),
+    )
+    .await;
+
+    // A failed build query should not lose the package itself: the build
+    // summary is secondary, and the rest of the page is still worth showing.
+    Ok((
+        package.map_err(|e| e.to_string())?,
+        builds.unwrap_or_default(),
+    ))
 }
 
 #[component]
@@ -293,11 +300,16 @@ fn Relations(pkg: ExtendedPackage) -> Element {
             title: "Dependencies",
             empty: "Nothing — this package builds on its own.",
             items: pkg.dependencies.clone(),
+            // Only dependencies gate this package's build. A dependent that is
+            // unsatisfied is waiting on *this* package, which is its problem to
+            // display, not a reason to flag anything here.
+            show_blocking: true,
         }
         RelationList {
             title: "Dependents",
             empty: "Nothing depends on this package.",
             items: pkg.dependents.clone(),
+            show_blocking: false,
         }
     }
 }
@@ -307,7 +319,10 @@ fn RelationList(
     title: String,
     empty: String,
     items: Vec<aurcache_client::PackageDependency>,
+    show_blocking: bool,
 ) -> Element {
+    let blocking = items.iter().filter(|item| !item.satisfied).count();
+
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
@@ -316,28 +331,60 @@ fn RelationList(
                     if !items.is_empty() {
                         span { class: "badge badge-sm badge-neutral", "{items.len()}" }
                     }
+                    if show_blocking && blocking > 0 {
+                        span { class: "badge badge-sm badge-warning",
+                            "{blocking} blocking"
+                        }
+                    }
                 }
                 if items.is_empty() {
                     p { class: "opacity-60 text-sm", "{empty}" }
                 } else {
                     ul { class: "divide-y divide-base-300",
                         for item in items.iter() {
-                            li { key: "{item.id}", class: "py-2 flex items-center gap-3",
-                                Link {
-                                    class: "link link-primary font-mono text-sm break-all",
-                                    to: Route::Package { pkgbase: item.name.clone() },
-                                    "{item.name}"
-                                }
-                                if !item.version_constraint.is_empty() {
-                                    span { class: "font-mono text-xs opacity-60",
-                                        "{item.version_constraint}"
-                                    }
-                                }
-                            }
+                            RelationRow { item: item.clone(), show_blocking }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// One dependency, and why it is or is not holding the build back.
+#[component]
+fn RelationRow(item: aurcache_client::PackageDependency, show_blocking: bool) -> Element {
+    let blocking = show_blocking && !item.satisfied;
+
+    rsx! {
+        li { key: "{item.id}", class: "py-2 flex items-center gap-2 flex-wrap",
+            Link {
+                class: "link link-primary font-mono text-sm break-all",
+                to: Route::Package { pkgbase: item.name.clone() },
+                "{item.name}"
+            }
+            if !item.version_constraint.is_empty() {
+                span { class: "font-mono text-xs opacity-60", "{item.version_constraint}" }
+            }
+            div { class: "flex-1" }
+            if blocking {
+                // Say what is actually wrong. "failed" alone does not
+                // distinguish a dependency that never built from one that built
+                // to a version too old to satisfy the constraint — and the
+                // second looks healthy everywhere else.
+                match item.built_version.clone() {
+                    Some(built) => rsx! {
+                        span { class: "font-mono text-xs opacity-70", "has {built}" }
+                        span { class: "badge badge-warning badge-sm", "too old" }
+                    },
+                    None => rsx! {
+                        span { class: "badge badge-warning badge-sm", "never built" }
+                    },
+                }
+            } else if let Some(built) = item.built_version.clone() {
+                span { class: "font-mono text-xs opacity-50", "{built}" }
+            }
+            BuildStatusBadge { status: item.status }
         }
     }
 }

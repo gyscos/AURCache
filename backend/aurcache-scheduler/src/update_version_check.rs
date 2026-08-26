@@ -4,6 +4,7 @@ use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, packages};
 use aurcache_deps::AurClient;
+use aurcache_types::build_state::BuildStates;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
@@ -77,6 +78,12 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
             .select_only()
             .column(builds::Column::Version)
             .filter(builds::Column::PkgId.eq(*package_id))
+            // Successful builds only: this is compared against the upstream
+            // version to decide whether the package is out of date, and a
+            // failed build of a new version is not that version being built.
+            // Counting it cleared the flag for exactly the packages that most
+            // needed it.
+            .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
             .order_by(builds::Column::EndTime, Order::Desc)
             .order_by(builds::Column::StartTime, Order::Desc)
             .limit(1)
@@ -84,7 +91,8 @@ async fn check_versions(db: &DatabaseConnection, store: &SnapshotStore) -> anyho
             .one(db)
             .await?;
 
-        let latest_version: Option<String> = latest_version_row.map(|(v,)| v);
+        let latest_version: Option<String> =
+            latest_version_row.map(|(v,)| v).filter(|v| !v.is_empty());
 
         let source_data = package.source_data;
         match source_data {

@@ -122,11 +122,23 @@ pub struct ExtendedPackage {
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct PackageDependency {
     pub id: i32,
     pub name: String,
+    /// What this relation requires, e.g. `>=1.3`. Empty when unconstrained.
     pub version_constraint: String,
+    /// Build state of the dependency itself, as a [`crate::build_state::BuildState`].
+    pub status: i32,
+    /// The version currently in the repository — the dependency's newest
+    /// successful build. `None` when it has never built.
+    pub built_version: Option<String>,
+    /// Whether [`Self::built_version`] satisfies [`Self::version_constraint`].
+    ///
+    /// This is what decides whether a dependency is holding a build back: the
+    /// builder promotes a dependent only once every dependency has a
+    /// successful build whose version satisfies the recorded constraint. False
+    /// here means this relation is the thing blocking.
+    pub satisfied: bool,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]

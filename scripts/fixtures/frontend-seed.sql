@@ -77,5 +77,23 @@ SELECT p.id,
        '2.12.1-2'
 FROM packages p WHERE p.name = 'hello';
 
+-- A dependency graph with all three interesting states, so the package page's
+-- "blocking" markers are on screen rather than only in a unit test:
+--   yay -> hello        satisfied (built, no constraint)
+--   yay -> python-3.11  built successfully, but to a version the constraint
+--                       rejects -- the case a status badge alone cannot show,
+--                       since the dependency looks healthy everywhere else
+--   yay -> never-built  no successful build at all
+DELETE FROM dependencies;
+INSERT INTO dependencies (dependent_id, dependee_id, version_constraint)
+SELECT d.id, e.id, v.constraint_text
+FROM (
+  SELECT 'yay' AS dependent, 'hello'       AS dependee, ''       AS constraint_text UNION ALL
+  SELECT 'yay',              'python-3.11',             '>=99.0'                    UNION ALL
+  SELECT 'yay',              'never-built',             '>=1.0'
+) v
+JOIN packages d ON d.name = v.dependent
+JOIN packages e ON e.name = v.dependee;
+
 UPDATE packages
 SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER BY b.id DESC LIMIT 1);
