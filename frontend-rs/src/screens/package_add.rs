@@ -35,6 +35,49 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Shorter than this and the result set is the whole AUR.
 const MIN_QUERY: usize = 3;
 
+/// What pressing Add will actually add.
+///
+/// The queue wins when there is one: the field is a staging area for it, and
+/// something half-typed there should not ride along with a list that was
+/// assembled deliberately. With nothing queued, the field *is* the request —
+/// typing a name and pressing Add, or Enter, adds it without a detour through
+/// the queue.
+fn to_add(queued: Vec<SourceData>, pending: Option<SourceData>) -> Vec<SourceData> {
+    if queued.is_empty() {
+        pending.into_iter().collect()
+    } else {
+        queued
+    }
+}
+
+/// Orders search results by how well they answer what was typed.
+///
+/// The AUR's own ordering is not by relevance: searching `hello` returns
+/// `howdy-git`, `biopass-bin`, `wsl-hello-sudo-bin` and four more before
+/// `hello` itself appears. The package someone typed the exact name of is the
+/// one they meant, so it goes first, then the ones that start with what they
+/// typed, then everything else.
+///
+/// Stable within each rank, so the AUR's own order — which does carry some
+/// popularity signal — survives among equally good matches.
+fn rank_results(query: &str, results: &mut [SearchResult]) {
+    let query = query.trim().to_lowercase();
+    results.sort_by_key(|result| {
+        let name = result.name.to_lowercase();
+        if name == query {
+            0
+        } else if name.starts_with(&query) {
+            1
+        } else if name.contains(&query) {
+            2
+        } else {
+            // Matched on something other than the name — the AUR searches
+            // descriptions too — so it is the least likely to be what was meant.
+            3
+        }
+    });
+}
+
 /// The source the form currently describes, or `None` while it is empty.
 ///
 /// One entry field decides its own kind: anything shaped like a git remote is
@@ -173,10 +216,12 @@ fn AddPackageDialog() -> Element {
         if q.chars().count() < MIN_QUERY || looks_like_git_url(q.trim()) {
             return Ok(Vec::new());
         }
-        crate::api::client()?
+        let mut found = crate::api::client()?
             .search(&q)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        rank_results(&q, &mut found);
+        Ok(found)
     });
 
     let close = move |_| {
@@ -208,9 +253,20 @@ fn AddPackageDialog() -> Element {
         git_subfolder.set(String::new());
     };
 
-    let ready = !queued().is_empty() && !platforms_selected().is_empty() && !busy();
+    let sources_to_add = move || to_add(queued(), pending());
 
-    let submit = move |_| async move {
+    let ready = !sources_to_add().is_empty() && !platforms_selected().is_empty() && !busy();
+
+    // Takes `()` rather than an event, because two different events reach it:
+    // a click on Add and Enter in the entry field.
+    let submit = move |()| async move {
+        let sources = sources_to_add();
+        if sources.is_empty() {
+            return;
+        }
+        // Whether the queue is what is being sent decides where a failure goes
+        // back to: the queue it came from, or the field it was typed in.
+        let from_queue = !queued().is_empty();
         busy.set(true);
         failures.set(Vec::new());
 
@@ -229,7 +285,7 @@ fn AddPackageDialog() -> Element {
         // the whole list would try to add them twice.
         let mut remaining = Vec::new();
         let mut failed = Vec::new();
-        for source in queued() {
+        for source in sources {
             let label = source_label(&source);
             let result = client
                 .add_package(&AddPackageRequest {
@@ -251,7 +307,11 @@ fn AddPackageDialog() -> Element {
             // closing is what refetches it.
             navigator().push(Route::Packages {});
         } else {
-            queued.set(remaining);
+            // A failure from the field stays in the field, which still holds
+            // it; moving it into the queue would show it twice.
+            if from_queue {
+                queued.set(remaining);
+            }
             failures.set(failed);
         }
     };
@@ -286,11 +346,14 @@ fn AddPackageDialog() -> Element {
                                     }
                                 });
                             },
-                            // Enter queues, which is what pressing it in a field
-                            // above a list of queued things should do.
+                            // Enter submits. Adding one known package is the
+                            // common case by far, and it should not take a
+                            // detour through the queue to do it. Building a
+                            // queue is done by clicking results, which is how
+                            // one gets built anyway.
                             onkeydown: move |e: KeyboardEvent| {
                                 if e.key() == Key::Enter {
-                                    enqueue();
+                                    spawn(submit(()));
                                 }
                             },
                         }
@@ -389,11 +452,11 @@ fn AddPackageDialog() -> Element {
                     button {
                         class: "btn btn-primary",
                         disabled: !ready,
-                        onclick: submit,
+                        onclick: move |_| submit(()),
                         if busy() {
                             span { class: "loading loading-spinner loading-xs" }
                         }
-                        {add_button_label(queued().len())}
+                        {add_button_label(sources_to_add().len())}
                     }
                 }
             }
@@ -511,8 +574,8 @@ fn SearchResults(
 #[cfg(test)]
 mod tests {
     use super::{
-        QueuedList, SearchResults, add_button_label, git_source, source_at, source_for,
-        source_label,
+        QueuedList, SearchResults, add_button_label, git_source, rank_results, source_at,
+        source_for, source_label, to_add,
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
@@ -644,6 +707,38 @@ mod tests {
         assert_ne!(source_label(&git), source_label(&other));
     }
 
+    /// The rule behind the Add button. A queue is a deliberate list, so it is
+    /// what gets sent; with nothing queued, the field is the whole request, so
+    /// one known name never needs queueing first.
+    #[test]
+    fn the_queue_wins_over_the_field() {
+        let aur = |name: &str| SourceData::Aur {
+            name: name.to_string(),
+        };
+
+        // Nothing at all.
+        assert!(to_add(Vec::new(), None).is_empty());
+
+        // Just the field: that is the request.
+        assert_eq!(
+            to_add(Vec::new(), Some(aur("hello")))
+                .iter()
+                .map(source_label)
+                .collect::<Vec<_>>(),
+            ["hello"]
+        );
+
+        // A queue, and a field left with something in it: the queue is sent and
+        // the field is not.
+        assert_eq!(
+            to_add(vec![aur("hello"), aur("neofetch")], Some(aur("yay")))
+                .iter()
+                .map(source_label)
+                .collect::<Vec<_>>(),
+            ["hello", "neofetch"]
+        );
+    }
+
     /// Says what pressing it will do, since the queue is what gets added and
     /// not whatever is still sitting in the field.
     /// Each queued source is listed and individually removable — queueing four
@@ -659,6 +754,64 @@ mod tests {
         assert!(html.contains("hello"), "{html}");
         assert!(html.contains("https://e.invalid/r.git#main"), "{html}");
         assert!(html.contains("Remove hello"), "each chip removable: {html}");
+    }
+
+    /// The AUR does not order by relevance: this is the real response to
+    /// `?query=hello`, in which the package actually called `hello` is eighth.
+    #[test]
+    fn the_exact_match_comes_first() {
+        let mut results: Vec<SearchResult> = [
+            "howdy-git",
+            "biopass-bin",
+            "howdy-bin",
+            "wsl-hello-sudo-bin",
+            "howdy-beta-git",
+            "howdy",
+            "hello",
+            "hello-world",
+        ]
+        .iter()
+        .map(|name| SearchResult {
+            name: (*name).to_string(),
+            version: "1-1".to_string(),
+        })
+        .collect();
+
+        rank_results("hello", &mut results);
+        let names: Vec<_> = results.iter().map(|r| r.name.as_str()).collect();
+
+        assert_eq!(names[0], "hello", "exact match first: {names:?}");
+        assert_eq!(names[1], "hello-world", "then prefix matches: {names:?}");
+        assert_eq!(
+            names[2], "wsl-hello-sudo-bin",
+            "then anything else containing it: {names:?}"
+        );
+        // The rest matched on description rather than name, and keep the AUR's
+        // own order among themselves.
+        assert_eq!(
+            &names[3..],
+            &[
+                "howdy-git",
+                "biopass-bin",
+                "howdy-bin",
+                "howdy-beta-git",
+                "howdy"
+            ]
+        );
+    }
+
+    /// Someone typing `HELLO` means the same package.
+    #[test]
+    fn ranking_ignores_case() {
+        let mut results: Vec<SearchResult> = ["hello-world", "Hello"]
+            .iter()
+            .map(|name| SearchResult {
+                name: (*name).to_string(),
+                version: "1-1".to_string(),
+            })
+            .collect();
+        rank_results("  HELLO  ", &mut results);
+        assert_eq!(results[0].name, "Hello");
     }
 
     /// Nothing queued is not an empty box with a heading, it is nothing.
