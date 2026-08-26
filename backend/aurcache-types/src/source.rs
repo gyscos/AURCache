@@ -35,6 +35,24 @@ pub enum SourceData {
     Upload { archive: Vec<u8> },
 }
 
+/// Whether a package someone typed is a git remote rather than an AUR name.
+///
+/// Git URLs either use the SCP-like `user@host:path` shorthand — any user, not
+/// just `git`, e.g. `aur@aur.archlinux.org:foo.git` — or an explicit scheme
+/// (`https://`, `ssh://`, `git://`, …). An AUR package name cannot contain `@`,
+/// so anything with one is unambiguously a remote.
+///
+/// A bare `.git` suffix is deliberately not enough: AUR names legitimately end
+/// in it (`paru-git`, `lab.git`), and with no scheme there is no filesystem to
+/// resolve a scheme-less path against anyway. Those stay AUR names.
+///
+/// Shared because the CLI and the web UI both accept one field that is either
+/// thing, and two copies of a guess like this would drift into disagreeing
+/// about the same input.
+pub fn looks_like_git_url(s: &str) -> bool {
+    s.contains('@') || s.contains("://")
+}
+
 impl From<GitSourceSpec> for SourceData {
     fn from(spec: GitSourceSpec) -> Self {
         Self::Git { spec }
@@ -69,5 +87,32 @@ impl Display for SourceData {
             "{}",
             serde_json::to_string(self).map_err(|_| std::fmt::Error)?
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_git_url;
+
+    #[test]
+    fn detects_scp_like_git_urls() {
+        assert!(looks_like_git_url("aur@aur.archlinux.org:paru"));
+        assert!(looks_like_git_url("git@github.com:user/project"));
+    }
+
+    #[test]
+    fn detects_scheme_git_urls() {
+        assert!(looks_like_git_url("https://github.com/user/project"));
+        assert!(looks_like_git_url("ssh://git@host/repo"));
+        assert!(looks_like_git_url("git://host/repo"));
+    }
+
+    /// The suffix alone is not a URL: these are real AUR package names, and
+    /// treating them as remotes would make them unaddable by name.
+    #[test]
+    fn does_not_treat_git_like_aur_names_as_urls() {
+        assert!(!looks_like_git_url("paru-git"));
+        assert!(!looks_like_git_url("lab.git"));
+        assert!(!looks_like_git_url("hello"));
     }
 }

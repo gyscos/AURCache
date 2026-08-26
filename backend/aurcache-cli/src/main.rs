@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use aurcache_client::{
     AddPackageRequest, AurCacheClient, Build, ExtendedPackage, GitSourceSpec, GraphDataPoint,
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
-    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker,
+    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -621,19 +621,6 @@ async fn add_package_command(
         println!("package add request complete");
     }
     Ok(())
-}
-
-/// Heuristic used to route a `pkg add` entry to the git or AUR source: git
-/// URLs either use the SCP-like `user@host:path` shorthand (any user, not
-/// just `git`, e.g. `aur@aur.archlinux.org:foo.git`) or an explicit URL
-/// scheme (`https://`, `ssh://`, `git://`, ...). AUR package names can't
-/// contain `@`, so any entry with one is unambiguously a git remote. A bare
-/// `.git` suffix with no scheme/user isn't enough on its own though - AUR
-/// package names can legitimately contain one (and there's no local
-/// filesystem to resolve a scheme-less path against anyway) - so those fall
-/// through to being treated as AUR package names.
-fn looks_like_git_url(s: &str) -> bool {
-    s.contains('@') || s.contains("://")
 }
 
 /// Parses a single `--patch` argument, accepting either
@@ -1348,7 +1335,7 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddPackageArgs, build_status_label, looks_like_git_url, parse_key_val};
+    use super::{AddPackageArgs, build_status_label, parse_key_val};
     use crate::config::ClientConfig;
     use clap::Parser;
 
@@ -1396,23 +1383,6 @@ mod tests {
         assert_eq!(parsed.args.packages, vec!["paru", "yay"]);
         assert_eq!(parsed.args.platforms, vec!["x86_64"]);
         assert_eq!(parsed.args.build_flags, vec!["--noconfirm"]);
-    }
-
-    #[test]
-    fn detects_scp_like_git_urls() {
-        assert!(looks_like_git_url("aur@aur.archlinux.org:paru"));
-        assert!(looks_like_git_url("git@github.com:user/project"));
-    }
-
-    #[test]
-    fn detects_scheme_git_urls() {
-        assert!(looks_like_git_url("https://github.com/user/project"));
-    }
-
-    #[test]
-    fn does_not_treat_git_like_aur_names_as_urls() {
-        assert!(!looks_like_git_url("paru-git"));
-        assert!(!looks_like_git_url("lab.git"));
     }
 }
 

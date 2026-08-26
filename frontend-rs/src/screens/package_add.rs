@@ -8,10 +8,21 @@
 //! One step, not the three the Dart version used. Choosing a source, naming it
 //! and picking architectures are not stages of anything — they are three fields,
 //! and two of them usually keep their defaults.
+//!
+//! And one field for the source, not a pair of tabs: `looks_like_git_url` tells
+//! a remote from a package name, the same way `aurcache-cli packages add` does,
+//! so nobody has to say which kind of thing they are about to paste.
+//!
+//! Several packages can be queued before committing, all onto the same
+//! platforms. Adding a handful at once is the normal case when setting a server
+//! up, and the platforms are almost always the same for all of them — asking
+//! once beats reopening the dialog per package and re-picking them each time.
 
 use crate::platforms::{self, PlatformChecklist};
 use crate::routes::Route;
-use aurcache_client::{AddPackageRequest, GitSourceSpec, SearchResult, SourceData};
+use aurcache_client::{
+    AddPackageRequest, GitSourceSpec, SearchResult, SourceData, looks_like_git_url,
+};
 use dioxus::prelude::*;
 use std::time::Duration;
 
@@ -24,11 +35,27 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Shorter than this and the result set is the whole AUR.
 const MIN_QUERY: usize = 3;
 
-/// Which kind of source is being added.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    Aur,
-    Git,
+/// The source the form currently describes, or `None` while it is empty.
+///
+/// One entry field decides its own kind: anything shaped like a git remote is
+/// one, and everything else is an AUR package name. That is the same call
+/// `aurcache-cli packages add` makes, from the same function, so the two cannot
+/// disagree about what a given string means.
+///
+/// An AUR name is taken as typed rather than requiring a search result to be
+/// clicked — the list is a convenience, and someone who already knows the name
+/// should not have to wait for the AUR to confirm it.
+fn source_for(entry: &str, git_ref: &str, subfolder: &str) -> Option<SourceData> {
+    let entry = entry.trim();
+    if looks_like_git_url(entry) {
+        return git_source(entry, git_ref, subfolder);
+    }
+    if entry.is_empty() {
+        return None;
+    }
+    Some(SourceData::Aur {
+        name: entry.to_string(),
+    })
 }
 
 /// The git source these fields describe, or `None` if there is not one yet.
@@ -55,6 +82,45 @@ fn git_source(url: &str, git_ref: &str, subfolder: &str) -> Option<SourceData> {
     })
 }
 
+/// A source waiting to be added, and how to write it on a chip.
+///
+/// The label is derived rather than stored: two chips with the same label are
+/// the same source, which is what the duplicate check relies on.
+fn source_label(source: &SourceData) -> String {
+    match source {
+        SourceData::Aur { name } => name.clone(),
+        SourceData::Git { spec } => {
+            let mut label = spec.url.clone();
+            if !spec.r#ref.is_empty() {
+                label.push('#');
+                label.push_str(&spec.r#ref);
+            }
+            if !spec.subfolder.is_empty() {
+                label.push('/');
+                label.push_str(&spec.subfolder);
+            }
+            label
+        }
+        // This dialog never builds one — the upload it belongs to was never
+        // implemented server-side — but the variant exists, so it gets a label
+        // rather than a panic.
+        SourceData::Upload { .. } => "uploaded archive".to_string(),
+    }
+}
+
+/// The pkgbase a source will land under, for comparing against what is already
+/// on the server.
+///
+/// Only an AUR source has one to predict. A git remote's pkgbase comes from the
+/// PKGBUILD inside it, which nothing here has read, so a duplicate git URL is
+/// left to the server to refuse.
+fn source_at(source: &SourceData) -> Option<&str> {
+    match source {
+        SourceData::Aur { name } => Some(name),
+        SourceData::Git { .. } | SourceData::Upload { .. } => None,
+    }
+}
+
 #[component]
 pub fn PackageAdd() -> Element {
     // The list stays mounted behind the dialog, so dismissing it reveals the
@@ -67,25 +133,44 @@ pub fn PackageAdd() -> Element {
 
 #[component]
 fn AddPackageDialog() -> Element {
-    let mut kind = use_signal(|| SourceKind::Aur);
-
-    // AUR
-    let mut query = use_signal(String::new);
+    // The one field: a package name or a git remote, told apart by their shape.
+    let mut entry = use_signal(String::new);
     let mut debounced = use_signal(String::new);
-    let mut chosen = use_signal(|| Option::<String>::None);
 
-    // Git
-    let mut git_url = use_signal(String::new);
+    // Only meaningful once the entry is a remote, which is when they appear.
     let mut git_ref = use_signal(|| "master".to_string());
     let mut git_subfolder = use_signal(String::new);
 
-    let mut selected = use_signal(|| vec![platforms::DEFAULT.to_string()]);
+    // What will be added when the button is pressed.
+    let mut queued = use_signal(Vec::<SourceData>::new);
+    let mut platforms_selected = use_signal(|| vec![platforms::DEFAULT.to_string()]);
     let mut busy = use_signal(|| false);
-    let mut error = use_signal(|| Option::<String>::None);
+    let mut failures = use_signal(Vec::<(String, String)>::new);
+
+    // What the server already has. Adding one again is a silent no-op — the
+    // server exits early and returns 200 — which is the worst of both: the
+    // dialog closes, nothing happens, and nothing says why. Marking them is how
+    // that question gets answered before it is asked.
+    let existing = use_resource(|| async move {
+        crate::api::client()?
+            .list_packages(None, None)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    let existing_names = move || -> Vec<String> {
+        match &*existing.read_unchecked() {
+            Some(Ok(list)) => list.iter().map(|p| p.name.clone()).collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    let is_git = move || looks_like_git_url(entry().trim());
 
     let results = use_resource(move || async move {
         let q = debounced();
-        if q.chars().count() < MIN_QUERY {
+        // Nothing to look up for a remote: the AUR does not know about it, and
+        // asking would spend a request to be told so.
+        if q.chars().count() < MIN_QUERY || looks_like_git_url(q.trim()) {
             return Ok(Vec::new());
         }
         crate::api::client()?
@@ -98,156 +183,204 @@ fn AddPackageDialog() -> Element {
         navigator().push(Route::Packages {});
     };
 
-    // What the fields currently describe, or `None` while they are incomplete.
-    // Deriving this rather than tracking a separate "can add" flag keeps the
-    // button's enabled state and the request from ever disagreeing.
-    let source = move || -> Option<SourceData> {
-        match kind() {
-            SourceKind::Aur => chosen().map(|name| SourceData::Aur { name }),
-            SourceKind::Git => git_source(&git_url(), &git_ref(), &git_subfolder()),
+    let pending = move || source_for(&entry(), &git_ref(), &git_subfolder());
+
+    // Already queued, or already on the server. Either way there is nothing to
+    // add, and offering it again would produce a duplicate or an error.
+    let already_taken = move |source: &SourceData| -> bool {
+        let label = source_label(source);
+        if queued().iter().any(|q| source_label(q) == label) {
+            return true;
         }
+        source_at(source).is_some_and(|name| existing_names().iter().any(|e| e == name))
     };
 
-    let ready = source().is_some() && !selected().is_empty() && !busy();
+    // Queue what the field describes and empty it, ready for the next one.
+    let mut enqueue = move || {
+        let Some(source) = pending() else { return };
+        if already_taken(&source) {
+            return;
+        }
+        queued.push(source);
+        entry.set(String::new());
+        debounced.set(String::new());
+        git_ref.set("master".to_string());
+        git_subfolder.set(String::new());
+    };
+
+    let ready = !queued().is_empty() && !platforms_selected().is_empty() && !busy();
 
     let submit = move |_| async move {
-        let Some(source) = source() else { return };
         busy.set(true);
-        error.set(None);
+        failures.set(Vec::new());
 
-        let outcome = match crate::api::client() {
-            Err(e) => Err(e),
-            Ok(client) => client
+        let client = match crate::api::client() {
+            Ok(client) => client,
+            Err(e) => {
+                failures.set(vec![(String::new(), e)]);
+                busy.set(false);
+                return;
+            }
+        };
+
+        // One request each, because that is what the API takes. A failure part
+        // way through leaves the earlier ones added, so the ones that worked
+        // are dropped from the queue and only the rest stay on screen — retrying
+        // the whole list would try to add them twice.
+        let mut remaining = Vec::new();
+        let mut failed = Vec::new();
+        for source in queued() {
+            let label = source_label(&source);
+            let result = client
                 .add_package(&AddPackageRequest {
-                    platforms: Some(selected()),
+                    platforms: Some(platforms_selected()),
                     build_flags: None,
-                    source,
+                    source: source.clone(),
                     patched_files: None,
                 })
-                .await
-                .map_err(|e| e.to_string()),
-        };
+                .await;
+            if let Err(e) = result {
+                failed.push((label, e.to_string()));
+                remaining.push(source);
+            }
+        }
         busy.set(false);
 
-        match outcome {
-            // The list behind the dialog is where the new package appears, and
+        if failed.is_empty() {
+            // The list behind the dialog is where the new packages appear, and
             // closing is what refetches it.
-            Ok(()) => {
-                navigator().push(Route::Packages {});
-            }
-            // Staying open keeps the typed source in reach: a name the AUR does
-            // not have, or a git URL that cannot be cloned, is usually a typo
-            // rather than a reason to start over.
-            Err(e) => error.set(Some(e)),
+            navigator().push(Route::Packages {});
+        } else {
+            queued.set(remaining);
+            failures.set(failed);
         }
     };
 
     rsx! {
         div { class: "modal modal-open",
             div { class: "modal-box max-w-2xl",
-                h3 { class: "font-bold text-lg", "Add package" }
-
-                div { role: "tablist", class: "tabs tabs-bordered mt-3",
-                    button {
-                        role: "tab",
-                        class: if kind() == SourceKind::Aur { "tab tab-active" } else { "tab" },
-                        onclick: move |_| kind.set(SourceKind::Aur),
-                        "AUR"
-                    }
-                    button {
-                        role: "tab",
-                        class: if kind() == SourceKind::Git { "tab tab-active" } else { "tab" },
-                        onclick: move |_| kind.set(SourceKind::Git),
-                        "Git"
-                    }
-                }
+                h3 { class: "font-bold text-lg", "Add packages" }
 
                 div { class: "py-4 space-y-3",
-                    match kind() {
-                        SourceKind::Aur => rsx! {
-                            input {
-                                r#type: "search",
-                                class: "input input-bordered w-full",
-                                placeholder: "Search the AUR…",
-                                autofocus: true,
-                                value: "{query}",
-                                oninput: move |e| {
-                                    let typed = e.value();
-                                    query.set(typed.clone());
-                                    // Each keystroke starts its own timer and
-                                    // then checks whether it is still the
-                                    // latest; the stale ones fall through
-                                    // without touching anything.
-                                    spawn(async move {
-                                        gloo_timers::future::sleep(SEARCH_DEBOUNCE).await;
-                                        if query() == typed {
-                                            debounced.set(typed);
-                                        }
-                                    });
-                                },
-                            }
-                            SearchResults {
-                                query: query(),
-                                // Cloned out of the resource so the borrow ends here rather
-                                // than living as long as the child's props.
-                                results: results.read_unchecked().as_ref().cloned(),
-                                chosen: chosen(),
-                                onpick: move |name| chosen.set(Some(name)),
-                            }
-                        },
-                        SourceKind::Git => rsx! {
-                            label { class: "form-control w-full",
-                                span { class: "label-text text-sm", "Repository URL" }
+                    label { class: "form-control w-full",
+                        span { class: "label-text text-sm",
+                            "AUR package name or git URL"
+                        }
+                        input {
+                            r#type: "text",
+                            class: "input input-bordered w-full font-mono text-sm",
+                            placeholder: "hello   ·   https://github.com/user/repo.git",
+                            autofocus: true,
+                            value: "{entry}",
+                            oninput: move |e| {
+                                let typed = e.value();
+                                entry.set(typed.clone());
+                                // Each keystroke starts its own timer and then
+                                // checks whether it is still the latest; the
+                                // stale ones fall through without touching
+                                // anything.
+                                spawn(async move {
+                                    gloo_timers::future::sleep(SEARCH_DEBOUNCE).await;
+                                    if entry() == typed {
+                                        debounced.set(typed);
+                                    }
+                                });
+                            },
+                            // Enter queues, which is what pressing it in a field
+                            // above a list of queued things should do.
+                            onkeydown: move |e: KeyboardEvent| {
+                                if e.key() == Key::Enter {
+                                    enqueue();
+                                }
+                            },
+                        }
+                    }
+
+                    if is_git() {
+                        // Only asked for once the entry is a remote. An AUR
+                        // package has neither, and showing them greyed out on
+                        // every add would be two dead fields most of the time.
+                        div { class: "flex gap-3 flex-wrap items-end",
+                            label { class: "form-control flex-1 min-w-32",
+                                span { class: "label-text text-sm", "Ref" }
                                 input {
-                                    r#type: "url",
+                                    r#type: "text",
                                     class: "input input-bordered w-full font-mono text-sm",
-                                    placeholder: "https://github.com/user/repo.git",
-                                    value: "{git_url}",
-                                    oninput: move |e| git_url.set(e.value()),
+                                    placeholder: "master",
+                                    value: "{git_ref}",
+                                    oninput: move |e| git_ref.set(e.value()),
                                 }
                             }
-                            div { class: "flex gap-3 flex-wrap",
-                                label { class: "form-control flex-1 min-w-40",
-                                    span { class: "label-text text-sm", "Ref" }
-                                    input {
-                                        r#type: "text",
-                                        class: "input input-bordered w-full font-mono text-sm",
-                                        placeholder: "master",
-                                        value: "{git_ref}",
-                                        oninput: move |e| git_ref.set(e.value()),
-                                    }
-                                }
-                                label { class: "form-control flex-1 min-w-40",
-                                    span { class: "label-text text-sm", "Subfolder" }
-                                    input {
-                                        r#type: "text",
-                                        class: "input input-bordered w-full font-mono text-sm",
-                                        placeholder: "repository root",
-                                        value: "{git_subfolder}",
-                                        oninput: move |e| git_subfolder.set(e.value()),
-                                    }
+                            label { class: "form-control flex-1 min-w-32",
+                                span { class: "label-text text-sm", "Subfolder" }
+                                input {
+                                    r#type: "text",
+                                    class: "input input-bordered w-full font-mono text-sm",
+                                    placeholder: "repository root",
+                                    value: "{git_subfolder}",
+                                    oninput: move |e| git_subfolder.set(e.value()),
                                 }
                             }
+                            // A remote has no search results to click, so this
+                            // is the only way to queue one.
+                            button {
+                                class: "btn btn-sm",
+                                disabled: pending().is_none_or(|s| already_taken(&s)),
+                                onclick: move |_| enqueue(),
+                                "Add to list"
+                            }
+                        }
+                    } else {
+                        SearchResults {
+                            query: entry(),
+                            // Cloned out of the resource so the borrow ends
+                            // here rather than living as long as the child's
+                            // props.
+                            results: results.read_unchecked().as_ref().cloned(),
+                            taken: {
+                                let mut taken = existing_names();
+                                taken.extend(queued().iter().map(source_label));
+                                taken
+                            },
+                            onpick: move |name: String| {
+                                entry.set(name);
+                                enqueue();
+                            },
+                        }
+                    }
+
+                    QueuedList {
+                        queued: queued(),
+                        onremove: move |label: String| {
+                            queued.retain(|s| source_label(s) != label);
                         },
                     }
 
                     div {
                         span { class: "label-text text-sm", "Platforms" }
                         PlatformChecklist {
-                            selected: selected(),
-                            onchange: move |next| selected.set(next),
+                            selected: platforms_selected(),
+                            onchange: move |next| platforms_selected.set(next),
                             size: "checkbox-sm",
                         }
                         // Whether a package builds for an architecture is the
                         // PKGBUILD's business, not ours, so this offers rather
-                        // than promises.
+                        // than promises. They apply to everything queued.
                         p { class: "text-xs opacity-50 pt-1",
-                            "Which of these actually work depends on the package's PKGBUILD."
+                            "Applied to every package above. Which of these actually work depends on each package's PKGBUILD."
                         }
                     }
 
-                    if let Some(message) = error() {
-                        div { class: "alert alert-error text-sm", span { "{message}" } }
+                    if !failures().is_empty() {
+                        div { class: "alert alert-error text-sm flex-col items-start gap-1",
+                            span { "Some packages could not be added:" }
+                            for (label, message) in failures() {
+                                div { key: "{label}", class: "text-xs",
+                                    span { class: "font-mono", "{label}" }
+                                    " — {message}"
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -260,7 +393,7 @@ fn AddPackageDialog() -> Element {
                         if busy() {
                             span { class: "loading loading-spinner loading-xs" }
                         }
-                        "Add"
+                        {add_button_label(queued().len())}
                     }
                 }
             }
@@ -268,6 +401,49 @@ fn AddPackageDialog() -> Element {
             // No colour of its own: `.modal` already dims the page behind it,
             // and a second translucent layer on top darkened it twice.
             div { class: "modal-backdrop", onclick: close }
+        }
+    }
+}
+
+/// How the commit button reads for a given queue length.
+///
+/// Says the count, so it is clear before pressing it that this adds four things
+/// and not the one still in the field.
+fn add_button_label(count: usize) -> String {
+    match count {
+        0 => "Add".to_string(),
+        1 => "Add 1 package".to_string(),
+        n => format!("Add {n} packages"),
+    }
+}
+
+/// The sources queued so far, each removable.
+#[component]
+fn QueuedList(queued: Vec<SourceData>, onremove: EventHandler<String>) -> Element {
+    if queued.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "flex flex-wrap gap-2",
+            for source in queued.iter() {
+                {
+                    let label = source_label(source);
+                    rsx! {
+                        span { key: "{label}", class: "badge badge-neutral gap-1 py-3",
+                            span { class: "font-mono text-xs", "{label}" }
+                            button {
+                                class: "btn btn-ghost btn-xs px-1",
+                                "aria-label": "Remove {label}",
+                                onclick: {
+                                    let label = label.clone();
+                                    move |_| onremove.call(label.clone())
+                                },
+                                "✕"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -281,7 +457,10 @@ fn AddPackageDialog() -> Element {
 fn SearchResults(
     query: String,
     results: Option<Result<Vec<SearchResult>, String>>,
-    chosen: Option<String>,
+    /// Names already on the server or already queued. Shown, but not
+    /// selectable: that a package is already handled is the useful answer, and
+    /// better than hiding it and leaving someone to wonder where it went.
+    taken: Vec<String>,
     onpick: EventHandler<String>,
 ) -> Element {
     if query.chars().count() < MIN_QUERY {
@@ -301,17 +480,26 @@ fn SearchResults(
             p { class: "text-sm opacity-60 py-2", "Nothing in the AUR matches “{query}”." }
         },
         Some(Ok(found)) => rsx! {
-            ul { class: "menu menu-sm p-0 max-h-64 overflow-y-auto border border-base-300 rounded-box",
+            ul { class: "menu menu-sm p-0 max-h-56 overflow-y-auto border border-base-300 rounded-box flex-nowrap",
                 for result in found {
-                    li { key: "{result.name}",
-                        button {
-                            class: if chosen.as_deref() == Some(result.name.as_str()) { "active" } else { "" },
-                            onclick: {
-                                let name = result.name.clone();
-                                move |_| onpick.call(name.clone())
-                            },
-                            span { class: "font-mono", "{result.name}" }
-                            span { class: "opacity-50 text-xs", "{result.version}" }
+                    {
+                        let held = taken.contains(&result.name);
+                        rsx! {
+                            li { key: "{result.name}",
+                                button {
+                                    class: if held { "opacity-50 cursor-not-allowed" } else { "" },
+                                    disabled: held,
+                                    onclick: {
+                                        let name = result.name.clone();
+                                        move |_| onpick.call(name.clone())
+                                    },
+                                    span { class: "font-mono", "{result.name}" }
+                                    span { class: "opacity-50 text-xs", "{result.version}" }
+                                    if held {
+                                        span { class: "badge badge-outline badge-xs ml-auto", "added" }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -322,27 +510,69 @@ fn SearchResults(
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchResults, git_source};
+    use super::{
+        QueuedList, SearchResults, add_button_label, git_source, source_at, source_for,
+        source_label,
+    };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
 
     #[component]
-    fn Harness(query: String, results: Option<Result<Vec<SearchResult>, String>>) -> Element {
+    fn Harness(
+        query: String,
+        results: Option<Result<Vec<SearchResult>, String>>,
+        taken: Vec<String>,
+    ) -> Element {
         rsx! {
-            SearchResults { query, results, chosen: None, onpick: move |_| {} }
+            SearchResults { query, results, taken, onpick: move |_| {} }
         }
     }
 
     fn render(query: &str, results: Option<Result<Vec<SearchResult>, String>>) -> String {
+        render_with(query, results, Vec::new())
+    }
+
+    fn render_with(
+        query: &str,
+        results: Option<Result<Vec<SearchResult>, String>>,
+        taken: Vec<String>,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
             Harness,
             HarnessProps {
                 query: query.to_string(),
                 results,
+                taken,
             },
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// Same reason as `Harness`: an `EventHandler` only exists inside a running
+    /// runtime, so the list is rendered through a component rather than handed
+    /// props from outside.
+    #[component]
+    fn QueueHarness(queued: Vec<SourceData>) -> Element {
+        rsx! {
+            QueuedList { queued, onremove: move |_| {} }
+        }
+    }
+
+    fn render_queue(queued: Vec<SourceData>) -> String {
+        let mut dom = VirtualDom::new_with_props(QueueHarness, QueueHarnessProps { queued });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn found(names: &[(&str, &str)]) -> Option<Result<Vec<SearchResult>, String>> {
+        Some(Ok(names
+            .iter()
+            .map(|(name, version)| SearchResult {
+                name: (*name).to_string(),
+                version: (*version).to_string(),
+            })
+            .collect()))
     }
 
     /// Two letters is not a failed search, it is an unfinished one. Reporting
@@ -371,6 +601,95 @@ mod tests {
         assert!(!html.contains("Nothing in the AUR"), "{html}");
     }
 
+    /// The whole point of marking them: adding a package the server already has
+    /// is a silent no-op, so queueing it would close the dialog having done
+    /// nothing, with nothing to say why. It stays visible, since "already
+    /// handled" is the useful answer, but it cannot be picked.
+    #[test]
+    fn an_already_added_package_cannot_be_picked() {
+        let html = render_with(
+            "hello",
+            found(&[("hello", "2.12.1-1"), ("hello-world", "1.0-3")]),
+            vec!["hello".to_string()],
+        );
+        assert!(html.contains("hello"), "still listed: {html}");
+        assert!(html.contains("added"), "marked as already added: {html}");
+        assert!(html.contains("disabled"), "not selectable: {html}");
+    }
+
+    /// Only the taken ones. A result that is disabled when it should not be is
+    /// a package nobody can add.
+    #[test]
+    fn a_package_that_is_not_added_stays_selectable() {
+        let html = render_with("hello", found(&[("hello-world", "1.0-3")]), Vec::new());
+        assert!(!html.contains("disabled"), "{html}");
+        assert!(!html.contains(">added<"), "{html}");
+    }
+
+    /// Chips key on this label, so two sources with the same label are treated
+    /// as the same thing — which is what makes the duplicate check work.
+    #[test]
+    fn a_source_label_identifies_it() {
+        assert_eq!(
+            source_label(&SourceData::Aur {
+                name: "hello".to_string()
+            }),
+            "hello"
+        );
+        let git = git_source("https://e.invalid/r.git", "main", "sub").unwrap();
+        assert_eq!(source_label(&git), "https://e.invalid/r.git#main/sub");
+
+        // Same URL, different ref: different sources, so different labels.
+        let other = git_source("https://e.invalid/r.git", "v2", "sub").unwrap();
+        assert_ne!(source_label(&git), source_label(&other));
+    }
+
+    /// Says what pressing it will do, since the queue is what gets added and
+    /// not whatever is still sitting in the field.
+    /// Each queued source is listed and individually removable — queueing four
+    /// and wanting three must not mean starting over.
+    #[test]
+    fn queued_sources_are_listed_and_removable() {
+        let html = render_queue(vec![
+            SourceData::Aur {
+                name: "hello".to_string(),
+            },
+            git_source("https://e.invalid/r.git", "main", "").unwrap(),
+        ]);
+        assert!(html.contains("hello"), "{html}");
+        assert!(html.contains("https://e.invalid/r.git#main"), "{html}");
+        assert!(html.contains("Remove hello"), "each chip removable: {html}");
+    }
+
+    /// Nothing queued is not an empty box with a heading, it is nothing.
+    #[test]
+    fn an_empty_queue_renders_nothing() {
+        assert_eq!(render_queue(Vec::new()), "");
+    }
+
+    #[test]
+    fn the_button_counts_what_it_will_add() {
+        assert_eq!(add_button_label(0), "Add");
+        assert_eq!(add_button_label(1), "Add 1 package");
+        assert_eq!(add_button_label(4), "Add 4 packages");
+    }
+
+    /// Only an AUR name can be checked against the server's package list; a git
+    /// remote's pkgbase lives in a PKGBUILD nothing here has read.
+    #[test]
+    fn only_an_aur_source_predicts_its_pkgbase() {
+        assert_eq!(
+            source_at(&SourceData::Aur {
+                name: "hello".to_string()
+            }),
+            Some("hello")
+        );
+        assert_eq!(
+            source_at(&git_source("https://e.invalid/r.git", "main", "").unwrap()),
+            None
+        );
+    }
+
     #[test]
     fn results_are_listed_with_their_versions() {
         let html = render(
@@ -382,6 +701,47 @@ mod tests {
         );
         assert!(html.contains("hello-world"), "{html}");
         assert!(html.contains("1.0-3"), "{html}");
+    }
+
+    /// The whole point of dropping the tabs: the field works out its own kind.
+    #[test]
+    fn the_entry_field_tells_a_remote_from_a_package_name() {
+        assert!(matches!(
+            source_for("hello", "master", ""),
+            Some(SourceData::Aur { .. })
+        ));
+        // A name that merely looks git-ish is still a package name.
+        assert!(matches!(
+            source_for("paru-git", "master", ""),
+            Some(SourceData::Aur { .. })
+        ));
+        assert!(matches!(
+            source_for("lab.git", "master", ""),
+            Some(SourceData::Aur { .. })
+        ));
+        assert!(matches!(
+            source_for("https://github.com/user/repo.git", "master", ""),
+            Some(SourceData::Git { .. })
+        ));
+        // The SCP-like shorthand has no scheme, only a user.
+        assert!(matches!(
+            source_for("aur@aur.archlinux.org:paru", "master", ""),
+            Some(SourceData::Git { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_field_describes_nothing() {
+        assert!(source_for("", "master", "").is_none());
+        assert!(source_for("   ", "master", "").is_none());
+    }
+
+    #[test]
+    fn an_aur_name_is_trimmed() {
+        let Some(SourceData::Aur { name }) = source_for("  hello  ", "master", "") else {
+            panic!("expected an AUR source");
+        };
+        assert_eq!(name, "hello");
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use aurcache_types::api::waiting::WaitingReason;
 pub use aurcache_types::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
-pub use aurcache_types::source::{GitSourceSpec, SourceData};
+pub use aurcache_types::source::{GitSourceSpec, SourceData, looks_like_git_url};
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
