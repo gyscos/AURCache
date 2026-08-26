@@ -100,7 +100,7 @@ async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), String> 
 
 #[component]
 pub fn Package(pkgbase: String) -> Element {
-    let data = use_resource({
+    let mut data = use_resource({
         let pkgbase = pkgbase.clone();
         move || load(pkgbase.clone())
     });
@@ -118,16 +118,31 @@ pub fn Package(pkgbase: String) -> Element {
             Some(Ok((pkg, builds))) => rsx! {
                 div { class: "space-y-4",
                     PackageHeader { pkg: pkg.clone() }
-                    BuildSummary { pkgbase: pkg.name.clone(), builds: builds.to_vec() }
-                    div { class: "grid grid-cols-1 lg:grid-cols-3 gap-4",
+                    // The sidebar starts level with the builds card rather than
+                    // below it, so the builds card is only as wide as it needs
+                    // and the space beside it is used.
+                    //
+                    // A fixed 26rem sidebar rather than a fraction: its content
+                    // is URLs and versions, which wrap badly, and a fraction of
+                    // a wide viewport is more than they need while a fraction
+                    // of a narrow one is less.
+                    div { class: "grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_26rem] gap-4 items-start",
                         // Dependency lists are unbounded — thirty entries is
-                        // ordinary — so they take the wide column. The metadata
-                        // beside them is always the same handful of short
-                        // fields and fits a fixed sidebar.
-                        div { class: "lg:col-span-2 space-y-4", Relations { pkg: pkg.clone() } }
-                        div { class: "space-y-4",
+                        // ordinary — so they take the flexible column.
+                        div { class: "space-y-4 min-w-0",
+                            BuildSummary {
+                                pkgbase: pkg.name.clone(),
+                                builds: builds.to_vec(),
+                                on_changed: move |()| data.restart(),
+                            }
+                            Relations { pkg: pkg.clone() }
+                        }
+                        div { class: "space-y-4 min-w-0",
                             SourceCard { pkg: pkg.clone() }
-                            BuildConfigCard { pkg: pkg.clone() }
+                            BuildConfigCard {
+                                pkg: pkg.clone(),
+                                on_changed: move |()| data.restart(),
+                            }
                             ProducesCard { pkg: pkg.clone() }
                         }
                     }
@@ -164,15 +179,6 @@ fn PackageHeader(pkg: ExtendedPackage) -> Element {
                             p { class: "opacity-70 mt-1", "{description}" }
                         }
                         VersionLine { pkg: pkg.clone() }
-                    }
-                    div { class: "flex-1" }
-                    div { class: "flex gap-2",
-                        button { class: "btn btn-primary btn-sm", "Rebuild" }
-                        Link {
-                            class: "btn btn-sm",
-                            to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
-                            "Edit sources"
-                        }
                     }
                 }
             }
@@ -213,7 +219,7 @@ fn VersionLine(pkg: ExtendedPackage) -> Element {
 
 /// The two builds worth knowing about, and how long a build usually takes.
 #[component]
-fn BuildSummary(pkgbase: String, builds: Vec<Build>) -> Element {
+fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()>) -> Element {
     let now = now_secs();
     let newest = latest(&builds);
     let repo = in_repo(&builds);
@@ -232,17 +238,20 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>) -> Element {
             div { class: "card-body py-4",
                 div { class: "flex items-center gap-3 flex-wrap",
                     h2 { class: "card-title text-base", "Builds" }
-                    div { class: "flex-1" }
                     if let Some(typical) = typical {
                         span { class: "text-sm opacity-60",
                             "typically {format_duration(Some(0), Some(typical))}"
                         }
                     }
+                    div { class: "flex-1" }
                     Link {
                         class: "link link-primary text-sm",
                         to: Route::PackageBuilds { pkgbase: pkgbase.clone() },
                         "All builds →"
                     }
+                    // Rebuilding produces a build, so the button belongs with
+                    // the builds rather than in the page header.
+                    RebuildButton { pkgbase: pkgbase.clone(), on_changed }
                 }
 
                 match newest {
@@ -464,13 +473,15 @@ fn SourceCard(pkg: ExtendedPackage) -> Element {
 }
 
 #[component]
-fn BuildConfigCard(pkg: ExtendedPackage) -> Element {
+fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 h2 { class: "card-title text-base", "Build config" }
-                Field { label: "Platforms",
-                    span { class: "font-mono text-xs", "{pkg.selected_platforms.join(\", \")}" }
+                PlatformField {
+                    pkgbase: pkg.name.clone(),
+                    selected: pkg.selected_platforms.clone(),
+                    on_changed,
                 }
                 {
                     let flags: Vec<String> = pkg
@@ -488,14 +499,17 @@ fn BuildConfigCard(pkg: ExtendedPackage) -> Element {
                 }
                 Field { label: "Patch",
                     if pkg.has_patch {
-                        Link {
-                            class: "link link-primary",
-                            to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
-                            "applied →"
-                        }
+                        span { class: "badge badge-warning badge-sm", "applied" }
                     } else {
                         span { class: "opacity-60", "none" }
                     }
+                }
+                // Editing the sources is what creates or clears that patch, so
+                // it sits with it rather than in the page header.
+                Link {
+                    class: "btn btn-sm btn-block mt-2",
+                    to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
+                    "Edit sources"
                 }
             }
         }
@@ -553,6 +567,172 @@ fn browsable_url(raw: &str) -> Option<String> {
     let url = raw.trim().strip_prefix("git+").unwrap_or(raw.trim());
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
+
+/// Queue a rebuild of this package.
+///
+/// Disabled while in flight so a double click does not queue twice, and it
+/// reports what happened rather than silently doing nothing — a rebuild is
+/// otherwise invisible until the build list refreshes.
+#[component]
+fn RebuildButton(pkgbase: String, on_changed: EventHandler<()>) -> Element {
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    rsx! {
+        div { class: "flex items-center gap-2",
+            if let Some(message) = error() {
+                span { class: "text-xs text-error", "{message}" }
+            }
+            button {
+                class: "btn btn-primary btn-sm",
+                disabled: busy(),
+                onclick: move |_| {
+                    let pkgbase = pkgbase.clone();
+                    async move {
+                        busy.set(true);
+                        error.set(None);
+                        let outcome = match client() {
+                            Ok(client) => client
+                                .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest {
+                                    force: true,
+                                })
+                                .await
+                                .map_err(|e| e.to_string()),
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = outcome {
+                            error.set(Some(e));
+                        } else {
+                            on_changed.call(());
+                        }
+                        busy.set(false);
+                    }
+                },
+                if busy() {
+                    span { class: "loading loading-spinner loading-xs" }
+                }
+                "Rebuild"
+            }
+        }
+    }
+}
+
+/// The platforms a package is built for, with an inline editor.
+///
+/// Changing this changes which dependencies are required — a PKGBUILD can
+/// declare `depends_aarch64` separately — so the server re-resolves the
+/// dependency graph on save. That is why the page reloads afterwards rather
+/// than patching the field in place.
+#[component]
+fn PlatformField(pkgbase: String, selected: Vec<String>, on_changed: EventHandler<()>) -> Element {
+    let mut editing = use_signal(|| false);
+    let mut draft = use_signal(|| selected.clone());
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    // Reset the draft each time the editor opens, so a cancelled edit does not
+    // linger into the next one.
+    let start = {
+        let selected = selected.clone();
+        move |_| {
+            draft.set(selected.clone());
+            error.set(None);
+            editing.set(true);
+        }
+    };
+
+    rsx! {
+        div { class: "flex gap-2 py-1 text-sm",
+            span { class: "opacity-60 w-24 shrink-0", "Platforms" }
+            div { class: "min-w-0 flex-1",
+                if editing() {
+                    div { class: "flex flex-col gap-1",
+                        for platform in ALL_PLATFORMS {
+                            label { key: "{platform}", class: "flex items-center gap-2 cursor-pointer",
+                                input {
+                                    r#type: "checkbox",
+                                    class: "checkbox checkbox-xs",
+                                    checked: draft().iter().any(|p| p == platform),
+                                    onchange: move |e| {
+                                        let mut next = draft();
+                                        if e.checked() {
+                                            if !next.iter().any(|p| p == platform) {
+                                                next.push(platform.to_string());
+                                            }
+                                        } else {
+                                            next.retain(|p| p != platform);
+                                        }
+                                        draft.set(next);
+                                    },
+                                }
+                                span { class: "font-mono text-xs", "{platform}" }
+                            }
+                        }
+                        if let Some(message) = error() {
+                            span { class: "text-xs text-error", "{message}" }
+                        }
+                        div { class: "flex gap-2 pt-1",
+                            button {
+                                class: "btn btn-primary btn-xs",
+                                // A package built for nothing would never build
+                                // again, so saving an empty set is refused
+                                // rather than accepted and puzzled over later.
+                                disabled: busy() || draft().is_empty(),
+                                onclick: {
+                                    let pkgbase = pkgbase.clone();
+                                    move |_| {
+                                        let pkgbase = pkgbase.clone();
+                                        async move {
+                                            busy.set(true);
+                                            error.set(None);
+                                            let outcome = match client() {
+                                                Ok(client) => client
+                                                    .patch_package(&pkgbase, &aurcache_client::PatchPackageRequest {
+                                                        platforms: Some(draft()),
+                                                        ..Default::default()
+                                                    })
+                                                    .await
+                                                    .map_err(|e| e.to_string()),
+                                                Err(e) => Err(e),
+                                            };
+                                            match outcome {
+                                                Ok(()) => {
+                                                    editing.set(false);
+                                                    on_changed.call(());
+                                                }
+                                                Err(e) => error.set(Some(e)),
+                                            }
+                                            busy.set(false);
+                                        }
+                                    }
+                                },
+                                "Save"
+                            }
+                            button {
+                                class: "btn btn-ghost btn-xs",
+                                disabled: busy(),
+                                onclick: move |_| editing.set(false),
+                                "Cancel"
+                            }
+                        }
+                    }
+                } else {
+                    div { class: "flex items-center gap-2 flex-wrap",
+                        span { class: "font-mono text-xs", {selected.join(", ")} }
+                        button {
+                            class: "btn btn-ghost btn-xs",
+                            onclick: start,
+                            "Change"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The platforms a build can target, matching `pacman_mirrors::platforms`.
+const ALL_PLATFORMS: [&str; 3] = ["x86_64", "aarch64", "armv7h"];
 
 /// A value the backend does not expose yet.
 ///

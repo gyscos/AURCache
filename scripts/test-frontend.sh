@@ -139,6 +139,8 @@ ROUTES=(
     "/packages|—|missing version shows a placeholder"
     "/package/hello|Dependencies|package detail (depth 2)"
     "/package/hello|In repo|package detail shows what is in the repo"
+    "/package/hello|Rebuild|the rebuild button sits with the builds"
+    "/package/hello|Change|platforms can be edited where they are shown"
     "/package/hello/builds|Platform|per-package build history (depth 3)"
     "/package/yay|blocking|a blocked package names what is holding it back"
     "/package/yay|too old|a dependency built to an unsatisfying version"

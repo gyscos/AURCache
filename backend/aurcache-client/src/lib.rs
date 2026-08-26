@@ -133,7 +133,7 @@ pub struct UpdatePackageRequest {
 }
 
 /// Request payload for partially updating package metadata.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct PatchPackageRequest {
     /// Replacement package name.
     #[serde(skip_serializing_if = "Option::is_none")]
