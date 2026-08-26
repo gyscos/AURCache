@@ -85,12 +85,15 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                 }
                                 tbody {
                                     for build in list.iter() {
-                                        tr { key: "{build.id}", class: "hover",
+                                        tr { key: "{build.number}", class: "hover",
                                             td {
                                                 Link {
                                                     class: "link link-primary font-mono",
-                                                    to: Route::Build { id: build.id },
-                                                    "#{build.id}"
+                                                    to: Route::Build {
+                                                        pkgbase: build.pkg_name.clone(),
+                                                        number: build.number,
+                                                    },
+                                                    "{build.number}"
                                                 }
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm", "{build.version}" }

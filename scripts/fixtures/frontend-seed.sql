@@ -40,9 +40,10 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
 -- The spread exercises every branch of the duration and age formatters,
 -- including a build that started but never finished (NULL end_time), which
 -- must read as unknown rather than as a zero-length build.
-INSERT INTO builds (pkg_id, output, status, start_time, end_time, platform, version)
+INSERT INTO builds (pkg_id, number, output, status, start_time, end_time, platform, version)
 SELECT
   p.id,
+  1,
   '==> Making package: ' || p.name || char(10) || '==> Retrieving sources...',
   p.status,
   CAST(strftime('%s','now') AS INTEGER) - offs.age,
@@ -106,8 +107,9 @@ WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');
 -- "Latest" and "In repo" only when they differ, and that gap -- newest attempt
 -- broken, repository still serving something older -- is the case worth having
 -- on screen.
-INSERT INTO builds (pkg_id, output, status, start_time, end_time, platform, version)
+INSERT INTO builds (pkg_id, number, output, status, start_time, end_time, platform, version)
 SELECT p.id,
+       2,
        '==> Making package: hello' || char(10) || 'error: build failed',
        2,
        CAST(strftime('%s','now') AS INTEGER) - 60,

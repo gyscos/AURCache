@@ -226,25 +226,25 @@ enum BuildsCommand {
     List(ListBuildsArgs),
     /// Get one build.
     Get {
-        /// Build id.
-        id: i32,
+        /// Build reference, e.g. `hello/3`.
+        build: BuildRef,
     },
     /// Fetch build output.
     Output(BuildOutputArgs),
     /// Retry a build.
     Retry {
-        /// Build id.
-        id: i32,
+        /// Build reference, e.g. `hello/3`.
+        build: BuildRef,
     },
     /// Cancel a build.
     Cancel {
-        /// Build id.
-        id: i32,
+        /// Build reference, e.g. `hello/3`.
+        build: BuildRef,
     },
     /// Delete a build.
     Delete {
-        /// Build id.
-        id: i32,
+        /// Build reference, e.g. `hello/3`.
+        build: BuildRef,
     },
     /// Follow builds until they finish, reporting progress.
     Watch(WatchArgs),
@@ -295,8 +295,8 @@ struct ListBuildsArgs {
 
 #[derive(Args, Debug, Clone)]
 struct BuildOutputArgs {
-    /// Build id.
-    id: i32,
+    /// Build reference, e.g. `hello/3`.
+    build: BuildRef,
 
     /// Skip output lines before this index.
     #[arg(long = "start-line")]
@@ -483,11 +483,11 @@ async fn run_builds_command(
 ) -> Result<()> {
     match command {
         BuildsCommand::List(args) => render_builds_list(client, format, args).await,
-        BuildsCommand::Get { id } => render_build(client, format, id).await,
+        BuildsCommand::Get { build } => render_build(client, format, build).await,
         BuildsCommand::Output(args) => render_build_output(client, format, args).await,
-        BuildsCommand::Retry { id } => retry_build_command(client, format, id).await,
-        BuildsCommand::Cancel { id } => cancel_build_command(client, format, id).await,
-        BuildsCommand::Delete { id } => delete_build_command(client, format, id).await,
+        BuildsCommand::Retry { build } => retry_build_command(client, format, build).await,
+        BuildsCommand::Cancel { build } => cancel_build_command(client, format, build).await,
+        BuildsCommand::Delete { build } => delete_build_command(client, format, build).await,
         BuildsCommand::Watch(args) => watch_builds_command(client, args).await,
     }
 }
@@ -678,22 +678,26 @@ async fn update_package_command(
     format: OutputFormat,
     args: UpdatePackageArgs,
 ) -> Result<()> {
-    let updated_ids = client
+    let queued = client
         .update_package(&args.pkgbase, &UpdatePackageRequest { force: args.force })
         .await?;
-    render(format, &updated_ids, |ids| print_updated_package_ids(ids))
+    render(format, &queued, |numbers| {
+        print_queued_builds(&args.pkgbase, numbers);
+    })
 }
 
-fn print_updated_package_ids(updated_ids: &[i32]) {
-    if updated_ids.is_empty() {
+/// The numbers come back bare, so they are printed against the package they
+/// belong to — `hello/4`, the same reference every other build command takes.
+fn print_queued_builds(pkgbase: &str, numbers: &[i32]) {
+    if numbers.is_empty() {
         println!("no builds were queued");
         return;
     }
     println!(
-        "queued package ids: {}",
-        updated_ids
+        "queued builds: {}",
+        numbers
             .iter()
-            .map(ToString::to_string)
+            .map(|n| format!("{pkgbase}/{n}"))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -755,8 +759,12 @@ async fn render_builds_list(
     render(format, &builds, |builds| print_build_list(builds))
 }
 
-async fn render_build(client: &AurCacheClient, format: OutputFormat, id: i32) -> Result<()> {
-    let build = client.get_build(id).await?;
+async fn render_build(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    build: BuildRef,
+) -> Result<()> {
+    let build = client.get_build(&build.pkgbase, build.number).await?;
     render(format, &build, print_build)
 }
 
@@ -765,7 +773,9 @@ async fn render_build_output(
     format: OutputFormat,
     args: BuildOutputArgs,
 ) -> Result<()> {
-    let output = client.build_output(args.id, args.start_line).await?;
+    let output = client
+        .build_output(&args.build.pkgbase, args.build.number, args.start_line)
+        .await?;
     match format {
         OutputFormat::Json => print_json(&json!({ "output": output })),
         OutputFormat::Text => {
@@ -775,12 +785,16 @@ async fn render_build_output(
     }
 }
 
-async fn retry_build_command(client: &AurCacheClient, format: OutputFormat, id: i32) -> Result<()> {
-    let build_id = client.retry_build(id).await?;
+async fn retry_build_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    build: BuildRef,
+) -> Result<()> {
+    let number = client.retry_build(&build.pkgbase, build.number).await?;
     match format {
-        OutputFormat::Json => print_json(&build_id),
+        OutputFormat::Json => print_json(&number),
         OutputFormat::Text => {
-            println!("enqueued build: {build_id}");
+            println!("enqueued build: {}/{number}", build.pkgbase);
             Ok(())
         }
     }
@@ -789,9 +803,9 @@ async fn retry_build_command(client: &AurCacheClient, format: OutputFormat, id: 
 async fn cancel_build_command(
     client: &AurCacheClient,
     format: OutputFormat,
-    id: i32,
+    build: BuildRef,
 ) -> Result<()> {
-    client.cancel_build(id).await?;
+    client.cancel_build(&build.pkgbase, build.number).await?;
     print_done_message(format, "build cancelled");
     Ok(())
 }
@@ -799,9 +813,9 @@ async fn cancel_build_command(
 async fn delete_build_command(
     client: &AurCacheClient,
     format: OutputFormat,
-    id: i32,
+    build: BuildRef,
 ) -> Result<()> {
-    client.delete_build(id).await?;
+    client.delete_build(&build.pkgbase, build.number).await?;
     print_done_message(format, "build deleted");
     Ok(())
 }
@@ -1103,9 +1117,11 @@ fn print_build_list(builds: &[Build]) {
         .iter()
         .map(|build| {
             vec![
-                build.id.to_string(),
-                build.pkg_id.to_string(),
-                build.pkg_name.clone(),
+                // The build's public name, the same form the argument parser
+                // accepts, so a row can be copied straight into another
+                // command. It already names the package, so there is no
+                // separate column for that.
+                format!("{}/{}", build.pkg_name, build.number),
                 build.platform.clone(),
                 build_status_label(build.status).to_string(),
                 build.version.clone(),
@@ -1116,9 +1132,7 @@ fn print_build_list(builds: &[Build]) {
         .collect::<Vec<_>>();
     print_table(
         &[
-            "id",
-            "pkg_id",
-            "package",
+            "build",
             "platform",
             "status",
             "version",
@@ -1130,9 +1144,7 @@ fn print_build_list(builds: &[Build]) {
 }
 
 fn print_build(build: &Build) {
-    println!("id: {}", build.id);
-    println!("pkg_id: {}", build.pkg_id);
-    println!("package: {}", build.pkg_name);
+    println!("build: {}/{}", build.pkg_name, build.number);
     println!("platform: {}", build.platform);
     println!("status: {}", build_status_label(build.status));
     println!("version: {}", build.version);
@@ -1169,7 +1181,9 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
     let start = Instant::now();
     let mut last_change = Instant::now();
     let mut last_beat = Instant::now();
-    let mut seen: HashMap<i32, i32> = HashMap::new();
+    // Keyed by the build's public identity, since the row id is no longer
+    // part of the API.
+    let mut seen: HashMap<(String, i32), i32> = HashMap::new();
 
     loop {
         let builds: Vec<_> = client
@@ -1182,16 +1196,17 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
         const STATUS_ENQUEUED: i32 = 3;
         let mut changed = false;
         for build in &builds {
-            if seen.get(&build.id) != Some(&build.status) {
+            let key = (build.pkg_name.clone(), build.number);
+            if seen.get(&key) != Some(&build.status) {
                 if args.fail_on_requeue
-                    && seen.get(&build.id) == Some(&STATUS_ACTIVE)
+                    && seen.get(&key) == Some(&STATUS_ACTIVE)
                     && build.status == STATUS_ENQUEUED
                 {
                     bail!(
-                        "{} #{} was requeued after running: the server refused the \
+                        "{}/{} was requeued after running: the server refused the \
                          worker's completion, which will repeat indefinitely",
                         build.pkg_name,
-                        build.id
+                        build.number
                     );
                 }
                 let elapsed = start.elapsed().as_secs();
@@ -1201,12 +1216,12 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
                     .map(|r| format!(" — {r}"))
                     .unwrap_or_default();
                 println!(
-                    "[{elapsed:>4}s] {} #{}: {}{reason}",
+                    "[{elapsed:>4}s] {}/{}: {}{reason}",
                     build.pkg_name,
-                    build.id,
+                    build.number,
                     build_status_label(build.status),
                 );
-                seen.insert(build.id, build.status);
+                seen.insert(key, build.status);
                 changed = true;
             }
         }
@@ -1244,9 +1259,9 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
                     .map(|r| format!(" — {r}"))
                     .unwrap_or_default();
                 eprintln!(
-                    "  {} #{}: {}{reason}",
+                    "  {}/{}: {}{reason}",
                     build.pkg_name,
-                    build.id,
+                    build.number,
                     build_status_label(build.status)
                 );
             }
@@ -1396,5 +1411,82 @@ mod tests {
     fn does_not_treat_git_like_aur_names_as_urls() {
         assert!(!looks_like_git_url("paru-git"));
         assert!(!looks_like_git_url("lab.git"));
+    }
+}
+
+/// A build named the way the rest of the system names it: `<pkgbase>/<number>`.
+///
+/// Parsed from one argument rather than two so `builds show hello/3` reads the
+/// way the UI and the URLs write it. The separator is `/` because a pkgbase
+/// cannot contain one — and because `#` would have to be quoted in most
+/// shells, and `:` already means an epoch in a version.
+#[derive(Clone, Debug)]
+struct BuildRef {
+    pkgbase: String,
+    number: i32,
+}
+
+impl std::str::FromStr for BuildRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Split on the last `/`: everything before it is the pkgbase.
+        let (pkgbase, number) = value
+            .rsplit_once('/')
+            .ok_or_else(|| format!("expected <pkgbase>/<number>, got {value:?}"))?;
+        if pkgbase.is_empty() {
+            return Err(format!("missing package name in {value:?}"));
+        }
+        let number = number
+            .parse::<i32>()
+            .map_err(|_| format!("{number:?} is not a build number"))?;
+        if number < 1 {
+            return Err("build numbers start at 1".to_string());
+        }
+        Ok(Self {
+            pkgbase: pkgbase.to_string(),
+            number,
+        })
+    }
+}
+
+#[cfg(test)]
+mod build_ref_tests {
+    use super::BuildRef;
+    use std::str::FromStr;
+
+    #[test]
+    fn a_reference_is_a_package_and_a_number() {
+        let parsed = BuildRef::from_str("hello/3").expect("parses");
+        assert_eq!(parsed.pkgbase, "hello");
+        assert_eq!(parsed.number, 3);
+    }
+
+    /// Package names contain the characters the AUR allows, none of which is a
+    /// slash — so the last slash is always the separator.
+    #[test]
+    fn awkward_package_names_survive() {
+        for (input, pkgbase) in [
+            ("aewm++/1", "aewm++"),
+            ("2048.c/12", "2048.c"),
+            ("python-3.11/7", "python-3.11"),
+            ("1337/2", "1337"),
+        ] {
+            let parsed = BuildRef::from_str(input).expect(input);
+            assert_eq!(parsed.pkgbase, pkgbase, "{input}");
+        }
+    }
+
+    /// A bare number is the old id form, and silently guessing what it meant
+    /// would resolve to a different build than the caller intended.
+    #[test]
+    fn a_bare_number_is_rejected() {
+        assert!(BuildRef::from_str("417").is_err());
+        assert!(BuildRef::from_str("hello").is_err());
+        assert!(BuildRef::from_str("/3").is_err());
+        assert!(BuildRef::from_str("hello/").is_err());
+        assert!(BuildRef::from_str("hello/x").is_err());
+        // Numbering starts at 1, so 0 is not a build.
+        assert!(BuildRef::from_str("hello/0").is_err());
     }
 }

@@ -12,6 +12,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub pkg_id: i32,
+    /// This build's number *within its package*, counting from 1.
+    ///
+    /// The public identity of a build is `<pkgbase>/<number>`; [`Self::id`] is
+    /// an internal key that no URL, API response or screen shows.
+    pub number: i32,
     pub output: Option<String>,
     pub status: Option<i32>,
     pub start_time: Option<i64>,

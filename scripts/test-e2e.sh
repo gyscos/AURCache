@@ -97,10 +97,10 @@ filter_noise() {
 # AURCache's own build log is what actually explains a failed build; container
 # logs mostly show the plumbing around it.
 dump_build_log() {
-    local build_id="$1"
-    [ -n "$build_id" ] || return 0
-    echo "--- AURCache build log (build $build_id) ---"
-    aurcache_cli builds output "$build_id" 2>&1 | tail -n 100 || echo "    (build log unavailable)"
+    local build_ref="$1"
+    [ -n "$build_ref" ] || return 0
+    echo "--- AURCache build log (build $build_ref) ---"
+    aurcache_cli builds output "$build_ref" 2>&1 | tail -n 100 || echo "    (build log unavailable)"
 }
 
 # Show every build's state, not just the one being waited on. A package stuck
@@ -121,15 +121,15 @@ dump_logs_on_failure() {
 
     dump_build_states
 
-    local build_id="${CURRENT_BUILD_ID:-}"
-    if [ -n "$build_id" ]; then
-        echo "--- build $build_id: errors ---"
-        aurcache_cli builds output "$build_id" 2>/dev/null \
+    local build_ref="${CURRENT_BUILD_REF:-}"
+    if [ -n "$build_ref" ]; then
+        echo "--- build $build_ref: errors ---"
+        aurcache_cli builds output "$build_ref" 2>/dev/null \
             | grep -E "^==> ERROR|error:|failed|Permission denied|No such file" \
             | tail -n 15 \
             || echo "    (no error lines matched; see the full log)"
-        echo "--- build $build_id: last 20 lines ---"
-        aurcache_cli builds output "$build_id" 2>/dev/null | tail -n 20 \
+        echo "--- build $build_ref: last 20 lines ---"
+        aurcache_cli builds output "$build_ref" 2>/dev/null | tail -n 20 \
             || echo "    (build log unavailable)"
     fi
 
@@ -139,7 +139,7 @@ dump_logs_on_failure() {
 
     echo
     echo "    Full logs:      $LOG_FILE"
-    echo "    Full build log: $CLI_BIN builds output ${build_id:-<id>}"
+    echo "    Full build log: $CLI_BIN builds output ${build_ref:-<pkgbase>/<number>}"
     echo "    Containers are left running; inspect with:"
     echo "        docker compose -f '$COMPOSE_FILE' logs -f"
     echo "        docker compose -f '$COMPOSE_FILE' exec ${E2E_SERVICES%% *} bash"
@@ -272,8 +272,8 @@ request_package() {
         # A dead container explains a failure better than the build log does, so
         # check that first.
         assert_services_alive
-        CURRENT_BUILD_ID=$(aurcache_cli --format json builds list --limit 20 2>/dev/null \
-            | jq -r "[.[] | select(.pkg_name == \"$PACKAGE\")] | max_by(.id) | .id // empty" 2>/dev/null || echo "")
+        CURRENT_BUILD_REF=$(aurcache_cli --format json builds list --limit 20 2>/dev/null \
+            | jq -r "[.[] | select(.pkg_name == \"$PACKAGE\")] | max_by(.number) | \"\(.pkg_name)/\(.number)\"" 2>/dev/null || echo "")
         dump_logs_on_failure
         exit 1
     fi

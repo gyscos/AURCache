@@ -253,9 +253,10 @@ impl AurCacheClient {
             .await
     }
 
-    /// Triggers an update check for the given package id.
+    /// Triggers an update check for the given package.
     ///
-    /// Returns any package ids queued as a result of the update.
+    /// Returns the build number, within that package, of each build queued as
+    /// a result of the update — one per platform that got one.
     pub async fn update_package(
         &self,
         pkgbase: &str,
@@ -347,19 +348,30 @@ impl AurCacheClient {
     }
 
     /// Fetches details for a single build id.
-    pub async fn get_build(&self, id: i32) -> Result<Build> {
-        self.request_json::<Build, Value>(Method::GET, &format!("/build/{id}"), &[], None)
-            .await
+    /// Fetch one build by its public identity, `<pkgbase>/<number>`.
+    pub async fn get_build(&self, pkgbase: &str, number: i32) -> Result<Build> {
+        self.request_json::<Build, Value>(
+            Method::GET,
+            &format!("/package/{pkgbase}/build/{number}"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// Fetches raw build output text.
     ///
     /// When `start_line` is provided, lines before that offset are skipped.
-    pub async fn build_output(&self, id: i32, start_line: Option<i32>) -> Result<String> {
+    pub async fn build_output(
+        &self,
+        pkgbase: &str,
+        number: i32,
+        start_line: Option<i32>,
+    ) -> Result<String> {
         let query = Query::default().opt("startline", start_line);
         self.request_text::<Value>(
             Method::GET,
-            &format!("/build/{id}/output"),
+            &format!("/package/{pkgbase}/build/{number}/output"),
             query.pairs(),
             None,
         )
@@ -367,21 +379,38 @@ impl AurCacheClient {
     }
 
     /// Retries the given build and returns the new build id.
-    pub async fn retry_build(&self, id: i32) -> Result<i32> {
-        self.request_json::<i32, Value>(Method::POST, &format!("/build/{id}/retry"), &[], None)
-            .await
+    /// Re-runs the given build, returning the new build's number within the
+    /// same package.
+    pub async fn retry_build(&self, pkgbase: &str, number: i32) -> Result<i32> {
+        self.request_json::<i32, Value>(
+            Method::POST,
+            &format!("/package/{pkgbase}/build/{number}/retry"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// Requests cancellation of the given build.
-    pub async fn cancel_build(&self, id: i32) -> Result<()> {
-        self.request_empty::<Value>(Method::POST, &format!("/build/{id}/cancel"), &[], None)
-            .await
+    pub async fn cancel_build(&self, pkgbase: &str, number: i32) -> Result<()> {
+        self.request_empty::<Value>(
+            Method::POST,
+            &format!("/package/{pkgbase}/build/{number}/cancel"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// Deletes the given build record.
-    pub async fn delete_build(&self, id: i32) -> Result<()> {
-        self.request_empty::<Value>(Method::DELETE, &format!("/build/{id}"), &[], None)
-            .await
+    pub async fn delete_build(&self, pkgbase: &str, number: i32) -> Result<()> {
+        self.request_empty::<Value>(
+            Method::DELETE,
+            &format!("/package/{pkgbase}/build/{number}"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// Lists all enrolled remote build workers and their status.

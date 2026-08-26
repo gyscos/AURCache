@@ -5,8 +5,13 @@ use utoipa::ToSchema;
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct BuildSummary {
-    pub id: i32,
-    pub pkg_id: i32,
+    /// This build's number within its package, counting from 1.
+    ///
+    /// A build is publicly `<pkgbase>/<number>` — `hello/3` — so the row id is
+    /// never exposed: it is a global sequence that says nothing about which
+    /// package a build belongs to, and leaks how many builds the server has
+    /// run in total.
+    pub number: i32,
     pub pkg_name: String,
     pub version: String,
     pub status: i32,

@@ -449,7 +449,7 @@ pub async fn package_update_endpoint(
                 results
                     .into_iter()
                     .filter(|r| r.enqueued)
-                    .map(|r| r.build_id)
+                    .map(|r| r.build_number)
                     .collect::<Vec<_>>(),
             )
         })

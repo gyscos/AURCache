@@ -129,12 +129,12 @@ curl -sf "http://localhost:$UI_PORT/" -o /dev/null || fail "ui server did not co
 # Routes two or more segments deep are the important ones and must stay in this
 # list. The relative-asset-path bug that shipped blank pages left `/` and
 # `/builds` working — at one segment deep a relative specifier still resolves
-# correctly — and broke only `/build/1` and below. A list of shallow routes
+# correctly — and broke only `/package/hello/build/1` and below. A list of shallow routes
 # would have passed straight through it.
 ROUTES=(
     "/|Needs a charting story|dashboard"
     "/builds|Duration|builds list"
-    "/build/1|Build #1|build log (depth 2)"
+    "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"
     "/packages|—|missing version shows a placeholder"
     "/package/hello|Dependencies|package detail (depth 2)"

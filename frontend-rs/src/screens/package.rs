@@ -27,7 +27,7 @@ const BUILD_SAMPLE: u64 = 20;
 /// depends on for correctness, so it picks the maximum explicitly rather than
 /// trusting position.
 fn latest(builds: &[Build]) -> Option<&Build> {
-    builds.iter().max_by_key(|b| (b.start_time, b.id))
+    builds.iter().max_by_key(|b| (b.start_time, b.number))
 }
 
 /// The newest build that succeeded — the one whose packages are in the repo.
@@ -35,7 +35,7 @@ fn in_repo(builds: &[Build]) -> Option<&Build> {
     builds
         .iter()
         .filter(|b| matches!(BuildState::from_i32(b.status), Some(BuildState::Successful)))
-        .max_by_key(|b| (b.end_time, b.id))
+        .max_by_key(|b| (b.end_time, b.number))
 }
 
 /// How long a build of this package usually takes.
@@ -163,36 +163,53 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
                     div { class: "min-w-0",
                         // The trail *is* the heading, rather than a small copy
                         // of it above: the package name appeared twice
-                        // otherwise. Ancestors are muted and unbolded so the
-                        // page you are on still reads as the title.
-                        h1 {
-                            class: "text-2xl font-bold flex items-center gap-2 flex-wrap break-all",
-                            Link {
-                                class: "font-normal opacity-50 link-hover",
-                                to: Route::Packages {},
-                                "Packages"
-                            }
-                            span { class: "font-normal opacity-30", "/" }
-                            if trail.is_empty() {
-                                span { class: "font-mono", "{pkg.name}" }
-                            } else {
+                        // otherwise. Ancestors are muted so the page you are on
+                        // still reads as the title.
+                        //
+                        // Laid out as ordinary inline text, not as a flex
+                        // row: a baseline-aligned flex row takes its baseline
+                        // from whichever item has the taller ascent, and the
+                        // package name is monospace while the crumbs are not.
+                        //
+                        // `leading-8` is what actually lands "Packages" on the
+                        // same pixel as the identical word on the package list.
+                        // There the heading's 28px line box is centred in this
+                        // 32px row, so it starts 2px down; here the line box is
+                        // the full 32px and starts at 0, and the extra
+                        // half-leading puts the baseline in the same place. Let
+                        // the box size itself instead and it comes out 29px
+                        // tall — the monospace name widens it — which centres
+                        // to a half pixel and rounds the whole heading up by
+                        // one.
+                        div { class: "flex items-center min-h-8",
+                            h1 { class: "card-title block leading-8 break-all",
                                 Link {
-                                    class: "font-mono font-normal opacity-50 link-hover",
-                                    to: Route::Package { pkgbase: pkg.name.clone() },
-                                    "{pkg.name}"
+                                    class: "opacity-60 link-hover",
+                                    to: Route::Packages {},
+                                    "Packages"
                                 }
-                                for (index, (label, route)) in trail.iter().enumerate() {
-                                    span { key: "sep-{index}", class: "font-normal opacity-30", "/" }
-                                    match route.clone() {
-                                        Some(route) => rsx! {
-                                            Link {
-                                                key: "{index}",
-                                                class: "font-normal opacity-50 link-hover",
-                                                to: route,
-                                                "{label}"
-                                            }
-                                        },
-                                        None => rsx! { span { key: "{index}", "{label}" } },
+                                span { class: "opacity-30 mx-2", "/" }
+                                if trail.is_empty() {
+                                    span { class: "font-mono", "{pkg.name}" }
+                                } else {
+                                    Link {
+                                        class: "font-mono opacity-60 link-hover",
+                                        to: Route::Package { pkgbase: pkg.name.clone() },
+                                        "{pkg.name}"
+                                    }
+                                    for (index, (label, route)) in trail.iter().enumerate() {
+                                        span { key: "sep-{index}", class: "opacity-30 mx-2", "/" }
+                                        match route.clone() {
+                                            Some(route) => rsx! {
+                                                Link {
+                                                    key: "{index}",
+                                                    class: "opacity-60 link-hover",
+                                                    to: route,
+                                                    "{label}"
+                                                }
+                                            },
+                                            None => rsx! { span { key: "{index}", "{label}" } },
+                                        }
                                     }
                                 }
                             }
@@ -262,7 +279,7 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
     // they differ, that gap is the story: the newest attempt failed and the
     // repository still holds something older.
     let show_repo = match (newest, repo) {
-        (Some(newest), Some(repo)) => newest.id != repo.id,
+        (Some(newest), Some(repo)) => newest.number != repo.number,
         (None, Some(_)) => true,
         _ => false,
     };
@@ -320,9 +337,9 @@ fn BuildRow(label: String, entry: Build, now: i64) -> Element {
     rsx! {
         Link {
             class: "flex items-center gap-3 py-2 hover:bg-base-200 px-2 -mx-2 rounded flex-wrap",
-            to: Route::Build { id: entry.id },
+            to: Route::Build { pkgbase: entry.pkg_name.clone(), number: entry.number },
             span { class: "text-sm opacity-60 w-20 shrink-0", "{label}" }
-            span { class: "font-mono text-sm", "#{entry.id}" }
+            span { class: "font-mono text-sm", "{entry.number}" }
             BuildStatusBadge { status: entry.status }
             span { class: "font-mono text-sm opacity-70", "{entry.version}" }
             div { class: "flex-1" }
@@ -798,10 +815,9 @@ fn Field(label: String, children: Element) -> Element {
 mod tests {
     use super::*;
 
-    fn sample(id: i32, status: BuildState, start: Option<i64>, end: Option<i64>) -> Build {
+    fn sample(number: i32, status: BuildState, start: Option<i64>, end: Option<i64>) -> Build {
         Build {
-            id,
-            pkg_id: 1,
+            number,
             pkg_name: "hello".to_string(),
             version: "1.0-1".to_string(),
             status: status.as_i32(),
@@ -821,7 +837,7 @@ mod tests {
             sample(3, BuildState::Failed, Some(300), Some(310)),
             sample(2, BuildState::Successful, Some(200), Some(260)),
         ];
-        assert_eq!(latest(&builds).map(|b| b.id), Some(3));
+        assert_eq!(latest(&builds).map(|b| b.number), Some(3));
     }
 
     /// What is in the repository is the newest *successful* build, which is
@@ -833,10 +849,10 @@ mod tests {
             sample(3, BuildState::Failed, Some(300), Some(310)),
             sample(2, BuildState::Successful, Some(200), Some(260)),
         ];
-        assert_eq!(in_repo(&builds).map(|b| b.id), Some(2));
+        assert_eq!(in_repo(&builds).map(|b| b.number), Some(2));
         assert_ne!(
-            latest(&builds).map(|b| b.id),
-            in_repo(&builds).map(|b| b.id),
+            latest(&builds).map(|b| b.number),
+            in_repo(&builds).map(|b| b.number),
             "a failing latest build is the case the second row exists for"
         );
     }
@@ -849,8 +865,8 @@ mod tests {
             sample(2, BuildState::Successful, Some(200), Some(260)),
         ];
         assert_eq!(
-            latest(&builds).map(|b| b.id),
-            in_repo(&builds).map(|b| b.id)
+            latest(&builds).map(|b| b.number),
+            in_repo(&builds).map(|b| b.number)
         );
     }
 
@@ -859,7 +875,7 @@ mod tests {
     fn a_package_that_never_succeeded_has_nothing_in_the_repo() {
         let builds = vec![sample(1, BuildState::Failed, Some(100), Some(150))];
         assert!(in_repo(&builds).is_none());
-        assert_eq!(latest(&builds).map(|b| b.id), Some(1));
+        assert_eq!(latest(&builds).map(|b| b.number), Some(1));
     }
 
     /// Median, not mean: the 40-minute outlier must not become "typical".

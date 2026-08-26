@@ -610,6 +610,9 @@ pub struct PlatformUpdateResult {
     /// whether the build was actually dispatched or is still waiting on a
     /// dependency rebuild.
     pub build_id: i32,
+    /// The same build's public number within its package. Callers that report
+    /// back to a user want this rather than `build_id`, which is internal.
+    pub build_number: i32,
     /// `true` if the build was enqueued/promoted and dispatched to the builder;
     /// `false` if it was left `WAITING_FOR_DEPS` pending an unfinished
     /// dependency rebuild.
@@ -643,6 +646,7 @@ async fn enqueue_platform_builds(
             results.push(PlatformUpdateResult {
                 platform: *platform,
                 build_id: result.build.id,
+                build_number: result.build.number,
                 enqueued: result.inserted,
             });
         } else {
@@ -661,6 +665,7 @@ async fn enqueue_platform_builds(
             results.push(PlatformUpdateResult {
                 platform: *platform,
                 build_id: waiting.build.id,
+                build_number: waiting.build.number,
                 enqueued: false,
             });
         }

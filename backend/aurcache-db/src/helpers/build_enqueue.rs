@@ -1,7 +1,7 @@
 use crate::builds;
 use crate::prelude::Builds;
 use pacman_mirrors::platforms::Platform;
-use sea_orm::sea_query::{OnConflict, Query};
+use sea_orm::sea_query::{Expr, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     IntoActiveModel, QueryFilter, TryIntoModel,
@@ -34,48 +34,77 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     initial_status: i32,
 ) -> Result<EnqueueBuildResult, DbErr> {
     let platform_str = platform.as_str();
-    let insert = Query::insert()
-        .into_table(builds::Entity)
-        .columns([
-            builds::Column::PkgId,
-            builds::Column::Status,
-            builds::Column::StartTime,
-            builds::Column::Platform,
-            builds::Column::Version,
-        ])
-        .values([
-            pkg_id.into(),
-            initial_status.into(),
-            start_time.into(),
-            platform_str.to_owned().into(),
-            version.to_owned().into(),
-        ])
-        .map_err(|e| DbErr::Custom(e.to_string()))?
-        .on_conflict(OnConflict::new().do_nothing().to_owned())
-        .to_owned();
 
-    let result = db.execute(db.get_database_backend().build(&insert)).await?;
+    // Two conflicts can stop this insert, and they mean opposite things.
+    //
+    // `(pkg_id, platform)` means a pending build already exists — the intended
+    // outcome, and the row we then return.
+    //
+    // `(pkg_id, number)` means another insert for the same package took this
+    // number between our subquery and our write. Nothing is wrong with *this*
+    // build; it simply needs the next number. Without the retry that race
+    // surfaces as "Missing pending build row", because `DO NOTHING` swallowed
+    // an insert that should have happened.
+    const NUMBER_RACE_ATTEMPTS: usize = 5;
 
-    let build = Builds::find()
-        .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(builds::Column::Platform.eq(platform_str))
-        .filter(builds::Column::Status.is_in([
-            Some(ACTIVE_BUILD_STATUS),
-            Some(ENQUEUED_BUILD_STATUS),
-            Some(WAITING_FOR_DEPS_STATUS),
-        ]))
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            DbErr::Custom(format!(
-                "Missing pending build row for package {pkg_id} on platform {platform_str}"
-            ))
-        })?;
+    for _ in 0..NUMBER_RACE_ATTEMPTS {
+        // Read inside the statement rather than in a separate query, so the
+        // window a competing insert can land in is as small as the database
+        // allows.
+        let next_number = Expr::cust_with_values(
+            "(SELECT COALESCE(MAX(number), 0) + 1 FROM builds WHERE pkg_id = ?)",
+            [pkg_id],
+        );
 
-    Ok(EnqueueBuildResult {
-        build,
-        inserted: result.rows_affected() == 1,
-    })
+        let insert = Query::insert()
+            .into_table(builds::Entity)
+            .columns([
+                builds::Column::PkgId,
+                builds::Column::Status,
+                builds::Column::StartTime,
+                builds::Column::Platform,
+                builds::Column::Version,
+                builds::Column::Number,
+            ])
+            .values([
+                pkg_id.into(),
+                initial_status.into(),
+                start_time.into(),
+                platform_str.to_owned().into(),
+                version.to_owned().into(),
+                next_number,
+            ])
+            .map_err(|e| DbErr::Custom(e.to_string()))?
+            .on_conflict(OnConflict::new().do_nothing().to_owned())
+            .to_owned();
+
+        let result = db.execute(db.get_database_backend().build(&insert)).await?;
+
+        let existing = Builds::find()
+            .filter(builds::Column::PkgId.eq(pkg_id))
+            .filter(builds::Column::Platform.eq(platform_str))
+            .filter(builds::Column::Status.is_in([
+                Some(ACTIVE_BUILD_STATUS),
+                Some(ENQUEUED_BUILD_STATUS),
+                Some(WAITING_FOR_DEPS_STATUS),
+            ]))
+            .one(db)
+            .await?;
+
+        if let Some(build) = existing {
+            return Ok(EnqueueBuildResult {
+                build,
+                inserted: result.rows_affected() == 1,
+            });
+        }
+        // Nothing inserted and nothing pending: the number was taken. Try again
+        // with a freshly read maximum.
+    }
+
+    Err(DbErr::Custom(format!(
+        "Could not assign a build number for package {pkg_id} on platform {platform_str} \
+         after {NUMBER_RACE_ATTEMPTS} attempts"
+    )))
 }
 
 /// Promote an existing `WAITING_FOR_DEPS` build to `ENQUEUED` so that it can be started.

@@ -82,22 +82,33 @@ pub fn Builds() -> Element {
                                 tbody {
                                     for build in shown.iter() {
                                         tr {
-                                            key: "{build.id}",
+                                            key: "{build.pkg_name}/{build.number}",
                                             class: "hover cursor-pointer",
                                             // The row is the build: that is what
                                             // a build list is a list of.
                                             onclick: {
-                                                let id = build.id;
+                                                let pkgbase = build.pkg_name.clone();
+                                                let number = build.number;
                                                 move |_| {
-                                                    navigator().push(Route::Build { id });
+                                                    navigator().push(Route::Build {
+                                                        pkgbase: pkgbase.clone(),
+                                                        number,
+                                                    });
                                                 }
                                             },
                                             td {
                                                 Link {
                                                     class: "font-mono",
-                                                    to: Route::Build { id: build.id },
+                                                    to: Route::Build {
+                                                        pkgbase: build.pkg_name.clone(),
+                                                        number: build.number,
+                                                    },
                                                     onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    "#{build.id}"
+                                                    // The package is its own
+                                                    // column here, so repeating
+                                                    // it in the build cell would
+                                                    // say it twice.
+                                                    "{build.number}"
                                                 }
                                             }
                                             // The one cell that goes somewhere

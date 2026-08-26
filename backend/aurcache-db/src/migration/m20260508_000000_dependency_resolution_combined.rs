@@ -839,15 +839,18 @@ mod tests {
             .await
             .unwrap();
 
+        // Distinct build numbers throughout, so the rejection below is the
+        // pending-build index doing its job and not `UNIQUE (pkg_id, number)`
+        // catching two rows left at the column default.
         db.execute_unprepared(
-            "INSERT INTO builds (id, pkg_id, platform, status) VALUES (1, 1, 'x86_64', 3);",
+            "INSERT INTO builds (id, pkg_id, number, platform, status) VALUES (1, 1, 1, 'x86_64', 3);",
         )
         .await
         .unwrap();
 
         let result = db
             .execute_unprepared(
-                "INSERT INTO builds (id, pkg_id, platform, status) VALUES (2, 1, 'x86_64', 3);",
+                "INSERT INTO builds (id, pkg_id, number, platform, status) VALUES (2, 1, 2, 'x86_64', 3);",
             )
             .await;
 
@@ -857,7 +860,7 @@ mod tests {
         );
 
         db.execute_unprepared(
-            "INSERT INTO builds (id, pkg_id, platform, status) VALUES (3, 1, 'x86_64', 1);",
+            "INSERT INTO builds (id, pkg_id, number, platform, status) VALUES (3, 1, 3, 'x86_64', 1);",
         )
         .await
         .expect("inserting a successful build alongside a pending one should succeed");

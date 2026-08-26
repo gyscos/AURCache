@@ -11,8 +11,10 @@ use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
+use aurcache_types::api::waiting::WaitingReason;
 use aurcache_utils::package::update::package_update;
 use aurcache_utils::snapshot::SnapshotStore;
+use sea_orm::FromQueryResult;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait,
@@ -55,27 +57,25 @@ fn slice_output(output: Option<String>, startline: Option<i32>) -> String {
 #[utoipa::path(
     responses(
             (status = 200, description = "Build output from `startline` onwards; empty if the build has not logged anything yet"),
-            (status = 404, description = "No build with that id"),
+            (status = 404, description = "No such build"),
     ),
     params(
-            ("buildid", description = "Id of build"),
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package"),
             ("startline", description = "Number of leading lines to skip (i.e. how many the caller already has)")
     )
 )]
-#[get("/build/<buildid>/output?<startline>")]
+#[get("/package/<pkgbase>/build/<number>/output?<startline>")]
 pub async fn build_output(
     db: &State<DatabaseConnection>,
-    buildid: i32,
+    pkgbase: &str,
+    number: i32,
     startline: Option<i32>,
     _a: Authenticated,
 ) -> Result<String, ApiError> {
     let db = db.inner();
 
-    let build = Builds::find_by_id(buildid)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
+    let build = build_by_number(db, pkgbase, number).await?;
 
     Ok(slice_output(build.output, startline))
 }
@@ -134,9 +134,9 @@ async fn list_builds_impl(
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
         .select_only()
         .column_as(builds::Column::Id, "id")
+        .column_as(builds::Column::Number, "number")
         .column(builds::Column::Status)
         .column_as(packages::Column::Name, "pkg_name")
-        .column_as(packages::Column::Id, "pkg_id")
         .column(builds::Column::Version)
         .column(builds::Column::EndTime)
         .column(builds::Column::StartTime)
@@ -145,18 +145,48 @@ async fn list_builds_impl(
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
 
-    let mut build = match pkg_id {
-        None => basequery.into_model::<BuildSummary>().all(db),
+    let rows = match pkg_id {
+        None => basequery.into_model::<BuildRow>().all(db),
         Some(pkg_id) => basequery
             .filter(builds::Column::PkgId.eq(pkg_id))
-            .into_model::<BuildSummary>()
+            .into_model::<BuildRow>()
             .all(db),
     }
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
 
-    annotate_waiting(db, &mut build).await?;
-    Ok(Json(build))
+    Ok(Json(annotate_waiting(db, rows).await))
+}
+
+/// A listed build as queried, including the row id the response omits.
+///
+/// Waiting reasons are keyed by row id internally, so the id has to survive as
+/// far as the annotation — but no further.
+#[derive(FromQueryResult)]
+struct BuildRow {
+    id: i32,
+    number: i32,
+    pkg_name: String,
+    version: String,
+    status: i32,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    platform: String,
+}
+
+impl BuildRow {
+    fn into_summary(self, waiting_reason: Option<WaitingReason>) -> BuildSummary {
+        BuildSummary {
+            number: self.number,
+            pkg_name: self.pkg_name,
+            version: self.version,
+            status: self.status,
+            start_time: self.start_time,
+            end_time: self.end_time,
+            platform: self.platform,
+            waiting_reason,
+        }
+    }
 }
 
 /// Attach [`WaitingReason`]s to any listed build that no approved worker can
@@ -164,24 +194,43 @@ async fn list_builds_impl(
 ///
 /// Best-effort by design: this is diagnostic decoration, and failing to compute
 /// it must never turn a working build list into an error page.
-async fn annotate_waiting(
-    db: &DatabaseConnection,
-    builds: &mut [BuildSummary],
-) -> Result<(), ApiError> {
-    if builds.is_empty() {
-        return Ok(());
+async fn annotate_waiting(db: &DatabaseConnection, rows: Vec<BuildRow>) -> Vec<BuildSummary> {
+    if rows.is_empty() {
+        return Vec::new();
     }
     let reasons = match worker_jobs::waiting_reasons(db, liveness_timeout_secs()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("could not compute build waiting reasons: {e}");
-            return Ok(());
+            Default::default()
         }
     };
-    for build in builds {
-        build.waiting_reason = reasons.get(&build.id).cloned();
-    }
-    Ok(())
+    rows.into_iter()
+        .map(|row| {
+            let reason = reasons.get(&row.id).cloned();
+            row.into_summary(reason)
+        })
+        .collect()
+}
+
+/// Resolve a public build identity — `<pkgbase>/<number>` — to its row.
+///
+/// The row id never leaves the server: it is a global sequence that says
+/// nothing about which package a build belongs to. Everything public keys on
+/// the package and the build's number within it.
+async fn build_by_number(
+    db: &DatabaseConnection,
+    pkgbase: &str,
+    number: i32,
+) -> Result<builds::Model, ApiError> {
+    Builds::find()
+        .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
+        .filter(packages::Column::Name.eq(pkgbase))
+        .filter(builds::Column::Number.eq(number))
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))
 }
 
 #[utoipa::path(
@@ -189,39 +238,45 @@ async fn annotate_waiting(
             (status = 200, description = "Get build details"),
     ),
     params(
-            ("buildid", description = "Id of build")
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package")
     )
 )]
-#[get("/build/<buildid>")]
+#[get("/package/<pkgbase>/build/<number>")]
 pub async fn get_build(
     db: &State<DatabaseConnection>,
-    buildid: i32,
+    pkgbase: &str,
+    number: i32,
     _a: Authenticated,
 ) -> Result<Json<BuildSummary>, ApiError> {
     let db = db.inner();
 
-    let result = Builds::find()
+    let row = Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
-        .filter(builds::Column::Id.eq(buildid))
+        .filter(packages::Column::Name.eq(pkgbase))
+        .filter(builds::Column::Number.eq(number))
         .select_only()
         .column_as(builds::Column::Id, "id")
+        .column_as(builds::Column::Number, "number")
         .column(builds::Column::Status)
         .column_as(packages::Column::Name, "pkg_name")
-        .column_as(builds::Column::PkgId, "pkg_id")
         .column(builds::Column::Version)
         .column(builds::Column::EndTime)
         .column(builds::Column::StartTime)
         .column(builds::Column::Platform)
-        .into_model::<BuildSummary>()
+        .into_model::<BuildRow>()
         .one(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
+        .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))?;
 
-    let mut result = [result];
-    annotate_waiting(db, &mut result).await?;
-    let [result] = result;
-    Ok(Json(result))
+    let mut annotated = annotate_waiting(db, vec![row]).await;
+    annotated.pop().map(Json).ok_or_else(|| {
+        err(
+            Status::InternalServerError,
+            "build vanished while annotating",
+        )
+    })
 }
 
 #[utoipa::path(
@@ -229,22 +284,20 @@ pub async fn get_build(
             (status = 200, description = "Delete build"),
     ),
     params(
-            ("buildid", description = "Id of build")
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package")
     )
 )]
-#[delete("/build/<buildid>")]
+#[delete("/package/<pkgbase>/build/<number>")]
 pub async fn delete_build(
     db: &State<DatabaseConnection>,
-    buildid: i32,
+    pkgbase: &str,
+    number: i32,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
     let db = db.inner();
 
-    let build = Builds::find_by_id(buildid)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
+    let build = build_by_number(db, pkgbase, number).await?;
 
     build
         .delete(db)
@@ -259,16 +312,22 @@ pub async fn delete_build(
             (status = 200, description = "Cancel build job"),
     ),
     params(
-            ("buildid", description = "Id of build")
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package")
     )
 )]
-#[post("/build/<buildid>/cancel")]
+#[post("/package/<pkgbase>/build/<number>/cancel")]
 pub async fn cancel_build(
+    db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
-    buildid: i32,
+    pkgbase: &str,
+    number: i32,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    tx.send(Action::Cancel(buildid))
+    // Cancellation still travels by row id on the internal queue; only the way
+    // the caller names the build has changed.
+    let build_id = build_by_number(db.inner(), pkgbase, number).await?.id;
+    tx.send(Action::Cancel(build_id))
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(())
@@ -279,27 +338,23 @@ pub async fn cancel_build(
             (status = 200, description = "Retry build"),
     ),
     params(
-            ("buildid", description = "Id of build"),
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package"),
     )
 )]
-#[post("/build/<buildid>/retry")]
+#[post("/package/<pkgbase>/build/<number>/retry")]
 pub async fn retry_build(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
-    buildid: i32,
+    pkgbase: &str,
+    number: i32,
     _a: Authenticated,
 ) -> Result<Json<i32>, ApiError> {
     let db = db.inner();
 
-    // Fetch the build details
-    let old_build = Builds::find_by_id(buildid)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no build with that id"))?;
-
-    // Extract the platform and package ID
+    // The build being retried tells us which platform and package to rebuild.
+    let old_build = build_by_number(db, pkgbase, number).await?;
     let platform = old_build.platform;
     let pkg_id = old_build.pkg_id;
 
@@ -321,10 +376,10 @@ pub async fn retry_build(
     // Pick out the build explicitly reported for the platform that was
     // retried; it may have been enqueued/promoted or left waiting on a
     // dependency rebuild, either way `package_update` already tells us its id.
-    let build_id = platform_results
+    let build_number = platform_results
         .into_iter()
         .find(|r| r.platform == platform)
-        .map(|r| r.build_id)
+        .map(|r| r.build_number)
         .ok_or_else(|| {
             err(
                 Status::InternalServerError,
@@ -332,7 +387,7 @@ pub async fn retry_build(
             )
         })?;
 
-    Ok(Json(build_id))
+    Ok(Json(build_number))
 }
 
 #[cfg(test)]

@@ -5,30 +5,35 @@ use aurcache_client::AurCacheClient;
 use aurcache_types::build_state::BuildState;
 use dioxus::prelude::*;
 
-/// The screen behind `/build/:id`.
+/// The screen behind `/package/:pkgbase/build/:number`.
 #[component]
-pub fn Build(id: i32) -> Element {
-    let build = use_resource(move || async move {
-        crate::api::client()?
-            .get_build(id)
-            .await
-            .map_err(|e| e.to_string())
+pub fn Build(pkgbase: String, number: i32) -> Element {
+    let build = use_resource({
+        let pkgbase = pkgbase.clone();
+        move || {
+            let pkgbase = pkgbase.clone();
+            async move {
+                crate::api::client()?
+                    .get_build(&pkgbase, number)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
     });
 
     // Fetched from the build's package so this page carries the same header
     // as every other package-scoped page, with the trail in the same place.
-    let package = use_resource(move || async move {
-        let name = build
-            .read_unchecked()
-            .as_ref()
-            .and_then(|r| r.as_ref().ok().map(|b| b.pkg_name.clone()));
-        match name {
-            Some(name) => crate::api::client()?
-                .get_package(&name)
-                .await
-                .map_err(|e| e.to_string())
-                .map(Some),
-            None => Ok(None),
+    let package = use_resource({
+        let pkgbase = pkgbase.clone();
+        move || {
+            let pkgbase = pkgbase.clone();
+            async move {
+                crate::api::client()?
+                    .get_package(&pkgbase)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .map(Some)
+            }
         }
     });
 
@@ -45,7 +50,7 @@ pub fn Build(id: i32) -> Element {
                                     pkgbase: build.pkg_name.clone(),
                                 }),
                             ),
-                            (build.id.to_string(), None),
+                            (build.number.to_string(), None),
                         ],
                     }
                 },
@@ -53,7 +58,7 @@ pub fn Build(id: i32) -> Element {
                 // the header rather than the page.
                 _ => rsx! {},
             }
-            BuildLog { build_id: id }
+            BuildLog { pkgbase, number }
         }
     }
 }
@@ -72,7 +77,9 @@ pub fn Build(id: i32) -> Element {
 const POLL_INTERVAL_MS: u32 = 3_000;
 
 #[component]
-pub fn BuildLog(build_id: i32) -> Element {
+pub fn BuildLog(pkgbase: String, number: i32) -> Element {
+    // Cloned for the polling future, which outlives this render.
+    let polled = pkgbase.clone();
     // One string, one text node. Per-line elements would only earn their keep
     // for per-line features — ANSI colour, line numbers, deep links — and a
     // build emits thousands of lines, so the browser would lay out thousands
@@ -88,49 +95,52 @@ pub fn BuildLog(build_id: i32) -> Element {
     // being written.
     let mut following = use_signal(|| true);
 
-    use_future(move || async move {
-        let client = match AurCacheClient::new(api_base(), None) {
-            Ok(c) => c,
-            Err(e) => {
-                error.set(Some(e.to_string()));
-                return;
-            }
-        };
-
-        loop {
-            // Ask only for what we do not already have.
-            let have = line_count();
-            match client.build_output(build_id, Some(have)).await {
-                Ok(chunk) if !chunk.is_empty() => {
-                    let added = chunk.lines().count() as i32;
-                    log.with_mut(|text| {
-                        if !text.is_empty() && !text.ends_with('\n') {
-                            text.push('\n');
-                        }
-                        text.push_str(&chunk);
-                    });
-                    line_count += added;
-                    if following() {
-                        scroll_log_to_bottom();
-                    }
-                }
-                Ok(_) => {}
+    use_future(move || {
+        let pkgbase = polled.clone();
+        async move {
+            let client = match AurCacheClient::new(api_base(), None) {
+                Ok(c) => c,
                 Err(e) => {
                     error.set(Some(e.to_string()));
                     return;
                 }
-            }
+            };
 
-            // Stop polling once the build reaches a terminal state, but only
-            // after the fetch above, so the last lines are never missed.
-            if let Ok(build) = client.get_build(build_id).await
-                && !matches!(BuildState::from_i32(build.status), Some(BuildState::Active))
-            {
-                finished.set(true);
-                return;
-            }
+            loop {
+                // Ask only for what we do not already have.
+                let have = line_count();
+                match client.build_output(&pkgbase, number, Some(have)).await {
+                    Ok(chunk) if !chunk.is_empty() => {
+                        let added = chunk.lines().count() as i32;
+                        log.with_mut(|text| {
+                            if !text.is_empty() && !text.ends_with('\n') {
+                                text.push('\n');
+                            }
+                            text.push_str(&chunk);
+                        });
+                        line_count += added;
+                        if following() {
+                            scroll_log_to_bottom();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error.set(Some(e.to_string()));
+                        return;
+                    }
+                }
 
-            gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+                // Stop polling once the build reaches a terminal state, but only
+                // after the fetch above, so the last lines are never missed.
+                if let Ok(build) = client.get_build(&pkgbase, number).await
+                    && !matches!(BuildState::from_i32(build.status), Some(BuildState::Active))
+                {
+                    finished.set(true);
+                    return;
+                }
+
+                gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+            }
         }
     });
 
@@ -138,7 +148,7 @@ pub fn BuildLog(build_id: i32) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 div { class: "flex items-center gap-3",
-                    h2 { class: "card-title", "Build #{build_id}" }
+                    h2 { class: "card-title font-mono", "{pkgbase}/{number}" }
                     if finished() {
                         span { class: "badge badge-ghost badge-sm", "finished" }
                     } else {

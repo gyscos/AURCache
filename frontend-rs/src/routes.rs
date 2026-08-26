@@ -20,8 +20,7 @@ pub enum Route {
 
         #[route("/builds")]
         Builds {},
-        #[route("/build/:id")]
-        Build { id: i32 },
+
 
         #[route("/packages")]
         Packages {},
@@ -29,6 +28,8 @@ pub enum Route {
         Package { pkgbase: String },
         #[route("/package/:pkgbase/builds")]
         PackageBuilds { pkgbase: String },
+        #[route("/package/:pkgbase/build/:number")]
+        Build { pkgbase: String, number: i32 },
         // `:..path` is a catch-all: source paths contain slashes, so a single
         // segment would only ever match files at the top level.
         #[route("/package/:pkgbase/source/:..path")]
@@ -71,10 +72,14 @@ impl Route {
     pub fn menu_entry(&self) -> Option<MenuEntry> {
         match self {
             Route::Dashboard { .. } => Some(MenuEntry::Dashboard),
-            Route::Builds { .. } | Route::Build { .. } => Some(MenuEntry::Builds),
+            Route::Builds { .. } => Some(MenuEntry::Builds),
+            // A single build lives under its package now — same URL, same
+            // breadcrumb, same header — so it highlights Packages with the
+            // rest of them rather than jumping the menu to Builds.
             Route::Packages { .. }
             | Route::Package { .. }
             | Route::PackageBuilds { .. }
+            | Route::Build { .. }
             | Route::PackageSource { .. } => Some(MenuEntry::Packages),
             Route::Activities { .. } => Some(MenuEntry::Activities),
             Route::Workers { .. } => Some(MenuEntry::Workers),
@@ -101,10 +106,17 @@ mod tests {
     #[test]
     fn sub_pages_highlight_their_section() {
         assert_eq!(entry_for("/builds"), Some(MenuEntry::Builds));
-        assert_eq!(entry_for("/build/3"), Some(MenuEntry::Builds));
 
         assert_eq!(entry_for("/packages"), Some(MenuEntry::Packages));
         assert_eq!(entry_for("/package/hello"), Some(MenuEntry::Packages));
+        assert_eq!(
+            entry_for("/package/hello/builds"),
+            Some(MenuEntry::Packages)
+        );
+        assert_eq!(
+            entry_for("/package/hello/build/3"),
+            Some(MenuEntry::Packages)
+        );
         assert_eq!(
             entry_for("/package/hello/source/PKGBUILD"),
             Some(MenuEntry::Packages)
@@ -132,7 +144,10 @@ mod tests {
         for route in [
             Route::Dashboard {},
             Route::Builds {},
-            Route::Build { id: 42 },
+            Route::Build {
+                pkgbase: "hello".into(),
+                number: 42,
+            },
             Route::Packages {},
             Route::Package {
                 pkgbase: "hello".into(),

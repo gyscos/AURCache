@@ -44,8 +44,12 @@ const NAMES: [&str; 6] = [
     "1337",
 ];
 
+/// Every caller seeds a single build per package, so build number 1 is right
+/// for all of them; `UNIQUE (pkg_id, number)` means it cannot be left to the
+/// column default.
 async fn insert_build(db: &DatabaseConnection, pkg_id: i32, status: i32, version: &str) {
     Builds::insert(builds::ActiveModel {
+        number: Set(1),
         pkg_id: Set(pkg_id),
         status: Set(Some(status)),
         platform: Set(Platform::X86_64),
@@ -289,6 +293,7 @@ async fn an_enqueued_builds_empty_version_is_not_a_version() {
 
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(1),
         status: Set(Some(BuildStates::ENQUEUED_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set(String::new()),
@@ -323,6 +328,7 @@ async fn a_completed_builds_version_is_reported() {
 
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(1),
         status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-1".to_string()),
@@ -408,6 +414,7 @@ async fn a_failed_build_does_not_become_the_reported_version() {
     // The version that is actually in the repository.
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(1),
         status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-1".to_string()),
@@ -422,6 +429,7 @@ async fn a_failed_build_does_not_become_the_reported_version() {
     // A newer attempt at the next version that failed.
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(2),
         status: Set(Some(BuildStates::FAILED_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-2".to_string()),
@@ -460,6 +468,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
 
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(1),
         status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set("1.0-1".to_string()),
@@ -473,6 +482,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
 
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
+        number: Set(2),
         status: Set(Some(BuildStates::ACTIVE_BUILD)),
         platform: Set(Platform::X86_64),
         version: Set("2.0-1".to_string()),

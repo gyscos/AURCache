@@ -167,7 +167,7 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
                 .cmp(&b.pkg_name.to_lowercase())
                 // A package's own builds are then newest-first, so the groups
                 // read as histories rather than as an arbitrary jumble.
-                .then(b.start_time.cmp(&a.start_time)),
+                .then(b.number.cmp(&a.number)),
             SortKey::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             SortKey::Time => a.start_time.cmp(&b.start_time),
         };
@@ -193,10 +193,9 @@ mod tests {
         }
     }
 
-    fn build(id: i32, pkg: &str, status: BuildState, start: Option<i64>) -> Build {
+    fn build(number: i32, pkg: &str, status: BuildState, start: Option<i64>) -> Build {
         Build {
-            id,
-            pkg_id: 1,
+            number,
             pkg_name: pkg.to_string(),
             version: "1.0-1".to_string(),
             status: status.as_i32(),
@@ -328,7 +327,7 @@ mod tests {
             },
         );
         assert_eq!(
-            builds.iter().map(|b| b.id).collect::<Vec<_>>(),
+            builds.iter().map(|b| b.number).collect::<Vec<_>>(),
             [1, 3, 2],
             "newest first"
         );
@@ -349,7 +348,10 @@ mod tests {
                 dir: SortDir::Asc,
             },
         );
-        assert_eq!(builds.iter().map(|b| b.id).collect::<Vec<_>>(), [3, 2, 1]);
+        assert_eq!(
+            builds.iter().map(|b| b.number).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
     }
 
     /// Clicking the active column reverses it; clicking a new one starts from
