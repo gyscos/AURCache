@@ -386,6 +386,23 @@ mod tests {
 use aurcache_types::build_state::BuildState as State;
 use dioxus::prelude::*;
 
+/// A list card's title, with an optional action on the right.
+///
+/// Shared so the two lists cannot drift: the packages header sat in a flex row
+/// with a button and the builds header was a bare `h2`, which made one block a
+/// button-height taller than the other. `min-h-8` matches a `btn-sm`, so the
+/// header occupies the same height whether or not it has an action.
+#[component]
+pub fn ListHeader(title: String, children: Element) -> Element {
+    rsx! {
+        div { class: "flex items-center gap-2 min-h-8",
+            h2 { class: "card-title", "{title}" }
+            div { class: "flex-1" }
+            {children}
+        }
+    }
+}
+
 /// Search box and status filter, shared by both lists.
 #[component]
 pub fn ListControls(

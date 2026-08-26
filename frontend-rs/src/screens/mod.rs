@@ -15,34 +15,13 @@ mod placeholder;
 pub use build::Build;
 pub use builds::Builds;
 pub use not_found::NotFound;
-pub use package::Package;
+pub use package::{Package, PackageHeader};
 pub use package_builds::PackageBuilds;
 pub use package_source::PackageSource;
 pub use packages::Packages;
 pub use placeholder::NotPorted;
 
-use crate::routes::Route;
 use dioxus::prelude::*;
-
-/// A way back to the package a sub-page belongs to.
-///
-/// The source editor had none: opening it to look at a PKGBUILD and deciding
-/// not to change anything left the browser's back button as the only exit,
-/// which is not an exit the page offers.
-#[component]
-pub fn PackageBreadcrumb(pkgbase: String, here: String) -> Element {
-    rsx! {
-        div { class: "flex items-center gap-2 text-sm",
-            Link {
-                class: "link link-primary font-mono",
-                to: Route::Package { pkgbase: pkgbase.clone() },
-                "← {pkgbase}"
-            }
-            span { class: "opacity-40", "/" }
-            span { class: "opacity-70", "{here}" }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Not ported yet.

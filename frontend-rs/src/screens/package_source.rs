@@ -1,6 +1,7 @@
 //! Editing a package's source files.
 
 use crate::api::api_base;
+use crate::routes::Route;
 use aurcache_client::{AurCacheClient, SourceFileContent};
 use dioxus::prelude::*;
 
@@ -28,6 +29,19 @@ pub fn PackageSource(pkgbase: String, path: Vec<String>) -> Element {
 
 #[component]
 pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
+    let package = use_resource({
+        let pkgbase = pkgbase.clone();
+        move || {
+            let pkgbase = pkgbase.clone();
+            async move {
+                crate::api::client()?
+                    .get_package(&pkgbase)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    });
+
     let files = use_resource({
         let pkgbase = pkgbase.clone();
         move || {
@@ -101,7 +115,21 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
 
     rsx! {
         div { class: "space-y-4",
-        crate::screens::PackageBreadcrumb { pkgbase: pkgbase.clone(), here: "Sources" }
+        // The package's own header stays, so editing its sources happens in
+        // sight of what is being edited rather than on a bare page. It carries
+        // the trail, so the breadcrumb sits in the same place on every
+        // package-scoped page.
+        match &*package.read_unchecked() {
+            Some(Ok(pkg)) => rsx! {
+                crate::screens::PackageHeader {
+                    pkg: pkg.clone(),
+                    trail: vec![("Sources".to_string(), None)],
+                }
+            },
+            // Its absence must not block the editor: the files are what this
+            // page is for, and they load independently.
+            _ => rsx! {},
+        }
         div { class: "flex gap-4",
             // File list
             div { class: "card bg-base-100 shadow-xl w-72 shrink-0",
@@ -164,7 +192,11 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                             async move {
                                                 let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
                                                 match client.put_source_file(&pkgbase, &path, &draft()).await {
-                                                    Ok(()) => status.set(Some(("Saved. The patch was updated.".into(), true))),
+                                                    Ok(()) => {
+                                                        navigator().push(Route::Package {
+                                                            pkgbase: pkgbase.clone(),
+                                                        });
+                                                    }
                                                     Err(e) => status.set(Some((e.to_string(), false))),
                                                 }
                                             }
@@ -198,10 +230,20 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                                         .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
                                                         .await
                                                     {
-                                                        Ok(_) => status.set(Some((
-                                                            "Saved. A rebuild is queued.".into(),
-                                                            true,
-                                                        ))),
+                                                        // Back to the package,
+                                                        // which is where the
+                                                        // build just queued will
+                                                        // appear.
+                                                        Ok(_) => {
+                                                            navigator().push(Route::Package {
+                                                                pkgbase: pkgbase.clone(),
+                                                            });
+                                                        }
+                                                        // Stay put on a partial
+                                                        // failure: the edit is
+                                                        // saved but the build is
+                                                        // not queued, and leaving
+                                                        // would hide that.
                                                         Err(e) => status.set(Some((
                                                             format!("Saved, but the rebuild could not be queued: {e}"),
                                                             false,

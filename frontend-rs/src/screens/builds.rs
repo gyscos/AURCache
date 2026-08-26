@@ -4,7 +4,8 @@ use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::format_duration;
 use crate::listing::{
-    ListControls, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_builds, sort_builds,
+    ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_builds,
+    sort_builds,
 };
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
@@ -36,7 +37,7 @@ pub fn Builds() -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                h2 { class: "card-title", "Builds" }
+                ListHeader { title: "Builds" }
 
                 match &*builds.read_unchecked() {
                     None => rsx! {

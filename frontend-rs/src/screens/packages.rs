@@ -7,8 +7,8 @@
 
 use crate::api::client;
 use crate::listing::{
-    ListControls, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_packages,
-    sort_packages,
+    ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
+    filter_packages, sort_packages,
 };
 use crate::routes::Route;
 use crate::status::StatusBadge;
@@ -38,9 +38,7 @@ pub fn Packages() -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                div { class: "flex items-center",
-                    h2 { class: "card-title", "Packages" }
-                    div { class: "flex-1" }
+                ListHeader { title: "Packages",
                     button { class: "btn btn-primary btn-sm", "Add package" }
                 }
 

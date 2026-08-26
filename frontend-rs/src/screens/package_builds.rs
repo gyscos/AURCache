@@ -6,6 +6,7 @@
 use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::format_duration;
+use crate::listing::ListHeader;
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
 use aurcache_client::Build;
@@ -24,18 +25,38 @@ async fn load(pkgbase: String) -> Result<Vec<Build>, String> {
 
 #[component]
 pub fn PackageBuilds(pkgbase: String) -> Element {
+    let package = use_resource({
+        let pkgbase = pkgbase.clone();
+        move || {
+            let pkgbase = pkgbase.clone();
+            async move {
+                crate::api::client()?
+                    .get_package(&pkgbase)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
+    });
+
     let builds = use_resource({
         let pkgbase = pkgbase.clone();
         move || load(pkgbase.clone())
     });
 
     rsx! {
+        div { class: "space-y-4",
+        match &*package.read_unchecked() {
+            Some(Ok(pkg)) => rsx! {
+                crate::screens::PackageHeader {
+                    pkg: pkg.clone(),
+                    trail: vec![("Builds".to_string(), None)],
+                }
+            },
+            _ => rsx! {},
+        }
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                crate::screens::PackageBreadcrumb {
-                    pkgbase: pkgbase.clone(),
-                    here: "All builds",
-                }
+                ListHeader { title: "Builds" }
 
                 match &*builds.read_unchecked() {
                     None => rsx! {
@@ -90,6 +111,7 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                     },
                 }
             }
+        }
         }
     }
 }

@@ -117,7 +117,7 @@ pub fn Package(pkgbase: String) -> Element {
             },
             Some(Ok((pkg, builds))) => rsx! {
                 div { class: "space-y-4",
-                    PackageHeader { pkg: pkg.clone() }
+                    PackageHeader { pkg: pkg.clone(), trail: vec![] }
                     // The sidebar starts level with the builds card rather than
                     // below it, so the builds card is only as wide as it needs
                     // and the space beside it is used.
@@ -153,7 +153,7 @@ pub fn Package(pkgbase: String) -> Element {
 }
 
 #[component]
-fn PackageHeader(pkg: ExtendedPackage) -> Element {
+pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) -> Element {
     let description = pkg.description.clone();
 
     rsx! {
@@ -161,8 +161,43 @@ fn PackageHeader(pkg: ExtendedPackage) -> Element {
             div { class: "card-body",
                 div { class: "flex flex-wrap items-start gap-3",
                     div { class: "min-w-0",
-                        div { class: "flex items-center gap-3 flex-wrap",
-                            h1 { class: "text-2xl font-bold font-mono break-all", "{pkg.name}" }
+                        // The trail *is* the heading, rather than a small copy
+                        // of it above: the package name appeared twice
+                        // otherwise. Ancestors are muted and unbolded so the
+                        // page you are on still reads as the title.
+                        h1 {
+                            class: "text-2xl font-bold flex items-center gap-2 flex-wrap break-all",
+                            Link {
+                                class: "font-normal opacity-50 link-hover",
+                                to: Route::Packages {},
+                                "Packages"
+                            }
+                            span { class: "font-normal opacity-30", "/" }
+                            if trail.is_empty() {
+                                span { class: "font-mono", "{pkg.name}" }
+                            } else {
+                                Link {
+                                    class: "font-mono font-normal opacity-50 link-hover",
+                                    to: Route::Package { pkgbase: pkg.name.clone() },
+                                    "{pkg.name}"
+                                }
+                                for (index, (label, route)) in trail.iter().enumerate() {
+                                    span { key: "sep-{index}", class: "font-normal opacity-30", "/" }
+                                    match route.clone() {
+                                        Some(route) => rsx! {
+                                            Link {
+                                                key: "{index}",
+                                                class: "font-normal opacity-50 link-hover",
+                                                to: route,
+                                                "{label}"
+                                            }
+                                        },
+                                        None => rsx! { span { key: "{index}", "{label}" } },
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "flex items-center gap-3 flex-wrap mt-1",
                             StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
                             if pkg.has_patch {
                                 span { class: "badge badge-warning badge-sm", "patched" }
@@ -237,18 +272,17 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body py-4",
                 div { class: "flex items-center gap-3 flex-wrap",
-                    h2 { class: "card-title text-base", "Builds" }
+                    Link {
+                        class: "card-title text-base link-hover",
+                        to: Route::PackageBuilds { pkgbase: pkgbase.clone() },
+                        "Builds"
+                    }
                     if let Some(typical) = typical {
                         span { class: "text-sm opacity-60",
                             "typically {format_duration(Some(0), Some(typical))}"
                         }
                     }
                     div { class: "flex-1" }
-                    Link {
-                        class: "link link-primary text-sm",
-                        to: Route::PackageBuilds { pkgbase: pkgbase.clone() },
-                        "All builds →"
-                    }
                     // Rebuilding produces a build, so the button belongs with
                     // the builds rather than in the page header.
                     RebuildButton { pkgbase: pkgbase.clone(), on_changed }

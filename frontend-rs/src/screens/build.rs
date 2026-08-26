@@ -8,7 +8,54 @@ use dioxus::prelude::*;
 /// The screen behind `/build/:id`.
 #[component]
 pub fn Build(id: i32) -> Element {
-    rsx! { BuildLog { build_id: id } }
+    let build = use_resource(move || async move {
+        crate::api::client()?
+            .get_build(id)
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    // Fetched from the build's package so this page carries the same header
+    // as every other package-scoped page, with the trail in the same place.
+    let package = use_resource(move || async move {
+        let name = build
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().ok().map(|b| b.pkg_name.clone()));
+        match name {
+            Some(name) => crate::api::client()?
+                .get_package(&name)
+                .await
+                .map_err(|e| e.to_string())
+                .map(Some),
+            None => Ok(None),
+        }
+    });
+
+    rsx! {
+        div { class: "space-y-4",
+            match (&*package.read_unchecked(), &*build.read_unchecked()) {
+                (Some(Ok(Some(pkg))), Some(Ok(build))) => rsx! {
+                    crate::screens::PackageHeader {
+                        pkg: pkg.clone(),
+                        trail: vec![
+                            (
+                                "Builds".to_string(),
+                                Some(crate::routes::Route::PackageBuilds {
+                                    pkgbase: build.pkg_name.clone(),
+                                }),
+                            ),
+                            (build.id.to_string(), None),
+                        ],
+                    }
+                },
+                // The log is what this page is for, so a failed lookup costs
+                // the header rather than the page.
+                _ => rsx! {},
+            }
+            BuildLog { build_id: id }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
