@@ -643,7 +643,7 @@ pub async fn get_package(
             match aur_info {
                 None => (
                     PackageSource::AurNotFound(AurNotFoundPackage {}),
-                    pkg.upstream_version.unwrap_or_default(),
+                    pkg.upstream_version,
                 ),
                 Some(aur_info) => {
                     let aur_url = format!("https://aur.archlinux.org/pkgbase/{}", pkg.name);
@@ -660,15 +660,16 @@ pub async fn get_package(
                             aur_flagged_outdated: aur_info.out_of_date.unwrap_or(0) != 0,
                             aur_url,
                         }),
-                        aur_info.version,
+                        Some(aur_info.version),
                     )
                 }
             }
         }
         SourceData::Git { spec } => (
             PackageSource::Git(spec),
-            // How current this version is depends on the version-check interval.
-            pkg.upstream_version.unwrap_or_default(),
+            // How current this version is depends on the version-check
+            // interval; `None` means no check has run yet.
+            pkg.upstream_version,
         ),
         SourceData::Upload { .. } => {
             return Err(err(

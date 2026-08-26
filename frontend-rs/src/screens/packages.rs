@@ -81,7 +81,7 @@ pub fn Packages() -> Element {
                                                 {pkg.latest_version.clone().unwrap_or_else(|| "—".into())}
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
-                                                "{pkg.upstream_version}"
+                                                {pkg.upstream_version.clone().unwrap_or_else(|| "—".into())}
                                             }
                                             td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
                                             td { class: "{WIDE_ONLY} text-right",

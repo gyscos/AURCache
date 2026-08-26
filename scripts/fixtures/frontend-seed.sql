@@ -22,9 +22,11 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
   ('2048.c',                 4, 0, '1.0-3',     '', 'x86_64', 'aur', '{"type":"aur","name":"2048.c"}',                 1),
   ('aewm++',                 1, 0, '1.1.6-4',   '', 'x86_64', 'aur', '{"type":"aur","name":"aewm++"}',                 1),
   ('python-3.11',            1, 0, '3.11.9-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"python-3.11"}',            1),
-  -- Deliberately gets no build below, so `latest_version` is null and the
-  -- "no version yet" placeholder is on screen rather than only in a unit test.
-  ('never-built',            3, 0, '0.1.0-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1);
+  -- Deliberately gets no build below, and no upstream version either: this is
+  -- a package that was just promoted from a dependency and has not been
+  -- version-checked yet. Both "no version yet" placeholders end up on screen
+  -- rather than only in a unit test.
+  ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1);
 
 -- Timestamps are Unix *seconds*: `aurcache-api/src/stats.rs` compares
 -- start_time against strftime('%s', 'now'). Milliseconds render as dates

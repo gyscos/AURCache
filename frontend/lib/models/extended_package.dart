@@ -18,7 +18,7 @@ sealed class ExtendedPackage with _$ExtendedPackage {
     required int status,
     // ignore: invalid_annotation_target
     @JsonKey(fromJson: _fromJson) required bool outofdate,
-    required String upstream_version,
+    required String? upstream_version,
     final String? latest_version,
     required List<String> selected_platforms,
     required List<String> selected_build_flags,

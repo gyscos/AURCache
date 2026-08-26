@@ -13,7 +13,9 @@ class SimplePackage {
   /// so far has not worked out a version yet. A non-nullable String here made
   /// the whole list fail to deserialise on the null the server sends.
   final String? latest_version;
-  final String upstream_version;
+
+  /// Null until a version check has determined it; see the note above.
+  final String? upstream_version;
 
   SimplePackage({
     required this.id,

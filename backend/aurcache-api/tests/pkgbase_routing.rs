@@ -331,3 +331,47 @@ async fn a_completed_builds_version_is_reported() {
         );
     }
 }
+
+/// A package can be directly requested while its upstream version is still
+/// unknown, and that must not break the list.
+///
+/// The dependency-resolution migration inserts rows with a NULL
+/// `upstream_version` and `directly_requested = false`. Adding one of those
+/// explicitly later calls `set_directly_requested`, which flips the flag and
+/// nothing else — so the row enters the list before any version check has
+/// filled the column in. `SimplePackage` typed it as a plain `String`, which
+/// fails to decode, taking down the whole route rather than one row.
+#[rocket::async_test]
+async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
+    let (client, db) = test_client().await;
+
+    Packages::insert(packages::ActiveModel {
+        name: Set("promoted-dep".to_string()),
+        status: Set(0),
+        out_of_date: Set(0),
+        upstream_version: Set(None),
+        build_flags: Set(String::new()),
+        platforms: Set("x86_64".to_string()),
+        source_type: Set(SourceType::Aur),
+        source_data: Set(SourceData::Aur {
+            name: "promoted-dep".to_string(),
+        }),
+        directly_requested: Set(true),
+        ..Default::default()
+    })
+    .exec(&db)
+    .await
+    .expect("insert package");
+
+    let response = client.get("/api/packages/list?limit=10").dispatch().await;
+    assert_eq!(
+        response.status(),
+        Status::Ok,
+        "one row with no upstream version must not fail the whole list"
+    );
+    let body = response.into_string().await.expect("body");
+    assert!(
+        body.contains(r#""upstream_version":null"#),
+        "an undetermined upstream version should be null: {body}"
+    );
+}

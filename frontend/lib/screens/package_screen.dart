@@ -218,7 +218,7 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
               ),
               _sideCard(
                 title: "Latest Upstream version",
-                subtitle: pkg.upstream_version,
+                subtitle: pkg.upstream_version ?? '—',
               ),
               if (pkg.split_packages != null &&
                   pkg.split_packages!.length > 1) ...[

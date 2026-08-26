@@ -90,7 +90,12 @@ pub struct SimplePackage {
     pub status: i32,
     pub outofdate: i32,
     pub latest_version: Option<String>,
-    pub upstream_version: String,
+    /// `None` until a version check has determined it. The column is nullable
+    /// and rows land in this list before their first check — the dependency
+    /// migration inserts them without one, and adding such a package
+    /// explicitly only flips `directly_requested`. Typed as a plain `String`
+    /// this failed to decode, which took down the whole route, not one row.
+    pub upstream_version: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone)]
@@ -104,7 +109,10 @@ pub struct ExtendedPackage {
     pub selected_platforms: Vec<String>,
     pub selected_build_flags: Option<Vec<String>>,
     // todo this should be renamed to "latest_upstream_version" or sth
-    pub upstream_version: String,
+    /// `None` while it is still unknown, matching [`SimplePackage`]. Coercing
+    /// it to `""` here would make one field mean two things depending on the
+    /// route, which is what it used to do.
+    pub upstream_version: Option<String>,
     pub package_source: PackageSource,
     pub split_packages: Option<Vec<String>>,
     pub dependencies: Vec<PackageDependency>,

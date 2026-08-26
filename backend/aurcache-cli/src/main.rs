@@ -1010,7 +1010,7 @@ fn print_package_list(packages: &[SimplePackage]) {
                 build_status_label(package.status).to_string(),
                 bool_label(package.outofdate != 0).to_string(),
                 option_text(package.latest_version.as_deref()),
-                package.upstream_version.clone(),
+                option_text(package.upstream_version.as_deref()),
             ]
         })
         .collect::<Vec<_>>();
@@ -1045,7 +1045,10 @@ fn print_package_summary(package: &ExtendedPackage) {
         "latest_version: {}",
         option_text(package.latest_version.as_deref())
     );
-    println!("upstream_version: {}", package.upstream_version);
+    println!(
+        "upstream_version: {}",
+        option_text(package.upstream_version.as_deref())
+    );
     println!(
         "platforms: {}",
         join_or_dash(
