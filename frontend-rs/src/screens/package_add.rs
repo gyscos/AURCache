@@ -1139,6 +1139,48 @@ mod tests {
         assert_eq!(edited_label(3), "3 files edited");
     }
 
+    /// Every chip's ✕ renders the same and sits in the same place, so a
+    /// handler capturing the wrong label is invisible in the markup — the only
+    /// way to see it is to press one and look at what came out.
+    #[test]
+    fn removing_a_chip_removes_that_one() {
+        use crate::testing::Harness;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let removed = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        #[component]
+        fn Host(removed: Rc<RefCell<Vec<String>>>) -> Element {
+            let mut queued = use_signal(|| vec![aur("hello"), aur("neofetch"), aur("yay")]);
+            rsx! {
+                QueuedList {
+                    queued: queued(),
+                    onremove: move |label: String| {
+                        removed.borrow_mut().push(label.clone());
+                        queued.retain(|s| source_label(s) != label);
+                    },
+                }
+            }
+        }
+
+        let mut app = Harness::new_with_props(
+            Host,
+            HostProps {
+                removed: removed.clone(),
+            },
+        );
+
+        // The middle one, so an off-by-one in either direction is caught.
+        app.click("aria-label", "Remove neofetch");
+        assert_eq!(removed.borrow().as_slice(), ["neofetch".to_string()]);
+
+        let html = app.html();
+        assert!(html.contains("hello"), "{html}");
+        assert!(!html.contains("neofetch"), "gone from the list: {html}");
+        assert!(html.contains("yay"), "{html}");
+    }
+
     /// Nothing queued is not an empty box with a heading, it is nothing.
     #[test]
     fn an_empty_queue_renders_nothing() {

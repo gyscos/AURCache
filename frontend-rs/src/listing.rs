@@ -179,6 +179,45 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
 }
 
 #[cfg(test)]
+mod interaction_tests {
+    use super::{ListControls, StatusFilter};
+    use crate::testing::Harness;
+    use dioxus::prelude::*;
+
+    /// The search box is bound both ways: it shows the term and it reports one.
+    /// Dropping either half leaves the markup unchanged on first render, and
+    /// the list silently stops filtering.
+    #[test]
+    fn typing_in_the_search_box_updates_the_term() {
+        #[component]
+        fn Host() -> Element {
+            let query = use_signal(String::new);
+            let status = use_signal(|| StatusFilter::ANY);
+            rsx! {
+                ListControls {
+                    query,
+                    status,
+                    placeholder: "Filter packages…",
+                    shown: 1,
+                    total: 10,
+                }
+                // Rendered so the test can see the signal the box writes to,
+                // rather than only the box's own value.
+                span { "term=[{query}]" }
+            }
+        }
+
+        let mut app = Harness::new(Host);
+        assert!(app.html().contains("term=[]"), "{}", app.html());
+
+        app.input("placeholder", "Filter packages…", "hello");
+        let html = app.html();
+        assert!(html.contains("term=[hello]"), "reported: {html}");
+        assert!(html.contains(r#"value="hello""#), "shown: {html}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -468,10 +507,6 @@ pub fn ListControls(
 
     rsx! {
         div { class: "flex flex-wrap items-center gap-2",
-            span { id: "probe-search",
-                "HREF[{web_sys::window().map(|w| w.location().href().unwrap_or_default()).unwrap_or_default()}]"
-                "QUERY[{query}]"
-            }
             input {
                 class: "input input-bordered input-sm w-full sm:w-64",
                 r#type: "search",
