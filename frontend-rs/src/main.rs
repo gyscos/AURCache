@@ -14,8 +14,10 @@
 #![allow(clippy::useless_format)]
 
 mod api;
+mod dates;
 mod format;
 mod legacy_hash;
+mod listing;
 mod routes;
 mod screens;
 mod shell;
@@ -38,6 +40,10 @@ fn App() -> Element {
     // Routes are real paths. That works on a reload or a pasted link because
     // the server answers unknown non-API paths with the app shell; see
     // `aurcache_api::spa`.
+    // Provided here so changing the format in the sidebar re-renders the dates
+    // on the current page rather than only on the next navigation.
+    dates::use_date_style_provider();
+
     rsx! {
         Router::<Route> {}
     }

@@ -9,7 +9,8 @@
 //! output is actually in the repository. The full history is a click away.
 
 use crate::api::client;
-use crate::format::{format_age, format_duration, now_secs};
+use crate::dates::RelativeDate;
+use crate::format::{format_duration, now_secs};
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
 use aurcache_client::{Build, ExtendedPackage, PackageSource};
@@ -282,7 +283,7 @@ fn BuildRow(label: String, entry: Build, now: i64) -> Element {
             BuildStatusBadge { status: entry.status }
             span { class: "font-mono text-sm opacity-70", "{entry.version}" }
             div { class: "flex-1" }
-            span { class: "text-sm opacity-60", {format_age(entry.start_time, now)} }
+            span { class: "text-sm opacity-60", RelativeDate { ts: entry.start_time, now } }
             span { class: "font-mono text-sm opacity-60 w-16 text-right",
                 {format_duration(entry.start_time, entry.end_time)}
             }

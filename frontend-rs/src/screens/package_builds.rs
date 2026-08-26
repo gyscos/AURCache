@@ -4,7 +4,8 @@
 //! repository; this is where the rest of the history lives.
 
 use crate::api::client;
-use crate::format::{format_age, format_duration, now_secs};
+use crate::dates::DateOnly;
+use crate::format::format_duration;
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
 use aurcache_client::Build;
@@ -27,7 +28,6 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
         let pkgbase = pkgbase.clone();
         move || load(pkgbase.clone())
     });
-    let now = now_secs();
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
@@ -78,7 +78,7 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm", "{build.version}" }
                                             td { class: "{WIDE_ONLY} text-sm opacity-70",
-                                                {format_age(build.start_time, now)}
+                                                DateOnly { ts: build.start_time }
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 {format_duration(build.start_time, build.end_time)}

@@ -6,6 +6,10 @@
 //! response shape becomes a compile error here.
 
 use crate::api::client;
+use crate::listing::{
+    ListControls, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_packages,
+    sort_packages,
+};
 use crate::routes::Route;
 use crate::status::StatusBadge;
 use aurcache_client::SimplePackage;
@@ -24,6 +28,12 @@ async fn load_packages() -> Result<Vec<SimplePackage>, String> {
 #[component]
 pub fn Packages() -> Element {
     let packages = use_resource(load_packages);
+    let query = use_signal(String::new);
+    let status = use_signal(|| StatusFilter::ANY);
+    let sort = use_signal(|| Sort {
+        key: SortKey::Name,
+        dir: SortDir::Asc,
+    });
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
@@ -48,26 +58,36 @@ pub fn Packages() -> Element {
                     Some(Ok(list)) if list.is_empty() => rsx! {
                         div { class: "alert", span { "No packages yet." } }
                     },
-                    Some(Ok(list)) => rsx! {
+                    Some(Ok(list)) => {
+                        let mut shown = filter_packages(list, &query(), status());
+                        sort_packages(&mut shown, sort());
+                        let (found, total) = (shown.len(), list.len());
+                        rsx! {
+                        ListControls {
+                            query,
+                            status,
+                            placeholder: "Filter packages…",
+                            shown: found,
+                            total,
+                        }
+                        if shown.is_empty() {
+                            div { class: "alert mt-2", span { "Nothing matches that filter." } }
+                        } else {
                         div { class: "overflow-x-auto",
                             table { class: "table table-zebra",
                                 thead {
                                     tr {
-                                        th { "Package" }
+                                        SortableHeader { label: "Package", column: SortKey::Name, sort, class: "" }
                                         th { "Version" }
                                         // Upstream and Actions are dropped on a
                                         // narrow screen rather than scrolled to.
-                                        // With all five columns the status badge
-                                        // is clipped mid-word on a phone, which
-                                        // reads as missing data. The Dart table
-                                        // drops the same two below 700px.
                                         th { class: "{WIDE_ONLY}", "Upstream" }
-                                        th { "Status" }
+                                        SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                         th { class: "{WIDE_ONLY} text-right", "Actions" }
                                     }
                                 }
                                 tbody {
-                                    for pkg in list.iter() {
+                                    for pkg in shown.iter() {
                                         tr { key: "{pkg.name}", class: "hover",
                                             td {
                                                 Link {
@@ -92,7 +112,9 @@ pub fn Packages() -> Element {
                                 }
                             }
                         }
-                        div { class: "text-sm opacity-60 pt-2", "{list.len()} packages" }
+                        }
+                        div { class: "text-sm opacity-60 pt-2", "{total} packages" }
+                    }
                     },
                 }
             }

@@ -82,7 +82,7 @@ pub struct PackagePatch {
     pub patch: Option<Option<String>>,
 }
 
-#[derive(Deserialize, ToSchema, Serialize)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct SimplePackage {
     pub id: i32,

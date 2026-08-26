@@ -4,6 +4,7 @@
 //! over the content below it. That is the same responsive behaviour as the Dart
 //! `MenuShell`, without needing to measure the viewport in Rust.
 
+use crate::dates::DateStylePicker;
 use crate::routes::{MenuEntry, Route};
 use crate::theme::ThemePicker;
 use dioxus::prelude::*;
@@ -55,6 +56,7 @@ fn SideMenu() -> Element {
     // signal that could fall out of step with the URL. The mapping itself lives
     // on `Route` so it can be tested without rendering.
     let active = use_route::<Route>().menu_entry();
+    let mut preferences_open = use_signal(|| false);
 
     rsx! {
             aside { class: "bg-base-100 w-64 min-h-full flex flex-col",
@@ -78,16 +80,16 @@ fn SideMenu() -> Element {
                         icon: rsx! { DashboardIcon {} },
                     }
                     MenuLink {
-                        to: Route::Builds {},
-                        label: "Builds",
-    active: active == Some(MenuEntry::Builds),
-                        icon: rsx! { BuildsIcon {} },
-                    }
-                    MenuLink {
                         to: Route::Packages {},
                         label: "Packages",
     active: active == Some(MenuEntry::Packages),
                         icon: rsx! { PackagesIcon {} },
+                    }
+                    MenuLink {
+                        to: Route::Builds {},
+                        label: "Builds",
+    active: active == Some(MenuEntry::Builds),
+                        icon: rsx! { BuildsIcon {} },
                     }
                     MenuLink {
                         to: Route::Activities {},
@@ -119,12 +121,18 @@ fn SideMenu() -> Element {
                     ExternalMenuLink { href: DOCS_URL, label: "Help" }
                     // Client-side only: a display preference, kept in the
                     // browser rather than in server settings. See `crate::theme`.
-                    ThemePicker {}
+                    MenuButton {
+                    label: "Preferences",
+                    onclick: move |_| preferences_open.set(true),
+                    icon: rsx! { SlidersIcon {} },
+                }
                 }
 
                 div { class: "flex-1" }
 
-                MenuSection { title: "Project info",
+                PreferencesDialog { open: preferences_open }
+
+            MenuSection { title: "Project info",
                     ExternalMenuLink { href: GITHUB_URL, label: "GitHub" }
                     div { class: "px-5 pt-1 pb-4 text-xs opacity-50",
                         "Version {env!(\"CARGO_PKG_VERSION\")}"
@@ -170,6 +178,65 @@ fn MenuLink(to: Route, label: String, active: bool, icon: Element) -> Element {
             // reader the section link is the page being viewed, which it is not.
             {icon}
             span { class: "text-sm", "{label}" }
+        }
+    }
+}
+
+/// A menu entry that acts rather than navigates.
+///
+/// A `button`, not a link: it opens something in place, and rendering it as an
+/// anchor would offer a middle-click that goes nowhere.
+#[component]
+fn MenuButton(label: String, onclick: EventHandler<MouseEvent>, icon: Element) -> Element {
+    rsx! {
+        button {
+            class: "flex items-center gap-4 px-5 py-2.5 hover:bg-base-200 w-full text-left",
+            onclick: move |e| onclick.call(e),
+            {icon}
+            span { class: "text-sm", "{label}" }
+        }
+    }
+}
+
+/// Display preferences, kept out of the sidebar itself.
+///
+/// They are per-browser rather than account settings — the server supplies a
+/// default and this overrides it locally — so the dialog says so rather than
+/// leaving someone to wonder why a colleague sees something else.
+#[component]
+fn PreferencesDialog(open: Signal<bool>) -> Element {
+    let mut open = open;
+
+    rsx! {
+        div {
+            class: if open() { "modal modal-open" } else { "modal" },
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "UI preferences",
+            div { class: "modal-box",
+                h3 { class: "font-bold text-lg", "UI preferences" }
+                p { class: "text-sm opacity-60",
+                    "Stored in this browser, not on the server."
+                }
+                div { class: "pt-2",
+                    ThemePicker {}
+                    DateStylePicker {}
+                }
+                div { class: "modal-action",
+                    button {
+                        class: "btn btn-sm",
+                        onclick: move |_| open.set(false),
+                        "Done"
+                    }
+                }
+            }
+            // Clicking away closes it, which is what the backdrop is for.
+            button {
+                class: "modal-backdrop",
+                onclick: move |_| open.set(false),
+                aria_label: "Close preferences",
+                "Close"
+            }
         }
     }
 }
@@ -277,6 +344,13 @@ fn SettingsIcon() -> Element {
 fn ConfigFilesIcon() -> Element {
     rsx! {
         Icon { path: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5M9 13h6M9 17h4" }
+    }
+}
+
+#[component]
+fn SlidersIcon() -> Element {
+    rsx! {
+        Icon { path: "M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2M14 4v4M8 10v4M14 16v4" }
     }
 }
 

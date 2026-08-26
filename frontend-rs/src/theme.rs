@@ -191,7 +191,7 @@ pub fn ThemePicker() -> Element {
     let mut choice = use_signal(stored_choice);
 
     rsx! {
-        label { class: "flex flex-col gap-1 px-5 py-2",
+        label { class: "flex flex-col gap-1 py-2",
             span { class: "text-xs opacity-60", "Theme" }
             select {
                 class: "select select-bordered select-sm w-full",

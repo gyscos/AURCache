@@ -198,6 +198,7 @@ impl SettingsTraits for ApplicationSettings {
             auto_update_interval: get_setting(Setting::AutoUpdateInterval, pkgid, db).await,
             job_timeout: get_setting(Setting::JobTimeout, pkgid, db).await,
             builder_image: get_setting(Setting::BuilderImage, pkgid, db).await,
+            date_format: get_setting(Setting::DateFormat, pkgid, db).await,
         })
     }
 

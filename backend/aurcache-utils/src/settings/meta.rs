@@ -40,6 +40,18 @@ impl SettingsMetaTrait for Setting {
             //
             // Off by default: the existing behaviour is to flag a package and
             // leave rebuilding to an opt-in schedule.
+            // The default the web UI starts from. A browser can override it
+            // for itself, which is not stored here — this is the shared
+            // starting point, not a per-user preference.
+            // How the web UI writes absolute dates: field order, zero
+            // padding, and a 12- or 24-hour clock, e.g. `dmy-nopad-12`. A
+            // browser can override it for itself, which is not stored here —
+            // this is the shared starting point, not a per-user preference.
+            Self::DateFormat => SettingsMeta {
+                key: "date_format",
+                env_name: Some("DATE_FORMAT"),
+                default: "ymd-pad-24",
+            },
             Self::BuildOnNewVersion => SettingsMeta {
                 key: "build_on_new_version",
                 env_name: Some("BUILD_ON_NEW_VERSION"),

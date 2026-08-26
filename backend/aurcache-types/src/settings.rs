@@ -32,6 +32,9 @@ pub struct ApplicationSettings {
     pub auto_update_interval: SettingsEntry<Option<String>>,
     pub job_timeout: SettingsEntry<u32>,
     pub builder_image: SettingsEntry<String>,
+    /// Default date format for the web UI. A browser may override it
+    /// locally; nothing writes a per-client choice back here.
+    pub date_format: SettingsEntry<String>,
 }
 
 #[derive(Clone)]
@@ -49,6 +52,7 @@ pub enum Setting {
     VersionCheckInterval,
     AutoUpdateInterval,
     BuildOnNewVersion,
+    DateFormat,
     JobTimeout,
     BuilderImage,
     MakepkgConf,
