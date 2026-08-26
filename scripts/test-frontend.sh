@@ -137,6 +137,10 @@ ROUTES=(
     "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"
     "/packages|—|missing version shows a placeholder"
+    "/packages/add|Search the AUR|the add dialog (depth 2)"
+    # The list stays mounted behind the dialog, so dismissing it reveals the
+    # page as it was rather than reloading it.
+    "/packages/add|Filter packages|the add dialog leaves the list behind it"
     "/package/hello|Dependencies|package detail (depth 2)"
     "/package/hello|In repo|package detail shows what is in the repo"
     "/package/hello|Rebuild|the rebuild button sits with the builds"

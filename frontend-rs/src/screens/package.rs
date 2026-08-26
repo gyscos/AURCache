@@ -11,6 +11,7 @@
 use crate::api::client;
 use crate::dates::RelativeDate;
 use crate::format::{format_duration, now_secs};
+use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
 use aurcache_client::{Build, ExtendedPackage, PackageSource};
@@ -698,26 +699,9 @@ fn PlatformField(pkgbase: String, selected: Vec<String>, on_changed: EventHandle
             div { class: "min-w-0 flex-1",
                 if editing() {
                     div { class: "flex flex-col gap-1",
-                        for platform in ALL_PLATFORMS {
-                            label { key: "{platform}", class: "flex items-center gap-2 cursor-pointer",
-                                input {
-                                    r#type: "checkbox",
-                                    class: "checkbox checkbox-xs",
-                                    checked: draft().iter().any(|p| p == platform),
-                                    onchange: move |e| {
-                                        let mut next = draft();
-                                        if e.checked() {
-                                            if !next.iter().any(|p| p == platform) {
-                                                next.push(platform.to_string());
-                                            }
-                                        } else {
-                                            next.retain(|p| p != platform);
-                                        }
-                                        draft.set(next);
-                                    },
-                                }
-                                span { class: "font-mono text-xs", "{platform}" }
-                            }
+                        PlatformChecklist {
+                            selected: draft(),
+                            onchange: move |next| draft.set(next),
                         }
                         if let Some(message) = error() {
                             span { class: "text-xs text-error", "{message}" }
@@ -781,9 +765,6 @@ fn PlatformField(pkgbase: String, selected: Vec<String>, on_changed: EventHandle
         }
     }
 }
-
-/// The platforms a build can target, matching `pacman_mirrors::platforms`.
-const ALL_PLATFORMS: [&str; 3] = ["x86_64", "aarch64", "armv7h"];
 
 /// A value the backend does not expose yet.
 ///

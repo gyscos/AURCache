@@ -2,9 +2,9 @@ mod config;
 
 use anyhow::{Context, Result, bail};
 use aurcache_client::{
-    AddPackageRequest, AddPackageSource, AurCacheClient, Build, ExtendedPackage, GraphDataPoint,
+    AddPackageRequest, AurCacheClient, Build, ExtendedPackage, GitSourceSpec, GraphDataPoint,
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
-    SimplePackage, UpdatePackageRequest, UserInfo, Worker,
+    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -595,16 +595,18 @@ async fn add_package_command(
             if format == OutputFormat::Text {
                 println!("adding package from git: {package}");
             }
-            AddPackageSource::Git {
-                url: package,
-                git_ref: args.git_ref.clone().expect("checked above"),
-                subfolder: args.subfolder.clone(),
+            SourceData::Git {
+                spec: GitSourceSpec {
+                    url: package,
+                    r#ref: args.git_ref.clone().expect("checked above"),
+                    subfolder: args.subfolder.clone(),
+                },
             }
         } else {
             if format == OutputFormat::Text {
                 println!("adding package: {package}");
             }
-            AddPackageSource::Aur { name: package }
+            SourceData::Aur { name: package }
         };
         let body = AddPackageRequest {
             platforms: some_vec(args.platforms.clone()),

@@ -24,6 +24,10 @@ pub enum Route {
 
         #[route("/packages")]
         Packages {},
+        // A dialog over the list rather than a page, but with a URL of its own
+        // so it can be linked to and Back closes it.
+        #[route("/packages/add")]
+        PackageAdd {},
         #[route("/package/:pkgbase")]
         Package { pkgbase: String },
         #[route("/package/:pkgbase/builds")]
@@ -77,6 +81,7 @@ impl Route {
             // breadcrumb, same header — so it highlights Packages with the
             // rest of them rather than jumping the menu to Builds.
             Route::Packages { .. }
+            | Route::PackageAdd { .. }
             | Route::Package { .. }
             | Route::PackageBuilds { .. }
             | Route::Build { .. }

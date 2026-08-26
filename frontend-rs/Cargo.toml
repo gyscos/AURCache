@@ -40,3 +40,6 @@ strip = true
 # Renders components to an HTML string, so presentational logic can be tested
 # without a browser or a running backend.
 dioxus-ssr = "0.7"
+# Asserting the exact JSON a request body serialises to. The shapes come from
+# the server's own types, but how they nest is still worth pinning.
+serde_json = "1"

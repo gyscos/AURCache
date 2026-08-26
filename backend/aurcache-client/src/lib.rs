@@ -14,6 +14,12 @@ pub use aurcache_types::api::package::{
     AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
 };
 pub use aurcache_types::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
+// The add and preview requests are the server's own shapes rather than copies:
+// they were duplicated here, so a field added to one was silently absent from
+// the other.
+pub use aurcache_types::api::package::{
+    AddPackage as AddPackageRequest, SourcePreviewFileRequest, SourcePreviewRequest,
+};
 pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
 pub use aurcache_types::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_types::api::stats::{GraphDataPoint, UserInfo};
@@ -21,12 +27,11 @@ pub use aurcache_types::api::waiting::WaitingReason;
 pub use aurcache_types::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
-pub use aurcache_types::source::GitSourceSpec;
+pub use aurcache_types::source::{GitSourceSpec, SourceData};
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
@@ -83,50 +88,12 @@ pub struct ListStats {
 }
 
 /// Search result returned from the AUR search proxy endpoint.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Package name.
     pub name: String,
     /// Upstream version string reported by the search backend.
     pub version: String,
-}
-
-/// Request payload for adding a package to AURCache.
-#[derive(Debug, Serialize)]
-pub struct AddPackageRequest {
-    /// Optional platform selection for the package.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platforms: Option<Vec<String>>,
-    /// Optional build flags to apply.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_flags: Option<Vec<String>>,
-    /// Package source to add.
-    pub source: AddPackageSource,
-    /// Optional initial patch, expressed as full file contents (path -> new
-    /// content) rather than a diff - the server diffs each entry against the
-    /// source's pristine content itself.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub patched_files: Option<BTreeMap<String, String>>,
-}
-
-/// Source payload used when creating a package.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-pub enum AddPackageSource {
-    /// Add a package by AUR name.
-    #[serde(rename = "aur")]
-    Aur { name: String },
-    /// Add a package from a git repository.
-    #[serde(rename = "git")]
-    Git {
-        /// Remote git repository URL.
-        url: String,
-        /// Git reference to build from.
-        #[serde(rename = "ref")]
-        git_ref: String,
-        /// Subdirectory containing build files.
-        subfolder: String,
-    },
 }
 
 /// Request payload for triggering a package update check.
@@ -413,6 +380,41 @@ impl AurCacheClient {
             &format!("/package/{pkgbase}/build/{number}"),
             &[],
             None,
+        )
+        .await
+    }
+
+    /// Lists the files of a source that has not been added yet.
+    ///
+    /// The source travels in the body rather than being named by pkgbase,
+    /// because there is no package to name: this is what lets a PKGBUILD be
+    /// inspected — and fixed — before the package exists.
+    pub async fn preview_source_files(&self, source: &SourceData) -> Result<SourceFileList> {
+        self.request_json(
+            Method::POST,
+            "/package/source/preview/files",
+            &[],
+            Some(&SourcePreviewRequest {
+                source: source.clone(),
+            }),
+        )
+        .await
+    }
+
+    /// Reads one pristine file from a source that has not been added yet.
+    pub async fn preview_source_file(
+        &self,
+        source: &SourceData,
+        path: &str,
+    ) -> Result<SourceFileContent> {
+        self.request_json(
+            Method::POST,
+            "/package/source/preview/file",
+            &[],
+            Some(&SourcePreviewFileRequest {
+                source: source.clone(),
+                path: path.to_string(),
+            }),
         )
         .await
     }

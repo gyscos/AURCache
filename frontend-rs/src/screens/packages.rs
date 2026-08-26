@@ -39,7 +39,9 @@ pub fn Packages() -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 ListHeader { title: "Packages",
-                    button { class: "btn btn-primary btn-sm", "Add package" }
+                    Link { class: "btn btn-primary btn-sm", to: Route::PackageAdd {},
+                        "Add package"
+                    }
                 }
 
                 match &*packages.read_unchecked() {

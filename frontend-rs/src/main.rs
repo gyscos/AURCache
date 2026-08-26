@@ -18,6 +18,7 @@ mod dates;
 mod format;
 mod legacy_hash;
 mod listing;
+mod platforms;
 mod routes;
 mod screens;
 mod shell;
