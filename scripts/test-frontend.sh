@@ -142,6 +142,8 @@ ROUTES=(
     "/package/hello/builds|Platform|per-package build history (depth 3)"
     "/package/yay|blocking|a blocked package names what is holding it back"
     "/package/yay|too old|a dependency built to an unsatisfying version"
+    "/package/my-tool-git|github.com/example/my-tool|a git package links to its repository"
+    "/package/my-tool-git|A tool built straight from git|a git package has metadata from its checkout"
     "/settings|card-title\">Settings|settings"
     "/config-files|card-title\">Config files|config files"
     "/workers|card-title\">Workers|workers"

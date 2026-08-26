@@ -24,43 +24,47 @@ pub struct Migration;
 /// this migration ran has no cached metadata yet, which is a real state and
 /// distinct from "the AUR reports an empty description".
 const SQLITE_UP: &str = r"
-alter table packages add aur_description TEXT;
-alter table packages add aur_maintainer TEXT;
-alter table packages add aur_project_url TEXT;
-alter table packages add aur_licenses TEXT;
-alter table packages add aur_first_submitted BIGINT;
-alter table packages add aur_last_modified BIGINT;
+alter table packages add source_description TEXT;
+alter table packages add source_maintainer TEXT;
+alter table packages add source_project_url TEXT;
+alter table packages add source_licenses TEXT;
+alter table packages add source_first_submitted BIGINT;
+alter table packages add source_last_modified BIGINT;
 alter table packages add aur_flagged_outdated BOOLEAN;
+alter table packages add aur_missing BOOLEAN;
 ";
 
 const POSTGRES_UP: &str = r"
-ALTER TABLE packages ADD COLUMN aur_description TEXT;
-ALTER TABLE packages ADD COLUMN aur_maintainer TEXT;
-ALTER TABLE packages ADD COLUMN aur_project_url TEXT;
-ALTER TABLE packages ADD COLUMN aur_licenses TEXT;
-ALTER TABLE packages ADD COLUMN aur_first_submitted BIGINT;
-ALTER TABLE packages ADD COLUMN aur_last_modified BIGINT;
+ALTER TABLE packages ADD COLUMN source_description TEXT;
+ALTER TABLE packages ADD COLUMN source_maintainer TEXT;
+ALTER TABLE packages ADD COLUMN source_project_url TEXT;
+ALTER TABLE packages ADD COLUMN source_licenses TEXT;
+ALTER TABLE packages ADD COLUMN source_first_submitted BIGINT;
+ALTER TABLE packages ADD COLUMN source_last_modified BIGINT;
 ALTER TABLE packages ADD COLUMN aur_flagged_outdated BOOLEAN;
+ALTER TABLE packages ADD COLUMN aur_missing BOOLEAN;
 ";
 
 const SQLITE_DOWN: &str = r"
-alter table packages drop column aur_description;
-alter table packages drop column aur_maintainer;
-alter table packages drop column aur_project_url;
-alter table packages drop column aur_licenses;
-alter table packages drop column aur_first_submitted;
-alter table packages drop column aur_last_modified;
+alter table packages drop column source_description;
+alter table packages drop column source_maintainer;
+alter table packages drop column source_project_url;
+alter table packages drop column source_licenses;
+alter table packages drop column source_first_submitted;
+alter table packages drop column source_last_modified;
 alter table packages drop column aur_flagged_outdated;
+alter table packages drop column aur_missing;
 ";
 
 const POSTGRES_DOWN: &str = r"
-ALTER TABLE packages DROP COLUMN aur_description;
-ALTER TABLE packages DROP COLUMN aur_maintainer;
-ALTER TABLE packages DROP COLUMN aur_project_url;
-ALTER TABLE packages DROP COLUMN aur_licenses;
-ALTER TABLE packages DROP COLUMN aur_first_submitted;
-ALTER TABLE packages DROP COLUMN aur_last_modified;
+ALTER TABLE packages DROP COLUMN source_description;
+ALTER TABLE packages DROP COLUMN source_maintainer;
+ALTER TABLE packages DROP COLUMN source_project_url;
+ALTER TABLE packages DROP COLUMN source_licenses;
+ALTER TABLE packages DROP COLUMN source_first_submitted;
+ALTER TABLE packages DROP COLUMN source_last_modified;
 ALTER TABLE packages DROP COLUMN aur_flagged_outdated;
+ALTER TABLE packages DROP COLUMN aur_missing;
 ";
 
 #[async_trait::async_trait]

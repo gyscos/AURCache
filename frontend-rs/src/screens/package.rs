@@ -138,10 +138,7 @@ pub fn Package(pkgbase: String) -> Element {
 
 #[component]
 fn PackageHeader(pkg: ExtendedPackage) -> Element {
-    let description = match &pkg.package_source {
-        PackageSource::Aur(aur) => aur.description.clone(),
-        _ => None,
-    };
+    let description = pkg.description.clone();
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
@@ -395,39 +392,41 @@ fn SourceCard(pkg: ExtendedPackage) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 h2 { class: "card-title text-base", "Source" }
+                // Where the source comes from. The descriptive fields below
+                // are read from the checkout, so they are the same for an AUR
+                // package and a git one.
                 match &pkg.package_source {
                     PackageSource::Aur(aur) => rsx! {
                         Field { label: "Origin",
                             a { class: "link link-primary", href: "{aur.aur_url}",
                                 target: "_blank", rel: "noopener noreferrer", "AUR ↗" }
                         }
-                        if let Some(maintainer) = aur.maintainer.clone() {
-                            Field { label: "Maintainer", span { "{maintainer}" } }
-                        }
-                        if let Some(licenses) = aur.licenses.clone() {
-                            Field { label: "Licenses", span { "{licenses}" } }
-                        }
-                        if let Some(url) = aur.project_url.clone() {
-                            Field { label: "Upstream",
-                                a { class: "link link-primary break-all", href: "{url}",
-                                    target: "_blank", rel: "noopener noreferrer", "{url}" }
-                            }
-                        }
-                        if aur.aur_flagged_outdated {
-                            div { class: "alert alert-warning text-sm mt-2",
-                                span { "Flagged out of date on the AUR." }
-                            }
-                        }
                     },
                     PackageSource::AurNotFound(_) => rsx! {
-                        div { class: "alert alert-warning text-sm",
+                        div { class: "alert alert-warning text-sm mb-2",
                             span { "No longer found on the AUR." }
                         }
                     },
                     PackageSource::Git(spec) => rsx! {
                         Field { label: "Origin", span { "Git" } }
                         Field { label: "URL",
-                            span { class: "font-mono text-xs break-all", "{spec.url}" }
+                            match browsable_url(&spec.url) {
+                                Some(href) => rsx! {
+                                    a {
+                                        class: "link link-primary font-mono text-xs break-all",
+                                        href: "{href}",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        "{spec.url}"
+                                    }
+                                },
+                                // An SSH remote is not a page a browser can
+                                // open, so it stays text rather than becoming
+                                // a link that goes nowhere.
+                                None => rsx! {
+                                    span { class: "font-mono text-xs break-all", "{spec.url}" }
+                                },
+                            }
                         }
                         Field { label: "Ref", span { class: "font-mono text-xs", "{spec.r#ref}" } }
                         if !spec.subfolder.is_empty() {
@@ -439,6 +438,24 @@ fn SourceCard(pkg: ExtendedPackage) -> Element {
                     PackageSource::Upload(_) => rsx! {
                         Field { label: "Origin", span { "Uploaded archive" } }
                     },
+                }
+
+                if let Some(maintainer) = pkg.maintainer.clone() {
+                    Field { label: "Maintainer", span { "{maintainer}" } }
+                }
+                if let Some(licenses) = pkg.licenses.clone() {
+                    Field { label: "Licenses", span { "{licenses}" } }
+                }
+                if let Some(url) = pkg.project_url.clone() {
+                    Field { label: "Upstream",
+                        a { class: "link link-primary break-all", href: "{url}",
+                            target: "_blank", rel: "noopener noreferrer", "{url}" }
+                    }
+                }
+                if matches!(&pkg.package_source, PackageSource::Aur(aur) if aur.aur_flagged_outdated) {
+                    div { class: "alert alert-warning text-sm mt-2",
+                        span { "Flagged out of date on the AUR." }
+                    }
                 }
             }
         }
@@ -520,6 +537,20 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
             }
         }
     }
+}
+
+/// The same repository as a page a browser can open, if it is one.
+///
+/// Git remotes are not all web addresses. `git+ssh://git@github.com/...` is a
+/// supported and documented source here, and so is `git@host:path`; neither is
+/// something a browser can follow. Only http(s) remotes become links, so the
+/// rest render as plain text instead of a link that goes nowhere.
+///
+/// The `git+` prefix is makepkg's way of marking a source as a git repository,
+/// not part of the address.
+fn browsable_url(raw: &str) -> Option<String> {
+    let url = raw.trim().strip_prefix("git+").unwrap_or(raw.trim());
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
 /// A value the backend does not expose yet.
@@ -686,6 +717,57 @@ mod tests {
             dependencies: vec![],
             dependents: vec![],
             has_patch: false,
+            description: None,
+            project_url: None,
+            licenses: None,
+            maintainer: None,
+            first_submitted: None,
+            last_modified: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::browsable_url;
+
+    #[test]
+    fn web_remotes_become_links() {
+        assert_eq!(
+            browsable_url("https://github.com/user/repo.git").as_deref(),
+            Some("https://github.com/user/repo.git")
+        );
+        // `git+` marks the source as a repository; it is not part of the
+        // address, and a browser would choke on it.
+        assert_eq!(
+            browsable_url("git+https://github.com/user/repo").as_deref(),
+            Some("https://github.com/user/repo")
+        );
+        assert_eq!(
+            browsable_url("http://example.com/r.git").as_deref(),
+            Some("http://example.com/r.git")
+        );
+    }
+
+    /// SSH remotes are supported sources here — the docs use
+    /// `git+ssh://git@github.com/EpicGames/UnrealEngine` — but they are not
+    /// pages. A link to one is worse than no link.
+    #[test]
+    fn ssh_remotes_do_not_become_links() {
+        for raw in [
+            "git+ssh://git@github.com/EpicGames/UnrealEngine",
+            "ssh://git@example.com/repo.git",
+            "git@github.com:user/repo.git",
+            "file:///srv/local.git",
+        ] {
+            assert_eq!(browsable_url(raw), None, "{raw}");
+        }
+    }
+
+    /// A scheme that merely contains "http" is not an http URL.
+    #[test]
+    fn only_a_real_http_scheme_counts() {
+        assert_eq!(browsable_url("nothttps://example.com"), None);
+        assert_eq!(browsable_url(""), None);
     }
 }

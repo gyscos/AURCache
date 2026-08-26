@@ -243,10 +243,10 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
               ...pkg.package_source.when(
                 aur: (aur) {
                   final lastUpdated = DateTime.fromMillisecondsSinceEpoch(
-                    aur.last_updated * 1000,
+                    (pkg.last_modified ?? 0) * 1000,
                   );
                   final firstSubmitted = DateTime.fromMillisecondsSinceEpoch(
-                    aur.first_submitted * 1000,
+                    (pkg.first_submitted ?? 0) * 1000,
                   );
 
                   return [
@@ -260,10 +260,10 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
                       subtitle:
                           "${firstSubmitted.year}-${firstSubmitted.month.toString().padLeft(2, '0')}-${firstSubmitted.day.toString().padLeft(2, '0')}",
                     ),
-                    _sideCard(title: "Licenses", subtitle: aur.licenses ?? "-"),
+                    _sideCard(title: "Licenses", subtitle: pkg.licenses ?? "-"),
                     _sideCard(
                       title: "Maintainer",
-                      subtitle: aur.maintainer ?? "-",
+                      subtitle: pkg.maintainer ?? "-",
                     ),
                     _sideCard(
                       title: "Flagged outdated",
@@ -394,12 +394,12 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
       children: [
         ...pkg.package_source.when(
           aur: (aur) {
-            if (aur.description != null) {
+            if (pkg.description != null) {
               return [
                 const SizedBox(height: 25),
                 Padding(
                   padding: const EdgeInsets.all(5.0),
-                  child: Text(aur.description!),
+                  child: Text(pkg.description!),
                 ),
                 const SizedBox(height: 25),
               ];

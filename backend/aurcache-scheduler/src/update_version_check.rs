@@ -7,7 +7,7 @@ use aurcache_db::{builds, packages};
 use aurcache_deps::AurClient;
 use aurcache_types::build_state::BuildStates;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
-use aurcache_utils::package::aur_metadata::apply_aur_metadata;
+use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
@@ -108,14 +108,22 @@ async fn check_versions(
             SourceData::Aur { .. } => {
                 match results.iter().find(|x1| x1.package_base == package.name) {
                     None => {
+                        // Removed from the AUR. Recorded so the package page
+                        // can say so: its metadata still comes from the
+                        // checkout, which continues to exist, so absent
+                        // metadata no longer implies absence from the AUR.
                         warn!("Couldn't find {} in AUR response", package.name);
+                        package_model.aur_missing = Set(Some(true));
                     }
                     Some(result) => {
                         package_model.upstream_version = Set(Some(result.version.clone()));
-                        // The rest of the same response, written down so the
-                        // package route can render without its own AUR call.
-                        // No extra AUR traffic: `result` is already here.
-                        apply_aur_metadata(&mut package_model, result);
+                        // The AUR's own out-of-date marker is the one thing
+                        // here it alone knows; the rest of the page's metadata
+                        // is read from the checkout below, which also covers
+                        // git-sourced packages that have no AUR entry.
+                        package_model.aur_flagged_outdated =
+                            Set(Some(result.out_of_date.unwrap_or(0) != 0));
+                        package_model.aur_missing = Set(Some(false));
                         // Only mark out of date when upstream is strictly newer than the
                         // locally built version.  This prevents VCS packages (-git etc.)
                         // from looping: the AUR-reported version is the one from when the
@@ -131,6 +139,14 @@ async fn check_versions(
                         // whose upstream repo moved without the AUR PKGBUILD's
                         // version being bumped. Resolve any git+ VCS sources
                         // and flag out-of-date if any of them changed.
+                        store_source_metadata(
+                            store,
+                            &mut package_model,
+                            &source_data,
+                            package.patch.as_deref(),
+                        )
+                        .await;
+
                         match store
                             .sourceinfo(&source_data, package.patch.as_deref())
                             .await
@@ -198,6 +214,15 @@ async fn check_versions(
                 let version = sourceinfo.base.version.to_string();
 
                 package_model.upstream_version = Set(Some(version.clone()));
+                // A git-sourced package has no AUR entry, so this is the only
+                // place its description, licenses and maintainer come from.
+                store_source_metadata(
+                    store,
+                    &mut package_model,
+                    &source_data,
+                    package.patch.as_deref(),
+                )
+                .await;
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
                 let mut is_outdated =
@@ -262,6 +287,23 @@ fn upstream_is_newer(upstream: &str, built: Option<&str>, package: &str) -> bool
 
 /// Persist the version-check outcome for one package. A write failure only
 /// costs this package one round of tracking, so it is logged, not propagated.
+/// Read the package's metadata out of its checkout and stage it on the model.
+///
+/// Best-effort: a source that cannot be read costs the display fields, not the
+/// version check. The checkout is already resolved at this point, so this adds
+/// no fetch.
+async fn store_source_metadata(
+    store: &SnapshotStore,
+    model: &mut packages::ActiveModel,
+    source_data: &SourceData,
+    patch: Option<&str>,
+) {
+    match store.source_metadata(source_data, patch).await {
+        Ok(metadata) => apply_source_metadata(model, &metadata),
+        Err(e) => warn!("Failed to read source metadata: {e}"),
+    }
+}
+
 async fn save_package(db: &DatabaseConnection, model: packages::ActiveModel, name: &str) {
     if let Err(e) = model.update(db).await {
         warn!("Failed to store version check result for {name}: {e}");

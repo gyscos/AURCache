@@ -26,6 +26,14 @@ sealed class ExtendedPackage with _$ExtendedPackage {
     required List<PackageDependency> dependents,
     final List<String>? split_packages,
     required bool has_patch,
+    // Read from the package's source checkout rather than the AUR, so these
+    // describe a git-sourced package too.
+    String? description,
+    String? project_url,
+    String? licenses,
+    String? maintainer,
+    int? first_submitted,
+    int? last_modified,
     // ignore: invalid_annotation_target
     @JsonKey(toJson: _toString) required PackageSource package_source,
   }) = _ExtendedPackage;
@@ -105,12 +113,6 @@ sealed class PackageSource with _$PackageSource {
 sealed class AurPackage with _$AurPackage {
   const factory AurPackage({
     required String name,
-    String? project_url,
-    String? description,
-    required int last_updated,
-    required int first_submitted,
-    String? licenses,
-    String? maintainer,
     required bool aur_flagged_outdated,
     required String aur_url,
   }) = _AurPackage;

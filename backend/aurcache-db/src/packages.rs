@@ -54,16 +54,22 @@ pub struct Model {
     // Metadata mirrored from the AUR by the version-check scheduler, so the
     // package route can answer without a live lookup. All nullable: a package
     // that has not been checked since these columns were added has none yet.
-    pub aur_description: Option<String>,
-    pub aur_maintainer: Option<String>,
-    pub aur_project_url: Option<String>,
+    pub source_description: Option<String>,
+    pub source_maintainer: Option<String>,
+    pub source_project_url: Option<String>,
     /// The AUR reports a list; stored joined with ", " for display.
-    pub aur_licenses: Option<String>,
-    pub aur_first_submitted: Option<i64>,
-    pub aur_last_modified: Option<i64>,
+    pub source_licenses: Option<String>,
+    pub source_first_submitted: Option<i64>,
+    pub source_last_modified: Option<i64>,
     /// The AUR's own "flagged out of date" marker. Not [`Self::out_of_date`],
     /// which means upstream is newer than what we last built.
     pub aur_flagged_outdated: Option<bool>,
+    /// Whether the last AUR check did not find this package — it was removed
+    /// from the AUR. `None` before the first check.
+    ///
+    /// Recorded rather than inferred from absent metadata: metadata now comes
+    /// from the source checkout, which an unlisted package still has.
+    pub aur_missing: Option<bool>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

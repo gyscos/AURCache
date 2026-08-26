@@ -26,7 +26,12 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
   -- a package that was just promoted from a dependency and has not been
   -- version-checked yet. Both "no version yet" placeholders end up on screen
   -- rather than only in a unit test.
-  ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1);
+  ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1),
+  -- A git-sourced package. It has no AUR entry at all, so its description,
+  -- licenses and maintainer can only come from its checkout — and its origin
+  -- link has to point at the repository rather than at the AUR.
+  ('my-tool-git',            1, 0, 'r42.abc1234-1', '', 'x86_64', 'git',
+   '{"type":"git","url":"https://github.com/example/my-tool","ref":"main","subfolder":""}', 1);
 
 -- Timestamps are Unix *seconds*: `aurcache-api/src/stats.rs` compares
 -- start_time against strftime('%s', 'now'). Milliseconds render as dates
@@ -61,24 +66,35 @@ JOIN (
 -- fixture offline: without it the package route falls back to a live AUR
 -- lookup for every package.
 UPDATE packages SET
-  aur_description      = 'Prints Hello World and more',
-  aur_maintainer       = 'someone',
-  aur_project_url      = 'https://www.gnu.org/software/hello/',
-  aur_licenses         = 'GPL-3.0-or-later',
-  aur_first_submitted  = 1425168000,
-  aur_last_modified    = 1755000000,
-  aur_flagged_outdated = 0
+  source_description      = 'Prints Hello World and more',
+  source_maintainer       = 'someone',
+  source_project_url      = 'https://www.gnu.org/software/hello/',
+  source_licenses         = 'GPL-3.0-or-later',
+  source_first_submitted  = 1425168000,
+  source_last_modified    = 1755000000,
+  aur_flagged_outdated = 0,
+  aur_missing = 0
 WHERE name = 'hello';
 
 UPDATE packages SET
-  aur_description      = 'Yet another yogurt. Pacman wrapper and AUR helper written in go.',
-  aur_maintainer       = 'jguer',
-  aur_project_url      = 'https://github.com/Jguer/yay',
-  aur_licenses         = 'GPL-3.0-or-later',
-  aur_first_submitted  = 1470000000,
-  aur_last_modified    = 1756000000,
-  aur_flagged_outdated = 0
+  source_description      = 'Yet another yogurt. Pacman wrapper and AUR helper written in go.',
+  source_maintainer       = 'jguer',
+  source_project_url      = 'https://github.com/Jguer/yay',
+  source_licenses         = 'GPL-3.0-or-later',
+  source_first_submitted  = 1470000000,
+  source_last_modified    = 1756000000,
+  aur_flagged_outdated = 0,
+  aur_missing = 0
 WHERE name = 'yay';
+
+UPDATE packages SET
+  source_description     = 'A tool built straight from git',
+  source_maintainer      = 'Alex <alex@example.com>',
+  source_project_url     = 'https://example.com/my-tool',
+  source_licenses        = 'MIT',
+  source_first_submitted = 1600000000,
+  source_last_modified   = 1756000000
+WHERE name = 'my-tool-git';
 
 -- The builds above take their status from the package row, which is right for
 -- everything except `hello`: its package status reflects the failed build added

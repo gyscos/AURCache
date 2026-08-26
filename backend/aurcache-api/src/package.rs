@@ -192,13 +192,14 @@ pub async fn package_update_entity_endpoint(
         upstream_version: NotSet,
         // Mirrored AUR metadata is owned by the version-check scheduler; a
         // package patch must not clear it.
-        aur_description: NotSet,
-        aur_maintainer: NotSet,
-        aur_project_url: NotSet,
-        aur_licenses: NotSet,
-        aur_first_submitted: NotSet,
-        aur_last_modified: NotSet,
+        source_description: NotSet,
+        source_maintainer: NotSet,
+        source_project_url: NotSet,
+        source_licenses: NotSet,
+        source_first_submitted: NotSet,
+        source_last_modified: NotSet,
         aur_flagged_outdated: NotSet,
+        aur_missing: NotSet,
         latest_build: input.latest_build.map_or(NotSet, Set),
         build_flags: input
             .build_flags
@@ -709,21 +710,20 @@ pub async fn get_package(
 
     let (package_source, version) = match source_data {
         SourceData::Aur { .. } => {
-            // Read straight from the row. The version-check scheduler mirrors
-            // this metadata, and `package::add` fills it in immediately for a
-            // new package, so there is no live AUR lookup on this path at all —
-            // it used to be ~128ms of a ~130ms response, and one of the AUR's
-            // 4000 daily calls per page view.
-            //
-            // A package with nothing mirrored is one the AUR did not return:
-            // reported as not found, which is what a live lookup concluded too.
-            match cached_aur_package(&pkg) {
-                Some(cached) => (PackageSource::Aur(cached), pkg.upstream_version.clone()),
-                None => (
-                    PackageSource::AurNotFound(AurNotFoundPackage {}),
-                    pkg.upstream_version.clone(),
-                ),
-            }
+            // Read straight from the row: the version-check scheduler mirrors
+            // this, and `package::add` fills it in immediately for a new
+            // package, so there is no AUR lookup on this path. It used to be
+            // ~128ms of a ~130ms response and one of the AUR's 4000 daily
+            // calls per page view.
+            let source = if pkg.aur_missing == Some(true) {
+                // The last check did not find it in the AUR. Its page still
+                // renders — the metadata comes from the checkout — but it says
+                // the package is gone from upstream.
+                PackageSource::AurNotFound(AurNotFoundPackage {})
+            } else {
+                PackageSource::Aur(aur_source(&pkg))
+            };
+            (source, pkg.upstream_version.clone())
         }
         SourceData::Git { spec } => (
             PackageSource::Git(spec),
@@ -740,6 +740,14 @@ pub async fn get_package(
     };
 
     let ext_pkg = ExtendedPackage {
+        // Mirrored from the package's checkout, so a git-sourced package
+        // describes itself as fully as an AUR one.
+        description: pkg.source_description.clone(),
+        project_url: pkg.source_project_url.clone(),
+        licenses: pkg.source_licenses.clone(),
+        maintainer: pkg.source_maintainer.clone(),
+        first_submitted: pkg.source_first_submitted,
+        last_modified: pkg.source_last_modified,
         id: pkg.id,
         name: pkg.name,
         directly_requested: pkg.directly_requested,
@@ -771,33 +779,17 @@ fn aur_pkgbase_url(pkgbase: &str) -> String {
     format!("https://aur.archlinux.org/pkgbase/{pkgbase}")
 }
 
-/// The AUR metadata mirrored onto the package row, if it has been checked.
+/// The AUR-specific part of a package's source description.
 ///
-/// `aur_last_modified` is the sentinel: the version-check scheduler always
-/// writes it alongside the rest, while any individual field may legitimately be
-/// null because the AUR reports no value for it.
-///
-/// Known limitation: a package later removed from the AUR keeps its last-known
-/// metadata here, where a live lookup would report it as gone. The version
-/// checker logs that case, and the alternative — re-querying the AUR on every
-/// page view to detect a rare event — is the cost this exists to avoid.
-fn cached_aur_package(pkg: &packages::Model) -> Option<AurPackage> {
-    let last_modified = pkg.aur_last_modified?;
-
-    Some(AurPackage {
+/// Everything else a package page shows comes from its checkout — see
+/// `aurcache_utils::package::metadata` — so this is only the flag the AUR
+/// alone knows and the link back to it.
+fn aur_source(pkg: &packages::Model) -> AurPackage {
+    AurPackage {
         name: pkg.name.clone(),
-        project_url: pkg.aur_project_url.clone(),
-        description: pkg.aur_description.clone(),
-        last_updated: u32::try_from(last_modified).unwrap_or(0),
-        first_submitted: pkg
-            .aur_first_submitted
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0),
-        licenses: pkg.aur_licenses.clone(),
-        maintainer: pkg.aur_maintainer.clone(),
         aur_flagged_outdated: pkg.aur_flagged_outdated.unwrap_or(false),
         aur_url: aur_pkgbase_url(&pkg.name),
-    })
+    }
 }
 
 #[cfg(test)]

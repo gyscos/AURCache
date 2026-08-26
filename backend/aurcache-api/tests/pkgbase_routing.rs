@@ -609,12 +609,12 @@ async fn package_metadata_is_served_from_the_row() {
     // What the version-check scheduler mirrors onto the row.
     packages::ActiveModel {
         id: Set(pkg_id),
-        aur_description: Set(Some("Prints Hello World and more".to_string())),
-        aur_maintainer: Set(Some("someone".to_string())),
-        aur_project_url: Set(Some("https://www.gnu.org/software/hello/".to_string())),
-        aur_licenses: Set(Some("GPL-3.0-or-later".to_string())),
-        aur_first_submitted: Set(Some(1_425_168_000)),
-        aur_last_modified: Set(Some(1_755_000_000)),
+        source_description: Set(Some("Prints Hello World and more".to_string())),
+        source_maintainer: Set(Some("someone".to_string())),
+        source_project_url: Set(Some("https://www.gnu.org/software/hello/".to_string())),
+        source_licenses: Set(Some("GPL-3.0-or-later".to_string())),
+        source_first_submitted: Set(Some(1_425_168_000)),
+        source_last_modified: Set(Some(1_755_000_000)),
         aur_flagged_outdated: Set(Some(false)),
         ..Default::default()
     }
@@ -639,12 +639,24 @@ async fn package_metadata_is_served_from_the_row() {
     );
 }
 
-/// A package the AUR did not return has nothing mirrored, and is reported as
-/// not found rather than as an AUR package with every field blank.
+/// A package the AUR no longer lists says so.
+///
+/// Driven by what the last check actually found, not inferred from missing
+/// metadata: metadata now comes from the source checkout, which a package
+/// removed from the AUR still has.
 #[rocket::async_test]
-async fn a_package_with_no_mirrored_metadata_reads_as_not_found() {
+async fn a_package_the_aur_no_longer_lists_reads_as_not_found() {
     let (client, db) = test_client().await;
-    seed(&db, "hello").await;
+    let pkg_id = seed(&db, "hello").await;
+
+    packages::ActiveModel {
+        id: Set(pkg_id),
+        aur_missing: Set(Some(true)),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .expect("mark missing");
 
     let body = client
         .get("/api/package/hello")

@@ -1,5 +1,5 @@
-use crate::package::aur_metadata::refresh_aur_metadata;
 use crate::package::enqueue::trigger_initial_builds;
+use crate::package::metadata::refresh_source_metadata;
 use crate::patch::SourcePatch;
 use crate::pkg::architectures_for_platforms;
 use crate::snapshot::SnapshotStore;
@@ -254,8 +254,8 @@ async fn finalize_package_add(
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
         // It may have been a dependency row that no version check has reached
-        // yet, so it can still be missing its AUR metadata.
-        refresh_aur_metadata(client, db, std::slice::from_ref(&package_spec.pkgbase)).await;
+        // yet, so it can still be missing its metadata.
+        refresh_source_metadata(store, db, std::slice::from_ref(&package_spec.pkgbase)).await;
         return Ok(package_spec.pkgbase);
     }
 
@@ -287,12 +287,12 @@ async fn finalize_package_add(
 
     let added_order = persist_plan(db, context, plan).await?;
 
-    // Fill in the AUR metadata now rather than waiting for the next scheduled
+    // Fill in the metadata now rather than waiting for the next scheduled
     // version check: the package route reads it straight from the row and has
     // no live fallback, so a package added between checks would otherwise show
-    // no description or maintainer for up to an hour. One bulk call covers the
-    // whole plan, dependencies included.
-    refresh_aur_metadata(client, db, &added_order).await;
+    // no description or maintainer for up to an hour. Read from the checkouts
+    // the plan just resolved, so nothing is fetched again.
+    refresh_source_metadata(store, db, &added_order).await;
     let pkgbase = added_order
         .last()
         .cloned()

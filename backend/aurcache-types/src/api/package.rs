@@ -119,6 +119,21 @@ pub struct ExtendedPackage {
     pub dependents: Vec<PackageDependency>,
     /// Whether the package currently has a source patch applied.
     pub has_patch: bool,
+    // Read from the package's source checkout rather than from the AUR, so
+    // these describe a git-sourced package as well as an AUR one, and reflect
+    // the patched PKGBUILD — which is what actually gets built.
+    pub description: Option<String>,
+    pub project_url: Option<String>,
+    /// Several licenses are joined with ", ".
+    pub licenses: Option<String>,
+    /// From the `# Maintainer:` comment in the PKGBUILD, which is where the
+    /// name lives — `.SRCINFO` has no such field.
+    pub maintainer: Option<String>,
+    /// Unix seconds of the packaging repository's first commit.
+    pub first_submitted: Option<i64>,
+    /// Unix seconds of its newest commit: when the packaging was last touched,
+    /// not when the upstream project last changed.
+    pub last_modified: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
@@ -160,12 +175,11 @@ pub struct AurNotFoundPackage {}
 #[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
 pub struct AurPackage {
     pub name: String,
-    pub project_url: Option<String>,
-    pub description: Option<String>,
-    pub last_updated: u32,
-    pub first_submitted: u32,
-    pub licenses: Option<String>,
-    pub maintainer: Option<String>,
+    /// Whether the AUR reports the package as flagged out of date by a user.
+    ///
+    /// The one thing here that only the AUR knows: everything else a package
+    /// page shows is read from its source checkout, which also covers
+    /// git-sourced packages that have no AUR entry at all.
     pub aur_flagged_outdated: bool,
     pub aur_url: String,
 }
