@@ -32,13 +32,9 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                div { class: "flex items-center gap-3 flex-wrap",
-                    h2 { class: "card-title", "Builds of " }
-                    Link {
-                        class: "link link-primary font-mono",
-                        to: Route::Package { pkgbase: pkgbase.clone() },
-                        "{pkgbase}"
-                    }
+                crate::screens::PackageBreadcrumb {
+                    pkgbase: pkgbase.clone(),
+                    here: "All builds",
                 }
 
                 match &*builds.read_unchecked() {

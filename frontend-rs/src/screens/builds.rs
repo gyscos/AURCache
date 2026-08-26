@@ -80,18 +80,37 @@ pub fn Builds() -> Element {
                                 }
                                 tbody {
                                     for build in shown.iter() {
-                                        tr { key: "{build.id}", class: "hover",
+                                        tr {
+                                            key: "{build.id}",
+                                            class: "hover cursor-pointer",
+                                            // The row is the build: that is what
+                                            // a build list is a list of.
+                                            onclick: {
+                                                let id = build.id;
+                                                move |_| {
+                                                    navigator().push(Route::Build { id });
+                                                }
+                                            },
                                             td {
                                                 Link {
-                                                    class: "link link-primary font-mono",
+                                                    class: "font-mono",
                                                     to: Route::Build { id: build.id },
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
                                                     "#{build.id}"
                                                 }
                                             }
+                                            // The one cell that goes somewhere
+                                            // else, so it gets its own hover
+                                            // colour: the row highlight alone
+                                            // would suggest the whole row shares
+                                            // a single destination.
                                             td {
+                                                class: "hover:bg-primary/20 transition-colors",
+                                                title: "Open package",
                                                 Link {
-                                                    class: "link font-medium",
+                                                    class: "font-mono",
                                                     to: Route::Package { pkgbase: build.pkg_name.clone() },
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
                                                     "{build.pkg_name}"
                                                 }
                                             }

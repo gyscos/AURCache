@@ -155,6 +155,8 @@ ROUTES=(
 if [ "$ONLINE" = "1" ]; then
     # Fetches the PKGBUILD from the AUR, so it needs network.
     ROUTES+=("/package/hello/source/PKGBUILD|Revert to upstream|source editor (depth 4)")
+    ROUTES+=("/package/hello/source/PKGBUILD|Save &amp; Rebuild|save and queue in one step")
+    ROUTES+=("/package/hello/source/PKGBUILD|← hello|the editor offers a way back")
 fi
 
 [ -n "$SHOTS" ] && mkdir -p "$SHOTS"

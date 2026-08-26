@@ -100,6 +100,8 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         .is_some_and(|c| c.patched_content.is_some());
 
     rsx! {
+        div { class: "space-y-4",
+        crate::screens::PackageBreadcrumb { pkgbase: pkgbase.clone(), here: "Sources" }
         div { class: "flex gap-4",
             // File list
             div { class: "card bg-base-100 shadow-xl w-72 shrink-0",
@@ -170,6 +172,47 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                     },
                                     "Save"
                                 }
+                                button {
+                                    class: "btn btn-primary btn-sm",
+                                    disabled: !dirty,
+                                    // Editing a PKGBUILD is nearly always a
+                                    // prelude to building it; without this the
+                                    // next step is a save, a navigation back,
+                                    // and a second button.
+                                    onclick: {
+                                        let pkgbase = pkgbase.clone();
+                                        let path = path.clone();
+                                        move |_| {
+                                            let pkgbase = pkgbase.clone();
+                                            let path = path.clone();
+                                            async move {
+                                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
+                                                // The rebuild is only queued if
+                                                // the save worked: rebuilding
+                                                // the old source would report
+                                                // success for a change that was
+                                                // never stored.
+                                                match client.put_source_file(&pkgbase, &path, &draft()).await {
+                                                    Err(e) => status.set(Some((e.to_string(), false))),
+                                                    Ok(()) => match client
+                                                        .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
+                                                        .await
+                                                    {
+                                                        Ok(_) => status.set(Some((
+                                                            "Saved. A rebuild is queued.".into(),
+                                                            true,
+                                                        ))),
+                                                        Err(e) => status.set(Some((
+                                                            format!("Saved, but the rebuild could not be queued: {e}"),
+                                                            false,
+                                                        ))),
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "Save & Rebuild"
+                                }
                             }
 
                             // A patch that no longer applies is shown, not hidden:
@@ -197,6 +240,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     }
                 }
             }
+        }
         }
     }
 }

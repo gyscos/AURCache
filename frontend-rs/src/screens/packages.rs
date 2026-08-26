@@ -88,12 +88,43 @@ pub fn Packages() -> Element {
                                 }
                                 tbody {
                                     for pkg in shown.iter() {
-                                        tr { key: "{pkg.name}", class: "hover",
+                                        tr {
+                                            key: "{pkg.name}",
+                                            class: "hover cursor-pointer",
+                                            // The whole row is the target, but
+                                            // the name stays a real link so the
+                                            // address is copyable, middle-click
+                                            // opens a tab, and keyboard users
+                                            // have something to focus — none of
+                                            // which a bare row handler gives.
+                                            onclick: {
+                                                let pkgbase = pkg.name.clone();
+                                                move |_| {
+                                                    navigator().push(Route::Package {
+                                                        pkgbase: pkgbase.clone(),
+                                                    });
+                                                }
+                                            },
                                             td {
                                                 Link {
-                                                    class: "link link-primary font-medium",
+                                                    // Monospace, matching the
+                                                    // package page's heading:
+                                                    // a pkgbase is an identifier
+                                                    // and reads as one.
+                                                    //
+                                                    // Not `link link-primary`:
+                                                    // when everything in the row
+                                                    // navigates, underlining one
+                                                    // cell implies the rest does
+                                                    // not.
+                                                    class: "font-mono",
                                                     // pkgbase is the public identifier.
                                                     to: Route::Package { pkgbase: pkg.name.clone() },
+                                                    // Otherwise the click reaches
+                                                    // the row too and pushes the
+                                                    // same route twice, leaving a
+                                                    // duplicate history entry.
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
                                                     "{pkg.name}"
                                                 }
                                             }
@@ -105,7 +136,15 @@ pub fn Packages() -> Element {
                                             }
                                             td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
                                             td { class: "{WIDE_ONLY} text-right",
-                                                button { class: "btn btn-ghost btn-xs", "Update" }
+                                                button {
+                                                    class: "btn btn-ghost btn-xs",
+                                                    // A button inside a clickable
+                                                    // row has to claim its own
+                                                    // click, or pressing it also
+                                                    // navigates away.
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                    "Update"
+                                                }
                                             }
                                         }
                                     }
