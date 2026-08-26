@@ -8,6 +8,7 @@ use rocket::route::{Handler, Outcome};
 use rocket::{Data, Request, Response, Route};
 use rust_embed::RustEmbed;
 use std::io::Cursor;
+use std::path::PathBuf;
 use tracing::error;
 
 #[derive(RustEmbed)]
@@ -46,6 +47,14 @@ impl Handler for CustomHandler {
 
         if path.is_dir() || path.to_str() == Some("") {
             path = path.join("index.html");
+        }
+
+        // A frontend route matches no file. Answering it with the app shell is
+        // what makes a reload or a pasted deep link work; see `crate::spa`.
+        if <Asset as RustEmbed>::get(path.to_string_lossy().as_ref()).is_none()
+            && crate::spa::serves_app_shell(&path)
+        {
+            path = PathBuf::from("index.html");
         }
 
         match <Asset as RustEmbed>::get(path.to_string_lossy().as_ref()) {
