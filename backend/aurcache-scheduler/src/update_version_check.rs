@@ -139,19 +139,12 @@ async fn check_versions(
                         // whose upstream repo moved without the AUR PKGBUILD's
                         // version being bumped. Resolve any git+ VCS sources
                         // and flag out-of-date if any of them changed.
-                        store_source_metadata(
-                            store,
-                            &mut package_model,
-                            &source_data,
-                            package.patch.as_deref(),
-                        )
-                        .await;
-
                         match store
-                            .sourceinfo(&source_data, package.patch.as_deref())
+                            .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
                             .await
                         {
-                            Ok(sourceinfo) => {
+                            Ok((sourceinfo, metadata)) => {
+                                apply_source_metadata(&mut package_model, &metadata);
                                 match sync_vcs_sources(db, package_id, &sourceinfo).await {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                                     Err(e) => warn!(
@@ -197,11 +190,11 @@ async fn check_versions(
                 // can't be updated this round; the actual build for this
                 // package will separately fail later with the same error,
                 // which is the desired outcome for an unapplicable patch.
-                let sourceinfo = match store
-                    .sourceinfo(&source_data, package.patch.as_deref())
+                let (sourceinfo, metadata) = match store
+                    .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
                     .await
                 {
-                    Ok(sourceinfo) => sourceinfo,
+                    Ok(resolved) => resolved,
                     Err(e) => {
                         warn!("Failed to get sourceinfo for {}: {e}", package.name);
                         save_package(db, package_model, &package.name).await;
@@ -216,13 +209,7 @@ async fn check_versions(
                 package_model.upstream_version = Set(Some(version.clone()));
                 // A git-sourced package has no AUR entry, so this is the only
                 // place its description, licenses and maintainer come from.
-                store_source_metadata(
-                    store,
-                    &mut package_model,
-                    &source_data,
-                    package.patch.as_deref(),
-                )
-                .await;
+                apply_source_metadata(&mut package_model, &metadata);
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
                 let mut is_outdated =
@@ -287,23 +274,6 @@ fn upstream_is_newer(upstream: &str, built: Option<&str>, package: &str) -> bool
 
 /// Persist the version-check outcome for one package. A write failure only
 /// costs this package one round of tracking, so it is logged, not propagated.
-/// Read the package's metadata out of its checkout and stage it on the model.
-///
-/// Best-effort: a source that cannot be read costs the display fields, not the
-/// version check. The checkout is already resolved at this point, so this adds
-/// no fetch.
-async fn store_source_metadata(
-    store: &SnapshotStore,
-    model: &mut packages::ActiveModel,
-    source_data: &SourceData,
-    patch: Option<&str>,
-) {
-    match store.source_metadata(source_data, patch).await {
-        Ok(metadata) => apply_source_metadata(model, &metadata),
-        Err(e) => warn!("Failed to read source metadata: {e}"),
-    }
-}
-
 async fn save_package(db: &DatabaseConnection, model: packages::ActiveModel, name: &str) {
     if let Err(e) = model.update(db).await {
         warn!("Failed to store version check result for {name}: {e}");

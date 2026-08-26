@@ -273,9 +273,41 @@ impl SnapshotStore {
         source_data: &SourceData,
         patch: Option<&str>,
     ) -> anyhow::Result<crate::package::source_metadata::SourceMetadata> {
+        let entry = self.get_or_fetch(source_data, patch).await?;
+        Ok(self.metadata_from_entry(&entry, source_data))
+    }
+
+    /// The parsed `.SRCINFO` and the metadata, from a single resolve.
+    ///
+    /// The version check needs both: the `.SRCINFO` to sync VCS sources, and
+    /// the metadata to mirror onto the row. Asking for them separately meant
+    /// two `get_or_fetch` round trips per package per pass — cheap, since the
+    /// second is served from cache, but pointless.
+    pub async fn sourceinfo_and_metadata(
+        &self,
+        source_data: &SourceData,
+        patch: Option<&str>,
+    ) -> anyhow::Result<(
+        SourceInfoV1,
+        crate::package::source_metadata::SourceMetadata,
+    )> {
+        let entry = self.get_or_fetch(source_data, patch).await?;
+        let metadata = self.metadata_from_entry(&entry, source_data);
+        let sourceinfo = entry
+            .active
+            .sourceinfo
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Source's .SRCINFO/PKGBUILD could not be parsed"))?;
+        Ok((sourceinfo, metadata))
+    }
+
+    fn metadata_from_entry(
+        &self,
+        entry: &CacheEntry,
+        source_data: &SourceData,
+    ) -> crate::package::source_metadata::SourceMetadata {
         use crate::package::source_metadata::{from_sourceinfo, maintainer_from_pkgbuild};
 
-        let entry = self.get_or_fetch(source_data, patch).await?;
         let mut metadata = entry
             .active
             .sourceinfo
@@ -296,8 +328,7 @@ impl SnapshotStore {
         let (first, last) = self.packaging_history(source_data);
         metadata.first_submitted = first;
         metadata.last_modified = last;
-
-        Ok(metadata)
+        metadata
     }
 
     /// When a package's packaging was first and last touched, from the commit
