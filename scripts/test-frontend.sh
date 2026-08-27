@@ -189,6 +189,11 @@ if [ "$ONLINE" = "1" ]; then
     ROUTES+=("/packages/add#hello|Edit sources before adding|the add dialog can patch one source")
 fi
 
+# Things that mean someone was midway through diagnosing something. Deliberately
+# narrow: this has to be quiet on real content, and package descriptions are
+# arbitrary upstream text.
+JUNK='PROBE\[|DEBUG\[|HREF\[|QUERY\[|dbg!|todo!\(|XXXTEMP'
+
 [ -n "$SHOTS" ] && mkdir -p "$SHOTS"
 
 echo "==> checking routes"
@@ -209,6 +214,16 @@ for entry in "${ROUTES[@]}"; do
     fi
     if ! printf '%s' "$dom" | grep -q "$marker"; then
         echo "  FAIL  $route ($desc): mounted, but did not render $marker"
+        failures=$((failures + 1))
+        continue
+    fi
+
+    # Every check above asks whether something is present. None of them can
+    # notice something that should not be, which is how a debug probe rendering
+    # `HREF[...]QUERY[...]` above two list pages survived four commits: the
+    # markers it sat beside still matched. This asks the other question.
+    if junk="$(printf '%s' "$dom" | grep -oE "$JUNK" | sort -u | head -3)" && [ -n "$junk" ]; then
+        echo "  FAIL  $route ($desc): left-over debugging in the page: $(printf '%s' "$junk" | tr '\n' ' ')"
         failures=$((failures + 1))
         continue
     fi

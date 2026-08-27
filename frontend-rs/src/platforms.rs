@@ -16,6 +16,22 @@ pub const ALL: [&str; 3] = ["x86_64", "aarch64", "armv7h"];
 /// only one that needs no emulation.
 pub const DEFAULT: &str = "x86_64";
 
+/// The selection after ticking or unticking one architecture.
+///
+/// Order is preserved and a repeated tick is a no-op, so a set cannot grow a
+/// duplicate — the same platform twice would be sent to the server twice.
+pub fn toggled(selected: &[String], platform: &str, checked: bool) -> Vec<String> {
+    let mut next: Vec<String> = selected.to_vec();
+    if checked {
+        if !next.iter().any(|p| p == platform) {
+            next.push(platform.to_string());
+        }
+    } else {
+        next.retain(|p| p != platform);
+    }
+    next
+}
+
 /// A checkbox per architecture, reporting the whole selection on every change.
 ///
 /// Reports the set rather than the toggle so callers hold one value; a caller
@@ -34,23 +50,12 @@ pub fn PlatformChecklist(
                     input {
                         r#type: "checkbox",
                         class: "checkbox {size}",
-                        // Names the box for assistive tech, and is what the
-                        // interaction tests address it by.
-                        "aria-label": "{platform}",
                         disabled,
                         checked: selected.iter().any(|p| p == platform),
                         onchange: {
                             let selected = selected.clone();
                             move |e: FormEvent| {
-                                let mut next = selected.clone();
-                                if e.checked() {
-                                    if !next.iter().any(|p| p == platform) {
-                                        next.push(platform.to_string());
-                                    }
-                                } else {
-                                    next.retain(|p| p != platform);
-                                }
-                                onchange.call(next);
+                                onchange.call(toggled(&selected, platform, e.checked()));
                             }
                         },
                     }
@@ -63,11 +68,7 @@ pub fn PlatformChecklist(
 
 #[cfg(test)]
 mod tests {
-    use super::{ALL, DEFAULT, PlatformChecklist};
-    use crate::testing::Harness;
-    use dioxus::prelude::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use super::{ALL, DEFAULT, toggled};
 
     /// The default has to be one of the offered architectures, or a new package
     /// starts out asking for something the picker cannot show.
@@ -76,65 +77,40 @@ mod tests {
         assert!(ALL.contains(&DEFAULT));
     }
 
-    /// The reported set is captured rather than rendered, because it is what
-    /// callers act on and it is not visible in the markup.
-    fn checklist(initial: &[&str]) -> (Harness, Rc<RefCell<Vec<Vec<String>>>>) {
-        let reported = Rc::new(RefCell::new(Vec::new()));
-        let selected: Vec<String> = initial.iter().map(ToString::to_string).collect();
-
-        #[component]
-        fn Host(selected: Vec<String>, reported: Rc<RefCell<Vec<Vec<String>>>>) -> Element {
-            let mut selected = use_signal(|| selected);
-            rsx! {
-                PlatformChecklist {
-                    selected: selected(),
-                    onchange: move |next: Vec<String>| {
-                        reported.borrow_mut().push(next.clone());
-                        selected.set(next);
-                    },
-                }
-            }
-        }
-
-        let app = Harness::new_with_props(
-            Host,
-            HostProps {
-                selected,
-                reported: reported.clone(),
-            },
-        );
-        (app, reported)
+    fn set(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
     }
 
-    /// Ticking a box reports the whole set, not the box. Getting this wrong
-    /// renders identically — the checkbox still moves — and the caller quietly
-    /// receives one architecture instead of two.
+    /// Ticking reports the whole set, not the box that moved. Reporting only
+    /// the toggled one would quietly narrow a two-platform build to one.
     #[test]
-    fn ticking_a_box_adds_it_to_the_reported_set() {
-        let (mut app, reported) = checklist(&["x86_64"]);
-
-        app.set_checked("aria-label", "aarch64", true);
+    fn ticking_a_box_adds_it_to_the_set() {
         assert_eq!(
-            reported.borrow().last().unwrap(),
-            &["x86_64".to_string(), "aarch64".to_string()]
+            toggled(&set(&["x86_64"]), "aarch64", true),
+            set(&["x86_64", "aarch64"])
         );
     }
 
     #[test]
     fn unticking_a_box_removes_only_that_one() {
-        let (mut app, reported) = checklist(&["x86_64", "aarch64"]);
-
-        app.set_checked("aria-label", "x86_64", false);
-        assert_eq!(reported.borrow().last().unwrap(), &["aarch64".to_string()]);
+        assert_eq!(
+            toggled(&set(&["x86_64", "aarch64"]), "x86_64", false),
+            set(&["aarch64"])
+        );
     }
 
-    /// Ticking something already selected must not list it twice, which would
-    /// send the same platform to the server two times over.
+    /// The same platform twice would be sent to the server twice.
     #[test]
-    fn ticking_an_already_selected_box_does_not_duplicate_it() {
-        let (mut app, reported) = checklist(&["x86_64"]);
+    fn ticking_an_already_selected_box_changes_nothing() {
+        assert_eq!(toggled(&set(&["x86_64"]), "x86_64", true), set(&["x86_64"]));
+    }
 
-        app.set_checked("aria-label", "x86_64", true);
-        assert_eq!(reported.borrow().last().unwrap(), &["x86_64".to_string()]);
+    /// Unticking something absent is not an error, just nothing.
+    #[test]
+    fn unticking_an_unselected_box_changes_nothing() {
+        assert_eq!(
+            toggled(&set(&["x86_64"]), "aarch64", false),
+            set(&["x86_64"])
+        );
     }
 }

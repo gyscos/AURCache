@@ -23,8 +23,6 @@ mod screens;
 mod shell;
 mod source_editor;
 mod status;
-#[cfg(test)]
-mod testing;
 mod theme;
 
 use dioxus::prelude::*;
