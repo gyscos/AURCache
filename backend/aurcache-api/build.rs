@@ -12,6 +12,16 @@
 //! nothing here and needs no wasm toolchain, which is what someone working only
 //! on the backend gets.
 //!
+//! The check reads `CARGO_FEATURE_STATIC` rather than `cfg!(feature = "static")`.
+//! Both work today — the `cfg!` was measured, not assumed — but only the
+//! environment variable is specified: the Cargo reference lists
+//! `CARGO_FEATURE_<name>` as how features reach a build script and says nothing
+//! about `cfg!`. The same page warns that `cfg!` in a build script describes the
+//! *host* it runs on rather than the target being built, which is why
+//! `target_os` and friends must be read from `CARGO_CFG_*`. Features happen not
+//! to trip over that; target cfgs do, and this project cross-compiles for
+//! arm64. Reading them all the same way keeps that trap shut.
+//!
 //! The nested cargo invocation is safe because `frontend-rs` is its own
 //! workspace with its own target directory: the two builds never contend for
 //! the same lock. The cargo-set environment is cleared for the child all the
