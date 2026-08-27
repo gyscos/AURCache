@@ -7,20 +7,13 @@ use aurcache_db::activities;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::prelude::Activities;
 use sea_orm::ActiveValue::Set;
-use sea_orm::{
-    ActiveModelTrait, DatabaseConnection, EntityTrait, FromQueryResult, Order, QueryOrder,
-    QuerySelect,
-};
-use serde::{Deserialize, Serialize};
+use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Order, QueryOrder, QuerySelect};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
-use utoipa::ToSchema;
 
-#[derive(FromQueryResult, Deserialize, ToSchema, Serialize)]
-pub struct Activity {
-    pub timestamp: i64,
-    pub text: String,
-    pub user: Option<String>,
-}
+// Defined in aurcache-types so the HTTP client and the browser frontend use
+// the same struct rather than a hand-mirrored copy.
+pub use aurcache_types::api::activity::Activity;
 
 #[derive(Debug, Clone)]
 pub struct ActivityLog {

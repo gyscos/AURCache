@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 // this client, and the browser frontend alike. Types still declared below are
 // ones whose server-side counterpart has a different shape or name; converging
 // those is the remaining half of the job.
+pub use aurcache_types::api::activity::Activity;
 pub use aurcache_types::api::aur::ApiPackage;
 pub use aurcache_types::api::builds::BuildSummary as Build;
 pub use aurcache_types::api::package::{
@@ -473,6 +474,13 @@ impl AurCacheClient {
             path.push_str(key);
         }
         path
+    }
+
+    /// The most recent entries in the activity log, newest first.
+    pub async fn activities(&self, limit: Option<u64>) -> Result<Vec<Activity>> {
+        let query = Query::default().opt("limit", limit);
+        self.request_json::<Vec<Activity>, Value>(Method::GET, "/activity", query.pairs(), None)
+            .await
     }
 
     /// Lists all enrolled remote build workers and their status.

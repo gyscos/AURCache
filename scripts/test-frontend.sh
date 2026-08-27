@@ -172,7 +172,13 @@ ROUTES=(
     "/settings|>Reset<|settings can undo a stored value"
     "/config-files|card-title\">Config files|config files"
     "/workers|card-title\">Workers|workers"
-    "/activities|card-title\">Activities|activities"
+    "/activities|added package hello|activities"
+    # The text is rendered server-side from the stored JSON, so this also
+    # proves the payload shapes in the fixture are ones the server can parse.
+    "/activities|forced update of package yay|the log renders each entry type"
+    # Nobody asked for this one; a schedule did. The Dart frontend called that
+    # "You", which claims work the reader did not do.
+    "/activities|AURCache|an unattributed entry is credited to the server"
     "/no/such/page|Not found|404 (depth 3)"
 )
 if [ "$ONLINE" = "1" ]; then

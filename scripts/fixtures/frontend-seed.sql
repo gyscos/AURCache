@@ -145,3 +145,16 @@ SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER
 -- user is in the moment after they save one, and the only one that offers a
 -- Reset. `-1` is the global scope; a real package id would make it per-package.
 INSERT INTO settings (key, value, pkg_id) VALUES ('max_concurrent_builds', '4', -1);
+
+-- A few lines of activity log. The text is not stored: the server renders it
+-- from `typ` and the JSON in `data`, so these have to be shapes the serializers
+-- actually parse (see aurcache-activitylog/src/*_activity.rs). Types are
+-- 0=add, 1=remove, 2=update.
+--
+-- The last row has no user, which is the case the screen renders differently:
+-- nobody asked for it, a schedule did.
+INSERT INTO activity (typ, data, timestamp, user) VALUES
+  (0, '{"package":"hello"}',                    CAST(strftime('%s','now') AS INTEGER) - 30,    'alice'),
+  (2, '{"package":"yay","forced":true}',        CAST(strftime('%s','now') AS INTEGER) - 900,   'alice'),
+  (1, '{"package":"obsolete-thing"}',           CAST(strftime('%s','now') AS INTEGER) - 4000,  'bob'),
+  (2, '{"package":"neofetch","forced":false}',  CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);

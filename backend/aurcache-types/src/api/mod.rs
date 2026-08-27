@@ -5,6 +5,7 @@
 //! are also read straight out of a database query; those derives are gated
 //! behind the `db` feature so this module stays usable without a driver.
 
+pub mod activity;
 pub mod aur;
 pub mod builds;
 pub mod package;

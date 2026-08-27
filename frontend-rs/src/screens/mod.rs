@@ -3,6 +3,7 @@
 //! Screens that are not ported yet render [`NotPorted`] rather than nothing, so
 //! the menu is honest about what the Rust frontend does and does not cover.
 
+mod activities;
 mod build;
 mod builds;
 mod not_found;
@@ -14,6 +15,7 @@ mod packages;
 mod placeholder;
 mod settings;
 
+pub use activities::Activities;
 pub use build::Build;
 pub use builds::Builds;
 pub use not_found::NotFound;
@@ -48,11 +50,6 @@ pub fn Dashboard() -> Element {
 #[component]
 pub fn Workers() -> Element {
     rsx! { NotPorted { title: "Workers", note: "" } }
-}
-
-#[component]
-pub fn Activities() -> Element {
-    rsx! { NotPorted { title: "Activities", note: "" } }
 }
 
 #[component]
