@@ -3,7 +3,7 @@ use crate::startup::{post_startup_tasks, pre_startup_tasks};
 use aurcache_api::init::{init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
-use aurcache_db::helpers::downloads::DownloadBuffer;
+use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::init::init_db;
 use aurcache_scheduler::auto_update::start_auto_update_job;
 use aurcache_scheduler::download_flush::start_download_flush;
@@ -71,7 +71,7 @@ async fn main() {
     // into the database from here, so serving a package costs no write. Both
     // sides share this one buffer; a second instance would count into a map
     // nothing flushes.
-    let downloads = Arc::new(DownloadBuffer::new());
+    let downloads = Arc::new(DownloadCounter::new());
     let download_flush_handle = start_download_flush(db.clone(), downloads.clone());
 
     let api_handle = init_api(db.clone(), tx, store.clone(), downloads.clone());

@@ -8,7 +8,7 @@ use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::oauth_config_from_env;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
-use aurcache_db::helpers::downloads::DownloadBuffer;
+use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
@@ -82,7 +82,7 @@ pub fn init_api(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
-    downloads: Arc<DownloadBuffer>,
+    downloads: Arc<DownloadCounter>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
@@ -234,7 +234,7 @@ pub fn init_worker_api(
 }
 
 #[must_use]
-pub fn init_repo(downloads: Arc<DownloadBuffer>) -> JoinHandle<()> {
+pub fn init_repo(downloads: Arc<DownloadCounter>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),

@@ -14,7 +14,7 @@ use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
-use aurcache_db::helpers::downloads::{self, DownloadBuffer};
+use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
@@ -681,7 +681,7 @@ enum RelationDirection {
 /// a split list produces those and nothing named after the pkgbase.
 async fn download_total(
     db: &DatabaseConnection,
-    buffer: &Arc<DownloadBuffer>,
+    buffer: &Arc<DownloadCounter>,
     name: &str,
     split: Option<&[String]>,
 ) -> Result<i64, ApiError> {
@@ -689,7 +689,8 @@ async fn download_total(
         Some(names) if !names.is_empty() => names.to_vec(),
         _ => vec![name.to_string()],
     };
-    downloads::total_for_packages(db, buffer, &names)
+    buffer
+        .total_for_packages(db, &names)
         .await
         .map_err(|e| err(Status::InternalServerError, e))
 }
@@ -707,7 +708,7 @@ https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackage),
 #[get("/package/<pkgbase>")]
 pub async fn get_package(
     db: &State<DatabaseConnection>,
-    downloads: &State<Arc<DownloadBuffer>>,
+    downloads: &State<Arc<DownloadCounter>>,
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<ExtendedPackage>, ApiError> {

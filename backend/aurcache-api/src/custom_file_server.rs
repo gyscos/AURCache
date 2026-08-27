@@ -1,4 +1,4 @@
-use aurcache_db::helpers::downloads::DownloadBuffer;
+use aurcache_db::helpers::downloads::DownloadCounter;
 use rocket::fs::NamedFile;
 use rocket::http::uri::Segments;
 use rocket::http::{Header, Method, Status};
@@ -118,7 +118,7 @@ impl Handler for CustomFileServer {
 /// counter, an unreadable name or a file that is not a package are all reasons
 /// to count nothing, and none of them is a reason to fail the request.
 fn count_download(req: &Request<'_>, path: &Path) {
-    let Some(buffer) = req.rocket().state::<Arc<DownloadBuffer>>() else {
+    let Some(buffer) = req.rocket().state::<Arc<DownloadCounter>>() else {
         return;
     };
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {

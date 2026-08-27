@@ -20,17 +20,23 @@ use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Counts not yet written to the database.
+/// The download counter: the in-memory tally and every way to read it.
+///
+/// One type rather than a buffer plus a set of free functions taking both it
+/// and a connection. The stored count on its own is always the wrong answer --
+/// it lags by up to a flush interval -- so no method returns it. Reading is
+/// `total_for_packages`, which adds what is still buffered, and there is
+/// nothing else to reach for.
 ///
 /// A `std::sync::Mutex` rather than an async one: every critical section here
 /// is a map update with no await inside it, so the lock is never held across a
 /// yield point.
 #[derive(Debug, Default)]
-pub struct DownloadBuffer {
+pub struct DownloadCounter {
     pending: Mutex<HashMap<String, i64>>,
 }
 
-impl DownloadBuffer {
+impl DownloadCounter {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -46,18 +52,9 @@ impl DownloadBuffer {
         }
     }
 
-    /// Counts held in memory for the given file names.
-    #[must_use]
-    pub fn pending_for(&self, file_names: &[String]) -> i64 {
-        let Ok(pending) = self.pending.lock() else {
-            return 0;
-        };
-        file_names.iter().filter_map(|name| pending.get(name)).sum()
-    }
-
     /// Counts held in memory for every file the predicate accepts.
     #[must_use]
-    pub fn pending_matching(&self, wanted: &dyn Fn(&str) -> bool) -> i64 {
+    fn pending_matching(&self, wanted: &dyn Fn(&str) -> bool) -> i64 {
         let Ok(pending) = self.pending.lock() else {
             return 0;
         };
@@ -74,6 +71,39 @@ impl DownloadBuffer {
             .lock()
             .map(|mut pending| std::mem::take(&mut *pending))
             .unwrap_or_default()
+    }
+
+    /// Every download of every file belonging to any of `pkgnames`.
+    ///
+    /// Stored plus buffered. Matched by parsed package name rather than by
+    /// prefix -- a prefix claims `hello-world` for `hello` -- and across all
+    /// versions and architectures: the question is how often people have
+    /// installed this package, not how often one build of it was fetched.
+    pub async fn total_for_packages<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        pkgnames: &[String],
+    ) -> Result<i64, DbErr> {
+        if pkgnames.is_empty() {
+            return Ok(0);
+        }
+        let wanted = |file_name: &str| {
+            pkgname_of(file_name).is_some_and(|name| pkgnames.iter().any(|p| p == name))
+        };
+
+        let stmt = Statement::from_string(
+            db.get_database_backend(),
+            "SELECT file_name, count FROM download_counts".to_string(),
+        );
+        let stored: i64 = StoredRow::find_by_statement(stmt)
+            .all(db)
+            .await?
+            .into_iter()
+            .filter(|row| wanted(&row.file_name))
+            .map(|row| row.count)
+            .sum();
+
+        Ok(stored + self.pending_matching(&wanted))
     }
 
     /// Fold the buffer into the table.
@@ -126,40 +156,6 @@ async fn write_counts<C: ConnectionTrait>(
     Ok(())
 }
 
-#[derive(FromQueryResult)]
-struct StoredCount {
-    count: i64,
-}
-
-/// Stored counts for the given file names, ignoring anything still buffered.
-pub async fn stored_for<C: ConnectionTrait>(db: &C, file_names: &[String]) -> Result<i64, DbErr> {
-    if file_names.is_empty() {
-        return Ok(0);
-    }
-    let placeholders: Vec<String> = (1..=file_names.len()).map(|i| format!("${i}")).collect();
-    let stmt = Statement::from_sql_and_values(
-        db.get_database_backend(),
-        format!(
-            "SELECT COALESCE(SUM(count), 0) AS count FROM download_counts WHERE file_name IN ({})",
-            placeholders.join(", ")
-        ),
-        file_names.iter().map(|n| n.as_str().into()),
-    );
-    Ok(StoredCount::find_by_statement(stmt)
-        .one(db)
-        .await?
-        .map_or(0, |row| row.count))
-}
-
-/// Total downloads for a set of files: what is stored plus what is buffered.
-pub async fn total_for<C: ConnectionTrait>(
-    db: &C,
-    buffer: &DownloadBuffer,
-    file_names: &[String],
-) -> Result<i64, DbErr> {
-    Ok(stored_for(db, file_names).await? + buffer.pending_for(file_names))
-}
-
 /// The package name a repository file belongs to.
 ///
 /// An Arch package file is `<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>`.
@@ -167,7 +163,7 @@ pub async fn total_for<C: ConnectionTrait>(
 /// before the last three fields -- which is the only way to tell `hello` from
 /// `hello-world`, since a prefix match claims both.
 #[must_use]
-pub fn pkgname_of(file_name: &str) -> Option<&str> {
+fn pkgname_of(file_name: &str) -> Option<&str> {
     let stem = file_name.split(".pkg.tar").next()?;
     // arch, pkgrel, pkgver -- three separators from the right.
     let mut cut = stem.len();
@@ -175,38 +171,6 @@ pub fn pkgname_of(file_name: &str) -> Option<&str> {
         cut = stem[..cut].rfind('-')?;
     }
     (cut > 0).then(|| &stem[..cut])
-}
-
-/// Every download of every file belonging to any of `pkgnames`.
-///
-/// Matched by parsed package name rather than by prefix, and across all
-/// versions and architectures: the question is how often people have installed
-/// this package, not how often they fetched one particular build of it.
-pub async fn total_for_packages<C: ConnectionTrait>(
-    db: &C,
-    buffer: &DownloadBuffer,
-    pkgnames: &[String],
-) -> Result<i64, DbErr> {
-    if pkgnames.is_empty() {
-        return Ok(0);
-    }
-    let wanted = |file_name: &str| {
-        pkgname_of(file_name).is_some_and(|name| pkgnames.iter().any(|p| p == name))
-    };
-
-    let stmt = Statement::from_string(
-        db.get_database_backend(),
-        "SELECT file_name, count FROM download_counts".to_string(),
-    );
-    let stored: i64 = StoredRow::find_by_statement(stmt)
-        .all(db)
-        .await?
-        .into_iter()
-        .filter(|row| wanted(&row.file_name))
-        .map(|row| row.count)
-        .sum();
-
-    Ok(stored + buffer.pending_matching(&wanted))
 }
 
 #[derive(FromQueryResult)]
@@ -232,6 +196,28 @@ mod tests {
         names.iter().map(ToString::to_string).collect()
     }
 
+    /// What is stored, read straight from the table. The production path
+    /// never does this -- reading past the buffer is the thing the counter
+    /// exists to prevent -- so it lives here, where "has it been flushed yet"
+    /// is the actual question.
+    async fn stored(db: &DatabaseConnection, file_name: &str) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            count: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT COALESCE(SUM(count), 0) AS count FROM download_counts WHERE file_name = $1",
+            [file_name.into()],
+        ))
+        .one(db)
+        .await
+        .unwrap()
+        .map_or(0, |row| row.count)
+    }
+
+    const HELLO: &str = "hello-1.0-1-x86_64.pkg.tar.zst";
+
     /// The whole point of reading through the buffer: a download must show up
     /// immediately, not at the next flush. Counting only the stored value would
     /// make the number stall for a flush interval, which reads as downloads
@@ -239,30 +225,37 @@ mod tests {
     #[tokio::test]
     async fn a_download_counts_before_it_is_flushed() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
-        let files = names(&["hello-1.0-x86_64.pkg.tar.zst"]);
+        let counter = DownloadCounter::new();
 
-        buffer.record(&files[0]);
-        buffer.record(&files[0]);
+        counter.record(HELLO);
+        counter.record(HELLO);
 
-        assert_eq!(stored_for(&db, &files).await.unwrap(), 0);
-        assert_eq!(total_for(&db, &buffer, &files).await.unwrap(), 2);
+        assert_eq!(stored(&db, HELLO).await, 0, "nothing should be written yet");
+        assert_eq!(
+            counter
+                .total_for_packages(&db, &names(&["hello"]))
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     /// And must not be counted twice once it is.
     #[tokio::test]
     async fn flushing_moves_counts_rather_than_copying_them() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
-        let files = names(&["hello-1.0-x86_64.pkg.tar.zst"]);
+        let counter = DownloadCounter::new();
 
-        buffer.record(&files[0]);
-        buffer.record(&files[0]);
-        buffer.flush(&db).await.unwrap();
+        counter.record(HELLO);
+        counter.record(HELLO);
+        counter.flush(&db).await.unwrap();
 
-        assert_eq!(stored_for(&db, &files).await.unwrap(), 2);
+        assert_eq!(stored(&db, HELLO).await, 2);
         assert_eq!(
-            total_for(&db, &buffer, &files).await.unwrap(),
+            counter
+                .total_for_packages(&db, &names(&["hello"]))
+                .await
+                .unwrap(),
             2,
             "a flushed count was counted again from the buffer"
         );
@@ -273,34 +266,30 @@ mod tests {
     #[tokio::test]
     async fn flushes_accumulate() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
-        let files = names(&["hello-1.0-x86_64.pkg.tar.zst"]);
+        let counter = DownloadCounter::new();
 
-        buffer.record(&files[0]);
-        buffer.flush(&db).await.unwrap();
-        buffer.record(&files[0]);
-        buffer.record(&files[0]);
-        buffer.flush(&db).await.unwrap();
+        counter.record(HELLO);
+        counter.flush(&db).await.unwrap();
+        counter.record(HELLO);
+        counter.record(HELLO);
+        counter.flush(&db).await.unwrap();
 
-        assert_eq!(total_for(&db, &buffer, &files).await.unwrap(), 3);
+        assert_eq!(
+            counter
+                .total_for_packages(&db, &names(&["hello"]))
+                .await
+                .unwrap(),
+            3
+        );
     }
 
-    /// A package's total is the sum over the files it produces, which is how a
-    /// split package's downloads add up to one figure.
+    /// Asking about nothing is not an error, and reaches no table.
     #[tokio::test]
-    async fn counts_sum_over_the_files_asked_for() {
+    async fn no_packages_is_no_downloads() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
-
-        buffer.record("a-1.0-x86_64.pkg.tar.zst");
-        buffer.record("b-1.0-x86_64.pkg.tar.zst");
-        buffer.record("b-1.0-x86_64.pkg.tar.zst");
-        buffer.record("unrelated-1.0-x86_64.pkg.tar.zst");
-        buffer.flush(&db).await.unwrap();
-
-        let both = names(&["a-1.0-x86_64.pkg.tar.zst", "b-1.0-x86_64.pkg.tar.zst"]);
-        assert_eq!(total_for(&db, &buffer, &both).await.unwrap(), 3);
-        assert_eq!(total_for(&db, &buffer, &[]).await.unwrap(), 0);
+        let counter = DownloadCounter::new();
+        counter.record(HELLO);
+        assert_eq!(counter.total_for_packages(&db, &[]).await.unwrap(), 0);
     }
 
     /// A prefix match claims `hello-world` for `hello`. The name has to be
@@ -335,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn a_packages_total_is_its_own_files_only() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
+        let buffer = DownloadCounter::new();
 
         buffer.record("hello-2.12.1-2-x86_64.pkg.tar.zst");
         buffer.record("hello-2.12.1-2-aarch64.pkg.tar.zst");
@@ -345,12 +334,13 @@ mod tests {
 
         let hello = names(&["hello"]);
         assert_eq!(
-            total_for_packages(&db, &buffer, &hello).await.unwrap(),
+            buffer.total_for_packages(&db, &hello).await.unwrap(),
             3,
             "a prefix match would have counted hello-world too"
         );
         assert_eq!(
-            total_for_packages(&db, &buffer, &names(&["hello-world"]))
+            buffer
+                .total_for_packages(&db, &names(&["hello-world"]))
                 .await
                 .unwrap(),
             1
@@ -362,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn a_split_packages_names_are_summed_and_read_through_the_buffer() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
+        let buffer = DownloadCounter::new();
 
         buffer.record("libfoo-1.0-1-x86_64.pkg.tar.zst");
         buffer.flush(&db).await.unwrap();
@@ -370,14 +360,14 @@ mod tests {
         buffer.record("libfoo-docs-1.0-1-x86_64.pkg.tar.zst");
 
         let both = names(&["libfoo", "libfoo-docs"]);
-        assert_eq!(total_for_packages(&db, &buffer, &both).await.unwrap(), 2);
+        assert_eq!(buffer.total_for_packages(&db, &both).await.unwrap(), 2);
     }
 
     /// Nothing buffered is not an error, and must not write anything.
     #[tokio::test]
     async fn flushing_an_empty_buffer_does_nothing() {
         let db = setup().await;
-        let buffer = DownloadBuffer::new();
+        let buffer = DownloadCounter::new();
         assert_eq!(buffer.flush(&db).await.unwrap(), 0);
     }
 }

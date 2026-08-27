@@ -17,7 +17,7 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
-use aurcache_db::helpers::downloads::DownloadBuffer;
+use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
@@ -99,7 +99,7 @@ async fn test_client() -> (Client, DatabaseConnection) {
     let checkouts = tempfile::tempdir().expect("tempdir");
     let rocket = rocket::build()
         .manage(db.clone())
-        .manage(Arc::new(DownloadBuffer::new()))
+        .manage(Arc::new(DownloadCounter::new()))
         .manage(ActivityLog::new(db.clone()))
         .manage(broadcast::channel::<Action>(16).0)
         .manage(Arc::new(SnapshotStore::with_checkout_root(

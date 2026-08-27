@@ -9,7 +9,7 @@
 //! chosen on that basis rather than on write cost -- the writes are one row per
 //! distinct file per interval, which is nothing.
 
-use aurcache_db::helpers::downloads::DownloadBuffer;
+use aurcache_db::helpers::downloads::DownloadCounter;
 use sea_orm::DatabaseConnection;
 use std::env;
 use std::sync::Arc;
@@ -18,7 +18,10 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 /// Spawn the flush loop. Runs every `DOWNLOAD_FLUSH_INTERVAL` seconds.
-pub fn start_download_flush(db: DatabaseConnection, buffer: Arc<DownloadBuffer>) -> JoinHandle<()> {
+pub fn start_download_flush(
+    db: DatabaseConnection,
+    buffer: Arc<DownloadCounter>,
+) -> JoinHandle<()> {
     let secs = env::var("DOWNLOAD_FLUSH_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
