@@ -455,6 +455,7 @@ fn AddPackageDialog(q: String) -> Element {
                                 taken.extend(queued().iter().map(source_label));
                                 taken
                             },
+                            frozen: busy(),
                             onpick: move |name: String| {
                                 entry.set(name);
                                 enqueue();
@@ -466,6 +467,7 @@ fn AddPackageDialog(q: String) -> Element {
                         queued: queued(),
                         adding: adding(),
                         added: added(),
+                        frozen: busy(),
                         onremove: move |label: String| {
                             queued.retain(|s| source_label(s) != label);
                         },
@@ -538,7 +540,15 @@ fn AddPackageDialog(q: String) -> Element {
                 }
 
                 div { class: "modal-action",
-                    button { class: "btn btn-ghost", onclick: close, "Cancel" }
+                    // Leaving mid-run would drop the future doing the adding,
+                    // part way through a queue, with no record of where it got
+                    // to. The run is bounded and reports progress beside this.
+                    button {
+                        class: "btn btn-ghost",
+                        disabled: busy(),
+                        onclick: close,
+                        "Cancel"
+                    }
                     button {
                         class: "btn btn-primary",
                         disabled: !ready,
@@ -555,7 +565,12 @@ fn AddPackageDialog(q: String) -> Element {
             // Clicking away closes, which is what a dimmed backdrop implies.
             // No colour of its own: `.modal` already dims the page behind it,
             // and a second translucent layer on top darkened it twice.
-            div { class: "modal-backdrop", onclick: close }
+            // The backdrop closes the dialog too, so it freezes with everything
+            // else rather than being the one way out of a frozen dialog.
+            div {
+                class: "modal-backdrop",
+                onclick: move |e| if !busy() { close(e) },
+            }
         }
     }
 }
@@ -642,6 +657,11 @@ fn QueuedList(
     /// Sources this run has already added.
     #[props(default)]
     added: Vec<String>,
+    /// A run is under way, so nothing can be taken out of it. `submit` copies
+    /// the queue before it starts and works from that copy, so removing a chip
+    /// here would take it off the screen while the request for it still went.
+    #[props(default = false)]
+    frozen: bool,
     onremove: EventHandler<String>,
 ) -> Element {
     if queued.is_empty() {
@@ -670,7 +690,7 @@ fn QueuedList(
                             // Only while it can still be taken back. Removing
                             // one mid-flight would not stop the request, and
                             // removing one already added would not undo it.
-                            if state == ChipState::Waiting {
+                            if state == ChipState::Waiting && !frozen {
                                 button {
                                     class: "btn btn-ghost btn-xs px-1",
                                     "aria-label": "Remove {label}",
@@ -711,6 +731,11 @@ fn SearchResults(
     /// selectable: that a package is already handled is the useful answer, and
     /// better than hiding it and leaving someone to wonder where it went.
     taken: Vec<String>,
+    /// A run is under way. The queue was snapshotted when it started, so a
+    /// package picked now would join a list nothing reads again -- the pill
+    /// would appear and then quietly not be added.
+    #[props(default = false)]
+    frozen: bool,
     onpick: EventHandler<String>,
 ) -> Element {
     let query = query.trim();
@@ -743,11 +768,12 @@ fn SearchResults(
                 for result in found {
                     {
                         let held = taken.contains(&result.name);
+                        let locked = held || frozen;
                         rsx! {
                             li { key: "{result.name}",
                                 button {
-                                    class: if held { "opacity-50 cursor-not-allowed" } else { "" },
-                                    disabled: held,
+                                    class: if locked { "opacity-50 cursor-not-allowed" } else { "" },
+                                    disabled: locked,
                                     onclick: {
                                         let name = result.name.clone();
                                         move |_| onpick.call(name.clone())
@@ -782,9 +808,10 @@ mod tests {
         query: String,
         results: Option<Result<Vec<SearchResult>, String>>,
         taken: Vec<String>,
+        #[props(default = false)] frozen: bool,
     ) -> Element {
         rsx! {
-            SearchResults { query, results, taken, onpick: move |_| {} }
+            SearchResults { query, results, taken, frozen, onpick: move |_| {} }
         }
     }
 
@@ -797,12 +824,22 @@ mod tests {
         results: Option<Result<Vec<SearchResult>, String>>,
         taken: Vec<String>,
     ) -> String {
+        render_search(query, results, taken, false)
+    }
+
+    fn render_search(
+        query: &str,
+        results: Option<Result<Vec<SearchResult>, String>>,
+        taken: Vec<String>,
+        frozen: bool,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
             Harness,
             HarnessProps {
                 query: query.to_string(),
                 results,
                 taken,
+                frozen,
             },
         );
         dom.rebuild_in_place();
@@ -817,9 +854,10 @@ mod tests {
         queued: Vec<SourceData>,
         adding: Option<String>,
         added: Vec<String>,
+        #[props(default = false)] frozen: bool,
     ) -> Element {
         rsx! {
-            QueuedList { queued, adding, added, onremove: move |_| {} }
+            QueuedList { queued, adding, added, frozen, onremove: move |_| {} }
         }
     }
 
@@ -828,16 +866,74 @@ mod tests {
     }
 
     fn render_run(queued: Vec<SourceData>, adding: Option<&str>, added: Vec<String>) -> String {
+        render_run_frozen(queued, adding, added, false)
+    }
+
+    fn render_run_frozen(
+        queued: Vec<SourceData>,
+        adding: Option<&str>,
+        added: Vec<String>,
+        frozen: bool,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
             QueueHarness,
             QueueHarnessProps {
                 queued,
                 adding: adding.map(ToString::to_string),
                 added,
+                frozen,
             },
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// While a run is under way the queue it is working from has already been
+    /// copied, so a package picked out of the search list would show as a pill
+    /// and then never be added. Every row is refused for the duration.
+    #[test]
+    fn search_results_cannot_be_picked_during_a_run() {
+        let found = Ok(vec![SearchResult {
+            name: "hello".to_string(),
+            version: "1.0".to_string(),
+        }]);
+
+        let open = render_search("hello", Some(found.clone()), Vec::new(), false);
+        assert!(open.contains("hello"));
+        assert!(
+            !open.contains("disabled"),
+            "a free row should be pickable: {open}"
+        );
+
+        let frozen = render_search("hello", Some(found), Vec::new(), true);
+        assert!(frozen.contains("hello"), "the row is still shown: {frozen}");
+        assert!(
+            frozen.contains("disabled"),
+            "a row stayed pickable while a run was under way: {frozen}"
+        );
+    }
+
+    /// Same reason from the other side: `submit` works from a copy of the
+    /// queue, so taking a pill out mid-run removes it from the screen while
+    /// the request for it still goes.
+    #[test]
+    fn queued_packages_cannot_be_removed_during_a_run() {
+        let queued = vec![aur("hello"), aur("neofetch")];
+
+        let open = render_run_frozen(queued.clone(), None, Vec::new(), false);
+        assert!(
+            open.contains("Remove hello"),
+            "a waiting package should be removable: {open}"
+        );
+
+        // `neofetch` is still waiting its turn -- the tempting one to remove,
+        // and the one whose removal would be a lie.
+        let frozen = render_run_frozen(queued, Some("hello"), Vec::new(), true);
+        assert!(frozen.contains("neofetch"), "the pill is still shown");
+        assert!(
+            !frozen.contains("Remove "),
+            "a package could still be taken out of a running queue: {frozen}"
+        );
     }
 
     fn aur(name: &str) -> SourceData {
