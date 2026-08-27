@@ -18,3 +18,8 @@ source_cache/
 # Build output of the Rust frontend (wasm bundle + wasm-bindgen glue).
 # Produced by `cargo build --target wasm32-unknown-unknown` + `wasm-bindgen`.
 frontend-rs/dist/
+
+# The built frontend, embedded into the server by `aurcache-api`'s `static`
+# feature. Produced by the Docker build and by scripts/test-frontend.sh; never
+# a source file.
+backend/aurcache-api/web/

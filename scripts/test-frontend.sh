@@ -22,8 +22,11 @@ SEED="$PROJECT_DIR/scripts/fixtures/frontend-seed.sql"
 
 # The API port is compiled in (aurcache_types::ports::AURCACHE_HTTP_PORT), so it
 # cannot be moved out of the way.
+# One port, because one server. The frontend is embedded into the backend by
+# `aurcache-api`'s `static` feature, exactly as it ships, so these checks
+# exercise the real asset handler and the real SPA fallback rather than a
+# stand-in that reimplements them.
 API_PORT=8080
-UI_PORT=8099
 
 SHOTS=""
 ONLINE=0
@@ -58,17 +61,13 @@ rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown \
 # suite then silently tests *that* build. This has happened; refuse instead.
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 port_busy "$API_PORT" && fail "port $API_PORT is already in use — stop the other server first"
-port_busy "$UI_PORT"  && fail "port $UI_PORT is already in use — stop the other server first"
 
 WORKDIR="$(mktemp -d)"
 BACKEND_PID=""
-UI_PID=""
 cleanup() {
-    [ -n "$UI_PID" ] && kill "$UI_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
-    # Wait for them to release the ports, or an immediate rerun trips the
+    # Wait for it to release the port, or an immediate rerun trips the
     # busy-port preflight.
-    [ -n "$UI_PID" ] && wait "$UI_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && wait "$BACKEND_PID" 2>/dev/null || true
     rm -rf "$WORKDIR"
 }
@@ -83,8 +82,17 @@ echo "==> building the frontend"
          target/wasm32-unknown-unknown/release/aurcache-frontend.wasm \
     && cp index.html dist/index.html )
 
+# `#[derive(RustEmbed)] #[folder = "web"]` bakes these in at compile time, so
+# they have to be in place before the server is built, and the server has to be
+# rebuilt whenever they change.
+echo "==> embedding the frontend"
+WEB_DIR="$PROJECT_DIR/backend/aurcache-api/web"
+rm -rf "$WEB_DIR"
+mkdir -p "$WEB_DIR"
+cp -r "$PROJECT_DIR/frontend-rs/dist/." "$WEB_DIR/"
+
 echo "==> building the server"
-( cd "$PROJECT_DIR/backend" && cargo build --quiet -p aurcache )
+( cd "$PROJECT_DIR/backend" && cargo build --quiet -p aurcache --features aurcache-api/static )
 
 # --- run -------------------------------------------------------------------
 
@@ -109,15 +117,8 @@ curl -sf "http://localhost:$API_PORT/api/packages/list?limit=1" -o /dev/null \
 echo "==> seeding fixture data"
 sqlite3 "$WORKDIR/db/db.sqlite" < "$SEED"
 
-echo "==> serving the frontend"
-( cd "$PROJECT_DIR/frontend-rs" \
-    && exec python3 serve.py "http://localhost:$API_PORT" "$UI_PORT" > "$WORKDIR/ui.log" 2>&1 ) &
-UI_PID=$!
-for _ in $(seq 1 60); do
-    curl -sf "http://localhost:$UI_PORT/" -o /dev/null && break
-    sleep 0.5
-done
-curl -sf "http://localhost:$UI_PORT/" -o /dev/null || fail "ui server did not come up"
+curl -sf "http://localhost:$API_PORT/" -o /dev/null \
+    || { tail -20 "$WORKDIR/server.log"; fail "server is not serving the frontend"; }
 
 # --- checks ----------------------------------------------------------------
 #
@@ -237,7 +238,7 @@ for entry in "${ROUTES[@]}"; do
     marker="${rest%%|*}"; desc="${rest#*|}"
 
     dom="$("$CHROME" --headless --disable-gpu --no-sandbox \
-             --virtual-time-budget=8000 --dump-dom "http://localhost:$UI_PORT$route" 2>/dev/null || true)"
+             --virtual-time-budget=8000 --dump-dom "http://localhost:$API_PORT$route" 2>/dev/null || true)"
 
     # The shell is the layout every route renders into. Missing it means the
     # app never mounted -- a blank page -- rather than a wrong screen.
@@ -268,7 +269,7 @@ for entry in "${ROUTES[@]}"; do
         [ -z "$name" ] && name="index"
         "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
             --window-size=1440,1400 --virtual-time-budget=8000 \
-            --screenshot="$SHOTS/$name.png" "http://localhost:$UI_PORT$route" >/dev/null 2>&1
+            --screenshot="$SHOTS/$name.png" "http://localhost:$API_PORT$route" >/dev/null 2>&1
     fi
 done
 
@@ -280,10 +281,10 @@ done
 if [ -n "$SHOTS" ]; then
     "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
         --window-size=420,900 --virtual-time-budget=8000 \
-        --screenshot="$SHOTS/packages-narrow.png" "http://localhost:$UI_PORT/packages" >/dev/null 2>&1
+        --screenshot="$SHOTS/packages-narrow.png" "http://localhost:$API_PORT/packages" >/dev/null 2>&1
     "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
         --window-size=1920,1200 --virtual-time-budget=8000 \
-        --screenshot="$SHOTS/settings-wide.png" "http://localhost:$UI_PORT/settings" >/dev/null 2>&1
+        --screenshot="$SHOTS/settings-wide.png" "http://localhost:$API_PORT/settings" >/dev/null 2>&1
     echo "==> screenshots in $SHOTS"
 fi
 
@@ -299,6 +300,6 @@ echo "==> all ${#ROUTES[@]} routes rendered"
 # stops both — so there is nothing to start or clean up here.
 echo "==> checking interactions"
 ( cd "$PROJECT_DIR/frontend-rs" \
-    && AURCACHE_UI="http://localhost:$UI_PORT" \
+    && AURCACHE_UI="http://localhost:$API_PORT" \
        timeout 240 cargo test --quiet --test browser -- --ignored ) \
     || fail "interaction tests failed"

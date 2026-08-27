@@ -36,7 +36,7 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// Where the frontend is served. The script exports this; the default matches
 /// what it uses, so a stack brought up by hand works too.
 fn ui_base() -> String {
-    std::env::var("AURCACHE_UI").unwrap_or_else(|_| "http://localhost:8099".to_string())
+    std::env::var("AURCACHE_UI").unwrap_or_else(|_| "http://localhost:8080".to_string())
 }
 
 /// A value as a JavaScript literal, so page scripts can be built by hand
