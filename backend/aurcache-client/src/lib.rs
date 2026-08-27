@@ -434,6 +434,21 @@ impl AurCacheClient {
         .await
     }
 
+    /// Reads one setting: the value in force, and where it came from.
+    ///
+    /// Separate from [`Self::settings`] because not every setting is in that
+    /// response — the config files are large text blobs, and sending both of
+    /// them with every settings fetch would be wasteful.
+    pub async fn get_setting(&self, pkgbase: Option<&str>, key: &str) -> Result<SettingResponse> {
+        self.request_json::<SettingResponse, Value>(
+            Method::GET,
+            &self.settings_path(pkgbase, Some(key)),
+            &[],
+            None,
+        )
+        .await
+    }
+
     /// Stores a value for one setting, overriding whatever it inherits.
     ///
     /// The value is sent as a string whatever its type: the server owns the

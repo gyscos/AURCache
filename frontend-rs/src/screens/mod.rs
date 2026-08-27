@@ -6,6 +6,7 @@
 mod activities;
 mod build;
 mod builds;
+mod config_files;
 mod not_found;
 mod package;
 mod package_add;
@@ -13,11 +14,12 @@ mod package_builds;
 mod package_source;
 mod packages;
 mod placeholder;
-mod settings;
+pub mod settings;
 
 pub use activities::Activities;
 pub use build::Build;
 pub use builds::Builds;
+pub use config_files::ConfigFiles;
 pub use not_found::NotFound;
 pub use package::{Package, PackageHeader};
 pub use package_add::PackageAdd;
@@ -50,9 +52,4 @@ pub fn Dashboard() -> Element {
 #[component]
 pub fn Workers() -> Element {
     rsx! { NotPorted { title: "Workers", note: "" } }
-}
-
-#[component]
-pub fn ConfigFiles() -> Element {
-    rsx! { NotPorted { title: "Config files", note: "" } }
 }

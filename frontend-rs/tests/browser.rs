@@ -224,6 +224,7 @@ async fn interactions() {
     let session = Session::start().await;
 
     filtering_narrows_the_list_and_updates_the_url(&session).await;
+    a_stored_config_file_is_loaded_into_the_editor(&session).await;
     a_linked_search_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
 
@@ -257,6 +258,29 @@ async fn filtering_narrows_the_list_and_updates_the_url(session: &Session) {
             std::time::Instant::now() < deadline,
             "URL never picked up the search: {}",
             session.url().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The stored `makepkg.conf` reaches the editor.
+///
+/// Not checkable from a DOM dump: a textarea's contents are a property, not
+/// serialised markup, so an editor that renders but never fills looks
+/// identical there.
+async fn a_stored_config_file_is_loaded_into_the_editor(session: &Session) {
+    session.open("/config-files").await;
+    session.wait_for("textarea").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = session.value_of("textarea").await;
+        if value.contains("MAKEFLAGS") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the seeded makepkg.conf never reached the editor; textarea held {value:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

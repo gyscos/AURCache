@@ -264,7 +264,7 @@ fn text_width(wide: bool) -> &'static str {
 /// `Default` has nothing stored, and `Env` is not stored here at all — an
 /// environment variable outranks the database, so deleting the row would
 /// change nothing while appearing to.
-fn is_stored(source: SettingSource) -> bool {
+pub fn is_stored(source: SettingSource) -> bool {
     matches!(source, SettingSource::Global | SettingSource::Package)
 }
 

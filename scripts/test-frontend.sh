@@ -170,7 +170,12 @@ ROUTES=(
     "/settings|Builder image|settings covers every section"
     # Seeded as a stored global value, which is the only state offering a Reset.
     "/settings|>Reset<|settings can undo a stored value"
-    "/config-files|card-title\">Config files|config files"
+    "/config-files|makepkg.conf|config files"
+    # That the stored file reaches the editor is checked in the interaction
+    # tests instead: a textarea's value is a DOM property, and a dump of the
+    # serialised document does not carry it.
+    # Stored and unset render differently; only the stored one offers a Reset.
+    "/config-files|>stored<|a stored file says so"
     "/workers|card-title\">Workers|workers"
     "/activities|added package hello|activities"
     # The text is rendered server-side from the stored JSON, so this also

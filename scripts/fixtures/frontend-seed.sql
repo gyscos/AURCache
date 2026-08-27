@@ -158,3 +158,9 @@ INSERT INTO activity (typ, data, timestamp, user) VALUES
   (2, '{"package":"yay","forced":true}',        CAST(strftime('%s','now') AS INTEGER) - 900,   'alice'),
   (1, '{"package":"obsolete-thing"}',           CAST(strftime('%s','now') AS INTEGER) - 4000,  'bob'),
   (2, '{"package":"neofetch","forced":false}',  CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);
+
+-- One config file stored, one left unset, so the page shows both states it
+-- renders differently: "stored" with a Reset, and "builder default" without.
+-- `-1` is the global scope.
+INSERT INTO settings (key, value, pkg_id) VALUES
+  ('makepkg_conf', '# Seeded makepkg.conf' || char(10) || 'MAKEFLAGS="-j8"' || char(10) || 'PACKAGER="AURCache <build@example.invalid>"', -1);
