@@ -17,6 +17,16 @@
 
          Theme variables rather than fixed colours, so the chart follows the
          palette like everything else. */
+      /* dioxus-charts wraps its <svg> in a plain <div> of its own, and the svg
+         asks for height:100%. That resolves against *that* wrapper rather than
+         the box we sized, and an auto-height wrapper makes the request
+         indefinite -- so the svg falls back to its viewBox aspect ratio and
+         grows with the available width. On a 2560-wide screen that is a ~680px
+         chart hanging out of a 256px card with 40px axis labels. Passing the
+         height through the wrapper is what makes a fixed height on the outer
+         box mean anything at all. */
+      .chart-box > div { height: 100%; }
+
       .series-0 .chart-line { stroke: oklch(var(--p)); }
       .series-1 .chart-line { stroke: oklch(var(--su)); }
     </style>

@@ -94,16 +94,24 @@ fn bindgen(frontend: &Path) {
 ///
 /// The folder is emptied first: a file dropped from the frontend would
 /// otherwise stay embedded indefinitely.
+///
+/// `index.html` is written *after* the bundle, and the order is load-bearing.
+/// `dist/` is wasm-bindgen's output directory, but nothing guarantees it holds
+/// only wasm-bindgen's output — a `dist/index.html` left by an earlier tool sat
+/// there for months, and copying the tree last meant that stale copy quietly
+/// replaced the real one on every build. The symptom was an edit to the page's
+/// CSS that simply never appeared, with a correctly rebuilt wasm alongside it
+/// to make the bundle look fresh.
 fn install(dist: &Path, web: &Path) {
     let _ = std::fs::remove_dir_all(web);
     std::fs::create_dir_all(web).expect("create web/");
 
+    copy_tree(dist, web);
     std::fs::copy(
         dist.parent().expect("dist has a parent").join("index.html"),
         web.join("index.html"),
     )
     .expect("copy index.html");
-    copy_tree(dist, web);
 }
 
 fn copy_tree(from: &Path, to: &Path) {

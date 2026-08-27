@@ -183,7 +183,10 @@ fn BuildsChart(points: Vec<GraphDataPoint>) -> Element {
     // and the axis labels come out enormous. A wide, short viewBox in a fixed
     // height gives a chart shaped like a chart.
     rsx! {
-        div { class: "h-64",
+        // `chart-box` is what stops the chart growing with the window; see the
+        // rule in index.html. Without it the fixed height below is advice the
+        // svg is free to ignore, and does.
+        div { class: "chart-box h-64",
             LineChart {
                 width: "100%",
                 height: "100%",
