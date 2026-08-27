@@ -6,7 +6,7 @@
 use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::format_duration;
-use crate::listing::ListHeader;
+use crate::listing::{ListHeader, Pager, paginate};
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
 use aurcache_client::Build;
@@ -18,7 +18,9 @@ async fn load(pkgbase: String) -> Result<Vec<Build>, String> {
     client()?
         // A sub-resource rather than a query filter: a pkgbase may contain `+`,
         // which is literal in a path but decodes to a space in a query value.
-        .list_builds(Some(&pkgbase), Some(100), None)
+        // No limit: the page is paged in the browser, and a capped fetch
+        // would have silently ended a long history at 100.
+        .list_builds(Some(&pkgbase), None, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -42,6 +44,7 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
         let pkgbase = pkgbase.clone();
         move || load(pkgbase.clone())
     });
+    let page = use_signal(|| 0usize);
 
     rsx! {
         div { class: "space-y-4",
@@ -70,7 +73,9 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                     Some(Ok(list)) if list.is_empty() => rsx! {
                         div { class: "alert", span { "This package has never been built." } }
                     },
-                    Some(Ok(list)) => rsx! {
+                    Some(Ok(list)) => {
+                        let current = paginate(list, page());
+                        rsx! {
                         div { class: "overflow-x-auto",
                             table { class: "table table-zebra",
                                 thead {
@@ -84,7 +89,7 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                     }
                                 }
                                 tbody {
-                                    for build in list.iter() {
+                                    for build in current.items.iter() {
                                         tr { key: "{build.number}", class: "hover",
                                             td {
                                                 Link {
@@ -110,7 +115,18 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                 }
                             }
                         }
-                        div { class: "text-sm opacity-60 pt-2", "{list.len()} builds" }
+                        Pager {
+                            page,
+                            index: current.index,
+                            pages: current.pages,
+                            first: current.first,
+                            count: current.items.len(),
+                            total: current.total,
+                        }
+                        if current.pages <= 1 {
+                            div { class: "text-sm opacity-60 pt-2", "{list.len()} builds" }
+                        }
+                    }
                     },
                 }
             }

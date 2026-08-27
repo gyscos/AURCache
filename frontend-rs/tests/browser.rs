@@ -189,6 +189,15 @@ impl Session {
         .await;
     }
 
+    /// How many nodes match, for checking how much of a list is on screen.
+    async fn count(&self, selector: &str) -> i64 {
+        self.eval(format!(
+            "return document.querySelectorAll({}).length;",
+            json(selector)
+        ))
+        .await
+    }
+
     /// The value of an input, for checking that typing landed where intended.
     async fn value_of(&self, selector: &str) -> String {
         self.eval(format!(
@@ -231,6 +240,8 @@ async fn interactions() {
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
     dependencies_stay_out_of_the_list_until_asked_for(&session).await;
+    a_second_page_holds_different_builds(&session).await;
+    a_build_can_be_found_by_the_name_the_list_shows(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
     removing_a_package_takes_it_out_of_the_list(&session).await;
 
@@ -522,5 +533,68 @@ async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
         .await;
     session
         .wait_until("the dependency to go again", |t| !t.contains("libfoo"))
+        .await;
+}
+
+/// Paging shows rows the previous page did not, and filtering starts over.
+///
+/// A rendering test can see the controls but not what they do: a Next button
+/// that renders and does nothing looks exactly like one that works, and a page
+/// that never resets only shows itself once a filter has been typed.
+async fn a_second_page_holds_different_builds(session: &Session) {
+    session.open("/builds").await;
+    session
+        .wait_until("the list to load", |t| t.contains("Page 1 of"))
+        .await;
+
+    // Counted, not compared as text: the pager's own label differs between
+    // pages, so comparing the rendered page against itself would pass even if
+    // the table below it never changed — or never paged at all.
+    let on_first = session.count("tbody tr").await;
+    assert_eq!(
+        on_first, 100,
+        "a page should hold exactly PAGE_SIZE rows, got {on_first}"
+    );
+
+    session.click("button[aria-label='Next page']").await;
+    session
+        .wait_until("the second page", |t| t.contains("Page 2 of"))
+        .await;
+
+    let on_second = session.count("tbody tr").await;
+    assert!(
+        on_second > 0 && on_second < 100,
+        "the second page should hold the remainder, got {on_second}"
+    );
+
+    let second_page = session.text().await;
+    assert!(
+        second_page.contains("Showing 101"),
+        "the second page did not start where the first ended: {second_page}"
+    );
+
+    // Filtering has to put you back at the start, or a search run from page 2
+    // reports matches it is not showing.
+    session.type_into("input[type=search]", "paru").await;
+    session
+        .wait_until("the filter to reset the page", |t| {
+            t.contains("Showing 1\u{2013}") || !t.contains("Page 2 of")
+        })
+        .await;
+}
+
+/// A build is findable by what the row calls it, not only by its package.
+async fn a_build_can_be_found_by_the_name_the_list_shows(session: &Session) {
+    session.open("/builds").await;
+    session
+        .wait_until("the list to load", |t| t.contains("hello"))
+        .await;
+
+    // `hello/2` is the failed second build the fixture gives it.
+    session.type_into("input[type=search]", "hello/2").await;
+    session
+        .wait_until("the list to narrow to one build", |t| {
+            t.contains("hello/2") && !t.contains("neofetch")
+        })
         .await;
 }

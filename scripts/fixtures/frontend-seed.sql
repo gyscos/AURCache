@@ -208,6 +208,25 @@ JOIN (
 ) offs
 WHERE p.name = 'hello';
 
+-- More builds than fit on a page, so pagination is exercised against a real
+-- list rather than only in a unit test. `paru` because nothing else in the
+-- route list or the interaction tests looks at it, and dated two months back
+-- so the dashboard's "this week" figures are unaffected. Numbered from 100 up
+-- to stay clear of the builds above under `UNIQUE (pkg_id, number)`.
+WITH RECURSIVE seq(n) AS (
+  SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 110
+)
+INSERT INTO builds (pkg_id, number, status, start_time, end_time, platform, version)
+SELECT p.id,
+       100 + seq.n,
+       1,
+       CAST(strftime('%s','now','-2 months') AS INTEGER) + seq.n * 60,
+       CAST(strftime('%s','now','-2 months') AS INTEGER) + seq.n * 60 + 90,
+       'x86_64',
+       '2.0.4-1'
+FROM packages p, seq
+WHERE p.name = 'paru';
+
 -- A fleet with one worker in each state, because each renders differently and
 -- pending is the one the page exists to surface.
 --

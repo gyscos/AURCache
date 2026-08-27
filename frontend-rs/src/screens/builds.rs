@@ -4,8 +4,8 @@ use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::format_duration;
 use crate::listing::{
-    ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter, filter_builds,
-    sort_builds, use_url_search,
+    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
+    filter_builds, paginate, sort_builds, use_url_search,
 };
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
@@ -16,9 +16,14 @@ use dioxus::prelude::*;
 /// table, which drops the same ones below 700px.
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
+/// Every build, paged in the browser.
+///
+/// This asked for 100 with no way to reach a second page, so the history simply
+/// stopped there and said nothing about it — and unlike the package list, a
+/// build list only grows.
 async fn load_builds() -> Result<Vec<Build>, String> {
     client()?
-        .list_builds(None, Some(100), None)
+        .list_builds(None, None, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -33,6 +38,11 @@ pub fn Builds(q: String) -> Element {
         key: SortKey::Time,
         dir: SortDir::Desc,
     });
+    let mut page = use_signal(|| 0usize);
+
+    // Changing what is listed puts you back at the start; see the same effect
+    // on the packages screen.
+    use_effect(use_reactive(&(query(), status()), move |_| page.set(0)));
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
@@ -55,11 +65,12 @@ pub fn Builds(q: String) -> Element {
                         let mut shown = filter_builds(list, &query(), status());
                         sort_builds(&mut shown, sort());
                         let (found, total) = (shown.len(), list.len());
+                        let current = paginate(&shown, page());
                         rsx! {
                         ListControls {
                             query,
                             status,
-                            placeholder: "Filter by package…",
+                            placeholder: "Filter by package or build…",
                             shown: found,
                             total,
                         }
@@ -84,7 +95,7 @@ pub fn Builds(q: String) -> Element {
                                     }
                                 }
                                 tbody {
-                                    for build in shown.iter() {
+                                    for build in current.items.iter() {
                                         tr {
                                             key: "{build.pkg_name}/{build.number}",
                                             class: "hover cursor-pointer",
@@ -133,7 +144,17 @@ pub fn Builds(q: String) -> Element {
                             }
                         }
                         }
-                        div { class: "text-sm opacity-60 pt-2", "{total} builds" }
+                        Pager {
+                            page,
+                            index: current.index,
+                            pages: current.pages,
+                            first: current.first,
+                            count: current.items.len(),
+                            total: current.total,
+                        }
+                        if current.pages <= 1 {
+                            div { class: "text-sm opacity-60 pt-2", "{total} builds" }
+                        }
                     }
                     },
                 }

@@ -7,8 +7,8 @@
 
 use crate::api::client;
 use crate::listing::{
-    ListControls, ListHeader, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
-    filter_packages, sort_packages, use_url_search,
+    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
+    filter_packages, paginate, sort_packages, use_url_search,
 };
 use crate::routes::Route;
 use crate::status::StatusBadge;
@@ -53,6 +53,16 @@ pub fn Packages(
     // maintaining, and a dependency closure buries that under packages nobody
     // chose.
     let mut show_dependencies = use_signal(|| false);
+    let mut page = use_signal(|| 0usize);
+
+    // Anything that changes which rows exist puts you back at the start.
+    // Without this, narrowing a filter while on page 3 lands on a page that no
+    // longer has anything on it — `paginate` clamps so it is not blank, but
+    // arriving mid-list after typing a filter is still not what was asked for.
+    use_effect(use_reactive(
+        &(query(), status(), show_dependencies()),
+        move |_| page.set(0),
+    ));
     let sort = use_signal(|| Sort {
         key: SortKey::Name,
         dir: SortDir::Asc,
@@ -95,6 +105,9 @@ pub fn Packages(
                         let mut shown = filter_packages(&in_scope, &query(), status());
                         sort_packages(&mut shown, sort());
                         let (found, total) = (shown.len(), in_scope.len());
+                        // Sorted first, so a page is a slice of the order on
+                        // screen rather than of the order it arrived in.
+                        let current = paginate(&shown, page());
                         rsx! {
                         ListControls {
                             query,
@@ -135,7 +148,7 @@ pub fn Packages(
                                     }
                                 }
                                 tbody {
-                                    for pkg in shown.iter() {
+                                    for pkg in current.items.iter() {
                                         tr {
                                             key: "{pkg.name}",
                                             class: "hover cursor-pointer",
@@ -211,7 +224,20 @@ pub fn Packages(
                             }
                         }
                         }
-                        div { class: "text-sm opacity-60 pt-2", "{total} packages" }
+                        Pager {
+                            page,
+                            index: current.index,
+                            pages: current.pages,
+                            first: current.first,
+                            count: current.items.len(),
+                            total: current.total,
+                        }
+                        // The pager already says "of N" once there is more
+                        // than one page; this is for the case where there is
+                        // not, so a short list still says how short.
+                        if current.pages <= 1 {
+                            div { class: "text-sm opacity-60 pt-2", "{total} packages" }
+                        }
                     }
                     },
                 }

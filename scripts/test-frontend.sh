@@ -133,6 +133,12 @@ ROUTES=(
     # The chart is SVG, so a real element proves it drew rather than errored.
     "/|<svg|the build graph renders"
     "/builds|Duration|builds list"
+    # The fixture holds more builds than fit on a page. That the second page
+    # holds different rows is an interaction test; this is only that the
+    # controls are there and say where you are.
+    "/builds|Page 1 of|a long list is paged"
+    "/builds|Showing 1|the pager says which rows are on screen"
+    "/package/paru/builds|Page 1 of|a long history is paged too"
     "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"
     "/packages|—|missing version shows a placeholder"

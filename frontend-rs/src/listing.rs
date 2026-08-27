@@ -1,9 +1,11 @@
 //! Sorting and filtering for the package and build lists.
 //!
-//! Done in the browser over the fetched page rather than as query parameters:
-//! the lists are already fetched whole, so this stays instant and needs no API
-//! change. If a repository ever outgrows one page, this is the thing that has
-//! to move server-side — the pure functions here are what would be ported.
+//! Done in the browser over the whole fetched list rather than as query
+//! parameters. Both lists are fetched entire, so filtering, sorting and paging
+//! stay instant, and each of the three sees the results of the other two —
+//! server-side paging would mean a filter that only searched the page you were
+//! already on. If the fetch itself ever becomes the problem, the pure functions
+//! here are what would move.
 
 use aurcache_client::{Build, SimplePackage};
 use aurcache_types::build_state::BuildState;
@@ -153,9 +155,19 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
 pub fn filter_builds(builds: &[Build], query: &str, status: StatusFilter) -> Vec<Build> {
     builds
         .iter()
-        .filter(|build| name_matches(&build.pkg_name, query) && status.matches(build.status))
+        .filter(|build| name_matches(&build_id(build), query) && status.matches(build.status))
         .cloned()
         .collect()
+}
+
+/// A build's identity, as the list shows it and as people refer to it.
+///
+/// Filtering matches this rather than the package name alone, so both halves of
+/// what is on screen are searchable: `hello` finds every build of it, because
+/// the match is a substring one, and `hello/3` finds the one. Matching only the
+/// package meant typing what the row said found nothing.
+fn build_id(build: &Build) -> String {
+    format!("{}/{}", build.pkg_name, build.number)
 }
 
 pub fn sort_builds(builds: &mut [Build], sort: Sort) {
@@ -194,6 +206,82 @@ mod tests {
             latest_version: None,
             upstream_version: None,
         }
+    }
+
+    /// A page is a window on the list, not a prefix of it.
+    #[test]
+    fn a_page_is_the_slice_it_says_it_is() {
+        let items: Vec<usize> = (0..250).collect();
+
+        let first = paginate(&items, 0);
+        assert_eq!(first.items.len(), PAGE_SIZE);
+        assert_eq!(first.items[0], 0);
+        assert_eq!(first.index, 0);
+        assert_eq!(first.pages, 3);
+        assert_eq!(first.first, 0);
+        assert_eq!(first.total, 250);
+
+        let second = paginate(&items, 1);
+        assert_eq!(second.items[0], PAGE_SIZE);
+        assert_eq!(second.first, PAGE_SIZE);
+
+        // The last page is the remainder, not a short read of a full one.
+        let last = paginate(&items, 2);
+        assert_eq!(last.items.len(), 50);
+        assert_eq!(last.items[0], 200);
+    }
+
+    /// Narrowing a filter while on a later page leaves the requested page past
+    /// the end. Unclamped that renders an empty table, which reads as "nothing
+    /// matches" when the rows are merely somewhere else.
+    #[test]
+    fn a_page_past_the_end_falls_back_to_the_last_one() {
+        let items: Vec<usize> = (0..5).collect();
+        let page = paginate(&items, 7);
+
+        assert_eq!(page.index, 0);
+        assert_eq!(page.pages, 1);
+        assert_eq!(page.items.len(), 5);
+    }
+
+    /// An empty list is one empty page, so the pager reads "1 of 1" rather
+    /// than dividing by zero on the way to saying so.
+    #[test]
+    fn an_empty_list_is_a_single_empty_page() {
+        let page = paginate::<usize>(&[], 3);
+
+        assert_eq!(page.pages, 1);
+        assert_eq!(page.index, 0);
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 0);
+    }
+
+    /// The list shows `package/number`, so that is what typing it must match.
+    /// Matching the package name alone meant copying what a row said found
+    /// nothing at all.
+    #[test]
+    fn builds_are_filtered_by_the_name_the_list_shows() {
+        let builds = vec![
+            build(3, "hello", BuildState::Successful, Some(30)),
+            build(4, "hello", BuildState::Successful, Some(40)),
+            build(3, "neofetch", BuildState::Successful, Some(50)),
+        ];
+
+        // The package alone still finds all of its builds.
+        let by_package = filter_builds(&builds, "hello", StatusFilter::ANY);
+        assert_eq!(by_package.len(), 2);
+
+        // And the identity finds the one.
+        let by_id = filter_builds(&builds, "hello/4", StatusFilter::ANY);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].number, 4);
+
+        // A build of another package with the same number is not it.
+        let other = filter_builds(&builds, "neofetch/3", StatusFilter::ANY);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].pkg_name, "neofetch");
+
+        assert!(filter_builds(&builds, "hello/9", StatusFilter::ANY).is_empty());
     }
 
     fn build(number: i32, pkg: &str, status: BuildState, start: Option<i64>) -> Build {
@@ -552,6 +640,97 @@ pub fn SortableHeader(
                 "{label}"
                 if active {
                     span { class: "text-xs opacity-70", "{sort().dir.arrow()}" }
+                }
+            }
+        }
+    }
+}
+
+/// How many rows a page holds.
+///
+/// 100 because that is what both lists previously fetched — the behaviour
+/// people are used to — except that it was a ceiling with nothing beyond it
+/// rather than the first page of everything.
+pub const PAGE_SIZE: usize = 100;
+
+/// One page of `items`, with the page number that was actually used.
+///
+/// The page is clamped rather than trusted. Narrowing a filter while on a later
+/// page leaves the requested page past the end of a now-shorter list, and an
+/// unclamped slice would render an empty table with no indication that the rows
+/// are simply somewhere else.
+#[must_use]
+pub fn paginate<T: Clone>(items: &[T], page: usize) -> Page<T> {
+    let pages = items.len().div_ceil(PAGE_SIZE).max(1);
+    let index = page.min(pages - 1);
+    let start = index * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(items.len());
+    Page {
+        items: items[start..end].to_vec(),
+        index,
+        pages,
+        first: start,
+        total: items.len(),
+    }
+}
+
+/// One page of a list, and where it sits in the whole.
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Zero-based, and clamped to the list that actually exists.
+    pub index: usize,
+    /// At least one, so "page 1 of 1" is what an empty list reads as.
+    pub pages: usize,
+    /// Index of the first row on this page, for the human-readable range.
+    pub first: usize,
+    pub total: usize,
+}
+
+/// Page controls, shown only when there is more than one page.
+///
+/// Takes plain numbers rather than the [`Page`] itself: a component's props
+/// must be `Clone + PartialEq`, and a generic payload would impose that on
+/// every list this is used from for no benefit — it only ever renders counts.
+#[component]
+pub fn Pager(
+    page: Signal<usize>,
+    index: usize,
+    pages: usize,
+    first: usize,
+    count: usize,
+    total: usize,
+) -> Element {
+    let mut page = page;
+    if pages <= 1 {
+        return rsx! {};
+    }
+    let (from, to) = (first + 1, first + count);
+
+    rsx! {
+        div { class: "flex flex-wrap items-center gap-2 mt-2",
+            span { class: "text-sm opacity-60", "Showing {from}\u{2013}{to} of {total}" }
+            div { class: "flex-1" }
+            div { class: "join",
+                button {
+                    class: "btn btn-sm join-item",
+                    disabled: index == 0,
+                    // Not `page -= 1`: the rendered page is clamped, so the
+                    // signal can be further along than what is on screen, and
+                    // stepping back from the stale value would appear to do
+                    // nothing.
+                    onclick: move |_| page.set(index.saturating_sub(1)),
+                    aria_label: "Previous page",
+                    "\u{2039}"
+                }
+                button { class: "btn btn-sm join-item no-animation", disabled: true,
+                    "Page {index + 1} of {pages}"
+                }
+                button {
+                    class: "btn btn-sm join-item",
+                    disabled: index + 1 >= pages,
+                    onclick: move |_| page.set(index + 1),
+                    aria_label: "Next page",
+                    "\u{203a}"
                 }
             }
         }
