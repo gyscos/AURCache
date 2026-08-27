@@ -840,6 +840,15 @@ async fn revoke_worker_command(
     Ok(())
 }
 
+/// A list as comma-separated text, or a dash when there is nothing in it.
+fn or_dash(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_string()
+    } else {
+        items.join(",")
+    }
+}
+
 fn print_worker_list(workers: &[Worker]) {
     let rows = workers
         .iter()
@@ -852,16 +861,16 @@ fn print_worker_list(workers: &[Worker]) {
             vec![
                 w.id.to_string(),
                 w.name.clone(),
-                w.status.clone(),
-                if w.native_arches.is_empty() {
+                format!("{:?}", w.status).to_lowercase(),
+                or_dash(&w.native_arches),
+                or_dash(&w.emulated_arches),
+                or_dash(&w.package_affinity),
+                if w.priority == 0 {
+                    // Zero is the default and means "no preference"; printing
+                    // it would suggest the fleet had been tuned when it has not.
                     "-".to_string()
                 } else {
-                    w.native_arches.clone()
-                },
-                if w.emulated_arches.is_empty() {
-                    "-".to_string()
-                } else {
-                    w.emulated_arches.clone()
+                    w.priority.to_string()
                 },
                 w.version.clone().unwrap_or_else(|| "-".to_string()),
                 format_timestamp(w.last_seen),
@@ -876,6 +885,8 @@ fn print_worker_list(workers: &[Worker]) {
             "status",
             "native",
             "emulated",
+            "affinity",
+            "priority",
             "version",
             "last_seen",
             "fingerprint",

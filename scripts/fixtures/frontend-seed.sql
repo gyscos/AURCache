@@ -199,3 +199,28 @@ JOIN (
   SELECT 9, 8
 ) offs
 WHERE p.name = 'hello';
+
+-- A fleet with one worker in each state, because each renders differently and
+-- pending is the one the page exists to surface.
+--
+-- `signed_cert` is left NULL throughout: the list endpoint no longer returns
+-- it, and a fixture carrying a fake PEM would only suggest it mattered here.
+DELETE FROM workers;
+INSERT INTO workers
+  (name, status, cert_fingerprint, native_arches, emulated_arches, last_seen, version, package_affinity, priority)
+VALUES
+  -- Approved, busy, and tuned: reserved for one package and preferred over the
+  -- others, so both of those columns have something to show.
+  ('builder-01', 'approved', 'sha256:1111111111111111aaaa', 'x86_64', '',
+   CAST(strftime('%s','now') AS INTEGER) - 45, '0.1.0', 'visual-studio-code-bin', 10),
+  -- Approved, but only reaches aarch64 through emulation.
+  ('builder-arm', 'approved', 'sha256:2222222222222222bbbb', 'aarch64', 'armv7h',
+   CAST(strftime('%s','now') AS INTEGER) - 900, '0.1.0', '', 0),
+  -- Enrolled and waiting. Has never checked in, so "last seen" is never rather
+  -- than a long time ago.
+  ('new-machine', 'pending', 'sha256:3333333333333333cccc', 'x86_64', '',
+   NULL, '0.1.0', '', 0),
+  -- Retired. Kept so old builds still name the machine that ran them, and
+  -- hidden behind the toggle by default.
+  ('old-builder', 'revoked', 'sha256:4444444444444444dddd', 'x86_64', '',
+   CAST(strftime('%s','now') AS INTEGER) - 5000000, '0.0.9', '', 0);

@@ -13,20 +13,52 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory="dist", **kw)
 
+    def _proxy(self, method):
+        """Forward an /api call to the backend, body and all."""
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        req = urllib.request.Request(BACKEND + self.path, data=body, method=method)
+        if self.headers.get("Content-Type"):
+            req.add_header("Content-Type", self.headers["Content-Type"])
+        try:
+            with urllib.request.urlopen(req) as r:
+                payload = r.read()
+                self.send_response(r.status)
+                self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        except urllib.error.HTTPError as e:
+            payload = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            payload = str(e).encode()
+            self.send_response(502)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    # Everything the UI actually sends. Without these, a write from the browser
+    # gets 501 from *this* proxy while the same request against the server
+    # succeeds -- which reads exactly like an application bug and is not one.
+    def do_POST(self):
+        self._proxy("POST")
+
+    def do_PATCH(self):
+        self._proxy("PATCH")
+
+    def do_PUT(self):
+        self._proxy("PUT")
+
+    def do_DELETE(self):
+        self._proxy("DELETE")
+
     def do_GET(self):
         if self.path.startswith("/api/"):
-            try:
-                with urllib.request.urlopen(BACKEND + self.path) as r:
-                    body = r.read()
-                    self.send_response(r.status)
-                    self.send_header("Content-Type", r.headers.get("Content-Type", "application/json"))
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-            except urllib.error.HTTPError as e:
-                self.send_response(e.code); self.end_headers(); self.wfile.write(e.read())
-            except Exception as e:
-                self.send_response(502); self.end_headers(); self.wfile.write(str(e).encode())
+            self._proxy("GET")
             return
         # SPA fallback, matching the server's rule in `aurcache_api::spa`:
         # anything that is not an existing file is a frontend route.

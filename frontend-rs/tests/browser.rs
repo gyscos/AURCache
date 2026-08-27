@@ -227,6 +227,7 @@ async fn interactions() {
     a_stored_config_file_is_loaded_into_the_editor(&session).await;
     a_linked_search_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
+    approving_a_worker_lets_it_build(&session).await;
 
     session.stop().await;
 }
@@ -293,6 +294,38 @@ async fn a_linked_search_arrives_applied(session: &Session) {
     session
         .wait_until("the linked search to apply", |t| {
             t.contains("neofetch") && !t.contains("visual-studio-code-bin")
+        })
+        .await;
+}
+
+/// Approving a worker moves it out of the queue of machines waiting.
+///
+/// The approval gate is what the workers page is for, and it is the one flow
+/// here that changes server state through a button rather than a form. A
+/// rendering test sees the button; only this sees what pressing it does.
+async fn approving_a_worker_lets_it_build(session: &Session) {
+    session.open("/workers").await;
+    session
+        .wait_until("the fleet to load", |t| t.contains("new-machine"))
+        .await;
+    assert!(
+        session
+            .text()
+            .await
+            .contains("1 worker is waiting for approval"),
+        "the fixture should start with exactly one pending worker"
+    );
+
+    session.click_labelled("table button", "Approve").await;
+
+    session
+        .wait_until("the approval to land", |t| t.contains("Worker approved"))
+        .await;
+    // The list refetches, so the notice about waiting machines should be gone
+    // rather than merely stale.
+    session
+        .wait_until("the pending notice to clear", |t| {
+            !t.contains("waiting for approval")
         })
         .await;
 }

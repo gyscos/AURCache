@@ -188,7 +188,18 @@ ROUTES=(
     # serialised document does not carry it.
     # Stored and unset render differently; only the stored one offers a Reset.
     "/config-files|>stored<|a stored file says so"
-    "/workers|card-title\">Workers|workers"
+    "/workers|builder-01|workers"
+    # The gate the page exists for: a machine waiting on an operator is called
+    # out, not left to be spotted in a status column.
+    "/workers|1 worker is waiting for approval|a pending worker is surfaced"
+    "/workers|>Approve<|a pending worker can be approved"
+    # Emulation is marked rather than listed as native: a fleet that reads as
+    # having native aarch64 when it does not is worth not implying.
+    "/workers|emulated: armv7h|emulated architectures are marked"
+    # Revoked rows are kept so old builds still name their machine, so they are
+    # hidden until asked for.
+    "/workers|Show retired (1)|retired workers are hidden behind a toggle"
+    "/workers|never|a worker that never checked in says so"
     "/activities|added package hello|activities"
     # The text is rendered server-side from the stored JSON, so this also
     # proves the payload shapes in the fixture are ones the server can parse.

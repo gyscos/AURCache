@@ -12,3 +12,4 @@ pub mod package;
 pub mod settings;
 pub mod stats;
 pub mod waiting;
+pub mod worker;

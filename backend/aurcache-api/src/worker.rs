@@ -13,6 +13,7 @@ use aurcache_ca::Ca;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::workers;
+use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary};
 use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus, WorkerStatus,
@@ -698,17 +699,49 @@ pub async fn job_status(
 // Admin management (operator auth)
 // ----------------------------------------------------------------------------
 
-#[utoipa::path(get, path = "/workers", responses((status = 200, body = [aurcache_db::workers::Model])))]
+/// The comma-separated lists the database stores, as actual lists.
+///
+/// Empty entries are dropped: an empty column splits to `[""]`, which would
+/// render as a blank chip.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// A worker row as the operator's view of it.
+///
+/// Not the row itself: that carries `signed_cert`, and there is no reason to
+/// hand a browser the certificate issued to a build machine.
+fn summarise(worker: workers::Model) -> WorkerSummary {
+    WorkerSummary {
+        id: worker.id,
+        name: worker.name,
+        status: ApprovalStatus::from_db(&worker.status),
+        cert_fingerprint: worker.cert_fingerprint,
+        native_arches: split_list(&worker.native_arches),
+        emulated_arches: split_list(&worker.emulated_arches),
+        package_affinity: split_list(&worker.package_affinity),
+        priority: worker.priority,
+        last_seen: worker.last_seen,
+        version: worker.version,
+    }
+}
+
+#[utoipa::path(get, path = "/workers", responses((status = 200, body = [WorkerSummary])))]
 #[get("/workers")]
 pub async fn list_workers(
     db: &State<DatabaseConnection>,
     _a: Authenticated,
-) -> Result<Json<Vec<workers::Model>>, ApiError> {
+) -> Result<Json<Vec<WorkerSummary>>, ApiError> {
     let db = db.inner();
     let workers = worker_store::list_workers(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    Ok(Json(workers))
+    Ok(Json(workers.into_iter().map(summarise).collect()))
 }
 
 #[utoipa::path(post, path = "/workers/{id}/approve", responses((status = 200)))]

@@ -25,6 +25,7 @@ pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, Source
 pub use aurcache_types::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_types::api::stats::{GraphDataPoint, ListStats, UserInfo};
 pub use aurcache_types::api::waiting::WaitingReason;
+pub use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary as Worker};
 pub use aurcache_types::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
@@ -36,27 +37,6 @@ use serde_json::Value;
 
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
-
-/// A registered build worker.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Worker {
-    /// Internal worker id.
-    pub id: i32,
-    /// Operator-facing worker name reported at enrollment.
-    pub name: String,
-    /// Enrollment status: `pending`, `approved`, or `revoked`.
-    pub status: String,
-    /// SHA-256 fingerprint of the worker's certificate/CSR (stable identity).
-    pub cert_fingerprint: String,
-    /// Comma-separated architectures the worker builds natively.
-    pub native_arches: String,
-    /// Comma-separated architectures the worker can build via emulation.
-    pub emulated_arches: String,
-    /// Unix seconds of the last heartbeat/contact, if ever seen.
-    pub last_seen: Option<i64>,
-    /// Worker software version reported at enrollment/heartbeat.
-    pub version: Option<String>,
-}
 
 /// Response returned when a personal API token is regenerated.
 #[derive(Debug, Serialize, Deserialize)]

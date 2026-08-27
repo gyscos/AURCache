@@ -1,0 +1,367 @@
+//! The build fleet, and the approval that lets a machine into it.
+//!
+//! A worker enrolls itself and then waits: it holds no signed certificate and
+//! can claim no jobs until an operator approves it. That gate is the point of
+//! this screen, so a machine waiting on it is called out rather than left to be
+//! spotted in a status column.
+//!
+//! Revoking is not a delete. It refuses the certificate, releases whatever the
+//! worker had reserved and requeues its in-flight builds — and the row stays,
+//! so a build from last year still resolves to the machine that produced it.
+//! That is also why retired workers are hidden behind a toggle: the list only
+//! grows.
+
+use crate::dates::RelativeDate;
+use crate::format::now_secs;
+use crate::listing::ListHeader;
+use aurcache_client::{ApprovalStatus, Worker};
+use dioxus::prelude::*;
+
+/// Columns that only appear once there is room for them.
+const WIDE_ONLY: &str = "hidden lg:table-cell";
+
+#[component]
+pub fn Workers() -> Element {
+    let mut reload = use_signal(|| 0u32);
+    let workers = use_resource(move || async move {
+        // Read so an approve or revoke refetches the list.
+        let _ = reload();
+        crate::api::client()?
+            .list_workers()
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    let mut show_retired = use_signal(|| false);
+    let mut busy = use_signal(|| Option::<i32>::None);
+    let mut status = use_signal(|| Option::<(String, bool)>::None);
+
+    // Both actions are the same shape, and both must refetch: the server
+    // decides what a worker becomes, and the row has to show what it decided.
+    let act = move |(id, approve): (i32, bool)| async move {
+        busy.set(Some(id));
+        status.set(None);
+        let outcome = match crate::api::client() {
+            Err(e) => Err(e),
+            Ok(client) => if approve {
+                client.approve_worker(id).await
+            } else {
+                client.revoke_worker(id).await
+            }
+            .map_err(|e| e.to_string()),
+        };
+        busy.set(None);
+        match outcome {
+            Ok(()) => {
+                status.set(Some((
+                    if approve {
+                        "Worker approved. It can claim jobs once it checks in."
+                    } else {
+                        "Worker revoked. Its builds have been requeued."
+                    }
+                    .to_string(),
+                    true,
+                )));
+                reload += 1;
+            }
+            Err(e) => status.set(Some((e, false))),
+        }
+    };
+
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body",
+                ListHeader { title: "Workers" }
+                p { class: "text-xs opacity-60 max-w-prose -mt-1",
+                    "A worker cannot build until it is approved. Revoking refuses its certificate, releases anything it reserved and requeues its builds; the row is kept so old builds still name the machine that ran them."
+                }
+
+                if let Some((message, ok)) = status() {
+                    div {
+                        class: if ok { "alert alert-success text-sm" } else { "alert alert-error text-sm" },
+                        span { "{message}" }
+                    }
+                }
+
+                match &*workers.read_unchecked() {
+                    None => rsx! {
+                        div { class: "flex justify-center p-8",
+                            span { class: "loading loading-spinner loading-lg" }
+                        }
+                    },
+                    Some(Err(e)) => rsx! {
+                        div { class: "alert alert-error", span { "Could not load workers: {e}" } }
+                    },
+                    Some(Ok(list)) if list.is_empty() => rsx! {
+                        div { class: "alert",
+                            span { "No workers have enrolled yet." }
+                        }
+                    },
+                    Some(Ok(list)) => {
+                        let waiting = list.iter().filter(|w| w.status == ApprovalStatus::Pending).count();
+                        let retired = list.iter().filter(|w| w.status.is_retired()).count();
+                        let shown: Vec<Worker> = list
+                            .iter()
+                            .filter(|w| show_retired() || !w.status.is_retired())
+                            .cloned()
+                            .collect();
+
+                        rsx! {
+                            div { class: "flex items-center gap-3 flex-wrap",
+                                // The whole reason to open this page. A count
+                                // in a status column is easy to walk past.
+                                if waiting > 0 {
+                                    div { class: "alert alert-warning text-sm py-2 w-auto",
+                                        span { {waiting_message(waiting)} }
+                                    }
+                                }
+                                div { class: "flex-1" }
+                                if retired > 0 {
+                                    button {
+                                        class: "btn btn-ghost btn-xs",
+                                        onclick: move |_| show_retired.toggle(),
+                                        if show_retired() {
+                                            "Hide retired ({retired})"
+                                        } else {
+                                            "Show retired ({retired})"
+                                        }
+                                    }
+                                }
+                            }
+                            WorkersTable { workers: shown, busy: busy(), act }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// How many machines are waiting on an operator.
+fn waiting_message(waiting: usize) -> String {
+    match waiting {
+        1 => "1 worker is waiting for approval.".to_string(),
+        n => format!("{n} workers are waiting for approval."),
+    }
+}
+
+#[component]
+fn WorkersTable(
+    workers: Vec<Worker>,
+    /// The worker with an action in flight, if any.
+    busy: Option<i32>,
+    /// `(id, approve)` — true approves, false revokes.
+    act: EventHandler<(i32, bool)>,
+) -> Element {
+    // Read once for the whole table rather than per row, so every "3m ago" on
+    // screen is measured from the same instant.
+    let now = now_secs();
+
+    rsx! {
+        div { class: "overflow-x-auto",
+            table { class: "table table-zebra",
+                thead {
+                    tr {
+                        th { "Worker" }
+                        th { "Status" }
+                        th { "Architectures" }
+                        th { class: "{WIDE_ONLY}", "Reserved for" }
+                        th { class: "{WIDE_ONLY}", "Priority" }
+                        th { class: "{WIDE_ONLY}", "Version" }
+                        th { class: "{WIDE_ONLY}", "Last seen" }
+                        th { "" }
+                    }
+                }
+                tbody {
+                    for worker in workers.iter() {
+                        tr { key: "{worker.id}", class: if worker.status.is_retired() { "opacity-50" } else { "" },
+                            td {
+                                // The fingerprint is the identity; the name is
+                                // whatever the machine called itself and is not
+                                // unique.
+                                div { class: "font-mono text-sm", title: "{worker.cert_fingerprint}",
+                                    "{worker.name}"
+                                }
+                            }
+                            td { StatusBadge { status: worker.status } }
+                            td { class: "text-sm", {architectures(worker)} }
+                            td { class: "{WIDE_ONLY}",
+                                if worker.package_affinity.is_empty() {
+                                    span { class: "opacity-40", "—" }
+                                } else {
+                                    div { class: "flex flex-wrap gap-1",
+                                        for package in worker.package_affinity.iter() {
+                                            span { key: "{package}", class: "badge badge-outline badge-sm font-mono", "{package}" }
+                                        }
+                                    }
+                                }
+                            }
+                            td { class: "{WIDE_ONLY} text-sm",
+                                if worker.priority == 0 {
+                                    // Zero is the default, meaning no
+                                    // preference. Printing it suggests the
+                                    // fleet has been tuned when it has not.
+                                    span { class: "opacity-40", "—" }
+                                } else {
+                                    span {
+                                        title: "Higher priority workers are offered jobs first.",
+                                        "{worker.priority}"
+                                    }
+                                }
+                            }
+                            td { class: "{WIDE_ONLY} text-sm opacity-70",
+                                {worker.version.clone().unwrap_or_else(|| "—".to_string())}
+                            }
+                            td { class: "{WIDE_ONLY} text-sm opacity-70",
+                                if worker.last_seen.is_some() {
+                                    RelativeDate { ts: worker.last_seen, now }
+                                } else {
+                                    // Enrolled but never called in — different
+                                    // from "a long time ago", and the case an
+                                    // operator is usually looking at.
+                                    span { class: "opacity-60", "never" }
+                                }
+                            }
+                            td {
+                                WorkerActions {
+                                    worker: worker.clone(),
+                                    busy: busy == Some(worker.id),
+                                    act,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What can be done to a worker, given where it is in the workflow.
+///
+/// Approve appears for anything not already approved — including a revoked
+/// worker, since letting a machine back in is the same act as letting it in the
+/// first time. Revoke disappears once revoked, because there is nothing left to
+/// take away.
+#[component]
+fn WorkerActions(worker: Worker, busy: bool, act: EventHandler<(i32, bool)>) -> Element {
+    let id = worker.id;
+    rsx! {
+        div { class: "flex gap-2 justify-end",
+            if busy {
+                span { class: "loading loading-spinner loading-xs" }
+            }
+            if !worker.status.can_build() {
+                button {
+                    class: "btn btn-primary btn-xs",
+                    disabled: busy,
+                    onclick: move |_| act.call((id, true)),
+                    if worker.status.is_retired() { "Reinstate" } else { "Approve" }
+                }
+            }
+            if !worker.status.is_retired() {
+                button {
+                    class: "btn btn-ghost btn-xs",
+                    disabled: busy,
+                    title: "Refuse this worker's certificate and requeue its builds",
+                    onclick: move |_| act.call((id, false)),
+                    "Revoke"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn StatusBadge(status: ApprovalStatus) -> Element {
+    let (label, class) = match status {
+        ApprovalStatus::Approved => ("approved", "badge-success"),
+        ApprovalStatus::Pending => ("pending", "badge-warning"),
+        ApprovalStatus::Revoked => ("revoked", "badge-neutral"),
+    };
+    rsx! {
+        span { class: "badge {class} badge-sm whitespace-nowrap", "{label}" }
+    }
+}
+
+/// What a worker can build, and how.
+///
+/// Emulated architectures are marked rather than listed alongside the native
+/// ones: they work, but slowly, and a fleet that looks like it has four native
+/// aarch64 machines when it has none is worth not implying.
+fn architectures(worker: &Worker) -> String {
+    match (
+        worker.native_arches.is_empty(),
+        worker.emulated_arches.is_empty(),
+    ) {
+        (true, true) => "—".to_string(),
+        (false, true) => worker.native_arches.join(", "),
+        (true, false) => format!("emulated: {}", worker.emulated_arches.join(", ")),
+        (false, false) => format!(
+            "{} (emulated: {})",
+            worker.native_arches.join(", "),
+            worker.emulated_arches.join(", ")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatusBadge, StatusBadgeProps, architectures, waiting_message};
+    use aurcache_client::{ApprovalStatus, Worker};
+    use dioxus::prelude::*;
+
+    fn worker(native: &[&str], emulated: &[&str]) -> Worker {
+        Worker {
+            id: 1,
+            name: "builder".to_string(),
+            status: ApprovalStatus::Approved,
+            cert_fingerprint: "abc".to_string(),
+            native_arches: native.iter().map(ToString::to_string).collect(),
+            emulated_arches: emulated.iter().map(ToString::to_string).collect(),
+            package_affinity: Vec::new(),
+            priority: 0,
+            last_seen: None,
+            version: None,
+        }
+    }
+
+    /// Emulation works but is slow. A fleet that reads as four native aarch64
+    /// machines when it has none would be a misleading thing to imply.
+    #[test]
+    fn emulated_architectures_are_marked_as_such() {
+        assert_eq!(architectures(&worker(&["x86_64"], &[])), "x86_64");
+        assert_eq!(
+            architectures(&worker(&["x86_64"], &["aarch64"])),
+            "x86_64 (emulated: aarch64)"
+        );
+        assert_eq!(
+            architectures(&worker(&[], &["aarch64"])),
+            "emulated: aarch64"
+        );
+        assert_eq!(architectures(&worker(&[], &[])), "—");
+    }
+
+    #[test]
+    fn the_waiting_notice_counts_properly() {
+        assert_eq!(waiting_message(1), "1 worker is waiting for approval.");
+        assert_eq!(waiting_message(3), "3 workers are waiting for approval.");
+    }
+
+    /// The three states have to be distinguishable at a glance; pending is the
+    /// one that wants an operator, so it is the one that must not read as calm.
+    #[test]
+    fn each_status_gets_its_own_badge() {
+        for (status, label, class) in [
+            (ApprovalStatus::Approved, "approved", "badge-success"),
+            (ApprovalStatus::Pending, "pending", "badge-warning"),
+            (ApprovalStatus::Revoked, "revoked", "badge-neutral"),
+        ] {
+            let mut dom = VirtualDom::new_with_props(StatusBadge, StatusBadgeProps { status });
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains(label), "{status:?}: {html}");
+            assert!(html.contains(class), "{status:?}: {html}");
+        }
+    }
+}
