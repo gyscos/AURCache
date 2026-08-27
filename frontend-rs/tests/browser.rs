@@ -230,6 +230,7 @@ async fn interactions() {
     approving_a_worker_lets_it_build(&session).await;
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
+    dependencies_stay_out_of_the_list_until_asked_for(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
     removing_a_package_takes_it_out_of_the_list(&session).await;
 
@@ -482,4 +483,44 @@ async fn removing_a_package_takes_it_out_of_the_list(session: &Session) {
         "removal did not land back on the list: {}",
         session.url().await
     );
+}
+
+/// The list shows what was asked for; the toggle adds what was pulled in.
+///
+/// The half a rendering test cannot reach is the absence: a marker can only
+/// assert that something is on the page, and the whole point of the default is
+/// that `libfoo` is not.
+async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
+    session.open("/packages").await;
+    session
+        .wait_until("the list to load", |t| t.contains("neofetch"))
+        .await;
+
+    let listed = session.text().await;
+    assert!(
+        !listed.contains("libfoo"),
+        "a dependency was listed without being asked for: {listed}"
+    );
+
+    session
+        .click_labelled("button", "Show dependencies (2)")
+        .await;
+    session
+        .wait_until("the dependency to appear", |t| t.contains("libfoo"))
+        .await;
+
+    // Revealed, but still distinguishable from a package somebody chose.
+    let shown = session.text().await;
+    assert!(
+        shown.contains("dependency"),
+        "a revealed dependency was not marked as one: {shown}"
+    );
+
+    // And back, so the next scenario sees the list as it found it.
+    session
+        .click_labelled("button", "Hide dependencies (2)")
+        .await;
+    session
+        .wait_until("the dependency to go again", |t| !t.contains("libfoo"))
+        .await;
 }

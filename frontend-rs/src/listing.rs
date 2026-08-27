@@ -186,6 +186,9 @@ mod tests {
         SimplePackage {
             id: 1,
             name: name.to_string(),
+            // These tests are about the search and sort helpers, which do not
+            // look at it; the packages screen owns the dependency filter.
+            directly_requested: true,
             status: status.as_i32(),
             outofdate,
             latest_version: None,

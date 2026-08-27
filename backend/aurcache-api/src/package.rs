@@ -34,7 +34,9 @@ use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
+use sea_orm::{
+    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
+};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
@@ -510,28 +512,37 @@ pub async fn package_del(
     ),
     params(
             ("limit", description = "limit of packages"),
-            ("page", description = "page of packages")
+            ("page", description = "page of packages"),
+            ("dependencies", description = "include packages that are only here as dependencies")
     )
 )]
-#[get("/packages/list?<limit>&<page>")]
+#[get("/packages/list?<limit>&<page>&<dependencies>")]
 pub async fn package_list(
     db: &State<DatabaseConnection>,
     limit: Option<u64>,
     page: Option<u64>,
+    dependencies: Option<bool>,
     _a: Authenticated,
 ) -> Result<Json<Vec<SimplePackage>>, ApiError> {
     let db = db.inner();
 
-    list_directly_requested_packages(db, limit, page)
+    list_packages(db, limit, page, dependencies.unwrap_or(false))
         .await
         .map(Json)
         .map_err(|e| err(Status::InternalServerError, e))
 }
 
-async fn list_directly_requested_packages(
+/// List packages, by default only the ones somebody asked for.
+///
+/// `dependencies` opts into the rest. It defaults to off because that is what
+/// every existing caller means by "the packages": a repository's dependency
+/// closure is usually the larger part of it, and reading the list as the set of
+/// things being maintained is the common case.
+async fn list_packages(
     db: &DatabaseConnection,
     limit: Option<u64>,
     page: Option<u64>,
+    dependencies: bool,
 ) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
     // correlated subquery: picks the version from builds for the package ordered by most
     // recent timestamp (end_time preferred, fallback to start_time)
@@ -561,7 +572,10 @@ async fn list_directly_requested_packages(
         .column(packages::Column::Status)
         .column_as(packages::Column::OutOfDate, "outofdate")
         .column_as(packages::Column::UpstreamVersion, "upstream_version")
-        .filter(packages::Column::DirectlyRequested.eq(true))
+        .column(packages::Column::DirectlyRequested)
+        .apply_if((!dependencies).then_some(()), |query, ()| {
+            query.filter(packages::Column::DirectlyRequested.eq(true))
+        })
         // No COALESCE to an empty string: a package with no build has no
         // version, and `null` says that where `""` is indistinguishable from a
         // build that produced a blank one. The detail endpoint below already
@@ -794,7 +808,7 @@ fn aur_source(pkg: &packages::Model) -> AurPackage {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelationDirection, list_directly_requested_packages, list_package_relations};
+    use super::{RelationDirection, list_package_relations, list_packages};
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
     use aurcache_db::{dependencies, packages};
@@ -802,7 +816,7 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     #[tokio::test]
-    async fn package_list_only_returns_directly_requested_packages() {
+    async fn package_list_hides_dependencies_unless_asked() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
@@ -846,12 +860,22 @@ mod tests {
         .await
         .unwrap();
 
-        let packages = list_directly_requested_packages(&db, None, None)
-            .await
-            .unwrap();
+        let packages = list_packages(&db, None, None, false).await.unwrap();
 
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "visible-package");
+        assert!(packages[0].directly_requested);
+
+        // Opting in returns both, and each says which kind it is -- the list
+        // is only worth widening if the two can still be told apart.
+        let mut packages = list_packages(&db, None, None, true).await.unwrap();
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0].name, "hidden-dependency");
+        assert!(!packages[0].directly_requested);
+        assert_eq!(packages[1].name, "visible-package");
+        assert!(packages[1].directly_requested);
     }
 
     #[tokio::test]

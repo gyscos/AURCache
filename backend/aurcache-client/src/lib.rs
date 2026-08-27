@@ -151,13 +151,20 @@ impl AurCacheClient {
             .await
     }
 
-    /// Lists directly requested packages.
+    /// Lists packages.
+    ///
+    /// Only the directly requested ones unless `dependencies` is set, which
+    /// adds the packages that are present only because something needs them.
     pub async fn list_packages(
         &self,
         limit: Option<u64>,
         page: Option<u64>,
+        dependencies: bool,
     ) -> Result<Vec<SimplePackage>> {
-        let query = Query::default().opt("limit", limit).opt("page", page);
+        let query = Query::default()
+            .opt("limit", limit)
+            .opt("page", page)
+            .opt("dependencies", dependencies.then_some(true));
         self.request_json::<Vec<SimplePackage>, Value>(
             Method::GET,
             "/packages/list",

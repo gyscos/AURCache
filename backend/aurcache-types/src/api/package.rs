@@ -87,6 +87,11 @@ pub struct PackagePatch {
 pub struct SimplePackage {
     pub id: i32,
     pub name: String,
+    /// False for a package that is only here because something else needs it.
+    ///
+    /// The list leaves those out by default, so this is what tells the two
+    /// apart once they are asked for together.
+    pub directly_requested: bool,
     pub status: i32,
     pub outofdate: i32,
     pub latest_version: Option<String>,

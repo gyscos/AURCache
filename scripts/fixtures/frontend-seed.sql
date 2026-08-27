@@ -28,9 +28,8 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
   -- rather than only in a unit test.
   ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1),
   -- Dependency-only packages: nobody asked for these, something else needs
-  -- them. They are what the dashboard's second package count counts, and they
-  -- are deliberately absent from the package list, which shows only what was
-  -- requested.
+  -- them. They are what the dashboard's second package count counts, and what
+  -- the package list keeps behind its "Show dependencies" toggle.
   ('libfoo',                 1, 0, '2.3.1-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"libfoo"}',                 0),
   ('libbar',                 1, 0, '0.9-2',     '', 'x86_64', 'aur', '{"type":"aur","name":"libbar"}',                 0),
   -- A git-sourced package. It has no AUR entry at all, so its description,

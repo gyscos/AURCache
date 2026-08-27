@@ -18,9 +18,19 @@ use dioxus::prelude::*;
 /// Columns that only appear once there is room for them.
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
+/// Everything, dependencies included, filtered down in the browser.
+///
+/// The toggle, the search and the status filter all narrow the same fetched
+/// list, so switching any of them is immediate and the counts beside them stay
+/// consistent. Fetching only what is shown would mean a round trip per toggle
+/// and a "N of M" whose M is a page rather than a repository.
+///
+/// No limit, deliberately. This asked for 100 with no way to reach a second
+/// page, so a repository larger than that silently showed a subset — and the
+/// dependency closure is usually the larger part of one.
 async fn load_packages() -> Result<Vec<SimplePackage>, String> {
     client()?
-        .list_packages(Some(100), None)
+        .list_packages(None, None, true)
         .await
         .map_err(|e| e.to_string())
 }
@@ -39,6 +49,10 @@ pub fn Packages(
     let packages = use_resource(load_packages);
     let query = use_url_search(q, sync_url, |q| Route::Packages { q });
     let status = use_signal(|| StatusFilter::ANY);
+    // Off by default: the list reads as the set of packages somebody is
+    // maintaining, and a dependency closure buries that under packages nobody
+    // chose.
+    let mut show_dependencies = use_signal(|| false);
     let sort = use_signal(|| Sort {
         key: SortKey::Name,
         dir: SortDir::Asc,
@@ -68,9 +82,19 @@ pub fn Packages(
                         div { class: "alert", span { "No packages yet." } }
                     },
                     Some(Ok(list)) => {
-                        let mut shown = filter_packages(list, &query(), status());
+                        let dependencies = list.iter().filter(|p| !p.directly_requested).count();
+                        // The toggle narrows first, so `total` is the size of
+                        // the list being searched rather than of the fetch.
+                        // Otherwise the count beside the search box would
+                        // report packages the page is not showing.
+                        let in_scope: Vec<SimplePackage> = if show_dependencies() {
+                            list.clone()
+                        } else {
+                            list.iter().filter(|p| p.directly_requested).cloned().collect()
+                        };
+                        let mut shown = filter_packages(&in_scope, &query(), status());
                         sort_packages(&mut shown, sort());
-                        let (found, total) = (shown.len(), list.len());
+                        let (found, total) = (shown.len(), in_scope.len());
                         rsx! {
                         ListControls {
                             query,
@@ -78,6 +102,21 @@ pub fn Packages(
                             placeholder: "Filter packages…",
                             shown: found,
                             total,
+                        }
+                        // Only when there are some. A toggle that reveals
+                        // nothing invites the reader to wonder what it is for.
+                        if dependencies > 0 {
+                            div { class: "flex justify-end -mt-2",
+                                button {
+                                    class: "btn btn-ghost btn-xs",
+                                    onclick: move |_| show_dependencies.toggle(),
+                                    if show_dependencies() {
+                                        "Hide dependencies ({dependencies})"
+                                    } else {
+                                        "Show dependencies ({dependencies})"
+                                    }
+                                }
+                            }
                         }
                         if shown.is_empty() {
                             div { class: "alert mt-2", span { "Nothing matches that filter." } }
@@ -135,6 +174,17 @@ pub fn Packages(
                                                     // duplicate history entry.
                                                     onclick: move |e: MouseEvent| e.stop_propagation(),
                                                     "{pkg.name}"
+                                                }
+                                                // Only meaningful while both
+                                                // kinds are on screen; with the
+                                                // toggle off every row would
+                                                // carry the opposite of it.
+                                                if !pkg.directly_requested {
+                                                    span {
+                                                        class: "badge badge-outline badge-sm ml-2",
+                                                        title: "Pulled in as a dependency, not requested directly",
+                                                        "dependency"
+                                                    }
                                                 }
                                             }
                                             td { class: "font-mono text-sm",

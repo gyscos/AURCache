@@ -161,6 +161,10 @@ struct ListPackagesArgs {
     /// Page offset used together with --limit.
     #[arg(long)]
     page: Option<u64>,
+
+    /// Include packages that are only present as dependencies.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -559,7 +563,9 @@ async fn render_packages_list(
     format: OutputFormat,
     args: ListPackagesArgs,
 ) -> Result<()> {
-    let packages = client.list_packages(args.limit, args.page).await?;
+    let packages = client
+        .list_packages(args.limit, args.page, args.all)
+        .await?;
     render(format, &packages, |packages| print_package_list(packages))
 }
 
@@ -1027,6 +1033,7 @@ fn print_package_list(packages: &[SimplePackage]) {
                 package.id.to_string(),
                 package.name.clone(),
                 build_status_label(package.status).to_string(),
+                bool_label(package.directly_requested).to_string(),
                 bool_label(package.outofdate != 0).to_string(),
                 option_text(package.latest_version.as_deref()),
                 option_text(package.upstream_version.as_deref()),
@@ -1038,6 +1045,7 @@ fn print_package_list(packages: &[SimplePackage]) {
             "id",
             "name",
             "status",
+            "requested",
             "out_of_date",
             "latest_version",
             "upstream_version",

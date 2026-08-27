@@ -136,6 +136,10 @@ ROUTES=(
     "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"
     "/packages|—|missing version shows a placeholder"
+    # The list is what somebody asked for; the closure is behind a toggle that
+    # says how much it is hiding. Whether it actually hides them is an
+    # interaction test -- a marker can only assert presence.
+    "/packages|Show dependencies (2)|dependencies are behind a toggle"
     "/packages/add|AUR package name or git URL|the add dialog (depth 2)"
     # A search in the URL is applied on arrival, so a link to one opens with it
     # already narrowed rather than showing everything.
