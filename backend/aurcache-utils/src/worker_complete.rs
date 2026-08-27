@@ -142,7 +142,16 @@ async fn finish_build<C: ConnectionTrait + TransactionTrait>(
     let txn = db.begin().await?;
     let res = Builds::update_many()
         .col_expr(builds::Column::Status, status.into())
-        .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
+        // `worker_id` is kept. On a finished build it is no longer a claim,
+        // it is the record of which machine produced the package -- which the
+        // workers page promises ("the row is kept so old builds still name the
+        // machine that ran them") and, until now, could not deliver, because
+        // this cleared it the moment the build ended. Nothing mistakes it for
+        // ownership: every path that treats a build as owned -- heartbeat,
+        // requeue_worker_builds, the lease reaper, claim_job -- also requires
+        // a non-terminal status.
+        //
+        // The lease is a different thing and does end here.
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
         .col_expr(builds::Column::EndTime, Some(now_secs()).into())
         .filter(builds::Column::Id.eq(build_id))
@@ -326,6 +335,31 @@ mod tests {
         .unwrap();
     }
 
+    /// A finished build has to keep saying which machine produced it. The
+    /// workers page tells operators the row is kept "so old builds still name
+    /// the machine that ran them", and every per-worker figure -- how many
+    /// builds it has finished, how many failed, its share of the fleet -- is
+    /// counted from this column. Clearing it on completion left every one of
+    /// them at zero for a fleet that had built everything in the repository.
+    #[tokio::test]
+    async fn a_finished_build_still_names_the_worker_that_ran_it() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        build(&db, 10, 1, STATUS_ACTIVE, "5").await;
+
+        complete_success(&db, 10, 5).await.unwrap();
+
+        let finished = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
+        assert_eq!(finished.status, Some(STATUS_SUCCESS));
+        assert_eq!(
+            finished.worker_id,
+            Some(5),
+            "the build no longer names the worker that produced it"
+        );
+        // The lease is a claim on a running build and does end here.
+        assert_eq!(finished.lease_expires_at, None);
+    }
+
     #[tokio::test]
     async fn owned_active_guard() {
         let db = setup().await;
@@ -344,7 +378,10 @@ mod tests {
         complete_success(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(STATUS_SUCCESS));
-        assert_eq!(b.worker_id, None);
+        // What the name of this test says, and what it did not actually check:
+        // the lease ends. The worker stays, as the record of who built it.
+        assert_eq!(b.lease_expires_at, None);
+        assert_eq!(b.worker_id, Some(5));
         assert_eq!(b.version, "2.0-1");
         assert!(b.end_time.is_some());
     }
