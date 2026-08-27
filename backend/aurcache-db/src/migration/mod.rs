@@ -15,6 +15,7 @@ mod m20260818_000000_remote_workers;
 mod m20260824_000000_worker_routing;
 mod m20260826_000000_package_source_metadata;
 mod m20260827_000000_build_number;
+mod m20260827_000001_download_counts;
 
 pub struct Migrator;
 
@@ -44,6 +45,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260818_000000_remote_workers::Migration),
             Box::new(m20260824_000000_worker_routing::Migration),
             Box::new(m20260827_000000_build_number::Migration),
+            Box::new(m20260827_000001_download_counts::Migration),
         ]
     }
 }

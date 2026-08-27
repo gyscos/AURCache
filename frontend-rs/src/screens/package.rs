@@ -580,6 +580,19 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
     }
 }
 
+/// A download count, or nothing at all.
+///
+/// Zero is rendered as "not downloaded yet" rather than "0": for a package
+/// built minutes ago the number is uninformative, and a bare 0 next to a
+/// healthy build reads as something being broken.
+fn downloads_label(downloads: i64) -> String {
+    match downloads {
+        ..=0 => "not downloaded yet".to_string(),
+        1 => "1 download".to_string(),
+        n => format!("{n} downloads"),
+    }
+}
+
 /// What lands in the repository when this package builds.
 #[component]
 fn ProducesCard(pkg: ExtendedPackage) -> Element {
@@ -605,6 +618,19 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
                             div { class: "flex-1" }
                             NotTracked { what: "size" }
                         }
+                    }
+                }
+                // Counted across every version and architecture this package
+                // has produced -- the question is how often it has been
+                // installed, not how often one particular build was fetched.
+                div { class: "flex items-baseline gap-2 pt-2",
+                    span { class: "text-sm", {downloads_label(pkg.downloads)} }
+                    span {
+                        class: "cursor-help text-xs opacity-40 hover:opacity-80 transition-opacity",
+                        title: "Fetches of this package from the repository. Counted in the \
+                                server and written out periodically, so it can lag by a minute \
+                                and does not count resumed downloads.",
+                        "?"
                     }
                 }
                 // These names come from the package's own declaration, not from
@@ -942,6 +968,7 @@ mod tests {
                 subfolder: String::new(),
             }),
             split_packages: None,
+            downloads: 0,
             dependencies: vec![],
             dependents: vec![],
             has_patch: false,

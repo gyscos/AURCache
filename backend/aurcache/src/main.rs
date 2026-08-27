@@ -3,8 +3,10 @@ use crate::startup::{post_startup_tasks, pre_startup_tasks};
 use aurcache_api::init::{init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
+use aurcache_db::helpers::downloads::DownloadBuffer;
 use aurcache_db::init::init_db;
 use aurcache_scheduler::auto_update::start_auto_update_job;
+use aurcache_scheduler::download_flush::start_download_flush;
 use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
@@ -65,9 +67,16 @@ async fn main() {
     // Reclaim build jobs whose remote worker went silent (lease liveness).
     let lease_reaper_handle = start_lease_reaper(db.clone());
 
-    let api_handle = init_api(db.clone(), tx, store.clone());
+    // Repository downloads are counted in memory by the file server and folded
+    // into the database from here, so serving a package costs no write. Both
+    // sides share this one buffer; a second instance would count into a map
+    // nothing flushes.
+    let downloads = Arc::new(DownloadBuffer::new());
+    let download_flush_handle = start_download_flush(db.clone(), downloads.clone());
+
+    let api_handle = init_api(db.clone(), tx, store.clone(), downloads.clone());
     let worker_api_handle = init_worker_api(db, ca, store);
-    let repo_handle = init_repo();
+    let repo_handle = init_repo(downloads);
 
     tokio::select! {
         _ = version_check_handle => {
@@ -81,6 +90,9 @@ async fn main() {
         }
         _ = lease_reaper_handle => {
             warn!("Lease reaper handle exited");
+        }
+        _ = download_flush_handle => {
+            warn!("Download flush handle exited");
         }
         _ = repo_handle => {
             warn!("Repo web server handle exited");

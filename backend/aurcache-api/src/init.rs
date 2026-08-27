@@ -8,6 +8,7 @@ use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::oauth_config_from_env;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
+use aurcache_db::helpers::downloads::DownloadBuffer;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
@@ -81,6 +82,7 @@ pub fn init_api(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
+    downloads: Arc<DownloadBuffer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
@@ -147,6 +149,9 @@ pub fn init_api(
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
             .manage(store)
+            // Shared with the repository server, so a package's count includes
+            // downloads not yet flushed rather than stalling until they are.
+            .manage(downloads)
             .mount("/api/", build_api())
             .mount("/api/", crate::worker::worker_admin_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))
@@ -229,8 +234,8 @@ pub fn init_worker_api(
 }
 
 #[must_use]
-pub fn init_repo() -> JoinHandle<()> {
-    tokio::spawn(async {
+pub fn init_repo(downloads: Arc<DownloadBuffer>) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
             port: aurcache_types::ports::AURCACHE_MIRROR_PORT,
@@ -239,6 +244,9 @@ pub fn init_repo() -> JoinHandle<()> {
         };
 
         let launch_result = rocket::custom(config)
+            // The file server counts what it serves through this; without it
+            // in state it simply counts nothing.
+            .manage(downloads)
             .mount("/", CustomFileServer::new("./repo"))
             .launch()
             .await;

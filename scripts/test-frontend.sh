@@ -63,12 +63,25 @@ port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 port_busy "$API_PORT" && fail "port $API_PORT is already in use — stop the other server first"
 
 WORKDIR="$(mktemp -d)"
+# Every browser launch below gets its own profile directory rather than the
+# user's default one. Dozens of launches in quick succession against a shared
+# profile interfere with each other -- the symptom is a page that reports as
+# mounted while its content is missing, on a different route each run, which is
+# indistinguishable from a real rendering bug until you notice the set moves.
+CHROME_PROFILE="$WORKDIR/chrome-profile"
 BACKEND_PID=""
 cleanup() {
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     # Wait for it to release the port, or an immediate rerun trips the
     # busy-port preflight.
     [ -n "$BACKEND_PID" ] && wait "$BACKEND_PID" 2>/dev/null || true
+    # `--dump-dom` normally exits on its own, but a launch that does not leaves
+    # its process behind, and this script starts one per check. Across repeated
+    # runs they accumulate until there is no memory left for the next one --
+    # which surfaces as routes failing to render, a different set each time, and
+    # reads exactly like a rendering bug in the app. Matched on this run's own
+    # profile directory so nothing else's browser is touched.
+    pkill -f "user-data-dir=$CHROME_PROFILE" 2>/dev/null || true
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -186,6 +199,11 @@ ROUTES=(
     "/package/hello|href=\"/package/hello/config-files\"|the package links to its config files"
     # The one irreversible action, in its own card rather than in the header.
     "/package/hello|Remove package|a package can be removed from its own page"
+    # Summed over every version and architecture the package has produced
+    # (1200 + 34 + 99), and not over `hello-world`, which a prefix match on the
+    # name would have swallowed.
+    "/package/hello|1333 downloads|downloads are counted across a package's files"
+    "/package/neofetch|not downloaded yet|a package nobody has fetched says so"
     "/settings|Version check interval|settings"
     # The fixture server runs with VERSION_CHECK_INTERVAL set, so this row is
     # env-locked. Naming the variable proves the source made it all the way
@@ -258,7 +276,7 @@ for entry in "${ROUTES[@]}"; do
     route="${entry%%|*}"; rest="${entry#*|}"
     marker="${rest%%|*}"; desc="${rest#*|}"
 
-    dom="$("$CHROME" --headless --disable-gpu --no-sandbox \
+    dom="$("$CHROME" --headless --disable-gpu --no-sandbox --user-data-dir="$CHROME_PROFILE" \
              --virtual-time-budget=8000 --dump-dom "http://localhost:$API_PORT$route" 2>/dev/null || true)"
 
     # The shell is the layout every route renders into. Missing it means the
@@ -290,7 +308,7 @@ for entry in "${ROUTES[@]}"; do
     if [ -n "$SHOTS" ]; then
         name="$(printf '%s' "${route#/}" | tr '/' '-')"
         [ -z "$name" ] && name="index"
-        "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
+        "$CHROME" --headless --disable-gpu --no-sandbox --user-data-dir="$CHROME_PROFILE" --hide-scrollbars \
             --window-size=1440,1400 --virtual-time-budget=8000 \
             --screenshot="$SHOTS/$name.png" "http://localhost:$API_PORT$route" >/dev/null 2>&1
     fi
@@ -302,10 +320,10 @@ done
 # broken twice. Settings splits into two columns only above 1440, so the shape
 # most people actually see it in is not the shape the run above captured.
 if [ -n "$SHOTS" ]; then
-    "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
+    "$CHROME" --headless --disable-gpu --no-sandbox --user-data-dir="$CHROME_PROFILE" --hide-scrollbars \
         --window-size=420,900 --virtual-time-budget=8000 \
         --screenshot="$SHOTS/packages-narrow.png" "http://localhost:$API_PORT/packages" >/dev/null 2>&1
-    "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
+    "$CHROME" --headless --disable-gpu --no-sandbox --user-data-dir="$CHROME_PROFILE" --hide-scrollbars \
         --window-size=1920,1200 --virtual-time-budget=8000 \
         --screenshot="$SHOTS/settings-wide.png" "http://localhost:$API_PORT/settings" >/dev/null 2>&1
     echo "==> screenshots in $SHOTS"

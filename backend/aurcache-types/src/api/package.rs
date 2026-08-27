@@ -120,6 +120,14 @@ pub struct ExtendedPackage {
     pub upstream_version: Option<String>,
     pub package_source: PackageSource,
     pub split_packages: Option<Vec<String>>,
+    /// How many times this package's files have been fetched from the
+    /// repository, across every version and architecture it has produced.
+    ///
+    /// Approximate by construction: counts are buffered in the server and
+    /// flushed periodically, so an unclean shutdown loses up to one interval,
+    /// and a resumed (ranged) download is not counted at all. It is a
+    /// popularity reading, not an accounting figure.
+    pub downloads: i64,
     pub dependencies: Vec<PackageDependency>,
     pub dependents: Vec<PackageDependency>,
     /// Whether the package currently has a source patch applied.

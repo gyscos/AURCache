@@ -14,6 +14,7 @@ use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
+use aurcache_db::helpers::downloads::{self, DownloadBuffer};
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
@@ -674,6 +675,25 @@ enum RelationDirection {
     Dependents,
 }
 
+/// Downloads for a package, over the file names it produces.
+///
+/// A package with no split list produces one file named after itself; one with
+/// a split list produces those and nothing named after the pkgbase.
+async fn download_total(
+    db: &DatabaseConnection,
+    buffer: &Arc<DownloadBuffer>,
+    name: &str,
+    split: Option<&[String]>,
+) -> Result<i64, ApiError> {
+    let names: Vec<String> = match split {
+        Some(names) if !names.is_empty() => names.to_vec(),
+        _ => vec![name.to_string()],
+    };
+    downloads::total_for_packages(db, buffer, &names)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))
+}
+
 #[utoipa::path(
     responses(
             (status = 200, description = "Get package details
@@ -687,6 +707,7 @@ https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackage),
 #[get("/package/<pkgbase>")]
 pub async fn get_package(
     db: &State<DatabaseConnection>,
+    downloads: &State<Arc<DownloadBuffer>>,
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<ExtendedPackage>, ApiError> {
@@ -753,6 +774,15 @@ pub async fn get_package(
         }
     };
 
+    let split_packages: Option<Vec<String>> = pkg
+        .split_packages
+        .clone()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    // Read before the struct below consumes `pkg.name`.
+    let download_count =
+        download_total(db, downloads, &pkg.name, split_packages.as_deref()).await?;
+
     let ext_pkg = ExtendedPackage {
         // Mirrored from the package's checkout, so a git-sourced package
         // describes itself as fully as an AUR one.
@@ -777,12 +807,14 @@ pub async fn get_package(
                 .collect(),
         ),
         upstream_version: version,
-        split_packages: pkg
-            .split_packages
-            .and_then(|s| serde_json::from_str(&s).ok()),
+        split_packages: split_packages.clone(),
         dependencies,
         dependents,
         has_patch,
+        // Over the names this package actually produces: a split package's
+        // downloads are its subpackages' downloads, and there is no file named
+        // after the pkgbase to count.
+        downloads: download_count,
     };
 
     Ok(Json(ext_pkg))

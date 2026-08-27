@@ -227,6 +227,17 @@ SELECT p.id,
 FROM packages p, seq
 WHERE p.name = 'paru';
 
+-- Download counts, so the package page has a figure rather than the
+-- never-downloaded state on every package. Keyed by file name, across two
+-- architectures and two versions of the same package, because the total is
+-- summed over everything a package has ever produced. `hello-world` is here to
+-- be excluded: a prefix match on "hello-" would swallow it.
+INSERT INTO download_counts (file_name, count, last_download) VALUES
+  ('hello-2.12.1-2-x86_64.pkg.tar.zst',  1200, CAST(strftime('%s','now') AS INTEGER)),
+  ('hello-2.12.1-2-aarch64.pkg.tar.zst',   34, CAST(strftime('%s','now') AS INTEGER)),
+  ('hello-2.11.0-1-x86_64.pkg.tar.zst',    99, CAST(strftime('%s','now') AS INTEGER)),
+  ('hello-world-1.0-1-x86_64.pkg.tar.zst', 77, CAST(strftime('%s','now') AS INTEGER));
+
 -- A fleet with one worker in each state, because each renders differently and
 -- pending is the one the page exists to surface.
 --
