@@ -89,7 +89,10 @@ echo "==> starting the server"
 # `exec` so the subshell is *replaced* by the server: without it $! is the
 # subshell's pid, killing that leaves the server running, and the next run
 # aborts on a busy port.
-( cd "$WORKDIR" && exec env VERSION_CHECK_INTERVAL=86400 \
+# A long liveness timeout so "is this worker connected" does not depend on how
+# far into the run the check happens: the fixture's online worker last checked
+# in seconds before seeding, and the default timeout is 60.
+( cd "$WORKDIR" && exec env VERSION_CHECK_INTERVAL=86400 WORKER_LIVENESS_TIMEOUT=3600 \
     "$PROJECT_DIR/backend/target/debug/aurcache" > "$WORKDIR/server.log" 2>&1 ) &
 BACKEND_PID=$!
 
@@ -213,6 +216,12 @@ ROUTES=(
     # hidden until asked for.
     "/workers|Show retired (1)|retired workers are hidden behind a toggle"
     "/workers|never|a worker that never checked in says so"
+    # What the page is for: whether a machine is there, whether it is working,
+    # and whether it matters. Approval status cannot answer any of the three --
+    # a worker that was approved and then switched off still reads "approved".
+    "/workers|1 building|a worker with work in flight says so"
+    "/workers|offline|a worker that stopped checking in is marked offline"
+    "/workers|% of fleet|a worker's share of the work is shown"
     "/activities|added package hello|activities"
     # The text is rendered server-side from the stored JSON, so this also
     # proves the payload shapes in the fixture are ones the server can parse.

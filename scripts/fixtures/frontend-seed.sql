@@ -239,10 +239,10 @@ VALUES
   -- Approved, busy, and tuned: reserved for one package and preferred over the
   -- others, so both of those columns have something to show.
   ('builder-01', 'approved', 'sha256:1111111111111111aaaa', 'x86_64', '',
-   CAST(strftime('%s','now') AS INTEGER) - 45, '0.1.0', 'visual-studio-code-bin', 10),
+   CAST(strftime('%s','now') AS INTEGER) - 5, '0.1.0', 'visual-studio-code-bin', 10),
   -- Approved, but only reaches aarch64 through emulation.
   ('builder-arm', 'approved', 'sha256:2222222222222222bbbb', 'aarch64', 'armv7h',
-   CAST(strftime('%s','now') AS INTEGER) - 900, '0.1.0', '', 0),
+   CAST(strftime('%s','now') AS INTEGER) - 200000, '0.1.0', '', 0),
   -- Enrolled and waiting. Has never checked in, so "last seen" is never rather
   -- than a long time ago.
   ('new-machine', 'pending', 'sha256:3333333333333333cccc', 'x86_64', '',
@@ -251,3 +251,25 @@ VALUES
   -- hidden behind the toggle by default.
   ('old-builder', 'revoked', 'sha256:4444444444444444dddd', 'x86_64', '',
    CAST(strftime('%s','now') AS INTEGER) - 5000000, '0.0.9', '', 0);
+
+-- Attribute builds to the machines that ran them, so the fleet page has a
+-- record to report rather than "no builds yet" on every row. The split is
+-- deliberate: builder-01 takes the bulk and nearly always succeeds, builder-arm
+-- takes a handful and fails some of them, which is the comparison the page
+-- exists to make. `yay`'s build is the active one, so builder-01 also has
+-- something in flight.
+UPDATE builds SET worker_id = (SELECT id FROM workers WHERE name = 'builder-01')
+ WHERE pkg_id IN (SELECT id FROM packages WHERE name IN ('paru', 'yay'));
+
+-- The one build that is still running has to look like it: a live lease and a
+-- recent start. The reaper requeues an ACTIVE build whose lease has lapsed *or*
+-- whose start is older than the job timeout -- either alone took this build
+-- away twenty seconds into the run, and the page lost the state it was there
+-- to show.
+UPDATE builds
+   SET lease_expires_at = CAST(strftime('%s','now') AS INTEGER) + 3600,
+       start_time = CAST(strftime('%s','now') AS INTEGER) - 60,
+       end_time = NULL
+ WHERE pkg_id = (SELECT id FROM packages WHERE name = 'yay');
+UPDATE builds SET worker_id = (SELECT id FROM workers WHERE name = 'builder-arm')
+ WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');

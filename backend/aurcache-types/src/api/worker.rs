@@ -34,6 +34,20 @@ pub struct WorkerSummary {
     pub last_seen: Option<i64>,
     /// Worker software version reported at enrollment or heartbeat.
     pub version: Option<String>,
+    /// Whether it has checked in recently enough to be considered connected.
+    ///
+    /// Derived server-side from `last_seen` and the liveness timeout, because
+    /// the timeout is the server's setting — a browser deciding for itself
+    /// would call a worker dead on a deployment that allows longer gaps.
+    pub online: bool,
+    /// Builds it is running right now.
+    pub active_builds: i32,
+    /// Builds it has finished, by outcome. Together these say whether a worker
+    /// is doing the job or merely holding a slot: a machine with a bad
+    /// toolchain claims work and fails it, which looks identical to a healthy
+    /// one until you count.
+    pub successful_builds: i32,
+    pub failed_builds: i32,
 }
 
 /// Where a worker is in the approval workflow.

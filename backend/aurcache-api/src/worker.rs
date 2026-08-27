@@ -10,10 +10,12 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
+use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
-use aurcache_db::workers;
+use aurcache_db::{builds, workers};
 use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary};
+use aurcache_types::builder::BuildStates;
 use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus,
@@ -31,7 +33,8 @@ use rocket::mtls::Certificate;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::serde::json::Json;
 use rocket::{Data, State, get, post};
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -712,11 +715,68 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// How many builds a worker is running, and how its finished ones went.
+#[derive(Default, Clone, Copy)]
+struct BuildTally {
+    active: i32,
+    successful: i32,
+    failed: i32,
+}
+
+/// One row per (worker, status) from the builds table.
+#[derive(sea_orm::FromQueryResult)]
+struct StatusCount {
+    worker_id: Option<i32>,
+    status: Option<i32>,
+    count: i64,
+}
+
+/// Tally every worker's builds in one grouped query.
+///
+/// One query rather than three per worker: the workers page is a list, and a
+/// count per row per outcome is how a list page starts issuing dozens of
+/// queries to render.
+async fn build_tallies(
+    db: &DatabaseConnection,
+) -> Result<HashMap<i32, BuildTally>, sea_orm::DbErr> {
+    let rows = Builds::find()
+        .select_only()
+        .column(builds::Column::WorkerId)
+        .column(builds::Column::Status)
+        .column_as(builds::Column::Id.count(), "count")
+        .filter(builds::Column::WorkerId.is_not_null())
+        .group_by(builds::Column::WorkerId)
+        .group_by(builds::Column::Status)
+        .into_model::<StatusCount>()
+        .all(db)
+        .await?;
+
+    let mut tallies: HashMap<i32, BuildTally> = HashMap::new();
+    for row in rows {
+        let (Some(worker_id), Some(status)) = (row.worker_id, row.status) else {
+            continue;
+        };
+        // Saturating because these are display counts: a repository with more
+        // than two billion builds of one worker should render a big number,
+        // not panic the list.
+        let count = i32::try_from(row.count).unwrap_or(i32::MAX);
+        let tally = tallies.entry(worker_id).or_default();
+        match status {
+            BuildStates::ACTIVE_BUILD => tally.active = count,
+            BuildStates::SUCCESSFUL_BUILD => tally.successful = count,
+            BuildStates::FAILED_BUILD => tally.failed = count,
+            // Enqueued and waiting-for-deps belong to no worker yet.
+            _ => {}
+        }
+    }
+    Ok(tallies)
+}
+
 /// A worker row as the operator's view of it.
 ///
 /// Not the row itself: that carries `signed_cert`, and there is no reason to
 /// hand a browser the certificate issued to a build machine.
-fn summarise(worker: workers::Model) -> WorkerSummary {
+fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) -> WorkerSummary {
     WorkerSummary {
         id: worker.id,
         name: worker.name,
@@ -728,7 +788,20 @@ fn summarise(worker: workers::Model) -> WorkerSummary {
         priority: worker.priority,
         last_seen: worker.last_seen,
         version: worker.version,
+        online: is_online(worker.last_seen, now, timeout),
+        active_builds: tally.active,
+        successful_builds: tally.successful,
+        failed_builds: tally.failed,
     }
+}
+
+/// Whether a worker has checked in recently enough to count as connected.
+///
+/// A worker that has never checked in is not online, which is a different
+/// statement from one that checked in and stopped -- `last_seen` tells those
+/// apart and this deliberately does not.
+fn is_online(last_seen: Option<i64>, now: i64, timeout: i64) -> bool {
+    last_seen.is_some_and(|seen| now - seen <= timeout)
 }
 
 #[utoipa::path(get, path = "/workers", responses((status = 200, body = [WorkerSummary])))]
@@ -741,7 +814,20 @@ pub async fn list_workers(
     let workers = worker_store::list_workers(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    Ok(Json(workers.into_iter().map(summarise).collect()))
+    let tallies = build_tallies(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+    let now = now_secs();
+    let timeout = liveness_timeout_secs();
+    Ok(Json(
+        workers
+            .into_iter()
+            .map(|worker| {
+                let tally = tallies.get(&worker.id).copied().unwrap_or_default();
+                summarise(worker, tally, now, timeout)
+            })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(post, path = "/workers/{id}/approve", responses((status = 200)))]
