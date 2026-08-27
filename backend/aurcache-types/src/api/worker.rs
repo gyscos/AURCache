@@ -1,5 +1,7 @@
 //! A build worker, as the operator's view of the fleet sees it.
 
+#[cfg(feature = "db")]
+use sea_orm::sea_query::StringLen;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -40,33 +42,40 @@ pub struct WorkerSummary {
 /// switches on it, and an unrecognised status should be resolved once at the
 /// edge rather than re-guessed at every use.
 ///
-/// Named apart from [`crate::worker::WorkerStatus`], which is the bag of
-/// string constants the column is written with. This is the typed reading of
-/// the same field, and [`Self::from_db`] parses those constants rather than
-/// re-spelling them.
+/// This is the stored type as well as the wire type: the `workers.status`
+/// column maps to it directly, so an unknown value fails at the edge instead of
+/// spreading as a string that every reader parses for itself.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "db",
+    derive(sea_orm::DeriveActiveEnum, sea_orm::EnumIter),
+    sea_orm(rs_type = "String", db_type = "String(StringLen::None)")
+)]
 pub enum ApprovalStatus {
     /// Enrolled and waiting for an operator. Cannot build.
+    #[cfg_attr(feature = "db", sea_orm(string_value = "pending"))]
     Pending,
     /// Approved: holds a signed certificate and may take jobs.
+    #[cfg_attr(feature = "db", sea_orm(string_value = "approved"))]
     Approved,
     /// Refused. Its certificate no longer works, and its reservations and
     /// in-flight builds have been released.
+    #[cfg_attr(feature = "db", sea_orm(string_value = "revoked"))]
     Revoked,
 }
 
 impl ApprovalStatus {
-    /// Parse the string the database stores.
+    /// The word this status is stored and sent as.
     ///
-    /// Anything unrecognised is treated as revoked: the statuses that grant
-    /// capability are the ones worth being sure about, so an unreadable value
-    /// should deny rather than allow.
-    pub fn from_db(status: &str) -> Self {
-        match status {
-            crate::worker::WorkerStatus::APPROVED => Self::Approved,
-            crate::worker::WorkerStatus::PENDING => Self::Pending,
-            _ => Self::Revoked,
+    /// One place, so the sea-orm `string_value` attributes and the serde
+    /// `rename_all` cannot drift from it unnoticed — the test below holds all
+    /// three together.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Revoked => "revoked",
         }
     }
 
@@ -83,26 +92,36 @@ impl ApprovalStatus {
     }
 }
 
+impl std::fmt::Display for ApprovalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ApprovalStatus;
 
+    /// The wire form, the stored form and `as_str` are the same three words
+    /// the column has always held, so existing rows keep their meaning after
+    /// the type change — and the three spellings cannot drift apart.
+    ///
+    /// The sea-orm `string_value` attributes are the fourth, and are checked
+    /// by round-tripping a worker through the database in `worker_store`.
     #[test]
-    fn statuses_parse_from_what_the_database_holds() {
-        assert_eq!(ApprovalStatus::from_db("pending"), ApprovalStatus::Pending);
-        assert_eq!(
-            ApprovalStatus::from_db("approved"),
-            ApprovalStatus::Approved
-        );
-        assert_eq!(ApprovalStatus::from_db("revoked"), ApprovalStatus::Revoked);
-    }
-
-    /// An unreadable status must not grant the ability to build.
-    #[test]
-    fn an_unknown_status_denies_rather_than_allows() {
-        let unknown = ApprovalStatus::from_db("something-new");
-        assert!(!unknown.can_build());
-        assert_eq!(unknown, ApprovalStatus::Revoked);
+    fn every_spelling_of_a_status_agrees() {
+        for (status, word) in [
+            (ApprovalStatus::Pending, "pending"),
+            (ApprovalStatus::Approved, "approved"),
+            (ApprovalStatus::Revoked, "revoked"),
+        ] {
+            assert_eq!(status.as_str(), word);
+            assert_eq!(status.to_string(), word);
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{word}\"")
+            );
+        }
     }
 
     #[test]

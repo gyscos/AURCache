@@ -1,5 +1,6 @@
 //! `SeaORM` Entity for remote build workers.
 
+use aurcache_types::api::worker::ApprovalStatus;
 use sea_orm::entity::prelude::*;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -10,8 +11,12 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
-    /// One of `pending`, `approved`, `revoked`.
-    pub status: String,
+    /// Where this worker is in the approval workflow.
+    ///
+    /// Typed rather than a string: it is read in a dozen places, and every one
+    /// of them comparing against its own spelling is how the three constants
+    /// ended up defined in three crates.
+    pub status: ApprovalStatus,
     /// SHA-256 fingerprint of the worker's self-generated certificate/CSR.
     /// Stable identity used for enrollment and mTLS mapping.
     pub cert_fingerprint: String,

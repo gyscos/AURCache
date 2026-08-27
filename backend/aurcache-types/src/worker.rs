@@ -6,18 +6,6 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Worker lifecycle states as stored in the `workers.status` column.
-pub struct WorkerStatus;
-
-impl WorkerStatus {
-    /// Registered but not yet approved by an admin / enrollment path.
-    pub const PENDING: &'static str = "pending";
-    /// Approved; the worker's certificate is signed and may claim jobs.
-    pub const APPROVED: &'static str = "approved";
-    /// Explicitly revoked; the worker is refused at the auth guard.
-    pub const REVOKED: &'static str = "revoked";
-}
-
 /// Enrollment request a worker sends on first contact (no client cert yet).
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct RegisterRequest {
@@ -54,8 +42,12 @@ fn default_concurrency() -> u32 {
 /// Enrollment status returned while a worker polls for approval.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct RegisterStatus {
-    /// One of [`WorkerStatus`] values.
-    pub status: String,
+    /// Where the worker stands in the approval workflow.
+    ///
+    /// The same type the column holds and the operator API returns: this used
+    /// to be a `String` compared against constants that were defined three
+    /// times over, in three crates.
+    pub status: crate::api::worker::ApprovalStatus,
     /// PEM of the CA-signed leaf certificate, present once approved.
     pub signed_cert: Option<String>,
     /// PEM of the CA certificate, present once approved (for the worker to pin).

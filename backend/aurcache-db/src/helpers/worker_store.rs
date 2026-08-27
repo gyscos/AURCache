@@ -4,17 +4,12 @@
 use crate::helpers::time::now_secs;
 use crate::prelude::Workers;
 use crate::workers;
+use aurcache_types::api::worker::ApprovalStatus;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
 };
-
-/// Worker status string constants (mirror of `aurcache_types::worker::WorkerStatus`,
-/// duplicated here so the db crate stays free of a types dependency cycle).
-pub const STATUS_PENDING: &str = "pending";
-pub const STATUS_APPROVED: &str = "approved";
-pub const STATUS_REVOKED: &str = "revoked";
 
 /// Everything a worker reports about itself at registration.
 ///
@@ -66,7 +61,7 @@ pub async fn register_worker<C: ConnectionTrait>(
         ])
         .values([
             reg.name.into(),
-            STATUS_PENDING.into(),
+            ApprovalStatus::Pending.into(),
             reg.fingerprint.into(),
             reg.native_arches.into(),
             reg.emulated_arches.into(),
@@ -126,10 +121,10 @@ async fn load_for_update<C: ConnectionTrait>(
 async fn set_status<C: ConnectionTrait>(
     db: &C,
     id: i32,
-    status: &str,
+    status: ApprovalStatus,
 ) -> Result<workers::Model, DbErr> {
     let mut active = load_for_update(db, id).await?;
-    active.status = Set(status.to_string());
+    active.status = Set(status);
     active.update(db).await
 }
 
@@ -151,7 +146,7 @@ pub async fn store_signed_cert<C: ConnectionTrait>(
 /// Approve a worker so it may claim jobs. The signed certificate is issued at
 /// registration time; approval only flips the gating status.
 pub async fn approve_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<workers::Model, DbErr> {
-    set_status(db, id, STATUS_APPROVED).await
+    set_status(db, id, ApprovalStatus::Approved).await
 }
 
 /// Revoke a worker: it is immediately refused at the auth guard, its package
@@ -166,7 +161,7 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     id: i32,
     max_attempts: i32,
 ) -> Result<workers::Model, DbErr> {
-    let worker = set_status(db, id, STATUS_REVOKED).await?;
+    let worker = set_status(db, id, ApprovalStatus::Revoked).await?;
     crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
     Ok(worker)
 }
@@ -239,7 +234,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(a.id, b.id);
-        assert_eq!(b.status, STATUS_PENDING);
+        assert_eq!(b.status, ApprovalStatus::Pending);
         assert_eq!(b.emulated_arches, "aarch64");
         assert_eq!(b.version.as_deref(), Some("0.2.0"));
         assert_eq!(list_workers(&db).await.unwrap().len(), 1);
@@ -279,7 +274,7 @@ mod tests {
         assert_eq!(updated.priority, 10);
         assert_eq!(updated.concurrency, 8);
         // Refreshing configuration must not disturb the approval decision.
-        assert_eq!(updated.status, STATUS_APPROVED);
+        assert_eq!(updated.status, ApprovalStatus::Approved);
     }
 
     /// Re-registering is how a returning machine announces itself, so it must
@@ -292,7 +287,7 @@ mod tests {
         revoke_worker(&db, w.id, 3).await.unwrap();
 
         let back = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
-        assert_eq!(back.status, STATUS_REVOKED);
+        assert_eq!(back.status, ApprovalStatus::Revoked);
         // ...but its liveness is refreshed, so the UI can show it checked in.
         assert!(back.last_seen.is_some());
     }
@@ -303,7 +298,7 @@ mod tests {
         let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
         store_signed_cert(&db, w.id, "CERTPEM", 9999).await.unwrap();
         let approved = approve_worker(&db, w.id).await.unwrap();
-        assert_eq!(approved.status, STATUS_APPROVED);
+        assert_eq!(approved.status, ApprovalStatus::Approved);
         assert_eq!(approved.signed_cert.as_deref(), Some("CERTPEM"));
         assert_eq!(approved.not_after, Some(9999));
 
@@ -317,10 +312,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(re.status, STATUS_APPROVED);
+        assert_eq!(re.status, ApprovalStatus::Approved);
 
         let revoked = revoke_worker(&db, w.id, 3).await.unwrap();
-        assert_eq!(revoked.status, STATUS_REVOKED);
+        assert_eq!(revoked.status, ApprovalStatus::Revoked);
     }
 
     /// Revoking must release the worker's grip on work in flight, not leave it

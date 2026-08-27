@@ -6,19 +6,23 @@
 //! crate keeps its own copy to avoid a dependency on the types crate here.
 
 use crate::helpers::time::now_secs;
-use crate::helpers::worker_store::STATUS_APPROVED;
 use crate::prelude::{Builds, Packages, Workers};
 use crate::{builds, packages, workers};
+use aurcache_types::api::worker::ApprovalStatus;
+use aurcache_types::builder::BuildStates;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
 
 use std::collections::{HashMap, HashSet};
 
-pub const STATUS_ACTIVE: i32 = 0;
-pub const STATUS_SUCCESS: i32 = 1;
-pub const STATUS_FAILED: i32 = 2;
-pub const STATUS_ENQUEUED: i32 = 3;
+// Build states, as the integers the `builds.status` column holds. Derived from
+// the `BuildState` enum rather than written out: these were four literals that
+// happened to agree with it, and nothing would have noticed if they stopped.
+pub const STATUS_ACTIVE: i32 = BuildStates::ACTIVE_BUILD;
+pub const STATUS_SUCCESS: i32 = BuildStates::SUCCESSFUL_BUILD;
+pub const STATUS_FAILED: i32 = BuildStates::FAILED_BUILD;
+pub const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
 
 /// One approved worker's routing-relevant configuration, plus its live state.
 #[derive(Debug)]
@@ -92,7 +96,7 @@ impl Fleet {
             .column(workers::Column::EmulatedArches)
             .column(workers::Column::PackageAffinity)
             .column(workers::Column::LastSeen)
-            .filter(workers::Column::Status.eq(STATUS_APPROVED))
+            .filter(workers::Column::Status.eq(ApprovalStatus::Approved))
             .into_model()
             .all(db)
             .await?;
@@ -621,7 +625,7 @@ mod tests {
         affinity: &'static str,
         priority: i32,
         concurrency: i32,
-        status: &'static str,
+        status: ApprovalStatus,
         /// `None` means "never seen", which reads as not live.
         last_seen: Option<i64>,
     }
@@ -635,7 +639,7 @@ mod tests {
                 affinity: "",
                 priority: 0,
                 concurrency: 1,
-                status: STATUS_APPROVED,
+                status: ApprovalStatus::Approved,
                 last_seen: Some(now_secs()),
             }
         }
@@ -732,7 +736,7 @@ mod tests {
             &db,
             W {
                 id: 1,
-                status: "revoked",
+                status: ApprovalStatus::Revoked,
                 ..W::default()
             },
         )
@@ -954,7 +958,7 @@ mod tests {
             W {
                 id: 2,
                 affinity: "unreal-engine",
-                status: "revoked",
+                status: ApprovalStatus::Revoked,
                 ..W::default()
             },
         )

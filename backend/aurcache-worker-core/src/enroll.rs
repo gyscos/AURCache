@@ -2,7 +2,8 @@
 //! persist the signed certificate, and hand back an authenticated client.
 
 use anyhow::{Context, Result};
-use aurcache_types::worker::{RegisterRequest, RegisterStatus, WorkerStatus};
+use aurcache_types::api::worker::ApprovalStatus;
+use aurcache_types::worker::{RegisterRequest, RegisterStatus};
 use std::time::Duration;
 
 use crate::client::{WorkerClient, fetch_and_pin_ca};
@@ -110,7 +111,7 @@ pub async fn ensure_enrolled(cfg: &CoreConfig, identity: &Identity) -> Result<Wo
             return Ok(client);
         }
         anyhow::ensure!(
-            status.status != WorkerStatus::REVOKED,
+            status.status != ApprovalStatus::Revoked,
             "worker was revoked by the server"
         );
         tracing::info!("Awaiting approval (status: {})…", status.status);

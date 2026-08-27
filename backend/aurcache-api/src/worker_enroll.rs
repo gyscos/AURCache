@@ -17,7 +17,7 @@
 //! 3. **Shared enrollment token** (`AURCACHE_ENROLLMENT_TOKEN`): fallback for
 //!    setups without a shared volume; the worker presents the token.
 
-use aurcache_types::worker::WorkerStatus;
+use aurcache_types::api::worker::ApprovalStatus;
 use std::env;
 use std::path::PathBuf;
 
@@ -38,14 +38,14 @@ use std::path::PathBuf;
 /// immediate, complete re-grant.
 #[must_use]
 pub fn eval_auto_approve(
-    status: &str,
+    status: ApprovalStatus,
     fingerprint: &str,
     provided_token: Option<&str>,
     expected_token: Option<&str>,
     preapproved_fingerprints: &[String],
     enrollment_dir_has_csr: bool,
 ) -> bool {
-    if status != WorkerStatus::PENDING {
+    if status != ApprovalStatus::Pending {
         return false;
     }
     if enrollment_dir_has_csr {
@@ -80,7 +80,7 @@ pub fn parse_preapproved(raw: &str) -> Vec<String> {
 /// best-effort: a missing/unreadable dir simply means that mode doesn't match.
 #[must_use]
 pub fn auto_approve_from_env(
-    status: &str,
+    status: ApprovalStatus,
     fingerprint: &str,
     provided_token: Option<&str>,
 ) -> bool {
@@ -110,7 +110,7 @@ pub fn auto_approve_from_env(
 mod tests {
     use super::*;
 
-    const PENDING: &str = WorkerStatus::PENDING;
+    const PENDING: ApprovalStatus = ApprovalStatus::Pending;
 
     #[test]
     fn enrollment_volume_grants_approval() {
@@ -174,7 +174,7 @@ mod tests {
     fn revoked_worker_is_never_auto_approved() {
         let pre = vec!["fp".to_string()];
         assert!(!eval_auto_approve(
-            WorkerStatus::REVOKED,
+            ApprovalStatus::Revoked,
             "fp",
             Some("s3cret"),
             Some("s3cret"),
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn approved_worker_is_not_reapproved() {
         assert!(!eval_auto_approve(
-            WorkerStatus::APPROVED,
+            ApprovalStatus::Approved,
             "fp",
             None,
             None,
@@ -197,17 +197,18 @@ mod tests {
         ));
     }
 
-    /// An unknown status is refused rather than defaulted into approval.
+    /// Only a pending worker can be auto-approved. This used to also cover an
+    /// unrecognised status string, which the type no longer permits — a status
+    /// is now one of three variants, so "something else" cannot be constructed
+    /// to be defaulted into approval.
     #[test]
-    fn unknown_status_is_refused() {
-        assert!(!eval_auto_approve(
-            "something-else",
-            "fp",
-            None,
-            None,
-            &[],
-            true
-        ));
+    fn only_a_pending_worker_is_auto_approved() {
+        for status in [ApprovalStatus::Approved, ApprovalStatus::Revoked] {
+            assert!(
+                !eval_auto_approve(status, "fp", None, None, &[], true),
+                "{status} should not be auto-approved"
+            );
+        }
     }
 
     #[test]

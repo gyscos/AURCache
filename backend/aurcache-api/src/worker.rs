@@ -16,7 +16,7 @@ use aurcache_db::workers;
 use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary};
 use aurcache_types::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
-    RegisterStatus, WorkerStatus,
+    RegisterStatus,
 };
 use aurcache_utils::build_logger::{BuildLogger, append_build_output};
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
@@ -155,7 +155,7 @@ impl<'r> FromRequest<'r> for WorkerAuth {
             return Outcome::Error((Status::InternalServerError, "no db".to_string()));
         };
         match worker_store::find_worker_by_fingerprint(db, &fingerprint).await {
-            Ok(Some(worker)) if worker.status == WorkerStatus::APPROVED => {
+            Ok(Some(worker)) if worker.status == ApprovalStatus::Approved => {
                 let _ = worker_store::touch_last_seen(db, worker.id, None).await;
                 Outcome::Success(Self { worker })
             }
@@ -258,7 +258,7 @@ pub async fn register_worker(
     // Eligibility (pending only) is enforced inside `auto_approve_from_env`, so
     // a revoked worker is never re-approved by re-registering.
     if crate::worker_enroll::auto_approve_from_env(
-        &worker.status,
+        worker.status,
         &fingerprint,
         input.enrollment_token.as_deref(),
     ) {
@@ -293,7 +293,7 @@ async fn register_status_for(
         .ok_or_else(|| err(Status::NotFound, "worker not registered"))?;
 
     // Only release the certificate + CA once the worker is approved.
-    let (signed_cert, ca_cert) = if worker.status == WorkerStatus::APPROVED {
+    let (signed_cert, ca_cert) = if worker.status == ApprovalStatus::Approved {
         (
             worker.signed_cert.clone(),
             Some(ca.ca_cert_pem().to_string()),
@@ -720,7 +720,7 @@ fn summarise(worker: workers::Model) -> WorkerSummary {
     WorkerSummary {
         id: worker.id,
         name: worker.name,
-        status: ApprovalStatus::from_db(&worker.status),
+        status: worker.status,
         cert_fingerprint: worker.cert_fingerprint,
         native_arches: split_list(&worker.native_arches),
         emulated_arches: split_list(&worker.emulated_arches),
