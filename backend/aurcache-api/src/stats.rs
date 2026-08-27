@@ -10,6 +10,7 @@ use crate::utils::error::{ApiError, err};
 use aurcache_db::builds;
 use aurcache_db::helpers::dbtype::database_type;
 use aurcache_db::prelude::{Builds, Packages};
+use aurcache_types::api::stats::RECENT_DAYS;
 use aurcache_types::builder::BuildStates;
 use aurcache_utils::utils::dir_size::dir_size;
 use rocket::http::Status;
@@ -18,6 +19,7 @@ use sea_orm::prelude::BigDecimal;
 use sea_orm::{ColumnTrait, QueryFilter};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm::{DbBackend, FromQueryResult, PaginatorTrait, Statement};
+use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -84,12 +86,18 @@ pub async fn dashboard_graph_data(
 }
 
 async fn get_graph_datapoints(db: &DatabaseConnection) -> anyhow::Result<Vec<GraphDataPoint>> {
+    // The success predicate is built from the enum rather than written as a
+    // literal, so a renumbered state cannot silently turn this into a count of
+    // something else.
+    let succeeded = format!("status = {}", BuildStates::SUCCESSFUL_BUILD);
     let query = match database_type() {
         DbBackend::Sqlite => {
-            "SELECT
+            format!(
+                "SELECT
     CAST(strftime('%Y', datetime(start_time, 'unixepoch')) AS INTEGER) AS year,
     CAST(strftime('%m', datetime(start_time, 'unixepoch')) AS INTEGER) AS month,
-    COUNT(*) AS count
+    COUNT(*) AS count,
+    CAST(SUM(CASE WHEN {succeeded} THEN 1 ELSE 0 END) AS INTEGER) AS successful
 FROM
     builds
 WHERE
@@ -98,12 +106,15 @@ GROUP BY
     year, month
 ORDER BY
     year DESC, month DESC;"
+            )
         }
         DbBackend::Postgres => {
-            "SELECT
+            format!(
+                "SELECT
     EXTRACT(YEAR FROM to_timestamp(start_time))::INTEGER AS year,
     EXTRACT(MONTH FROM to_timestamp(start_time))::INTEGER AS month,
-    COUNT(*)::INTEGER AS count
+    COUNT(*)::INTEGER AS count,
+    SUM(CASE WHEN {succeeded} THEN 1 ELSE 0 END)::INTEGER AS successful
 FROM
     builds
 WHERE
@@ -112,13 +123,14 @@ GROUP BY
     year, month
 ORDER BY
     year DESC, month DESC;"
+            )
         }
         _ => bail!("Unsupported database type"),
     };
 
     let result = GraphDataPoint::find_by_statement(Statement::from_sql_and_values(
         database_type(),
-        query,
+        &query,
         vec![],
     ))
     .all(db)
@@ -127,9 +139,11 @@ ORDER BY
     Ok(result)
 }
 
-async fn count_directly_requested_packages(db: &DatabaseConnection) -> anyhow::Result<u32> {
+/// Packages someone asked for (`requested`), or ones present only as
+/// dependencies of those.
+async fn count_packages(db: &DatabaseConnection, requested: bool) -> anyhow::Result<u32> {
     Packages::find()
-        .filter(aurcache_db::packages::Column::DirectlyRequested.eq(true))
+        .filter(aurcache_db::packages::Column::DirectlyRequested.eq(requested))
         .count(db)
         .await?
         .try_into()
@@ -248,30 +262,45 @@ async fn build_trends(db: &DatabaseConnection) -> anyhow::Result<BuildTrends> {
     Ok(BuildTrends { count, duration })
 }
 
+/// Count builds, optionally in one state and optionally only recent ones.
+///
+/// `since` is a Unix second; builds with no start time are excluded from a
+/// windowed count, since an unstarted build has not happened yet.
+async fn count_builds(
+    db: &DatabaseConnection,
+    status: Option<i32>,
+    since: Option<i64>,
+) -> anyhow::Result<u32> {
+    let mut query = Builds::find();
+    if let Some(status) = status {
+        query = query.filter(builds::Column::Status.eq(status));
+    }
+    if let Some(since) = since {
+        query = query.filter(builds::Column::StartTime.gte(since));
+    }
+    Ok(query.count(db).await?.try_into()?)
+}
+
 async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
-    let total_builds: u32 = Builds::find().count(db).await?.try_into()?;
-
-    let failed_builds: u32 = Builds::find()
-        .filter(builds::Column::Status.eq(BuildStates::FAILED_BUILD))
-        .count(db)
-        .await?
-        .try_into()?;
-
-    let successful_builds: u32 = Builds::find()
-        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
-        .count(db)
-        .await?
-        .try_into()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let cutoff = now - RECENT_DAYS * 24 * 60 * 60;
 
     let trends = build_trends(db).await?;
 
     Ok(ListStats {
-        total_builds,
-        successful_builds,
-        failed_builds,
+        total_builds: count_builds(db, None, None).await?,
+        successful_builds: count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), None).await?,
+        failed_builds: count_builds(db, Some(BuildStates::FAILED_BUILD), None).await?,
+
+        recent_builds: count_builds(db, None, Some(cutoff)).await?,
+        recent_successful: count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), Some(cutoff))
+            .await?,
+        recent_failed: count_builds(db, Some(BuildStates::FAILED_BUILD), Some(cutoff)).await?,
+
         avg_build_time: avg_build_time(db).await?,
         repo_size: dir_size("repo/").unwrap_or(0),
-        total_packages: count_directly_requested_packages(db).await?,
+        requested_packages: count_packages(db, true).await?,
+        dependency_packages: count_packages(db, false).await?,
         total_build_trend: trends.count,
         avg_build_time_trend: trends.duration,
     })
@@ -279,7 +308,7 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
 
 #[cfg(test)]
 mod tests {
-    use super::count_directly_requested_packages;
+    use super::count_packages;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::{self, SourceData};
     use sea_orm::{ActiveModelTrait, Database, Set};
@@ -330,8 +359,9 @@ mod tests {
         .await
         .unwrap();
 
-        let count = count_directly_requested_packages(&db).await.unwrap();
-
-        assert_eq!(count, 1);
+        // One of each was inserted above, so the two counts partition the
+        // table — a filter that ignored the flag would give 2 for both.
+        assert_eq!(count_packages(&db, true).await.unwrap(), 1);
+        assert_eq!(count_packages(&db, false).await.unwrap(), 1);
     }
 }

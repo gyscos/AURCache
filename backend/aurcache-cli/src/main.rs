@@ -974,9 +974,13 @@ fn print_stats(stats: &ListStats) {
     println!("total_builds: {}", stats.total_builds);
     println!("successful_builds: {}", stats.successful_builds);
     println!("failed_builds: {}", stats.failed_builds);
+    println!("recent_builds: {}", stats.recent_builds);
+    println!("recent_successful: {}", stats.recent_successful);
+    println!("recent_failed: {}", stats.recent_failed);
     println!("avg_build_time_seconds: {}", stats.avg_build_time);
     println!("repo_size_bytes: {}", stats.repo_size);
-    println!("total_packages: {}", stats.total_packages);
+    println!("requested_packages: {}", stats.requested_packages);
+    println!("dependency_packages: {}", stats.dependency_packages);
     println!("total_build_trend: {:.2}", stats.total_build_trend);
     println!("avg_build_time_trend: {:.2}", stats.avg_build_time_trend);
 }
@@ -989,10 +993,11 @@ fn print_graph(points: &[GraphDataPoint]) {
                 point.year.to_string(),
                 format!("{:02}", point.month),
                 point.count.to_string(),
+                point.successful.to_string(),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["year", "month", "count"], &rows);
+    print_table(&["year", "month", "count", "successful"], &rows);
 }
 
 fn print_search_results(results: &[SearchResult]) {

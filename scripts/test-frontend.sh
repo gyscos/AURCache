@@ -132,7 +132,19 @@ curl -sf "http://localhost:$UI_PORT/" -o /dev/null || fail "ui server did not co
 # correctly — and broke only `/package/hello/build/1` and below. A list of shallow routes
 # would have passed straight through it.
 ROUTES=(
-    "/|Needs a charting story|dashboard"
+    "/|Builds per month|dashboard"
+    # The tiles that link somewhere only render with a router above them, which
+    # the unit tests cannot stand up — so this is where they are covered.
+    "/|Repository|the dashboard shows its headline numbers"
+    "/|href=\"/packages\"|a counted tile links to what it counts"
+    # Dependencies are counted apart from what was asked for. The fixture has
+    # 10 requested and 2 dependency-only packages; both tiles are links, so
+    # this is the only place they render.
+    "/|12 with dependencies|dependencies are counted apart from requests"
+    # A bad week must not hide inside a good lifetime figure.
+    "/|this week|the weekly reading sits beside the lifetime one"
+    # The chart is SVG, so a real element proves it drew rather than errored.
+    "/|<svg|the build graph renders"
     "/builds|Duration|builds list"
     "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"

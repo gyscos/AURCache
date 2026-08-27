@@ -27,6 +27,12 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
   -- version-checked yet. Both "no version yet" placeholders end up on screen
   -- rather than only in a unit test.
   ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1),
+  -- Dependency-only packages: nobody asked for these, something else needs
+  -- them. They are what the dashboard's second package count counts, and they
+  -- are deliberately absent from the package list, which shows only what was
+  -- requested.
+  ('libfoo',                 1, 0, '2.3.1-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"libfoo"}',                 0),
+  ('libbar',                 1, 0, '0.9-2',     '', 'x86_64', 'aur', '{"type":"aur","name":"libbar"}',                 0),
   -- A git-sourced package. It has no AUR entry at all, so its description,
   -- licenses and maintainer can only come from its checkout — and its origin
   -- link has to point at the repository rather than at the AUR.
@@ -164,3 +170,32 @@ INSERT INTO activity (typ, data, timestamp, user) VALUES
 -- `-1` is the global scope.
 INSERT INTO settings (key, value, pkg_id) VALUES
   ('makepkg_conf', '# Seeded makepkg.conf' || char(10) || 'MAKEFLAGS="-j8"' || char(10) || 'PACKAGER="AURCache <build@example.invalid>"', -1);
+
+-- Builds spread back over the year, purely so the dashboard graph has a curve.
+-- It groups by month over the last twelve, and every build seeded above landed
+-- in the last few days — one point is a dot, not a line.
+--
+-- Numbered from 10 up so they cannot collide with the builds above under
+-- `UNIQUE (pkg_id, number)`, and given end times so they count as finished.
+INSERT INTO builds (pkg_id, number, status, start_time, end_time, platform, version)
+SELECT
+  p.id,
+  10 + offs.n,
+  1,
+  CAST(strftime('%s','now',  '-' || offs.months || ' months') AS INTEGER),
+  CAST(strftime('%s','now',  '-' || offs.months || ' months') AS INTEGER) + 120,
+  'x86_64',
+  '1.0-1'
+FROM packages p
+JOIN (
+  SELECT 1 AS n, 1 AS months UNION ALL
+  SELECT 2, 2  UNION ALL
+  SELECT 3, 3  UNION ALL
+  SELECT 4, 3  UNION ALL
+  SELECT 5, 4  UNION ALL
+  SELECT 6, 6  UNION ALL
+  SELECT 7, 6  UNION ALL
+  SELECT 8, 6  UNION ALL
+  SELECT 9, 8
+) offs
+WHERE p.name = 'hello';

@@ -27,6 +27,39 @@ pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
     }
 }
 
+/// A byte count, at the largest unit that leaves a number worth reading.
+///
+/// Binary units, because that is what a package repository on disk is measured
+/// in and what `du` will tell you. One decimal below 10 so `1.4 GiB` does not
+/// round to the same thing as `1.9 GiB`.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// A span of seconds, for a duration that is already a number rather than two
+/// timestamps — an average, say.
+pub fn format_secs(secs: u32) -> String {
+    match secs {
+        0 => "—".to_string(),
+        1..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
 /// How long ago something happened, relative to `now`.
 ///
 /// Relative rather than absolute because it avoids a timezone and locale
@@ -50,6 +83,31 @@ pub fn format_age(ts: Option<i64>, now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{format_bytes, format_secs};
+
+    #[test]
+    fn bytes_climb_to_the_largest_readable_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        // Past ten, the decimal stops earning its place.
+        assert_eq!(format_bytes(20 * 1024), "20 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+        // Nothing larger than TiB, so a huge value stays in it rather than
+        // running off the end of the table.
+        assert_eq!(format_bytes(5 * 1024_u64.pow(5)), "5120 TiB");
+    }
+
+    /// Zero is "no builds have finished", not "they took no time".
+    #[test]
+    fn an_average_of_zero_reads_as_unknown() {
+        assert_eq!(format_secs(0), "—");
+        assert_eq!(format_secs(45), "45s");
+        assert_eq!(format_secs(90), "1m 30s");
+        assert_eq!(format_secs(3700), "1h 1m");
+    }
+
     use super::*;
 
     #[test]

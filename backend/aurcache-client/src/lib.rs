@@ -23,7 +23,7 @@ pub use aurcache_types::api::package::{
 };
 pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
 pub use aurcache_types::api::settings::{SettingResponse, SettingValue};
-pub use aurcache_types::api::stats::{GraphDataPoint, UserInfo};
+pub use aurcache_types::api::stats::{GraphDataPoint, ListStats, UserInfo};
 pub use aurcache_types::api::waiting::WaitingReason;
 pub use aurcache_types::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
@@ -65,27 +65,6 @@ pub struct ApiTokenResponse {
     ///
     /// The server only returns this value at generation time.
     pub token: String,
-}
-
-/// Aggregate dashboard statistics for the AURCache instance.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListStats {
-    /// Total number of builds recorded by the server.
-    pub total_builds: u32,
-    /// Number of successful builds.
-    pub successful_builds: u32,
-    /// Number of failed builds.
-    pub failed_builds: u32,
-    /// Average build duration in seconds.
-    pub avg_build_time: u32,
-    /// Repository size on disk in bytes.
-    pub repo_size: u64,
-    /// Number of directly requested packages.
-    pub total_packages: u32,
-    /// Relative trend for build count over recent periods.
-    pub total_build_trend: f32,
-    /// Relative trend for average build time over recent periods.
-    pub avg_build_time_trend: f32,
 }
 
 /// Search result returned from the AUR search proxy endpoint.

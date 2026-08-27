@@ -7,6 +7,7 @@ mod activities;
 mod build;
 mod builds;
 mod config_files;
+mod dashboard;
 mod not_found;
 mod package;
 mod package_add;
@@ -20,6 +21,7 @@ pub use activities::Activities;
 pub use build::Build;
 pub use builds::Builds;
 pub use config_files::ConfigFiles;
+pub use dashboard::Dashboard;
 pub use not_found::NotFound;
 pub use package::{Package, PackageHeader};
 pub use package_add::PackageAdd;
@@ -38,16 +40,6 @@ use dioxus::prelude::*;
 // keeps type-checking against real names, and porting one is a change in one
 // place with no route churn.
 // ---------------------------------------------------------------------------
-
-#[component]
-pub fn Dashboard() -> Element {
-    rsx! {
-        NotPorted {
-            title: "Dashboard",
-            note: "Needs a charting story — the Dart version uses fl_chart for the build history graph, which has no direct equivalent here.",
-        }
-    }
-}
 
 #[component]
 pub fn Workers() -> Element {

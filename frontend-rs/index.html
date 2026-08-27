@@ -8,6 +8,18 @@
          Tailwind build so unused classes are purged. -->
     <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.14/dist/full.min.css" rel="stylesheet" type="text/css" />
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* The chart crate colours each series itself and offers one class for
+         all of them, so telling them apart needs a descendant selector — which
+         Tailwind has no utility for. It groups each series as
+         `{class_line}-{n}`, set to `series-{n}` here, and an SVG presentation attribute loses to any
+         CSS rule, so these win without !important.
+
+         Theme variables rather than fixed colours, so the chart follows the
+         palette like everything else. */
+      .series-0 .chart-line { stroke: oklch(var(--p)); }
+      .series-1 .chart-line { stroke: oklch(var(--su)); }
+    </style>
   </head>
   <body>
     <script>
