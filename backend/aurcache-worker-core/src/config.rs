@@ -52,6 +52,19 @@ pub struct CoreConfig {
     /// the address used to reach the worker protocol is not the address that
     /// serves the package repository.
     pub repo_host: Option<String>,
+    /// Overrides the whole repository base URL, not just its host.
+    ///
+    /// The server renders one template for every worker, so scheme, port and
+    /// path are the same for all of them and only the host varies. That holds
+    /// while every worker reaches the repository the same way, and stops
+    /// holding as soon as one does not: a worker inside the compose network
+    /// uses `http://aurcache:8081` while one across the internet comes in
+    /// through a reverse proxy at `https://aur.example.com/repo`. Differing in
+    /// host alone cannot express that.
+    ///
+    /// Takes precedence over [`Self::repo_host`], which is the narrower case of
+    /// the same thing.
+    pub repo_url: Option<String>,
 }
 
 /// Read an environment variable, treating blank values as unset.
@@ -170,6 +183,7 @@ impl CoreConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3 * 60 * 60),
             repo_host: env_opt("AURCACHE_REPO_HOST"),
+            repo_url: env_opt("AURCACHE_REPO_URL"),
         }
     }
 }

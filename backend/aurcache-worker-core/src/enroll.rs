@@ -143,6 +143,7 @@ fn try_finish_enrollment(
         &status.repo_template,
         &cfg.aurcache_url,
         cfg.repo_host.as_deref(),
+        cfg.repo_url.as_deref(),
     );
     match section.lines().find(|l| l.starts_with("Server =")) {
         Some(server) => tracing::info!("Package repository for this worker: {server}"),
