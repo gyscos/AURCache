@@ -397,7 +397,7 @@ async fn one_queued_package_can_be_taken_back(session: &Session) {
 async fn a_per_package_file_leaves_the_server_wide_one_alone(session: &Session) {
     const MARKER: &str = "# only-for-hello";
 
-    session.open("/package/hello/settings").await;
+    session.open("/package/hello/config-files").await;
     // `hello` seeds nothing of its own, so what loads is the server-wide file.
     session
         .wait_until("the inherited file", |t| t.contains("inherited"))
@@ -436,7 +436,7 @@ async fn a_build_flag_survives_a_reload_and_can_be_taken_off(session: &Session) 
     // placeholder as its value would pass if the two matched.
     const FLAG: &str = "--skipinteg";
 
-    session.open("/package/hello/settings").await;
+    session.open("/package/hello").await;
     session
         .wait_until("the empty flag list", |t| t.contains("No build flags"))
         .await;
@@ -449,7 +449,7 @@ async fn a_build_flag_survives_a_reload_and_can_be_taken_off(session: &Session) 
         .wait_until("the flag to appear", |t| t.contains(FLAG))
         .await;
 
-    session.open("/package/hello/settings").await;
+    session.open("/package/hello").await;
     session
         .wait_until("the flag to have persisted", |t| t.contains(FLAG))
         .await;
@@ -468,7 +468,7 @@ async fn a_build_flag_survives_a_reload_and_can_be_taken_off(session: &Session) 
 /// it, and it has no dependency edges — so it is deleted outright rather than
 /// demoted to a dependency, which is the case worth asserting.
 async fn removing_a_package_takes_it_out_of_the_list(session: &Session) {
-    session.open("/package/2048.c/settings").await;
+    session.open("/package/2048.c").await;
     session
         .wait_until("the remove section", |t| t.contains("Remove package"))
         .await;

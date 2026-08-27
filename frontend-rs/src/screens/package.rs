@@ -14,7 +14,7 @@ use crate::format::{format_duration, now_secs};
 use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
-use aurcache_client::{Build, ExtendedPackage, PackageSource};
+use aurcache_client::{Build, ExtendedPackage, PackageSource, PatchPackageRequest};
 use aurcache_types::build_state::BuildState;
 use dioxus::prelude::*;
 
@@ -147,6 +147,10 @@ pub fn Package(pkgbase: String) -> Element {
                             ProducesCard { pkg: pkg.clone() }
                         }
                     }
+                    // Below the fold of the page proper: it is the one
+                    // irreversible action here, and it has no business sitting
+                    // beside Rebuild where people click without reading.
+                    RemoveCard { pkgbase: pkg.name.clone() }
                 }
             },
         }
@@ -535,19 +539,19 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                     selected: pkg.selected_platforms.clone(),
                     on_changed,
                 }
-                {
-                    let flags: Vec<String> = pkg
+                BuildFlagsField {
+                    pkgbase: pkg.name.clone(),
+                    // A package with no flags stores an empty string, which the
+                    // API splits on `;` into one empty flag rather than none.
+                    // Left in, it renders as a chip with no label.
+                    flags: pkg
                         .selected_build_flags
                         .clone()
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|flag| !flag.trim().is_empty())
-                        .collect();
-                    (!flags.is_empty()).then(|| rsx! {
-                        Field { label: "Flags",
-                            span { class: "font-mono text-xs break-all", "{flags.join(\" \")}" }
-                        }
-                    })
+                        .collect(),
+                    on_changed,
                 }
                 Field { label: "Patch",
                     if pkg.has_patch {
@@ -563,14 +567,13 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                     to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
                     "Edit sources"
                 }
-                // This card shows what is set; the settings page is where the
-                // rest of it — build flags, the per-package config files — is
-                // changed. Without a way through, that page is reachable only
-                // by typing its URL.
+                // The per-package makepkg.conf/pacman.conf overrides. They
+                // need a page of their own — two full-height editors — and
+                // without a way through it is reachable only by typing its URL.
                 Link {
                     class: "btn btn-sm btn-block mt-2",
-                    to: Route::PackageSettings { pkgbase: pkg.name.clone() },
-                    "Settings"
+                    to: Route::PackageConfigFiles { pkgbase: pkg.name.clone() },
+                    "Config files"
                 }
             }
         }
@@ -994,5 +997,237 @@ mod url_tests {
     fn only_a_real_http_scheme_counts() {
         assert_eq!(browsable_url("nothttps://example.com"), None);
         assert_eq!(browsable_url(""), None);
+    }
+}
+
+/// The makepkg flags this package builds with, as chips.
+///
+/// Free-form rather than a fixed set: they are passed to makepkg, which has far
+/// more of them than a checklist would be honest about. Every edit saves the
+/// whole list, because that is what the endpoint takes — there is no
+/// add-one/remove-one operation to mirror.
+#[component]
+fn BuildFlagsField(pkgbase: String, flags: Vec<String>, on_changed: EventHandler<()>) -> Element {
+    let mut draft = use_signal(String::new);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    let pkgbase = use_signal(|| pkgbase);
+    let current = use_signal(|| flags.clone());
+    // Follow the server after a save, or the chips show the list as it was
+    // before the change that was just made.
+    use_effect(use_reactive(&flags, move |flags| {
+        let mut current = current;
+        current.set(flags);
+    }));
+
+    let save = move |next: Vec<String>| async move {
+        busy.set(true);
+        error.set(None);
+        let outcome = match client() {
+            Ok(client) => client
+                .patch_package(
+                    &pkgbase(),
+                    &PatchPackageRequest {
+                        build_flags: Some(next),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        busy.set(false);
+        match outcome {
+            Ok(()) => {
+                draft.set(String::new());
+                on_changed.call(());
+            }
+            Err(e) => error.set(Some(e)),
+        }
+    };
+
+    // Adding a flag already present would save a list with a duplicate in it,
+    // which makepkg would then see twice.
+    let entered = draft().trim().to_string();
+    let can_add = !entered.is_empty() && !current().contains(&entered) && !busy();
+
+    let add = move |()| async move {
+        let entered = draft().trim().to_string();
+        if entered.is_empty() || current().contains(&entered) {
+            return;
+        }
+        let mut next = current();
+        next.push(entered);
+        save(next).await;
+    };
+
+    rsx! {
+        div { class: "flex gap-2 py-1 text-sm",
+            span { class: "opacity-60 w-24 shrink-0", "Flags" }
+            div { class: "min-w-0 flex-1 flex flex-col gap-2",
+                if current().is_empty() {
+                    span { class: "opacity-60 text-xs italic",
+                        "No build flags. makepkg runs with its own defaults."
+                    }
+                } else {
+                    div { class: "flex flex-wrap gap-1",
+                        for flag in current() {
+                            span {
+                                key: "{flag}",
+                                class: "badge badge-outline gap-1 font-mono text-xs",
+                                "{flag}"
+                                button {
+                                    class: "opacity-60 hover:opacity-100",
+                                    disabled: busy(),
+                                    aria_label: "Remove {flag}",
+                                    onclick: {
+                                        let flag = flag.clone();
+                                        move |_| {
+                                            let flag = flag.clone();
+                                            async move {
+                                                let next = current()
+                                                    .into_iter()
+                                                    .filter(|f| *f != flag)
+                                                    .collect();
+                                                save(next).await;
+                                            }
+                                        }
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div { class: "flex gap-2",
+                    input {
+                        r#type: "text",
+                        class: "input input-bordered input-xs font-mono w-48",
+                        placeholder: "--nocheck",
+                        value: "{draft}",
+                        disabled: busy(),
+                        oninput: move |e| draft.set(e.value()),
+                        onkeydown: move |e: KeyboardEvent| async move {
+                            if e.key() == Key::Enter {
+                                add(()).await;
+                            }
+                        },
+                    }
+                    button {
+                        class: "btn btn-xs",
+                        disabled: !can_add,
+                        onclick: move |_| add(()),
+                        "Add"
+                    }
+                }
+
+                if let Some(message) = error() {
+                    span { class: "text-xs text-error", "{message}" }
+                }
+            }
+        }
+    }
+}
+
+/// Removing the package from the repository.
+///
+/// "Remove" rather than "delete" because that is what the server does: it
+/// clears the direct-request flag and then live-checks. A package nothing
+/// depends on is deleted along with any dependency that was only there for it;
+/// one that something still needs stays, demoted to a dependency. Saying
+/// "delete" would promise the first case in a UI that cannot tell which applies
+/// until it has happened.
+#[component]
+fn RemoveCard(pkgbase: String) -> Element {
+    let mut confirming = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    let pkgbase = use_signal(|| pkgbase);
+
+    let remove = move |_| async move {
+        busy.set(true);
+        error.set(None);
+        let outcome = match client() {
+            Ok(client) => client
+                .delete_package(&pkgbase())
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        busy.set(false);
+        match outcome {
+            Ok(()) => {
+                confirming.set(false);
+                // The package may no longer exist, so going back to it would
+                // land on an error page.
+                navigator().push(Route::Packages { q: String::new() });
+            }
+            Err(e) => error.set(Some(e)),
+        }
+    };
+
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl border border-error/30",
+            div { class: "card-body",
+                h2 { class: "card-title text-base text-error", "Remove" }
+                p { class: "text-xs opacity-60 max-w-prose",
+                    "Marks this package as no longer requested. If nothing depends on it, "
+                    "it and its builds are deleted, along with any dependency that was only "
+                    "installed for it. If something still depends on it, it stays as a "
+                    "dependency."
+                }
+                if let Some(message) = error() {
+                    div { class: "alert alert-error text-sm", span { "{message}" } }
+                }
+                div {
+                    button {
+                        class: "btn btn-error btn-sm btn-outline",
+                        onclick: move |_| confirming.set(true),
+                        "Remove package"
+                    }
+                }
+            }
+        }
+
+        div {
+            class: if confirming() { "modal modal-open" } else { "modal" },
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "Confirm removal",
+            div { class: "modal-box",
+                h3 { class: "font-bold text-lg", "Remove {pkgbase}?" }
+                p { class: "text-sm opacity-70 pt-2",
+                    "It stops being a requested package. Unless something depends on it, "
+                    "it and its build history are deleted, and so is anything that was only "
+                    "here as its dependency. This cannot be undone."
+                }
+                div { class: "modal-action",
+                    button {
+                        class: "btn btn-sm",
+                        disabled: busy(),
+                        onclick: move |_| confirming.set(false),
+                        "Cancel"
+                    }
+                    button {
+                        class: "btn btn-error btn-sm",
+                        disabled: busy(),
+                        onclick: remove,
+                        if busy() {
+                            span { class: "loading loading-spinner loading-xs" }
+                        }
+                        "Remove"
+                    }
+                }
+            }
+            button {
+                class: "modal-backdrop",
+                disabled: busy(),
+                onclick: move |_| confirming.set(false),
+                aria_label: "Cancel removal",
+                "Close"
+            }
+        }
     }
 }
