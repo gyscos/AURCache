@@ -75,26 +75,12 @@ trap cleanup EXIT
 
 # --- build -----------------------------------------------------------------
 
-echo "==> building the frontend"
-( cd "$PROJECT_DIR/frontend-rs" \
-    && cargo build --release --quiet --target wasm32-unknown-unknown \
-    && wasm-bindgen --target web --out-dir dist --no-typescript \
-         target/wasm32-unknown-unknown/release/aurcache-frontend.wasm \
-    && cp index.html dist/index.html )
-
-# `#[derive(RustEmbed)] #[folder = "web"]` bakes these in at compile time, so
-# they have to be in place before the server is built, and the server has to be
-# rebuilt whenever they change.
-echo "==> embedding the frontend"
-WEB_DIR="$PROJECT_DIR/backend/aurcache-api/web"
-rm -rf "$WEB_DIR"
-mkdir -p "$WEB_DIR"
-cp -r "$PROJECT_DIR/frontend-rs/dist/." "$WEB_DIR/"
-
-echo "==> building the server"
+# One build. `aurcache-api`'s build script compiles the frontend to wasm and
+# embeds it, and re-runs whenever the frontend changes, so these checks cannot
+# run against a stale bundle -- which they silently did, twice, back when the
+# two were separate steps.
+echo "==> building the server, frontend and all"
 ( cd "$PROJECT_DIR/backend" && cargo build --quiet -p aurcache --features aurcache-api/static )
-
-# --- run -------------------------------------------------------------------
 
 echo "==> starting the server"
 # A long interval keeps the scheduler's second pass outside this run. Its first
