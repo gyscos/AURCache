@@ -303,6 +303,24 @@ pub async fn claim_job<C: ConnectionTrait>(
             .exec(db)
             .await?;
         if res.rows_affected == 1 {
+            // The package row keeps its own copy of the status, and that is
+            // what the packages list shows. Without this it goes on saying
+            // "enqueued" -- or "waiting for deps" -- for the whole build,
+            // while the builds list beside it says "building": the same fact
+            // reported two ways, one of them wrong. `worker_complete` writes
+            // the terminal status at the other end of the build; this is the
+            // start of it.
+            //
+            // Only after the claim above has actually won. That update is the
+            // compare-and-swap deciding which worker gets the build, so doing
+            // this first would announce a build that another worker took.
+            if let Some(pkg_id) = candidates.iter().find(|b| b.id == id).map(|b| b.pkg_id) {
+                Packages::update_many()
+                    .col_expr(packages::Column::Status, STATUS_ACTIVE.into())
+                    .filter(packages::Column::Id.eq(pkg_id))
+                    .exec(db)
+                    .await?;
+            }
             return Builds::find_by_id(id).one(db).await;
         }
     }
@@ -680,10 +698,71 @@ mod tests {
         enqueue_pkg(db, id, &format!("p{id}"), platform, start).await;
     }
 
+    /// A package's status, without loading the rest of the row: the fixtures
+    /// here insert only `(id, name)`, so the other columns are NULL and
+    /// decoding a full model fails on them.
+    async fn pkg_status(db: &DatabaseConnection, id: i32) -> Option<i32> {
+        Packages::find_by_id(id)
+            .select_only()
+            .column(packages::Column::Status)
+            .into_tuple::<Option<i32>>()
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     async fn claim(db: &DatabaseConnection, worker_id: i32) -> Option<builds::Model> {
         claim_job(db, worker_id, LEASE, SPILL, LIVENESS)
             .await
             .unwrap()
+    }
+
+    /// The package's own status has to follow the build's, because that is the
+    /// one the packages list renders. It used to be written on enqueue and
+    /// again on completion, with nothing in between -- so for the whole
+    /// duration of a build the package claimed to be waiting for it to start.
+    #[tokio::test]
+    async fn claiming_a_build_marks_its_package_as_building() {
+        let db = setup().await;
+        worker(&db, W::default()).await;
+        enqueue(&db, 10, "x86_64", 100).await;
+        db.execute_unprepared(&format!(
+            "UPDATE packages SET status = {STATUS_ENQUEUED} WHERE id = 10"
+        ))
+        .await
+        .unwrap();
+
+        let claimed = claim(&db, 1).await.unwrap();
+        assert_eq!(claimed.status, Some(STATUS_ACTIVE));
+
+        assert_eq!(
+            pkg_status(&db, 10).await,
+            Some(STATUS_ACTIVE),
+            "the package still reports the status it had before the build started"
+        );
+    }
+
+    /// Only the package whose build was actually claimed. A claim moves one
+    /// build; announcing every queued package as building would be a different
+    /// wrong answer.
+    #[tokio::test]
+    async fn claiming_leaves_other_packages_alone() {
+        let db = setup().await;
+        worker(&db, W::default()).await;
+        enqueue(&db, 10, "x86_64", 100).await;
+        enqueue(&db, 11, "x86_64", 200).await;
+        db.execute_unprepared(&format!(
+            "UPDATE packages SET status = {STATUS_ENQUEUED} WHERE id IN (10, 11)"
+        ))
+        .await
+        .unwrap();
+
+        // The older job is the one that gets taken.
+        let claimed = claim(&db, 1).await.unwrap();
+        assert_eq!(claimed.pkg_id, 10);
+
+        assert_eq!(pkg_status(&db, 11).await, Some(STATUS_ENQUEUED));
     }
 
     // ---------------------------------------------------------------- arches
