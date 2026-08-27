@@ -148,7 +148,6 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 div { class: "flex items-center gap-3",
-                    h2 { class: "card-title font-mono", "{pkgbase}/{number}" }
                     if finished() {
                         span { class: "badge badge-ghost badge-sm", "finished" }
                     } else {

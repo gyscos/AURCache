@@ -163,6 +163,9 @@ ROUTES=(
     "/package/hello|Rebuild|the rebuild button sits with the builds"
     "/package/hello|Change|platforms can be edited where they are shown"
     "/package/hello/builds|Platform|per-package build history (depth 3)"
+    # The whole row navigates, so the number must not be styled as the only
+    # thing that does. `link-primary` on it is the state being guarded against.
+    "/package/hello/builds|cursor-pointer|the build rows are clickable"
     "/package/yay|blocking|a blocked package names what is holding it back"
     "/package/yay|too old|a dependency built to an unsatisfying version"
     "/package/my-tool-git|github.com/example/my-tool|a git package links to its repository"

@@ -90,14 +90,42 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                 }
                                 tbody {
                                     for build in current.items.iter() {
-                                        tr { key: "{build.number}", class: "hover",
+                                        tr {
+                                            key: "{build.number}",
+                                            class: "hover cursor-pointer",
+                                            // The row is the build, so the
+                                            // whole row navigates.
+                                            onclick: {
+                                                let pkgbase = build.pkg_name.clone();
+                                                let number = build.number;
+                                                move |_| {
+                                                    navigator().push(Route::Build {
+                                                        pkgbase: pkgbase.clone(),
+                                                        number,
+                                                    });
+                                                }
+                                            },
                                             td {
                                                 Link {
-                                                    class: "link link-primary font-mono",
+                                                    // Not `link link-primary`:
+                                                    // when every cell navigates,
+                                                    // underlining one implies
+                                                    // the rest do not. It stays
+                                                    // a link so the address is
+                                                    // copyable, middle-click
+                                                    // opens a tab, and there is
+                                                    // something to focus.
+                                                    class: "font-mono",
                                                     to: Route::Build {
                                                         pkgbase: build.pkg_name.clone(),
                                                         number: build.number,
                                                     },
+                                                    // Otherwise the click
+                                                    // reaches the row too and
+                                                    // pushes the same route
+                                                    // twice, leaving a
+                                                    // duplicate history entry.
+                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
                                                     "{build.number}"
                                                 }
                                             }
