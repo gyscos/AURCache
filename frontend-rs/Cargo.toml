@@ -43,3 +43,17 @@ dioxus-ssr = "0.7"
 # Asserting the exact JSON a request body serialises to. The shapes come from
 # the server's own types, but how they nest is still worth pinning.
 serde_json = "1"
+
+# Drives a browser for the tests that click and type. WebDriver rather than the
+# devtools protocol: this crate resolves the local Chrome, fetches a matching
+# chromedriver and supervises both, so the test script needs no browser
+# plumbing of its own. The CDP client also cannot navigate to a fragment-only
+# URL, which this frontend's search terms are.
+#
+# Host-only: tokio's mio does not build for wasm, and `clippy --target wasm32
+# --all-targets` would otherwise fail on a dependency no wasm build uses.
+# `tests/browser.rs` is gated the same way.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+thirtyfour = "0.37"
+serde = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

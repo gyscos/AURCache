@@ -257,3 +257,14 @@ if [ "$failures" -gt 0 ]; then
     fail "$failures route(s) did not render"
 fi
 echo "==> all ${#ROUTES[@]} routes rendered"
+
+# The checks above dump a page and read it. These drive it: type in a filter,
+# queue something, take it back. That needs a session rather than one
+# --dump-dom per assertion, so it lives in Rust. The browser is the test
+# crate's business — it resolves Chrome, fetches a matching chromedriver and
+# stops both — so there is nothing to start or clean up here.
+echo "==> checking interactions"
+( cd "$PROJECT_DIR/frontend-rs" \
+    && AURCACHE_UI="http://localhost:$UI_PORT" \
+       timeout 240 cargo test --quiet --test browser -- --ignored ) \
+    || fail "interaction tests failed"
