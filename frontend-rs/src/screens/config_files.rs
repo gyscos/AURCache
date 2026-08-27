@@ -26,8 +26,6 @@ const FILES: [(&str, &str); 2] = [
 
 #[component]
 pub fn ConfigFiles() -> Element {
-    let mut showing = use_signal(|| FILES[0].0.to_string());
-
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
@@ -35,46 +33,85 @@ pub fn ConfigFiles() -> Element {
                 p { class: "text-xs opacity-60 max-w-prose -mt-1",
                     "Used by every build. Left unset, each falls back to the copy the builder image ships."
                 }
+                ConfigFileTabs { pkgbase: None }
+            }
+        }
+    }
+}
 
-                div { role: "tablist", class: "tabs tabs-bordered mt-2",
-                    for (key, name) in FILES {
-                        button {
-                            key: "{key}",
-                            role: "tab",
-                            class: if showing() == key { "tab tab-active" } else { "tab" },
-                            onclick: move |_| showing.set(key.to_string()),
-                            "{name}"
-                        }
-                    }
+/// The two files, as tabs, for one scope.
+///
+/// Shared with the per-package settings page rather than reimplemented there:
+/// both scopes are the same two settings behind the same endpoints, differing
+/// only in which row is written. `pkgbase` of `None` is the server-wide file.
+#[component]
+pub fn ConfigFileTabs(pkgbase: Option<String>) -> Element {
+    let mut showing = use_signal(|| FILES[0].0.to_string());
+
+    rsx! {
+        div { role: "tablist", class: "tabs tabs-bordered mt-2",
+            for (key, name) in FILES {
+                button {
+                    key: "{key}",
+                    role: "tab",
+                    class: if showing() == key { "tab tab-active" } else { "tab" },
+                    onclick: move |_| showing.set(key.to_string()),
+                    "{name}"
                 }
+            }
+        }
 
-                // Keyed on the file so switching tabs remounts the editor.
-                // Without that, the draft signal would survive the change and
-                // one file's edits would appear under the other's name.
-                for (key, name) in FILES {
-                    if showing() == key {
-                        ConfigFileEditor { key: "{key}", setting: key, name }
-                    }
+        // Keyed on the file so switching tabs remounts the editor.
+        // Without that, the draft signal would survive the change and
+        // one file's edits would appear under the other's name.
+        for (key, name) in FILES {
+            if showing() == key {
+                ConfigFileEditor {
+                    key: "{key}",
+                    setting: key,
+                    name,
+                    pkgbase: pkgbase.clone(),
                 }
             }
         }
     }
 }
 
+/// Whether *this* scope holds the value, as opposed to inheriting it.
+///
+/// Not the same question as [`is_stored`] once there is a package involved: a
+/// package row inherits a `Global` value, so a globally stored file is stored
+/// but not overridden here, and offering to "reset" it from the package page
+/// would clear nothing.
+fn overridden(source: SettingSource, scoped: bool) -> bool {
+    if scoped {
+        source == SettingSource::Package
+    } else {
+        is_stored(source)
+    }
+}
+
 /// One file: what it currently is, and a way to change it.
+///
+/// `pkgbase` picks the scope. In the package scope the file is an override:
+/// unset means the server-wide file applies, not the builder image's — the
+/// hierarchy has one more rung, which is why the badges below say "inherited"
+/// rather than naming a specific fallback they cannot see from here.
 #[component]
-fn ConfigFileEditor(setting: String, name: String) -> Element {
+fn ConfigFileEditor(setting: String, name: String, pkgbase: Option<String>) -> Element {
     // Held in a signal so the closures below stay `Copy`; two buttons share
     // the save path, and a captured `String` would let only one of them have
     // it.
     let setting = use_signal(|| setting);
+    let scoped = pkgbase.is_some();
+    let pkgbase = use_signal(|| pkgbase);
     let mut reload = use_signal(|| 0u32);
     let loaded = use_resource(move || async move {
         // Read so a save re-fetches: the server owns the value, and the source
         // badge has to follow what it actually stored.
         let _ = reload();
         crate::api::client()?
-            .get_setting(None, &setting())
+            .get_setting(pkgbase().as_deref(), &setting())
             .await
             .map_err(|e| e.to_string())
     });
@@ -95,6 +132,11 @@ fn ConfigFileEditor(setting: String, name: String) -> Element {
     });
 
     let dirty = draft() != stored();
+    let reset_title = if scoped {
+        "Discard this package's copy and use the server-wide file"
+    } else {
+        "Discard the stored file and use the builder's own copy"
+    };
 
     let save = move |value: Option<String>| async move {
         busy.set(true);
@@ -102,8 +144,12 @@ fn ConfigFileEditor(setting: String, name: String) -> Element {
         let outcome = match crate::api::client() {
             Err(e) => Err(e),
             Ok(client) => match &value {
-                Some(value) => client.patch_setting(None, &setting(), value).await,
-                None => client.reset_setting(None, &setting()).await,
+                Some(value) => {
+                    client
+                        .patch_setting(pkgbase().as_deref(), &setting(), value)
+                        .await
+                }
+                None => client.reset_setting(pkgbase().as_deref(), &setting()).await,
             }
             .map_err(|e| e.to_string()),
         };
@@ -111,9 +157,10 @@ fn ConfigFileEditor(setting: String, name: String) -> Element {
         match outcome {
             Ok(()) => {
                 status.set(Some((
-                    match value {
-                        Some(_) => "Saved.".to_string(),
-                        None => "Reset to the builder's own copy.".to_string(),
+                    match (value, scoped) {
+                        (Some(_), _) => "Saved.".to_string(),
+                        (None, true) => "Reset to the server-wide file.".to_string(),
+                        (None, false) => "Reset to the builder's own copy.".to_string(),
                     },
                     true,
                 )));
@@ -140,20 +187,24 @@ fn ConfigFileEditor(setting: String, name: String) -> Element {
                         // Says which copy is on screen. Without it an unset
                         // file and a stored one that happens to match the
                         // image's are indistinguishable.
-                        if is_stored(source()) {
-                            span { class: "badge badge-outline badge-sm", "stored" }
+                        if overridden(source(), scoped) {
+                            span { class: "badge badge-outline badge-sm",
+                                if scoped { "package override" } else { "stored" }
+                            }
                         } else {
-                            span { class: "badge badge-outline badge-sm", "builder default" }
+                            span { class: "badge badge-outline badge-sm",
+                                if scoped { "inherited" } else { "builder default" }
+                            }
                         }
                         if dirty {
                             span { class: "badge badge-info badge-sm", "unsaved" }
                         }
                         div { class: "flex-1" }
-                        if is_stored(source()) {
+                        if overridden(source(), scoped) {
                             button {
                                 class: "btn btn-ghost btn-sm",
                                 disabled: busy(),
-                                title: "Discard the stored file and use the builder's own copy",
+                                title: reset_title,
                                 onclick: move |_| save(None),
                                 "Reset"
                             }

@@ -228,6 +228,10 @@ async fn interactions() {
     a_linked_search_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
     approving_a_worker_lets_it_build(&session).await;
+    a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
+    a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
+    // Last: it deletes a row the others would otherwise still be looking at.
+    removing_a_package_takes_it_out_of_the_list(&session).await;
 
     session.stop().await;
 }
@@ -369,5 +373,113 @@ async fn one_queued_package_can_be_taken_back(session: &Session) {
     assert!(
         session.text().await.contains("one.git"),
         "removing one chip took its neighbour with it"
+    );
+}
+
+/// Saving a package's config file writes the package's row, not the server's.
+///
+/// The failure this exists for is invisible to every other kind of test: pass
+/// the scope as `None` and the page still renders correctly, still reports a
+/// successful save, and quietly edits the file every other package builds
+/// against. Only reading the global file back afterwards can tell.
+async fn a_per_package_file_leaves_the_server_wide_one_alone(session: &Session) {
+    const MARKER: &str = "# only-for-hello";
+
+    session.open("/package/hello/settings").await;
+    // `hello` seeds nothing of its own, so what loads is the server-wide file.
+    session
+        .wait_until("the inherited file", |t| t.contains("inherited"))
+        .await;
+
+    session.type_into("textarea", MARKER).await;
+    session.click_labelled("button", "Save").await;
+    session
+        .wait_until("the save to land on the package", |t| {
+            t.contains("package override")
+        })
+        .await;
+
+    // The actual assertion. A textarea's contents are a property rather than
+    // markup, so this is also the only way to read the file back at all.
+    session.open("/config-files").await;
+    session.wait_for("textarea").await;
+    let global = session.value_of("textarea").await;
+    assert!(
+        !global.contains(MARKER),
+        "a per-package save was written to the server-wide makepkg.conf: {global:?}"
+    );
+    assert!(
+        global.contains("MAKEFLAGS"),
+        "the server-wide makepkg.conf lost its seeded contents: {global:?}"
+    );
+}
+
+/// A build flag is stored, comes back on a fresh load, and can be removed.
+///
+/// The reload is the point. Adding a chip to a local list renders identically
+/// to one that reached the server, and this page is the only way to set flags
+/// at all.
+async fn a_build_flag_survives_a_reload_and_can_be_taken_off(session: &Session) {
+    // Deliberately not the placeholder's own text: a field that reported its
+    // placeholder as its value would pass if the two matched.
+    const FLAG: &str = "--skipinteg";
+
+    session.open("/package/hello/settings").await;
+    session
+        .wait_until("the empty flag list", |t| t.contains("No build flags"))
+        .await;
+
+    session
+        .type_into("input[placeholder='--nocheck']", FLAG)
+        .await;
+    session.click_labelled("button", "Add").await;
+    session
+        .wait_until("the flag to appear", |t| t.contains(FLAG))
+        .await;
+
+    session.open("/package/hello/settings").await;
+    session
+        .wait_until("the flag to have persisted", |t| t.contains(FLAG))
+        .await;
+
+    session
+        .click(&format!("button[aria-label='Remove {FLAG}']"))
+        .await;
+    session
+        .wait_until("the flag to be gone", |t| t.contains("No build flags"))
+        .await;
+}
+
+/// Removing a package takes it out of the repository.
+///
+/// `2048.c` because nothing else in this suite or in the route list looks at
+/// it, and it has no dependency edges — so it is deleted outright rather than
+/// demoted to a dependency, which is the case worth asserting.
+async fn removing_a_package_takes_it_out_of_the_list(session: &Session) {
+    session.open("/package/2048.c/settings").await;
+    session
+        .wait_until("the remove section", |t| t.contains("Remove package"))
+        .await;
+
+    // The dialog is in the document whether or not it is open, so clicking the
+    // confirm button without opening it would "pass" without confirming
+    // anything. Everything below is scoped to `.modal-open` for that reason.
+    session.click_labelled("button", "Remove package").await;
+    session.wait_for(".modal-open").await;
+    session
+        .wait_until("the confirmation to name the package", |t| {
+            t.contains("Remove 2048.c?")
+        })
+        .await;
+
+    session.click(".modal-open .modal-action .btn-error").await;
+
+    session
+        .wait_until("the package to leave the list", |t| !t.contains("2048.c"))
+        .await;
+    assert!(
+        session.url().await.ends_with("/packages"),
+        "removal did not land back on the list: {}",
+        session.url().await
     );
 }

@@ -42,6 +42,8 @@ pub enum Route {
         PackageBuilds { pkgbase: String },
         #[route("/package/:pkgbase/build/:number")]
         Build { pkgbase: String, number: i32 },
+        #[route("/package/:pkgbase/settings")]
+        PackageSettings { pkgbase: String },
         // `:..path` is a catch-all: source paths contain slashes, so a single
         // segment would only ever match files at the top level.
         #[route("/package/:pkgbase/source/:..path")]
@@ -93,7 +95,8 @@ impl Route {
             | Route::Package { .. }
             | Route::PackageBuilds { .. }
             | Route::Build { .. }
-            | Route::PackageSource { .. } => Some(MenuEntry::Packages),
+            | Route::PackageSource { .. }
+            | Route::PackageSettings { .. } => Some(MenuEntry::Packages),
             Route::Activities { .. } => Some(MenuEntry::Activities),
             Route::Workers { .. } => Some(MenuEntry::Workers),
             Route::Settings { .. } => Some(MenuEntry::Settings),
@@ -132,6 +135,10 @@ mod tests {
         );
         assert_eq!(
             entry_for("/package/hello/source/PKGBUILD"),
+            Some(MenuEntry::Packages)
+        );
+        assert_eq!(
+            entry_for("/package/hello/settings"),
             Some(MenuEntry::Packages)
         );
     }
@@ -206,6 +213,9 @@ mod tests {
             Route::PackageSource {
                 pkgbase: "hello".into(),
                 path: vec!["PKGBUILD".into()],
+            },
+            Route::PackageSettings {
+                pkgbase: "hello".into(),
             },
             // A nested source file: the catch-all segment has to survive both
             // directions, or deep links into subdirectories break.

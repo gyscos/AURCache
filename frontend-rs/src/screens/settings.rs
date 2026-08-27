@@ -205,7 +205,7 @@ fn SettingsSections(
 }
 
 #[component]
-fn Section(title: String, children: Element) -> Element {
+pub fn Section(title: String, children: Element) -> Element {
     rsx! {
         // `break-inside-avoid` and a margin rather than a gap: the sections are
         // laid out in CSS columns (see `SettingsSections`), which flow rather

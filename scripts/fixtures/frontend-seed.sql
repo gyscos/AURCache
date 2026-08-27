@@ -15,7 +15,7 @@ DELETE FROM packages;
 
 INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, platforms, source_type, source_data, directly_requested) VALUES
   ('hello',                  2, 0, '2.12.1-2',  '', 'x86_64', 'aur', '{"type":"aur","name":"hello"}',                  1),
-  ('neofetch',               1, 1, '7.1.0-2',   '', 'x86_64', 'aur', '{"type":"aur","name":"neofetch"}',               1),
+  ('neofetch',               1, 1, '7.1.0-2',   '--noconfirm;--nocolor', 'x86_64', 'aur', '{"type":"aur","name":"neofetch"}', 1),
   ('yay',                    0, 0, '12.4.2-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"yay"}',                    1),
   ('paru',                   2, 0, '2.0.4-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"paru"}',                   1),
   ('visual-studio-code-bin', 3, 0, '1.92.0-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"visual-studio-code-bin"}', 1),
@@ -170,6 +170,15 @@ INSERT INTO activity (typ, data, timestamp, user) VALUES
 -- `-1` is the global scope.
 INSERT INTO settings (key, value, pkg_id) VALUES
   ('makepkg_conf', '# Seeded makepkg.conf' || char(10) || 'MAKEFLAGS="-j8"' || char(10) || 'PACKAGER="AURCache <build@example.invalid>"', -1);
+
+-- A per-package override, so the package settings page has both of its states
+-- to render: `neofetch` holds its own pacman.conf while `hello` inherits the
+-- server-wide one. `pkg_id` is looked up rather than written as a literal
+-- because it comes from an autoincrement above.
+-- On `makepkg_conf` rather than `pacman_conf` because it is the tab that opens
+-- by default, and a DOM dump only carries the tab that is showing.
+INSERT INTO settings (key, value, pkg_id) VALUES
+  ('makepkg_conf', '# neofetch-only makepkg.conf', (SELECT id FROM packages WHERE name = 'neofetch'));
 
 -- Builds spread back over the year, purely so the dashboard graph has a curve.
 -- It groups by month over the last twelve, and every build seeded above landed

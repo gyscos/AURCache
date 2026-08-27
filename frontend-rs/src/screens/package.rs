@@ -563,6 +563,15 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                     to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
                     "Edit sources"
                 }
+                // This card shows what is set; the settings page is where the
+                // rest of it — build flags, the per-package config files — is
+                // changed. Without a way through, that page is reachable only
+                // by typing its URL.
+                Link {
+                    class: "btn btn-sm btn-block mt-2",
+                    to: Route::PackageSettings { pkgbase: pkg.name.clone() },
+                    "Settings"
+                }
             }
         }
     }
@@ -676,7 +685,11 @@ fn RebuildButton(pkgbase: String, on_changed: EventHandler<()>) -> Element {
 /// dependency graph on save. That is why the page reloads afterwards rather
 /// than patching the field in place.
 #[component]
-fn PlatformField(pkgbase: String, selected: Vec<String>, on_changed: EventHandler<()>) -> Element {
+pub fn PlatformField(
+    pkgbase: String,
+    selected: Vec<String>,
+    on_changed: EventHandler<()>,
+) -> Element {
     let mut editing = use_signal(|| false);
     let mut draft = use_signal(|| selected.clone());
     let mut busy = use_signal(|| false);

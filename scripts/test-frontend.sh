@@ -157,6 +157,22 @@ ROUTES=(
     "/package/yay|too old|a dependency built to an unsatisfying version"
     "/package/my-tool-git|github.com/example/my-tool|a git package links to its repository"
     "/package/my-tool-git|A tool built straight from git|a git package has metadata from its checkout"
+    # Per-package settings. The page is mostly overrides, so both states are
+    # checked: `hello` inherits everything, `neofetch` holds its own.
+    "/package/hello/settings|Build environment|package settings (depth 3)"
+    "/package/hello/settings|>Settings<|the trail says where it is"
+    # Unset here does not mean the builder's own copy -- it means the
+    # server-wide file -- and the badge has to say which.
+    "/package/hello/settings|>inherited<|an unset file says it inherits"
+    "/package/neofetch/settings|>package override<|a package that holds its own file says so"
+    # makepkg flags, which nothing else in the UI can set.
+    "/package/neofetch/settings|--noconfirm|build flags render as chips"
+    "/package/hello/settings|No build flags|a package without flags says so"
+    # The page is a dead end without a way in.
+    "/package/hello|href=\"/package/hello/settings\"|the package page links to its settings"
+    # Removal is the one destructive action on the page, and it is behind a
+    # confirmation rather than a bare button.
+    "/package/hello/settings|Remove package|a package can be removed"
     "/settings|Version check interval|settings"
     # The fixture server runs with VERSION_CHECK_INTERVAL set, so this row is
     # env-locked. Naming the variable proves the source made it all the way
@@ -233,7 +249,9 @@ for entry in "${ROUTES[@]}"; do
         failures=$((failures + 1))
         continue
     fi
-    if ! printf '%s' "$dom" | grep -q "$marker"; then
+    # `--` so a marker that starts with a dash -- a makepkg flag, say -- is
+    # read as a pattern rather than as an option to grep.
+    if ! printf '%s' "$dom" | grep -q -- "$marker"; then
         echo "  FAIL  $route ($desc): mounted, but did not render $marker"
         failures=$((failures + 1))
         continue
