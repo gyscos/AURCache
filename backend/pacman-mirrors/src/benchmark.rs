@@ -1,6 +1,5 @@
 use crate::Mirror;
 use crate::mirror::Mirrors;
-use anyhow::anyhow;
 use chrono::Utc;
 use reqwest::Client;
 use std::fmt::Write as _;
@@ -101,11 +100,7 @@ impl Benchmark for Mirror {
         // the clock at the response headers would time the handshake only and
         // ignore how fast the mirror actually serves data.
         let start = Instant::now();
-        let response = client
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(|e| anyhow!(e))?;
+        let response = client.get(url.as_str()).send().await?;
         let size = response.bytes().await?.len();
         let elapsed = start.elapsed();
 

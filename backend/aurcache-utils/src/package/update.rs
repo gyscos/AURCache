@@ -323,20 +323,20 @@ async fn sync_dependency_graph(
     )
     .await?;
 
+    // A dependency row can vanish between `ensure_missing_dependency_packages`
+    // and this re-read (a concurrent delete); skip it rather than panic.
     let deps_map = dep_constraints_by_pkgbase
         .into_iter()
-        .map(|(pkgbase, constraint)| {
-            let package = dep_packages
-                .get(&pkgbase)
-                .cloned()
-                .expect("dep package must exist after ensure");
-            (
-                pkgbase,
-                DepInfo {
-                    constraint,
-                    package,
-                },
-            )
+        .filter_map(|(pkgbase, constraint)| {
+            dep_packages.get(&pkgbase).map(|package| {
+                (
+                    pkgbase,
+                    DepInfo {
+                        constraint,
+                        package: package.clone(),
+                    },
+                )
+            })
         })
         .collect();
 

@@ -42,8 +42,9 @@ pub fn repo_add(pkgfile: &Path, db_archive: &Path, files_archive: &Path) -> anyh
         match entry {
             Ok(entry) => {
                 if let Ok(path) = entry.path() {
-                    if !path.display().to_string().starts_with('.') {
-                        files.push(path.display().to_string());
+                    let name = path.display().to_string();
+                    if !name.starts_with('.') {
+                        files.push(name);
                     }
 
                     if path == Path::new(".PKGINFO") {

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod activity;
 mod aur;
 mod auth;

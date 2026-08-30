@@ -98,7 +98,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         .exec(db)
         .await?;
 
-    // set all pending or failed package status to failed
+    // set all pending builds to failed
     Builds::update_many()
         .col_expr(
             builds::Column::Status,

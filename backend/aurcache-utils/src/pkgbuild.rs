@@ -42,18 +42,14 @@ pub fn parse_pkgbuild_content(content: &str) -> anyhow::Result<SourceInfoV1> {
     let path = dir.path().join("PKGBUILD");
 
     std::fs::write(&path, content)?;
-    let result = SourceInfoV1::from_pkgbuild(&path);
-    let result = match result {
-        Ok(info) => Ok(info),
-        Err(_) => {
-            let fixed = fix_source_urls(content);
-            if fixed == content {
-                anyhow::bail!("PKGBUILD parsing failed and no fixes were applied");
-            }
-            std::fs::write(&path, &fixed)?;
-            SourceInfoV1::from_pkgbuild(&path).map_err(anyhow::Error::from)
+    let result = SourceInfoV1::from_pkgbuild(&path).or_else(|_| {
+        let fixed = fix_source_urls(content);
+        if fixed == content {
+            anyhow::bail!("PKGBUILD parsing failed and no fixes were applied");
         }
-    };
+        std::fs::write(&path, &fixed)?;
+        SourceInfoV1::from_pkgbuild(&path).map_err(anyhow::Error::from)
+    });
 
     dir.close()?;
     result

@@ -3,13 +3,14 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+const ENV_NAME: &str = "LOG_LEVEL";
+
 pub fn init_logger() {
-    let env_name = "LOG_LEVEL";
     let default_level = LevelFilter::INFO;
 
     let env_filter = EnvFilter::builder()
         .with_default_directive(default_level.into())
-        .with_env_var(env_name)
+        .with_env_var(ENV_NAME)
         .from_env_lossy();
 
     let env_filter = env_filter

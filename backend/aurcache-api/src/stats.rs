@@ -90,7 +90,8 @@ async fn get_graph_datapoints(db: &DatabaseConnection) -> anyhow::Result<Vec<Gra
     // literal, so a renumbered state cannot silently turn this into a count of
     // something else.
     let succeeded = format!("status = {}", BuildStates::SUCCESSFUL_BUILD);
-    let query = match database_type() {
+    let backend = database_type();
+    let query = match backend {
         DbBackend::Sqlite => {
             format!(
                 "SELECT
@@ -128,13 +129,10 @@ ORDER BY
         _ => bail!("Unsupported database type"),
     };
 
-    let result = GraphDataPoint::find_by_statement(Statement::from_sql_and_values(
-        database_type(),
-        &query,
-        vec![],
-    ))
-    .all(db)
-    .await?;
+    let result =
+        GraphDataPoint::find_by_statement(Statement::from_sql_and_values(backend, &query, vec![]))
+            .all(db)
+            .await?;
 
     Ok(result)
 }
@@ -142,12 +140,12 @@ ORDER BY
 /// Packages someone asked for (`requested`), or ones present only as
 /// dependencies of those.
 async fn count_packages(db: &DatabaseConnection, requested: bool) -> anyhow::Result<u32> {
-    Packages::find()
+    let count = Packages::find()
         .filter(aurcache_db::packages::Column::DirectlyRequested.eq(requested))
         .count(db)
         .await?
-        .try_into()
-        .map_err(Into::into)
+        .try_into()?;
+    Ok(count)
 }
 
 /// Average duration of a successful build, in seconds.

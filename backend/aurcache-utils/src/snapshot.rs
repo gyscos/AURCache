@@ -397,29 +397,7 @@ impl SnapshotStore {
             // Re-apply whichever patch (if any) was previously active for
             // this source, so a `refresh` doesn't silently drop it.
             let existing_patch = previous.and_then(|entry| entry.patch.clone());
-            let entry = match existing_patch {
-                None => Arc::new(CacheEntry {
-                    commit,
-                    active: raw,
-                    original: None,
-                    patch: None,
-                }),
-                Some(patch) => {
-                    let (patched_bytes, patched_sourceinfo) =
-                        apply_patch_to_archive(&raw.archive_bytes, &patch)?;
-                    let patched = SourceSnapshot {
-                        archive_bytes: patched_bytes,
-                        sourceinfo: Some(patched_sourceinfo),
-                        pkgbase: raw.pkgbase.clone(),
-                    };
-                    Arc::new(CacheEntry {
-                        commit,
-                        active: patched,
-                        original: Some(raw),
-                        patch: Some(patch),
-                    })
-                }
-            };
+            let entry = build_cache_entry(commit, raw, existing_patch)?;
             self.cache.lock().await.put(cache_key, entry);
         }
         Ok(changed)
@@ -456,29 +434,7 @@ impl SnapshotStore {
             pkgbase,
         };
 
-        let entry = match patch {
-            None => Arc::new(CacheEntry {
-                commit,
-                active: raw,
-                original: None,
-                patch: None,
-            }),
-            Some(patch) => {
-                let (patched_bytes, patched_sourceinfo) =
-                    apply_patch_to_archive(&raw.archive_bytes, &patch)?;
-                let patched = SourceSnapshot {
-                    archive_bytes: patched_bytes,
-                    sourceinfo: Some(patched_sourceinfo),
-                    pkgbase: raw.pkgbase.clone(),
-                };
-                Arc::new(CacheEntry {
-                    commit,
-                    active: patched,
-                    original: Some(raw),
-                    patch: Some(patch),
-                })
-            }
-        };
+        let entry = build_cache_entry(commit, raw, patch)?;
 
         self.cache.lock().await.put(cache_key, Arc::clone(&entry));
         Ok(entry)
@@ -663,6 +619,39 @@ fn apply_patch_to_archive(
     let tar_gz_bytes = create_archive_from_memory(&pkgbase, &files)?;
 
     Ok((tar_gz_bytes, sourceinfo))
+}
+
+/// Build a [`CacheEntry`] from a fresh raw snapshot, applying `patch` on top
+/// if one is active. Used by both the hot path ([`SnapshotStore::get_or_fetch`])
+/// and the refresh path so the patched/no-patch shape stays in one place.
+fn build_cache_entry(
+    commit: Oid,
+    raw: SourceSnapshot,
+    patch: Option<SourcePatch>,
+) -> anyhow::Result<Arc<CacheEntry>> {
+    Ok(match patch {
+        None => Arc::new(CacheEntry {
+            commit,
+            active: raw,
+            original: None,
+            patch: None,
+        }),
+        Some(patch) => {
+            let (patched_bytes, patched_sourceinfo) =
+                apply_patch_to_archive(&raw.archive_bytes, &patch)?;
+            let patched = SourceSnapshot {
+                archive_bytes: patched_bytes,
+                sourceinfo: Some(patched_sourceinfo),
+                pkgbase: raw.pkgbase.clone(),
+            };
+            Arc::new(CacheEntry {
+                commit,
+                active: patched,
+                original: Some(raw),
+                patch: Some(patch),
+            })
+        }
+    })
 }
 
 /// Unpack a `{pkgbase}/...` tar.gz archive entirely into memory, returning

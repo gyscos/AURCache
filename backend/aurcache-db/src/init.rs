@@ -7,6 +7,11 @@ use std::time::Duration;
 use std::{env, fs};
 use tracing::log::LevelFilter;
 
+/// Read a required Postgres env var, with a message naming it.
+fn required_env(name: &str) -> anyhow::Result<String> {
+    env::var(name).map_err(|_| anyhow!("No {name} envvar specified"))
+}
+
 pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
     let db: DatabaseConnection = match database_type() {
         DbBackend::Sqlite => {
@@ -31,12 +36,9 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
             db
         }
         DbBackend::Postgres => {
-            let db_user = env::var("DB_USER")
-                .map_err(|_| anyhow!("No DB_USER envvar for POSTGRES Username specified"))?;
-            let db_pwd = env::var("DB_PWD")
-                .map_err(|_| anyhow!("No DB_PWD envvar for POSTGRES Password specified"))?;
-            let db_host = env::var("DB_HOST")
-                .map_err(|_| anyhow!("No DB_HOST envvar for POSTGRES HOST specified"))?;
+            let db_user = required_env("DB_USER")?;
+            let db_pwd = required_env("DB_PWD")?;
+            let db_host = required_env("DB_HOST")?;
             let db_name = env::var("DB_NAME").unwrap_or_else(|_| "postgres".to_string());
 
             let conn_str = format!("postgres://{db_user}:{db_pwd}@{db_host}/{db_name}");

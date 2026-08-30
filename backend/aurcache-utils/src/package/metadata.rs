@@ -54,12 +54,17 @@ pub async fn refresh_source_metadata(
     pkgbases: &[String],
 ) {
     for pkgbase in pkgbases {
-        let Ok(Some(row)) = Packages::find()
-            .filter(packages::Column::Name.eq(pkgbase.clone()))
+        let row = match Packages::find()
+            .filter(packages::Column::Name.eq(pkgbase))
             .one(db)
             .await
-        else {
-            continue;
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("could not load {pkgbase} for metadata refresh: {e}");
+                continue;
+            }
         };
 
         let metadata = match store

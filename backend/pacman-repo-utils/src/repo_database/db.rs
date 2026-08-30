@@ -46,6 +46,7 @@ pub fn add_to_db_file(
     db_archive: &Path,
 ) -> anyhow::Result<()> {
     let mut new_archive_data = Vec::new();
+    let target_file = format!("{dir_name}/{file_name}");
     {
         let mut builder = if db_archive.exists() {
             let mut existing_archive_data = Vec::new();
@@ -56,8 +57,6 @@ pub fn add_to_db_file(
 
             let enc = GzEncoder::new(&mut new_archive_data, Compression::default());
             let mut tar_builder = Builder::new(enc);
-
-            let target_file = format!("{dir_name}/{file_name}");
 
             // Copy all entries *except* the ones we will replace
             for mut entry in archive.entries()?.flatten() {
@@ -89,7 +88,7 @@ pub fn add_to_db_file(
 
         // Add file (replacing old one)
         let mut header = Header::new_gnu();
-        header.set_path(format!("{dir_name}/{file_name}"))?;
+        header.set_path(&target_file)?;
         header.set_size(content.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();

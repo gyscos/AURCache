@@ -158,8 +158,6 @@ fn merge_makepkg_conf(system_defaults: Option<&str>, overrides: &str) -> String 
     out
 }
 
-/// Write the per-package `makepkg.conf` / `pacman.conf` / mirrorlist to a
-/// staging directory the caller seeds the base chroot from.
 /// Append the worker's cache layout to a server-rendered `pacman.conf`.
 ///
 /// `arch-nspawn` reads `CacheDir` from the chroot's own `pacman.conf` and
@@ -197,6 +195,8 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
 /// default so nothing else has to change.
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
+/// Write the per-package `makepkg.conf` / `pacman.conf` / mirrorlist to a
+/// staging directory the caller seeds the base chroot from.
 pub fn write_configs(
     dir: &Path,
     makepkg_conf: &str,

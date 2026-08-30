@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::Context;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::fs;
@@ -52,9 +52,7 @@ fn create_empty_archive(path: &Path, name: &str, suffix: &str) -> anyhow::Result
     let tar_gz = File::create(archive_path)?;
     let enc = GzEncoder::new(tar_gz, Compression::default());
     let mut tar = tar::Builder::new(enc);
-    tar.finish()
-        .map_err(|_| anyhow!("failed to create repo archive"))?;
-    symlink(archive_file_name, symlink_path)
-        .map_err(|_| anyhow!("failed to create repo symlink"))?;
+    tar.finish().context("failed to create repo archive")?;
+    symlink(archive_file_name, symlink_path).context("failed to create repo symlink")?;
     Ok(())
 }

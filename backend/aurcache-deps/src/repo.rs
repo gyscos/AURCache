@@ -47,11 +47,9 @@ impl AurClient {
             return Ok(false);
         }
 
-        let mut archives = Vec::new();
-        for entry in fs::read_dir(&self.repo_root)? {
-            let entry = entry?;
-            archives.push(entry.path().join("repo.db.tar.gz"));
-        }
+        let archives = fs::read_dir(&self.repo_root)?
+            .map(|entry| entry.map(|entry| entry.path().join("repo.db.tar.gz")))
+            .collect::<Result<Vec<_>, _>>()?;
 
         any_archive_provides(archives, dep_name)
     }
@@ -237,32 +235,29 @@ fn desc_matches_dependency(content: &str, dep_name: &str) -> bool {
 /// Since we only need `%NAME%` and `%PROVIDES%` for dependency resolution, a lenient
 /// section extractor is both simpler and more robust.
 fn parse_desc_sections(content: &str) -> HashMap<String, Vec<String>> {
+    fn flush(
+        map: &mut HashMap<String, Vec<String>>,
+        key: Option<String>,
+        values: &mut Vec<String>,
+    ) {
+        if let Some(key) = key {
+            map.insert(key, values.drain(..).filter(|v| !v.is_empty()).collect());
+        }
+    }
+
     let mut map = HashMap::new();
     let mut current_key: Option<String> = None;
     let mut current_values: Vec<String> = Vec::new();
 
     for line in content.lines() {
         if line.starts_with('%') && line.ends_with('%') {
-            if let Some(key) = current_key.take() {
-                map.insert(
-                    key,
-                    current_values.drain(..).filter(|v| !v.is_empty()).collect(),
-                );
-            }
+            flush(&mut map, current_key.take(), &mut current_values);
             current_key = Some(line[1..line.len() - 1].to_string());
         } else if current_key.is_some() {
             current_values.push(line.to_string());
         }
     }
-    if let Some(key) = current_key.take() {
-        map.insert(
-            key,
-            current_values
-                .into_iter()
-                .filter(|v| !v.is_empty())
-                .collect(),
-        );
-    }
+    flush(&mut map, current_key.take(), &mut current_values);
     map
 }
 

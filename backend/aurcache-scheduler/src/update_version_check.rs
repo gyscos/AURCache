@@ -38,7 +38,7 @@ pub fn start_update_version_checking(
 
             let check_interval: SettingsEntry<u64> =
                 ApplicationSettings::get(Setting::VersionCheckInterval, None, &db).await;
-            tokio::time::sleep(Duration::from_secs(check_interval.value)).await;
+            tokio::time::sleep(Duration::from_secs(check_interval.value.max(1))).await;
         }
     })
 }

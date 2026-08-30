@@ -50,17 +50,11 @@ impl Status {
     pub const URL_X86_64_ALT: &'static str =
         "https://arjixwastaken.github.io/arch-mirrorlist-mirror/mirrors.json";
 
-    /// Get the status from [`Status::URL`](Self::URL).
+    /// Get the status from [`Status::URL_X86_64`].
     pub async fn get_from_default_url(target_platform: Platform) -> anyhow::Result<Self> {
         match target_platform {
             Platform::X86_64 => {
-                let result = (|| async {
-                    // fetch original archlinux.org mirrorlist
-                    Self::get_from_url(Self::URL_X86_64, target_platform).await
-                })
-                .retry(FibonacciBuilder::default().with_max_times(2))
-                .await;
-                match result {
+                match Self::fetch_status(Self::URL_X86_64, target_platform, 2).await {
                     Ok(v) => Ok(v),
                     Err(_) => {
                         warn!(
@@ -68,18 +62,20 @@ impl Status {
                             Self::URL_X86_64,
                             Self::URL_X86_64_ALT
                         );
-                        (|| async {
-                            // fetch alternative archlinux mirrorlist
-                            Self::get_from_url(Self::URL_X86_64_ALT, target_platform).await
-                        })
-                        .retry(FibonacciBuilder::default().with_max_times(4))
-                        .await
+                        Self::fetch_status(Self::URL_X86_64_ALT, target_platform, 4).await
                     }
                 }
             }
             Platform::Aarch64 => bail!("Aarch64 rank mirroring not supported"),
             Platform::Armv7h => bail!("ARM32 rank mirroring not supported"),
         }
+    }
+
+    /// Fetch the status JSON from `url`, retrying up to `times` times.
+    async fn fetch_status(url: &str, platform: Platform, times: usize) -> anyhow::Result<Self> {
+        (|| async { Self::get_from_url(url, platform).await })
+            .retry(FibonacciBuilder::default().with_max_times(times))
+            .await
     }
 
     /// Get the status from a given url.

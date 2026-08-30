@@ -166,11 +166,7 @@ async fn write_counts<C: ConnectionTrait>(
 fn pkgname_of(file_name: &str) -> Option<&str> {
     let stem = file_name.split(".pkg.tar").next()?;
     // arch, pkgrel, pkgver -- three separators from the right.
-    let mut cut = stem.len();
-    for _ in 0..3 {
-        cut = stem[..cut].rfind('-')?;
-    }
-    (cut > 0).then(|| &stem[..cut])
+    stem.rsplitn(4, '-').nth(3).filter(|name| !name.is_empty())
 }
 
 #[derive(FromQueryResult)]

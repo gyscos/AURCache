@@ -1,6 +1,6 @@
 mod config;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
     AddPackageRequest, AurCacheClient, Build, ExtendedPackage, GitSourceSpec, GraphDataPoint,
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
@@ -594,6 +594,7 @@ async fn add_package_command(
     if git_entries > 0 && args.git_ref.is_none() {
         bail!("--ref is required when adding a git repository URL");
     }
+    let git_ref = args.git_ref;
 
     let patched_files = read_patch_files(&args.patches)?;
     for package in args.packages {
@@ -604,7 +605,9 @@ async fn add_package_command(
             SourceData::Git {
                 spec: GitSourceSpec {
                     url: package,
-                    r#ref: args.git_ref.clone().expect("checked above"),
+                    r#ref: git_ref.clone().ok_or_else(|| {
+                        anyhow!("--ref is required when adding a git repository URL")
+                    })?,
                     subfolder: args.subfolder.clone(),
                 },
             }

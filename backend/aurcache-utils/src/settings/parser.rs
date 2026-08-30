@@ -15,7 +15,13 @@ macro_rules! impl_parse_setting {
     };
 }
 
-impl_parse_setting!(u32, i32, u64, i64, String);
+impl_parse_setting!(u32, i32, u64, i64);
+
+impl ParseSetting for String {
+    fn parse_setting(s: &str) -> Result<Self, String> {
+        Ok(s.to_string())
+    }
+}
 
 impl ParseSetting for bool {
     /// Accepts the spellings that turn up in environment variables, not just

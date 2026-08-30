@@ -9,11 +9,8 @@ use aurcache_deps::{AurClient, DependencyResolution, parse_dep};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
 use std::collections::HashMap;
 
+use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_SUCCESS};
 use crate::packages;
-
-const ACTIVE_BUILD_STATUS: i32 = 0;
-const SUCCESSFUL_BUILD_STATUS: i32 = 1;
-const ENQUEUED_BUILD_STATUS: i32 = 3;
 
 /// A package that can satisfy a dependency: either a row already in the
 /// database, or one an in-flight add has planned but not yet inserted.
@@ -89,11 +86,7 @@ async fn resolve_local_dependency_resolutions<C: ConnectionTrait>(
     planned: &[PackageCandidate],
 ) -> Result<HashMap<String, DependencyResolution>, DbErr> {
     let mut local_packages: Vec<PackageCandidate> = packages::Entity::find()
-        .filter(packages::Column::Status.is_in([
-            ACTIVE_BUILD_STATUS,
-            SUCCESSFUL_BUILD_STATUS,
-            ENQUEUED_BUILD_STATUS,
-        ]))
+        .filter(packages::Column::Status.is_in([STATUS_ACTIVE, STATUS_SUCCESS, STATUS_ENQUEUED]))
         .all(db)
         .await?
         .iter()

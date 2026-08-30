@@ -86,7 +86,11 @@ fn resolve_and_checkout(repo: &Repository, git_ref: &str) -> anyhow::Result<Oid>
         .map(ToString::to_string);
     // Only when following the default branch: advancing HEAD's branch to some
     // *other* ref's commit would silently rewrite it.
-    let tracked_branch = (git_ref == "HEAD").then(|| head_branch(repo)).flatten();
+    let tracked_branch = if git_ref == "HEAD" {
+        head_branch(repo)
+    } else {
+        None
+    };
 
     match (local_ref_name, tracked_branch) {
         // Resolved to a local branch or tag: point HEAD at it directly.

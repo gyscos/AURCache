@@ -11,6 +11,7 @@ use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::promote_waiting_build;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
+use aurcache_types::builder::BuildStates;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
@@ -18,10 +19,6 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use std::collections::HashMap;
-
-const STATUS_ACTIVE: i32 = 0;
-const STATUS_SUCCESS: i32 = 1;
-const STATUS_FAILED: i32 = 2;
 
 /// Confirm the given worker currently holds the active lease on the build.
 /// Uploads and completions are only accepted from the owning worker while the
@@ -35,7 +32,7 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-    if build.status != Some(STATUS_ACTIVE) {
+    if build.status != Some(BuildStates::ACTIVE_BUILD) {
         return Err(DbErr::Custom(format!("build {build_id} is not active")));
     }
     if build.worker_id != Some(worker_id) {
@@ -65,7 +62,7 @@ pub async fn lock_lease<C: ConnectionTrait>(
         // acquiring the row lock the guard depends on.
         .col_expr(builds::Column::WorkerId, Some(worker_id).into())
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
         .filter(builds::Column::WorkerId.eq(worker_id))
         .exec(db)
         .await?;
@@ -97,7 +94,7 @@ pub async fn record_built_version<C: ConnectionTrait>(
     let res = Builds::update_many()
         .col_expr(builds::Column::Version, version.to_string().into())
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
         .filter(builds::Column::WorkerId.eq(worker_id))
         .exec(db)
         .await?;
@@ -155,7 +152,7 @@ async fn finish_build<C: ConnectionTrait + TransactionTrait>(
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
         .col_expr(builds::Column::EndTime, Some(now_secs()).into())
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
         .filter(builds::Column::WorkerId.eq(worker_id))
         .exec(&txn)
         .await?;
@@ -167,7 +164,7 @@ async fn finish_build<C: ConnectionTrait + TransactionTrait>(
     if let Some(pkg) = Packages::find_by_id(build.pkg_id).one(&txn).await? {
         let mut pkg = pkg.into_active_model();
         pkg.status = Set(status);
-        if status == STATUS_SUCCESS {
+        if status == BuildStates::SUCCESSFUL_BUILD {
             pkg.out_of_date = Set(0);
         }
         pkg.update(&txn).await?;
@@ -183,7 +180,7 @@ pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    let build = finish_build(db, build_id, worker_id, STATUS_SUCCESS).await?;
+    let build = finish_build(db, build_id, worker_id, BuildStates::SUCCESSFUL_BUILD).await?;
 
     if let Err(e) = trigger_dependents(db, build.pkg_id, build.platform).await {
         tracing::error!(
@@ -201,7 +198,7 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    finish_build(db, build_id, worker_id, STATUS_FAILED).await?;
+    finish_build(db, build_id, worker_id, BuildStates::FAILED_BUILD).await?;
     Ok(())
 }
 
@@ -270,7 +267,7 @@ async fn dependency_satisfied<C: ConnectionTrait>(
         .column(builds::Column::Version)
         .filter(builds::Column::PkgId.eq(dependee_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(STATUS_SUCCESS)))
+        .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
         .order_by(builds::Column::EndTime, Order::Desc)
         .limit(1)
         .into_tuple()
@@ -345,12 +342,12 @@ mod tests {
     async fn a_finished_build_still_names_the_worker_that_ran_it() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, STATUS_ACTIVE, "5").await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
 
         complete_success(&db, 10, 5).await.unwrap();
 
         let finished = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(finished.status, Some(STATUS_SUCCESS));
+        assert_eq!(finished.status, Some(BuildStates::SUCCESSFUL_BUILD));
         assert_eq!(
             finished.worker_id,
             Some(5),
@@ -364,7 +361,7 @@ mod tests {
     async fn owned_active_guard() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, STATUS_ACTIVE, "5").await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
         assert!(assert_owned_active(&db, 5, 10).await.is_ok());
         assert!(assert_owned_active(&db, 6, 10).await.is_err());
     }
@@ -373,11 +370,11 @@ mod tests {
     async fn success_marks_terminal_and_clears_lease() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, STATUS_ACTIVE, "5").await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
         record_built_version(&db, 10, 5, "2.0-1").await.unwrap();
         complete_success(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(STATUS_SUCCESS));
+        assert_eq!(b.status, Some(BuildStates::SUCCESSFUL_BUILD));
         // What the name of this test says, and what it did not actually check:
         // the lease ends. The worker stays, as the record of who built it.
         assert_eq!(b.lease_expires_at, None);
@@ -390,10 +387,10 @@ mod tests {
     async fn failure_is_terminal_not_requeued() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, STATUS_ACTIVE, "5").await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
         complete_failure(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(STATUS_FAILED));
+        assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
         assert_eq!(b.attempt_count, 0);
     }
 
@@ -402,13 +399,13 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         // Build reclaimed and re-handed to worker 6.
-        build(&db, 10, 1, STATUS_ACTIVE, "6").await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "6").await;
         // Late completion from the original owner (worker 5) must not clobber it.
         assert!(complete_success(&db, 10, 5).await.is_err());
         assert!(complete_failure(&db, 10, 5).await.is_err());
         assert!(record_built_version(&db, 10, 5, "9.9-9").await.is_err());
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(STATUS_ACTIVE));
+        assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
         assert_eq!(b.worker_id, Some(6));
     }
 }

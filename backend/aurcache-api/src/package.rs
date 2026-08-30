@@ -43,14 +43,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
-/// Resolve a package by its pkgbase, the public identifier.
-///
-/// Row ids are deliberately absent from the public API — they are an
-/// implementation detail. The two also cannot be accepted interchangeably:
-/// some real pkgbases are entirely numeric (`1337` and `67` both exist in the
-/// AUR), so a route taking either would resolve those names to whatever rows
-/// happened to hold those ids — a wrong-package bug rather than a not-found
-/// error. Hence no id fallback.
 /// Resolve an optional pkgbase to its row id, for endpoints whose per-package
 /// scope is optional (settings). `None` means "global", not "not found".
 pub(crate) async fn package_id_for(
@@ -63,6 +55,14 @@ pub(crate) async fn package_id_for(
     }
 }
 
+/// Resolve a package by its pkgbase, the public identifier.
+///
+/// Row ids are deliberately absent from the public API — they are an
+/// implementation detail. The two also cannot be accepted interchangeably:
+/// some real pkgbases are entirely numeric (`1337` and `67` both exist in the
+/// AUR), so a route taking either would resolve those names to whatever rows
+/// happened to hold those ids — a wrong-package bug rather than a not-found
+/// error. Hence no id fallback.
 async fn package_by_pkgbase(
     db: &DatabaseConnection,
     pkgbase: &str,
@@ -113,15 +113,16 @@ pub async fn package_add_endpoint(
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    let platforms = match input.platforms.clone() {
-        None => None,
-        Some(v) => Some(
+    let input = input.into_inner();
+    let platforms = input
+        .platforms
+        .map(|v| {
             v.into_iter()
                 .map(|s| Platform::from_str(&s).ok())
                 .collect::<Option<Vec<Platform>>>()
-                .ok_or_else(|| err(Status::BadRequest, "Invalid platform name"))?,
-        ),
-    };
+                .ok_or_else(|| err(Status::BadRequest, "Invalid platform name"))
+        })
+        .transpose()?;
 
     let new_pkg_name = package_add(
         store,
@@ -129,8 +130,8 @@ pub async fn package_add_endpoint(
         tx,
         platforms,
         input.build_flags.as_deref().map(normalize_build_flags),
-        input.source.clone(),
-        input.patched_files.clone(),
+        input.source,
+        input.patched_files,
     )
     .await
     // Adding is driven by user input: an unknown AUR name, an unreachable git

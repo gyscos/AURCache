@@ -244,6 +244,14 @@ pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<StagedCredential
     let source = resolve(cfg);
     let key = source.path();
     if !key.exists() {
+        // A `Provided` key is an operator error, mirroring `ensure`; a
+        // `Generated` key simply may not exist yet.
+        if matches!(source, KeySource::Provided(_)) {
+            anyhow::bail!(
+                "WORKER_GIT_SSH_KEY points at {}, which does not exist",
+                key.display()
+            );
+        }
         return Ok(None);
     }
 

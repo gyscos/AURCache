@@ -145,11 +145,12 @@ fn collect_dependency_requirements<'a>(
     for dep in deps {
         let (name, constraint) = crate::pkg::parse_dep(dep);
         let constraint = crate::pkg::parse_dep_constraint(constraint);
-        crate::pkg::merge_constraint_into(&mut dep_constraints, name, constraint)?;
-
-        if !dep_names.iter().any(|seen| seen == name) {
+        // The constraint map's keys are exactly the dependency set, so a
+        // membership check there is the dedupe.
+        if !dep_constraints.contains_key(name) {
             dep_names.push(name.to_string());
         }
+        crate::pkg::merge_constraint_into(&mut dep_constraints, name, constraint)?;
     }
     Ok(DependencyRequirements {
         dep_names,
@@ -363,33 +364,21 @@ async fn add_package_with_source(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
-    match &source_data {
-        SourceData::Aur { name } => {
-            let pkgbase = resolve_aur_pkgbase(client, name).await?;
-            let aur_data = SourceData::Aur {
-                name: pkgbase.clone(),
-            };
-            let package_spec = resolve_srcinfo_to_spec(
-                store,
-                &aur_data,
-                patched_files,
-                &architectures_for_platforms(&context.platforms_str),
-            )
-            .await?;
-            finalize_package_add(client, store, db, tx, context, package_spec).await
-        }
-        SourceData::Git { .. } => {
-            let package_spec = resolve_srcinfo_to_spec(
-                store,
-                &source_data,
-                patched_files,
-                &architectures_for_platforms(&context.platforms_str),
-            )
-            .await?;
-            finalize_package_add(client, store, db, tx, context, package_spec).await
-        }
+    let source_data = match source_data {
+        SourceData::Aur { name } => SourceData::Aur {
+            name: resolve_aur_pkgbase(client, &name).await?,
+        },
         SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
-    }
+        other => other,
+    };
+    let package_spec = resolve_srcinfo_to_spec(
+        store,
+        &source_data,
+        patched_files,
+        &architectures_for_platforms(&context.platforms_str),
+    )
+    .await?;
+    finalize_package_add(client, store, db, tx, context, package_spec).await
 }
 
 #[allow(clippy::double_must_use)]

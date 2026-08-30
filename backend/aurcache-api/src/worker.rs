@@ -624,14 +624,11 @@ pub async fn complete_job(
 /// split-package names recorded on the package row.
 fn expected_pkgnames(pkg: &aurcache_db::packages::Model) -> Vec<String> {
     let mut names = vec![pkg.name.clone()];
-    if let Some(json) = &pkg.split_packages
+    if let Some(json) = pkg.split_packages.as_deref()
         && let Ok(split) = serde_json::from_str::<Vec<String>>(json)
     {
-        for s in split {
-            if !names.contains(&s) {
-                names.push(s);
-            }
-        }
+        let extra: Vec<_> = split.into_iter().filter(|s| !names.contains(s)).collect();
+        names.extend(extra);
     }
     names
 }

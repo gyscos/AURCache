@@ -1,3 +1,4 @@
+use crate::sleep_until_next_fire;
 use aurcache_db::action::Action;
 use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::update::package_update_all_outdated;
@@ -36,21 +37,7 @@ pub fn start_auto_update_job(
                 Some(Ok(schedule)) => {
                     let mut upcoming = schedule.upcoming(Utc);
 
-                    if let Some(next_time) = upcoming.next() {
-                        // A negative delta (clock jump) just means "run now".
-                        let duration = next_time
-                            .signed_duration_since(Utc::now())
-                            .to_std()
-                            .unwrap_or(Duration::ZERO);
-
-                        info!(
-                            "Waiting for scheduled update until {} ({} seconds)",
-                            next_time,
-                            duration.as_secs()
-                        );
-
-                        tokio::time::sleep(duration).await;
-
+                    if sleep_until_next_fire(&mut upcoming, "update").await {
                         info!("Executing scheduled job at: {}", Utc::now());
                         if let Err(e) = package_update_all_outdated(&db, &store, &tx).await {
                             warn!("Failed to trigger update of all outdated packages: {e}");

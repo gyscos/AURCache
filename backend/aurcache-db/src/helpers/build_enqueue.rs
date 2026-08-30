@@ -1,4 +1,5 @@
 use crate::builds;
+use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
@@ -6,10 +7,6 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     IntoActiveModel, QueryFilter, TryIntoModel,
 };
-
-const ACTIVE_BUILD_STATUS: i32 = 0;
-const ENQUEUED_BUILD_STATUS: i32 = 3;
-const WAITING_FOR_DEPS_STATUS: i32 = 4;
 
 pub struct EnqueueBuildResult {
     pub build: builds::Model,
@@ -19,9 +16,10 @@ pub struct EnqueueBuildResult {
 /// Insert a new pending build with the given `initial_status` if no pending build already exists
 /// for `(pkg_id, platform)`.
 ///
-/// `initial_status` must be one of `ENQUEUED_BUILD` or `WAITING_FOR_DEPS`.  The partial unique
-/// index on `builds(pkg_id, platform)` covering all pending states (ACTIVE, ENQUEUED,
-/// WAITING_FOR_DEPS) ensures at most one pending row per `(pkg_id, platform)` at any time.
+/// `initial_status` must be one of [`STATUS_ENQUEUED`] or [`STATUS_WAITING_FOR_DEPS`].
+/// The partial unique index on `builds(pkg_id, platform)` covering all pending
+/// states (ACTIVE, ENQUEUED, WAITING_FOR_DEPS) ensures at most one pending row
+/// per `(pkg_id, platform)` at any time.
 ///
 /// If a pending build already exists the insert is skipped (`inserted = false`) and the existing
 /// row is returned, regardless of its status.
@@ -84,9 +82,9 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
             .filter(builds::Column::PkgId.eq(pkg_id))
             .filter(builds::Column::Platform.eq(platform_str))
             .filter(builds::Column::Status.is_in([
-                Some(ACTIVE_BUILD_STATUS),
-                Some(ENQUEUED_BUILD_STATUS),
-                Some(WAITING_FOR_DEPS_STATUS),
+                Some(STATUS_ACTIVE),
+                Some(STATUS_ENQUEUED),
+                Some(STATUS_WAITING_FOR_DEPS),
             ]))
             .one(db)
             .await?;
@@ -119,7 +117,7 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     let Some(build) = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(WAITING_FOR_DEPS_STATUS)))
+        .filter(builds::Column::Status.eq(Some(STATUS_WAITING_FOR_DEPS)))
         .one(db)
         .await?
     else {
@@ -127,7 +125,7 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     };
 
     let mut active = build.into_active_model();
-    active.status = Set(Some(ENQUEUED_BUILD_STATUS));
+    active.status = Set(Some(STATUS_ENQUEUED));
     let updated = active.save(db).await?.try_into_model()?;
     Ok(Some(updated))
 }

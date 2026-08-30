@@ -18,13 +18,10 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     pkg.delete(&txn).await?;
 
     // remove corresponding builds
-    let builds = Builds::find()
+    Builds::delete_many()
         .filter(builds::Column::PkgId.eq(pkg_id))
-        .all(&txn)
+        .exec(&txn)
         .await?;
-    for b in builds {
-        b.delete(&txn).await?;
-    }
 
     // remove package files
     let package_files: Vec<files::Model> = Files::find()

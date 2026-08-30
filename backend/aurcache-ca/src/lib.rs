@@ -171,8 +171,7 @@ fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// SHA-256 fingerprint (hex, lowercase) of a raw SubjectPublicKeyInfo DER slice.

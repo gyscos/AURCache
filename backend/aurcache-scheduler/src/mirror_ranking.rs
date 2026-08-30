@@ -1,3 +1,4 @@
+use crate::sleep_until_next_fire;
 use aurcache_utils::job_config::{
     mirrorlist_dir, mirrorlist_path, native_arch, shared_mirrorlist_path,
 };
@@ -34,24 +35,10 @@ pub fn start_mirror_rank_job() -> anyhow::Result<JoinHandle<()>> {
 
         let mut upcoming = schedule.upcoming(Utc);
         loop {
-            // Get the next occurrence from now
-            if let Some(next_time) = upcoming.next() {
-                let now = Utc::now();
-                // A negative delta (clock jump) just means "run now".
-                let duration = next_time
-                    .signed_duration_since(now)
-                    .to_std()
-                    .unwrap_or(Duration::ZERO);
-                info!(
-                    "Waiting for scheduled mirror ranking until {} ({} seconds)",
-                    next_time,
-                    duration.as_secs()
-                );
-
-                // Wait until the scheduled time
-                tokio::time::sleep(duration).await;
-
-                // Execute your scheduled code
+            // Get the next occurrence from now, or if the schedule has no
+            // future occurrence (unlikely with cron), wait a default duration
+            // before retrying.
+            if sleep_until_next_fire(&mut upcoming, "mirror ranking").await {
                 match update_mirrorlist().await {
                     Ok(()) => {
                         info!("Mirror ranking finished");
@@ -61,7 +48,6 @@ pub fn start_mirror_rank_job() -> anyhow::Result<JoinHandle<()>> {
                     }
                 }
             } else {
-                // If there is no upcoming occurrence (unlikely with cron), wait a default duration before retrying.
                 warn!("Your defined cron-job doesn't have a future schedule: '{cron_str}'");
                 tokio::time::sleep(Duration::from_secs(60 * 30)).await;
             }

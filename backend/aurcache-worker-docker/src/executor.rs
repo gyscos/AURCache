@@ -100,15 +100,12 @@ impl DockerExecutor {
             None,
         );
         while let Some(item) = stream.next().await {
-            match item {
-                Ok(_) => {}
-                // A pull failure is not fatal on its own: the image may already
-                // be present locally, and the build will say so far more
-                // clearly than a pull error would.
-                Err(e) => {
-                    tracing::warn!("image pull reported: {e}");
-                    break;
-                }
+            // A pull failure is not fatal on its own: the image may already
+            // be present locally, and the build will say so far more clearly
+            // than a pull error would.
+            if let Err(e) = item {
+                tracing::warn!("image pull reported: {e}");
+                break;
             }
         }
         Ok(())

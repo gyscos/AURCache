@@ -1,9 +1,5 @@
 //! Database helpers for the remote-worker job lifecycle: atomic claim, lease
 //! renewal via heartbeat, and requeue/fail of dropped builds.
-//!
-//! Build status integers mirror `aurcache_types::builder::BuildStates`
-//! (0=active, 1=success, 2=failed, 3=enqueued, 4=waiting-for-deps); the db
-//! crate keeps its own copy to avoid a dependency on the types crate here.
 
 use crate::helpers::time::now_secs;
 use crate::prelude::{Builds, Packages, Workers};
@@ -23,6 +19,7 @@ pub const STATUS_ACTIVE: i32 = BuildStates::ACTIVE_BUILD;
 pub const STATUS_SUCCESS: i32 = BuildStates::SUCCESSFUL_BUILD;
 pub const STATUS_FAILED: i32 = BuildStates::FAILED_BUILD;
 pub const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
+pub const STATUS_WAITING_FOR_DEPS: i32 = BuildStates::WAITING_FOR_DEPS;
 
 /// One approved worker's routing-relevant configuration, plus its live state.
 #[derive(Debug)]
