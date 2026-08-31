@@ -81,6 +81,20 @@ fn SideMenu() -> Element {
                     }
                 }
 
+                // The one thing you *create* here, reachable without first
+                // navigating to Packages. A button rather than a menu row on
+                // purpose: every row below is a section of the app you dwell
+                // in, and styling a single narrow task as a sixth section
+                // would misdescribe both it and them.
+                div { class: "px-5 pb-2",
+                    Link {
+                        to: Route::PackageAdd { q: String::new() },
+                        class: "btn btn-primary btn-sm w-full gap-2",
+                        PlusIcon {}
+                        "Add package"
+                    }
+                }
+
                 MenuSection { title: "General",
                     MenuLink {
                         to: Route::Dashboard {},
@@ -327,6 +341,24 @@ fn BuildsIcon() -> Element {
 fn PackagesIcon() -> Element {
     rsx! {
         Icon { path: "M21 8v8l-9 4-9-4V8l9-4 9 4Zm-18 0 9 4 9-4M12 12v8" }
+    }
+}
+
+/// Deliberately not the `Icon` sizing: this one sits inside a button next to
+/// text rather than in a menu row, where the 5-unit glyphs would crowd it.
+#[component]
+fn PlusIcon() -> Element {
+    rsx! {
+        svg {
+            class: "h-4 w-4 shrink-0",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: "M12 5v14M5 12h14" }
+        }
     }
 }
 
