@@ -18,6 +18,13 @@ pub struct BuildSummary {
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub platform: String,
+    /// Total size in bytes of the artifacts this build produced.
+    ///
+    /// `None` for a build that produced nothing to measure -- one that failed,
+    /// is still running, or is queued -- and for a successful build that ran
+    /// before the size was recorded. This is one platform's output; a package's
+    /// total covers every platform it builds for.
+    pub size: Option<i64>,
     /// Why this build is stuck, when it is `ENQUEUED` and *no* approved worker
     /// can currently take it. `None` for everything else, including a build
     /// merely waiting behind a busy worker — see

@@ -5,6 +5,7 @@ import 'package:skeletonizer/skeletonizer.dart';
 
 import '../constants/color_constants.dart';
 import '../models/build.dart';
+import '../utils/file_formatter.dart';
 import '../utils/package_color.dart';
 import '../utils/time_formatter.dart';
 
@@ -35,6 +36,8 @@ class BuildsTable extends StatelessWidget {
         DataColumn(label: Skeleton.keep(child: Text("Version"))),
         if (context.desktop)
           DataColumn(label: Skeleton.keep(child: Text("Platform"))),
+        if (context.desktop)
+          DataColumn(label: Skeleton.keep(child: Text("Size")), numeric: true),
         DataColumn(label: Skeleton.keep(child: Text("Status"))),
       ],
       rows: data.map((e) => buildDataRow(context, e)).toList(),
@@ -61,6 +64,10 @@ class BuildsTable extends StatelessWidget {
         ),
         DataCell(Text(build.version)),
         if (context.desktop) DataCell(Text(build.platform)),
+        // A dash for every build that produced nothing to measure — failed,
+        // running or queued. The status column beside it says which.
+        if (context.desktop)
+          DataCell(Text(build.size?.readableFileSize() ?? '—')),
         DataCell(
           Row(
             mainAxisSize: MainAxisSize.min,

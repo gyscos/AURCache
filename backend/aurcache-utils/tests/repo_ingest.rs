@@ -58,7 +58,7 @@ async fn ingest_writes_repo_and_files_row_and_parses_version() {
         fake_pkg_zst("hello", "2.12.1-1"),
     )];
 
-    let version = ingest_pkgs_in(
+    let ingested = ingest_pkgs_in(
         &db,
         &logger,
         pkg_id,
@@ -71,7 +71,19 @@ async fn ingest_writes_repo_and_files_row_and_parses_version() {
     .expect("ingest should succeed");
 
     // Version is parsed from the built package filename (server-authoritative).
-    assert_eq!(version, "2.12.1-1");
+    assert_eq!(ingested.version, "2.12.1-1");
+
+    // The reported size is the artifact's own length, so the build row and the
+    // `files` row cannot disagree about how big the same output was.
+    let written = std::fs::metadata(
+        repo_root
+            .path()
+            .join("x86_64")
+            .join("hello-2.12.1-1-x86_64.pkg.tar.zst"),
+    )
+    .expect("artifact should be on disk")
+    .len();
+    assert_eq!(ingested.total_size, i64::try_from(written).unwrap());
 
     // Artifact written into the repo tree + repo db updated.
     let arch_dir = repo_root.path().join("x86_64");

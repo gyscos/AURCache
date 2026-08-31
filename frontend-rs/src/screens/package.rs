@@ -909,6 +909,7 @@ mod tests {
             start_time: start,
             end_time: end,
             platform: "x86_64".to_string(),
+            size: None,
             waiting_reason: None,
         }
     }

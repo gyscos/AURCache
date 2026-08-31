@@ -582,7 +582,7 @@ pub async fn complete_job(
         // Publishing is guarded by the lease itself: `assert_owned_active` above
         // is a stale read by the time the (slow) ingest runs, so the ingest
         // re-checks ownership under a row lock before committing anything.
-        let version = ingest_pkgs(
+        let ingested = ingest_pkgs(
             db,
             &logger,
             build.pkg_id,
@@ -595,9 +595,15 @@ pub async fn complete_job(
         )
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_complete::record_built_version(db, build_id, auth.worker.id, &version)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
+        worker_complete::record_built_version(
+            db,
+            build_id,
+            auth.worker.id,
+            &ingested.version,
+            ingested.total_size,
+        )
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
         worker_complete::complete_success(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;

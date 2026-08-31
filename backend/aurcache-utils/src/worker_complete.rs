@@ -84,6 +84,7 @@ pub async fn record_built_version<C: ConnectionTrait>(
     build_id: i32,
     worker_id: i32,
     version: &str,
+    total_size: i64,
 ) -> Result<(), DbErr> {
     let build = Builds::find_by_id(build_id)
         .one(db)
@@ -93,6 +94,10 @@ pub async fn record_built_version<C: ConnectionTrait>(
 
     let res = Builds::update_many()
         .col_expr(builds::Column::Version, version.to_string().into())
+        // Recorded here rather than in a statement of its own: this is the one
+        // update that runs exactly when a build has published artifacts, under
+        // the lease guard that says they were this worker's to publish.
+        .col_expr(builds::Column::Size, Some(total_size).into())
         .filter(builds::Column::Id.eq(build_id))
         .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
         .filter(builds::Column::WorkerId.eq(worker_id))
@@ -366,7 +371,9 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
-        record_built_version(&db, 10, 5, "2.0-1").await.unwrap();
+        record_built_version(&db, 10, 5, "2.0-1", 4096)
+            .await
+            .unwrap();
         complete_success(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(BuildStates::SUCCESSFUL_BUILD));
@@ -376,6 +383,9 @@ mod tests {
         assert_eq!(b.worker_id, Some(5));
         assert_eq!(b.version, "2.0-1");
         assert!(b.end_time.is_some());
+        // Recorded by the same guarded update that records the version, so a
+        // build that published artifacts always says how large they were.
+        assert_eq!(b.size, Some(4096));
     }
 
     #[tokio::test]
@@ -387,6 +397,9 @@ mod tests {
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
         assert_eq!(b.attempt_count, 0);
+        // A failed build produced nothing to measure. `None` says that; a `0`
+        // would claim it produced an empty package.
+        assert_eq!(b.size, None);
     }
 
     #[tokio::test]
@@ -398,7 +411,11 @@ mod tests {
         // Late completion from the original owner (worker 5) must not clobber it.
         assert!(complete_success(&db, 10, 5).await.is_err());
         assert!(complete_failure(&db, 10, 5).await.is_err());
-        assert!(record_built_version(&db, 10, 5, "9.9-9").await.is_err());
+        assert!(
+            record_built_version(&db, 10, 5, "9.9-9", 4096)
+                .await
+                .is_err()
+        );
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
         assert_eq!(b.worker_id, Some(6));

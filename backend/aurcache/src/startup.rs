@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use tokio::fs;
@@ -8,9 +9,9 @@ use aurcache_db::{builds, files, packages};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
-use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
+use sea_orm::{QueryFilter, QueryOrder};
 use tracing::{error, info, warn};
 
 const START_BANNER: &str = r"
@@ -113,6 +114,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         .await?;
 
     backfill_file_sizes(db).await;
+    backfill_build_sizes(db).await;
 
     // todo arm mirrorlists unsupported for now!
     let mirrorlist_dir = mirrorlist_dir();
@@ -206,4 +208,66 @@ async fn backfill_file_sizes(db: &DatabaseConnection) {
         }
     }
     info!("Recorded size for {filled} package files");
+}
+
+/// Fill in `builds.size` for the newest successful build of each package and
+/// platform, from the artifacts currently in the repository.
+///
+/// Runs after [`backfill_file_sizes`], which is where those sizes come from.
+/// Only the newest successful build can be recovered: it is the one whose
+/// output is still on disk, and older builds' artifacts were replaced by it, so
+/// they keep a `NULL` that honestly says the size is not known rather than a
+/// number borrowed from a different build.
+///
+/// A group with any unrecorded file size is skipped entirely, matching what the
+/// package page and list do with a partial total.
+async fn backfill_build_sizes(db: &DatabaseConnection) {
+    let rows = match Files::find().all(db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("could not load files for the build-size backfill: {e}");
+            return;
+        }
+    };
+
+    let mut totals: HashMap<(i32, Platform), Option<i64>> = HashMap::new();
+    for row in rows {
+        let entry = totals
+            .entry((row.package_id, row.platform))
+            .or_insert(Some(0));
+        *entry = entry.and_then(|acc| row.size.map(|size| acc + size));
+    }
+
+    let mut filled = 0;
+    for ((pkg_id, platform), total) in totals {
+        let Some(total) = total else { continue };
+        let newest = Builds::find()
+            .filter(builds::Column::PkgId.eq(pkg_id))
+            .filter(builds::Column::Platform.eq(platform))
+            .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+            .filter(builds::Column::Size.is_null())
+            .order_by_desc(builds::Column::Number)
+            .one(db)
+            .await;
+        let build = match newest {
+            Ok(Some(build)) => build,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!("could not find a build to record a size for: {e}");
+                continue;
+            }
+        };
+        let active = builds::ActiveModel {
+            id: Set(build.id),
+            size: Set(Some(total)),
+            ..Default::default()
+        };
+        match active.update(db).await {
+            Ok(_) => filled += 1,
+            Err(e) => warn!("could not record size for build {}: {e}", build.id),
+        }
+    }
+    if filled > 0 {
+        info!("Recorded output size for {filled} builds");
+    }
 }

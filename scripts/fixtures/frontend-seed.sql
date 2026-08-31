@@ -296,4 +296,27 @@ INSERT INTO files (filename, platform, package_id, size) VALUES
   ('hello-docs-2.12.1-2-x86_64.pkg.tar.zst', 'x86_64',
    (SELECT id FROM packages WHERE name = 'hello'), 40960),
   ('neofetch-7.1.0-2-x86_64.pkg.tar.zst',    'x86_64',
-   (SELECT id FROM packages WHERE name = 'neofetch'), NULL);
+   (SELECT id FROM packages WHERE name = 'neofetch'), NULL),
+  -- `aewm++` is the one package here whose latest build succeeded, so it is
+  -- where the build column and the package column can be seen agreeing: both
+  -- report 512 KiB.
+  ('aewm++-1.1.6-4-x86_64.pkg.tar.zst',      'x86_64',
+   (SELECT id FROM packages WHERE name = 'aewm++'), 500000),
+  ('aewm++-docs-1.1.6-4-x86_64.pkg.tar.zst', 'x86_64',
+   (SELECT id FROM packages WHERE name = 'aewm++'), 24576);
+
+-- Size the builds the way the startup backfill does: the newest *successful*
+-- build of each package and platform owns the artifacts currently on disk, so
+-- it gets their total, and every other build keeps NULL. That is what makes a
+-- failed build's size column a dash rather than a stale number.
+UPDATE builds
+   SET size = (SELECT CASE WHEN COUNT(*) = COUNT(f.size) THEN SUM(f.size) END
+                 FROM files f
+                WHERE f.package_id = builds.pkg_id
+                  AND f.platform = builds.platform)
+ WHERE status = 1
+   AND number = (SELECT MAX(b2.number)
+                   FROM builds b2
+                  WHERE b2.pkg_id = builds.pkg_id
+                    AND b2.platform = builds.platform
+                    AND b2.status = 1);

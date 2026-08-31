@@ -20,6 +20,13 @@ class Build {
   /// ever gets rendered as one line of text.
   final Map<String, dynamic>? waiting_reason;
 
+  /// Total size in bytes of the artifacts this build produced.
+  ///
+  /// Null for a build that produced nothing to measure — failed, running, or
+  /// queued — and for a successful build that predates the recording. This is
+  /// one platform's output; a package's total covers every platform.
+  final int? size;
+
   Build({
     required this.id,
     required this.pkg_id,
@@ -30,6 +37,7 @@ class Build {
     required this.end_time,
     required this.status,
     this.waiting_reason,
+    this.size,
   });
 
   factory Build.fromJson(Map<String, dynamic> json) => _$BuildFromJson(json);

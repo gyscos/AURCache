@@ -2,7 +2,7 @@
 
 use crate::api::client;
 use crate::dates::DateOnly;
-use crate::format::format_duration;
+use crate::format::{format_bytes, format_duration};
 use crate::listing::{
     ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
     filter_builds, paginate, sort_builds, use_url_search,
@@ -91,6 +91,7 @@ pub fn Builds(q: String) -> Element {
                                         SortableHeader { label: "Started", column: SortKey::Time, sort, class: "{WIDE_ONLY}" }
                                         th { class: "{WIDE_ONLY}", "Duration" }
                                         th { class: "{WIDE_ONLY}", "Platform" }
+                                        SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                     }
                                 }
@@ -137,6 +138,9 @@ pub fn Builds(q: String) -> Element {
                                                 {format_duration(build.start_time, build.end_time)}
                                             }
                                             td { class: "{WIDE_ONLY} text-sm opacity-70", "{build.platform}" }
+                                            td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
+                                                {build_size(build)}
+                                            }
                                             td { BuildStatusBadge { status: build.status } }
                                         }
                                     }
@@ -161,4 +165,16 @@ pub fn Builds(q: String) -> Element {
             }
         }
     }
+}
+
+/// A build's output size for the list column.
+///
+/// A dash for every build that produced nothing to measure -- failed, running,
+/// or queued -- and for a successful build that predates the recording. The
+/// status column beside it already says which.
+fn build_size(build: &Build) -> String {
+    build
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .map_or_else(|| "—".to_string(), format_bytes)
 }

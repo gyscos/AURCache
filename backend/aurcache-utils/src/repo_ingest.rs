@@ -54,6 +54,15 @@ pub struct LeaseGuard {
     pub worker_id: i32,
 }
 
+/// What an ingest recorded: the version it published, and how large it was.
+#[derive(Debug, Clone)]
+pub struct Ingested {
+    /// The `pkgver-pkgrel` every artifact of this build shares.
+    pub version: String,
+    /// Combined size in bytes of the artifacts written to the repository.
+    pub total_size: i64,
+}
+
 /// Ingest built package artifacts into the repo for `(pkg_id, platform)`.
 ///
 /// Writes each artifact to `./repo/{platform}/{filename}`, adds it to the
@@ -68,7 +77,7 @@ pub async fn ingest_pkgs(
     platform: &Platform,
     artifacts: Vec<Artifact>,
     lease: Option<LeaseGuard>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Ingested> {
     ingest_pkgs_in(
         db,
         logger,
@@ -97,7 +106,7 @@ pub async fn ingest_pkgs_in(
     artifacts: Vec<Artifact>,
     repo_root: &Path,
     lease: Option<LeaseGuard>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Ingested> {
     if artifacts.is_empty() {
         bail!("No files found in build output");
     }
@@ -268,7 +277,18 @@ pub async fn ingest_pkgs_in(
     logger
         .append("Successfully updated repo and cleaned up old files\n".to_string())
         .await;
-    Ok(actual_version)
+    // Summed from the bytes already written rather than by stat'ing the repo:
+    // same figure, no I/O, and it cannot disagree with the `files` rows written
+    // from those same lengths above.
+    let total_size = build_pkgs
+        .iter()
+        .map(|pkg| i64::try_from(pkg.bytes.len()).unwrap_or(i64::MAX))
+        .sum();
+
+    Ok(Ingested {
+        version: actual_version,
+        total_size,
+    })
 }
 
 /// Parse an Arch package filename into its name / version / arch components.

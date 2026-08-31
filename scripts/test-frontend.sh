@@ -159,6 +159,9 @@ ROUTES=(
     "/packages|Upstream|packages list"
     "/packages|Size|the packages list has a size column"
     "/packages|1.2 MiB|the size column totals a package's artifacts"
+    "/packages|512 KiB|a successful package reports the size of what it built"
+    "/builds|Size|the builds list has a size column"
+    "/builds|512 KiB|a successful build reports the size of its output"
     "/packages|—|missing version shows a placeholder"
     # The list is what somebody asked for; the closure is behind a toggle that
     # says how much it is hiding. Whether it actually hides them is an

@@ -16,6 +16,7 @@ pub enum SortKey {
     Name,
     Status,
     Time,
+    Size,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,7 +66,10 @@ impl Sort {
             Self {
                 key,
                 dir: match key {
-                    SortKey::Time => SortDir::Desc,
+                    // Newest build and largest package first: for these two the
+                    // interesting end is the top, where A-Z is the natural
+                    // reading for everything else.
+                    SortKey::Time | SortKey::Size => SortDir::Desc,
                     _ => SortDir::Asc,
                 },
             }
@@ -144,6 +148,11 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
             // not offer this column; falling back to name would present an
             // ordering that has nothing to do with time.
             SortKey::Time => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            // `Option`'s own ordering is what this wants: `None` sorts below
+            // every `Some`, so unrecorded sizes group at one end rather than
+            // among the small ones, and land last under the descending order a
+            // Size column opens in.
+            SortKey::Size => a.total_size.cmp(&b.total_size),
         };
         match sort.dir {
             SortDir::Asc => ordering,
@@ -182,6 +191,7 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
                 .then(b.number.cmp(&a.number)),
             SortKey::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             SortKey::Time => a.start_time.cmp(&b.start_time),
+            SortKey::Size => a.size.cmp(&b.size),
         };
         match sort.dir {
             SortDir::Asc => ordering,
@@ -207,6 +217,66 @@ mod tests {
             upstream_version: None,
             total_size: None,
         }
+    }
+
+    fn sized(name: &str, total_size: Option<i64>) -> SimplePackage {
+        SimplePackage {
+            total_size,
+            ..package(name, BuildState::Successful, 0)
+        }
+    }
+
+    /// Descending is what a Size column opens in, and it puts the biggest first
+    /// with the unrecorded ones trailing -- below even a zero-byte package,
+    /// since `None` sorts below every `Some`.
+    #[test]
+    fn sorting_by_size_puts_the_largest_first_and_the_unknown_last() {
+        let mut packages = vec![
+            sized("small", Some(10)),
+            sized("unknown", None),
+            sized("large", Some(9000)),
+            sized("empty", Some(0)),
+        ];
+        sort_packages(
+            &mut packages,
+            Sort {
+                key: SortKey::Size,
+                dir: SortDir::Desc,
+            },
+        );
+        let order: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(order, ["large", "small", "empty", "unknown"]);
+    }
+
+    /// Reversing moves the unknowns to the other end as a group; they are never
+    /// interleaved with real sizes in either direction.
+    #[test]
+    fn reversing_the_size_sort_keeps_the_unknown_together() {
+        let mut packages = vec![
+            sized("small", Some(10)),
+            sized("unknown", None),
+            sized("large", Some(9000)),
+        ];
+        sort_packages(
+            &mut packages,
+            Sort {
+                key: SortKey::Size,
+                dir: SortDir::Asc,
+            },
+        );
+        let order: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(order, ["unknown", "small", "large"]);
+    }
+
+    /// A Size column opens descending: the big ones are the reason to sort by
+    /// size at all, so they should be on screen without a second click.
+    #[test]
+    fn size_opens_descending() {
+        let sort = Sort {
+            key: SortKey::Name,
+            dir: SortDir::Asc,
+        };
+        assert_eq!(sort.toggled(SortKey::Size).dir, SortDir::Desc);
     }
 
     /// A page is a window on the list, not a prefix of it.
@@ -294,6 +364,7 @@ mod tests {
             start_time: start,
             end_time: None,
             platform: "x86_64".to_string(),
+            size: None,
             waiting_reason: None,
         }
     }

@@ -24,6 +24,13 @@ pub struct Model {
     #[schema(value_type = String)]
     pub platform: Platform,
     pub version: String,
+    /// Total size in bytes of the artifacts this build produced.
+    ///
+    /// `None` for a build that produced nothing to measure -- one that failed,
+    /// was cancelled, or has not finished -- and for a successful build that
+    /// predates the column. Per platform, since a build is: a package's total
+    /// is the sum across every platform it builds for.
+    pub size: Option<i64>,
     /// Id of the worker that holds the active lease on this build, if any.
     pub worker_id: Option<i32>,
     /// Epoch seconds when the current worker's lease expires. Renewed by

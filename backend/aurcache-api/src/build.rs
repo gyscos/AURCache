@@ -164,6 +164,7 @@ fn build_row_select() -> Select<Builds> {
         .column(builds::Column::EndTime)
         .column(builds::Column::StartTime)
         .column(builds::Column::Platform)
+        .column(builds::Column::Size)
 }
 
 /// A listed build as queried, including the row id the response omits.
@@ -180,6 +181,7 @@ struct BuildRow {
     start_time: Option<i64>,
     end_time: Option<i64>,
     platform: String,
+    size: Option<i64>,
 }
 
 impl BuildRow {
@@ -192,6 +194,7 @@ impl BuildRow {
             start_time: self.start_time,
             end_time: self.end_time,
             platform: self.platform,
+            size: self.size,
             waiting_reason,
         }
     }

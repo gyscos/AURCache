@@ -145,10 +145,7 @@ pub fn Packages(
                                         // Upstream and Actions are dropped on a
                                         // narrow screen rather than scrolled to.
                                         th { class: "{WIDE_ONLY}", "Upstream" }
-                                        // Not sortable, matching Version and
-                                        // Upstream: the sort key is shared with
-                                        // the builds list, which has no size.
-                                        th { class: "{WIDE_ONLY} text-right", "Size" }
+                                        SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                         th { class: "{WIDE_ONLY} text-right", "Actions" }
                                     }
