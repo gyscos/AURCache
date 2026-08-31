@@ -12,11 +12,12 @@ use rocket::{State, post};
 use rocket_oauth2::{OAuth2, TokenResponse};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use crate::models::authenticated::Authenticated;
+use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, is_user_allowed};
 
 #[derive(OpenApi)]
 #[openapi(paths(oauth_login, oauth_callback, regenerate_api_token_endpoint))]
@@ -24,8 +25,13 @@ pub struct AuthApi;
 
 #[derive(serde::Deserialize, Debug)]
 pub struct OauthUserInfo {
-    //pub email: String,
     pub name: String,
+    /// The address the sign-in allowlist is matched against.
+    ///
+    /// Optional because not every provider returns it, and a deployment with no
+    /// allowlist has no use for it. When a list *is* configured, an absent
+    /// address is refused -- see [`is_user_allowed`].
+    pub email: Option<String>,
     //pub preferred_username: String,
     //pub nickname: String,
 }
@@ -131,12 +137,11 @@ pub async fn oauth_callback(
     token: TokenResponse<OauthUserInfo>,
     cookies: &CookieJar<'_>,
 ) -> Result<Redirect, Unauthorized<String>> {
-    cookies.add_private(
-        Cookie::build(("token", token.access_token().to_string()))
-            .same_site(SameSite::Lax)
-            .build(),
-    );
-
+    // Nothing is written to the cookie jar until the user has been identified
+    // *and* allowed. Rocket applies jar changes to the response whatever this
+    // function returns, and `Authenticated` treats the mere presence of the
+    // `token` cookie as a valid session -- so setting it before the check would
+    // hand a refused user a working session along with their rejection.
     let user_info: OauthUserInfo = reqwest::Client::builder()
         .build()
         .context("failed to build reqwest client")
@@ -153,9 +158,30 @@ pub async fn oauth_callback(
         .map_err(|e| Unauthorized(e.to_string()))?;
 
     let real_name = user_info.name;
+    let email = user_info.email.as_deref();
+
+    if !is_user_allowed(allowed_users().as_deref(), email) {
+        // Logged at warn: on a server that restricts sign-in, someone being
+        // turned away is worth seeing, and the operator locking themselves out
+        // by a typo in the list looks identical from the browser.
+        warn!(
+            "Refused sign-in for {} ({}): not in {ALLOWED_USERS_ENV}",
+            email.unwrap_or("no email reported"),
+            real_name
+        );
+        return Err(Unauthorized(
+            "This account is not permitted to sign in to this AURCache instance.".to_string(),
+        ));
+    }
+
     debug!("Logged in username: {real_name}");
 
-    // Set a private cookie with the user's name, and redirect to the home page.
+    // Both cookies together: the session, and the name that labels it.
+    cookies.add_private(
+        Cookie::build(("token", token.access_token().to_string()))
+            .same_site(SameSite::Lax)
+            .build(),
+    );
     cookies.add_private(
         Cookie::build(("username", real_name))
             .same_site(SameSite::Lax)
@@ -186,7 +212,30 @@ pub async fn regenerate_api_token_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{has_api_token, regenerate_api_token, username_for_api_token};
+    use super::{OauthUserInfo, has_api_token, regenerate_api_token, username_for_api_token};
+
+    /// A provider that does not return `email` must still sign users in. The
+    /// field was added for the allowlist, and making it required would have
+    /// broken every deployment whose provider omits it -- the failure would be
+    /// a deserialisation error on the callback, i.e. nobody can log in at all.
+    #[test]
+    fn userinfo_without_an_email_still_parses() {
+        let info: OauthUserInfo = serde_json::from_str(r#"{"name":"Alex"}"#).unwrap();
+        assert_eq!(info.name, "Alex");
+        assert_eq!(info.email, None);
+    }
+
+    /// Extra claims are ignored rather than rejected: real providers return far
+    /// more than these two fields.
+    #[test]
+    fn userinfo_keeps_the_email_and_ignores_other_claims() {
+        let info: OauthUserInfo = serde_json::from_str(
+            r#"{"name":"Alex","email":"me@example.com","sub":"1","nickname":"al"}"#,
+        )
+        .unwrap();
+        assert_eq!(info.email.as_deref(), Some("me@example.com"));
+    }
+
     use aurcache_db::migration::Migrator;
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;

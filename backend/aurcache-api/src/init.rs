@@ -5,7 +5,7 @@ use crate::custom_file_server::CustomFileServer;
 #[cfg(feature = "static")]
 use crate::embed::CustomHandler;
 use crate::models::authenticated::OauthEnabled;
-use crate::utils::config::oauth_config_from_env;
+use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, oauth_config_from_env};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::downloads::DownloadCounter;
@@ -143,6 +143,19 @@ pub fn init_api(
         }
 
         let oauth_config = oauth_config_from_env();
+
+        // An allowlist restricts who may *sign in*, so it does nothing at all
+        // without OAuth: every request is already authenticated when OAuth is
+        // off. Said out loud, because the mistake looks exactly like a working
+        // restriction from the outside -- the server simply lets everyone in.
+        if oauth_config.is_err() && allowed_users().is_some() {
+            tracing::warn!(
+                "{ALLOWED_USERS_ENV} is set but OAuth is not configured, so it restricts nothing \
+                 and this instance is open to everyone. Configure the OAUTH_* variables to \
+                 enforce it."
+            );
+        }
+
         let mut rock = rocket::custom(config)
             .manage(db.clone())
             .manage(tx)
