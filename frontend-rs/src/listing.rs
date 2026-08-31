@@ -8,7 +8,7 @@
 //! here are what would move.
 
 use aurcache_client::{Build, SimplePackage};
-use aurcache_types::build_state::BuildState;
+use aurcache_common::build_state::BuildState;
 
 /// Which column a list is ordered by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -477,7 +477,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 use crate::routes::Route;
-use aurcache_types::build_state::BuildState as State;
+use aurcache_common::build_state::BuildState as State;
 use dioxus::prelude::*;
 
 /// A list card's title, with an optional action on the right.

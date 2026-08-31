@@ -10,16 +10,16 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
+use aurcache_common::api::worker::{ApprovalStatus, WorkerSummary};
+use aurcache_common::builder::BuildStates;
+use aurcache_common::worker::{
+    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
+    RegisterStatus,
+};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, workers};
-use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary};
-use aurcache_types::builder::BuildStates;
-use aurcache_types::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
-    RegisterStatus,
-};
 use aurcache_utils::build_logger::{BuildLogger, append_build_output};
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
 use aurcache_utils::repo_ingest::{
@@ -81,7 +81,7 @@ fn public_repo_url() -> String {
     env::var("AURCACHE_PUBLIC_URL").unwrap_or_else(|_| {
         format!(
             "http://localhost:{}",
-            aurcache_types::ports::AURCACHE_MIRROR_PORT
+            aurcache_common::ports::AURCACHE_MIRROR_PORT
         )
     })
 }
@@ -111,10 +111,10 @@ fn render_repo_template(public_url: &str) -> String {
         None => (rest, ""),
     };
     let port = authority.rsplit_once(':').map_or_else(
-        || format!(":{}", aurcache_types::ports::AURCACHE_MIRROR_PORT),
+        || format!(":{}", aurcache_common::ports::AURCACHE_MIRROR_PORT),
         |(_, port)| format!(":{port}"),
     );
-    let placeholder = aurcache_types::worker::REPO_HOST_PLACEHOLDER;
+    let placeholder = aurcache_common::worker::REPO_HOST_PLACEHOLDER;
     format!("[repo]\nSigLevel = Never\nServer = {scheme}://{placeholder}{port}{path}/$arch\n")
 }
 
@@ -627,8 +627,11 @@ fn expected_pkgnames(pkg: &aurcache_db::packages::Model) -> Vec<String> {
     if let Some(json) = pkg.split_packages.as_deref()
         && let Ok(split) = serde_json::from_str::<Vec<String>>(json)
     {
-        let extra: Vec<_> = split.into_iter().filter(|s| !names.contains(s)).collect();
-        names.extend(extra);
+        for name in split {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
     }
     names
 }
@@ -858,7 +861,7 @@ pub async fn revoke_worker(
 #[cfg(test)]
 mod repo_template_tests {
     use super::render_repo_template;
-    use aurcache_types::worker::REPO_HOST_PLACEHOLDER;
+    use aurcache_common::worker::REPO_HOST_PLACEHOLDER;
 
     /// Only the host is replaced: the scheme, port and path describe how the
     /// repository is published and remain the server's decision.
@@ -878,7 +881,7 @@ mod repo_template_tests {
         let t = render_repo_template("http://aurcache.example.com");
         assert!(t.contains(&format!(
             "Server = http://{REPO_HOST_PLACEHOLDER}:{}/$arch",
-            aurcache_types::ports::AURCACHE_MIRROR_PORT
+            aurcache_common::ports::AURCACHE_MIRROR_PORT
         )));
     }
 

@@ -93,7 +93,7 @@ pull jobs over HTTPS/mTLS. Concurrency now lives on the worker
 
 ## Worker protocol (`/api/worker`, mTLS)
 
-Types live in `aurcache-types`: `JobDescriptor`, `ClaimRequest`,
+Types live in `aurcache-common`: `JobDescriptor`, `ClaimRequest`,
 `Heartbeat {active_build_ids, version}`, `CompleteReport {success, exit_code,
 reason, canceled}`.
 

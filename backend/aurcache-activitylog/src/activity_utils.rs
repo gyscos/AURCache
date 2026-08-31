@@ -11,9 +11,9 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Order, QueryOrd
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Defined in aurcache-types so the HTTP client and the browser frontend use
+// Defined in aurcache-common so the HTTP client and the browser frontend use
 // the same struct rather than a hand-mirrored copy.
-pub use aurcache_types::api::activity::Activity;
+pub use aurcache_common::api::activity::Activity;
 
 #[derive(Debug, Clone)]
 pub struct ActivityLog {

@@ -6,7 +6,7 @@ use aurcache_client::{
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
     SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
-use aurcache_types::build_state::{BuildState, BuildStates};
+use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{

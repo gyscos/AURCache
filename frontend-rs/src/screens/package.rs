@@ -15,7 +15,7 @@ use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
 use aurcache_client::{Build, ExtendedPackage, PackageSource, PatchPackageRequest};
-use aurcache_types::build_state::BuildState;
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// How many builds to pull for the summary. Enough for a stable typical

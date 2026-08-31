@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
@@ -22,7 +23,6 @@ use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_types::build_state::BuildStates;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
@@ -201,7 +201,7 @@ fn client_and_server_share_one_type_per_shape() {
     // Compiles only if these are the *same* type, not merely the same fields.
     // The left side is what the server serialises, the right what the client
     // deserialises: naming both is what makes this catch drift. Comparing
-    // `aurcache_types` against the client would be near-tautological, since
+    // `aurcache_common` against the client would be near-tautological, since
     // the client re-exports it.
     fn _same<T>(x: T) -> T {
         x
@@ -224,8 +224,8 @@ fn client_and_server_share_one_type_per_shape() {
 /// wrong.
 #[test]
 fn a_git_source_round_trips_through_json() {
-    use aurcache_types::api::package::PackageSource;
-    use aurcache_types::source::GitSourceSpec;
+    use aurcache_common::api::package::PackageSource;
+    use aurcache_common::source::GitSourceSpec;
 
     let source = PackageSource::Git(GitSourceSpec {
         url: "https://aur.archlinux.org/hello.git".to_string(),

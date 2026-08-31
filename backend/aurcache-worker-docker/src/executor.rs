@@ -10,7 +10,7 @@
 //! credential handling. New deployments should use `aurcache-worker`.
 
 use anyhow::{Context, Result, anyhow};
-use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};

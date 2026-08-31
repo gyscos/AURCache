@@ -4,7 +4,7 @@
 //! self-abort (the server will have requeued them).
 
 use anyhow::Result;
-use aurcache_types::worker::{ClaimRequest, CompleteReport, Heartbeat, JobDescriptor};
+use aurcache_common::worker::{ClaimRequest, CompleteReport, Heartbeat, JobDescriptor};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -17,7 +17,7 @@
 //! 3. **Shared enrollment token** (`AURCACHE_ENROLLMENT_TOKEN`): fallback for
 //!    setups without a shared volume; the worker presents the token.
 
-use aurcache_types::api::worker::ApprovalStatus;
+use aurcache_common::api::worker::ApprovalStatus;
 use std::env;
 use std::path::PathBuf;
 

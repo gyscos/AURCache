@@ -2,9 +2,9 @@ use std::env;
 use std::path::Path;
 use tokio::fs;
 
+use aurcache_common::builder::BuildStates;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, packages};
-use aurcache_types::builder::BuildStates;
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
@@ -98,7 +98,9 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         .exec(db)
         .await?;
 
-    // set all pending builds to failed
+    // Fail builds that were mid-flight when the server stopped. Waiting-for-deps
+    // builds are deliberately left alone: nothing was running, and the
+    // dependency that promotes them may still complete.
     Builds::update_many()
         .col_expr(
             builds::Column::Status,

@@ -11,9 +11,9 @@ pub use model::{DependencyResolution, Error, Package, PkgDeps};
 /// Convert a search result into the API shape.
 ///
 /// Implemented here rather than in the server: `Package` is defined in this
-/// crate and `ApiPackage` in `aurcache-types`, so the server — owning
+/// crate and `ApiPackage` in `aurcache-common`, so the server — owning
 /// neither — cannot write this impl.
-impl From<Package> for aurcache_types::api::aur::ApiPackage {
+impl From<Package> for aurcache_common::api::aur::ApiPackage {
     fn from(package: Package) -> Self {
         Self {
             name: package.name,

@@ -98,10 +98,20 @@ name = "aurcache-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "aurcache-types",
+ "aurcache-common",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aurcache-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "utoipa",
 ]
 
 [[package]]
@@ -109,7 +119,7 @@ name = "aurcache-frontend"
 version = "0.1.0"
 dependencies = [
  "aurcache-client",
- "aurcache-types",
+ "aurcache-common",
  "dioxus",
  "dioxus-charts",
  "dioxus-ssr",
@@ -122,16 +132,6 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "web-sys",
-]
-
-[[package]]
-name = "aurcache-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "utoipa",
 ]
 
 [[package]]

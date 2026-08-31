@@ -1,6 +1,6 @@
 use crate::sleep_until_next_fire;
+use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::action::Action;
-use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;

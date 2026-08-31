@@ -1,8 +1,8 @@
 use crate::settings::parser::ParseSetting;
-use aurcache_db::settings;
-use aurcache_types::settings::{
+use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
+use aurcache_db::settings;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::future::Future;
 

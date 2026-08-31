@@ -1,10 +1,10 @@
 use anyhow::anyhow;
+use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, packages};
-use aurcache_types::builder::BuildStates;
 use futures::future::try_join_all;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{

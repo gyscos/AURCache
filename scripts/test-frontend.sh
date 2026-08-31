@@ -20,7 +20,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SEED="$PROJECT_DIR/scripts/fixtures/frontend-seed.sql"
 
-# The API port is compiled in (aurcache_types::ports::AURCACHE_HTTP_PORT), so it
+# The API port is compiled in (aurcache_common::ports::AURCACHE_HTTP_PORT), so it
 # cannot be moved out of the way.
 # One port, because one server. The frontend is embedded into the backend by
 # `aurcache-api`'s `static` feature, exactly as it ships, so these checks

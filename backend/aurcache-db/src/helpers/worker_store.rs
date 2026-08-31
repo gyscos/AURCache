@@ -4,7 +4,7 @@
 use crate::helpers::time::now_secs;
 use crate::prelude::Workers;
 use crate::workers;
-use aurcache_types::api::worker::ApprovalStatus;
+use aurcache_common::api::worker::ApprovalStatus;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{

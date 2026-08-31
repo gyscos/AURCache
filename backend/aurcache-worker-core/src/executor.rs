@@ -10,7 +10,7 @@
 //! own crate with its own binary, so neither has to know the other exists and
 //! retiring one is a deletion rather than a refactor.
 
-use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 

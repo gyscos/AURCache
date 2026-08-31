@@ -19,7 +19,7 @@ aurcache-db = {path = "../aurcache-db"}
 aurcache-api = { path = "../aurcache-api" }
 aurcache-ca = { path = "../aurcache-ca" }
 aurcache-scheduler = {path = "../aurcache-scheduler"}
-aurcache-types = {path = "../aurcache-types"}
+aurcache-common = {path = "../aurcache-common"}
 aurcache-utils = {path = "../aurcache-utils"}
 
 dotenvy = "0.15.7"

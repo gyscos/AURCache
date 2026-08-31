@@ -4,32 +4,32 @@
 //! [`AurCacheClient`], a small async wrapper around the most common endpoints.
 
 use anyhow::{Context, Result};
-// The API shapes are defined once, in aurcache-types, and used by the server,
+// The API shapes are defined once, in aurcache-common, and used by the server,
 // this client, and the browser frontend alike. Types still declared below are
 // ones whose server-side counterpart has a different shape or name; converging
 // those is the remaining half of the job.
-pub use aurcache_types::api::activity::Activity;
-pub use aurcache_types::api::aur::ApiPackage;
-pub use aurcache_types::api::builds::BuildSummary as Build;
-pub use aurcache_types::api::package::{
+pub use aurcache_common::api::activity::Activity;
+pub use aurcache_common::api::aur::ApiPackage;
+pub use aurcache_common::api::builds::BuildSummary as Build;
+pub use aurcache_common::api::package::{
     AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
 };
-pub use aurcache_types::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
+pub use aurcache_common::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
 // The add and preview requests are the server's own shapes rather than copies:
 // they were duplicated here, so a field added to one was silently absent from
 // the other.
-pub use aurcache_types::api::package::{
+pub use aurcache_common::api::package::{
     AddPackage as AddPackageRequest, SourcePreviewFileRequest, SourcePreviewRequest,
 };
-pub use aurcache_types::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
-pub use aurcache_types::api::settings::{SettingResponse, SettingValue};
-pub use aurcache_types::api::stats::{GraphDataPoint, ListStats, UserInfo};
-pub use aurcache_types::api::waiting::WaitingReason;
-pub use aurcache_types::api::worker::{ApprovalStatus, WorkerSummary as Worker};
-pub use aurcache_types::settings::{
+pub use aurcache_common::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
+pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
+pub use aurcache_common::api::stats::{GraphDataPoint, ListStats, UserInfo};
+pub use aurcache_common::api::waiting::WaitingReason;
+pub use aurcache_common::api::worker::{ApprovalStatus, WorkerSummary as Worker};
+pub use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
-pub use aurcache_types::source::{GitSourceSpec, SourceData, looks_like_git_url};
+pub use aurcache_common::source::{GitSourceSpec, SourceData, looks_like_git_url};
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

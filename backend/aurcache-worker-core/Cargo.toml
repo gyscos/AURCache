@@ -20,7 +20,7 @@ base64 = "0.22.1"
 flate2 = { workspace = true }
 tar = { workspace = true }
 percent-encoding = "2.3"
-aurcache-types = { path = "../aurcache-types" }
+aurcache-common = { path = "../aurcache-common" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

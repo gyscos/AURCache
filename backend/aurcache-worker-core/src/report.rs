@@ -5,7 +5,7 @@
 //! constructors are the vocabulary for that report; how the build itself ran is
 //! the executor's business.
 
-use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use std::process::ExitStatus;
 
 /// Map a build process exit status into a terminal report.

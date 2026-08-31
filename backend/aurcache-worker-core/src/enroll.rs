@@ -2,8 +2,8 @@
 //! persist the signed certificate, and hand back an authenticated client.
 
 use anyhow::{Context, Result};
-use aurcache_types::api::worker::ApprovalStatus;
-use aurcache_types::worker::{RegisterRequest, RegisterStatus};
+use aurcache_common::api::worker::ApprovalStatus;
+use aurcache_common::worker::{RegisterRequest, RegisterStatus};
 use std::time::Duration;
 
 use crate::client::{WorkerClient, fetch_and_pin_ca};

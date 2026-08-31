@@ -36,7 +36,7 @@ aurcache-ca = {path = "../aurcache-ca"}
 aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-utils = {path = "../aurcache-utils"}
 pacman-mirrors = {path = "../pacman-mirrors"}
-aurcache-types = {path = "../aurcache-types"}
+aurcache-common = {path = "../aurcache-common"}
 
 [features]
 default = []

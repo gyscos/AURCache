@@ -4,7 +4,7 @@
 //! set of pkgbases with a live `SRCDEST`, which the cache garbage-collector
 //! must not evict out from under a sibling build.
 
-use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
 use std::collections::HashSet;

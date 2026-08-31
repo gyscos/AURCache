@@ -7,11 +7,11 @@ use crate::models::authenticated::Authenticated;
 use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
+use aurcache_common::api::waiting::WaitingReason;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
-use aurcache_types::api::waiting::WaitingReason;
 use aurcache_utils::package::update::package_update;
 use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::FromQueryResult;
@@ -276,12 +276,19 @@ pub async fn get_build(
     let db = db.inner();
 
     let row = build_row_by_number(db, pkgbase, number).await?;
-    // `annotate_waiting` maps rows 1:1, so the vector always has one element.
+    // `annotate_waiting` maps rows 1:1, so this always yields the one row —
+    // but an HTTP handler should not panic on an invariant it cannot enforce
+    // locally, so the impossible case is an error rather than an `expect`.
     let summary = annotate_waiting(db, vec![row])
         .await
         .into_iter()
         .next()
-        .expect("annotate_waiting maps rows 1:1");
+        .ok_or_else(|| {
+            err(
+                Status::InternalServerError,
+                "build vanished while annotating",
+            )
+        })?;
     Ok(Json(summary))
 }
 

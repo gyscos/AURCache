@@ -35,7 +35,7 @@ aurcache-deps = {path = "../aurcache-deps"}
 aurcache-activitylog = {path = "../aurcache-activitylog"}
 pacman-mirrors = {path = "../pacman-mirrors"}
 pacman-repo-utils = {path = "../pacman-repo-utils"}
-aurcache-types = {path = "../aurcache-types"}
+aurcache-common = {path = "../aurcache-common"}
 
 
 [dev-dependencies]

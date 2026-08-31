@@ -540,7 +540,7 @@ public key simply shows none.
 
 Mirror the columns on `backend/aurcache-db/src/workers.rs`.
 
-### Wire protocol (`backend/aurcache-types/src/worker.rs`)
+### Wire protocol (`backend/aurcache-common/src/worker.rs`)
 
 `RegisterRequest` gains four `#[serde(default)]` fields — `packages:
 Vec<String>`, `priority: i32`, `concurrency: u32`, `ssh_public_key:
@@ -620,7 +620,7 @@ against `sqlite::memory:` like the current claim tests.
 | `backend/aurcache-db/src/migration/m2026xxxx_worker_routing.rs` | new columns (+ `mod.rs` registration) |
 | `backend/aurcache-db/src/workers.rs` | entity fields |
 | `backend/aurcache-db/src/helpers/worker_jobs.rs` | fleet snapshot, `capable`/`available`/`blocked`, rewritten `claim_job` |
-| `backend/aurcache-types/src/worker.rs` | `RegisterRequest` fields |
+| `backend/aurcache-common/src/worker.rs` | `RegisterRequest` fields |
 | `backend/aurcache-api/src/worker.rs` | pass new fields through register; `spill_delay`/`liveness_timeout` env accessors |
 | `backend/aurcache-api/src/build.rs` | `waiting_reason` on `ENQUEUED` builds |
 | `backend/aurcache-db/src/helpers/worker_store.rs` | refresh `name`, affinity, priority, concurrency, SSH key on re-register; requeue active builds on revoke |

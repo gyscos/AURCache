@@ -432,9 +432,9 @@ dependencies = [
  "aurcache-api",
  "aurcache-builder",
  "aurcache-ca",
+ "aurcache-common",
  "aurcache-db",
  "aurcache-scheduler",
- "aurcache-types",
  "aurcache-utils",
  "dotenvy",
  "openssl",
@@ -451,8 +451,8 @@ name = "aurcache-activitylog"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aurcache-common",
  "aurcache-db",
- "aurcache-types",
  "sea-orm",
  "serde",
  "serde_json",
@@ -469,9 +469,9 @@ dependencies = [
  "aurcache-builder",
  "aurcache-ca",
  "aurcache-client",
+ "aurcache-common",
  "aurcache-db",
  "aurcache-deps",
- "aurcache-types",
  "aurcache-utils",
  "bigdecimal",
  "chrono",
@@ -501,8 +501,8 @@ name = "aurcache-builder"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aurcache-common",
  "aurcache-db",
- "aurcache-types",
  "aurcache-utils",
  "sea-orm",
  "tokio",
@@ -528,7 +528,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurcache-client",
- "aurcache-types",
+ "aurcache-common",
  "chrono",
  "clap",
  "dialoguer",
@@ -543,10 +543,22 @@ name = "aurcache-client"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "aurcache-types",
+ "aurcache-common",
  "reqwest",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aurcache-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "utoipa",
 ]
 
 [[package]]
@@ -555,8 +567,8 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-recursion",
+ "aurcache-common",
  "aurcache-deps",
- "aurcache-types",
  "flate2",
  "pacman-mirrors",
  "sea-orm",
@@ -577,7 +589,7 @@ dependencies = [
  "alpm-compress",
  "alpm-srcinfo",
  "alpm-types",
- "aurcache-types",
+ "aurcache-common",
  "backon",
  "flate2",
  "reqwest",
@@ -605,9 +617,9 @@ dependencies = [
  "alpm-srcinfo",
  "anyhow",
  "aurcache-builder",
+ "aurcache-common",
  "aurcache-db",
  "aurcache-deps",
- "aurcache-types",
  "aurcache-utils",
  "chrono",
  "cron",
@@ -620,17 +632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aurcache-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sea-orm",
- "serde",
- "serde_json",
- "utoipa",
-]
-
-[[package]]
 name = "aurcache-utils"
 version = "0.0.0"
 dependencies = [
@@ -639,9 +640,9 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "aurcache-activitylog",
+ "aurcache-common",
  "aurcache-db",
  "aurcache-deps",
- "aurcache-types",
  "diffy",
  "flate2",
  "futures",
@@ -669,8 +670,8 @@ dependencies = [
  "anyhow",
  "aurcache-api",
  "aurcache-ca",
+ "aurcache-common",
  "aurcache-db",
- "aurcache-types",
  "aurcache-utils",
  "aurcache-worker-core",
  "base64 0.22.1",
@@ -698,7 +699,7 @@ name = "aurcache-worker-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aurcache-types",
+ "aurcache-common",
  "base64 0.22.1",
  "flate2",
  "hex",
@@ -719,7 +720,7 @@ name = "aurcache-worker-docker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aurcache-types",
+ "aurcache-common",
  "aurcache-worker-core",
  "bollard",
  "futures",
@@ -3303,6 +3304,7 @@ dependencies = [
  "md5",
  "sha2 0.11.0",
  "tar",
+ "tempfile",
  "tracing",
  "zstd",
 ]

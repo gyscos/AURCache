@@ -17,7 +17,7 @@ aurcache-client = { path = "../backend/aurcache-client" }
 # than on integers it would otherwise have to guess.
 # `default-features = false` drops the build-queue types that carry database
 # models, and with them sea-orm/sqlx — which do not build for wasm.
-aurcache-types = { path = "../backend/aurcache-types", default-features = false }
+aurcache-common = { path = "../backend/aurcache-common", default-features = false }
 # Line and bar charts as SVG, styled by CSS so they follow the theme picker.
 # Static for now: the crate has no hover support, and adding it upstream is a
 # separate piece of work.

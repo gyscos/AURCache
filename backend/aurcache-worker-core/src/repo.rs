@@ -10,7 +10,7 @@
 //! The worker already knows the right answer: it is the host it dialled to
 //! reach the server in the first place.
 
-use aurcache_types::worker::REPO_HOST_PLACEHOLDER;
+use aurcache_common::worker::REPO_HOST_PLACEHOLDER;
 
 /// Extract the host from a base URL such as `https://aurcache:8083`.
 ///

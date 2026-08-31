@@ -87,7 +87,7 @@ pub fn init_api(
     tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
-            port: aurcache_types::ports::AURCACHE_HTTP_PORT,
+            port: aurcache_common::ports::AURCACHE_HTTP_PORT,
             secret_key: get_secret_key(),
             ..Default::default()
         };
@@ -208,7 +208,7 @@ pub fn init_worker_api(
         let port = env::var("AURCACHE_WORKER_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(aurcache_types::ports::AURCACHE_WORKER_PORT);
+            .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
 
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
@@ -238,7 +238,7 @@ pub fn init_repo(downloads: Arc<DownloadCounter>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
-            port: aurcache_types::ports::AURCACHE_MIRROR_PORT,
+            port: aurcache_common::ports::AURCACHE_MIRROR_PORT,
             secret_key: get_secret_key(),
             ..Default::default()
         };

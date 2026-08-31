@@ -8,9 +8,9 @@
 //! the retry budget is exhausted. Explicit failures are handled synchronously in
 //! the `complete` endpoint and are never seen here.
 
+use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::reap_expired_builds;
-use aurcache_types::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::settings::general::SettingsTraits;
 use sea_orm::DatabaseConnection;
 use std::env;

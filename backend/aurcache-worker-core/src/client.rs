@@ -9,7 +9,7 @@
 //!   for all job endpoints.
 
 use anyhow::{Context, Result, bail};
-use aurcache_types::worker::{
+use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
     RegisterStatus,
 };

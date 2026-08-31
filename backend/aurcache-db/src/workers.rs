@@ -1,6 +1,6 @@
 //! `SeaORM` Entity for remote build workers.
 
-use aurcache_types::api::worker::ApprovalStatus;
+use aurcache_common::api::worker::ApprovalStatus;
 use sea_orm::entity::prelude::*;
 use serde::Serialize;
 use utoipa::ToSchema;

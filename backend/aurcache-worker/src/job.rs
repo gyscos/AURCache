@@ -5,7 +5,7 @@
 //! the caller's wrapper.
 
 use anyhow::{Context, Result};
-use aurcache_types::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

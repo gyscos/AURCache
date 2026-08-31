@@ -2,7 +2,7 @@
 
 use crate::api::api_base;
 use aurcache_client::AurCacheClient;
-use aurcache_types::build_state::BuildState;
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// The screen behind `/package/:pkgbase/build/:number`.

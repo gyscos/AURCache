@@ -231,7 +231,7 @@ impl Cache {
             }
             let pkgbase = ent.file_name().to_string_lossy().to_string();
             let path = ent.path();
-            let size = aurcache_utils::utils::dir_size::dir_size(&path).unwrap_or(0);
+            let size = aurcache_common::fs::dir_size(&path);
             let last_used = ent
                 .metadata()
                 .and_then(|m| m.modified())

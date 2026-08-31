@@ -20,7 +20,7 @@ aurcache-deps = {path = "../aurcache-deps"}
 aurcache-builder = {path = "../aurcache-builder"}
 aurcache-db = {path = "../aurcache-db"}
 aurcache-utils = {path = "../aurcache-utils"}
-aurcache-types = {path = "../aurcache-types"}
+aurcache-common = {path = "../aurcache-common"}
 
 cron = "0.17.0"
 serde_json = {workspace = true}

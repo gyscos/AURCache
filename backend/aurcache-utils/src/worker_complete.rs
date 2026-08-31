@@ -6,12 +6,12 @@
 //! Workers poll for enqueued jobs, so promoting a dependent from
 //! `WAITING_FOR_DEPS` to `ENQUEUED` is all that is required to dispatch it.
 
+use aurcache_common::builder::BuildStates;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::promote_waiting_build;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_types::builder::BuildStates;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{

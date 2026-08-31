@@ -23,12 +23,12 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
+use aurcache_common::worker::{ClaimRequest, CompleteReport};
 use aurcache_db::builds;
 use aurcache_db::files;
 use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_SUCCESS};
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
-use aurcache_types::worker::{ClaimRequest, CompleteReport};
 use aurcache_worker_core::client::{WorkerClient, fetch_and_pin_ca};
 use aurcache_worker_core::config::CoreConfig;
 use aurcache_worker_core::enroll::ensure_enrolled;

@@ -2,7 +2,7 @@
 
 use crate::builds;
 use crate::prelude::Builds;
-use aurcache_types::builder::BuildStates;
+use aurcache_common::builder::BuildStates;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
     Select,

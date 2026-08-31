@@ -1,5 +1,5 @@
 [package]
-name = "aurcache-types"
+name = "aurcache-common"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,15 +13,19 @@ anyhow = { workspace = true }
 utoipa = { workspace = true }
 sea-orm = { workspace = true, optional = true }
 
-
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 # The build-queue `Action` carries database models, which drags sea-orm and
 # sqlx in with it. Everything else here is plain serde types that a browser
 # frontend can use, so the database half is optional: wasm consumers take
 # `default-features = false` and still get the API types and enums.
-default = ["db"]
+default = ["db", "fs"]
 # Enables the sea-orm derives on types that are also stored in the database.
 # A browser frontend takes `default-features = false` and gets the same shapes
 # without a database driver.
 db = ["dep:sea-orm"]
+# Filesystem helpers. No extra dependencies — the gate exists so a wasm build
+# does not carry `std::fs` code it can never run.
+fs = []

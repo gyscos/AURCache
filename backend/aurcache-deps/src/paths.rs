@@ -8,7 +8,7 @@
 //!
 //! These live in this crate rather than `aurcache-utils` because
 //! `aurcache-db`'s dependency-backfill migration constructs an [`AurClient`],
-//! so `aurcache-deps` cannot depend on `aurcache-utils` (or `aurcache-types`,
+//! so `aurcache-deps` cannot depend on `aurcache-utils` (or `aurcache-common`,
 //! which depends on `aurcache-db`) without a cycle. `aurcache_utils::job_config`
 //! re-exports them so the rest of the workspace has one obvious import.
 //!

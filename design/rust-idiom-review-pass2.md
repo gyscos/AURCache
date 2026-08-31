@@ -102,18 +102,18 @@ listed under "Applied" below.
 
 ### 5. Build-status constants exist in six places
 
-* `aurcache_types::builder::BuildStates`
+* `aurcache_common::builder::BuildStates`
 * `aurcache_db::helpers::build_enqueue` (`ACTIVE_BUILD_STATUS`, …)
 * `aurcache_db::helpers::dependency_resolution` (again)
 * `aurcache_db::helpers::worker_jobs` (`STATUS_ACTIVE`, …)
 * `aurcache_db::migration::m20260508_…` (again)
 * `aurcache_utils::worker_complete` (again)
 
-plus worker-status strings twice (`aurcache_types::worker::WorkerStatus` and
+plus worker-status strings twice (`aurcache_common::worker::WorkerStatus` and
 `aurcache_db::helpers::worker_store::STATUS_*`). The root cause is that
-`aurcache-types` depends on `aurcache-db`, so `aurcache-db` cannot use the
+`aurcache-common` depends on `aurcache-db`, so `aurcache-db` cannot use the
 canonical copy. Inverting that (put the status types in a leaf crate, or in
-`aurcache-db` and re-export from `aurcache-types`) collapses all of them.
+`aurcache-db` and re-export from `aurcache-common`) collapses all of them.
 
 Related: `BuildStates` is a namespace of `i32` consts rather than a
 `#[repr(i32)]` enum with `TryFrom<i32>`. Every read of `builds.status` is a bare
@@ -233,7 +233,7 @@ Grouped; every change compiles, is `fmt`/`clippy` clean, and tests pass.
   on `Ok(None)` — i.e. on the completely normal "no per-package override" path,
   for every setting lookup. Now only a real query error warns. Also the three
   `eprintln!`s in that file became `tracing::warn!`.
-* `aurcache-types/src/settings.rs` documented the precedence as
+* `aurcache-common/src/settings.rs` documented the precedence as
   `Env → Package → Global → Default`; the code (and `CLAUDE.md`) do
   `Package → Env → Global → Default`.
 * `utils/package/update.rs::dependencies_ready_for_platform` had a doc comment

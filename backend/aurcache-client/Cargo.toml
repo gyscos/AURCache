@@ -8,7 +8,7 @@ workspace = true
 [dependencies]
 # Shared API shapes. `default-features = false` keeps sea-orm out, so this
 # crate — and the wasm frontend that uses it — stay driver-free.
-aurcache-types = { path = "../aurcache-types", default-features = false }
+aurcache-common = { path = "../aurcache-common", default-features = false }
 anyhow = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }

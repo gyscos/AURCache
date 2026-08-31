@@ -4,8 +4,8 @@
 use crate::helpers::time::now_secs;
 use crate::prelude::{Builds, Packages, Workers};
 use crate::{builds, packages, workers};
-use aurcache_types::api::worker::ApprovalStatus;
-use aurcache_types::builder::BuildStates;
+use aurcache_common::api::worker::ApprovalStatus;
+use aurcache_common::builder::BuildStates;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
 };
@@ -453,9 +453,9 @@ pub async fn requeue_or_fail<C: ConnectionTrait>(
 /// Only ever set for builds that *no approved worker can currently take*.
 /// Ordinary queueing behind a busy worker is not a reason and yields `None`;
 /// otherwise every queued build would carry a scary-looking explanation.
-/// Re-exported from `aurcache-types`, where it lives so the API and a
+/// Re-exported from `aurcache-common`, where it lives so the API and a
 /// frontend can share it.
-pub use aurcache_types::api::waiting::WaitingReason;
+pub use aurcache_common::api::waiting::WaitingReason;
 
 /// Explain every `ENQUEUED` build that no approved worker can currently claim.
 ///

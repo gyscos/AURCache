@@ -1,6 +1,6 @@
 //! Build status as a coloured badge.
 
-use aurcache_types::build_state::BuildState;
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// The colour a state is shown in, independent of what it is called.

@@ -7,12 +7,12 @@ use rocket::serde::json::Json;
 use crate::models::authenticated::Authenticated;
 use crate::models::stats::{GraphDataPoint, ListStats, UserInfo};
 use crate::utils::error::{ApiError, err};
+use aurcache_common::api::stats::RECENT_DAYS;
+use aurcache_common::builder::BuildStates;
+use aurcache_common::fs::dir_size;
 use aurcache_db::builds;
 use aurcache_db::helpers::dbtype::database_type;
 use aurcache_db::prelude::{Builds, Packages};
-use aurcache_types::api::stats::RECENT_DAYS;
-use aurcache_types::builder::BuildStates;
-use aurcache_utils::utils::dir_size::dir_size;
 use rocket::http::Status;
 use rocket::{State, get};
 use sea_orm::prelude::BigDecimal;
@@ -296,7 +296,7 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
         recent_failed: count_builds(db, Some(BuildStates::FAILED_BUILD), Some(cutoff)).await?,
 
         avg_build_time: avg_build_time(db).await?,
-        repo_size: dir_size("repo/").unwrap_or(0),
+        repo_size: dir_size("repo/"),
         requested_packages: count_packages(db, true).await?,
         dependency_packages: count_packages(db, false).await?,
         total_build_trend: trends.count,

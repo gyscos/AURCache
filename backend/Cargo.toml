@@ -13,7 +13,7 @@ members = [
     "aurcache-activitylog",
     "aurcache-utils",
     "aurcache-scheduler",
-    "aurcache-types",
+    "aurcache-common",
     "aurcache-ca",
     "aurcache-worker",
     "aurcache-worker-core",

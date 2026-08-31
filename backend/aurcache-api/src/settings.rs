@@ -1,7 +1,7 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::settings::{SettingResponse, SettingValue};
 use crate::utils::error::{ApiError, err};
-use aurcache_types::settings::{ApplicationSettings, Setting};
+use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_utils::settings::general::SettingsTraits;
 use rocket::http::Status;
 use rocket::serde::json::Json;

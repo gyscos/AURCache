@@ -13,7 +13,7 @@ use crate::listing::{
 use crate::routes::Route;
 use crate::status::StatusBadge;
 use aurcache_client::SimplePackage;
-use aurcache_types::build_state::BuildState;
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// Columns that only appear once there is room for them.
@@ -359,7 +359,7 @@ fn RowAction(pkgbase: String, action: Option<Action>, on_changed: EventHandler<(
 #[cfg(test)]
 mod tests {
     use super::{Action, row_action};
-    use aurcache_types::build_state::BuildState;
+    use aurcache_common::build_state::BuildState;
 
     const FRESH: i32 = 0;
     const STALE: i32 = 1;

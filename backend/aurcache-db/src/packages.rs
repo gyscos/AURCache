@@ -4,9 +4,9 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Re-exported from `aurcache-types`, where they live so the API and a
+/// Re-exported from `aurcache-common`, where they live so the API and a
 /// frontend can share them. They are still this entity's column types.
-pub use aurcache_types::source::{GitSourceSpec, SourceData};
+pub use aurcache_common::source::{GitSourceSpec, SourceData};
 
 // todo the toSchema derive should be removed to couple db and api
 #[derive(

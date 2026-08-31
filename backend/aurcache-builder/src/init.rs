@@ -10,10 +10,10 @@
 //! `Action::Build` is just a low-latency wakeup hint; workers also poll on an
 //! interval, so there is nothing to do for it here.
 
+use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::Builds;
-use aurcache_types::builder::BuildStates;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, IntoActiveModel};

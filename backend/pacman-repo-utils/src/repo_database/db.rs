@@ -8,12 +8,18 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
 /// Rewrite `db_archive` as a fresh tar.gz: copy across every existing entry
-/// whose path `keep` rejects, then hand the new builder to `fill`, and write
-/// the result back. Used by every mutation so add/remove cannot drift on how a
-/// database archive is rewritten.
-fn rewrite_archive<F, G>(db_archive: &Path, keep: F, fill: G) -> anyhow::Result<()>
+/// except those `superseded` selects, then hand the new builder to `fill`, and
+/// write the result back. Used by every mutation so add/remove cannot drift on
+/// how a database archive is rewritten.
+///
+/// `superseded` takes a [`Path`], not a `&str`, so both callers match on whole
+/// path components rather than on bytes. Entry paths here are `{pkgname}-{ver}`
+/// directories, where one name is routinely a byte prefix of another: with
+/// `str::starts_with`, removing `foo-1.0-1` also drops the `foo-1.0-10` a
+/// rebuild just added.
+fn rewrite_archive<F, G>(db_archive: &Path, superseded: F, fill: G) -> anyhow::Result<()>
 where
-    F: Fn(&str) -> bool,
+    F: Fn(&Path) -> bool,
     G: FnOnce(&mut Builder<GzEncoder<&mut Vec<u8>>>) -> anyhow::Result<()>,
 {
     let mut new_archive_data = Vec::new();
@@ -29,8 +35,7 @@ where
             let mut tar_builder = Builder::new(enc);
 
             for mut entry in archive.entries()?.flatten() {
-                let path = entry.path()?.to_string_lossy().into_owned();
-                if keep(path.as_ref()) {
+                if superseded(&entry.path()?) {
                     continue;
                 }
                 tar_builder.append(&entry.header().clone(), &mut entry)?;
@@ -69,7 +74,7 @@ pub fn add_to_db_file(
 
     rewrite_archive(
         db_archive,
-        |path| path == dir_name || path == target_file,
+        |path| path == Path::new(dir_name) || path == Path::new(&target_file),
         |builder| {
             // Add folder (replacing old one)
             let mut header = Header::new_gnu();
@@ -91,4 +96,68 @@ pub fn add_to_db_file(
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every entry path in `db_archive`, for asserting what a rewrite kept.
+    fn entry_paths(db_archive: &Path) -> Vec<String> {
+        let mut data = Vec::new();
+        File::open(db_archive)
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        let mut archive = Archive::new(GzDecoder::new(Cursor::new(data)));
+        archive
+            .entries()
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Removing one package must not take its version-prefixed neighbours with
+    /// it. `foo-1.0-1` is a byte prefix of `foo-1.0-10`, so a `str::starts_with`
+    /// predicate deletes the entry a rebuild just added — the package silently
+    /// disappears from the repository database while its file stays on disk.
+    #[test]
+    fn removing_a_pkgrel_does_not_remove_its_longer_neighbour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_archive = tmp.path().join("repo.db.tar.gz");
+
+        add_to_db_file("old", "foo-1.0-1", "desc", &db_archive).unwrap();
+        add_to_db_file("new", "foo-1.0-10", "desc", &db_archive).unwrap();
+
+        remove_from_db_file(&db_archive, "foo-1.0-1").unwrap();
+
+        let paths = entry_paths(&db_archive);
+        assert!(
+            paths.iter().any(|p| p.starts_with("foo-1.0-10")),
+            "the rebuilt package was removed along with the old pkgrel: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == "foo-1.0-1/desc"),
+            "the old pkgrel survived removal: {paths:?}"
+        );
+    }
+
+    /// Re-adding a package replaces its entries rather than stacking
+    /// duplicates, which is what the equality half of the predicate is for.
+    #[test]
+    fn re_adding_replaces_rather_than_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_archive = tmp.path().join("repo.db.tar.gz");
+
+        add_to_db_file("first", "foo-1.0-1", "desc", &db_archive).unwrap();
+        add_to_db_file("second", "foo-1.0-1", "desc", &db_archive).unwrap();
+
+        let paths = entry_paths(&db_archive);
+        assert_eq!(
+            paths.iter().filter(|p| p.starts_with("foo-1.0-1")).count(),
+            2,
+            "expected exactly one directory and one desc entry: {paths:?}"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! A Rust frontend for AURCache, in Dioxus.
 //!
-//! Shares the API types with the server through `aurcache-types` rather than
+//! Shares the API types with the server through `aurcache-common` rather than
 //! redeclaring them, which is the main argument for the port: the
 //! hand-maintained models in the Dart tree stop existing, and a change to a
 //! response shape becomes a compile error here instead of a runtime surprise.

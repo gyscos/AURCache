@@ -1,5 +1,5 @@
 use crate::settings::general::SettingsTraits;
-use aurcache_types::settings::{ApplicationSettings, Setting};
+use aurcache_common::settings::{ApplicationSettings, Setting};
 use sea_orm::DatabaseConnection;
 use std::fmt::Write as _;
 use std::path::Path;

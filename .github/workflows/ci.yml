@@ -83,12 +83,13 @@ jobs:
           # docker/build-rust.sh
           cargo check --features static
 
-      # `aurcache-types` exists so a browser frontend can share the API shapes
-      # without a database driver. Every workspace build turns the `db` feature
-      # on, so only an explicit no-default-features check proves that still holds.
+      # `aurcache-common` exists so a browser frontend can share the API shapes
+      # without a database driver or the filesystem helpers. Every workspace
+      # build turns the `db` and `fs` features on, so only an explicit
+      # no-default-features check proves that still holds.
       - name: Check driver-free types
         run: |
-          cargo check -p aurcache-types --no-default-features
+          cargo check -p aurcache-common --no-default-features
           cargo check -p aurcache-client
   lintFlutter:
     runs-on: ubuntu-latest
