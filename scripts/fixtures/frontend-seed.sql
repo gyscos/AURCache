@@ -284,3 +284,16 @@ UPDATE builds
  WHERE pkg_id = (SELECT id FROM packages WHERE name = 'yay');
 UPDATE builds SET worker_id = (SELECT id FROM workers WHERE name = 'builder-arm')
  WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');
+
+-- Built artifacts for the package page's file list. `hello` is a split package
+-- here so the list has more than one row, and one row is deliberately left
+-- without a size: that is what a row written before the size column looks like
+-- until the startup backfill reaches it, and the page must render it as unknown
+-- rather than as a zero-byte package.
+INSERT INTO files (filename, platform, package_id, size) VALUES
+  ('hello-2.12.1-2-x86_64.pkg.tar.zst',      'x86_64',
+   (SELECT id FROM packages WHERE name = 'hello'), 1258291),
+  ('hello-docs-2.12.1-2-x86_64.pkg.tar.zst', 'x86_64',
+   (SELECT id FROM packages WHERE name = 'hello'), 40960),
+  ('neofetch-7.1.0-2-x86_64.pkg.tar.zst',    'x86_64',
+   (SELECT id FROM packages WHERE name = 'neofetch'), NULL);

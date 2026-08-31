@@ -3,14 +3,14 @@ use std::path::Path;
 use tokio::fs;
 
 use aurcache_common::builder::BuildStates;
-use aurcache_db::prelude::{Builds, Packages};
-use aurcache_db::{builds, packages};
+use aurcache_db::prelude::{Builds, Files, Packages};
+use aurcache_db::{builds, files, packages};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
 use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
 use tracing::{error, info, warn};
 
 const START_BANNER: &str = r"
@@ -112,6 +112,8 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         .exec(db)
         .await?;
 
+    backfill_file_sizes(db).await;
+
     // todo arm mirrorlists unsupported for now!
     let mirrorlist_dir = mirrorlist_dir();
     if let Err(e) = fs::create_dir_all(&mirrorlist_dir).await {
@@ -158,4 +160,50 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Fill in `files.size` for rows that predate the column.
+///
+/// `repo_ingest` records the size from the bytes it already holds, so this only
+/// covers rows written before that existed. Best-effort throughout: a file that
+/// is gone stays `NULL` and the page reports its size as unknown, which beats
+/// failing startup over a display field. Idempotent, so it also repairs a row
+/// whose file was replaced out of band.
+async fn backfill_file_sizes(db: &DatabaseConnection) {
+    let rows = match Files::find()
+        .filter(files::Column::Size.is_null())
+        .all(db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("could not look up files needing a size backfill: {e}");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+
+    info!("Backfilling size for {} package files", rows.len());
+    let mut filled = 0;
+    for row in rows {
+        let path = Path::new("./repo")
+            .join(row.platform.to_string())
+            .join(&row.filename);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+        let active = files::ActiveModel {
+            id: Set(row.id),
+            size: Set(Some(size)),
+            ..Default::default()
+        };
+        match active.update(db).await {
+            Ok(_) => filled += 1,
+            Err(e) => warn!("could not record size for {}: {e}", row.filename),
+        }
+    }
+    info!("Recorded size for {filled} package files");
 }

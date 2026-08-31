@@ -14,7 +14,9 @@ pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::package::{
     AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
 };
-pub use aurcache_common::api::package::{ExtendedPackage, PackageDependency, SimplePackage};
+pub use aurcache_common::api::package::{
+    ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
+};
 // The add and preview requests are the server's own shapes rather than copies:
 // they were duplicated here, so a field added to one was silently absent from
 // the other.

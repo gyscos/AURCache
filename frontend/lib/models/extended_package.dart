@@ -25,6 +25,10 @@ sealed class ExtendedPackage with _$ExtendedPackage {
     required List<PackageDependency> dependencies,
     required List<PackageDependency> dependents,
     final List<String>? split_packages,
+    // The artifacts actually in the repository, one per split package per
+    // platform. Null on a response from a server that predates the field;
+    // empty until the package has built successfully once.
+    final List<PackageFile>? files,
     required bool has_patch,
     // Read from the package's source checkout rather than the AUR, so these
     // describe a git-sourced package too.
@@ -61,6 +65,7 @@ sealed class ExtendedPackage with _$ExtendedPackage {
       ),
     ],
     split_packages: null,
+    files: [],
     has_patch: false,
     package_source: PackageSource.git(
       GitPackage(
@@ -70,6 +75,21 @@ sealed class ExtendedPackage with _$ExtendedPackage {
       ),
     ),
   );
+}
+
+/// One built artifact in the repository.
+@freezed
+sealed class PackageFile with _$PackageFile {
+  const factory PackageFile({
+    required String filename,
+    required String platform,
+    // Compressed download size in bytes. Null when it is not known, which is
+    // not the same as a zero-byte file — the UI shows a dash rather than 0 B.
+    required int? size,
+  }) = _PackageFile;
+
+  factory PackageFile.fromJson(Map<String, dynamic> json) =>
+      _$PackageFileFromJson(json);
 }
 
 @freezed

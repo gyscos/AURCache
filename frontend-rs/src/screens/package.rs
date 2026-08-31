@@ -10,11 +10,11 @@
 
 use crate::api::client;
 use crate::dates::RelativeDate;
-use crate::format::{format_duration, now_secs};
+use crate::format::{format_bytes, format_duration, now_secs};
 use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
-use aurcache_client::{Build, ExtendedPackage, PackageSource, PatchPackageRequest};
+use aurcache_client::{Build, ExtendedPackage, PackageFile, PackageSource, PatchPackageRequest};
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
@@ -604,22 +604,48 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
         .as_ref()
         .is_some_and(|names| names.len() > 1);
 
+    // Once the package has built, the repository rows are the truth: they say
+    // which of the declared names actually produced an artifact, on which
+    // platform, and how big it is. Before the first build there are no rows, so
+    // the declared names are all the page can show.
+    let built = !pkg.files.is_empty();
+    let total = total_size(&pkg.files);
+
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 h2 { class: "card-title text-base",
                     "Produces"
-                    if split {
+                    if built {
+                        span { class: "badge badge-sm badge-neutral", "{pkg.files.len()}" }
+                    } else if split {
                         span { class: "badge badge-sm badge-neutral", "{names.len()}" }
                     }
                 }
                 ul { class: "divide-y divide-base-300",
-                    for name in names.iter() {
-                        li { key: "{name}", class: "py-2 flex items-center gap-2",
-                            span { class: "font-mono text-sm break-all", "{name}" }
-                            div { class: "flex-1" }
-                            NotTracked { what: "size" }
+                    if built {
+                        for file in pkg.files.iter() {
+                            li { key: "{file.filename}", class: "py-2 flex items-center gap-2",
+                                span { class: "font-mono text-sm break-all", "{file.filename}" }
+                                div { class: "flex-1" }
+                                span { class: "badge badge-ghost badge-xs", "{file.platform}" }
+                                FileSize { file: file.clone() }
+                            }
                         }
+                    } else {
+                        for name in names.iter() {
+                            li { key: "{name}", class: "py-2 flex items-center gap-2",
+                                span { class: "font-mono text-sm break-all", "{name}" }
+                                div { class: "flex-1" }
+                                NotTracked { what: "size" }
+                            }
+                        }
+                    }
+                }
+                if let Some(total) = total {
+                    div { class: "flex items-baseline gap-2 pt-2 text-sm",
+                        span { class: "opacity-60", "Total" }
+                        span { class: "font-mono", {format_bytes(total)} }
                     }
                 }
                 // Counted across every version and architecture this package
@@ -635,11 +661,12 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
                         "?"
                     }
                 }
-                // These names come from the package's own declaration, not from
-                // the repository. Until the artifacts are exposed, the page
-                // cannot say which of them are actually built and present.
-                p { class: "text-xs opacity-50 mt-2",
-                    "Declared package names. Built artifacts and their sizes are not tracked yet."
+                if !built {
+                    // Nothing is in the repository yet, so these are what the
+                    // PKGBUILD declares rather than what exists.
+                    p { class: "text-xs opacity-50 mt-2",
+                        "Declared package names. Nothing has been built into the repository yet."
+                    }
                 }
             }
         }
@@ -825,6 +852,39 @@ fn NotTracked(what: String) -> Element {
     }
 }
 
+/// The combined size of every artifact, or `None` if any one of them is unknown.
+///
+/// All-or-nothing on purpose: summing only the known sizes would print a total
+/// smaller than the parts it is made of, which reads as a bug rather than as
+/// missing data. `Option`'s `Sum` gives exactly this — one `None` and the whole
+/// total is `None`.
+fn total_size(files: &[PackageFile]) -> Option<u64> {
+    if files.is_empty() {
+        return None;
+    }
+    files
+        .iter()
+        .map(|f| f.size.and_then(|s| u64::try_from(s).ok()))
+        .sum()
+}
+
+/// One artifact's size, or the placeholder when it is not known.
+///
+/// Unknown means the row predates the size column and the file was already gone
+/// when the startup backfill looked, so there is nothing to report -- rendering
+/// it as `0 B` would claim the package file is empty.
+#[component]
+fn FileSize(file: PackageFile) -> Element {
+    match file.size.and_then(|s| u64::try_from(s).ok()) {
+        Some(bytes) => rsx! {
+            span { class: "font-mono text-sm opacity-70", {format_bytes(bytes)} }
+        },
+        None => rsx! {
+            NotTracked { what: "size" }
+        },
+    }
+}
+
 /// A label/value row inside a sidebar card.
 #[component]
 fn Field(label: String, children: Element) -> Element {
@@ -953,6 +1013,35 @@ mod tests {
         assert_eq!(produced_names(&pkg), vec!["hello".to_string()]);
     }
 
+    fn file(name: &str, size: Option<i64>) -> PackageFile {
+        PackageFile {
+            filename: name.to_string(),
+            platform: "x86_64".to_string(),
+            size,
+        }
+    }
+
+    #[test]
+    fn total_size_adds_every_artifact() {
+        let files = vec![file("a.pkg.tar.zst", Some(1000)), file("b.pkg.tar.zst", Some(24))];
+        assert_eq!(total_size(&files), Some(1024));
+    }
+
+    /// One unknown size makes the whole total unknown: a partial sum would
+    /// render a total visibly smaller than the rows above it.
+    #[test]
+    fn one_unknown_size_makes_the_total_unknown() {
+        let files = vec![file("a.pkg.tar.zst", Some(1000)), file("b.pkg.tar.zst", None)];
+        assert_eq!(total_size(&files), None);
+    }
+
+    /// A package that has never built has no artifacts, and no total to show —
+    /// not a total of zero.
+    #[test]
+    fn a_package_with_no_artifacts_has_no_total() {
+        assert_eq!(total_size(&[]), None);
+    }
+
     fn package() -> ExtendedPackage {
         ExtendedPackage {
             id: 1,
@@ -970,6 +1059,7 @@ mod tests {
                 subfolder: String::new(),
             }),
             split_packages: None,
+            files: vec![],
             downloads: 0,
             dependencies: vec![],
             dependents: vec![],

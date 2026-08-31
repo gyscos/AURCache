@@ -16,6 +16,7 @@ import '../components/package_source_patch_popup.dart';
 import '../constants/color_constants.dart';
 import '../models/build.dart';
 import '../providers/activity_log.dart';
+import '../utils/file_formatter.dart';
 import '../providers/statistics.dart';
 
 class PackageScreen extends ConsumerStatefulWidget {
@@ -220,7 +221,30 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
                 title: "Latest Upstream version",
                 subtitle: pkg.upstream_version ?? '—',
               ),
-              if (pkg.split_packages != null &&
+              // The artifacts in the repository, once there are any. These
+              // supersede the declared split-package names: they say which of
+              // those actually built, for which platform, and how big each is.
+              if (pkg.files != null && pkg.files!.isNotEmpty) ...[
+                const SizedBox(height: 5),
+                const Divider(),
+                const SizedBox(height: 5),
+                const Text(
+                  "Files:",
+                  style: TextStyle(fontSize: 18),
+                  textAlign: TextAlign.start,
+                ),
+                const SizedBox(height: 12),
+                ...pkg.files!.map(_fileRow),
+                if (_totalSize(pkg.files!) != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    "Total: ${_totalSize(pkg.files!)!.readableFileSize()}",
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ],
+                const SizedBox(height: 5),
+                const Divider(),
+              ] else if (pkg.split_packages != null &&
                   pkg.split_packages!.length > 1) ...[
                 const SizedBox(height: 5),
                 const Divider(),
@@ -370,6 +394,41 @@ class _PackageScreenState extends ConsumerState<PackageScreen> {
           })
           .toList(growable: false),
     );
+  }
+
+  /// One artifact: its filename, the platform it was built for, and its size.
+  ///
+  /// A null size renders as a dash, not as "0 B" — it means the size is not
+  /// recorded for that row, not that the package file is empty.
+  Widget _fileRow(PackageFile file) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(file.filename, style: const TextStyle(fontSize: 13)),
+          Text(
+            "${file.platform} · ${file.size?.readableFileSize() ?? '—'}",
+            style: const TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Combined size of every artifact, or null if any one of them is unknown.
+  ///
+  /// All-or-nothing on purpose: adding up only the known sizes would show a
+  /// total smaller than the rows above it, which reads as a bug rather than as
+  /// missing data.
+  int? _totalSize(List<PackageFile> files) {
+    var total = 0;
+    for (final file in files) {
+      final size = file.size;
+      if (size == null) return null;
+      total += size;
+    }
+    return total;
   }
 
   Widget _sideCard({required String title, required String subtitle}) {

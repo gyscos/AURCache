@@ -120,6 +120,10 @@ pub struct ExtendedPackage {
     pub upstream_version: Option<String>,
     pub package_source: PackageSource,
     pub split_packages: Option<Vec<String>>,
+    /// The built artifacts currently in the repository for this package: one
+    /// per split package per platform, newest build only. Empty until the
+    /// package has built successfully at least once.
+    pub files: Vec<PackageFile>,
     /// How many times this package's files have been fetched from the
     /// repository, across every version and architecture it has produced.
     ///
@@ -147,6 +151,22 @@ pub struct ExtendedPackage {
     /// Unix seconds of its newest commit: when the packaging was last touched,
     /// not when the upstream project last changed.
     pub last_modified: Option<i64>,
+}
+
+/// One built artifact in the repository.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+pub struct PackageFile {
+    /// The artifact's filename, which is also its path under the platform's
+    /// repository directory.
+    pub filename: String,
+    pub platform: String,
+    /// Size on disk in bytes -- the compressed download size, the same figure
+    /// pacman reports as `%CSIZE%`.
+    ///
+    /// `None` when it is not known: the row predates the size column and the
+    /// file was gone by the time the startup backfill looked for it. Rendered
+    /// as unknown rather than as zero.
+    pub size: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]

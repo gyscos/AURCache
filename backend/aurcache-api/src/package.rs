@@ -4,7 +4,7 @@ use crate::models::package::{
     SourcePreviewFileRequest, SourcePreviewRequest, UpdatePackage,
 };
 use crate::models::package::{
-    AurNotFoundPackage, AurPackage, ExtendedPackage, PackageDependency, PackageSource,
+    AurNotFoundPackage, AurPackage, ExtendedPackage, PackageDependency, PackageFile, PackageSource,
     SimplePackage,
 };
 use crate::utils::error::{ApiError, err};
@@ -18,8 +18,8 @@ use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::packages::SourceData;
-use aurcache_db::prelude::{Dependencies, Packages};
-use aurcache_db::{dependencies, packages};
+use aurcache_db::prelude::{Dependencies, Files, Packages};
+use aurcache_db::{dependencies, files, packages};
 use aurcache_deps::AurClient;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
@@ -731,6 +731,10 @@ pub async fn get_package(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
+    let files = package_files(db, pkg.id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
     let has_patch = pkg.patch.is_some();
 
     let (package_source, upstream_version) = package_source_and_version(&pkg)?;
@@ -769,6 +773,7 @@ pub async fn get_package(
         ),
         upstream_version,
         split_packages: split_packages.clone(),
+        files,
         dependencies,
         dependents,
         has_patch,
@@ -813,6 +818,33 @@ fn package_source_and_version(
             "Upload sources are not yet supported",
         )),
     }
+}
+
+/// The artifacts currently in the repository for a package.
+///
+/// Read straight from the `files` rows rather than by listing the repository
+/// directory: those rows are what the ingest and the delete path both maintain,
+/// so this is the same list the server acts on, and the size comes with them
+/// instead of costing a `stat` per artifact per page view.
+///
+/// Ordered by filename so the page is stable across requests; a split package
+/// otherwise lists its parts in whatever order the rows came back in.
+async fn package_files(
+    db: &DatabaseConnection,
+    pkg_id: i32,
+) -> Result<Vec<PackageFile>, sea_orm::DbErr> {
+    Ok(Files::find()
+        .filter(files::Column::PackageId.eq(pkg_id))
+        .order_by_asc(files::Column::Filename)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|f| PackageFile {
+            filename: f.filename,
+            platform: f.platform.to_string(),
+            size: f.size,
+        })
+        .collect())
 }
 
 /// The AUR page for a pkgbase. Derived, never fetched.
@@ -1041,5 +1073,82 @@ mod tests {
         assert_eq!(dependents[0].id, parent.id);
         assert_eq!(dependents[0].name, "parent");
         assert_eq!(dependents[0].version_constraint, ">=1.0");
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::package_files;
+    use aurcache_db::files;
+    use aurcache_db::migration::Migrator;
+    use pacman_mirrors::platforms::Platform;
+    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn file(db: &DatabaseConnection, name: &str, pkg_id: i32, size: Option<i64>) {
+        files::ActiveModel {
+            filename: Set(name.to_string()),
+            platform: Set(Platform::X86_64),
+            package_id: Set(pkg_id),
+            size: Set(size),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// The page lists one row per artifact -- a split package has several --
+    /// scoped to the package that owns them.
+    #[tokio::test]
+    async fn lists_only_this_package_s_artifacts() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        file(&db, "hello-1.0-1-x86_64.pkg.tar.zst", 1, Some(1000)).await;
+        file(&db, "hello-docs-1.0-1-x86_64.pkg.tar.zst", 1, Some(24)).await;
+        file(&db, "other-1.0-1-x86_64.pkg.tar.zst", 2, Some(99)).await;
+
+        let listed = package_files(&db, 1).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed.iter().map(|f| f.size).sum::<Option<i64>>(),
+            Some(1024)
+        );
+        assert!(listed.iter().all(|f| f.platform == "x86_64"));
+    }
+
+    /// Ordered by filename, so a split package does not reshuffle its parts
+    /// between two loads of the same page.
+    #[tokio::test]
+    async fn artifacts_come_back_in_a_stable_order() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        file(&db, "zzz-1.0-1-x86_64.pkg.tar.zst", 1, Some(1)).await;
+        file(&db, "aaa-1.0-1-x86_64.pkg.tar.zst", 1, Some(2)).await;
+
+        let listed = package_files(&db, 1).await.unwrap();
+        let names: Vec<&str> = listed.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "aaa-1.0-1-x86_64.pkg.tar.zst",
+                "zzz-1.0-1-x86_64.pkg.tar.zst"
+            ]
+        );
+    }
+
+    /// A row written before the size column carries `None`, which must survive
+    /// to the response rather than being flattened to a zero-byte file.
+    #[tokio::test]
+    async fn an_unrecorded_size_stays_unknown() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        file(&db, "hello-1.0-1-x86_64.pkg.tar.zst", 1, None).await;
+
+        let listed = package_files(&db, 1).await.unwrap();
+        assert_eq!(listed[0].size, None);
     }
 }

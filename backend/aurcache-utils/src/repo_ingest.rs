@@ -216,22 +216,28 @@ pub async fn ingest_pkgs_in(
         }
 
         for pkg in &build_pkgs {
+            // The bytes were written to disk in phase 2, so their length is the
+            // file's size without stat'ing it. Recorded even when the row is
+            // otherwise unchanged: a rebuild at the same version produces the
+            // same filename with different contents, and skipping the update
+            // would leave the old size on the row forever.
+            let size = i64::try_from(pkg.bytes.len()).unwrap_or(i64::MAX);
             let file_id = if let Some(existing_id) = pkg.existing_id {
-                if pkg.existing_package_id != Some(pkg_id) {
-                    let active = files::ActiveModel {
-                        id: Set(existing_id),
-                        package_id: Set(pkg_id),
-                        ..Default::default()
-                    };
-                    active.update(&txn).await?.id
-                } else {
-                    existing_id
+                files::ActiveModel {
+                    id: Set(existing_id),
+                    package_id: Set(pkg_id),
+                    size: Set(Some(size)),
+                    ..Default::default()
                 }
+                .update(&txn)
+                .await?
+                .id
             } else {
                 files::ActiveModel {
                     filename: Set(pkg.filename.clone()),
                     platform: Set(*platform),
                     package_id: Set(pkg_id),
+                    size: Set(Some(size)),
                     ..Default::default()
                 }
                 .insert(&txn)

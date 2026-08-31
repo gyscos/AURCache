@@ -9,6 +9,12 @@ pub struct Model {
     pub id: i32,
     pub platform: Platform,
     pub package_id: i32,
+    /// On-disk size of the artifact in bytes, as `repo_ingest` wrote it.
+    ///
+    /// `None` for a row written before the column existed, until the startup
+    /// backfill stats the file. Distinct from `Some(0)`, which would claim the
+    /// package file is empty.
+    pub size: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
