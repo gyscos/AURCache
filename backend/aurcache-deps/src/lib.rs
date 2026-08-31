@@ -18,6 +18,7 @@ impl From<Package> for aurcache_common::api::aur::ApiPackage {
         Self {
             name: package.name,
             version: package.version,
+            description: package.description,
         }
     }
 }

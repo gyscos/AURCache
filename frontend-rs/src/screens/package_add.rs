@@ -33,6 +33,16 @@ use std::time::Duration;
 /// request someone else pays for.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// How long to wait before looking up a one- or two-character entry.
+///
+/// Such a query is answered by an exact name lookup, which is only meaningful
+/// if that *is* the whole name — passing through `h` and `he` on the way to
+/// `hello` asks two questions nobody wanted the answer to. Longer than
+/// [`SEARCH_DEBOUNCE`] because there is no incremental feedback to lose: the
+/// answer is one package or none, and it still arrives promptly once typing
+/// stops. Short names stay addable; they just settle a beat later.
+const EXACT_LOOKUP_DEBOUNCE: Duration = Duration::from_millis(900);
+
 /// Up to this many bytes, the server looks the name up exactly instead of
 /// searching — see `aurcache_api::aur::search`, which switches on the same
 /// number. A substring search for `a` would match most of the AUR; an exact
@@ -58,6 +68,78 @@ fn to_add(queued: Vec<SourceData>, pending: Option<SourceData>) -> Vec<SourceDat
     } else {
         queued
     }
+}
+
+/// How many completed searches to keep for narrowing.
+///
+/// Bounded because someone exploring tries many unrelated queries in one
+/// sitting, and a broad result set is not small -- `hel` alone is a few
+/// thousand packages. Sixteen covers the back-and-forth of refining a search
+/// while letting the ones before it go.
+const SEARCH_CACHE_ENTRIES: usize = 16;
+
+/// Completed AUR searches, newest first, used to answer later queries locally.
+///
+/// Only substring searches go in here. A query of one or two characters is
+/// answered by an *exact name lookup* server-side, whose single result is not
+/// the set of everything containing those characters -- narrowing from it would
+/// claim almost nothing matches.
+#[derive(Default)]
+struct SearchCache(Vec<(String, Vec<SearchResult>)>);
+
+impl SearchCache {
+    /// The results for `query`, if any cached search can answer it without the
+    /// network.
+    ///
+    /// The AUR searches `by=name-desc`, a substring match, so anything matching
+    /// a longer query also matched a shorter prefix of it: a cached search for
+    /// `hel` contains every result `hello` could have. The longest usable
+    /// prefix is chosen because it is the smallest set to filter.
+    ///
+    /// This is why a successful response has to be a *complete* one. It is:
+    /// aurweb answers an over-broad search with `Too many package results.`
+    /// rather than a truncated list, and `aurcache-deps` turns that into an
+    /// error, so a set we hold is never a partial one.
+    fn narrow(&self, query: &str) -> Option<Vec<SearchResult>> {
+        let query = query.trim().to_lowercase();
+        let (_, results) = self
+            .0
+            .iter()
+            .filter(|(cached, _)| query.starts_with(cached))
+            .max_by_key(|(cached, _)| cached.len())?;
+        Some(
+            results
+                .iter()
+                .filter(|result| matches_query(result, &query))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Record a completed substring search.
+    ///
+    /// Insertion never rewrites an existing entry, so narrowing is
+    /// non-destructive: typing on past `hel` and deleting back to it filters
+    /// the original `hel` results again rather than a narrowed remnant of them.
+    fn insert(&mut self, query: &str, results: &[SearchResult]) {
+        let query = query.trim().to_lowercase();
+        if query.len() <= EXACT_LOOKUP_MAX {
+            return;
+        }
+        self.0.retain(|(cached, _)| cached != &query);
+        self.0.insert(0, (query, results.to_vec()));
+        self.0.truncate(SEARCH_CACHE_ENTRIES);
+    }
+}
+
+/// Whether a result matches `query` the way the AUR's `by=name-desc` does:
+/// a case-insensitive substring of either the name or the description.
+fn matches_query(result: &SearchResult, query: &str) -> bool {
+    result.name.to_lowercase().contains(query)
+        || result
+            .description
+            .as_deref()
+            .is_some_and(|d| d.to_lowercase().contains(query))
 }
 
 /// Orders search results by how well they answer what was typed.
@@ -194,6 +276,8 @@ fn AddPackageDialog(q: String) -> Element {
     // Starts equal to the entry so a URL-seeded search runs immediately, rather
     // than waiting for a keystroke that may never come.
     let mut debounced = use_signal(|| q);
+    // Completed searches, so refining a query stops asking the AUR again.
+    let mut cache = use_signal(SearchCache::default);
 
     // Only meaningful once the entry is a remote, which is when they appear.
     let mut git_ref = use_signal(|| "master".to_string());
@@ -246,10 +330,18 @@ fn AddPackageDialog(q: String) -> Element {
         if q.trim().is_empty() || looks_like_git_url(q.trim()) {
             return Ok(Vec::new());
         }
+        // A search already made can answer anything that extends it, with no
+        // request and no wait — which is most of typing, since a query grows a
+        // character at a time.
+        if let Some(mut narrowed) = cache.read().narrow(&q) {
+            rank_results(&q, &mut narrowed);
+            return Ok(narrowed);
+        }
         let mut found = crate::api::client()?
             .search(&q)
             .await
             .map_err(|e| e.to_string())?;
+        cache.write().insert(&q, &found);
         rank_results(&q, &mut found);
         Ok(found)
     });
@@ -390,7 +482,12 @@ fn AddPackageDialog(q: String) -> Element {
                                 // stale ones fall through without touching
                                 // anything.
                                 spawn(async move {
-                                    gloo_timers::future::sleep(SEARCH_DEBOUNCE).await;
+                                    let wait = if typed.trim().len() <= EXACT_LOOKUP_MAX {
+                                        EXACT_LOOKUP_DEBOUNCE
+                                    } else {
+                                        SEARCH_DEBOUNCE
+                                    };
+                                    gloo_timers::future::sleep(wait).await;
                                     if entry() == typed {
                                         debounced.set(typed);
                                     }
@@ -778,10 +875,21 @@ fn SearchResults(
                                         let name = result.name.clone();
                                         move |_| onpick.call(name.clone())
                                     },
-                                    span { class: "font-mono", "{result.name}" }
-                                    span { class: "opacity-50 text-xs", "{result.version}" }
-                                    if held {
-                                        span { class: "badge badge-outline badge-xs ml-auto", "added" }
+                                    // Name and version on one line, the AUR's
+                                    // summary under it: a search matches on the
+                                    // description too, so without it a result
+                                    // can look unrelated to what was typed.
+                                    div { class: "flex flex-col items-start gap-0.5 min-w-0",
+                                        div { class: "flex items-baseline gap-2",
+                                            span { class: "font-mono", "{result.name}" }
+                                            span { class: "opacity-50 text-xs", "{result.version}" }
+                                            if held {
+                                                span { class: "badge badge-outline badge-xs", "added" }
+                                            }
+                                        }
+                                        if let Some(description) = result.description.as_deref() {
+                                            span { class: "text-xs opacity-60 text-left", "{description}" }
+                                        }
                                     }
                                 }
                             }
@@ -796,9 +904,9 @@ fn SearchResults(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChipState, QueuedList, SearchResults, add_button_label, chip_state, dialog_width,
-        edited_label, git_source, progress_label, rank_results, single_source, source_at,
-        source_for, source_label, to_add,
+        ChipState, QueuedList, SEARCH_CACHE_ENTRIES, SearchCache, SearchResults, add_button_label,
+        chip_state, dialog_width, edited_label, git_source, progress_label, rank_results,
+        single_source, source_at, source_for, source_label, to_add,
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
@@ -815,8 +923,129 @@ mod tests {
         }
     }
 
+    fn result(name: &str, description: Option<&str>) -> SearchResult {
+        SearchResult {
+            name: name.to_string(),
+            version: "1.0-1".to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    /// The property the whole thing rests on: the AUR matches substrings, so a
+    /// longer query's answer is contained in a shorter one's.
+    #[test]
+    fn a_cached_search_answers_anything_that_extends_it() {
+        let mut cache = SearchCache::default();
+        cache.insert("hel", &[result("hello", None), result("helm", None)]);
+
+        let narrowed = cache.narrow("hello").expect("hel can answer hello");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].name, "hello");
+    }
+
+    /// Narrowing must not consume what it narrowed: typing past a query and
+    /// deleting back to it filters the original results again, not a remnant.
+    #[test]
+    fn narrowing_is_non_destructive() {
+        let mut cache = SearchCache::default();
+        cache.insert("hel", &[result("hello", None), result("helm", None)]);
+
+        assert_eq!(cache.narrow("hello").unwrap().len(), 1);
+        // Back to the original query, and back to the original answer.
+        assert_eq!(cache.narrow("hel").unwrap().len(), 2);
+        // And on to a different extension of the same base.
+        assert_eq!(cache.narrow("helm").unwrap().len(), 1);
+    }
+
+    /// A result the AUR returned for matching in its *description* has to
+    /// survive narrowing, or the list would silently shed exactly the results
+    /// a name-only filter cannot explain.
+    #[test]
+    fn narrowing_keeps_description_matches() {
+        let mut cache = SearchCache::default();
+        cache.insert(
+            "term",
+            &[result("alacritty", Some("A fast terminal emulator"))],
+        );
+
+        let narrowed = cache.narrow("termin").expect("term can answer termin");
+        assert_eq!(narrowed.len(), 1, "description match was dropped");
+    }
+
+    /// A query that is not an extension of anything cached needs the network;
+    /// answering it from an unrelated set would invent results.
+    #[test]
+    fn an_unrelated_query_is_not_answered_locally() {
+        let mut cache = SearchCache::default();
+        cache.insert("hel", &[result("hello", None)]);
+
+        assert!(cache.narrow("vim").is_none());
+        // Shorter than the cached query: its answer is a superset we do not have.
+        assert!(cache.narrow("he").is_none());
+    }
+
+    /// One- and two-character entries are exact lookups, not substring
+    /// searches. Caching one would make `ab` claim to answer `abc`, when all it
+    /// ever held was the package literally called `ab`.
+    #[test]
+    fn an_exact_lookup_is_never_used_as_a_base() {
+        let mut cache = SearchCache::default();
+        cache.insert("ab", &[result("ab", None)]);
+        assert!(cache.narrow("abc").is_none());
+    }
+
+    /// Bounded, because exploring tries many unrelated queries and a broad
+    /// result set is thousands of packages.
+    #[test]
+    fn the_cache_forgets_the_oldest_searches() {
+        let mut cache = SearchCache::default();
+        for i in 0..SEARCH_CACHE_ENTRIES + 4 {
+            cache.insert(&format!("query{i}"), &[result("pkg", None)]);
+        }
+        assert_eq!(cache.0.len(), SEARCH_CACHE_ENTRIES);
+        assert!(
+            cache.narrow("query0x").is_none(),
+            "oldest should be evicted"
+        );
+        let newest = format!("query{}x", SEARCH_CACHE_ENTRIES + 3);
+        assert!(cache.narrow(&newest).is_some(), "newest should be kept");
+    }
+
+    /// Case is not part of the question: the AUR matches case-insensitively.
+    #[test]
+    fn narrowing_ignores_case() {
+        let mut cache = SearchCache::default();
+        cache.insert("Hel", &[result("Hello", None)]);
+        assert_eq!(cache.narrow("hELLo").unwrap().len(), 1);
+    }
+
     fn render(query: &str, results: Option<Result<Vec<SearchResult>, String>>) -> String {
         render_with(query, results, Vec::new())
+    }
+
+    /// The description is why a result that does not look like the query is in
+    /// the list at all -- the AUR matches `name-desc`, so `hello` returns
+    /// `edax-reversi` for its "othello" description. Showing the name alone
+    /// left that unexplained.
+    #[test]
+    fn a_result_shows_what_the_package_is() {
+        let found = Ok(vec![result(
+            "edax-reversi",
+            Some("Edax is a very strong othello engine"),
+        )]);
+        let html = render("hello", Some(found));
+        assert!(
+            html.contains("Edax is a very strong othello engine"),
+            "the description is not on screen: {html}"
+        );
+    }
+
+    /// A package with no description still renders, without an empty line where
+    /// one would have been.
+    #[test]
+    fn a_result_without_a_description_renders_plainly() {
+        let html = render("hello", Some(Ok(vec![result("hello", None)])));
+        assert!(html.contains("hello"));
     }
 
     fn render_with(
@@ -896,6 +1125,7 @@ mod tests {
         let found = Ok(vec![SearchResult {
             name: "hello".to_string(),
             version: "1.0".to_string(),
+            description: None,
         }]);
 
         let open = render_search("hello", Some(found.clone()), Vec::new(), false);
@@ -948,6 +1178,7 @@ mod tests {
             .map(|(name, version)| SearchResult {
                 name: (*name).to_string(),
                 version: (*version).to_string(),
+                description: None,
             })
             .collect()))
     }
@@ -1110,6 +1341,7 @@ mod tests {
         .map(|name| SearchResult {
             name: (*name).to_string(),
             version: "1-1".to_string(),
+            description: None,
         })
         .collect();
 
@@ -1144,6 +1376,7 @@ mod tests {
             .map(|name| SearchResult {
                 name: (*name).to_string(),
                 version: "1-1".to_string(),
+                description: None,
             })
             .collect();
         rank_results("  HELLO  ", &mut results);
@@ -1271,6 +1504,7 @@ mod tests {
             Some(Ok(vec![SearchResult {
                 name: "hello-world".to_string(),
                 version: "1.0-3".to_string(),
+                description: None,
             }])),
         );
         assert!(html.contains("hello-world"), "{html}");

@@ -1024,7 +1024,10 @@ mod tests {
 
     #[test]
     fn total_size_adds_every_artifact() {
-        let files = vec![file("a.pkg.tar.zst", Some(1000)), file("b.pkg.tar.zst", Some(24))];
+        let files = vec![
+            file("a.pkg.tar.zst", Some(1000)),
+            file("b.pkg.tar.zst", Some(24)),
+        ];
         assert_eq!(total_size(&files), Some(1024));
     }
 
@@ -1032,7 +1035,10 @@ mod tests {
     /// render a total visibly smaller than the rows above it.
     #[test]
     fn one_unknown_size_makes_the_total_unknown() {
-        let files = vec![file("a.pkg.tar.zst", Some(1000)), file("b.pkg.tar.zst", None)];
+        let files = vec![
+            file("a.pkg.tar.zst", Some(1000)),
+            file("b.pkg.tar.zst", None),
+        ];
         assert_eq!(total_size(&files), None);
     }
 

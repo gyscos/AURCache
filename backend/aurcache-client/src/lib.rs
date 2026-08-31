@@ -50,13 +50,10 @@ pub struct ApiTokenResponse {
 }
 
 /// Search result returned from the AUR search proxy endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchResult {
-    /// Package name.
-    pub name: String,
-    /// Upstream version string reported by the search backend.
-    pub version: String,
-}
+///
+/// The server's own shape rather than a copy of it: this was a duplicate
+/// declaration, so a field added to one silently did not exist on the other.
+pub use aurcache_common::api::aur::ApiPackage as SearchResult;
 
 /// Request payload for triggering a package update check.
 #[derive(Debug, Serialize)]
