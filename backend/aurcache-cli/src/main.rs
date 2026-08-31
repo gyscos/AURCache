@@ -6,6 +6,7 @@ use aurcache_client::{
     ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
     SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
+use aurcache_types::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{
@@ -1180,11 +1181,6 @@ fn print_raw_response(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Terminal build states: nothing further will happen to these on its own.
-const STATUS_SUCCESS: i32 = 1;
-const STATUS_FAILED: i32 = 2;
-const STATUS_ACTIVE: i32 = 0;
-
 /// Follow builds until they settle, printing transitions and detecting stalls.
 ///
 /// Written for humans watching a queue and for scripts driving one: it reports
@@ -1209,13 +1205,13 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
             .filter(|b| args.package.as_ref().is_none_or(|name| &b.pkg_name == name))
             .collect();
 
-        const STATUS_ENQUEUED: i32 = 3;
+        const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
         let mut changed = false;
         for build in &builds {
             let key = (build.pkg_name.clone(), build.number);
             if seen.get(&key) != Some(&build.status) {
                 if args.fail_on_requeue
-                    && seen.get(&key) == Some(&STATUS_ACTIVE)
+                    && seen.get(&key) == Some(&BuildStates::ACTIVE_BUILD)
                     && build.status == STATUS_ENQUEUED
                 {
                     bail!(
@@ -1249,13 +1245,13 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
         // is not settled: the caller may be watching for a build that has not
         // been queued yet.
         let settled = !builds.is_empty()
-            && builds
-                .iter()
-                .all(|b| b.status == STATUS_SUCCESS || b.status == STATUS_FAILED);
+            && builds.iter().all(|b| {
+                b.status == BuildStates::SUCCESSFUL_BUILD || b.status == BuildStates::FAILED_BUILD
+            });
         if settled {
             let failed: Vec<&str> = builds
                 .iter()
-                .filter(|b| b.status == STATUS_FAILED)
+                .filter(|b| b.status == BuildStates::FAILED_BUILD)
                 .map(|b| b.pkg_name.as_str())
                 .collect();
             if failed.is_empty() {
@@ -1265,10 +1261,13 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
             bail!("build failed: {}", failed.join(", "));
         }
 
-        let anything_running = builds.iter().any(|b| b.status == STATUS_ACTIVE);
+        let anything_running = builds.iter().any(|b| b.status == BuildStates::ACTIVE_BUILD);
 
         if !anything_running && last_change.elapsed() >= Duration::from_secs(args.stall_after) {
-            for build in builds.iter().filter(|b| b.status != STATUS_SUCCESS) {
+            for build in builds
+                .iter()
+                .filter(|b| b.status != BuildStates::SUCCESSFUL_BUILD)
+            {
                 let reason = build
                     .waiting_reason
                     .as_ref()
@@ -1288,14 +1287,20 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
         }
 
         if last_beat.elapsed() >= Duration::from_secs(args.heartbeat) {
-            let active = builds.iter().filter(|b| b.status == STATUS_ACTIVE).count();
+            let active = builds
+                .iter()
+                .filter(|b| b.status == BuildStates::ACTIVE_BUILD)
+                .count();
             println!(
                 "[{:>4}s] {} building, {} of {} finished",
                 start.elapsed().as_secs(),
                 active,
                 builds
                     .iter()
-                    .filter(|b| b.status == STATUS_SUCCESS || b.status == STATUS_FAILED)
+                    .filter(|b| {
+                        b.status == BuildStates::SUCCESSFUL_BUILD
+                            || b.status == BuildStates::FAILED_BUILD
+                    })
                     .count(),
                 builds.len()
             );
@@ -1310,13 +1315,13 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
 }
 
 fn build_status_label(status: i32) -> &'static str {
-    match status {
-        0 => "active",
-        1 => "successful",
-        2 => "failed",
-        3 => "enqueued",
-        4 => "waiting for deps",
-        _ => "unknown",
+    match BuildState::from_i32(status) {
+        Some(BuildState::Active) => "active",
+        Some(BuildState::Successful) => "successful",
+        Some(BuildState::Failed) => "failed",
+        Some(BuildState::Enqueued) => "enqueued",
+        Some(BuildState::WaitingForDeps) => "waiting for deps",
+        None => "unknown",
     }
 }
 

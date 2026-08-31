@@ -53,34 +53,35 @@ impl Status {
     /// Get the status from [`Status::URL_X86_64`].
     pub async fn get_from_default_url(target_platform: Platform) -> anyhow::Result<Self> {
         match target_platform {
-            Platform::X86_64 => {
-                match Self::fetch_status(Self::URL_X86_64, target_platform, 2).await {
-                    Ok(v) => Ok(v),
-                    Err(_) => {
-                        warn!(
-                            "<{}> timed out! Using alternative mirrorlist URL: {}",
-                            Self::URL_X86_64,
-                            Self::URL_X86_64_ALT
-                        );
-                        Self::fetch_status(Self::URL_X86_64_ALT, target_platform, 4).await
-                    }
+            Platform::X86_64 => match Self::fetch_status(Self::URL_X86_64, 2).await {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    warn!(
+                        "<{}> timed out! Using alternative mirrorlist URL: {}",
+                        Self::URL_X86_64,
+                        Self::URL_X86_64_ALT
+                    );
+                    Self::fetch_status(Self::URL_X86_64_ALT, 4).await
                 }
-            }
+            },
             Platform::Aarch64 => bail!("Aarch64 rank mirroring not supported"),
             Platform::Armv7h => bail!("ARM32 rank mirroring not supported"),
         }
     }
 
     /// Fetch the status JSON from `url`, retrying up to `times` times.
-    async fn fetch_status(url: &str, platform: Platform, times: usize) -> anyhow::Result<Self> {
-        (|| async { Self::get_from_url(url, platform).await })
+    async fn fetch_status(url: &str, times: usize) -> anyhow::Result<Self> {
+        (|| async { Self::get_from_url(url).await })
             .retry(FibonacciBuilder::default().with_max_times(times))
             .await
     }
 
     /// Get the status from a given url.
-    pub async fn get_from_url(url: &str, _platform: Platform) -> anyhow::Result<Self> {
-        // todo we need to fetch mirror list differently dependent on platform
+    ///
+    /// Both known URLs serve the x86_64 mirrorlist; aarch64/armv7h ranking are
+    /// rejected in [`get_from_default_url`], so a platform discriminator would
+    /// be dead weight until an aarch64 source exists.
+    pub async fn get_from_url(url: &str) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (compatible; AURCache/1.0;)")
             .http1_only()

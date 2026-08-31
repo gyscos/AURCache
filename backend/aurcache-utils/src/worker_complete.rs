@@ -15,8 +15,8 @@ use aurcache_types::builder::BuildStates;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel, Order,
-    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
+    QueryFilter, QuerySelect, TransactionTrait,
 };
 use std::collections::HashMap;
 
@@ -262,18 +262,13 @@ async fn dependency_satisfied<C: ConnectionTrait>(
     platform: Platform,
     constraint: &str,
 ) -> Result<bool, DbErr> {
-    let latest_success: Option<String> = Builds::find()
-        .select_only()
-        .column(builds::Column::Version)
-        .filter(builds::Column::PkgId.eq(dependee_id))
-        .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
-        .order_by(builds::Column::EndTime, Order::Desc)
-        .limit(1)
-        .into_tuple()
-        .one(db)
-        .await?;
-    Ok(latest_success.is_some_and(|v| crate::pkg::satisfies_constraint(&v, constraint)))
+    let Some(version) =
+        aurcache_db::helpers::builds::latest_successful_version(db, dependee_id, platform.as_str())
+            .await?
+    else {
+        return Ok(false);
+    };
+    Ok(crate::pkg::satisfies_constraint(&version, constraint))
 }
 
 async fn promote_dependent<C: ConnectionTrait>(

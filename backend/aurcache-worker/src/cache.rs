@@ -231,7 +231,7 @@ impl Cache {
             }
             let pkgbase = ent.file_name().to_string_lossy().to_string();
             let path = ent.path();
-            let size = dir_size(&path);
+            let size = aurcache_utils::utils::dir_size::dir_size(&path).unwrap_or(0);
             let last_used = ent
                 .metadata()
                 .and_then(|m| m.modified())
@@ -274,22 +274,6 @@ fn scan_pkgcache(dir: &Path) -> Vec<CacheEntry> {
         });
     }
     entries
-}
-
-/// Recursively compute a directory's size in bytes (best-effort).
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0;
-    if let Ok(read) = std::fs::read_dir(path) {
-        for ent in read.flatten() {
-            let Ok(ft) = ent.file_type() else { continue };
-            if ft.is_dir() {
-                total += dir_size(&ent.path());
-            } else if let Ok(md) = ent.metadata() {
-                total += md.len();
-            }
-        }
-    }
-    total
 }
 
 /// Replace path-unsafe characters so a pkgbase maps to a single directory.

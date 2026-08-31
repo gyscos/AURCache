@@ -54,14 +54,14 @@ pub const KEY_FILE: &str = "id_ed25519";
 /// `known_hosts` filename within that directory.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
-/// A credential staged for a build: where the key ended up, and the
-/// `GIT_SSH_COMMAND` that uses it.
+/// A credential staged for a build: the `GIT_SSH_COMMAND` that uses it.
 ///
-/// The path is kept alongside the command because `makepkg.conf` guards the
-/// export on that file being readable — see [`augment_makepkg_conf`].
+/// Only the command is carried — the staged key path lives at the fixed
+/// [`KEY_FILE`] slot the worker's ssh-agent loads (see [`stage_for_job`]), and
+/// the command itself must never name it (the build user cannot read the file;
+/// see [`git_ssh_command`]).
 #[derive(Debug, Clone)]
 pub struct StagedCredential {
-    pub key: PathBuf,
     pub git_ssh_command: String,
 }
 
@@ -273,7 +273,6 @@ pub fn stage_for_job(cfg: &Config, dir: &Path) -> Result<Option<StagedCredential
 
     Ok(Some(StagedCredential {
         git_ssh_command: git_ssh_command(known_hosts.as_deref()),
-        key: staged_key,
     }))
 }
 
@@ -355,7 +354,6 @@ mod tests {
         assert_eq!(augment_makepkg_conf(base, None), base);
 
         let cred = StagedCredential {
-            key: PathBuf::from("/staged/id_ed25519"),
             git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
         let augmented = augment_makepkg_conf(base, Some(&cred));
@@ -373,7 +371,6 @@ mod tests {
     #[test]
     fn the_export_is_guarded_so_it_does_not_apply_in_the_chroot() {
         let cred = StagedCredential {
-            key: PathBuf::from("/staged/id_ed25519"),
             git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
         let conf = augment_makepkg_conf("PKGDEST=/output", Some(&cred));
@@ -426,7 +423,6 @@ mod tests {
         // ssh-agent loads it from — but the command must not name it: the build
         // user cannot read it, and authentication goes through the agent.
         let staged = dest.join(KEY_FILE);
-        assert_eq!(cred.key, staged);
         assert!(!cred.git_ssh_command.contains(&staged.display().to_string()));
         assert!(!cred.git_ssh_command.contains("-i "));
         assert_eq!(std::fs::read_to_string(&staged).unwrap(), "PRIVATE");

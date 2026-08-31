@@ -528,6 +528,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurcache-client",
+ "aurcache-types",
  "chrono",
  "clap",
  "dialoguer",

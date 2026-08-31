@@ -14,10 +14,11 @@ use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
+use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::packages::SourceData;
-use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_db::{builds, dependencies, packages};
+use aurcache_db::prelude::{Dependencies, Packages};
+use aurcache_db::{dependencies, packages};
 use aurcache_deps::AurClient;
 use aurcache_types::build_state::BuildStates;
 use aurcache_utils::package::add::package_add;
@@ -717,24 +718,12 @@ pub async fn get_package(
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
-    // Query the latest build.version for this package (most recent by end_time then start_time)
-    let latest_version_row = Builds::find()
-        .select_only()
-        .column(builds::Column::Version)
-        .filter(builds::Column::PkgId.eq(pkg.id))
-        // Successful only; see the list query above.
-        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
-        .order_by(builds::Column::EndTime, Order::Desc)
-        .order_by(builds::Column::StartTime, Order::Desc)
-        .limit(1)
-        .into_tuple::<(String,)>()
-        .one(db)
+    let latest_version = latest_successful_version_any_platform(db, pkg.id)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-
-    // Same rule as the list query: an enqueued build's empty version is not a
-    // version.
-    let latest_version: Option<String> = latest_version_row.map(|(v,)| v).filter(|v| !v.is_empty());
+        .map_err(|e| err(Status::InternalServerError, e))?
+        // Same rule as the list query: an enqueued build's empty version is not
+        // a version.
+        .filter(|v| !v.is_empty());
     let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
@@ -743,38 +732,8 @@ pub async fn get_package(
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     let has_patch = pkg.patch.is_some();
-    let source_data = pkg.source_data.clone();
 
-    let (package_source, version) = match source_data {
-        SourceData::Aur { .. } => {
-            // Read straight from the row: the version-check scheduler mirrors
-            // this, and `package::add` fills it in immediately for a new
-            // package, so there is no AUR lookup on this path. It used to be
-            // ~128ms of a ~130ms response and one of the AUR's 4000 daily
-            // calls per page view.
-            let source = if pkg.aur_missing == Some(true) {
-                // The last check did not find it in the AUR. Its page still
-                // renders — the metadata comes from the checkout — but it says
-                // the package is gone from upstream.
-                PackageSource::AurNotFound(AurNotFoundPackage {})
-            } else {
-                PackageSource::Aur(aur_source(&pkg))
-            };
-            (source, pkg.upstream_version.clone())
-        }
-        SourceData::Git { spec } => (
-            PackageSource::Git(spec),
-            // How current this version is depends on the version-check
-            // interval; `None` means no check has run yet.
-            pkg.upstream_version,
-        ),
-        SourceData::Upload { .. } => {
-            return Err(err(
-                Status::NotImplemented,
-                "Upload sources are not yet supported",
-            ));
-        }
-    };
+    let (package_source, upstream_version) = package_source_and_version(&pkg)?;
 
     let split_packages: Option<Vec<String>> = pkg
         .split_packages
@@ -808,7 +767,7 @@ pub async fn get_package(
                 .map(ToString::to_string)
                 .collect(),
         ),
-        upstream_version: version,
+        upstream_version,
         split_packages: split_packages.clone(),
         dependencies,
         dependents,
@@ -820,6 +779,40 @@ pub async fn get_package(
     };
 
     Ok(Json(ext_pkg))
+}
+
+/// The `PackageSource` and upstream version for a package row, resolved
+/// entirely from persisted fields — no AUR lookup happens on this path. The
+/// version-check scheduler mirrors the same assignment, and `package::add`
+/// fills the row in immediately, so the page cannot drift from either; the AUR
+/// call it used to make was ~128ms of a ~130ms response and one of the AUR's
+/// 4000 daily calls per page view.
+fn package_source_and_version(
+    pkg: &packages::Model,
+) -> Result<(PackageSource, Option<String>), ApiError> {
+    match &pkg.source_data {
+        SourceData::Aur { .. } => {
+            // The last check did not find it in the AUR. Its page still renders
+            // — the metadata comes from the checkout — but it says the package
+            // is gone from upstream.
+            let source = if pkg.aur_missing == Some(true) {
+                PackageSource::AurNotFound(AurNotFoundPackage {})
+            } else {
+                PackageSource::Aur(aur_source(pkg))
+            };
+            Ok((source, pkg.upstream_version.clone()))
+        }
+        SourceData::Git { spec } => Ok((
+            PackageSource::Git(spec.clone()),
+            // How current this version is depends on the version-check
+            // interval; `None` means no check has run yet.
+            pkg.upstream_version.clone(),
+        )),
+        SourceData::Upload { .. } => Err(err(
+            Status::NotImplemented,
+            "Upload sources are not yet supported",
+        )),
+    }
 }
 
 /// The AUR page for a pkgbase. Derived, never fetched.

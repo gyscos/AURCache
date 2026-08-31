@@ -17,7 +17,7 @@ use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::FromQueryResult;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect, RelationTrait,
+    QueryOrder, QuerySelect, RelationTrait, Select,
 };
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
@@ -130,17 +130,7 @@ async fn list_builds_impl(
     limit: Option<u64>,
     page: Option<u64>,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
-    let basequery = Builds::find()
-        .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
-        .select_only()
-        .column_as(builds::Column::Id, "id")
-        .column_as(builds::Column::Number, "number")
-        .column(builds::Column::Status)
-        .column_as(packages::Column::Name, "pkg_name")
-        .column(builds::Column::Version)
-        .column(builds::Column::EndTime)
-        .column(builds::Column::StartTime)
-        .column(builds::Column::Platform)
+    let basequery = build_row_select()
         .order_by(builds::Column::StartTime, Order::Desc)
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
@@ -156,6 +146,24 @@ async fn list_builds_impl(
     .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(Json(annotate_waiting(db, rows).await))
+}
+
+/// The build-list projection shared by the list and single-build routes.
+///
+/// Every listed build has the same fields, so there is one place the shape of a
+/// [`BuildRow`] is described.
+fn build_row_select() -> Select<Builds> {
+    Builds::find()
+        .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
+        .select_only()
+        .column_as(builds::Column::Id, "id")
+        .column_as(builds::Column::Number, "number")
+        .column(builds::Column::Status)
+        .column_as(packages::Column::Name, "pkg_name")
+        .column(builds::Column::Version)
+        .column(builds::Column::EndTime)
+        .column(builds::Column::StartTime)
+        .column(builds::Column::Platform)
 }
 
 /// A listed build as queried, including the row id the response omits.
@@ -233,6 +241,22 @@ async fn build_by_number(
         .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))
 }
 
+/// Resolve a single build to its [`BuildRow`] projection, for the detail route.
+async fn build_row_by_number(
+    db: &DatabaseConnection,
+    pkgbase: &str,
+    number: i32,
+) -> Result<BuildRow, ApiError> {
+    build_row_select()
+        .filter(packages::Column::Name.eq(pkgbase))
+        .filter(builds::Column::Number.eq(number))
+        .into_model::<BuildRow>()
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))
+}
+
 #[utoipa::path(
     responses(
             (status = 200, description = "Get build details"),
@@ -251,32 +275,14 @@ pub async fn get_build(
 ) -> Result<Json<BuildSummary>, ApiError> {
     let db = db.inner();
 
-    let row = Builds::find()
-        .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
-        .filter(packages::Column::Name.eq(pkgbase))
-        .filter(builds::Column::Number.eq(number))
-        .select_only()
-        .column_as(builds::Column::Id, "id")
-        .column_as(builds::Column::Number, "number")
-        .column(builds::Column::Status)
-        .column_as(packages::Column::Name, "pkg_name")
-        .column(builds::Column::Version)
-        .column(builds::Column::EndTime)
-        .column(builds::Column::StartTime)
-        .column(builds::Column::Platform)
-        .into_model::<BuildRow>()
-        .one(db)
+    let row = build_row_by_number(db, pkgbase, number).await?;
+    // `annotate_waiting` maps rows 1:1, so the vector always has one element.
+    let summary = annotate_waiting(db, vec![row])
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))?;
-
-    let mut annotated = annotate_waiting(db, vec![row]).await;
-    annotated.pop().map(Json).ok_or_else(|| {
-        err(
-            Status::InternalServerError,
-            "build vanished while annotating",
-        )
-    })
+        .into_iter()
+        .next()
+        .expect("annotate_waiting maps rows 1:1");
+    Ok(Json(summary))
 }
 
 #[utoipa::path(

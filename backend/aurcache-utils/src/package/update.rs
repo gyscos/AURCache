@@ -18,7 +18,7 @@ use aurcache_types::builder::BuildStates;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -514,17 +514,9 @@ async fn dependency_satisfies_constraint(
     platform: &Platform,
     constraint: Option<&crate::pkg::Constraint>,
 ) -> anyhow::Result<bool> {
-    let Some(build) = Builds::find()
-        .select_only()
-        .column(builds::Column::Version)
-        .filter(builds::Column::PkgId.eq(dependee_id))
-        .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
-        .order_by(builds::Column::EndTime, sea_orm::Order::Desc)
-        .order_by(builds::Column::StartTime, sea_orm::Order::Desc)
-        .into_tuple::<(String,)>()
-        .one(db)
-        .await?
+    let Some(version) =
+        aurcache_db::helpers::builds::latest_successful_version(db, dependee_id, platform.as_str())
+            .await?
     else {
         return Ok(false);
     };
@@ -532,7 +524,7 @@ async fn dependency_satisfies_constraint(
     let Some(constraint) = constraint else {
         return Ok(true);
     };
-    let Ok(version) = Version::from_str(&build.0) else {
+    let Ok(version) = Version::from_str(&version) else {
         return Ok(false);
     };
     Ok(constraint.is_satisfied(&version))

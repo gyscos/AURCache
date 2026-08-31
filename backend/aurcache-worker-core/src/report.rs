@@ -12,12 +12,7 @@ use std::process::ExitStatus;
 #[must_use]
 pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
     if canceled {
-        return CompleteReport {
-            success: false,
-            exit_code: status.code(),
-            reason: Some("build canceled".to_string()),
-            canceled: true,
-        };
+        return canceled_report(status.code());
     }
     if status.success() {
         return CompleteReport {
@@ -55,12 +50,17 @@ pub fn setup_failure(reason: impl std::fmt::Display) -> CompleteReport {
 }
 
 /// A terminal report for a build aborted before it started (cancel observed
-/// during setup).
+/// during setup, so there is no process exit status).
 #[must_use]
 pub fn classify_exit_canceled() -> CompleteReport {
+    canceled_report(None)
+}
+
+/// The shared "build canceled" shape, with whatever exit code is available.
+fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
     CompleteReport {
         success: false,
-        exit_code: None,
+        exit_code,
         reason: Some("build canceled".to_string()),
         canceled: true,
     }

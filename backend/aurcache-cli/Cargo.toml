@@ -8,6 +8,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 aurcache-client = { path = "../aurcache-client" }
+aurcache-types = { path = "../aurcache-types" }
 chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

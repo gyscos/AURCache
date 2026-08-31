@@ -27,6 +27,17 @@ struct ParsedPkg {
     arch: String,
 }
 
+/// A built artifact, enriched as it flows through ingest with where it is to be
+/// written and what the `files` table already knows about it.
+struct IngestPkg {
+    filename: String,
+    bytes: Vec<u8>,
+    parsed: ParsedPkg,
+    pkg_path: PathBuf,
+    existing_id: Option<i32>,
+    existing_package_id: Option<i32>,
+}
+
 /// A single built artifact: its filename and raw bytes.
 pub type Artifact = (String, Vec<u8>);
 
@@ -91,14 +102,23 @@ pub async fn ingest_pkgs_in(
         bail!("No files found in build output");
     }
 
+    let platform_repo = repo_root.join(platform.as_str());
+
     // Parse + filter the artifacts (skip hidden helper files).
-    let mut build_pkgs: Vec<(String, Vec<u8>, ParsedPkg)> = Vec::new();
+    let mut build_pkgs: Vec<IngestPkg> = Vec::new();
     for (filename, bytes) in artifacts {
         if filename.starts_with('.') {
             continue;
         }
         let parsed = parse_arch_pkg(&filename)?;
-        build_pkgs.push((filename, bytes, parsed));
+        build_pkgs.push(IngestPkg {
+            pkg_path: platform_repo.join(&filename),
+            filename,
+            bytes,
+            parsed,
+            existing_id: None,
+            existing_package_id: None,
+        });
     }
 
     if build_pkgs.is_empty() {
@@ -107,29 +127,16 @@ pub async fn ingest_pkgs_in(
 
     // Extract the version from the first built package. All split packages of
     // the same pkgbase share the same pkgver-pkgrel, so any one is representative.
-    let actual_version = build_pkgs[0].2.version.clone();
+    let actual_version = build_pkgs[0].parsed.version.clone();
 
     // PHASE 1: resolve file ownership in a short read transaction so we don't
     // hold a DB connection during the file-write / repo_add phase.
-    struct FileInfo {
-        archive_name: String,
-        pkg_path: PathBuf,
-        parsed_name: String,
-        existing_id: Option<i32>,
-        existing_package_id: Option<i32>,
-    }
 
-    let platform_repo = repo_root.join(platform.as_str());
-
-    let mut file_infos: Vec<FileInfo> = Vec::new();
     {
         let txn = db.begin().await?;
-        for (filename, _bytes, parsed) in &build_pkgs {
-            let archive_name = filename.clone();
-            let pkg_path = platform_repo.join(&archive_name);
-
+        for pkg in &mut build_pkgs {
             let existing = Files::find()
-                .filter(files::Column::Filename.eq(&archive_name))
+                .filter(files::Column::Filename.eq(&pkg.filename))
                 .filter(files::Column::Platform.eq(*platform))
                 .one(&txn)
                 .await?;
@@ -144,23 +151,21 @@ pub async fn ingest_pkgs_in(
                     .await?;
 
                 if existing_owner_depends_on_new_owner.is_none() {
-                    bail!("File '{archive_name}' is already produced by another package");
+                    bail!(
+                        "File '{}' is already produced by another package",
+                        pkg.filename
+                    );
                 }
                 logger
                     .append(format!(
-                        "Transferring file '{archive_name}' from package {} (depends on this package)\n",
-                        ex.package_id
+                        "Transferring file '{}' from package {} (depends on this package)\n",
+                        pkg.filename, ex.package_id
                     ))
                     .await;
             }
 
-            file_infos.push(FileInfo {
-                archive_name,
-                pkg_path,
-                parsed_name: parsed.name.clone(),
-                existing_id: existing.as_ref().map(|e| e.id),
-                existing_package_id: existing.as_ref().map(|e| e.package_id),
-            });
+            pkg.existing_id = existing.as_ref().map(|e| e.id);
+            pkg.existing_package_id = existing.as_ref().map(|e| e.package_id);
         }
         txn.commit().await?;
     }
@@ -175,20 +180,20 @@ pub async fn ingest_pkgs_in(
     fs::create_dir_all(&platform_repo)?;
 
     // PHASE 2: write files and update the pacman repo — no DB connection held.
-    for (fi, (_filename, bytes, _parsed)) in file_infos.iter().zip(build_pkgs.iter()) {
+    for pkg in &build_pkgs {
         logger
-            .append(format!("Write {} to repo directory\n", fi.archive_name))
+            .append(format!("Write {} to repo directory\n", pkg.filename))
             .await;
-        fs::write(&fi.pkg_path, bytes)?;
+        fs::write(&pkg.pkg_path, &pkg.bytes)?;
 
         logger
             .append(format!(
                 "Add {} to repo.db.tar.gz and repo.files.tar.gz\n",
-                fi.archive_name
+                pkg.filename
             ))
             .await;
         pacman_repo_utils::repo_add::repo_add(
-            &fi.pkg_path,
+            &pkg.pkg_path,
             &platform_repo.join("repo.db.tar.gz"),
             &platform_repo.join("repo.files.tar.gz"),
         )?;
@@ -210,9 +215,9 @@ pub async fn ingest_pkgs_in(
             return Err(e.into());
         }
 
-        for fi in &file_infos {
-            let file_id = if let Some(existing_id) = fi.existing_id {
-                if fi.existing_package_id != Some(pkg_id) {
+        for pkg in &build_pkgs {
+            let file_id = if let Some(existing_id) = pkg.existing_id {
+                if pkg.existing_package_id != Some(pkg_id) {
                     let active = files::ActiveModel {
                         id: Set(existing_id),
                         package_id: Set(pkg_id),
@@ -224,7 +229,7 @@ pub async fn ingest_pkgs_in(
                 }
             } else {
                 files::ActiveModel {
-                    filename: Set(fi.archive_name.clone()),
+                    filename: Set(pkg.filename.clone()),
                     platform: Set(*platform),
                     package_id: Set(pkg_id),
                     ..Default::default()
@@ -233,7 +238,7 @@ pub async fn ingest_pkgs_in(
                 .await?
                 .id
             };
-            new_file_ids.insert(fi.parsed_name.clone(), file_id);
+            new_file_ids.insert(pkg.parsed.name.clone(), file_id);
         }
 
         let stale = Files::find()
