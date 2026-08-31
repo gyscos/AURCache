@@ -162,6 +162,13 @@ ROUTES=(
     # says how much it is hiding. Whether it actually hides them is an
     # interaction test -- a marker can only assert presence.
     "/packages|Show dependencies (2)|dependencies are behind a toggle"
+    # One label per state, because one label for all of them said the same
+    # thing of a package that is fine, one that failed and one already queued.
+    # That a queued package offers nothing is a unit test -- a marker can only
+    # assert presence.
+    "/packages|>Rebuild<|a healthy package offers a rebuild"
+    "/packages|>Retry<|a failed package offers a retry"
+    "/packages|>Update<|an out-of-date package offers an update"
     "/packages/add|AUR package name or git URL|the add dialog (depth 2)"
     # A search in the URL is applied on arrival, so a link to one opens with it
     # already narrowed rather than showing everything.

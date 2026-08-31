@@ -5,6 +5,17 @@
 //! name, and the fields are that component's props — a route that does not line
 //! up with its screen is a compile error rather than a blank page.
 
+// `unreachable_code` fires inside the `Routable` expansion rather than on
+// anything written here, and the derive generates an `impl` an attribute on the
+// enum does not reach -- so the allow has to sit on the module. It started
+// warning with the 2026-08-28 nightly; the alternative is failing every build
+// on a lint about code we do not write.
+//
+// The scope is this file, which is the route table, one match over it and its
+// tests. None of that has any business containing unreachable code, so the
+// suppression is unlikely to hide anything of ours.
+#![allow(unreachable_code)]
+
 use crate::screens::*;
 use crate::shell::MenuShell;
 use dioxus::prelude::*;

@@ -27,23 +27,19 @@ async fn load(pkgbase: String) -> Result<Vec<Build>, String> {
 
 #[component]
 pub fn PackageBuilds(pkgbase: String) -> Element {
-    let package = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            async move {
-                crate::api::client()?
-                    .get_package(&pkgbase)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        }
-    });
+    // `use_reactive` so the fetch follows the route. Navigating between two
+    // packages reuses this component -- same route, different parameter -- and
+    // a resource whose closure captured the old name simply never re-runs: the
+    // URL changes, no request is made, and the previous package stays on
+    // screen looking like the one that was clicked.
+    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+        crate::api::client()?
+            .get_package(&pkgbase)
+            .await
+            .map_err(|e| e.to_string())
+    }));
 
-    let builds = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || load(pkgbase.clone())
-    });
+    let builds = use_resource(use_reactive(&pkgbase, load));
     let page = use_signal(|| 0usize);
 
     rsx! {

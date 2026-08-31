@@ -8,37 +8,35 @@ use dioxus::prelude::*;
 /// The screen behind `/package/:pkgbase/build/:number`.
 #[component]
 pub fn Build(pkgbase: String, number: i32) -> Element {
-    let build = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            async move {
-                crate::api::client()?
-                    .get_build(&pkgbase, number)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        }
-    });
+    // `use_reactive` so the fetch follows the route. Navigating between two
+    // packages reuses this component -- same route, different parameter -- and
+    // a resource whose closure captured the old name simply never re-runs: the
+    // URL changes, no request is made, and the previous package stays on
+    // screen looking like the one that was clicked.
+    let build = use_resource(use_reactive(
+        &(pkgbase.clone(), number),
+        |(pkgbase, number)| async move {
+            crate::api::client()?
+                .get_build(&pkgbase, number)
+                .await
+                .map_err(|e| e.to_string())
+        },
+    ));
 
     // Fetched from the build's package so this page carries the same header
     // as every other package-scoped page, with the trail in the same place.
-    let package = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            async move {
-                crate::api::client()?
-                    .get_package(&pkgbase)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .map(Some)
-            }
-        }
-    });
+    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+        crate::api::client()?
+            .get_package(&pkgbase)
+            .await
+            .map_err(|e| e.to_string())
+            .map(Some)
+    }));
 
     rsx! {
-        div { class: "space-y-4",
+        // `h-full` so the log below can flex into what the header leaves,
+        // rather than guessing a fraction of the viewport and overshooting it.
+        div { class: "space-y-4 h-full flex flex-col min-h-0",
             match (&*package.read_unchecked(), &*build.read_unchecked()) {
                 (Some(Ok(Some(pkg))), Some(Ok(build))) => rsx! {
                     crate::screens::PackageHeader {
@@ -145,8 +143,8 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     });
 
     rsx! {
-        div { class: "card bg-base-100 shadow-xl",
-            div { class: "card-body",
+        div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
+            div { class: "card-body flex flex-col min-h-0",
                 div { class: "flex items-center gap-3",
                     if finished() {
                         span { class: "badge badge-ghost badge-sm", "finished" }
@@ -178,8 +176,14 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
 
                 pre {
                     id: "build-log",
+                    // `flex-1 min-h-0` rather than a share of the viewport:
+                    // the log takes whatever is left after the header and the
+                    // footer, so the card fills the window exactly and this is
+                    // the only thing that scrolls. `min-h-0` because a flex
+                    // child will not shrink below its content without it, which
+                    // is what pushed the page past the window before.
                     class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
-                            overflow-auto max-h-[70vh] whitespace-pre-wrap font-mono",
+                            flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
                     if line_count() == 0 {
                         span { class: "opacity-60", "waiting for output…" }
                     } else {

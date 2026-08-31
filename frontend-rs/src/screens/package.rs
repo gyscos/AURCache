@@ -101,10 +101,12 @@ async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), String> 
 
 #[component]
 pub fn Package(pkgbase: String) -> Element {
-    let mut data = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || load(pkgbase.clone())
-    });
+    // `use_reactive` so the fetch follows the route. Navigating between two
+    // packages reuses this component -- same route, different parameter -- and
+    // a resource whose closure captured the old name simply never re-runs: the
+    // URL changes, no request is made, and the previous package stays on
+    // screen looking like the one that was clicked.
+    let mut data = use_resource(use_reactive(&pkgbase, load));
 
     rsx! {
         match &*data.read_unchecked() {

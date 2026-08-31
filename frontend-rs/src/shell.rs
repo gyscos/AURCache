@@ -24,7 +24,13 @@ pub fn MenuShell() -> Element {
         div { class: "drawer lg:drawer-open",
             input { id: DRAWER_ID, r#type: "checkbox", class: "drawer-toggle" }
 
-            div { class: "drawer-content flex flex-col min-h-screen bg-base-200",
+            // `h-screen` rather than `min-h-screen`, with the scrolling moved
+            // inside: a page that wants to fill the window and scroll one pane
+            // of itself -- a build log -- needs an ancestor with a height to
+            // fill. Against `min-h-screen` there is none, so such a page can
+            // only guess at a height, overshoot, and leave the window scrolling
+            // behind the pane that is already scrolling.
+            div { class: "drawer-content flex flex-col h-screen overflow-hidden bg-base-200",
                 // Only exists below `lg`, where the drawer is collapsed.
                 div { class: "navbar bg-base-100 shadow-sm lg:hidden",
                     label {
@@ -35,7 +41,10 @@ pub fn MenuShell() -> Element {
                     span { class: "font-bold px-2", "AURCache" }
                 }
 
-                main { class: "flex-1 p-4 lg:p-6", Outlet::<Route> {} }
+                // The one scrollbar for pages that simply run long. A page
+                // that fills this exactly -- see the build log -- leaves it
+                // with nothing to scroll, and its own pane is the only one.
+                main { class: "flex-1 min-h-0 overflow-y-auto p-4 lg:p-6", Outlet::<Route> {} }
             }
 
             div { class: "drawer-side z-10",

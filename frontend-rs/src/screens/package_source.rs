@@ -29,33 +29,23 @@ pub fn PackageSource(pkgbase: String, path: Vec<String>) -> Element {
 
 #[component]
 pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
-    let package = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            async move {
-                crate::api::client()?
-                    .get_package(&pkgbase)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        }
-    });
+    // `use_reactive` so the fetch follows the route; see the note on the
+    // package screen for what a captured name does when the parameter changes.
+    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+        crate::api::client()?
+            .get_package(&pkgbase)
+            .await
+            .map_err(|e| e.to_string())
+    }));
 
-    let files = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            async move {
-                let client = AurCacheClient::new(api_base(), None).map_err(|e| e.to_string())?;
-                client
-                    .list_source_files(&pkgbase)
-                    .await
-                    .map(|l| l.files)
-                    .map_err(|e| e.to_string())
-            }
-        }
-    });
+    let files = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+        let client = AurCacheClient::new(api_base(), None).map_err(|e| e.to_string())?;
+        client
+            .list_source_files(&pkgbase)
+            .await
+            .map(|l| l.files)
+            .map_err(|e| e.to_string())
+    }));
 
     let mut selected = use_signal(|| Option::<String>::None);
     let mut loaded = use_signal(|| Option::<SourceFileContent>::None);

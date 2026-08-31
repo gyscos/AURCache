@@ -240,6 +240,7 @@ async fn interactions() {
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
     dependencies_stay_out_of_the_list_until_asked_for(&session).await;
+    following_a_dependency_loads_that_package(&session).await;
     a_second_page_holds_different_builds(&session).await;
     a_build_can_be_found_by_the_name_the_list_shows(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
@@ -597,4 +598,39 @@ async fn a_build_can_be_found_by_the_name_the_list_shows(session: &Session) {
             t.contains("hello/2") && !t.contains("neofetch")
         })
         .await;
+}
+
+/// Clicking a dependency actually opens it.
+///
+/// Invisible to every rendering check: both pages render correctly on their
+/// own, and the URL updates either way. What broke was that navigating between
+/// two `/package/:pkgbase` routes reuses the component, so a fetch that
+/// captured the first name never ran again -- the address bar said one package
+/// while the page showed the other, with no request in flight to explain it.
+async fn following_a_dependency_loads_that_package(session: &Session) {
+    // `yay` depends on `hello`, so its dependency list has something to click.
+    session.open("/package/yay").await;
+    session
+        .wait_until("the package to load", |t| t.contains("yay"))
+        .await;
+    assert!(
+        session.text().await.contains("hello"),
+        "expected yay's dependency list to name hello"
+    );
+
+    session.click_labelled("a", "hello").await;
+
+    // The breadcrumb, not the body: `yay` appears on hello's page too, in its
+    // dependents list, so "does the text mention hello" is true either way.
+    // The heading is what says which package the page is actually about.
+    session
+        .wait_until("the dependency's own page", |t| {
+            t.contains("Packages/hello")
+        })
+        .await;
+    assert!(
+        session.url().await.ends_with("/package/hello"),
+        "url did not follow the click: {}",
+        session.url().await
+    );
 }

@@ -13,6 +13,7 @@ use crate::listing::{
 use crate::routes::Route;
 use crate::status::StatusBadge;
 use aurcache_client::SimplePackage;
+use aurcache_types::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// Columns that only appear once there is room for them.
@@ -46,7 +47,7 @@ pub fn Packages(
     #[props(default = true)]
     sync_url: bool,
 ) -> Element {
-    let packages = use_resource(load_packages);
+    let mut packages = use_resource(load_packages);
     let query = use_url_search(q, sync_url, |q| Route::Packages { q });
     let status = use_signal(|| StatusFilter::ANY);
     // Off by default: the list reads as the set of packages somebody is
@@ -208,14 +209,10 @@ pub fn Packages(
                                             }
                                             td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
                                             td { class: "{WIDE_ONLY} text-right",
-                                                button {
-                                                    class: "btn btn-ghost btn-xs",
-                                                    // A button inside a clickable
-                                                    // row has to claim its own
-                                                    // click, or pressing it also
-                                                    // navigates away.
-                                                    onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                    "Update"
+                                                RowAction {
+                                                    pkgbase: pkg.name.clone(),
+                                                    action: row_action(pkg.status, pkg.outofdate),
+                                                    on_changed: move |()| packages.restart(),
                                                 }
                                             }
                                         }
@@ -243,5 +240,185 @@ pub fn Packages(
                 }
             }
         }
+    }
+}
+
+/// What a package's row offers to do about its current state.
+///
+/// One button, whose label is the thing it would actually accomplish. A row
+/// that always says "Update" says it of a package that is up to date, of one
+/// whose last build failed, and of one already queued -- three states in which
+/// it means three different things, and one in which it means nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// Upstream has moved: fetch the new version.
+    Update,
+    /// The last build failed. Same version, another go.
+    Retry,
+    /// Nothing is wrong; build it again anyway.
+    Rebuild,
+}
+
+impl Action {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Update => "Update",
+            Self::Retry => "Retry",
+            Self::Rebuild => "Rebuild",
+        }
+    }
+
+    /// Whether to build regardless of what the upstream version says.
+    ///
+    /// Only `Update` has a new version to go and get; the other two are asking
+    /// for another build of what is already there, which an unforced update
+    /// would decline to do.
+    fn force(self) -> bool {
+        self != Self::Update
+    }
+}
+
+/// The action a package's state calls for, or `None` when there is nothing
+/// useful to offer.
+///
+/// Out of date comes before the build outcome: a package whose last build
+/// failed *and* which has since gone out of date is better served by fetching
+/// the new version than by rebuilding the one that failed.
+///
+/// A package with a build already queued or running gets nothing. The work is
+/// happening; a second request would either be refused or queue a duplicate,
+/// and a button cannot say which.
+#[must_use]
+pub fn row_action(status: i32, outofdate: i32) -> Option<Action> {
+    match BuildState::from_i32(status) {
+        Some(BuildState::Active | BuildState::Enqueued | BuildState::WaitingForDeps) => None,
+        _ if outofdate != 0 => Some(Action::Update),
+        Some(BuildState::Failed) => Some(Action::Retry),
+        Some(BuildState::Successful) => Some(Action::Rebuild),
+        // A status this build of the frontend does not know. Offering an action
+        // for a state it cannot describe is worse than offering none.
+        None => None,
+    }
+}
+
+/// The row's button, or nothing.
+#[component]
+fn RowAction(pkgbase: String, action: Option<Action>, on_changed: EventHandler<()>) -> Element {
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    let Some(action) = action else {
+        return rsx! {};
+    };
+
+    rsx! {
+        div { class: "flex items-center justify-end gap-2",
+            if let Some(message) = error() {
+                span { class: "text-xs text-error", title: "{message}", "failed" }
+            }
+            button {
+                class: "btn btn-ghost btn-xs",
+                disabled: busy(),
+                // A button inside a clickable row has to claim its own click,
+                // or pressing it also navigates away.
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    let pkgbase = pkgbase.clone();
+                    async move {
+                        busy.set(true);
+                        error.set(None);
+                        let outcome = match client() {
+                            Ok(client) => client
+                                .update_package(
+                                    &pkgbase,
+                                    &aurcache_client::UpdatePackageRequest { force: action.force() },
+                                )
+                                .await
+                                .map_err(|e| e.to_string()),
+                            Err(e) => Err(e),
+                        };
+                        match outcome {
+                            // The list is how the new state becomes visible:
+                            // the row's action changes as soon as the build is
+                            // queued, which is the feedback that it worked.
+                            Ok(_) => on_changed.call(()),
+                            Err(e) => error.set(Some(e)),
+                        }
+                        busy.set(false);
+                    }
+                },
+                if busy() {
+                    span { class: "loading loading-spinner loading-xs" }
+                }
+                {action.label()}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, row_action};
+    use aurcache_types::build_state::BuildState;
+
+    const FRESH: i32 = 0;
+    const STALE: i32 = 1;
+
+    /// The four states the button is meant to distinguish, which one label for
+    /// all of them could not.
+    #[test]
+    fn the_action_matches_what_the_package_needs() {
+        assert_eq!(
+            row_action(BuildState::Successful.as_i32(), FRESH),
+            Some(Action::Rebuild)
+        );
+        assert_eq!(
+            row_action(BuildState::Failed.as_i32(), FRESH),
+            Some(Action::Retry)
+        );
+        assert_eq!(
+            row_action(BuildState::Successful.as_i32(), STALE),
+            Some(Action::Update)
+        );
+    }
+
+    /// Work already in flight. A second request would either be refused or
+    /// queue a duplicate, and the row cannot say which.
+    #[test]
+    fn a_package_already_building_offers_nothing() {
+        for state in [
+            BuildState::Active,
+            BuildState::Enqueued,
+            BuildState::WaitingForDeps,
+        ] {
+            assert_eq!(row_action(state.as_i32(), FRESH), None, "{state:?}");
+            // Even out of date: the build under way is what resolves it.
+            assert_eq!(row_action(state.as_i32(), STALE), None, "{state:?}");
+        }
+    }
+
+    /// A new version is worth more than another go at the old one, so this
+    /// says Update rather than Retry.
+    #[test]
+    fn out_of_date_outranks_a_failed_build() {
+        assert_eq!(
+            row_action(BuildState::Failed.as_i32(), STALE),
+            Some(Action::Update)
+        );
+    }
+
+    /// Only `Update` has a new version to fetch; the others are asking for
+    /// another build of what is there, which an unforced update declines.
+    #[test]
+    fn only_an_update_defers_to_the_upstream_version() {
+        assert!(!Action::Update.force());
+        assert!(Action::Retry.force());
+        assert!(Action::Rebuild.force());
+    }
+
+    /// A status this build does not know is not an invitation to guess.
+    #[test]
+    fn an_unknown_status_offers_nothing() {
+        assert_eq!(row_action(99, FRESH), None);
     }
 }
