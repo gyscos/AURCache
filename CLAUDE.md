@@ -4,17 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AURCache is a build server and repository for Arch Linux packages sourced from the AUR. It has a Rust
-backend and a Flutter web frontend. Users add AUR (or git) packages for building; AURCache builds them
-in containers and serves the results as a pacman repository, and detects when packages are out of date.
+AURCache is a build server and repository for Arch Linux packages sourced from the AUR. Backend and
+frontend are both Rust. Users add AUR (or git) packages for building; AURCache builds them in
+containers and serves the results as a pacman repository, and detects when packages are out of date.
+
+`frontend-rs/` (Dioxus, compiled to wasm) is the frontend. `frontend/` is the older Flutter UI and is
+**deprecated: do not make changes there.** The two have already diverged — the Flutter sidebar has no
+Packages entry, and its models lag the API — and only the Rust one is built, linted, tested or shipped.
 
 ## Build, test, and lint commands
 
 ```bash
-# repo helpers (Justfile at repo root)
-just format   # cargo fmt + dart format
-just lint     # cargo clippy + flutter analyze
-just codegen  # flutter pub get + build_runner build
+# repo helpers (Justfile at repo root) -- these are the whole workflow
+just serve         # run a server with the UI embedded, as the container ships it
+just format        # cargo fmt, both workspaces
+just lint          # clippy over both workspaces; the frontend for wasm *and* host
+just test          # cargo test, both workspaces (no browser)
+just test-browser  # scripts/test-frontend.sh
 just clean
 
 # Rust backend workspace
@@ -28,19 +34,18 @@ cargo test --all
 cargo test -p aurcache-db --test dependency_backfill backfill_creates_dependency_links
 cargo test -p aurcache-utils --test add scenario_b_one_aur_dep
 
-# Flutter frontend
-cd frontend
-flutter pub get
-flutter pub run build_runner build --delete-conflicting-outputs
-flutter analyze --no-fatal-infos
-dart format --set-exit-if-changed .
-flutter test
+# Rust frontend (its own workspace: it only builds for wasm32-unknown-unknown,
+# so including it in the backend workspace would break `cargo build --workspace`)
+cd frontend-rs
+cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test          # host target; the component logic, not the browser
 
-# run a single Flutter test file
-flutter test test/widget_test.dart
+# There is no separate frontend build step. `aurcache-api`'s build script
+# compiles the frontend to wasm and embeds it under the `static` feature,
+# re-running whenever the frontend changes.
+cd backend && cargo run --features aurcache-api/static -p aurcache
 
 # builds used elsewhere in the repo
-cd frontend && flutter build web
 cd docs && yarn install --frozen-lockfile && yarn build
 
 # Rust frontend in a real browser: asserts every route mounts (~1 min)
@@ -90,9 +95,19 @@ defect this frontend has had was of that kind.
   `Authorization: Bearer <token>`, resolving `--url`/`--token`, then `AURCACHE_URL`/`AURCACHE_TOKEN`, then
   `~/.config/aurcache-client/config.json`, then an interactive prompt (saved back to the config file). Use
   `--format json` for machine-readable output, or `raw` for endpoints without a dedicated subcommand.
-- `frontend/` is a Flutter web UI. Navigation is in `lib/components/routing/router.dart`, HTTP access is
-  via Dio in `lib/api`, async state is exposed through Riverpod providers in `lib/providers`, and typed API
-  models live in `lib/models`.
+- `backend/aurcache-common` is the shared leaf crate: the API types the server, CLI and browser frontend
+  all speak, plus small helpers that would otherwise be duplicated or force a heavy dependency. Everything
+  in it is dependency-free or behind a feature — `db` (sea-orm derives) and `fs` (filesystem helpers) are
+  both on by default, and wasm consumers take `default-features = false` and still get the types. CI's
+  "Check driver-free types" job (`cargo check -p aurcache-common --no-default-features`) is what keeps
+  that true; a workspace build always turns the features on, so nothing else would catch a regression.
+  It was called `aurcache-types` until it grew helpers as well as types.
+- `frontend-rs/` is the Dioxus UI, in its own workspace because it only builds for
+  `wasm32-unknown-unknown`. Routes are in `src/routes.rs`, the sidebar and layout in `src/shell.rs`,
+  screens in `src/screens/`, and the pure filter/sort/paginate helpers in `src/listing.rs` — those are
+  where list behaviour is tested, since components cannot be rendered in a unit test. The API client is
+  `aurcache-client`, the same one the CLI uses, so API shapes are shared rather than re-declared.
+- `frontend/` is the deprecated Flutter UI. Nothing there is built or tested any more; leave it alone.
 - `docs/` is a separate Docusaurus site used for published documentation.
 
 ## Key conventions
@@ -110,13 +125,14 @@ defect this frontend has had was of that kind.
   encodings when touching DB, API, or model conversion code.
 - Settings are resolved through `ApplicationSettings` helpers, not by reading env vars ad hoc. The
   effective precedence in code is `Package -> Env -> Global -> Default`.
-- Frontend data/state layers depend on code generation. Models use `json_serializable` and `freezed`;
-  providers use `@riverpod`. After editing annotated Dart files, rerun
-  `flutter pub run build_runner build --delete-conflicting-outputs`.
-- Generated Dart files (`*.g.dart`, `*.freezed.dart`) are analyzer-excluded; edit the source file, not the
-  generated output.
-- The frontend talks to `http://localhost:8080/api` in debug builds and resolves `api/` relative to the
-  current origin in release/web builds.
+- API shapes live in `aurcache-common` and are shared, never re-declared. A field added to a response is
+  added once and the CLI, the client library and the frontend all see it; mirroring a struct by hand is
+  how the two ends drift apart.
+- The frontend resolves the API against the origin the page was served from, falling back to
+  `http://localhost:8080/api` when there is no window (see `frontend-rs/src/api.rs`).
+- A size, a count or a total that is not known is `Option::None`, not `0`: "nothing recorded" and "zero
+  bytes" are different answers, and the UI renders the first as a dash. Totals over several such values
+  are all-or-nothing — a sum of only the known parts reads as a wrong number rather than as missing data.
 - The repo includes multiple containerized workflows: `docker-compose.hostmode.dev.yaml` mounts the host
   Docker socket for builds, `docker-compose.dindmode.dev.yaml` is the simpler dev setup, and
   `scripts/test-e2e.sh` exercises `docker-compose.e2e.yaml` end to end.
