@@ -2,7 +2,6 @@ use anyhow::anyhow;
 use aurcache_common::build_state::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::action::Action;
-use aurcache_db::helpers::active_value_ext::ActiveValueExt;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, packages};
@@ -79,8 +78,8 @@ async fn check_versions(
     };
 
     for package in packages {
+        let package_id = package.id;
         let mut package_model: packages::ActiveModel = package.clone().into();
-        let package_id = *package_model.id.get()?;
 
         // Query the latest build.version for this package (most recent by end_time then start_time)
         let latest_version_row = Builds::find()

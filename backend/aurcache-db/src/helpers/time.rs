@@ -1,9 +1,16 @@
 //! Shared wall-clock helper.
 //!
-//! Lives here rather than in a dedicated utility crate because `aurcache-db` is
-//! the lowest crate every server-side consumer already depends on. The
-//! `aurcache-worker` binary deliberately does *not* depend on it (only its
-//! tests do), so it keeps its own copy.
+//! Lives here because `aurcache-db` is the lowest crate every server-side
+//! consumer already depends on, and everything that calls this stores the
+//! result in a timestamp column.
+//!
+//! `aurcache-worker-core` keeps its own four-line copy, and should: both crates
+//! do depend on `aurcache-common`, so this *could* move there, but the worker's
+//! version returns `u64` for an `AtomicU64` it subtracts with `saturating_sub`
+//! to get an age, while this one returns `i64` for signed SQL columns. Sharing
+//! one of them would buy four deduplicated lines at the price of a cast at
+//! every call site on the other side -- and an `i64`-to-`u64` cast of a
+//! backwards clock turns "0 seconds" into several billion.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

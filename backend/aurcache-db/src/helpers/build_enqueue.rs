@@ -5,7 +5,7 @@ use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    IntoActiveModel, QueryFilter, TryIntoModel,
+    IntoActiveModel, QueryFilter,
 };
 
 pub struct EnqueueBuildResult {
@@ -126,6 +126,6 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
 
     let mut active = build.into_active_model();
     active.status = Set(Some(STATUS_ENQUEUED));
-    let updated = active.save(db).await?.try_into_model()?;
+    let updated = active.update(db).await?;
     Ok(Some(updated))
 }

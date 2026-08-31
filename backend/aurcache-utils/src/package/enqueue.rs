@@ -12,7 +12,6 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::Sender;
 use tracing::warn;
 
@@ -265,7 +264,7 @@ async fn trigger_build_for_package(
             pkg.id,
             *platform,
             &version,
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+            aurcache_db::helpers::time::now_secs(),
             initial_status,
         )
         .await?;

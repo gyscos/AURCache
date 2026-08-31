@@ -9,7 +9,6 @@ use aurcache_db::prelude::Activities;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Order, QueryOrder, QuerySelect};
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // Defined in aurcache-common so the HTTP client and the browser frontend use
 // the same struct rather than a hand-mirrored copy.
@@ -33,7 +32,7 @@ impl ActivityLog {
         user: Option<String>,
     ) -> anyhow::Result<()> {
         let activity = serde_json::to_string(&activity)?;
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let timestamp = aurcache_db::helpers::time::now_secs();
 
         activities::ActiveModel {
             timestamp: Set(timestamp),

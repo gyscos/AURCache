@@ -19,7 +19,6 @@ use sea_orm::prelude::BigDecimal;
 use sea_orm::{ColumnTrait, QueryFilter};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm::{DbBackend, FromQueryResult, PaginatorTrait, Statement};
-use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -280,7 +279,7 @@ async fn count_builds(
 }
 
 async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let now = aurcache_db::helpers::time::now_secs();
     let cutoff = now - RECENT_DAYS * 24 * 60 * 60;
 
     let trends = build_trends(db).await?;

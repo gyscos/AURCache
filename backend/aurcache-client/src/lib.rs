@@ -285,7 +285,6 @@ impl AurCacheClient {
         .await
     }
 
-    /// Fetches details for a single build id.
     /// Fetch one build by its public identity, `<pkgbase>/<number>`.
     pub async fn get_build(&self, pkgbase: &str, number: i32) -> Result<Build> {
         self.request_json::<Build, Value>(
@@ -316,7 +315,6 @@ impl AurCacheClient {
         .await
     }
 
-    /// Retries the given build and returns the new build id.
     /// Re-runs the given build, returning the new build's number within the
     /// same package.
     pub async fn retry_build(&self, pkgbase: &str, number: i32) -> Result<i32> {

@@ -7,7 +7,6 @@ use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
-use aurcache_db::helpers::active_value_ext::ActiveValueExt;
 use aurcache_db::helpers::dependency_resolution::PackageCandidate;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
@@ -600,8 +599,8 @@ async fn persist_plan(
             patch: Set(pkg.patch),
             ..Default::default()
         };
-        let saved = model.save(&txn).await?;
-        ids.insert(pkg.pkgbase.clone(), *saved.id.get()?);
+        let inserted = model.insert(&txn).await?;
+        ids.insert(pkg.pkgbase.clone(), inserted.id);
         added_order.push(pkg.pkgbase);
     }
 

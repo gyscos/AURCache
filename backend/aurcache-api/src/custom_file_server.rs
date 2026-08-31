@@ -83,7 +83,8 @@ impl Handler for CustomFileServer {
 
         let mut builder = match get_range_header_data(req, file_size, &file_path).await {
             Some((partial_data, start, end)) => {
-                // Build a 206 Partial Content response.
+                // Build a 206 Partial Content response. The builder methods
+                // return `&mut Builder`, so this cannot be a returned chain.
                 let mut builder = Response::build();
                 builder
                     .status(Status::PartialContent)
@@ -91,7 +92,6 @@ impl Handler for CustomFileServer {
                         "Content-Range",
                         format!("bytes {}-{}/{}", start, end - 1, file_size),
                     )
-                    .raw_header("Accept-Ranges", "bytes")
                     .sized_body(partial_data.len(), Cursor::new(partial_data));
                 builder
             }

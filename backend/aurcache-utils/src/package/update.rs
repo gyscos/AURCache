@@ -22,7 +22,6 @@ use sea_orm::{
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::Sender;
 use tracing::info;
 
@@ -643,7 +642,7 @@ async fn enqueue_platform_builds(
             });
         } else {
             let txn = services.db.begin().await?;
-            let start_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+            let start_time = aurcache_db::helpers::time::now_secs();
             let waiting = enqueue_build_if_missing(
                 &txn,
                 request.pkg_model.id,
@@ -688,7 +687,7 @@ pub async fn update_platform(
     }
 
     let txn = db.begin().await?;
-    let start_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let start_time = aurcache_db::helpers::time::now_secs();
     let enqueue_result = enqueue_build_if_missing(
         &txn,
         pkg.id,
