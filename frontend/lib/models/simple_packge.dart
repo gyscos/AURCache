@@ -17,6 +17,12 @@ class SimplePackage {
   /// Null until a version check has determined it; see the note above.
   final String? upstream_version;
 
+  /// Combined size in bytes of this package's artifacts in the repository.
+  ///
+  /// Null when there is nothing to total: the package has never built, or one
+  /// of its artifacts has no recorded size. Never a partial sum.
+  final int? total_size;
+
   SimplePackage({
     required this.id,
     required this.name,
@@ -24,6 +30,7 @@ class SimplePackage {
     required this.latest_version,
     required this.upstream_version,
     required this.outofdate,
+    this.total_size,
   });
 
   factory SimplePackage.fromJson(Map<String, dynamic> json) =>
@@ -37,6 +44,7 @@ class SimplePackage {
     latest_version: '1.0.0',
     upstream_version: '1.0.0',
     outofdate: false,
+    total_size: 1258291,
   );
 
   static bool _fromJson(num value) => value != 0;

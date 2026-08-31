@@ -568,6 +568,19 @@ async fn list_packages(
         successful = BuildStates::SUCCESSFUL_BUILD
     );
 
+    // Same all-or-nothing rule the package page applies to its own total: the
+    // `CASE` yields NULL unless every artifact has a recorded size, so a
+    // partial sum never reaches the column. A package with no artifacts sums
+    // over no rows and is NULL too, which is what "nothing built yet" should
+    // show.
+    //
+    // `CAST(... AS BIGINT)` because Postgres widens `SUM(bigint)` to `numeric`,
+    // which does not decode into an `i64`; SQLite reads the cast as its own
+    // INTEGER affinity and is unaffected.
+    let total_size_subquery = "(SELECT CASE WHEN COUNT(*) = COUNT(f.size) \
+        THEN CAST(SUM(f.size) AS BIGINT) END \
+        FROM files f WHERE f.package_id = packages.id)";
+
     let all: Vec<SimplePackage> = Packages::find()
         .select_only()
         .column(packages::Column::Name)
@@ -585,6 +598,7 @@ async fn list_packages(
         // reported it this way, so coercing here made one field mean two
         // different things depending on which route you asked.
         .column_as(Expr::cust(&latest_version_subquery), "latest_version")
+        .column_as(Expr::cust(total_size_subquery), "total_size")
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
@@ -1136,6 +1150,69 @@ mod file_tests {
                 "aaa-1.0-1-x86_64.pkg.tar.zst",
                 "zzz-1.0-1-x86_64.pkg.tar.zst"
             ]
+        );
+    }
+
+    /// The list column totals a package's artifacts, and applies the same
+    /// all-or-nothing rule the detail page does: one unrecorded size makes the
+    /// whole total unknown, rather than reporting a sum smaller than the files
+    /// it covers. Exercised through the real SQL, since the rule lives in a
+    /// `CASE` expression rather than in Rust.
+    #[tokio::test]
+    async fn the_list_totals_artifact_sizes_all_or_nothing() {
+        use super::list_packages;
+        use aurcache_db::packages;
+        use aurcache_db::packages::SourceData;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        let mut ids = std::collections::HashMap::new();
+        for name in ["complete", "partial", "unbuilt"] {
+            let row = packages::ActiveModel {
+                name: Set(name.to_string()),
+                status: Set(1),
+                out_of_date: Set(0),
+                upstream_version: Set(Some("1.0.0".to_string())),
+                latest_build: Set(None),
+                build_flags: Set(String::new()),
+                platforms: Set("x86_64".to_string()),
+                source_type: Set(packages::SourceType::Aur),
+                source_data: Set(SourceData::Aur { name: name.into() }),
+                directly_requested: Set(true),
+                split_packages: Set(None),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            ids.insert(name, row.id);
+        }
+
+        file(&db, "complete-a.pkg.tar.zst", ids["complete"], Some(1000)).await;
+        file(&db, "complete-b.pkg.tar.zst", ids["complete"], Some(24)).await;
+        file(&db, "partial-a.pkg.tar.zst", ids["partial"], Some(1000)).await;
+        file(&db, "partial-b.pkg.tar.zst", ids["partial"], None).await;
+
+        let listed = list_packages(&db, None, None, true).await.unwrap();
+        let total = |name: &str| {
+            listed
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the list"))
+                .total_size
+        };
+
+        assert_eq!(total("complete"), Some(1024));
+        assert_eq!(
+            total("partial"),
+            None,
+            "a partial sum reached the column instead of being suppressed"
+        );
+        assert_eq!(
+            total("unbuilt"),
+            None,
+            "a package with no artifacts should have no total, not zero"
         );
     }
 

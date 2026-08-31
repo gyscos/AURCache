@@ -157,6 +157,8 @@ ROUTES=(
     "/package/paru/builds|Page 1 of|a long history is paged too"
     "/package/hello/build/1|hello|build log (depth 4)"
     "/packages|Upstream|packages list"
+    "/packages|Size|the packages list has a size column"
+    "/packages|1.2 MiB|the size column totals a package's artifacts"
     "/packages|—|missing version shows a placeholder"
     # The list is what somebody asked for; the closure is behind a toggle that
     # says how much it is hiding. Whether it actually hides them is an

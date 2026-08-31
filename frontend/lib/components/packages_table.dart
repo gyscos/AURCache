@@ -2,6 +2,7 @@ import 'package:aurcache/api/packages.dart';
 import 'package:aurcache/providers/builds.dart';
 import 'package:aurcache/providers/packages.dart';
 import 'package:aurcache/providers/statistics.dart';
+import 'package:aurcache/utils/file_formatter.dart';
 import 'package:aurcache/utils/responsive.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
@@ -33,6 +34,10 @@ class PackagesTable extends ConsumerWidget {
       columns: [
         DataColumn(label: Skeleton.keep(child: Text("Package Name"))),
         DataColumn(label: Skeleton.keep(child: Text("Version"))),
+        // Desktop-only, like the other reference columns: a phone-width table
+        // has room for the name, version and status, and not much else.
+        if (context.desktop)
+          DataColumn(label: Skeleton.keep(child: Text("Size")), numeric: true),
         if (context.desktop)
           DataColumn(label: Skeleton.keep(child: Text("Up-To-Date"))),
         DataColumn(label: Skeleton.keep(child: Text("Status"))),
@@ -61,6 +66,10 @@ class PackagesTable extends ConsumerWidget {
               : null,
         ),
         DataCell(Text(package.latest_version ?? '—')),
+        // A dash covers both "nothing built yet" and "a size is missing"; the
+        // status column already says which of the two a row is.
+        if (context.desktop)
+          DataCell(Text(package.total_size?.readableFileSize() ?? '—')),
         if (context.desktop)
           DataCell(
             IconButton(

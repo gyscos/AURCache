@@ -101,6 +101,15 @@ pub struct SimplePackage {
     /// explicitly only flips `directly_requested`. Typed as a plain `String`
     /// this failed to decode, which took down the whole route, not one row.
     pub upstream_version: Option<String>,
+    /// Combined size in bytes of every artifact this package has in the
+    /// repository.
+    ///
+    /// `None` when there is nothing to total: the package has never built, or
+    /// at least one of its artifacts has no recorded size. Deliberately not a
+    /// partial sum -- a total smaller than the files it claims to cover reads
+    /// as a bug rather than as missing data. Matches the total the package page
+    /// shows for the same package.
+    pub total_size: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]

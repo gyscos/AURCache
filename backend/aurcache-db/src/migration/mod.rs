@@ -17,6 +17,7 @@ mod m20260826_000000_package_source_metadata;
 mod m20260827_000000_build_number;
 mod m20260827_000001_download_counts;
 mod m20260831_000000_file_size;
+mod m20260831_000001_files_package_id_index;
 
 pub struct Migrator;
 
@@ -48,6 +49,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260827_000000_build_number::Migration),
             Box::new(m20260827_000001_download_counts::Migration),
             Box::new(m20260831_000000_file_size::Migration),
+            Box::new(m20260831_000001_files_package_id_index::Migration),
         ]
     }
 }

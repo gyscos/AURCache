@@ -205,6 +205,7 @@ mod tests {
             outofdate,
             latest_version: None,
             upstream_version: None,
+            total_size: None,
         }
     }
 

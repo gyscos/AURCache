@@ -6,6 +6,7 @@
 //! response shape becomes a compile error here.
 
 use crate::api::client;
+use crate::format::format_bytes;
 use crate::listing::{
     ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
     filter_packages, paginate, sort_packages, use_url_search,
@@ -144,6 +145,10 @@ pub fn Packages(
                                         // Upstream and Actions are dropped on a
                                         // narrow screen rather than scrolled to.
                                         th { class: "{WIDE_ONLY}", "Upstream" }
+                                        // Not sortable, matching Version and
+                                        // Upstream: the sort key is shared with
+                                        // the builds list, which has no size.
+                                        th { class: "{WIDE_ONLY} text-right", "Size" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                         th { class: "{WIDE_ONLY} text-right", "Actions" }
                                     }
@@ -207,6 +212,9 @@ pub fn Packages(
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 {pkg.upstream_version.clone().unwrap_or_else(|| "—".into())}
                                             }
+                                            td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
+                                                {package_size(pkg)}
+                                            }
                                             td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
                                             td { class: "{WIDE_ONLY} text-right",
                                                 RowAction {
@@ -241,6 +249,17 @@ pub fn Packages(
             }
         }
     }
+}
+
+/// A package's combined artifact size for the list column.
+///
+/// A dash covers both "nothing built yet" and "a size is missing" — the server
+/// sends `None` for either, and the status column already says which of the two
+/// this row is.
+fn package_size(pkg: &SimplePackage) -> String {
+    pkg.total_size
+        .and_then(|size| u64::try_from(size).ok())
+        .map_or_else(|| "—".to_string(), format_bytes)
 }
 
 /// What a package's row offers to do about its current state.
