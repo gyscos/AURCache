@@ -1,4 +1,5 @@
 pub mod add;
+pub mod bulk_add;
 pub mod delete;
 pub mod enqueue;
 pub mod live_check;

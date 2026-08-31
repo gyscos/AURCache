@@ -3,6 +3,7 @@
 pub use super::activities::Entity as Activities;
 pub use super::api_tokens::Entity as ApiTokens;
 pub use super::builds::Entity as Builds;
+pub use super::bulk_adds::Entity as BulkAdds;
 pub use super::dependencies::Entity as Dependencies;
 pub use super::files::Entity as Files;
 pub use super::package_vcs_sources::Entity as PackageVcsSources;

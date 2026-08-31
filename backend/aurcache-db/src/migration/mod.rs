@@ -19,6 +19,7 @@ mod m20260827_000001_download_counts;
 mod m20260831_000000_file_size;
 mod m20260831_000001_files_package_id_index;
 mod m20260831_000002_build_size;
+mod m20260831_000003_bulk_adds;
 
 pub struct Migrator;
 
@@ -52,6 +53,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000000_file_size::Migration),
             Box::new(m20260831_000001_files_package_id_index::Migration),
             Box::new(m20260831_000002_build_size::Migration),
+            Box::new(m20260831_000003_bulk_adds::Migration),
         ]
     }
 }

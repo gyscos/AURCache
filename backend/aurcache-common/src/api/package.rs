@@ -162,6 +162,71 @@ pub struct ExtendedPackage {
     pub last_modified: Option<i64>,
 }
 
+/// Request to add several packages in one go.
+///
+/// Separate from [`AddPackage`] rather than a list of them because the point is
+/// what the server can do once it sees the whole set: every AUR name is
+/// resolved to its pkgbase in one batched RPC request instead of one per
+/// package. Targeting is shared across the batch -- a restore applies the same
+/// platforms and flags to everything it puts back.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+pub struct AddPackages {
+    pub platforms: Option<Vec<String>>,
+    pub build_flags: Option<Vec<String>>,
+    pub sources: Vec<SourceData>,
+}
+
+/// What starting a bulk add returns, immediately.
+///
+/// The work is not done when this is sent -- it has barely started. Poll
+/// [`BulkAddProgress`] with the id to watch it, or do not: the job does not
+/// depend on anyone watching.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct BulkAddAccepted {
+    pub job_id: i32,
+    /// How many sources were taken on. Not how many will succeed.
+    pub accepted: i32,
+}
+
+/// How one package in a bulk add turned out.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum BulkAddOutcome {
+    /// Added, along with any dependencies it pulled in.
+    Added,
+    /// Already present, so nothing to do. Marked directly-requested if it had
+    /// only been here as a dependency.
+    Existed,
+    /// Not added. The rest of the batch continued regardless.
+    Failed { error: String },
+}
+
+/// One line of a bulk add's progress.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct BulkAddEntry {
+    /// The source as the caller named it, so a failure can be matched back to
+    /// the request even when the name never resolved to a pkgbase.
+    pub name: String,
+    #[serde(flatten)]
+    pub outcome: BulkAddOutcome,
+}
+
+/// A bulk add's state, and the entries after the offset the caller asked from.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct BulkAddProgress {
+    pub id: i32,
+    pub total: i32,
+    pub completed: i32,
+    pub failed: i32,
+    /// Whether the job has stopped -- successfully or not. A job whose server
+    /// restarted mid-run is finished too, with the unreached packages recorded
+    /// as failures rather than left pending forever.
+    pub finished: bool,
+    /// Entries from the requested offset onwards, so a caller polling only ever
+    /// receives what it has not already seen.
+    pub entries: Vec<BulkAddEntry>,
+}
+
 /// One built artifact in the repository.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
 pub struct PackageFile {

@@ -6,6 +6,7 @@ pub mod action;
 pub mod activities;
 pub mod api_tokens;
 pub mod builds;
+pub mod bulk_adds;
 pub mod dependencies;
 pub mod files;
 pub mod helpers;

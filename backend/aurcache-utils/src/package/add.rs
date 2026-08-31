@@ -22,7 +22,7 @@ use sea_orm::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::broadcast::Sender;
 
-struct AddContext {
+pub(crate) struct AddContext {
     platforms: Vec<Platform>,
     platforms_str: String,
     build_flags_str: String,
@@ -105,7 +105,7 @@ fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn build_add_context(
+pub(crate) fn build_add_context(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
 ) -> AddContext {
@@ -157,7 +157,7 @@ fn collect_dependency_requirements<'a>(
     })
 }
 
-async fn package_exists(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<bool> {
+pub(crate) async fn package_exists(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<bool> {
     Ok(Packages::find()
         .filter(packages::Column::Name.eq(pkgbase))
         .one(db)
@@ -363,13 +363,43 @@ async fn add_package_with_source(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
-    let source_data = match source_data {
+    let source_data = resolve_source_pkgbase(client, source_data).await?;
+    add_resolved_source(client, store, db, tx, context, source_data, patched_files).await
+}
+
+/// Turn a caller's source into one naming a pkgbase.
+///
+/// An AUR source may name any *pkgname*, which is not necessarily the pkgbase
+/// that owns it (`czkawka-cli` belongs to `czkawka`), and everything downstream
+/// keys on the pkgbase. Split out so a bulk add can resolve a whole batch of
+/// names in one request rather than paying for this one package at a time --
+/// see [`super::bulk_add`].
+pub(crate) async fn resolve_source_pkgbase(
+    client: &aurcache_deps::AurClient,
+    source_data: SourceData,
+) -> anyhow::Result<SourceData> {
+    Ok(match source_data {
         SourceData::Aur { name } => SourceData::Aur {
             name: resolve_aur_pkgbase(client, &name).await?,
         },
         SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
         other => other,
-    };
+    })
+}
+
+/// Add a source whose pkgbase is already known.
+///
+/// The half of the add that stays per-package: a checkout, a dependency plan,
+/// and the rows. Only the resolution in front of it batches.
+pub(crate) async fn add_resolved_source(
+    client: &aurcache_deps::AurClient,
+    store: &SnapshotStore,
+    db: &DatabaseConnection,
+    tx: &Sender<Action>,
+    context: &AddContext,
+    source_data: SourceData,
+    patched_files: Option<BTreeMap<String, String>>,
+) -> anyhow::Result<String> {
     let package_spec = resolve_srcinfo_to_spec(
         store,
         &source_data,
