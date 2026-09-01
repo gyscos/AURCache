@@ -10,6 +10,7 @@ use git2::Oid;
 use lru::LruCache;
 use tokio::sync::Mutex;
 
+use crate::git::checkout::EmptyRepository;
 use crate::patch::SourcePatch;
 use crate::pkgbuild::fix_source_urls;
 
@@ -384,7 +385,9 @@ impl SnapshotStore {
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
 
         let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path).await?;
+            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path)
+                .await
+                .map_err(|e| explain_source_failure(source_data, e))?;
 
         let changed = previous_commit != Some(commit);
         if changed {
@@ -427,7 +430,9 @@ impl SnapshotStore {
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
         let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path).await?;
+            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path)
+                .await
+                .map_err(|e| explain_source_failure(source_data, e))?;
         let raw = SourceSnapshot {
             archive_bytes,
             sourceinfo,
@@ -484,6 +489,87 @@ impl SnapshotStore {
             }
             SourceData::Upload { .. } => anyhow::bail!("Upload sources are not yet supported"),
         }
+    }
+}
+
+/// Say what an empty AUR repository actually means.
+///
+/// The AUR answers a clone for a package it does not have with an *empty*
+/// repository rather than a 404, so a misspelled name gets all the way to the
+/// checkout before anything notices. The error that comes back describes the
+/// git-level symptom, which is a poor way to be told a package name is wrong --
+/// and this is the most common way for an add to fail.
+///
+/// It cannot be caught earlier. The AUR RPC matches on *pkgname*, so a name
+/// that resolves to nothing is ambiguous: it is what a nonexistent package
+/// looks like, and equally what a real pkgbase with no child of the same name
+/// looks like (`czkawka`, whose packages are `czkawka-cli` and `czkawka-gui`).
+/// The empty clone is the first unambiguous evidence.
+fn explain_source_failure(source_data: &SourceData, error: anyhow::Error) -> anyhow::Error {
+    let SourceData::Aur { name } = source_data else {
+        return error;
+    };
+    if error.downcast_ref::<EmptyRepository>().is_some() {
+        return anyhow::anyhow!("no package named '{name}' in the AUR");
+    }
+    error
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::{EmptyRepository, explain_source_failure};
+    use aurcache_db::packages::SourceData;
+
+    fn aur(name: &str) -> SourceData {
+        SourceData::Aur {
+            name: name.to_string(),
+        }
+    }
+
+    /// The message a mistyped package name should produce. The AUR serves an
+    /// empty repository rather than a 404, so without this the user is told
+    /// their git ref is unresolvable.
+    #[test]
+    fn an_empty_aur_clone_says_the_package_does_not_exist() {
+        let error = anyhow::Error::new(EmptyRepository {
+            url: "https://aur.archlinux.org/nope.git".to_string(),
+        });
+        let explained = explain_source_failure(&aur("nope"), error).to_string();
+        assert!(
+            explained.contains("no package named 'nope' in the AUR"),
+            "unhelpful message: {explained}"
+        );
+    }
+
+    /// Only that failure is reinterpreted. An unparseable PKGBUILD in a package
+    /// that does exist must keep saying so.
+    #[test]
+    fn other_failures_are_passed_through_untouched() {
+        let error = anyhow::anyhow!("PKGBUILD parsing failed");
+        let explained = explain_source_failure(&aur("real"), error).to_string();
+        assert_eq!(explained, "PKGBUILD parsing failed");
+    }
+
+    /// A user-supplied git remote that is empty is empty -- there is no AUR to
+    /// blame, and saying "not in the AUR" would be wrong.
+    #[test]
+    fn a_git_source_keeps_the_git_level_reason() {
+        let error = anyhow::Error::new(EmptyRepository {
+            url: "https://example.com/x.git".to_string(),
+        });
+        let source = SourceData::Git {
+            spec: aurcache_common::source::GitSourceSpec {
+                url: "https://example.com/x.git".to_string(),
+                r#ref: "main".to_string(),
+                subfolder: String::new(),
+            },
+        };
+        let explained = explain_source_failure(&source, error).to_string();
+        assert!(
+            explained.contains("is empty"),
+            "lost the reason: {explained}"
+        );
+        assert!(!explained.contains("AUR"));
     }
 }
 

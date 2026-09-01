@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use git2::{Direction, Oid, Repository};
 use std::path::Path;
 
@@ -50,6 +50,31 @@ fn resolve_remote_ref<'a>(
     repo.revparse_ext(git_ref)
         .map_err(|e| anyhow!("could not resolve git ref '{git_ref}': {e}"))
 }
+
+/// A clone that succeeded and brought back nothing.
+///
+/// Its own type rather than a message because a caller has to *recognise* it:
+/// the AUR answers a clone for an unknown package with an empty repository, so
+/// this is how a misspelled package name arrives, and
+/// `aurcache_utils::snapshot` turns it into a sentence about the AUR. Matching
+/// on the wording of an error would make that a coincidence rather than a
+/// contract.
+#[derive(Debug)]
+pub struct EmptyRepository {
+    pub url: String,
+}
+
+impl std::fmt::Display for EmptyRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the git repository at {} is empty (it has no commits)",
+            self.url
+        )
+    }
+}
+
+impl std::error::Error for EmptyRepository {}
 
 /// The branch HEAD is on, as `(full ref name, shorthand)`, or `None` when the
 /// checkout is detached.
@@ -148,6 +173,18 @@ pub fn checkout_or_fetch_repo_ref(
         std::fs::create_dir_all(path)?;
         Repository::clone(git_repo, path)?
     };
+
+    // A repository with no commits cannot have the ref resolved out of it, and
+    // the reason is worth saying plainly: `revparse` would otherwise report a
+    // missing `HEAD`, which reads as a broken ref rather than as an empty
+    // remote. The AUR serves exactly this for a package name it does not know
+    // -- the clone succeeds and brings back nothing -- so this is the shape a
+    // misspelled package arrives in.
+    if repo.is_empty()? {
+        bail!(EmptyRepository {
+            url: git_repo.to_string()
+        });
+    }
 
     resolve_and_checkout(&repo, git_ref)
 }
