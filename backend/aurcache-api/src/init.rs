@@ -78,6 +78,14 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
 /// handed to the schedulers and the worker listener so every path shares one set
 /// of on-disk git checkouts (see `main.rs`).
 #[must_use]
+/// Where the worker CA lives, supplied by the binary.
+///
+/// The CA is files on disk rather than rows, and only the binary resolves where
+/// -- `AURCACHE_CA_DIR`, or `./data/ca`. Dump and restore both move those files,
+/// so both need to be told where they are.
+#[derive(Debug, Clone)]
+pub struct CaDirectory(pub std::path::PathBuf);
+
 /// The running server's release version, supplied by the binary.
 ///
 /// Only the `aurcache` crate carries a meaningful version; the library crates
@@ -92,6 +100,7 @@ pub fn init_api(
     store: Arc<SnapshotStore>,
     downloads: Arc<DownloadCounter>,
     version: ServerVersion,
+    ca_dir: CaDirectory,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
@@ -176,6 +185,7 @@ pub fn init_api(
             // downloads not yet flushed rather than stalling until they are.
             .manage(downloads)
             .manage(version)
+            .manage(ca_dir)
             .mount("/api/", build_api())
             .mount("/api/", crate::worker::worker_admin_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))

@@ -602,13 +602,15 @@ impl AurCacheClient {
         dry_run: bool,
         on_existing: &str,
         clear: bool,
+        secrets: &str,
     ) -> Result<RestoreAccepted> {
         let mut url = reqwest::Url::parse(&endpoint_url(&self.base_url, "/restore"))
             .context("invalid restore URL")?;
         url.query_pairs_mut()
             .append_pair("dry_run", &dry_run.to_string())
             .append_pair("on_existing", on_existing)
-            .append_pair("clear", &clear.to_string());
+            .append_pair("clear", &clear.to_string())
+            .append_pair("secrets", secrets);
         let response = self
             .client
             .post(url)
@@ -638,9 +640,18 @@ impl AurCacheClient {
     }
 
     /// Download a lite export of the server's authored state.
-    pub async fn dump(&self) -> Result<Vec<u8>> {
-        self.request_bytes::<()>(Method::GET, "/dump", &[], None)
-            .await
+    ///
+    /// `include_secrets` adds the CA private key, the worker certificates and
+    /// the API token hashes. The resulting file can mint worker identities this
+    /// server accepts; treat it as a credential.
+    pub async fn dump(&self, include_secrets: bool) -> Result<Vec<u8>> {
+        self.request_bytes::<()>(
+            Method::GET,
+            "/dump",
+            &[("include_secrets".to_string(), include_secrets.to_string())],
+            None,
+        )
+        .await
     }
 
     async fn send<B>(

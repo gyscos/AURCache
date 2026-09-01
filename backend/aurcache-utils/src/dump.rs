@@ -8,13 +8,16 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::settings::general::GLOBAL_PKG_ID;
+use anyhow::Context;
 use aurcache_common::api::dump::{
-    DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages, DumpSettings, DumpWorker,
-    MANIFEST_FILE, PACKAGES_FILE, PATCH_DIR, SETTINGS_FILE, WORKERS_FILE,
+    CA_CERT_FILE, CA_KEY_FILE, DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages,
+    DumpSecrets, DumpSettings, DumpToken, DumpWorker, MANIFEST_FILE, PACKAGES_FILE, PATCH_DIR,
+    SETTINGS_FILE, TOKENS_FILE, WORKERS_FILE,
 };
 use aurcache_common::api::worker::ApprovalStatus;
+use aurcache_db::api_tokens;
 use aurcache_db::helpers::time::now_secs;
-use aurcache_db::prelude::{Packages, Settings, Workers};
+use aurcache_db::prelude::{ApiTokens, Packages, Settings, Workers};
 use aurcache_db::{packages, settings, workers};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -44,10 +47,20 @@ pub struct Dump {
     pub workers: Vec<DumpWorker>,
     /// Patch contents by pkgbase, written as `patches/<pkgbase>.patch`.
     pub patches: BTreeMap<String, String>,
+    /// Present only when the dump was taken with secrets.
+    pub secrets: Option<DumpSecrets>,
 }
 
 /// Read the authored state out of the database.
-pub async fn build_dump(db: &DatabaseConnection, aurcache_version: &str) -> anyhow::Result<Dump> {
+///
+/// `ca_dir` opts the dump into carrying secrets: the CA, the certificates the
+/// workers hold, and the API token hashes. `None` -- the default everywhere --
+/// produces a dump that is safe to keep beside ordinary backups.
+pub async fn build_dump(
+    db: &DatabaseConnection,
+    aurcache_version: &str,
+    ca_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Dump> {
     // Ordered by name so two dumps of the same instance are byte-identical and
     // a dump kept in git shows only real changes.
     let package_rows = Packages::find()
@@ -79,19 +92,59 @@ pub async fn build_dump(db: &DatabaseConnection, aurcache_version: &str) -> anyh
     }
 
     let settings = build_settings(db, &pkgbase_of_id).await?;
-    let workers = build_workers(db).await?;
+    let secrets = match ca_dir {
+        Some(dir) => Some(build_secrets(db, dir).await?),
+        None => None,
+    };
+    let workers = build_workers(db, secrets.is_some()).await?;
 
     Ok(Dump {
         manifest: DumpManifest {
             schema_version: DUMP_SCHEMA_VERSION,
             aurcache_version: aurcache_version.to_string(),
             created_at: now_secs(),
-            includes_secrets: false,
+            // Derived from what is actually in the dump rather than from what
+            // was asked for, so the flag and the file cannot disagree about
+            // something this consequential.
+            includes_secrets: secrets.is_some(),
         },
         packages,
         settings,
         workers,
         patches,
+        secrets,
+    })
+}
+
+/// Read the CA and the token hashes.
+///
+/// The CA is read from its files rather than from a loaded `Ca`, deliberately:
+/// there is no method anywhere that hands out the private key of a CA already
+/// in memory, and this does not add one. Export moves files; so does restore.
+async fn build_secrets(
+    db: &DatabaseConnection,
+    ca_dir: &std::path::Path,
+) -> anyhow::Result<DumpSecrets> {
+    let ca_cert_pem = std::fs::read_to_string(ca_dir.join(CA_CERT_FILE))
+        .with_context(|| format!("reading the CA certificate from {}", ca_dir.display()))?;
+    let ca_key_pem = std::fs::read_to_string(ca_dir.join(CA_KEY_FILE))
+        .with_context(|| format!("reading the CA key from {}", ca_dir.display()))?;
+
+    let tokens = ApiTokens::find()
+        .order_by_asc(api_tokens::Column::Username)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| DumpToken {
+            username: row.username,
+            token_hash: row.token_hash,
+        })
+        .collect();
+
+    Ok(DumpSecrets {
+        ca_cert_pem,
+        ca_key_pem,
+        tokens,
     })
 }
 
@@ -137,7 +190,10 @@ async fn build_settings(
 ///
 /// Only approved ones: a pending enrolment is a decision nobody has made yet,
 /// and restoring it would carry an unanswered question into the new instance.
-async fn build_workers(db: &DatabaseConnection) -> anyhow::Result<Vec<DumpWorker>> {
+async fn build_workers(
+    db: &DatabaseConnection,
+    with_certificates: bool,
+) -> anyhow::Result<Vec<DumpWorker>> {
     let rows = Workers::find()
         .filter(workers::Column::Status.eq(ApprovalStatus::Approved))
         .order_by_asc(workers::Column::Name)
@@ -155,6 +211,11 @@ async fn build_workers(db: &DatabaseConnection) -> anyhow::Result<Vec<DumpWorker
             package_affinity: split_list(&row.package_affinity),
             priority: row.priority,
             concurrency: row.concurrency,
+            // Only alongside the CA that signed them. On their own they would
+            // authenticate nobody, and a dump that looked complete while being
+            // useless is worse than one that plainly has no certificates.
+            signed_cert: with_certificates.then(|| row.signed_cert.clone()).flatten(),
+            not_after: with_certificates.then_some(row.not_after).flatten(),
         })
         .collect())
 }
@@ -170,6 +231,11 @@ pub fn write_archive(dump: &Dump) -> anyhow::Result<Vec<u8>> {
         append(&mut tar, WORKERS_FILE, &to_json(&dump.workers)?)?;
         for (pkgbase, patch) in &dump.patches {
             append(&mut tar, &format!("{PATCH_DIR}/{pkgbase}.patch"), patch)?;
+        }
+        if let Some(secrets) = &dump.secrets {
+            append(&mut tar, CA_CERT_FILE, &secrets.ca_cert_pem)?;
+            append(&mut tar, CA_KEY_FILE, &secrets.ca_key_pem)?;
+            append(&mut tar, TOKENS_FILE, &to_json(&secrets.tokens)?)?;
         }
         tar.finish()?;
     }

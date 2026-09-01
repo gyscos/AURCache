@@ -57,7 +57,7 @@ async fn a_dump_carries_configuration_and_not_history() {
     let db = db().await;
     package(&db, "hello", true, None).await;
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     let pkg = dump.packages.get("hello").expect("package missing");
 
     assert_eq!(pkg.platforms, ["x86_64", "aarch64"]);
@@ -92,7 +92,7 @@ async fn a_dependency_is_not_promoted_to_a_request() {
     package(&db, "requested", true, None).await;
     package(&db, "pulled-in", false, None).await;
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     assert!(dump.packages["requested"].directly_requested);
     assert!(!dump.packages["pulled-in"].directly_requested);
 }
@@ -105,7 +105,7 @@ async fn a_patch_travels_as_a_file() {
     package(&db, "patched", true, Some("--- a\n+++ b\n")).await;
     package(&db, "plain", true, None).await;
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     assert_eq!(
         dump.patches.get("patched").map(String::as_str),
         Some("--- a\n+++ b\n")
@@ -142,7 +142,7 @@ async fn settings_are_keyed_by_pkgbase() {
         .unwrap();
     }
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     assert_eq!(
         dump.settings
             .global
@@ -189,7 +189,7 @@ async fn only_approved_workers_are_carried() {
         .unwrap();
     }
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     let names: Vec<&str> = dump.workers.iter().map(|w| w.name.as_str()).collect();
     assert_eq!(names, ["trusted"]);
     // The fingerprint is the identity a re-enrolling worker is recognised by.
@@ -203,7 +203,7 @@ async fn the_archive_holds_the_documented_files() {
     let db = db().await;
     package(&db, "hello", true, None).await;
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     let files = archive_files(&write_archive(&dump).unwrap());
 
     for expected in [
@@ -228,8 +228,8 @@ async fn the_output_is_ordered_and_stable() {
         package(&db, name, true, None).await;
     }
 
-    let first = build_dump(&db, "test").await.unwrap();
-    let second = build_dump(&db, "test").await.unwrap();
+    let first = build_dump(&db, "test", None).await.unwrap();
+    let second = build_dump(&db, "test", None).await.unwrap();
     assert_eq!(
         serde_json::to_string(&first.packages).unwrap(),
         serde_json::to_string(&second.packages).unwrap()
@@ -264,7 +264,7 @@ async fn a_git_source_is_carried_whole() {
     .await
     .unwrap();
 
-    let dump = build_dump(&db, "test").await.unwrap();
+    let dump = build_dump(&db, "test", None).await.unwrap();
     match &dump.packages["mine"].source_data {
         SourceData::Git { spec } => {
             assert_eq!(spec.url, "https://example.com/mine.git");
@@ -300,7 +300,7 @@ use aurcache_utils::restore::{load_dump, preview};
 
 /// A dump of whatever is in `db`, as bytes.
 async fn dump_bytes(db: &DatabaseConnection) -> Vec<u8> {
-    write_archive(&build_dump(db, "test").await.unwrap()).unwrap()
+    write_archive(&build_dump(db, "test", None).await.unwrap()).unwrap()
 }
 
 /// A dump round-trips: what comes out describes what went in.
@@ -364,9 +364,9 @@ async fn overwrite_is_reported_as_overwrite() {
         &target,
         &loaded,
         &RestoreOptions {
-            clear: false,
             dry_run: true,
             on_existing: ExistingPackagePolicy::Overwrite,
+            ..RestoreOptions::default()
         },
     )
     .await
@@ -465,9 +465,9 @@ async fn overwrite_replaces_the_configuration() {
         &target,
         &loaded,
         &RestoreOptions {
-            clear: false,
             dry_run: false,
             on_existing: ExistingPackagePolicy::Overwrite,
+            ..RestoreOptions::default()
         },
     )
     .await
@@ -568,6 +568,7 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
         &target,
         &store,
         &tx,
+        &tempfile::tempdir().unwrap().keep(),
         loaded,
         RestoreOptions::default(),
         progress_tx,
@@ -729,4 +730,210 @@ async fn an_already_trusted_worker_keeps_its_routing() {
     let all = workers::Entity::find().all(&target).await.unwrap();
     assert_eq!(all.len(), 1, "the same machine was trusted twice");
     assert_eq!(all[0].concurrency, 9, "the dump overrode local routing");
+}
+
+/// The default carries nothing dangerous. Asserted against the archive bytes
+/// rather than the struct, because what leaves the process is what matters: a
+/// dump kept beside ordinary backups must not contain a key that mints workers.
+#[tokio::test]
+async fn a_default_dump_carries_no_secrets() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    aurcache_db::api_tokens::ActiveModel {
+        username: Set("alice".to_string()),
+        token_hash: Set("secret-hash".to_string()),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+
+    let dump = build_dump(&source, "test", None).await.unwrap();
+    assert!(dump.secrets.is_none());
+    assert!(!dump.manifest.includes_secrets);
+
+    let files = archive_files(&write_archive(&dump).unwrap());
+    for forbidden in ["ca-cert.pem", "ca-key.pem", "tokens.json"] {
+        assert!(
+            !files.contains_key(forbidden),
+            "a public dump carries {forbidden}"
+        );
+    }
+    // Not merely absent as a file -- absent as bytes, wherever they might have
+    // been smuggled.
+    let whole = files.values().cloned().collect::<String>();
+    assert!(
+        !whole.contains("secret-hash"),
+        "a token hash leaked into a public dump"
+    );
+}
+
+/// Asked for them, a dump carries the CA, the certificates and the hashes --
+/// and says so in the manifest.
+#[tokio::test]
+async fn a_private_dump_carries_the_ca_and_says_so() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    aurcache_db::api_tokens::ActiveModel {
+        username: Set("alice".to_string()),
+        token_hash: Set("secret-hash".to_string()),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    workers::ActiveModel {
+        name: Set("builder".to_string()),
+        status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+        cert_fingerprint: Set("fp-1".to_string()),
+        signed_cert: Set(Some("-----BEGIN CERTIFICATE-----".to_string())),
+        not_after: Set(Some(99)),
+        native_arches: Set("x86_64".to_string()),
+        emulated_arches: Set(String::new()),
+        package_affinity: Set(String::new()),
+        priority: Set(0),
+        concurrency: Set(1),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+
+    let ca_dir = tempfile::tempdir().unwrap();
+    std::fs::write(ca_dir.path().join("ca-cert.pem"), "CERT").unwrap();
+    std::fs::write(ca_dir.path().join("ca-key.pem"), "KEY").unwrap();
+
+    let dump = build_dump(&source, "test", Some(ca_dir.path()))
+        .await
+        .unwrap();
+    assert!(dump.manifest.includes_secrets);
+    let secrets = dump.secrets.clone().unwrap();
+    assert_eq!(secrets.ca_key_pem, "KEY");
+    assert_eq!(secrets.tokens.len(), 1);
+    // The certificate travels only in this mode.
+    assert!(dump.workers[0].signed_cert.is_some());
+
+    let files = archive_files(&write_archive(&dump).unwrap());
+    assert_eq!(files.get("ca-key.pem").map(String::as_str), Some("KEY"));
+
+    // And it round-trips through the reader, which is what a restore does.
+    let loaded = load_dump(&write_archive(&dump).unwrap()).unwrap();
+    assert_eq!(loaded.secrets.unwrap().ca_key_pem, "KEY");
+}
+
+/// Ignoring secrets is the default on the way back in, too. Replacing a CA
+/// invalidates every certificate the current workers hold, which is destructive
+/// in the mode whose promise is that it only adds.
+#[tokio::test]
+async fn restoring_does_not_touch_the_ca_unless_asked() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    let src_ca = tempfile::tempdir().unwrap();
+    std::fs::write(src_ca.path().join("ca-cert.pem"), "DUMP-CERT").unwrap();
+    std::fs::write(src_ca.path().join("ca-key.pem"), "DUMP-KEY").unwrap();
+    let bytes = write_archive(
+        &build_dump(&source, "test", Some(src_ca.path()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let target = db().await;
+    let target_ca = tempfile::tempdir().unwrap();
+    std::fs::write(target_ca.path().join("ca-key.pem"), "MINE").unwrap();
+
+    let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    aurcache_utils::restore::apply(
+        &target,
+        &store,
+        &tx,
+        target_ca.path(),
+        load_dump(&bytes).unwrap(),
+        RestoreOptions::default(),
+        progress_tx,
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read_to_string(target_ca.path().join("ca-key.pem")).unwrap(),
+        "MINE",
+        "a default restore replaced the CA"
+    );
+    // The token hashes are left alone for the same reason.
+    assert!(
+        aurcache_db::prelude::ApiTokens::find()
+            .all(&target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Asked for them, they are taken -- and the key lands owner-readable only.
+#[tokio::test]
+async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    aurcache_db::api_tokens::ActiveModel {
+        username: Set("alice".to_string()),
+        token_hash: Set("h".to_string()),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    let src_ca = tempfile::tempdir().unwrap();
+    std::fs::write(src_ca.path().join("ca-cert.pem"), "DUMP-CERT").unwrap();
+    std::fs::write(src_ca.path().join("ca-key.pem"), "DUMP-KEY").unwrap();
+    let bytes = write_archive(
+        &build_dump(&source, "test", Some(src_ca.path()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let target = db().await;
+    let target_ca = tempfile::tempdir().unwrap();
+    std::fs::write(target_ca.path().join("ca-key.pem"), "MINE").unwrap();
+
+    let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    aurcache_utils::restore::apply(
+        &target,
+        &store,
+        &tx,
+        target_ca.path(),
+        load_dump(&bytes).unwrap(),
+        RestoreOptions {
+            secrets: aurcache_common::api::dump::SecretsPolicy::Copy,
+            ..RestoreOptions::default()
+        },
+        progress_tx,
+    )
+    .await;
+
+    let key_path = target_ca.path().join("ca-key.pem");
+    assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "DUMP-KEY");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "the CA private key is readable by others");
+    }
+    // Tokens users already hold keep working.
+    let tokens = aurcache_db::prelude::ApiTokens::find()
+        .all(&target)
+        .await
+        .unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].username, "alice");
 }

@@ -30,6 +30,14 @@ pub const SETTINGS_FILE: &str = "settings.json";
 pub const WORKERS_FILE: &str = "workers.json";
 /// Directory holding one `<pkgbase>.patch` per patched package.
 pub const PATCH_DIR: &str = "patches";
+/// The CA certificate, present only in a dump taken with secrets.
+pub const CA_CERT_FILE: &str = "ca-cert.pem";
+/// The CA private key. The most dangerous thing a dump can contain: it signs
+/// worker identities, so anyone holding it can mint a certificate this server
+/// accepts as a worker.
+pub const CA_KEY_FILE: &str = "ca-key.pem";
+/// API token hashes, present only in a dump taken with secrets.
+pub const TOKENS_FILE: &str = "tokens.json";
 
 #[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
 pub struct DumpManifest {
@@ -93,11 +101,61 @@ pub struct DumpWorker {
     pub package_affinity: Vec<String>,
     pub priority: i32,
     pub concurrency: i32,
+    /// The certificate this worker holds, present only in a dump taken with
+    /// secrets.
+    ///
+    /// Only meaningful under the CA that signed it, so it never travels without
+    /// one -- a dump carrying certificates and no CA would look coherent and
+    /// authenticate nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_cert: Option<String>,
+    /// When that certificate expires. Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<i64>,
+}
+
+/// One API token, as the database holds it.
+///
+/// The hash, never the token. `api_tokens` only ever stores a SHA-256 digest,
+/// so a dump carries nothing directly usable to authenticate -- but restoring
+/// it means the tokens users already hold keep working, which is the point.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct DumpToken {
+    pub username: String,
+    pub token_hash: String,
 }
 
 /// `packages.json`: pkgbase to package. A map rather than a list so a dump
 /// diffs cleanly when one entry changes.
 pub type DumpPackages = BTreeMap<String, DumpPackage>;
+
+/// What a dump carries that is dangerous to hold.
+///
+/// The CA certificate and its private key travel together with the worker
+/// certificates, as one unit: a signed certificate is only meaningful under the
+/// CA that signed it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DumpSecrets {
+    pub ca_cert_pem: String,
+    pub ca_key_pem: String,
+    pub tokens: Vec<DumpToken>,
+}
+
+/// What to do about secrets a dump carries.
+///
+/// Defaults to leaving them alone, and not for symmetry with the package
+/// policy: replacing a CA invalidates every certificate the current workers
+/// hold, which is a destructive act in the mode whose whole promise is that it
+/// only adds.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretsPolicy {
+    /// Leave this instance's CA and tokens as they are.
+    #[default]
+    Ignore,
+    /// Take the dump's, replacing what is here.
+    Copy,
+}
 
 /// What to do about a package the dump carries that already exists here.
 ///
@@ -134,6 +192,10 @@ pub struct RestoreOptions {
     /// existing package by the time the dump is written.
     #[serde(default)]
     pub clear: bool,
+    /// What to do about the CA, worker certificates and token hashes, when the
+    /// dump carries any. Ignored when it does not.
+    #[serde(default)]
+    pub secrets: SecretsPolicy,
 }
 
 /// What an import did, or would do, to one package.

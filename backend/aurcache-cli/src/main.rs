@@ -85,6 +85,11 @@ enum Command {
         /// directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Also export the CA private key, worker certificates and API token
+        /// hashes. The file becomes a credential: anyone holding it can mint a
+        /// worker this server accepts. Written owner-readable only.
+        #[arg(long)]
+        include_secrets: bool,
     },
     /// Restore an instance from a dump.
     Restore {
@@ -100,6 +105,10 @@ enum Command {
         /// package, setting and worker this instance has is removed first.
         #[arg(long)]
         clear: bool,
+        /// Take the dump's CA, worker certificates and token hashes. Replacing
+        /// the CA invalidates every certificate this server's workers hold.
+        #[arg(long, value_enum, default_value_t = Secrets::Ignore)]
+        secrets: Secrets,
     },
     /// Manage builds.
     Builds {
@@ -409,13 +418,28 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Token { command } => run_token_command(client, format, command).await,
         Command::Config { .. } => unreachable!("config commands are handled before client setup"),
         Command::Pkg { command } => run_packages_command(client, format, command).await,
-        Command::Dump { output } => dump_command(client, format, output).await,
+        Command::Dump {
+            output,
+            include_secrets,
+        } => dump_command(client, format, output, include_secrets).await,
         Command::Restore {
             archive,
             dry_run,
             on_existing,
             clear,
-        } => restore_command(client, format, &archive, dry_run, on_existing, clear).await,
+            secrets,
+        } => {
+            restore_command(
+                client,
+                format,
+                &archive,
+                dry_run,
+                on_existing,
+                clear,
+                secrets,
+            )
+            .await
+        }
         Command::Builds { command } => run_builds_command(client, format, command).await,
         Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
@@ -682,6 +706,24 @@ async fn add_package_command(
     follow_bulk_add(client, format, accepted).await
 }
 
+/// What an import should do about the dump's secrets.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum Secrets {
+    /// Leave this server's CA and tokens alone.
+    Ignore,
+    /// Take the dump's, replacing what is here.
+    Copy,
+}
+
+impl Secrets {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Copy => "copy",
+        }
+    }
+}
+
 /// What an import should do about a package that is already here.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
 enum OnExisting {
@@ -708,12 +750,19 @@ async fn restore_command(
     dry_run: bool,
     on_existing: OnExisting,
     clear: bool,
+    secrets: Secrets,
 ) -> Result<()> {
     let bytes =
         std::fs::read(archive).with_context(|| format!("failed to read {}", archive.display()))?;
 
     let accepted = client
-        .restore(bytes, dry_run, on_existing.as_str(), clear)
+        .restore(
+            bytes,
+            dry_run,
+            on_existing.as_str(),
+            clear,
+            secrets.as_str(),
+        )
         .await?;
 
     // A dry run has nothing to poll: it changed nothing, and what it would have
@@ -794,8 +843,9 @@ async fn dump_command(
     client: &AurCacheClient,
     format: OutputFormat,
     output: Option<PathBuf>,
+    include_secrets: bool,
 ) -> Result<()> {
-    let bytes = client.dump().await?;
+    let bytes = client.dump(include_secrets).await?;
 
     let path = output.unwrap_or_else(|| {
         PathBuf::from(format!(
@@ -811,7 +861,10 @@ async fn dump_command(
         return Ok(());
     }
 
-    std::fs::write(&path, &bytes)
+    // A dump with secrets is a credential. Written owner-only, and created that
+    // way rather than chmod'ed afterwards -- between the two there is a moment
+    // where the CA private key is world-readable.
+    write_dump_file(&path, &bytes, include_secrets)
         .with_context(|| format!("failed to write dump to {}", path.display()))?;
 
     match format {
@@ -819,8 +872,30 @@ async fn dump_command(
             "{}",
             serde_json::json!({ "path": path.display().to_string(), "bytes": bytes.len() })
         ),
-        OutputFormat::Text => println!("wrote {} ({} bytes)", path.display(), bytes.len()),
+        OutputFormat::Text => {
+            println!("wrote {} ({} bytes)", path.display(), bytes.len());
+            if include_secrets {
+                println!(
+                    "This file contains the CA private key. Anyone holding it can \
+                     act as a build worker for this server."
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+/// Write the archive, owner-only when it carries secrets.
+fn write_dump_file(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    use std::io::Write;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    open.open(path)?.write_all(bytes)?;
     Ok(())
 }
 

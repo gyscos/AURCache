@@ -26,9 +26,10 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use aurcache_common::api::dump::{
-    DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages, DumpSettings, DumpWorker,
-    ExistingPackagePolicy, MANIFEST_FILE, PACKAGES_FILE, PATCH_DIR, RestoreEntry, RestoreOptions,
-    RestoreOutcome, SETTINGS_FILE, WORKERS_FILE,
+    CA_CERT_FILE, CA_KEY_FILE, DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages,
+    DumpSecrets, DumpSettings, DumpToken, DumpWorker, ExistingPackagePolicy, MANIFEST_FILE,
+    PACKAGES_FILE, PATCH_DIR, RestoreEntry, RestoreOptions, RestoreOutcome, SETTINGS_FILE,
+    SecretsPolicy, TOKENS_FILE, WORKERS_FILE,
 };
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
@@ -55,6 +56,8 @@ pub struct LoadedDump {
     pub settings: DumpSettings,
     pub workers: Vec<DumpWorker>,
     pub patches: BTreeMap<String, String>,
+    /// Present only when the dump was taken with secrets.
+    pub secrets: Option<DumpSecrets>,
 }
 
 /// Read and validate a `.tar.gz` dump.
@@ -126,13 +129,74 @@ pub fn load_dump(bytes: &[u8]) -> anyhow::Result<LoadedDump> {
         }
     }
 
+    let secrets = load_secrets(&files, &workers)?;
+    // The flag exists so a reader can tell what it is holding before unpacking
+    // it. One that disagrees with the contents is a dump that has been edited,
+    // and the safe reading of "the manifest says no secrets" is not one worth
+    // guessing at.
+    if manifest.includes_secrets != secrets.is_some() {
+        anyhow::bail!(
+            "the manifest says includes_secrets={} but the archive {} secrets",
+            manifest.includes_secrets,
+            if secrets.is_some() {
+                "carries"
+            } else {
+                "does not carry"
+            }
+        );
+    }
+
     Ok(LoadedDump {
         manifest,
         packages,
         settings,
         workers,
         patches,
+        secrets,
     })
+}
+
+/// The CA, worker certificates and token hashes, if the archive carries them.
+///
+/// They travel as one unit. A signed certificate means nothing without the CA
+/// that signed it, so a dump holding certificates and no CA would look complete
+/// and authenticate nobody -- and half a CA is not a CA at all.
+fn load_secrets(
+    files: &BTreeMap<String, String>,
+    workers: &[DumpWorker],
+) -> anyhow::Result<Option<DumpSecrets>> {
+    let cert = files.get(CA_CERT_FILE);
+    let key = files.get(CA_KEY_FILE);
+
+    let (ca_cert_pem, ca_key_pem) = match (cert, key) {
+        (Some(cert), Some(key)) => (cert.clone(), key.clone()),
+        (None, None) => {
+            if workers.iter().any(|w| w.signed_cert.is_some()) {
+                anyhow::bail!(
+                    "this dump carries worker certificates but no CA, so nothing could \
+                     verify them; it was assembled wrongly"
+                );
+            }
+            if files.contains_key(TOKENS_FILE) {
+                anyhow::bail!("this dump carries {TOKENS_FILE} but no CA; secrets travel together");
+            }
+            return Ok(None);
+        }
+        (Some(_), None) => anyhow::bail!("{CA_KEY_FILE} is missing; half a CA is not a CA"),
+        (None, Some(_)) => anyhow::bail!("{CA_CERT_FILE} is missing; half a CA is not a CA"),
+    };
+
+    let tokens: Vec<DumpToken> = match files.get(TOKENS_FILE) {
+        Some(content) => serde_json::from_str(content)
+            .map_err(|e| anyhow::anyhow!("{TOKENS_FILE} is not valid: {e}"))?,
+        None => Vec::new(),
+    };
+
+    Ok(Some(DumpSecrets {
+        ca_cert_pem,
+        ca_key_pem,
+        tokens,
+    }))
 }
 
 fn parse<T: serde::de::DeserializeOwned>(
@@ -220,6 +284,7 @@ pub async fn apply(
     db: &DatabaseConnection,
     store: &SnapshotStore,
     tx: &Sender<Action>,
+    ca_dir: &std::path::Path,
     dump: LoadedDump,
     options: RestoreOptions,
     progress: UnboundedSender<RestoreEntry>,
@@ -243,6 +308,18 @@ pub async fn apply(
 
     for entry in &applied.entries {
         let _ = progress.send(entry.clone());
+    }
+
+    // Written after the rows commit, and only then: replacing the CA on disk is
+    // not something a rolled-back transaction can take back, so it must not
+    // happen while the import might still fail.
+    if let Err(e) = write_secrets(&dump, &options, ca_dir) {
+        let _ = progress.send(RestoreEntry {
+            pkgbase: String::new(),
+            outcome: RestoreOutcome::Failed {
+                error: format!("the packages were imported, but the secrets were not: {e}"),
+            },
+        });
     }
 
     // PASS 2: sources. Every imported package's `provides` and split package
@@ -293,6 +370,53 @@ pub async fn apply(
             });
         }
     }
+}
+
+/// Install the dump's CA and token hashes, when asked to.
+///
+/// Replacing the CA invalidates every certificate the current workers hold, so
+/// it happens only on request. `--clear` counts as that request: it already
+/// says the dump replaces what it carries, and a CA is one of the things it
+/// carries.
+///
+/// The CA is written to disk rather than the database, which is why it cannot
+/// share the transaction that wrote the rows -- and why it is written after
+/// them, once nothing is left that could still roll back.
+fn write_secrets(
+    dump: &LoadedDump,
+    options: &RestoreOptions,
+    ca_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let Some(secrets) = &dump.secrets else {
+        return Ok(());
+    };
+    if options.secrets == SecretsPolicy::Ignore && !options.clear {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(ca_dir)?;
+    // The certificate first: a reader that finds a key without a certificate
+    // has half a CA, and this narrows that window to a single write.
+    std::fs::write(ca_dir.join(CA_CERT_FILE), &secrets.ca_cert_pem)?;
+    write_private(&ca_dir.join(CA_KEY_FILE), &secrets.ca_key_pem)?;
+    warn!(
+        "restore: replaced the worker CA in {}. Every certificate the current \
+         workers hold was signed by the previous one and is now worthless; they \
+         will re-enrol.",
+        ca_dir.display()
+    );
+    Ok(())
+}
+
+/// Write key material readable only by its owner.
+fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// What pass 1 did.
@@ -365,7 +489,8 @@ pub async fn write_rows(
     }
 
     write_settings(&txn, dump, &ids).await?;
-    write_workers(&txn, dump).await?;
+    write_workers(&txn, dump, options).await?;
+    write_tokens(&txn, dump, options).await?;
     txn.commit().await?;
 
     // Only now: a rolled-back transaction can put a row back, and nothing can
@@ -427,7 +552,10 @@ async fn clear_existing<C: sea_orm::ConnectionTrait>(
 async fn write_workers<C: sea_orm::ConnectionTrait>(
     txn: &C,
     dump: &LoadedDump,
+    options: &RestoreOptions,
 ) -> anyhow::Result<()> {
+    // A certificate is only worth restoring alongside the CA that signed it.
+    let with_certificates = dump.secrets.is_some() && take_secrets(options);
     for worker in &dump.workers {
         let existing = aurcache_db::prelude::Workers::find()
             .filter(aurcache_db::workers::Column::CertFingerprint.eq(&worker.cert_fingerprint))
@@ -447,6 +575,51 @@ async fn write_workers<C: sea_orm::ConnectionTrait>(
             package_affinity: Set(join_list(&worker.package_affinity)),
             priority: Set(worker.priority),
             concurrency: Set(worker.concurrency),
+            signed_cert: Set(with_certificates
+                .then(|| worker.signed_cert.clone())
+                .flatten()),
+            not_after: Set(with_certificates.then_some(worker.not_after).flatten()),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Whether this import is taking the dump's secrets.
+fn take_secrets(options: &RestoreOptions) -> bool {
+    options.secrets == SecretsPolicy::Copy || options.clear
+}
+
+/// Restore the API token hashes, so tokens users already hold keep working.
+///
+/// Matched on the hash: the same token restored twice is the same token, and a
+/// user who has since generated a new one here keeps it alongside rather than
+/// having it replaced by an older one from the dump.
+async fn write_tokens<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    dump: &LoadedDump,
+    options: &RestoreOptions,
+) -> anyhow::Result<()> {
+    let Some(secrets) = &dump.secrets else {
+        return Ok(());
+    };
+    if !take_secrets(options) {
+        return Ok(());
+    }
+
+    for token in &secrets.tokens {
+        let existing = aurcache_db::prelude::ApiTokens::find()
+            .filter(aurcache_db::api_tokens::Column::TokenHash.eq(&token.token_hash))
+            .one(txn)
+            .await?;
+        if existing.is_some() {
+            continue;
+        }
+        aurcache_db::api_tokens::ActiveModel {
+            username: Set(token.username.clone()),
+            token_hash: Set(token.token_hash.clone()),
             ..Default::default()
         }
         .insert(txn)
@@ -753,6 +926,70 @@ mod tests {
             "a rolled-back clear destroyed data anyway"
         );
         assert_eq!(survivors[0].name, "precious");
+    }
+
+    /// A certificate is only meaningful under the CA that signed it, so a dump
+    /// carrying certificates and no CA authenticates nobody -- while looking
+    /// complete. Refused rather than partially applied.
+    #[test]
+    fn worker_certificates_without_a_ca_are_refused() {
+        let mut files = good();
+        files[3] = (
+            "workers.json",
+            r#"[{"name":"w","cert_fingerprint":"fp","status":"approved","native_arches":["x86_64"],
+                 "emulated_arches":[],"package_affinity":[],"priority":0,"concurrency":1,
+                 "signed_cert":"-----BEGIN CERTIFICATE-----"}]"#
+                .to_string(),
+        );
+        let error = load(files).unwrap_err().to_string();
+        assert!(error.contains("no CA"), "unhelpful: {error}");
+    }
+
+    /// Half a CA is not a CA.
+    #[test]
+    fn a_ca_certificate_without_its_key_is_refused() {
+        let mut files = good();
+        files.push(("ca-cert.pem", "-----BEGIN CERTIFICATE-----".to_string()));
+        let error = load(files).unwrap_err().to_string();
+        assert!(error.contains("half a CA"), "unhelpful: {error}");
+    }
+
+    /// The manifest's flag is how a reader knows what it is holding before it
+    /// unpacks anything. One that disagrees with the contents means the archive
+    /// was edited, and "the manifest says no secrets" is not a claim worth
+    /// guessing at.
+    #[test]
+    fn a_manifest_that_lies_about_secrets_is_refused() {
+        let mut files = good();
+        files.push(("ca-cert.pem", "cert".to_string()));
+        files.push(("ca-key.pem", "key".to_string()));
+        // The manifest still says includes_secrets: false.
+        let error = load(files).unwrap_err().to_string();
+        assert!(error.contains("manifest says"), "unhelpful: {error}");
+    }
+
+    /// A well-formed private dump loads, and carries what it says.
+    #[test]
+    fn a_dump_with_secrets_loads() {
+        let mut files = good();
+        files[0] = (
+            "manifest.json",
+            format!(
+                r#"{{"schema_version":{DUMP_SCHEMA_VERSION},"aurcache_version":"t","created_at":0,"includes_secrets":true}}"#
+            ),
+        );
+        files.push(("ca-cert.pem", "cert".to_string()));
+        files.push(("ca-key.pem", "key".to_string()));
+        files.push((
+            "tokens.json",
+            r#"[{"username":"alice","token_hash":"abc"}]"#.to_string(),
+        ));
+
+        let loaded = load(files).unwrap();
+        let secrets = loaded.secrets.expect("secrets were dropped");
+        assert_eq!(secrets.ca_key_pem, "key");
+        assert_eq!(secrets.tokens.len(), 1);
+        assert_eq!(secrets.tokens[0].username, "alice");
     }
 
     /// A patch reaches the package it names.

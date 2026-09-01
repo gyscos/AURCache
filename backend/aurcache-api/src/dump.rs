@@ -1,11 +1,11 @@
 //! Downloading a lite export of the instance's authored state.
 
-use crate::init::ServerVersion;
+use crate::init::{CaDirectory, ServerVersion};
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use aurcache_common::api::dump::{
     ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOptions, RestoreOutcome,
-    RestoreProgress,
+    RestoreProgress, SecretsPolicy,
 };
 use aurcache_db::action::Action;
 use aurcache_db::helpers::operations;
@@ -63,15 +63,34 @@ fn dump_file_name(created_at: i64) -> String {
 /// are rebuilt by the next resolve and are not carried. No secrets: the CA and
 /// worker certificates are deliberately absent, so this is safe to keep
 /// alongside ordinary backups.
-#[get("/dump")]
+#[get("/dump?<include_secrets>")]
 pub async fn dump(
     db: &State<DatabaseConnection>,
     version: &State<ServerVersion>,
-    _a: Authenticated,
+    ca_dir: &State<CaDirectory>,
+    include_secrets: Option<bool>,
+    a: Authenticated,
 ) -> Result<DumpArchive, ApiError> {
-    let dump = aurcache_utils::dump::build_dump(db.inner(), &version.0)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+    let with_secrets = include_secrets.unwrap_or(false);
+    if with_secrets {
+        // Logged loudly and by name. The CA private key signs worker
+        // identities, so whoever takes a copy can mint a worker this server
+        // accepts -- for as long as the CA lives, and regardless of whether
+        // their own access is revoked later. That is worth a line in the log
+        // even when it is entirely legitimate.
+        warn!(
+            "Exporting a dump WITH SECRETS (CA private key, worker certificates, \
+             token hashes), requested by {}",
+            a.username.as_deref().unwrap_or("an unauthenticated caller")
+        );
+    }
+    let dump = aurcache_utils::dump::build_dump(
+        db.inner(),
+        &version.0,
+        with_secrets.then(|| ca_dir.0.as_path()),
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))?;
     let created_at = dump.manifest.created_at;
     let bytes = aurcache_utils::dump::write_archive(&dump)
         .map_err(|e| err(Status::InternalServerError, e))?;
@@ -116,14 +135,19 @@ mod tests {
 // Rocket's request guards, the three query parameters and the body are each an
 // independent input; bundling them into a struct would only move the same list.
 #[allow(clippy::too_many_arguments)]
-#[post("/restore?<dry_run>&<on_existing>&<clear>", data = "<archive>")]
+#[post(
+    "/restore?<dry_run>&<on_existing>&<clear>&<secrets>",
+    data = "<archive>"
+)]
 pub async fn restore(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
     tx: &State<Sender<Action>>,
+    ca_dir: &State<CaDirectory>,
     dry_run: Option<bool>,
     on_existing: Option<String>,
     clear: Option<bool>,
+    secrets: Option<String>,
     archive: Data<'_>,
     _a: Authenticated,
 ) -> Result<status::Accepted<Json<RestoreAccepted>>, ApiError> {
@@ -139,6 +163,16 @@ pub async fn restore(
     let options = RestoreOptions {
         dry_run: dry_run.unwrap_or(false),
         clear: clear.unwrap_or(false),
+        secrets: match secrets.as_deref() {
+            None | Some("ignore") => SecretsPolicy::Ignore,
+            Some("copy") => SecretsPolicy::Copy,
+            Some(other) => {
+                return Err(err(
+                    Status::BadRequest,
+                    format!("unknown secrets policy '{other}'"),
+                ));
+            }
+        },
         on_existing: match on_existing.as_deref() {
             None | Some("skip") => ExistingPackagePolicy::Skip,
             Some("overwrite") => ExistingPackagePolicy::Overwrite,
@@ -175,6 +209,7 @@ pub async fn restore(
     let db_task = db.inner().clone();
     let store_task = Arc::clone(store.inner());
     let tx_task = tx.inner().clone();
+    let ca_dir_task = ca_dir.inner().clone();
 
     tokio::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -182,8 +217,16 @@ pub async fn restore(
             let db = db_task.clone();
             let store = Arc::clone(&store_task);
             tokio::spawn(async move {
-                aurcache_utils::restore::apply(&db, &store, &tx_task, loaded, options, progress_tx)
-                    .await;
+                aurcache_utils::restore::apply(
+                    &db,
+                    &store,
+                    &tx_task,
+                    &ca_dir_task.0,
+                    loaded,
+                    options,
+                    progress_tx,
+                )
+                .await;
             })
         };
 

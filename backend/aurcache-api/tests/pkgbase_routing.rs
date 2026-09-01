@@ -109,6 +109,11 @@ async fn test_client() -> (Client, DatabaseConnection) {
         // sentinels refuse to launch without it, which is the point: a route
         // needing unmanaged state would otherwise 500 in production.
         .manage(aurcache_api::init::ServerVersion("test".to_string()))
+        // Dump and restore both move the CA's files, so both need to know
+        // where they are. Rocket's sentinels refuse to launch without it.
+        .manage(aurcache_api::init::CaDirectory(std::path::PathBuf::from(
+            "/nonexistent-ca-dir",
+        )))
         .mount("/api", aurcache_api::backend::build_api());
     // The checkout root only has to outlive Rocket's construction; nothing in
     // these tests fetches sources.
