@@ -231,6 +231,8 @@ ROUTES=(
     # can pin rather than only reporting what it already pinned.
     "/settings|\$JOB_TIMEOUT|settings document their environment variables"
     "/settings|Builder image|settings covers every section"
+    "/settings|Backup|the settings page offers backup and restore"
+    "/settings|Drop a dump here|a dump can be dropped as well as chosen"
     # Seeded as a stored global value, which is the only state offering a Reset.
     "/settings|>Reset<|settings can undo a stored value"
     "/config-files|makepkg.conf|config files"

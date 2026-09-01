@@ -1,6 +1,7 @@
 //! One module per route.
 
 mod activities;
+pub mod backup;
 mod build;
 mod builds;
 pub mod config_files;

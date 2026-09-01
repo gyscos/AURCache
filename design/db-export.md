@@ -1,6 +1,9 @@
 # Design: Lite Database Export and Restore
 
-Status: **Proposed** · Last updated: 2026-08-25
+Status: **Implemented** · Last updated: 2026-09-01
+
+Built as described, with two deliberate divergences and one thing this document
+got wrong about the schema. Both are recorded inline below where they apply.
 
 ## Motivation
 
@@ -26,7 +29,7 @@ did AURCache work it out?*
 | Per-package build config | `packages.build_flags`, `platforms` |
 | Whether it was asked for directly | `packages.directly_requested` |
 | Source patches | `packages.patch` |
-| Server config, per-package overrides | `settings` (`pkg_id IS NULL` vs set) |
+| Server config, per-package overrides | `settings` (`pkg_id = -1` vs a real id) |
 | Trusted workers and their routing | `workers` |
 
 **Not exported (derived).** `status`, `out_of_date`, `upstream_version`,
@@ -41,6 +44,13 @@ importing a graph that disagrees with today's AUR.
 
 Nothing in the dump refers to a package by row id, including `settings` rows,
 which are keyed by pkgbase instead of `pkg_id`.
+
+> **Correction.** An earlier draft said global settings are `pkg_id IS NULL`.
+> They are not: the column is `NOT NULL` and globals use a `-1` sentinel,
+> because `UNIQUE (pkg_id, key)` depends on it — NULLs do not compare equal, so
+> a nullable column would let the same global key be inserted twice. The first
+> implementation matched on `None` and silently exported no global settings at
+> all; a test caught it.
 
 This removes the id-remapping logic a dump format would otherwise need, and it
 keeps the format stable as ids stop appearing in public URIs. A dump is
@@ -106,6 +116,37 @@ graph, then enqueue. Replaying the adds instead would need network at import
 time and could resolve to a different dependency set than the dump captured,
 silently dropping a dependency's patch.
 
+> **Divergence: a third pass, between those two.** Inserting every row before
+> resolving anything does remove the question of import order — a dependency
+> cycle stops being a special case — but it is not sufficient on its own. A
+> local package satisfies a dependency by its pkgbase, by one of its split
+> package names, or by something it `provides`, and a dump carries only the
+> first: the other two are derived from the PKGBUILD and are not exported. So a
+> git-sourced package providing `libfoo` would not be recognised as satisfying a
+> dependency on `libfoo`, resolution would fall through to the AUR, and an AUR
+> package would be adopted in place of the source the operator chose. The
+> split-package case is likelier still.
+>
+> So every package's source is read *after* the rows are written and *before*
+> the graph is rebuilt, filling in `provides` and the split names. Restore has
+> to read those sources anyway, since `dependencies` is not exported either.
+>
+> A second, quieter precondition: imported rows are written `ENQUEUED`, because
+> `resolve_local_dependency_resolutions` only considers packages that are
+> active, successful or enqueued. A row in any other state is invisible to
+> resolution and its dependents fall through to the AUR for the same reason.
+
+> **Divergence: how failure is handled.** "Atomic" holds for the rows and not
+> for what follows, because the two cannot be the same. Writing the rows is one
+> transaction over local state: all of them or none. Reading sources and
+> resolving dependencies is per package and network-bound, and one unparseable
+> PKGBUILD does not undo the other 199 — re-running would then be the only way
+> back. Such a package keeps its row, since the commonest reason to land there
+> is a transient read and the row carries the configuration the operator asked
+> for; what it does not keep is silence. The failure is reported per package,
+> saying that other packages will not find it and that `--on-existing overwrite`
+> is what retries it.
+
 Builds are enqueued automatically. Worker concurrency bounds the result, so a
 large restore is a slow trickle rather than a stampede; it is expected to take a
 while.
@@ -144,6 +185,18 @@ act in the mode whose promise is that it only adds.
 ## Surface
 
 Both directions from the CLI and the web UI.
+
+- `GET /api/dump?include_secrets=` and `aurcache-cli dump [--include-secrets]`
+- `POST /api/restore?dry_run=&on_existing=&clear=&secrets=` and
+  `aurcache-cli restore <archive> [--dry-run] [--on-existing …] [--clear]
+  [--secrets copy]`
+- `GET /api/restore/<id>?after=` follows a running import, the same way a bulk
+  add is followed: progress is a stored log read by offset, so an observer can
+  attach late, and one that disconnects misses nothing.
+
+A dry run that finds a blocking conflict exits non-zero from the CLI, so
+`restore --dry-run && restore` cannot walk into the failure the preview existed
+to find.
 
 ## Open questions
 

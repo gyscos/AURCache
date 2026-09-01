@@ -237,6 +237,8 @@ async fn interactions() {
     a_linked_search_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
     a_queue_is_added_as_one_job(&session).await;
+    the_export_dialog_warns_only_when_secrets_are_asked_for(&session).await;
+    the_restore_dialog_offers_its_options(&session).await;
     approving_a_worker_lets_it_build(&session).await;
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
@@ -429,6 +431,75 @@ async fn a_queue_is_added_as_one_job(session: &Session) {
             t.contains("could not be added")
                 && t.contains("bulk-one.git")
                 && t.contains("bulk-two.git")
+        })
+        .await;
+}
+
+/// The export dialog only warns about secrets once they are asked for.
+///
+/// Invisible to a render test, which sees one paint: the warning is the point
+/// of the checkbox, and a warning that is always on screen is one nobody reads
+/// by the time it matters. The download itself is a plain link, so what is
+/// checked here is that ticking the box changes what the link offers.
+async fn the_export_dialog_warns_only_when_secrets_are_asked_for(session: &Session) {
+    session.open("/settings").await;
+    session.click_labelled(".card button", "Export…").await;
+    session
+        .wait_until("the export dialog", |t| t.contains("Include secrets"))
+        .await;
+    assert!(
+        !session.text().await.contains("This file is a credential"),
+        "the warning is shown before secrets are asked for"
+    );
+
+    session.click("input[aria-label='Include secrets']").await;
+    session
+        .wait_until("the credential warning", |t| {
+            t.contains("This file is a credential")
+        })
+        .await;
+
+    // And the link now asks for them.
+    session
+        .wait_for_script(
+            "the download link to carry the flag",
+            "const a = [...document.querySelectorAll('.modal-open a')] \
+                 .find(e => e.getAttribute('href')?.includes('include_secrets=true')); \
+             return !!a;"
+                .to_string(),
+        )
+        .await;
+}
+
+/// The restore dialog offers a drop target and the three choices an import has
+/// to make, and disables the one that would be meaningless.
+async fn the_restore_dialog_offers_its_options(session: &Session) {
+    session.open("/settings").await;
+    session.click_labelled(".card button", "Restore…").await;
+    session
+        .wait_until("the restore dialog", |t| {
+            t.contains("Drop a dump here") && t.contains("Replace everything")
+        })
+        .await;
+
+    // Nothing chosen yet, so there is nothing to preview or restore.
+    session
+        .wait_for_script(
+            "Preview to be disabled with no file",
+            "const b = [...document.querySelectorAll('.modal-open .modal-action button')] \
+                 .find(e => e.textContent.trim() === 'Preview'); \
+             return !!b && b.disabled;"
+                .to_string(),
+        )
+        .await;
+
+    // Replacing everything leaves the per-package policy with nothing to decide.
+    session
+        .click("input[aria-label='Replace everything']")
+        .await;
+    session
+        .wait_until("the policy to be explained away", |t| {
+            t.contains("Nothing will already be here")
         })
         .await;
 }

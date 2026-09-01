@@ -200,6 +200,7 @@ fn SettingsSections(
         }
 
         ApiAccessSection {}
+        crate::screens::backup::BackupSection {}
         }
     }
 }
