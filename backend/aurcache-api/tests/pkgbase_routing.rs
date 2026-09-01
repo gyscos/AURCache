@@ -105,6 +105,10 @@ async fn test_client() -> (Client, DatabaseConnection) {
         .manage(Arc::new(SnapshotStore::with_checkout_root(
             checkouts.path().to_path_buf(),
         )))
+        // The dump route reports which AURCache wrote a dump. Rocket's
+        // sentinels refuse to launch without it, which is the point: a route
+        // needing unmanaged state would otherwise 500 in production.
+        .manage(aurcache_api::init::ServerVersion("test".to_string()))
         .mount("/api", aurcache_api::backend::build_api());
     // The checkout root only has to outlive Rocket's construction; nothing in
     // these tests fetches sources.

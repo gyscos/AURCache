@@ -78,11 +78,20 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
 /// handed to the schedulers and the worker listener so every path shares one set
 /// of on-disk git checkouts (see `main.rs`).
 #[must_use]
+/// The running server's release version, supplied by the binary.
+///
+/// Only the `aurcache` crate carries a meaningful version; the library crates
+/// are unversioned and would report `0.0.0`. A dump records which AURCache
+/// wrote it, so it has to be the real one.
+#[derive(Debug, Clone)]
+pub struct ServerVersion(pub String);
+
 pub fn init_api(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
     downloads: Arc<DownloadCounter>,
+    version: ServerVersion,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
@@ -101,6 +110,7 @@ pub fn init_api(
                 (path = "/api", api = crate::health::HealthApi, tags = ["Health"]),
                 (path = "/api", api = crate::package::PackageApi, tags = ["Package"]),
                 (path = "/api", api = crate::stats::StatsApi, tags = ["Stats"]),
+                (path = "/api", api = crate::dump::DumpApi, tags = ["Dump"]),
                 (path = "/api", api = crate::activity::ActivityApi, tags = ["Activity"]),
                 (path = "/api", api = crate::settings::SettingsApi, tags = ["Settings"]),
                 (path = "/api", api = crate::worker::WorkerApi, tags = ["Worker"]),
@@ -165,6 +175,7 @@ pub fn init_api(
             // Shared with the repository server, so a package's count includes
             // downloads not yet flushed rather than stalling until they are.
             .manage(downloads)
+            .manage(version)
             .mount("/api/", build_api())
             .mount("/api/", crate::worker::worker_admin_routes())
             .mount("/", Scalar::with_url("/docs", ApiDoc::openapi()))

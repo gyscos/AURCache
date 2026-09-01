@@ -1,5 +1,6 @@
 pub mod aur;
 pub mod build_logger;
+pub mod dump;
 pub mod git;
 pub mod job_config;
 pub mod package;

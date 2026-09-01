@@ -6,7 +6,12 @@ use aurcache_db::settings;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::future::Future;
 
-const GLOBAL_PKG_ID: i32 = -1;
+/// `pkg_id` standing for "applies to the whole server".
+///
+/// A sentinel rather than NULL because the column is NOT NULL, which the
+/// `UNIQUE (pkg_id, key)` constraint depends on: NULLs do not compare equal, so
+/// a nullable column would let the same global key be inserted twice.
+pub const GLOBAL_PKG_ID: i32 = -1;
 
 async fn set_settings_bulk<I>(entries: I, db: &DatabaseConnection) -> anyhow::Result<()>
 where

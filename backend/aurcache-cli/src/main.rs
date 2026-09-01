@@ -16,7 +16,8 @@ use config::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -77,6 +78,13 @@ enum Command {
     Pkg {
         #[command(subcommand)]
         command: PackagesCommand,
+    },
+    /// Export the server's authored state to a `.tar.gz`.
+    Dump {
+        /// Where to write the archive. Defaults to a dated name in the current
+        /// directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Manage builds.
     Builds {
@@ -386,6 +394,7 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Token { command } => run_token_command(client, format, command).await,
         Command::Config { .. } => unreachable!("config commands are handled before client setup"),
         Command::Pkg { command } => run_packages_command(client, format, command).await,
+        Command::Dump { output } => dump_command(client, format, output).await,
         Command::Builds { command } => run_builds_command(client, format, command).await,
         Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
@@ -650,6 +659,46 @@ async fn add_package_command(
         .await?;
 
     follow_bulk_add(client, format, accepted).await
+}
+
+/// Write the server's dump to a file.
+///
+/// A file rather than stdout by default: it is a `.tar.gz`, and a shell that
+/// swallows it into a terminal is a worse default than one that has to be
+/// redirected deliberately. `--output -` still writes to stdout for a caller
+/// that wants to pipe it.
+async fn dump_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    let bytes = client.dump().await?;
+
+    let path = output.unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "aurcache-dump-{}.tar.gz",
+            Utc::now().format("%Y%m%d")
+        ))
+    });
+
+    if path.as_os_str() == "-" {
+        std::io::stdout()
+            .write_all(&bytes)
+            .context("failed to write dump to stdout")?;
+        return Ok(());
+    }
+
+    std::fs::write(&path, &bytes)
+        .with_context(|| format!("failed to write dump to {}", path.display()))?;
+
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({ "path": path.display().to_string(), "bytes": bytes.len() })
+        ),
+        OutputFormat::Text => println!("wrote {} ({} bytes)", path.display(), bytes.len()),
+    }
+    Ok(())
 }
 
 /// Report a bulk add until it finishes.

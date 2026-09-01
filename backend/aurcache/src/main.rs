@@ -1,6 +1,6 @@
 use crate::logger::init_logger;
 use crate::startup::{post_startup_tasks, pre_startup_tasks};
-use aurcache_api::init::{init_api, init_repo, init_worker_api};
+use aurcache_api::init::{ServerVersion, init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::downloads::DownloadCounter;
@@ -74,7 +74,13 @@ async fn main() {
     let downloads = Arc::new(DownloadCounter::new());
     let download_flush_handle = start_download_flush(db.clone(), downloads.clone());
 
-    let api_handle = init_api(db.clone(), tx, store.clone(), downloads.clone());
+    let api_handle = init_api(
+        db.clone(),
+        tx,
+        store.clone(),
+        downloads.clone(),
+        ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
+    );
     let worker_api_handle = init_worker_api(db, ca, store);
     let repo_handle = init_repo(downloads);
 

@@ -6,6 +6,7 @@ mod auth;
 pub mod backend;
 mod build;
 pub mod custom_file_server;
+mod dump;
 #[cfg(feature = "static")]
 pub mod embed;
 mod health;

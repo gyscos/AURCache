@@ -566,6 +566,35 @@ impl AurCacheClient {
             .with_context(|| format!("failed to read text response from {path}"))
     }
 
+    /// Fetch a binary response body.
+    ///
+    /// Separate from [`Self::request_text`] because a dump is a `.tar.gz`:
+    /// decoding it as UTF-8 would corrupt it.
+    pub async fn request_bytes<B>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&B>,
+    ) -> Result<Vec<u8>>
+    where
+        B: Serialize + ?Sized,
+    {
+        let response = self.send(method, path, query, body).await?;
+        let response = ensure_success(response).await?;
+        Ok(response
+            .bytes()
+            .await
+            .with_context(|| format!("failed to read response body from {path}"))?
+            .to_vec())
+    }
+
+    /// Download a lite export of the server's authored state.
+    pub async fn dump(&self) -> Result<Vec<u8>> {
+        self.request_bytes::<()>(Method::GET, "/dump", &[], None)
+            .await
+    }
+
     async fn send<B>(
         &self,
         method: Method,
