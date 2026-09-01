@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
     AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BulkAddAccepted, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, GitSourceSpec, GraphDataPoint, ListStats, Method,
-    PackageDependency, PackageSource, PatchPackageRequest, SearchResult, SimplePackage, SourceData,
-    UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
+    PackageDependency, PackageSource, PatchPackageRequest, RestoreOutcome, SearchResult,
+    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
 use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
@@ -85,6 +85,17 @@ enum Command {
         /// directory.
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Restore an instance from a dump.
+    Restore {
+        /// The `.tar.gz` to read.
+        archive: PathBuf,
+        /// Report what would happen and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// What to do about a package that already exists here.
+        #[arg(long, value_enum, default_value_t = OnExisting::Skip)]
+        on_existing: OnExisting,
     },
     /// Manage builds.
     Builds {
@@ -395,6 +406,11 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Config { .. } => unreachable!("config commands are handled before client setup"),
         Command::Pkg { command } => run_packages_command(client, format, command).await,
         Command::Dump { output } => dump_command(client, format, output).await,
+        Command::Restore {
+            archive,
+            dry_run,
+            on_existing,
+        } => restore_command(client, format, &archive, dry_run, on_existing).await,
         Command::Builds { command } => run_builds_command(client, format, command).await,
         Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
@@ -659,6 +675,102 @@ async fn add_package_command(
         .await?;
 
     follow_bulk_add(client, format, accepted).await
+}
+
+/// What an import should do about a package that is already here.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum OnExisting {
+    /// Leave it alone.
+    Skip,
+    /// Replace its configuration with the dump's.
+    Overwrite,
+}
+
+impl OnExisting {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// Restore a dump, reporting each package as the server gets to it.
+async fn restore_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    archive: &Path,
+    dry_run: bool,
+    on_existing: OnExisting,
+) -> Result<()> {
+    let bytes =
+        std::fs::read(archive).with_context(|| format!("failed to read {}", archive.display()))?;
+
+    let accepted = client.restore(bytes, dry_run, on_existing.as_str()).await?;
+
+    // A dry run has nothing to poll: it changed nothing, and what it would have
+    // done is already in hand.
+    let Some(job_id) = accepted.job_id else {
+        if format == OutputFormat::Json {
+            println!("{}", serde_json::to_string_pretty(&accepted)?);
+        } else {
+            println!("would apply {} package(s):", accepted.total);
+            for entry in &accepted.preview {
+                println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);
+            }
+        }
+        return Ok(());
+    };
+
+    if format == OutputFormat::Json {
+        loop {
+            let progress = client.restore_progress(job_id, 0).await?;
+            if progress.finished {
+                println!("{}", serde_json::to_string_pretty(&progress)?);
+                return restore_result(progress.failed);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    println!("restoring {} package(s), job {job_id}", accepted.total);
+    let mut seen = 0_usize;
+    loop {
+        let progress = client.restore_progress(job_id, seen).await?;
+        for entry in &progress.entries {
+            println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);
+            if let RestoreOutcome::Failed { error } = &entry.outcome {
+                println!("             {error}");
+            }
+        }
+        seen += progress.entries.len();
+        if progress.finished {
+            println!(
+                "done: {} applied, {} failed, of {}",
+                progress.completed, progress.failed, progress.total
+            );
+            return restore_result(progress.failed);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+fn outcome_label(outcome: &RestoreOutcome) -> &'static str {
+    match outcome {
+        RestoreOutcome::Imported => "imported",
+        RestoreOutcome::Skipped => "skipped",
+        RestoreOutcome::Overwritten => "overwritten",
+        RestoreOutcome::Failed { .. } => "failed",
+    }
+}
+
+/// A restore with failures exits non-zero, so a partly-applied dump is not
+/// mistaken for a clean one by whatever called it.
+fn restore_result(failed: i32) -> Result<()> {
+    if failed > 0 {
+        bail!("{failed} package(s) could not be restored");
+    }
+    Ok(())
 }
 
 /// Write the server's dump to a file.

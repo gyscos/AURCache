@@ -11,6 +11,9 @@ use anyhow::{Context, Result};
 pub use aurcache_common::api::activity::Activity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
+pub use aurcache_common::api::dump::{
+    RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
+};
 pub use aurcache_common::api::package::{
     AddPackages as AddPackagesRequest, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
@@ -587,6 +590,49 @@ impl AurCacheClient {
             .await
             .with_context(|| format!("failed to read response body from {path}"))?
             .to_vec())
+    }
+
+    /// Restore a dump, returning before it has finished.
+    ///
+    /// A dry run reports what it *would* do and no job id, because it changed
+    /// nothing to watch.
+    pub async fn restore(
+        &self,
+        archive: Vec<u8>,
+        dry_run: bool,
+        on_existing: &str,
+    ) -> Result<RestoreAccepted> {
+        let mut url = reqwest::Url::parse(&endpoint_url(&self.base_url, "/restore"))
+            .context("invalid restore URL")?;
+        url.query_pairs_mut()
+            .append_pair("dry_run", &dry_run.to_string())
+            .append_pair("on_existing", on_existing);
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+            .body(archive);
+        let response = match &self.token {
+            Some(token) => response.bearer_auth(token),
+            None => response,
+        };
+        let response = ensure_success(response.send().await.context("request failed")?).await?;
+        response
+            .json()
+            .await
+            .context("failed to read the restore response")
+    }
+
+    /// Read a restore's progress, returning only entries after the first
+    /// `after` of them.
+    pub async fn restore_progress(&self, job_id: i32, after: usize) -> Result<RestoreProgress> {
+        self.request_json::<RestoreProgress, ()>(
+            Method::GET,
+            &format!("/restore/{job_id}"),
+            &[("after".to_string(), after.to_string())],
+            None,
+        )
+        .await
     }
 
     /// Download a lite export of the server's authored state.

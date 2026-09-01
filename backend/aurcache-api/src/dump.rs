@@ -3,13 +3,34 @@
 use crate::init::ServerVersion;
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use aurcache_common::api::dump::{
+    ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOptions, RestoreOutcome,
+    RestoreProgress,
+};
+use aurcache_db::action::Action;
+use aurcache_db::helpers::operations;
+use aurcache_utils::snapshot::SnapshotStore;
+use rocket::data::Data;
 use rocket::http::{Header, Status};
-use rocket::{Responder, State, get};
+use rocket::response::status;
+use rocket::serde::json::Json;
+use rocket::{Responder, State, get, post};
 use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc;
+use tracing::warn;
 use utoipa::OpenApi;
 
+/// The largest dump the server will read.
+///
+/// A lite dump of a very large instance is still small -- text, compressed --
+/// so this is far above anything legitimate and exists to stop an unbounded
+/// read rather than to constrain real use.
+const MAX_DUMP_SIZE: rocket::data::ByteUnit = rocket::data::ByteUnit::Mebibyte(64);
+
 #[derive(OpenApi)]
-#[openapi(paths(dump))]
+#[openapi(paths(dump, restore_progress))]
 pub struct DumpApi;
 
 /// The archive, with the filename a browser should save it under.
@@ -76,4 +97,151 @@ mod tests {
             "aurcache-dump-20250901.tar.gz"
         );
     }
+}
+
+/// Restore a dump, returning before it has finished.
+///
+/// Not in the OpenAPI document: the body is a raw archive, which utoipa cannot
+/// describe from a `Data` argument. The worker's upload routes are left out for
+/// the same reason.
+///
+/// The whole archive is validated first, so a dump that would be refused is
+/// refused before anything is written. A dry run answers with what it *would*
+/// do and no job id, because there is nothing to watch.
+///
+/// Otherwise the rows are written in one transaction and the slow half -- one
+/// source read per package, then the dependency graph -- runs detached, with
+/// progress recorded the way a bulk add's is.
+#[post("/restore?<dry_run>&<on_existing>", data = "<archive>")]
+pub async fn restore(
+    db: &State<DatabaseConnection>,
+    store: &State<Arc<SnapshotStore>>,
+    tx: &State<Sender<Action>>,
+    dry_run: Option<bool>,
+    on_existing: Option<String>,
+    archive: Data<'_>,
+    _a: Authenticated,
+) -> Result<status::Accepted<Json<RestoreAccepted>>, ApiError> {
+    let bytes = archive
+        .open(MAX_DUMP_SIZE)
+        .into_bytes()
+        .await
+        .map_err(|e| err(Status::BadRequest, e))?;
+    if !bytes.is_complete() {
+        return Err(err(Status::PayloadTooLarge, "dump is too large"));
+    }
+
+    let options = RestoreOptions {
+        dry_run: dry_run.unwrap_or(false),
+        on_existing: match on_existing.as_deref() {
+            None | Some("skip") => ExistingPackagePolicy::Skip,
+            Some("overwrite") => ExistingPackagePolicy::Overwrite,
+            Some(other) => {
+                return Err(err(
+                    Status::BadRequest,
+                    format!("unknown on_existing policy '{other}'"),
+                ));
+            }
+        },
+    };
+
+    // A dump that cannot be read is the caller's problem, and saying so before
+    // anything is written is the point of validating the whole file first.
+    let loaded =
+        aurcache_utils::restore::load_dump(&bytes.value).map_err(|e| err(Status::BadRequest, e))?;
+    let total = i32::try_from(loaded.packages.len()).unwrap_or(i32::MAX);
+
+    if options.dry_run {
+        let preview = aurcache_utils::restore::preview(db.inner(), &loaded, &options)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+        return Ok(status::Accepted(Json(RestoreAccepted {
+            job_id: None,
+            total,
+            preview,
+        })));
+    }
+
+    let job_id = operations::create(db.inner(), operations::KIND_RESTORE, total)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
+    let db_task = db.inner().clone();
+    let store_task = Arc::clone(store.inner());
+    let tx_task = tx.inner().clone();
+
+    tokio::spawn(async move {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let worker = {
+            let db = db_task.clone();
+            let store = Arc::clone(&store_task);
+            tokio::spawn(async move {
+                aurcache_utils::restore::apply(&db, &store, &tx_task, loaded, options, progress_tx)
+                    .await;
+            })
+        };
+
+        let mut completed = 0_i32;
+        let mut failed = 0_i32;
+        while let Some(entry) = progress_rx.recv().await {
+            match &entry.outcome {
+                RestoreOutcome::Failed { .. } => failed += 1,
+                _ => completed += 1,
+            }
+            if let Err(e) =
+                operations::append(&db_task, job_id, completed, failed, &[entry], false).await
+            {
+                warn!("could not record restore {job_id} progress: {e}");
+            }
+        }
+        if let Err(e) = worker.await {
+            warn!("restore {job_id} ended abnormally: {e}");
+        }
+        if let Err(e) =
+            operations::append::<_, RestoreEntry>(&db_task, job_id, completed, failed, &[], true)
+                .await
+        {
+            warn!("could not close restore {job_id}: {e}");
+        }
+    });
+
+    Ok(status::Accepted(Json(RestoreAccepted {
+        job_id: Some(job_id),
+        total,
+        preview: Vec::new(),
+    })))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Progress of a restore", body = RestoreProgress),
+            (status = 404, description = "No such restore"),
+    ),
+    params(
+        ("id", description = "Job id returned when the restore was started"),
+        ("after", description = "How many entries the caller already holds"),
+    )
+)]
+/// Read a restore's progress from `after` onwards.
+#[get("/restore/<id>?<after>")]
+pub async fn restore_progress(
+    db: &State<DatabaseConnection>,
+    id: i32,
+    after: Option<usize>,
+    _a: Authenticated,
+) -> Result<Json<RestoreProgress>, ApiError> {
+    let job = operations::get(db.inner(), id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .filter(|job| job.kind == operations::KIND_RESTORE)
+        .ok_or_else(|| err(Status::NotFound, format!("no restore {id}")))?;
+
+    Ok(Json(RestoreProgress {
+        id: job.id,
+        total: job.total,
+        completed: job.completed,
+        failed: job.failed,
+        finished: job.finished_at.is_some(),
+        entries: operations::entries_after(&job.log, after.unwrap_or(0)),
+    }))
 }

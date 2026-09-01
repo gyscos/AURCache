@@ -26,6 +26,8 @@ pub fn build_api() -> Vec<Route> {
         regenerate_api_token_endpoint,
         package_list,
         crate::dump::dump,
+        crate::dump::restore,
+        crate::dump::restore_progress,
         package_add_endpoint,
         packages_add_endpoint,
         bulk_add_progress,

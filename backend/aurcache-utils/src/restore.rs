@@ -26,10 +26,26 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use aurcache_common::api::dump::{
-    DUMP_SCHEMA_VERSION, DumpManifest, DumpPackages, DumpSettings, DumpWorker, MANIFEST_FILE,
-    PACKAGES_FILE, PATCH_DIR, SETTINGS_FILE, WORKERS_FILE,
+    DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages, DumpSettings, DumpWorker,
+    ExistingPackagePolicy, MANIFEST_FILE, PACKAGES_FILE, PATCH_DIR, RestoreEntry, RestoreOptions,
+    RestoreOutcome, SETTINGS_FILE, WORKERS_FILE,
 };
+use aurcache_common::builder::BuildStates;
+use aurcache_db::action::Action;
+use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::prelude::Packages;
+use aurcache_db::{packages, settings};
 use flate2::read::GzDecoder;
+use sea_orm::ActiveValue::Set;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
+};
+use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::warn;
+
+use crate::package::add::{provides_json, split_packages_json};
+use crate::snapshot::SnapshotStore;
 
 /// A dump that has been read and checked, ready to apply.
 #[derive(Debug)]
@@ -127,6 +143,302 @@ fn parse<T: serde::de::DeserializeOwned>(
         .get(name)
         .ok_or_else(|| anyhow::anyhow!("{name} is missing; this is not an AURCache dump"))?;
     serde_json::from_str(content).map_err(|e| anyhow::anyhow!("{name} is not valid: {e}"))
+}
+
+/// Join a dump's list back into the database's semicolon-delimited column.
+fn join_list(values: &[String]) -> String {
+    values.join(";")
+}
+
+/// What a dump would do to one package, without doing it.
+///
+/// A dry run answers the only question worth asking before an import: which of
+/// my packages does this touch. It reads, so it can be wrong about a race, but
+/// nothing it reports has happened.
+pub async fn preview(
+    db: &DatabaseConnection,
+    dump: &LoadedDump,
+    options: &RestoreOptions,
+) -> anyhow::Result<Vec<RestoreEntry>> {
+    let mut entries = Vec::new();
+    for pkgbase in dump.packages.keys() {
+        let exists = package_row(db, pkgbase).await?.is_some();
+        entries.push(RestoreEntry {
+            pkgbase: pkgbase.clone(),
+            outcome: match (exists, options.on_existing) {
+                (false, _) => RestoreOutcome::Imported,
+                (true, ExistingPackagePolicy::Skip) => RestoreOutcome::Skipped,
+                (true, ExistingPackagePolicy::Overwrite) => RestoreOutcome::Overwritten,
+            },
+        });
+    }
+    Ok(entries)
+}
+
+async fn package_row(
+    db: &DatabaseConnection,
+    pkgbase: &str,
+) -> anyhow::Result<Option<packages::Model>> {
+    Ok(Packages::find()
+        .filter(packages::Column::Name.eq(pkgbase))
+        .one(db)
+        .await?)
+}
+
+/// Apply a dump.
+///
+/// Three passes, and the order between the last two is the point -- see this
+/// module's header. Rows first, with no network; then every package's source,
+/// which is what fills in the names a dependency can be resolved by; only then
+/// the dependency graph.
+pub async fn apply(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    tx: &Sender<Action>,
+    dump: LoadedDump,
+    options: RestoreOptions,
+    progress: UnboundedSender<RestoreEntry>,
+) {
+    // PASS 1: rows. One transaction, because a half-applied dump is neither
+    // what the instance was nor what the dump describes.
+    let applied = match write_rows(db, &dump, &options).await {
+        Ok(applied) => applied,
+        Err(e) => {
+            // The transaction rolled back, so nothing was written; say so
+            // against the dump as a whole rather than blaming one package.
+            let _ = progress.send(RestoreEntry {
+                pkgbase: String::new(),
+                outcome: RestoreOutcome::Failed {
+                    error: format!("nothing was imported: {e}"),
+                },
+            });
+            return;
+        }
+    };
+
+    for entry in &applied.entries {
+        let _ = progress.send(entry.clone());
+    }
+
+    // PASS 2: sources. Every imported package's `provides` and split package
+    // names, so that pass 3 can recognise them. Until this is done for *all* of
+    // them, resolving any one would fall through to the AUR and adopt a package
+    // in place of one the dump carried.
+    for pkgbase in &applied.touched {
+        if let Err(e) = fill_source_facts(db, store, pkgbase).await {
+            warn!("restore: could not read the source of {pkgbase}: {e}");
+        }
+    }
+
+    // PASS 3: the graph, and the builds it makes possible.
+    for pkgbase in &applied.touched {
+        let Ok(Some(row)) = package_row(db, pkgbase).await else {
+            continue;
+        };
+        if let Err(e) = crate::package::update::package_resync_dependencies(
+            &aurcache_deps::AurClient::new(),
+            store,
+            db,
+            tx,
+            &row,
+        )
+        .await
+        {
+            warn!("restore: could not resolve dependencies for {pkgbase}: {e}");
+        }
+    }
+}
+
+/// What pass 1 did.
+#[derive(Debug)]
+pub struct Applied {
+    pub entries: Vec<RestoreEntry>,
+    /// Packages whose sources and graph the later passes must visit. A skipped
+    /// package is not among them: it was already here, with its own resolution
+    /// already done.
+    pub touched: Vec<String>,
+}
+
+/// Insert and update the rows, in one transaction.
+///
+/// Public because it is the whole of the import that touches no network: the
+/// passes after it read sources and resolve dependencies, so this is the part
+/// whose effect on the database can be stated exactly and tested directly.
+pub async fn write_rows(
+    db: &DatabaseConnection,
+    dump: &LoadedDump,
+    options: &RestoreOptions,
+) -> anyhow::Result<Applied> {
+    let txn = db.begin().await?;
+    let mut entries = Vec::new();
+    let mut touched = Vec::new();
+    let mut ids = BTreeMap::new();
+
+    for (pkgbase, package) in &dump.packages {
+        let existing = Packages::find()
+            .filter(packages::Column::Name.eq(pkgbase))
+            .one(&txn)
+            .await?;
+        let patch = dump.patches.get(pkgbase).cloned();
+
+        let outcome = match (existing, options.on_existing) {
+            (Some(row), ExistingPackagePolicy::Skip) => {
+                ids.insert(pkgbase.clone(), row.id);
+                RestoreOutcome::Skipped
+            }
+            (Some(row), ExistingPackagePolicy::Overwrite) => {
+                let id = row.id;
+                let mut active: packages::ActiveModel = row.into();
+                apply_config(&mut active, package, patch);
+                active.update(&txn).await?;
+                ids.insert(pkgbase.clone(), id);
+                touched.push(pkgbase.clone());
+                RestoreOutcome::Overwritten
+            }
+            (None, _) => {
+                let id = insert_row(&txn, pkgbase, package, patch).await?;
+                ids.insert(pkgbase.clone(), id);
+                touched.push(pkgbase.clone());
+                RestoreOutcome::Imported
+            }
+        };
+        entries.push(RestoreEntry {
+            pkgbase: pkgbase.clone(),
+            outcome,
+        });
+    }
+
+    write_settings(&txn, dump, &ids).await?;
+    txn.commit().await?;
+
+    Ok(Applied { entries, touched })
+}
+
+/// The columns a dump owns. Everything else on the row is derived and is left
+/// to the passes that follow.
+fn apply_config(active: &mut packages::ActiveModel, package: &DumpPackage, patch: Option<String>) {
+    active.platforms = Set(join_list(&package.platforms));
+    active.build_flags = Set(join_list(&package.build_flags));
+    active.directly_requested = Set(package.directly_requested);
+    active.source_type = Set(source_type_of(&package.source_data));
+    active.source_data = Set(package.source_data.clone());
+    active.patch = Set(patch);
+}
+
+fn source_type_of(source_data: &SourceData) -> SourceType {
+    match source_data {
+        SourceData::Aur { .. } => SourceType::Aur,
+        SourceData::Git { .. } => SourceType::Git,
+        SourceData::Upload { .. } => SourceType::Upload,
+    }
+}
+
+async fn insert_row<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    pkgbase: &str,
+    package: &DumpPackage,
+    patch: Option<String>,
+) -> anyhow::Result<i32> {
+    Ok(packages::ActiveModel {
+        name: Set(pkgbase.to_string()),
+        // Enqueued, not some neutral state: `resolve_local_dependency_resolutions`
+        // only considers packages that are active, successful or enqueued, so a
+        // row in any other state is invisible to resolution -- and a dependency
+        // on it would fall through to the AUR, which is exactly what importing
+        // the package was meant to prevent.
+        status: Set(BuildStates::ENQUEUED_BUILD),
+        out_of_date: Set(0),
+        platforms: Set(join_list(&package.platforms)),
+        build_flags: Set(join_list(&package.build_flags)),
+        source_type: Set(source_type_of(&package.source_data)),
+        source_data: Set(package.source_data.clone()),
+        directly_requested: Set(package.directly_requested),
+        patch: Set(patch),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?
+    .id)
+}
+
+/// Settings, keyed back from pkgbase onto row ids.
+async fn write_settings<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    dump: &LoadedDump,
+    ids: &BTreeMap<String, i32>,
+) -> anyhow::Result<()> {
+    for (key, value) in &dump.settings.global {
+        upsert_setting(db, key, value, crate::settings::general::GLOBAL_PKG_ID).await?;
+    }
+    for (pkgbase, values) in &dump.settings.packages {
+        // Validation guarantees the package is in the dump; this only skips one
+        // that was left alone by `Skip`, whose own settings are already right.
+        let Some(id) = ids.get(pkgbase) else { continue };
+        for (key, value) in values {
+            upsert_setting(db, key, value, *id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn upsert_setting<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    key: &str,
+    value: &str,
+    pkg_id: i32,
+) -> anyhow::Result<()> {
+    let existing = settings::Entity::find()
+        .filter(settings::Column::Key.eq(key))
+        .filter(settings::Column::PkgId.eq(pkg_id))
+        .one(db)
+        .await?;
+    match existing {
+        Some(row) => {
+            let mut active: settings::ActiveModel = row.into();
+            active.value = Set(Some(value.to_string()));
+            active.update(db).await?;
+        }
+        None => {
+            settings::ActiveModel {
+                key: Set(key.to_string()),
+                value: Set(Some(value.to_string())),
+                pkg_id: Set(Some(pkg_id)),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a package's source and record what a dependency can find it by.
+///
+/// This is the step that makes the import self-contained. Without it the row
+/// knows only its pkgbase, and a dependency naming one of its split packages or
+/// something it provides would not match it.
+async fn fill_source_facts(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    pkgbase: &str,
+) -> anyhow::Result<()> {
+    let Some(row) = package_row(db, pkgbase).await? else {
+        return Ok(());
+    };
+    let sourceinfo = store
+        .sourceinfo(&row.source_data, row.patch.as_deref())
+        .await?;
+    let deps = aurcache_deps::deps_from_srcinfo(
+        &sourceinfo,
+        &crate::pkg::architectures_for_platforms(&row.platforms),
+    );
+
+    let mut active: packages::ActiveModel = row.into();
+    active.split_packages = Set(split_packages_json(pkgbase, &deps.pkgnames)?);
+    active.provides = Set(provides_json(&deps.provides)?);
+    active.upstream_version = Set(Some(sourceinfo.base.version.to_string()));
+    active.update(db).await?;
+    Ok(())
 }
 
 #[cfg(test)]

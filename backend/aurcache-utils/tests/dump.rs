@@ -4,10 +4,11 @@ use aurcache_common::api::dump::{DUMP_SCHEMA_VERSION, MANIFEST_FILE, PACKAGES_FI
 use aurcache_common::source::GitSourceSpec;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings, workers};
 use aurcache_utils::dump::{build_dump, write_archive};
 use flate2::read::GzDecoder;
-use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
+use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
 use sea_orm_migration::MigratorTrait;
 use std::collections::HashMap;
 use std::io::Read;
@@ -288,4 +289,234 @@ fn archive_files(bytes: &[u8]) -> HashMap<String, String> {
             (path, content)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+use aurcache_common::api::dump::{ExistingPackagePolicy, RestoreOptions, RestoreOutcome};
+use aurcache_utils::restore::{load_dump, preview};
+
+/// A dump of whatever is in `db`, as bytes.
+async fn dump_bytes(db: &DatabaseConnection) -> Vec<u8> {
+    write_archive(&build_dump(db, "test").await.unwrap()).unwrap()
+}
+
+/// A dump round-trips: what comes out describes what went in.
+#[tokio::test]
+async fn a_dump_reloads_as_what_it_described() {
+    let source = db().await;
+    package(&source, "hello", true, Some("--- a\n")).await;
+    package(&source, "dep", false, None).await;
+
+    let loaded = load_dump(&dump_bytes(&source).await).unwrap();
+    assert_eq!(loaded.packages.len(), 2);
+    assert!(loaded.packages["hello"].directly_requested);
+    assert!(!loaded.packages["dep"].directly_requested);
+    assert_eq!(
+        loaded.patches.get("hello").map(String::as_str),
+        Some("--- a\n")
+    );
+}
+
+/// A preview says what would happen and changes nothing -- which is the only
+/// useful thing to know before importing over a live instance.
+#[tokio::test]
+async fn a_preview_reports_without_applying() {
+    let source = db().await;
+    package(&source, "already-here", true, None).await;
+    package(&source, "brand-new", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    package(&target, "already-here", true, None).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    let entries = preview(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let by_name: HashMap<&str, &RestoreOutcome> = entries
+        .iter()
+        .map(|e| (e.pkgbase.as_str(), &e.outcome))
+        .collect();
+    assert!(matches!(by_name["already-here"], RestoreOutcome::Skipped));
+    assert!(matches!(by_name["brand-new"], RestoreOutcome::Imported));
+
+    // Nothing was written: the package the dump would have added is still absent.
+    let count = Packages::find().all(&target).await.unwrap().len();
+    assert_eq!(count, 1, "a preview wrote to the database");
+}
+
+/// Overwrite is opt-in, and it changes what the preview promises.
+#[tokio::test]
+async fn overwrite_is_reported_as_overwrite() {
+    let source = db().await;
+    package(&source, "shared", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    package(&target, "shared", true, None).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    let entries = preview(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            dry_run: true,
+            on_existing: ExistingPackagePolicy::Overwrite,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(entries[0].outcome, RestoreOutcome::Overwritten));
+}
+
+/// The invariant the whole ordering rests on: an imported row must land in a
+/// status `resolve_local_dependency_resolutions` actually queries. In any other
+/// state the row is invisible to resolution, and a dependency on it would fall
+/// through to the AUR and adopt a package in place of the one just imported --
+/// exactly what importing it was meant to prevent.
+#[tokio::test]
+async fn an_imported_row_is_visible_to_dependency_resolution() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let row = Packages::find().one(&target).await.unwrap().unwrap();
+    // The set `resolve_local_dependency_resolutions` filters on.
+    let visible = [
+        aurcache_common::builder::BuildStates::ACTIVE_BUILD,
+        aurcache_common::builder::BuildStates::SUCCESSFUL_BUILD,
+        aurcache_common::builder::BuildStates::ENQUEUED_BUILD,
+    ];
+    assert!(
+        visible.contains(&row.status),
+        "an imported package is invisible to dependency resolution (status {})",
+        row.status
+    );
+}
+
+/// Skip leaves an existing package exactly as it was. The default has to be
+/// the one that cannot destroy configuration nobody meant to replace.
+#[tokio::test]
+async fn skip_leaves_the_existing_configuration_alone() {
+    let source = db().await;
+    package(&source, "shared", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let id = package(&target, "shared", true, None).await;
+    // Something the dump does not carry, so a wrongly-applied overwrite shows.
+    let mut existing: packages::ActiveModel = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    existing.platforms = Set("aarch64".to_string());
+    existing.update(&target).await.unwrap();
+
+    let loaded = load_dump(&bytes).unwrap();
+    let applied = aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let row = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.platforms, "aarch64", "skip overwrote the target");
+    assert!(
+        applied.touched.is_empty(),
+        "a skipped package should not be re-resolved: it was already here"
+    );
+}
+
+/// Overwrite replaces the configuration the dump owns.
+#[tokio::test]
+async fn overwrite_replaces_the_configuration() {
+    let source = db().await;
+    package(&source, "shared", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let id = package(&target, "shared", true, None).await;
+    let mut existing: packages::ActiveModel = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    existing.platforms = Set("aarch64".to_string());
+    existing.update(&target).await.unwrap();
+
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            dry_run: false,
+            on_existing: ExistingPackagePolicy::Overwrite,
+        },
+    )
+    .await
+    .unwrap();
+
+    let row = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.platforms, "x86_64;aarch64", "overwrite did not apply");
+}
+
+/// Settings come back under the right package, having travelled by name.
+#[tokio::test]
+async fn settings_are_restored_against_the_right_package() {
+    let source = db().await;
+    let pkg_id = package(&source, "hello", true, None).await;
+    for (key, value, scope) in [
+        ("version_check_interval", "600", Some(-1)),
+        ("build_flags", "--nocheck", Some(pkg_id)),
+    ] {
+        settings::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(Some(value.to_string())),
+            pkg_id: Set(scope),
+            ..Default::default()
+        }
+        .insert(&source)
+        .await
+        .unwrap();
+    }
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let new_id = Packages::find().one(&target).await.unwrap().unwrap().id;
+    let rows = settings::Entity::find().all(&target).await.unwrap();
+    let global = rows
+        .iter()
+        .find(|r| r.key == "version_check_interval")
+        .unwrap();
+    assert_eq!(global.pkg_id, Some(-1));
+    let scoped = rows.iter().find(|r| r.key == "build_flags").unwrap();
+    assert_eq!(
+        scoped.pkg_id,
+        Some(new_id),
+        "a per-package setting landed on the wrong package"
+    );
 }
