@@ -731,6 +731,9 @@ enum OnExisting {
     Skip,
     /// Replace its configuration with the dump's.
     Overwrite,
+    /// Leave it alone, but take the dump's patch if it has none. Refuses the
+    /// import when both sides carry one.
+    MergePatches,
 }
 
 impl OnExisting {
@@ -738,6 +741,7 @@ impl OnExisting {
         match self {
             Self::Skip => "skip",
             Self::Overwrite => "overwrite",
+            Self::MergePatches => "merge-patches",
         }
     }
 }
@@ -777,9 +781,21 @@ async fn restore_command(
             println!("would apply {} package(s):", accepted.total);
             for entry in &accepted.preview {
                 println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);
+                if let RestoreOutcome::Failed { error } = &entry.outcome {
+                    println!("             {error}");
+                }
             }
         }
-        return Ok(());
+        // A dry run that found something blocking exits non-zero, so
+        // `restore --dry-run && restore` cannot walk into the failure it was
+        // run to discover. Reporting the problem and then reporting success is
+        // the one thing a preview must not do.
+        let blocked = accepted
+            .preview
+            .iter()
+            .filter(|e| matches!(e.outcome, RestoreOutcome::Failed { .. }))
+            .count();
+        return restore_result(i32::try_from(blocked).unwrap_or(i32::MAX));
     };
 
     if format == OutputFormat::Json {
@@ -820,6 +836,7 @@ fn outcome_label(outcome: &RestoreOutcome) -> &'static str {
         RestoreOutcome::Imported => "imported",
         RestoreOutcome::Skipped => "skipped",
         RestoreOutcome::Overwritten => "overwritten",
+        RestoreOutcome::PatchAdopted => "patched",
         RestoreOutcome::Failed { .. } => "failed",
     }
 }

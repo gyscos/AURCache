@@ -937,3 +937,164 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].username, "alice");
 }
+
+/// `merge-patches` fills in a patch the instance lacks, and leaves the rest of
+/// its configuration alone -- it is `skip` plus that one thing.
+#[tokio::test]
+async fn merge_patches_adopts_a_patch_the_instance_lacks() {
+    let source = db().await;
+    package(&source, "shared", true, Some("--- from-dump\n")).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let id = package(&target, "shared", true, None).await;
+    // Local configuration the dump does not match, to show it survives.
+    let mut existing: packages::ActiveModel = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    existing.platforms = Set("aarch64".to_string());
+    existing.update(&target).await.unwrap();
+
+    let loaded = load_dump(&bytes).unwrap();
+    let applied = aurcache_utils::restore::write_rows(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            on_existing: ExistingPackagePolicy::MergePatches,
+            ..RestoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let row = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.patch.as_deref(), Some("--- from-dump\n"));
+    assert_eq!(
+        row.platforms, "aarch64",
+        "merge-patches overwrote configuration"
+    );
+    assert!(matches!(
+        applied.entries[0].outcome,
+        RestoreOutcome::PatchAdopted
+    ));
+    // A patch changes what the source resolves to, so it has to be read again.
+    assert_eq!(applied.touched, ["shared"]);
+}
+
+/// The instance's own patch is never replaced by the dump's absence of one.
+#[tokio::test]
+async fn merge_patches_keeps_the_instances_own_patch() {
+    let source = db().await;
+    package(&source, "shared", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let id = package(&target, "shared", true, Some("--- mine\n")).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    let applied = aurcache_utils::restore::write_rows(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            on_existing: ExistingPackagePolicy::MergePatches,
+            ..RestoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let row = Packages::find_by_id(id)
+        .one(&target)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.patch.as_deref(), Some("--- mine\n"));
+    assert!(matches!(
+        applied.entries[0].outcome,
+        RestoreOutcome::Skipped
+    ));
+    // Nothing changed, so nothing needs re-reading.
+    assert!(applied.touched.is_empty());
+}
+
+/// Two patches for the same package are not merged and not silently picked
+/// between: the import is refused, and nothing is written.
+#[tokio::test]
+async fn two_patches_for_one_package_refuse_the_import() {
+    let source = db().await;
+    package(&source, "shared", true, Some("--- from-dump\n")).await;
+    package(&source, "also-new", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    package(&target, "shared", true, Some("--- mine\n")).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    let error = aurcache_utils::restore::write_rows(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            on_existing: ExistingPackagePolicy::MergePatches,
+            ..RestoreOptions::default()
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("shared"), "the conflict is unnamed: {error}");
+    assert!(
+        error.contains("--on-existing overwrite"),
+        "the refusal offers no way forward: {error}"
+    );
+    // Refused before anything was written: the other package in the dump did
+    // not land either.
+    let names: Vec<String> = Packages::find()
+        .all(&target)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, ["shared"], "a refused import wrote something anyway");
+}
+
+/// A dry run reports the conflict rather than discovering it on the real run,
+/// which is the whole reason to offer one.
+#[tokio::test]
+async fn a_preview_names_the_conflicting_packages() {
+    let source = db().await;
+    package(&source, "clash", true, Some("--- from-dump\n")).await;
+    package(&source, "fine", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    package(&target, "clash", true, Some("--- mine\n")).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    let entries = preview(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            dry_run: true,
+            on_existing: ExistingPackagePolicy::MergePatches,
+            ..RestoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let by_name: HashMap<&str, &RestoreOutcome> = entries
+        .iter()
+        .map(|e| (e.pkgbase.as_str(), &e.outcome))
+        .collect();
+    assert!(matches!(by_name["clash"], RestoreOutcome::Failed { .. }));
+    assert!(matches!(by_name["fine"], RestoreOutcome::Imported));
+}

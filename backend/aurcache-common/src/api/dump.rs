@@ -171,6 +171,15 @@ pub enum ExistingPackagePolicy {
     Skip,
     /// Replace its configuration with the dump's.
     Overwrite,
+    /// Leave its configuration alone, but adopt the dump's patch when it has
+    /// none of its own.
+    ///
+    /// Nothing is merged textually. Two patches against the same PKGBUILD
+    /// cannot be combined without understanding both, so when each side has one
+    /// the import is refused rather than picking -- that is a conflict only the
+    /// operator can resolve, and guessing produces a package that builds
+    /// something nobody wrote.
+    MergePatches,
 }
 
 /// How an import should behave.
@@ -208,6 +217,9 @@ pub enum RestoreOutcome {
     Skipped,
     /// Already here; its configuration was replaced.
     Overwritten,
+    /// Already here and left as it was, except that it had no patch and the
+    /// dump had one.
+    PatchAdopted,
     /// Rejected. The rest of the import still applied.
     Failed { error: String },
 }

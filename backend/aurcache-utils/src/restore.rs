@@ -226,17 +226,53 @@ pub async fn preview(
 ) -> anyhow::Result<Vec<RestoreEntry>> {
     let mut entries = Vec::new();
     for pkgbase in dump.packages.keys() {
-        let exists = package_row(db, pkgbase).await?.is_some();
+        let existing = package_row(db, pkgbase).await?;
+        let dump_patch = dump.patches.get(pkgbase);
         entries.push(RestoreEntry {
             pkgbase: pkgbase.clone(),
-            outcome: match (exists, options.on_existing) {
-                (false, _) => RestoreOutcome::Imported,
-                (true, ExistingPackagePolicy::Skip) => RestoreOutcome::Skipped,
-                (true, ExistingPackagePolicy::Overwrite) => RestoreOutcome::Overwritten,
+            outcome: match (existing, options.on_existing) {
+                (None, _) => RestoreOutcome::Imported,
+                (Some(_), ExistingPackagePolicy::Skip) => RestoreOutcome::Skipped,
+                (Some(_), ExistingPackagePolicy::Overwrite) => RestoreOutcome::Overwritten,
+                (Some(row), ExistingPackagePolicy::MergePatches) => {
+                    match patch_decision(row.patch.as_deref(), dump_patch.map(String::as_str)) {
+                        PatchDecision::Keep => RestoreOutcome::Skipped,
+                        PatchDecision::Adopt => RestoreOutcome::PatchAdopted,
+                        PatchDecision::Conflict => RestoreOutcome::Failed {
+                            error: PATCH_CONFLICT.to_string(),
+                        },
+                    }
+                }
             },
         });
     }
     Ok(entries)
+}
+
+/// Said the same way wherever it is reported, so a dry run and a refused import
+/// give the operator the same sentence.
+const PATCH_CONFLICT: &str = "both this instance and the dump carry a patch for this package; \
+     keep one and remove the other, or import with --on-existing overwrite";
+
+/// What `merge-patches` should do about one package's patches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchDecision {
+    /// Nothing to do: the instance's patch stands, or neither side has one.
+    Keep,
+    /// The instance has none and the dump does.
+    Adopt,
+    /// Both do. Not resolvable without reading them.
+    Conflict,
+}
+
+fn patch_decision(existing: Option<&str>, from_dump: Option<&str>) -> PatchDecision {
+    // An empty patch is the absence of one, not a patch that changes nothing.
+    let has = |patch: Option<&str>| patch.is_some_and(|p| !p.trim().is_empty());
+    match (has(existing), has(from_dump)) {
+        (true, true) => PatchDecision::Conflict,
+        (false, true) => PatchDecision::Adopt,
+        _ => PatchDecision::Keep,
+    }
 }
 
 async fn package_row(
@@ -439,6 +475,27 @@ pub async fn write_rows(
     dump: &LoadedDump,
     options: &RestoreOptions,
 ) -> anyhow::Result<Applied> {
+    // Every conflict, before anything is written. Reporting them one at a time
+    // would make an operator fix one, re-run, and meet the next; and a refusal
+    // that has already applied half the dump is the state this whole design
+    // exists to avoid.
+    if options.on_existing == ExistingPackagePolicy::MergePatches {
+        let mut conflicts = Vec::new();
+        for pkgbase in dump.packages.keys() {
+            let existing = package_row(db, pkgbase).await?;
+            let decision = patch_decision(
+                existing.as_ref().and_then(|row| row.patch.as_deref()),
+                dump.patches.get(pkgbase).map(String::as_str),
+            );
+            if decision == PatchDecision::Conflict {
+                conflicts.push(pkgbase.clone());
+            }
+        }
+        if !conflicts.is_empty() {
+            anyhow::bail!("{PATCH_CONFLICT}: {}", conflicts.join(", "));
+        }
+    }
+
     let txn = db.begin().await?;
     let mut entries = Vec::new();
     let mut touched = Vec::new();
@@ -474,6 +531,25 @@ pub async fn write_rows(
                 ids.insert(pkgbase.clone(), id);
                 touched.push(pkgbase.clone());
                 RestoreOutcome::Overwritten
+            }
+            (Some(row), ExistingPackagePolicy::MergePatches) => {
+                let id = row.id;
+                // Conflicts were ruled out above, so this is only ever "the
+                // instance has none and the dump does".
+                let decision = patch_decision(row.patch.as_deref(), patch.as_deref());
+                ids.insert(pkgbase.clone(), id);
+                if decision == PatchDecision::Adopt {
+                    let mut active: packages::ActiveModel = row.into();
+                    active.patch = Set(patch);
+                    active.update(&txn).await?;
+                    // A patch changes what the source resolves to, so its
+                    // `provides`, split names and dependencies all have to be
+                    // read again.
+                    touched.push(pkgbase.clone());
+                    RestoreOutcome::PatchAdopted
+                } else {
+                    RestoreOutcome::Skipped
+                }
             }
             (None, _) => {
                 let id = insert_row(&txn, pkgbase, package, patch).await?;

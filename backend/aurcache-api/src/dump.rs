@@ -176,6 +176,7 @@ pub async fn restore(
         on_existing: match on_existing.as_deref() {
             None | Some("skip") => ExistingPackagePolicy::Skip,
             Some("overwrite") => ExistingPackagePolicy::Overwrite,
+            Some("merge-patches") => ExistingPackagePolicy::MergePatches,
             Some(other) => {
                 return Err(err(
                     Status::BadRequest,
