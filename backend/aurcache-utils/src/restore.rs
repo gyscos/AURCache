@@ -320,6 +320,16 @@ pub async fn write_rows(
     let mut touched = Vec::new();
     let mut ids = BTreeMap::new();
 
+    // Clearing happens inside the same transaction that writes the
+    // replacement. If it did not, an import that failed after wiping would
+    // leave an empty instance -- the one outcome worse than either keeping the
+    // old state or taking the new one.
+    let orphaned = if options.clear {
+        clear_existing(&txn).await?
+    } else {
+        Vec::new()
+    };
+
     for (pkgbase, package) in &dump.packages {
         let existing = Packages::find()
             .filter(packages::Column::Name.eq(pkgbase))
@@ -355,9 +365,94 @@ pub async fn write_rows(
     }
 
     write_settings(&txn, dump, &ids).await?;
+    write_workers(&txn, dump).await?;
     txn.commit().await?;
 
+    // Only now: a rolled-back transaction can put a row back, and nothing can
+    // put back a deleted file.
+    for file in &orphaned {
+        crate::utils::remove_archive_file::forget_archive_file(file);
+    }
+
     Ok(Applied { entries, touched })
+}
+
+/// Remove everything a dump replaces, returning the built artifacts whose files
+/// the caller must forget once the transaction commits.
+///
+/// What gets cleared is decided by what a dump *contains*, not by a list of
+/// tables: packages, settings and workers travel in every dump, so all three
+/// go. Anything a dump does not carry is left alone -- which is what stops a
+/// public dump, which has no CA, from destroying one.
+///
+/// Builds, files and VCS-source rows go with their packages. They are not in
+/// the dump because they are derived, but leaving them would orphan them
+/// against packages that no longer exist.
+async fn clear_existing<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+) -> anyhow::Result<Vec<aurcache_db::files::Model>> {
+    let orphaned = aurcache_db::prelude::Files::find().all(txn).await?;
+
+    aurcache_db::prelude::Dependencies::delete_many()
+        .exec(txn)
+        .await?;
+    aurcache_db::prelude::PackageVcsSources::delete_many()
+        .exec(txn)
+        .await?;
+    aurcache_db::prelude::Files::delete_many().exec(txn).await?;
+    aurcache_db::prelude::Builds::delete_many()
+        .exec(txn)
+        .await?;
+    aurcache_db::prelude::Settings::delete_many()
+        .exec(txn)
+        .await?;
+    aurcache_db::prelude::Workers::delete_many()
+        .exec(txn)
+        .await?;
+    Packages::delete_many().exec(txn).await?;
+
+    Ok(orphaned)
+}
+
+/// Restore the workers a dump trusts.
+///
+/// Identified by fingerprint, not by name: the fingerprint is what a worker
+/// proves on contact, and two instances can easily have used different names
+/// for the same machine.
+///
+/// No certificate is imported -- a public dump has none, and one signed by
+/// another instance's CA would mean nothing here. A worker whose fingerprint is
+/// already known re-enrolls and is approved without anyone being asked, which is
+/// what makes a migration invisible to it.
+async fn write_workers<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    dump: &LoadedDump,
+) -> anyhow::Result<()> {
+    for worker in &dump.workers {
+        let existing = aurcache_db::prelude::Workers::find()
+            .filter(aurcache_db::workers::Column::CertFingerprint.eq(&worker.cert_fingerprint))
+            .one(txn)
+            .await?;
+        // Already trusted here. Its routing is this instance's decision, not
+        // the dump's, so it is left as it is.
+        if existing.is_some() {
+            continue;
+        }
+        aurcache_db::workers::ActiveModel {
+            name: Set(worker.name.clone()),
+            status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+            cert_fingerprint: Set(worker.cert_fingerprint.clone()),
+            native_arches: Set(join_list(&worker.native_arches)),
+            emulated_arches: Set(join_list(&worker.emulated_arches)),
+            package_affinity: Set(join_list(&worker.package_affinity)),
+            priority: Set(worker.priority),
+            concurrency: Set(worker.concurrency),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// The columns a dump owns. Everything else on the row is derived and is left
@@ -489,7 +584,7 @@ async fn fill_source_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::load_dump;
+    use super::{clear_existing, load_dump};
     use aurcache_common::api::dump::DUMP_SCHEMA_VERSION;
 
     /// Build an archive from explicit file contents, so a test can write a
@@ -601,6 +696,63 @@ mod tests {
         );
         let error = load(files).unwrap_err().to_string();
         assert!(error.contains("no platforms"), "unhelpful: {error}");
+    }
+
+    /// Clearing is undone by a rollback.
+    ///
+    /// This is what lets `write_rows` clear and write in one transaction, and
+    /// it is the property the whole `--clear` design rests on: if the write
+    /// fails, the instance must still be what it was. An emptied instance is
+    /// the one outcome worse than either keeping the old state or taking the
+    /// new one, and it is not recoverable by re-running.
+    #[tokio::test]
+    async fn a_rolled_back_clear_puts_everything_back() {
+        use aurcache_db::migration::Migrator;
+        use aurcache_db::packages::{SourceData, SourceType};
+        use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set, TransactionTrait};
+        use sea_orm_migration::MigratorTrait;
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        aurcache_db::packages::ActiveModel {
+            name: Set("precious".to_string()),
+            status: Set(0),
+            out_of_date: Set(0),
+            build_flags: Set(String::new()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(SourceType::Aur),
+            source_data: Set(SourceData::Aur {
+                name: "precious".to_string(),
+            }),
+            directly_requested: Set(true),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let txn = db.begin().await.unwrap();
+        clear_existing(&txn).await.unwrap();
+        assert!(
+            aurcache_db::prelude::Packages::find()
+                .all(&txn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the clear did not take effect inside its transaction"
+        );
+        txn.rollback().await.unwrap();
+
+        let survivors = aurcache_db::prelude::Packages::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "a rolled-back clear destroyed data anyway"
+        );
+        assert_eq!(survivors[0].name, "precious");
     }
 
     /// A patch reaches the package it names.

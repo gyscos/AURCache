@@ -123,6 +123,17 @@ pub struct RestoreOptions {
     pub dry_run: bool,
     #[serde(default)]
     pub on_existing: ExistingPackagePolicy,
+    /// Replace, rather than add to, whatever the dump covers.
+    ///
+    /// The rule is that the dump replaces what it *contains*: packages,
+    /// settings and workers all travel in every dump, so all three are wiped
+    /// and rewritten. Anything a dump does not carry is untouched by this --
+    /// which is what keeps a public dump from destroying a CA it never had.
+    ///
+    /// `on_existing` has nothing left to decide once this is set: there is no
+    /// existing package by the time the dump is written.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 /// What an import did, or would do, to one package.

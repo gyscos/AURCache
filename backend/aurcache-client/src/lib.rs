@@ -601,12 +601,14 @@ impl AurCacheClient {
         archive: Vec<u8>,
         dry_run: bool,
         on_existing: &str,
+        clear: bool,
     ) -> Result<RestoreAccepted> {
         let mut url = reqwest::Url::parse(&endpoint_url(&self.base_url, "/restore"))
             .context("invalid restore URL")?;
         url.query_pairs_mut()
             .append_pair("dry_run", &dry_run.to_string())
-            .append_pair("on_existing", on_existing);
+            .append_pair("on_existing", on_existing)
+            .append_pair("clear", &clear.to_string());
         let response = self
             .client
             .post(url)

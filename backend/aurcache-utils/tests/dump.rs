@@ -364,6 +364,7 @@ async fn overwrite_is_reported_as_overwrite() {
         &target,
         &loaded,
         &RestoreOptions {
+            clear: false,
             dry_run: true,
             on_existing: ExistingPackagePolicy::Overwrite,
         },
@@ -464,6 +465,7 @@ async fn overwrite_replaces_the_configuration() {
         &target,
         &loaded,
         &RestoreOptions {
+            clear: false,
             dry_run: false,
             on_existing: ExistingPackagePolicy::Overwrite,
         },
@@ -608,4 +610,123 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     // The row stays: it carries the configuration the dump asked for, and the
     // commonest reason to get here is a transient read.
     assert_eq!(Packages::find().all(&target).await.unwrap().len(), 1);
+}
+
+/// `--clear` replaces rather than adds: what was here and is not in the dump
+/// is gone, and what the dump carries is present.
+#[tokio::test]
+async fn clear_replaces_what_was_here() {
+    let source = db().await;
+    package(&source, "from-dump", true, None).await;
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    package(&target, "only-here", true, None).await;
+
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(
+        &target,
+        &loaded,
+        &RestoreOptions {
+            clear: true,
+            ..RestoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<String> = Packages::find()
+        .all(&target)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(names, ["from-dump"], "clear did not replace the contents");
+}
+
+/// Approved workers come back, identified by the fingerprint they will present
+/// on contact rather than by a name either instance chose.
+#[tokio::test]
+async fn workers_are_restored_by_fingerprint() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    workers::ActiveModel {
+        name: Set("builder".to_string()),
+        status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+        cert_fingerprint: Set("fp-1".to_string()),
+        native_arches: Set("x86_64".to_string()),
+        emulated_arches: Set(String::new()),
+        package_affinity: Set(String::new()),
+        priority: Set(7),
+        concurrency: Set(3),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let restored = workers::Entity::find().all(&target).await.unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].cert_fingerprint, "fp-1");
+    assert_eq!(restored[0].priority, 7);
+    assert_eq!(restored[0].concurrency, 3);
+    // No certificate travels: one signed by another instance's CA would mean
+    // nothing here, so the worker re-enrols and is approved on its fingerprint.
+    assert_eq!(restored[0].signed_cert, None);
+}
+
+/// A worker already trusted here keeps the routing this instance gave it. The
+/// dump says who to trust, not how this server should schedule.
+#[tokio::test]
+async fn an_already_trusted_worker_keeps_its_routing() {
+    let source = db().await;
+    package(&source, "hello", true, None).await;
+    workers::ActiveModel {
+        name: Set("builder".to_string()),
+        status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+        cert_fingerprint: Set("fp-1".to_string()),
+        native_arches: Set("x86_64".to_string()),
+        emulated_arches: Set(String::new()),
+        package_affinity: Set(String::new()),
+        priority: Set(7),
+        concurrency: Set(3),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    workers::ActiveModel {
+        name: Set("same-machine-other-name".to_string()),
+        status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+        cert_fingerprint: Set("fp-1".to_string()),
+        native_arches: Set("x86_64".to_string()),
+        emulated_arches: Set(String::new()),
+        package_affinity: Set(String::new()),
+        priority: Set(1),
+        concurrency: Set(9),
+        ..Default::default()
+    }
+    .insert(&target)
+    .await
+    .unwrap();
+
+    let loaded = load_dump(&bytes).unwrap();
+    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let all = workers::Entity::find().all(&target).await.unwrap();
+    assert_eq!(all.len(), 1, "the same machine was trusted twice");
+    assert_eq!(all[0].concurrency, 9, "the dump overrode local routing");
 }

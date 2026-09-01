@@ -113,13 +113,17 @@ mod tests {
 /// Otherwise the rows are written in one transaction and the slow half -- one
 /// source read per package, then the dependency graph -- runs detached, with
 /// progress recorded the way a bulk add's is.
-#[post("/restore?<dry_run>&<on_existing>", data = "<archive>")]
+// Rocket's request guards, the three query parameters and the body are each an
+// independent input; bundling them into a struct would only move the same list.
+#[allow(clippy::too_many_arguments)]
+#[post("/restore?<dry_run>&<on_existing>&<clear>", data = "<archive>")]
 pub async fn restore(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
     tx: &State<Sender<Action>>,
     dry_run: Option<bool>,
     on_existing: Option<String>,
+    clear: Option<bool>,
     archive: Data<'_>,
     _a: Authenticated,
 ) -> Result<status::Accepted<Json<RestoreAccepted>>, ApiError> {
@@ -134,6 +138,7 @@ pub async fn restore(
 
     let options = RestoreOptions {
         dry_run: dry_run.unwrap_or(false),
+        clear: clear.unwrap_or(false),
         on_existing: match on_existing.as_deref() {
             None | Some("skip") => ExistingPackagePolicy::Skip,
             Some("overwrite") => ExistingPackagePolicy::Overwrite,

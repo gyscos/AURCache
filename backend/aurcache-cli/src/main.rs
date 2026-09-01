@@ -96,6 +96,10 @@ enum Command {
         /// What to do about a package that already exists here.
         #[arg(long, value_enum, default_value_t = OnExisting::Skip)]
         on_existing: OnExisting,
+        /// Replace what is here rather than adding to it. Destructive: every
+        /// package, setting and worker this instance has is removed first.
+        #[arg(long)]
+        clear: bool,
     },
     /// Manage builds.
     Builds {
@@ -410,7 +414,8 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
             archive,
             dry_run,
             on_existing,
-        } => restore_command(client, format, &archive, dry_run, on_existing).await,
+            clear,
+        } => restore_command(client, format, &archive, dry_run, on_existing, clear).await,
         Command::Builds { command } => run_builds_command(client, format, command).await,
         Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
@@ -702,11 +707,14 @@ async fn restore_command(
     archive: &Path,
     dry_run: bool,
     on_existing: OnExisting,
+    clear: bool,
 ) -> Result<()> {
     let bytes =
         std::fs::read(archive).with_context(|| format!("failed to read {}", archive.display()))?;
 
-    let accepted = client.restore(bytes, dry_run, on_existing.as_str()).await?;
+    let accepted = client
+        .restore(bytes, dry_run, on_existing.as_str(), clear)
+        .await?;
 
     // A dry run has nothing to poll: it changed nothing, and what it would have
     // done is already in hand.
@@ -714,6 +722,9 @@ async fn restore_command(
         if format == OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&accepted)?);
         } else {
+            if clear {
+                println!("would first remove every package, setting and worker here");
+            }
             println!("would apply {} package(s):", accepted.total);
             for entry in &accepted.preview {
                 println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);

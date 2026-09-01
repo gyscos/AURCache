@@ -8,6 +8,22 @@ pub async fn try_remove_archive_file(
     file: files::Model,
     db: &DatabaseTransaction,
 ) -> anyhow::Result<()> {
+    forget_archive_file(&file);
+    file.delete(db).await?;
+
+    Ok(())
+}
+
+/// Take a built artifact out of the repository: off the disk, and out of the
+/// pacman databases that index it.
+///
+/// Split from the row deletion because the two cannot be undone together. A
+/// caller that deletes rows inside a transaction has to do this *after* it
+/// commits -- a rolled-back transaction can put a row back, and nothing can put
+/// back a file. Both steps are best-effort and logged: the row is the record
+/// that matters, and a file left behind is tidier than a row pointing at
+/// nothing.
+pub fn forget_archive_file(file: &files::Model) {
     let platform_repo = PathBuf::from(format!("./repo/{}", file.platform));
     let file_path = platform_repo.join(&file.filename);
 
@@ -24,8 +40,4 @@ pub async fn try_remove_archive_file(
     } else {
         info!("Removed old file: {}", file_path.display());
     }
-
-    file.delete(db).await?;
-
-    Ok(())
 }
