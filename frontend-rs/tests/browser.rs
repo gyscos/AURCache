@@ -236,6 +236,7 @@ async fn interactions() {
     a_stored_config_file_is_loaded_into_the_editor(&session).await;
     a_linked_search_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
+    a_queue_is_added_as_one_job(&session).await;
     approving_a_worker_lets_it_build(&session).await;
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
@@ -387,6 +388,49 @@ async fn one_queued_package_can_be_taken_back(session: &Session) {
         session.text().await.contains("one.git"),
         "removing one chip took its neighbour with it"
     );
+}
+
+/// A queue of several packages is submitted as one bulk add, and each one's
+/// outcome comes back separately.
+///
+/// The failure this guards against is invisible without a browser and a server:
+/// the dialog now starts a job and polls it rather than issuing one request per
+/// package, so a mistake in the polling loop -- never attaching, losing the
+/// offset, not noticing the job finished -- leaves a spinner on screen forever
+/// while the server has long since finished. Two unreachable remotes are used
+/// deliberately: what is being tested is that both outcomes are reported, and
+/// a failure is the outcome this fixture can produce without network.
+async fn a_queue_is_added_as_one_job(session: &Session) {
+    session.open("/packages/add").await;
+
+    let entry = ".modal-box input[type=text]";
+    for repo in ["bulk-one", "bulk-two"] {
+        let url = format!("https://github.com/user/{repo}.git");
+        session.type_into(entry, &url).await;
+        session
+            .wait_until("the git fields", |t| t.contains("Subfolder"))
+            .await;
+        session
+            .click_labelled(".modal-box button", "Add to list")
+            .await;
+        session
+            .wait_until("the queued chip", |t| t.contains(&format!("{repo}.git")))
+            .await;
+    }
+
+    session
+        .click_labelled(".modal-action button", "Add 2 packages")
+        .await;
+
+    // Both are named, so the job's per-package outcomes reached the screen --
+    // not just the first, and not a single collapsed error for the batch.
+    session
+        .wait_until("both packages to be reported", |t| {
+            t.contains("could not be added")
+                && t.contains("bulk-one.git")
+                && t.contains("bulk-two.git")
+        })
+        .await;
 }
 
 /// Saving a package's config file writes the package's row, not the server's.

@@ -21,16 +21,23 @@
 use crate::platforms::{self, PlatformChecklist};
 use crate::routes::Route;
 use aurcache_client::{
-    AddPackageRequest, GitSourceSpec, SearchResult, SourceData, looks_like_git_url,
+    AddPackageRequest, AddPackagesRequest, BulkAddOutcome, GitSourceSpec, SearchResult, SourceData,
+    looks_like_git_url,
 };
 use dioxus::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// How long to wait after the last keystroke before searching.
 ///
 /// The search proxies to the AUR, so every keystroke sent straight through is a
 /// request someone else pays for.
+/// How often to ask a running bulk add what it has done.
+///
+/// A package takes seconds to add -- a checkout each -- so polling faster than
+/// this only produces identical answers.
+const BULK_POLL_INTERVAL: Duration = Duration::from_millis(700);
+
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// How long to wait before looking up a one- or two-character entry.
@@ -140,6 +147,112 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
             .description
             .as_deref()
             .is_some_and(|d| d.to_lowercase().contains(query))
+}
+
+/// Add a list of sources in one request, following the job until it ends.
+///
+/// One request rather than one per package: the server resolves every AUR name
+/// to its pkgbase in a single batched RPC call, where adding them one at a time
+/// spent an AUR request per package before fetching anything.
+///
+/// Returns the failures and the sources that produced them, so the queue can
+/// keep exactly what still needs adding. Watching is optional as far as the
+/// server is concerned — the job runs whether or not this keeps polling — but
+/// the dialog stays open, so it does.
+async fn submit_bulk(
+    client: &aurcache_client::AurCacheClient,
+    sources: Vec<SourceData>,
+    platforms: Vec<String>,
+    mut added: Signal<Vec<String>>,
+    mut adding: Signal<Option<String>>,
+) -> (Vec<(String, String)>, Vec<SourceData>) {
+    // Kept so a failure can be matched back to the source that caused it: the
+    // job reports the name the request carried, which is what `source_label`
+    // produces here.
+    let by_label: HashMap<String, SourceData> = sources
+        .iter()
+        .map(|source| (source_label(source), source.clone()))
+        .collect();
+    // The job works through the list in order, so once N outcomes are in, the
+    // one in flight is the N-th. That is what the queue puts a spinner on.
+    let labels: Vec<String> = sources.iter().map(source_label).collect();
+
+    let accepted = match client
+        .add_packages(&AddPackagesRequest {
+            platforms: Some(platforms),
+            build_flags: None,
+            sources: sources.clone(),
+        })
+        .await
+    {
+        Ok(accepted) => accepted,
+        // Nothing started, so everything is still to do.
+        Err(e) => return (vec![(String::new(), e.to_string())], sources),
+    };
+
+    let mut seen = 0_usize;
+    let mut failed = Vec::new();
+    let mut remaining = Vec::new();
+    loop {
+        let progress = match client.bulk_add_progress(accepted.job_id, seen).await {
+            Ok(progress) => progress,
+            // The job is still running; we have merely lost sight of it. Say so
+            // rather than reporting packages as failed, which they are not.
+            Err(e) => {
+                failed.push((String::new(), format!("lost track of the add: {e}")));
+                return (failed, remaining);
+            }
+        };
+        seen += progress.entries.len();
+        for entry in progress.entries {
+            match entry.outcome {
+                BulkAddOutcome::Added | BulkAddOutcome::Existed => added.push(entry.name),
+                BulkAddOutcome::Failed { error } => {
+                    if let Some(source) = by_label.get(&entry.name) {
+                        remaining.push(source.clone());
+                    }
+                    failed.push((entry.name, error));
+                }
+            }
+        }
+        if progress.finished {
+            return (failed, remaining);
+        }
+        adding.set(labels.get(seen).cloned());
+        gloo_timers::future::sleep(BULK_POLL_INTERVAL).await;
+    }
+}
+
+/// Add a single source that carries file edits, through the endpoint that
+/// accepts them.
+async fn submit_patched(
+    client: &aurcache_client::AurCacheClient,
+    sources: Vec<SourceData>,
+    platforms: Vec<String>,
+    patched: BTreeMap<String, String>,
+    mut added: Signal<Vec<String>>,
+) -> (Vec<(String, String)>, Vec<SourceData>) {
+    let mut failed = Vec::new();
+    let mut remaining = Vec::new();
+    for source in sources {
+        let label = source_label(&source);
+        match client
+            .add_package(&AddPackageRequest {
+                platforms: Some(platforms.clone()),
+                build_flags: None,
+                source: source.clone(),
+                patched_files: Some(patched.clone()),
+            })
+            .await
+        {
+            Ok(()) => added.push(label),
+            Err(e) => {
+                failed.push((label, e.to_string()));
+                remaining.push(source);
+            }
+        }
+    }
+    (failed, remaining)
 }
 
 /// Orders search results by how well they answer what was typed.
@@ -408,33 +521,16 @@ fn AddPackageDialog(q: String) -> Element {
             }
         };
 
-        // One request each, because that is what the API takes. A failure part
-        // way through leaves the earlier ones added, so the ones that worked
-        // are dropped from the queue and only the rest stay on screen — retrying
-        // the whole list would try to add them twice.
-        let mut remaining = Vec::new();
-        let mut failed = Vec::new();
-        for source in sources {
-            let label = source_label(&source);
-            adding.set(Some(label.clone()));
-            let result = client
-                .add_package(&AddPackageRequest {
-                    platforms: Some(platforms_selected()),
-                    build_flags: None,
-                    source: source.clone(),
-                    // Only ever one source when there are edits, so they
-                    // cannot be attached to the wrong one.
-                    patched_files: (!patched().is_empty()).then(&*patched),
-                })
-                .await;
-            match result {
-                Ok(()) => added.push(label),
-                Err(e) => {
-                    failed.push((label, e.to_string()));
-                    remaining.push(source);
-                }
-            }
-        }
+        // A patched add carries file edits, which the bulk request has nowhere
+        // to put — and there is only ever one source when there are edits, so
+        // it is a single add by definition.
+        let (mut failed, mut remaining) = if patched().is_empty() {
+            submit_bulk(&client, sources, platforms_selected(), added, adding).await
+        } else {
+            submit_patched(&client, sources, platforms_selected(), patched(), added).await
+        };
+        failed.shrink_to_fit();
+        remaining.shrink_to_fit();
         adding.set(None);
         busy.set(false);
 
