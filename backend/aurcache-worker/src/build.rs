@@ -27,6 +27,26 @@ use std::path::{Path, PathBuf};
 /// own binds, so a bind here overrides one devtools made for the same target —
 /// which is how the per-job pacman cache replaces the shared one. There is no
 /// supported flag for that; `SRCDEST`, which does have one, uses it instead.
+/// Where to find the sandbox-wrapping `makechrootpkg`.
+///
+/// An absolute path, not a name on `PATH`. The worker runs devtools through
+/// `sudo`, and sudo replaces `PATH` with its own `secure_path`, so a `PATH`
+/// set for the service never reaches the command. Naming the file is the only
+/// way to be sure which one runs.
+///
+/// This is *not* the packaged `/usr/bin/makechrootpkg`: it is a copy with the
+/// two places a PKGBUILD is executed outside the chroot wrapped in
+/// `aurcache-sandbox` (see `packaging/patch-makechrootpkg.py`). Running the
+/// unpatched one would build packages with those two steps unconfined, which is
+/// a silent loss of isolation rather than a failure -- so the default points at
+/// the patched copy and an operator who moves it says where it went.
+fn makechrootpkg_path() -> String {
+    std::env::var("WORKER_MAKECHROOTPKG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/usr/lib/aurcache/bin/makechrootpkg".to_string())
+}
+
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
@@ -35,7 +55,7 @@ pub fn build_command(
     build_user: &str,
 ) -> Vec<String> {
     let mut argv = vec![
-        "makechrootpkg".to_string(),
+        makechrootpkg_path(),
         "-c".to_string(),
         "-r".to_string(),
         chroot_root.display().to_string(),
@@ -77,7 +97,15 @@ mod tests {
             "builder",
         );
         let joined = cmd.join(" ");
-        assert_eq!(cmd[0], "makechrootpkg");
+        // An absolute path, not a bare name: the command goes through `sudo`,
+        // which replaces PATH with its own `secure_path`, so a name would
+        // resolve to the *unpatched* system makechrootpkg and run two steps of
+        // every build unconfined.
+        assert!(
+            cmd[0].starts_with('/') && cmd[0].ends_with("/makechrootpkg"),
+            "makechrootpkg must be named by absolute path, got {}",
+            cmd[0]
+        );
         assert!(!cmd.iter().any(|a| a == "systemd-run"));
         assert!(!cmd.iter().any(|a| a == "--pkgdest"));
         assert!(joined.contains("makechrootpkg -c -r /chroot -l job-42"));

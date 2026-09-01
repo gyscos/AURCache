@@ -128,9 +128,9 @@ COPY --from=builder /usr/local/bin/aurcache-sandbox /usr/local/bin/aurcache-sand
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
 # Confine the two places makechrootpkg executes a PKGBUILD on the worker,
 # outside the chroot. See backend/aurcache-sandbox.
-COPY --chmod=0755 docker/patch-makechrootpkg.py /usr/local/bin/patch-makechrootpkg
+COPY --chmod=0755 packaging/patch-makechrootpkg.py /usr/local/bin/patch-makechrootpkg
 # Paths a PKGBUILD must never read; see the file for why it is not an env var.
-COPY docker/sandbox-protected /etc/aurcache/sandbox-protected
+COPY packaging/sandbox-protected /etc/aurcache/sandbox-protected
 COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
 RUN pacman -S --noconfirm --needed python && /usr/local/bin/patch-makechrootpkg
 # Entrypoint fixes shared-enroll-volume ownership before dropping to the worker.

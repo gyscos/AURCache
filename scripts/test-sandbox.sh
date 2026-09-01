@@ -24,7 +24,7 @@ trap '(( KEEP )) || rm -rf "$WORKDIR"' EXIT
 echo "==> building test image (Arch + devtools + sandbox)"
 cargo build --release --manifest-path backend/Cargo.toml -p aurcache-sandbox >/dev/null
 cp backend/target/release/aurcache-sandbox "$WORKDIR/"
-cp docker/nspawn-wrapper.sh docker/patch-makechrootpkg.py docker/sandbox-protected "$WORKDIR/"
+cp docker/nspawn-wrapper.sh packaging/patch-makechrootpkg.py packaging/sandbox-protected "$WORKDIR/"
 cp docker/testpkg/hostile-fixture/PKGBUILD "$WORKDIR/"
 
 cat > "$WORKDIR/Dockerfile" <<'EOF'
@@ -43,7 +43,7 @@ COPY PKGBUILD /fixture/PKGBUILD
 RUN chmod +x /usr/local/bin/aurcache-sandbox /usr/local/bin/systemd-nspawn \
       /usr/local/bin/patch-makechrootpkg \
  && /usr/local/bin/patch-makechrootpkg \
- && mv /usr/local/bin/makechrootpkg /usr/local/bin/makechrootpkg.confined
+ && mv /usr/lib/aurcache/bin/makechrootpkg /usr/local/bin/makechrootpkg.confined
 COPY probe.sh /probe.sh
 RUN chmod +x /probe.sh
 EOF

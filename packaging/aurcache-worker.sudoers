@@ -1,0 +1,12 @@
+# The worker starts each build as a different unprivileged user, and the chroot
+# operations need root. This is what lets the worker itself never run as root.
+#
+# Deliberately not restricted to a command list: makechrootpkg is a shell script
+# that invokes mkarchroot, arch-nspawn, systemd-nspawn, pacman, mount and
+# others, with arguments derived from the job. Enumerating them would produce a
+# list that looks tighter than it is and breaks on the next devtools release.
+# The real confinement is elsewhere: each build runs in its own chroot as the
+# `builder` user, and the two places a PKGBUILD executes outside that chroot are
+# Landlock-confined by aurcache-sandbox.
+aurcache ALL=(ALL) NOPASSWD: ALL
+builder  ALL=(ALL) NOPASSWD: ALL

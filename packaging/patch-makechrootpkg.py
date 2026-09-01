@@ -31,8 +31,16 @@ import os
 import stat
 import sys
 
-SRC = "/usr/bin/makechrootpkg"
-DST = "/usr/local/bin/makechrootpkg"
+SRC = os.environ.get("MAKECHROOTPKG_SRC", "/usr/bin/makechrootpkg")
+# A location AURCache owns, named by the worker as an absolute path.
+#
+# Not `/usr/local/bin`: that belongs to the administrator rather than to a
+# package, and a copy there shadows `makechrootpkg` for *every* user on the
+# host, so someone building something unrelated by hand silently gets this
+# sandboxed variant. It was chosen originally because it is on sudo's
+# `secure_path` -- the worker runs devtools through sudo, which replaces PATH --
+# and naming the file absolutely removes that constraint entirely.
+DST = os.environ.get("MAKECHROOTPKG_DST", "/usr/lib/aurcache/bin/makechrootpkg")
 
 # (description, anchor, replacement)
 PATCHES = [
@@ -76,18 +84,17 @@ def main() -> int:
             return 1
         text = text.replace(anchor, replacement, 1)
 
+    os.makedirs(os.path.dirname(DST), exist_ok=True)
     with open(DST, "w", encoding="utf-8") as out:
         out.write(text)
 
-    # A shadow that is not executable is *silently skipped* by PATH lookup, so
-    # the stock makechrootpkg runs and every build executes PKGBUILDs
-    # unconfined, with nothing to indicate it. Set the mode, then verify it.
+    # A copy that is not executable fails the build with a confusing "permission
+    # denied" rather than anything naming this file. Set the mode, then verify.
     os.chmod(DST, 0o755)
     mode = os.stat(DST).st_mode
     if not mode & stat.S_IXUSR or not os.access(DST, os.X_OK):
         print(
-            f"patch-makechrootpkg: {DST} is not executable ({mode & 0o777:o}); "
-            "PATH would silently fall through to the unpatched script.",
+            f"patch-makechrootpkg: {DST} is not executable ({mode & 0o777:o}).",
             file=sys.stderr,
         )
         return 1

@@ -1,0 +1,104 @@
+# Maintainer: Lukas Heiligenbrunner <lukas.heiligenbrunner@gmail.com>
+#
+# Split into two packages because the two halves have almost nothing in common.
+# A server needs no devtools, no base-devel and no sudo; a build box usually
+# wants the worker and not the server. Installing one should not drag in the
+# other's dependencies, and on a single-machine setup both are installable side
+# by side and share the `aurcache` user.
+
+pkgbase=aurcache
+pkgname=(aurcache-server aurcache-worker)
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Build server and repository for Arch Linux packages from the AUR"
+arch=(x86_64 aarch64 armv7h)
+url="https://github.com/Lukas-Heiligenbrunner/AURCache"
+license=(GPL-3.0-or-later)
+makedepends=(cargo git)
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir="AURCache-$pkgver"
+
+prepare() {
+    cd "$_srcdir/backend"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$_srcdir/backend"
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    # `static` embeds the web UI in the server binary, which is what makes the
+    # native install a single unit with nothing to serve separately.
+    cargo build --frozen --release --features aurcache-api/static -p aurcache
+    cargo build --frozen --release -p aurcache-worker -p aurcache-sandbox
+}
+
+check() {
+    cd "$_srcdir/backend"
+    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+    cargo test --frozen --workspace
+}
+
+package_aurcache-server() {
+    pkgdesc="$pkgdesc (server)"
+    depends=(gcc-libs openssl)
+    backup=(etc/aurcache/server.env)
+
+    cd "$_srcdir"
+    install -Dm755 backend/target/release/aurcache "$pkgdir/usr/bin/aurcache"
+    install -Dm644 packaging/aurcache.service \
+        "$pkgdir/usr/lib/systemd/system/aurcache.service"
+    install -Dm644 packaging/aurcache.sysusers \
+        "$pkgdir/usr/lib/sysusers.d/aurcache.conf"
+    install -Dm644 packaging/aurcache.tmpfiles \
+        "$pkgdir/usr/lib/tmpfiles.d/aurcache.conf"
+    install -Dm644 packaging/server.env "$pkgdir/etc/aurcache/server.env"
+}
+
+package_aurcache-worker() {
+    pkgdesc="$pkgdesc (build worker)"
+    # devtools and base-devel are what the worker shells out to; python runs the
+    # patch that confines the two places a PKGBUILD is executed outside the
+    # chroot. sudo is how the unprivileged worker starts a build as the build
+    # user, which is why the worker itself never needs to be root.
+    depends=(gcc-libs openssl devtools base-devel sudo git fakeroot python)
+    backup=(etc/aurcache/worker.env etc/aurcache/sandbox-protected)
+    install=aurcache-worker.install
+
+    cd "$_srcdir"
+    install -Dm755 backend/target/release/aurcache-worker \
+        "$pkgdir/usr/bin/aurcache-worker"
+    # Confines the two places makechrootpkg executes a PKGBUILD outside the
+    # chroot. Without it every build dies at source download.
+    install -Dm755 backend/target/release/aurcache-sandbox \
+        "$pkgdir/usr/bin/aurcache-sandbox"
+
+    install -Dm644 packaging/aurcache-worker.service \
+        "$pkgdir/usr/lib/systemd/system/aurcache-worker.service"
+    install -Dm644 packaging/aurcache.sysusers \
+        "$pkgdir/usr/lib/sysusers.d/aurcache.conf"
+    install -Dm644 packaging/aurcache.tmpfiles \
+        "$pkgdir/usr/lib/tmpfiles.d/aurcache.conf"
+
+    # The patcher and its wrapper, plus the hook that re-runs them when devtools
+    # changes. The derived copy is *not* shipped: it has to come from the
+    # devtools installed on this machine, or it would run against another
+    # release's libraries.
+    install -Dm644 packaging/patch-makechrootpkg.py \
+        "$pkgdir/usr/lib/aurcache/patch-makechrootpkg.py"
+    install -Dm755 packaging/aurcache-patch-makechrootpkg \
+        "$pkgdir/usr/lib/aurcache/aurcache-patch-makechrootpkg"
+    install -Dm644 packaging/aurcache-makechrootpkg.hook \
+        "$pkgdir/usr/share/libalpm/hooks/aurcache-makechrootpkg.hook"
+
+    # Paths a PKGBUILD must never read; see the file for why it is not an
+    # environment variable.
+    install -Dm644 packaging/sandbox-protected \
+        "$pkgdir/etc/aurcache/sandbox-protected"
+    install -Dm644 packaging/worker.env "$pkgdir/etc/aurcache/worker.env"
+    install -Dm644 packaging/aurcache-worker.sudoers \
+        "$pkgdir/etc/sudoers.d/aurcache-worker"
+    chmod 0440 "$pkgdir/etc/sudoers.d/aurcache-worker"
+}
