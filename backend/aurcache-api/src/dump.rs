@@ -16,6 +16,7 @@ use rocket::response::status;
 use rocket::serde::json::Json;
 use rocket::{Responder, State, get, post};
 use sea_orm::DatabaseConnection;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc;
@@ -181,19 +182,34 @@ pub async fn restore(
             })
         };
 
-        let mut completed = 0_i32;
-        let mut failed = 0_i32;
+        // Counted per package rather than per entry, because a package can be
+        // reported twice: imported by the first pass, then failed by a later
+        // one when its source turned out to be unreadable. The later word is
+        // the true one, so it moves out of `completed` rather than adding to
+        // both. The log keeps both lines -- the sequence is what explains what
+        // happened.
+        let mut succeeded: HashSet<String> = HashSet::new();
+        let mut failed: HashSet<String> = HashSet::new();
         while let Some(entry) = progress_rx.recv().await {
             match &entry.outcome {
-                RestoreOutcome::Failed { .. } => failed += 1,
-                _ => completed += 1,
+                RestoreOutcome::Failed { .. } => {
+                    succeeded.remove(&entry.pkgbase);
+                    failed.insert(entry.pkgbase.clone());
+                }
+                _ => {
+                    succeeded.insert(entry.pkgbase.clone());
+                }
             }
+            let completed = i32::try_from(succeeded.len()).unwrap_or(i32::MAX);
+            let failures = i32::try_from(failed.len()).unwrap_or(i32::MAX);
             if let Err(e) =
-                operations::append(&db_task, job_id, completed, failed, &[entry], false).await
+                operations::append(&db_task, job_id, completed, failures, &[entry], false).await
             {
                 warn!("could not record restore {job_id} progress: {e}");
             }
         }
+        let completed = i32::try_from(succeeded.len()).unwrap_or(i32::MAX);
+        let failed = i32::try_from(failed.len()).unwrap_or(i32::MAX);
         if let Err(e) = worker.await {
             warn!("restore {job_id} ended abnormally: {e}");
         }

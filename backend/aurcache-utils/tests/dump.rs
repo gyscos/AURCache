@@ -520,3 +520,92 @@ async fn settings_are_restored_against_the_right_package() {
         "a per-package setting landed on the wrong package"
     );
 }
+
+/// A package whose source cannot be read must be *reported*, not merely logged.
+///
+/// This is the failure that looks like success: the row is written by pass 1,
+/// so a report that only counts pass 1 says everything was imported while the
+/// package sits without the split package names and `provides` that let other
+/// packages find it. Restoring a package whose git remote does not exist is the
+/// cheapest way to reach that state.
+#[tokio::test]
+async fn a_package_whose_source_fails_is_reported_as_failed() {
+    let source = db().await;
+    packages::ActiveModel {
+        name: Set("broken".to_string()),
+        status: Set(0),
+        out_of_date: Set(0),
+        build_flags: Set(String::new()),
+        platforms: Set("x86_64".to_string()),
+        source_type: Set(SourceType::Git),
+        source_data: Set(SourceData::Git {
+            spec: GitSourceSpec {
+                // Unroutable by construction, so this needs no network to fail.
+                url: "https://localhost:1/nope.git".to_string(),
+                r#ref: "HEAD".to_string(),
+                subfolder: String::new(),
+            },
+        }),
+        directly_requested: Set(true),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let loaded = load_dump(&bytes).unwrap();
+    let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
+        tempfile::tempdir().unwrap().keep(),
+    ));
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    aurcache_utils::restore::apply(
+        &target,
+        &store,
+        &tx,
+        loaded,
+        RestoreOptions::default(),
+        progress_tx,
+    )
+    .await;
+
+    let mut entries = Vec::new();
+    while let Ok(entry) = progress_rx.try_recv() {
+        entries.push(entry);
+    }
+
+    // Imported first -- the row really was written -- and then failed, which is
+    // the word that has to reach whoever is watching.
+    assert!(
+        matches!(
+            entries.first().map(|e| &e.outcome),
+            Some(RestoreOutcome::Imported)
+        ),
+        "expected the row to be written first: {entries:?}"
+    );
+    let failure = entries
+        .iter()
+        .find(|e| matches!(e.outcome, RestoreOutcome::Failed { .. }))
+        .expect("a package whose source cannot be read was reported as a success");
+    let RestoreOutcome::Failed { error } = &failure.outcome else {
+        unreachable!()
+    };
+    // The message has to say what is wrong with the package now, not just that
+    // something went wrong: it is on the instance but other packages cannot
+    // find it.
+    assert!(
+        error.contains("will not find it"),
+        "the failure does not say what it means: {error}"
+    );
+    assert!(
+        error.contains("--on-existing overwrite"),
+        "the failure does not say how to retry it: {error}"
+    );
+
+    // The row stays: it carries the configuration the dump asked for, and the
+    // commonest reason to get here is a transient read.
+    assert_eq!(Packages::find().all(&target).await.unwrap().len(), 1);
+}

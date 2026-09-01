@@ -191,6 +191,31 @@ async fn package_row(
 /// module's header. Rows first, with no network; then every package's source,
 /// which is what fills in the names a dependency can be resolved by; only then
 /// the dependency graph.
+///
+/// # What happens when part of it fails
+///
+/// The two halves fail differently, on purpose.
+///
+/// **Pass 1 is all or nothing.** It is one transaction over local rows, so
+/// either every package the dump describes is written or none is. A dump that
+/// half-applied would leave an instance that is neither what it was nor what
+/// the dump says, which is worse than either.
+///
+/// **Passes 2 and 3 are per package, and a failure does not roll anything
+/// back.** They read sources over the network and parse PKGBUILDs, so they fail
+/// for reasons that have nothing to do with the rest of the dump: one
+/// unparseable PKGBUILD, one unreachable remote, one dependency naming
+/// something that does not exist. Undoing 199 good packages because the 200th
+/// has a typo in it would be the wrong trade, and re-running the restore is
+/// then the only way back.
+///
+/// The row is deliberately kept. It carries the platforms, flags and patch the
+/// operator asked for, and the commonest reason to get here is a transient read
+/// -- throwing that configuration away on a network blip would lose more than
+/// it saves. What such a package does *not* have is its `provides` and split
+/// package names, so a dependency naming one of those will not find it; the
+/// entry says so, because it is the difference between a restore that worked
+/// and one that looks like it did.
 pub async fn apply(
     db: &DatabaseConnection,
     store: &SnapshotStore,
@@ -224,27 +249,48 @@ pub async fn apply(
     // names, so that pass 3 can recognise them. Until this is done for *all* of
     // them, resolving any one would fall through to the AUR and adopt a package
     // in place of one the dump carried.
+    let mut unresolved = Vec::new();
     for pkgbase in &applied.touched {
         if let Err(e) = fill_source_facts(db, store, pkgbase).await {
             warn!("restore: could not read the source of {pkgbase}: {e}");
+            let _ = progress.send(RestoreEntry {
+                pkgbase: pkgbase.clone(),
+                outcome: RestoreOutcome::Failed {
+                    error: format!(
+                        "imported, but its source could not be read, so other packages \
+                         will not find it by its split package names or what it provides: {e}. \
+                         Fix the source and restore again with --on-existing overwrite."
+                    ),
+                },
+            });
+            unresolved.push(pkgbase.clone());
         }
     }
 
     // PASS 3: the graph, and the builds it makes possible.
+    let client = aurcache_deps::AurClient::new();
     for pkgbase in &applied.touched {
+        // Its source could not be read, so its dependency list cannot be
+        // either. Trying anyway would fail identically and report it twice.
+        if unresolved.contains(pkgbase) {
+            continue;
+        }
         let Ok(Some(row)) = package_row(db, pkgbase).await else {
             continue;
         };
-        if let Err(e) = crate::package::update::package_resync_dependencies(
-            &aurcache_deps::AurClient::new(),
-            store,
-            db,
-            tx,
-            &row,
-        )
-        .await
+        if let Err(e) =
+            crate::package::update::package_resync_dependencies(&client, store, db, tx, &row).await
         {
             warn!("restore: could not resolve dependencies for {pkgbase}: {e}");
+            let _ = progress.send(RestoreEntry {
+                pkgbase: pkgbase.clone(),
+                outcome: RestoreOutcome::Failed {
+                    error: format!(
+                        "imported, but its dependencies could not be resolved, so it will not \
+                         build until they are: {e}"
+                    ),
+                },
+            });
         }
     }
 }
