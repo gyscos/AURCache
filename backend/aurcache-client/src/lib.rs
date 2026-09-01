@@ -12,10 +12,11 @@ pub use aurcache_common::api::activity::Activity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::package::{
-    AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
+    AddPackages as AddPackagesRequest, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
+    BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
 };
 pub use aurcache_common::api::package::{
-    ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
+    AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
 };
 // The add and preview requests are the server's own shapes rather than copies:
 // they were duplicated here, so a field added to one was silently absent from
@@ -188,6 +189,35 @@ impl AurCacheClient {
     pub async fn add_package(&self, body: &AddPackageRequest) -> Result<()> {
         self.request_empty(Method::POST, "/package", &[], Some(body))
             .await
+    }
+
+    /// Starts adding several packages in one request, returning before any of
+    /// them are added.
+    ///
+    /// The server resolves every AUR name to its pkgbase in one batched RPC
+    /// call, so this is not the same as calling [`Self::add_package`] in a
+    /// loop: adding N packages that way costs N AUR requests for the
+    /// resolution alone. Poll [`Self::bulk_add_progress`] with the returned id
+    /// to follow it, or do not -- the work does not depend on being watched.
+    pub async fn add_packages(&self, body: &AddPackagesRequest) -> Result<BulkAddAccepted> {
+        self.request_json(Method::POST, "/packages", &[], Some(body))
+            .await
+    }
+
+    /// Reads a bulk add's progress, returning only the entries after the first
+    /// `after` of them.
+    ///
+    /// Pass the number already held so each poll returns just what is new;
+    /// pass zero to get the run from the beginning, including whatever happened
+    /// before this caller started watching.
+    pub async fn bulk_add_progress(&self, job_id: i32, after: usize) -> Result<BulkAddProgress> {
+        self.request_json::<BulkAddProgress, ()>(
+            Method::GET,
+            &format!("/packages/bulk/{job_id}"),
+            &[("after".to_string(), after.to_string())],
+            None,
+        )
+        .await
     }
 
     /// Triggers an update check for the given package.

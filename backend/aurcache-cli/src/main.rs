@@ -2,9 +2,10 @@ mod config;
 
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
-    AddPackageRequest, AurCacheClient, Build, ExtendedPackage, GitSourceSpec, GraphDataPoint,
-    ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest, SearchResult,
-    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
+    AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BulkAddAccepted, BulkAddOutcome,
+    BulkAddProgress, ExtendedPackage, GitSourceSpec, GraphDataPoint, ListStats, Method,
+    PackageDependency, PackageSource, PatchPackageRequest, SearchResult, SimplePackage, SourceData,
+    UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
 use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
@@ -598,11 +599,9 @@ async fn add_package_command(
     let git_ref = args.git_ref;
 
     let patched_files = read_patch_files(&args.patches)?;
+    let mut sources = Vec::new();
     for package in args.packages {
-        let source = if looks_like_git_url(&package) {
-            if format == OutputFormat::Text {
-                println!("adding package from git: {package}");
-            }
+        sources.push(if looks_like_git_url(&package) {
             SourceData::Git {
                 spec: GitSourceSpec {
                     url: package,
@@ -613,22 +612,116 @@ async fn add_package_command(
                 },
             }
         } else {
-            if format == OutputFormat::Text {
-                println!("adding package: {package}");
-            }
             SourceData::Aur { name: package }
-        };
-        let body = AddPackageRequest {
-            platforms: some_vec(args.platforms.clone()),
-            build_flags: some_vec(args.build_flags.clone()),
-            source,
-            patched_files: patched_files.clone(),
-        };
-        client.add_package(&body).await?;
+        });
     }
 
-    if format == OutputFormat::Text {
-        println!("package add request complete");
+    // A patch belongs to one package's sources, and the bulk endpoint has
+    // nowhere to put it, so a patched add stays a single-package add. The
+    // argument parser already refuses `--patch` with more than one package.
+    if patched_files.is_some() {
+        let source = sources
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no package given"))?;
+        client
+            .add_package(&AddPackageRequest {
+                platforms: some_vec(args.platforms.clone()),
+                build_flags: some_vec(args.build_flags.clone()),
+                source,
+                patched_files,
+            })
+            .await?;
+        if format == OutputFormat::Text {
+            println!("package add request complete");
+        }
+        return Ok(());
+    }
+
+    // One request for the whole list. Adding them one at a time made the server
+    // resolve each AUR name to its pkgbase on its own -- an AUR request per
+    // package, before any source was fetched.
+    let accepted = client
+        .add_packages(&AddPackagesRequest {
+            platforms: some_vec(args.platforms.clone()),
+            build_flags: some_vec(args.build_flags.clone()),
+            sources,
+        })
+        .await?;
+
+    follow_bulk_add(client, format, accepted).await
+}
+
+/// Report a bulk add until it finishes.
+///
+/// The server does not need us here -- the job runs whether or not anything
+/// watches -- so this is reporting, not driving. A non-zero exit for failures
+/// is what makes it usable from a script.
+async fn follow_bulk_add(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    accepted: BulkAddAccepted,
+) -> Result<()> {
+    if format == OutputFormat::Json {
+        // Machine output waits for the end and prints the whole run at once:
+        // a stream of partial states is harder to consume than one final
+        // document, and the run is what the caller asked about.
+        loop {
+            let progress = client.bulk_add_progress(accepted.job_id, 0).await?;
+            if progress.finished {
+                println!("{}", serde_json::to_string_pretty(&progress)?);
+                return bulk_add_result(&progress);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    println!(
+        "adding {} package(s), job {}",
+        accepted.accepted, accepted.job_id
+    );
+    let mut seen = 0_usize;
+    // Counted here rather than read off the job, which folds "added" and
+    // "already present" into one number: a restore wants to know how much of it
+    // was already there, and reporting an untouched package as added is a
+    // small lie the summary does not need to tell.
+    let (mut added, mut present) = (0_usize, 0_usize);
+    loop {
+        let progress = client.bulk_add_progress(accepted.job_id, seen).await?;
+        for entry in &progress.entries {
+            match &entry.outcome {
+                BulkAddOutcome::Added => {
+                    added += 1;
+                    println!("  added    {}", entry.name);
+                }
+                BulkAddOutcome::Existed => {
+                    present += 1;
+                    println!("  present  {}", entry.name);
+                }
+                BulkAddOutcome::Failed { error } => {
+                    println!("  failed   {}: {error}", entry.name);
+                }
+            }
+        }
+        seen += progress.entries.len();
+        if progress.finished {
+            let mut parts = vec![format!("{added} added")];
+            if present > 0 {
+                parts.push(format!("{present} already present"));
+            }
+            parts.push(format!("{} failed", progress.failed));
+            println!("done: {}, of {}", parts.join(", "), progress.total);
+            return bulk_add_result(&progress);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// A run with failures exits non-zero, naming how many, so a restore that only
+/// partly worked is not mistaken for a clean one by whatever called it.
+fn bulk_add_result(progress: &BulkAddProgress) -> Result<()> {
+    if progress.failed > 0 {
+        bail!("{} package(s) could not be added", progress.failed);
     }
     Ok(())
 }
