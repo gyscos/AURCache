@@ -98,3 +98,75 @@ pub struct DumpWorker {
 /// `packages.json`: pkgbase to package. A map rather than a list so a dump
 /// diffs cleanly when one entry changes.
 pub type DumpPackages = BTreeMap<String, DumpPackage>;
+
+/// What to do about a package the dump carries that already exists here.
+///
+/// Three policies rather than one flag because the right answer depends on why
+/// you are importing: topping up an instance from a colleague's dump wants
+/// `Skip`, rebuilding one from your own backup wants `Overwrite`.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExistingPackagePolicy {
+    /// Leave what is here alone. The safe default: an import that only ever
+    /// adds cannot destroy configuration nobody meant to replace.
+    #[default]
+    Skip,
+    /// Replace its configuration with the dump's.
+    Overwrite,
+}
+
+/// How an import should behave.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, Default)]
+pub struct RestoreOptions {
+    /// Report what would happen and change nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub on_existing: ExistingPackagePolicy,
+}
+
+/// What an import did, or would do, to one package.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum RestoreOutcome {
+    /// Not here before; inserted.
+    Imported,
+    /// Already here and left alone.
+    Skipped,
+    /// Already here; its configuration was replaced.
+    Overwritten,
+    /// Rejected. The rest of the import still applied.
+    Failed { error: String },
+}
+
+/// One line of an import's report.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct RestoreEntry {
+    pub pkgbase: String,
+    #[serde(flatten)]
+    pub outcome: RestoreOutcome,
+}
+
+/// An import's state and the entries after the offset asked for.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgress {
+    pub id: i32,
+    pub total: i32,
+    pub completed: i32,
+    pub failed: i32,
+    pub finished: bool,
+    pub entries: Vec<RestoreEntry>,
+}
+
+/// What starting an import returns.
+///
+/// A dry run has no id to poll: it changed nothing, so there is nothing to
+/// watch, and the entries it would have written are in `preview`.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
+pub struct RestoreAccepted {
+    pub job_id: Option<i32>,
+    pub total: i32,
+    /// Populated only for a dry run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<RestoreEntry>,
+}
