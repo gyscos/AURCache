@@ -4,8 +4,9 @@ use std::path::Path;
 use tokio::fs;
 
 use aurcache_common::builder::BuildStates;
-use aurcache_db::prelude::{Builds, BulkAdds, Files, Packages};
-use aurcache_db::{builds, bulk_adds, files, packages};
+use aurcache_db::helpers::operations;
+use aurcache_db::prelude::{Builds, Files, Packages};
+use aurcache_db::{builds, files, packages};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
@@ -115,7 +116,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
 
     backfill_file_sizes(db).await;
     backfill_build_sizes(db).await;
-    close_orphaned_bulk_adds(db).await;
+    close_orphaned_operations(db).await;
 
     // todo arm mirrorlists unsupported for now!
     let mirrorlist_dir = mirrorlist_dir();
@@ -273,28 +274,13 @@ async fn backfill_build_sizes(db: &DatabaseConnection) {
     }
 }
 
-/// Close out bulk adds that were running when the server stopped.
+/// Close out operations that were running when the server stopped.
 ///
-/// The work ran in a task, so it died with the process; the row would otherwise
-/// keep reporting itself as running and never finish, and a caller polling it
-/// would wait for progress that cannot come. What was already added stays
-/// added -- each package is committed as it goes -- so this only corrects the
-/// job's own state.
-async fn close_orphaned_bulk_adds(db: &DatabaseConnection) {
-    let now = aurcache_db::helpers::time::now_secs();
-    match BulkAdds::update_many()
-        .col_expr(bulk_adds::Column::FinishedAt, Some(now).into())
-        .filter(bulk_adds::Column::FinishedAt.is_null())
-        .exec(db)
-        .await
-    {
-        Ok(res) if res.rows_affected > 0 => {
-            warn!(
-                "Closed {} bulk add(s) left running by a restart",
-                res.rows_affected
-            );
-        }
-        Ok(_) => {}
-        Err(e) => warn!("could not close interrupted bulk adds: {e}"),
+/// See [`operations::close_orphaned`]; this only reports what it did.
+async fn close_orphaned_operations(db: &DatabaseConnection) {
+    match operations::close_orphaned(db).await {
+        Ok(0) => {}
+        Ok(closed) => warn!("Closed {closed} operation(s) left running by a restart"),
+        Err(e) => warn!("could not close interrupted operations: {e}"),
     }
 }

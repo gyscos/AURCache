@@ -17,10 +17,10 @@ use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::helpers::downloads::DownloadCounter;
-use aurcache_db::helpers::time::now_secs;
+use aurcache_db::helpers::operations;
 use aurcache_db::packages::SourceData;
-use aurcache_db::prelude::{BulkAdds, Dependencies, Files, Packages};
-use aurcache_db::{bulk_adds, dependencies, files, packages};
+use aurcache_db::prelude::{Dependencies, Files, Packages};
+use aurcache_db::{dependencies, files, packages};
 use aurcache_deps::AurClient;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
@@ -148,14 +148,9 @@ pub async fn packages_add_endpoint(
     let build_flags = input.build_flags.as_deref().map(normalize_build_flags);
     let total = i32::try_from(input.sources.len()).unwrap_or(i32::MAX);
 
-    let job = bulk_adds::ActiveModel {
-        created_at: Set(now_secs()),
-        total: Set(total),
-        ..Default::default()
-    }
-    .insert(db.inner())
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    let job_id = operations::create(db.inner(), operations::KIND_BULK_ADD, total)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     // Everything the task needs is cloned in: it outlives this request by
     // design, so it cannot borrow from it.
@@ -164,7 +159,6 @@ pub async fn packages_add_endpoint(
     let store_task = Arc::clone(store.inner());
     let al_task = al.inner().clone();
     let username = a.username.clone();
-    let job_id = job.id;
 
     tokio::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
@@ -213,7 +207,7 @@ pub async fn packages_add_endpoint(
                 warn!("could not log activity for {}: {e}", entry.name);
             }
             if let Err(e) =
-                record_bulk_progress(&db_task, job_id, completed, failed, &[entry], false).await
+                operations::append(&db_task, job_id, completed, failed, &[entry], false).await
             {
                 warn!("could not record bulk add {job_id} progress: {e}");
             }
@@ -225,7 +219,10 @@ pub async fn packages_add_endpoint(
         if let Err(e) = worker.await {
             warn!("bulk add {job_id} ended abnormally: {e}");
         }
-        if let Err(e) = record_bulk_progress(&db_task, job_id, completed, failed, &[], true).await {
+        if let Err(e) =
+            operations::append::<_, BulkAddEntry>(&db_task, job_id, completed, failed, &[], true)
+                .await
+        {
             warn!("could not close bulk add {job_id}: {e}");
         }
     });
@@ -234,36 +231,6 @@ pub async fn packages_add_endpoint(
         job_id,
         accepted: total,
     })))
-}
-
-/// Append outcomes to a bulk add's log and update its counters.
-async fn record_bulk_progress(
-    db: &DatabaseConnection,
-    job_id: i32,
-    completed: i32,
-    failed: i32,
-    entries: &[BulkAddEntry],
-    finished: bool,
-) -> Result<(), sea_orm::DbErr> {
-    let Some(job) = BulkAdds::find_by_id(job_id).one(db).await? else {
-        return Ok(());
-    };
-    let mut log = job.log.clone();
-    for entry in entries {
-        if let Ok(line) = serde_json::to_string(entry) {
-            log.push_str(&line);
-            log.push('\n');
-        }
-    }
-    let mut active: bulk_adds::ActiveModel = job.into();
-    active.log = Set(log);
-    active.completed = Set(completed);
-    active.failed = Set(failed);
-    if finished {
-        active.finished_at = Set(Some(now_secs()));
-    }
-    active.update(db).await?;
-    Ok(())
 }
 
 #[utoipa::path(
@@ -289,13 +256,13 @@ pub async fn bulk_add_progress(
     after: Option<usize>,
     _a: Authenticated,
 ) -> Result<Json<BulkAddProgress>, ApiError> {
-    let job = BulkAdds::find_by_id(id)
-        .one(db.inner())
+    let job = operations::get(db.inner(), id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
+        .filter(|job| job.kind == operations::KIND_BULK_ADD)
         .ok_or_else(|| err(Status::NotFound, format!("no bulk add {id}")))?;
 
-    let entries = entries_after(&job.log, after.unwrap_or(0));
+    let entries = operations::entries_after(&job.log, after.unwrap_or(0));
 
     Ok(Json(BulkAddProgress {
         id: job.id,
@@ -305,20 +272,6 @@ pub async fn bulk_add_progress(
         finished: job.finished_at.is_some(),
         entries,
     }))
-}
-
-/// The entries in a bulk add's log after the first `after` of them.
-///
-/// A caller that holds none asks from zero and receives the whole run,
-/// including everything that happened before it attached -- which is the point
-/// of keeping the log rather than only pushing events. An offset past the end
-/// yields nothing rather than erroring, because a poll that arrives between two
-/// writes is normal.
-fn entries_after(log: &str, after: usize) -> Vec<BulkAddEntry> {
-    log.lines()
-        .skip(after)
-        .filter_map(|line| serde_json::from_str::<BulkAddEntry>(line).ok())
-        .collect()
 }
 
 #[utoipa::path(
@@ -1440,70 +1393,5 @@ mod file_tests {
 
         let listed = package_files(&db, 1).await.unwrap();
         assert_eq!(listed[0].size, None);
-    }
-}
-
-#[cfg(test)]
-mod bulk_tests {
-    use super::entries_after;
-    use aurcache_common::api::package::{BulkAddEntry, BulkAddOutcome};
-
-    fn log_of(entries: &[BulkAddEntry]) -> String {
-        entries
-            .iter()
-            .map(|e| serde_json::to_string(e).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn entry(name: &str, outcome: BulkAddOutcome) -> BulkAddEntry {
-        BulkAddEntry {
-            name: name.to_string(),
-            outcome,
-        }
-    }
-
-    /// Attaching with nothing in hand gives the whole run, including what
-    /// happened before anyone was watching. That is what the stored log buys
-    /// over pushing events to whoever happens to be connected.
-    #[test]
-    fn a_late_observer_still_sees_the_whole_run() {
-        let log = log_of(&[
-            entry("hello", BulkAddOutcome::Added),
-            entry("yay", BulkAddOutcome::Existed),
-            entry(
-                "nope",
-                BulkAddOutcome::Failed {
-                    error: "no such package".to_string(),
-                },
-            ),
-        ]);
-        let seen = entries_after(&log, 0);
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[0].name, "hello");
-        assert!(matches!(
-            &seen[2].outcome,
-            BulkAddOutcome::Failed { error } if error == "no such package"
-        ));
-    }
-
-    /// Polling asks from what it already holds, so it receives only what is new.
-    #[test]
-    fn an_offset_returns_only_what_is_new() {
-        let log = log_of(&[
-            entry("a", BulkAddOutcome::Added),
-            entry("b", BulkAddOutcome::Added),
-        ]);
-        let seen = entries_after(&log, 1);
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].name, "b");
-    }
-
-    /// A poll landing between writes is the normal case, not an error.
-    #[test]
-    fn an_offset_past_the_end_is_empty() {
-        assert!(entries_after("", 0).is_empty());
-        let log = log_of(&[entry("a", BulkAddOutcome::Added)]);
-        assert!(entries_after(&log, 5).is_empty());
     }
 }
