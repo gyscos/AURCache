@@ -26,7 +26,12 @@
 # security notes.
 set -euo pipefail
 
-real=/usr/local/libexec/alpm-pkgbuild-bridge
+# Defaults are the native layout: the real bridge comes from Arch's
+# `alpm-pkgbuild-bridge` package, and the sandbox from ours. The container
+# images put both under /usr/local and override these; one wrapper serves both
+# rather than each layout carrying its own near-copy.
+real=${AURCACHE_PKGBUILD_BRIDGE:-/usr/bin/alpm-pkgbuild-bridge}
+sandbox=${AURCACHE_SANDBOX:-/usr/bin/aurcache-sandbox}
 pkgbuild=${1:?usage: alpm-pkgbuild-bridge <path/to/PKGBUILD>}
 dir=$(cd "$(dirname "$pkgbuild")" && pwd)
 file=$(basename "$pkgbuild")
@@ -36,7 +41,7 @@ exec env -i \
     PATH=/usr/local/bin:/usr/bin:/bin \
     HOME=/nonexistent \
     LANG=C.UTF-8 \
-    /usr/local/bin/aurcache-sandbox \
+    "$sandbox" \
         --read-except "${AURCACHE_PROTECTED_DIR:-/app}" \
         --allow "$dir" \
         -- "$real" "$file"

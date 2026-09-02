@@ -8,51 +8,70 @@
 # the build path is uniform across arches — an aarch64 worker is just this image
 # run with `--platform linux/arm64`.
 #
-# Stage 1 cross-compiles the `aurcache-worker` binary on the native build host
-# (fast — no cargo emulation), targeting the requested arch. Stage 2 assembles a
-# minimal Arch base for that arch with `devtools`. Run privileged: arch-nspawn /
-# mkarchroot need mount + unshare.
+# Stage 1 cross-compiles and packages on the native build host (fast — no cargo
+# emulation). Stage 2 installs that package into a minimal Arch base for the
+# target arch, so the image and a native install are the same thing. Run
+# privileged: arch-nspawn / mkarchroot need mount + unshare.
+#
+# amd64 and arm64 only: armv7's cross toolchain is not in Arch's official
+# repositories.
 
-########## Stage 1: cross-compile the worker binary ##########
-# Runs natively on the builder's platform; TARGETARCH selects the Rust target.
-FROM --platform=$BUILDPLATFORM rust:1.97 AS builder
+########## Stage 1: cross-compile and package ##########
+# Runs natively on the builder and cross-compiles, which is the whole reason
+# this is not simply built in the target-arch image: cargo under qemu turns
+# minutes into a great deal longer.
+#
+# Arch has no cross-compilation feature, but `CARCH` is a plain shell variable
+# makepkg uses for the package name, and aarch64's toolchain is in `extra`. So
+# exporting CARCH and cross-compiling inside build() yields a correctly labelled
+# package from one PKGBUILD -- the same one a native install uses.
+# Pinned to amd64 rather than $BUILDPLATFORM: the official Arch image is
+# x86_64-only (ARM Linux uses the lopsided/ images below), so there is no native
+# packager base on an aarch64 builder -- and Arch Linux ARM packages no x86_64
+# cross toolchain either, so an ARM host could not produce the amd64 package
+# even if there were. Building the images therefore needs an amd64 host; on
+# anything else this stage runs emulated and slowly rather than failing, which
+# is worth knowing before wondering why a build takes an hour.
+FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager
 ARG TARGETARCH
-ARG TARGETVARIANT
-WORKDIR /app
-COPY backend/ /app/
-# Map the Docker target arch to a Rust target + cross toolchain, then build.
-# Setting CC/AR for the target lets C-backed crates (e.g. ring) cross-compile.
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
+    && pacman -Syu --noconfirm --needed base-devel rust git \
+        aarch64-linux-gnu-gcc \
+    # makepkg refuses to run as root, and rightly: a PKGBUILD is a shell script.
+    && useradd --create-home packager \
+    && echo 'packager ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/packager \
+    # The build stage runs unprivileged, so its output directory has to exist
+    # and be writable before the drop to `packager`.
+    && install -d -o packager /pkg
+
+COPY --chown=packager . /src
+USER packager
+WORKDIR /src/packaging/aurcache-worker
+# `--skipinteg` because the tarball is this tree rather than a release, and
+# `--nodeps` because the *build* needs nothing from the target architecture:
+# dependencies are recorded in the package and resolved where it is installed.
 RUN set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT:-}" in \
-      amd64) RUST_TARGET=x86_64-unknown-linux-gnu; PKGS="" ;; \
-      arm64) RUST_TARGET=aarch64-unknown-linux-gnu; PKGS="gcc-aarch64-linux-gnu" ;; \
-      armv7) RUST_TARGET=armv7-unknown-linux-gnueabihf; PKGS="gcc-arm-linux-gnueabihf" ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}${TARGETVARIANT:-}"; exit 1 ;; \
+    case "$TARGETARCH" in \
+      amd64) CARCH=x86_64 ;; \
+      arm64) CARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH (workers build for amd64 and arm64)"; exit 1 ;; \
     esac; \
-    if [ -n "$PKGS" ]; then apt-get update && apt-get install -y --no-install-recommends $PKGS; fi; \
-    rustup target add "$RUST_TARGET"; \
-    case "$RUST_TARGET" in \
-      aarch64-*) export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-                        CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-                        AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar ;; \
-      armv7-*)   export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
-                        CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
-                        AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar ;; \
-    esac; \
-    cargo build --release --target "$RUST_TARGET" -p aurcache-worker -p aurcache-sandbox; \
-    cp "target/$RUST_TARGET/release/aurcache-worker" \
-       "target/$RUST_TARGET/release/aurcache-sandbox" /usr/local/bin/
+    /src/packaging/make-source-tarball.sh /src aurcache-worker 0.5.0 .; \
+    export CARCH; \
+    makepkg --nodeps --skipinteg --noconfirm --nocheck; \
+    mkdir -p /pkg && cp ./*.pkg.tar.zst /pkg/
 
 ########## Stage 2: per-arch Arch Linux runtime base ##########
 # Official Arch is x86_64-only; Arch Linux ARM images cover arm64 / armv7.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS runtime-amd64
 FROM --platform=linux/arm64 lopsided/archlinux:latest AS runtime-arm64
-FROM --platform=linux/arm/v7 lopsided/archlinux-arm32v7:latest AS runtime-armv7
 
 # Select the base matching the target arch (buildkit resolves the alias).
 ARG TARGETARCH
-ARG TARGETVARIANT
-FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
+
+########## Stage 2b: the worker image ##########
+FROM runtime-${TARGETARCH} AS final
 
 # devtools provides mkarchroot / makechrootpkg / arch-nspawn.
 #
@@ -64,80 +83,44 @@ FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
-        base-devel devtools sudo git fakeroot openssh \
     && pacman-key --init \
     && pacman-key --populate \
     && systemd-machine-id-setup
 
-# Two unprivileged users, deliberately separate:
+# Everything the worker needs on a host -- the binaries, the two users, the
+# directories and their modes, the sudoers entry, the sandbox policy, and the
+# patched makechrootpkg -- installs from the same package a native install uses.
 #
-#   aurcache - runs the worker process. Owns the mTLS identity and the build
-#              credentials, and is the only user that can read them.
-#   builder  - runs each package build. `makechrootpkg -U builder` names it
-#              explicitly, so a build never inherits the worker's user through
-#              SUDO_USER and never reaches the worker's secrets by file
-#              permissions.
-#
-# They share a group so both can use the caches: builds write SRCDEST, and the
-# worker garbage-collects it. sudo is what lets the unprivileged worker start a
-# build as another user, so the worker itself never needs to be root.
-# `aurbuild` is builder's *primary* group, not a supplementary one. That
-# matters: makechrootpkg carries only the build user's primary uid/gid into the
-# chroot, so a supplementary group does not exist in there and group-write on
-# the bind-mounted caches silently fails with "no write permission for $SRCDEST"
-# — from inside the chroot, after the host-side checks have already passed.
-RUN groupadd aurbuild \
-    && useradd --create-home --shell /bin/bash --gid aurbuild builder \
-    && useradd --create-home --shell /bin/bash --groups aurbuild aurcache \
-    && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
-    && echo 'aurcache ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/aurcache \
-    && chmod 0440 /etc/sudoers.d/builder /etc/sudoers.d/aurcache
+# That is the point of packaging first: the image stops being a second,
+# hand-maintained copy of the host contract that can drift from the documented
+# one. `pacman -U` pulls devtools and python as ordinary dependencies, and
+# systemd's own hooks apply the sysusers and tmpfiles declarations.
+# `systemd-sysusers` / `systemd-tmpfiles` are run explicitly as well as by
+# pacman's own hooks: an image with no systemd manager is exactly where a hook
+# that quietly did not run would go unnoticed until a build failed for want of
+# a directory. Both are idempotent.
+COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    pacman -U --noconfirm /tmp/pkg/aurcache-worker-*.pkg.tar.zst \
+    && rm -rf /tmp/pkg \
+    && systemd-sysusers \
+    && systemd-tmpfiles --create
 
-# Data / chroot / cache locations, writable by the build user.
+# The same locations the package's tmpfiles declaration creates. A container
+# has no systemd unit to carry them, so they are set here instead.
 ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
     WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot \
     WORKER_CACHE_DIR=/var/cache/aurcache-worker
-# Ownership is the second half of the uid split, and it is what protects the
-# worker's secrets even if the Landlock policy is never applied:
-#
-#   data dir   - owned by aurcache, traversable so builds can reach work/,
-#                but identity and secrets inside are aurcache-only.
-#   work/      - owned by *builder*, shared to aurcache by group.
-#   cache dir  - likewise.
-#
-# The build dirs are owned by the build user rather than the worker because
-# makechrootpkg copies only the build user's primary uid/gid into the chroot:
-# supplementary groups do not exist in the chroot's /etc/group, so group-based
-# write access silently fails inside it with "no write permission for $SRCDEST".
-# Ownership by uid is the only form that survives. The worker reaches these
-# through the shared group, which it does not need inside any chroot.
-RUN mkdir -p "$WORKER_DATA_DIR/work" "$WORKER_DATA_DIR/secrets" \
-        "$WORKER_CHROOT_DIR" "$WORKER_CACHE_DIR" \
-    && chown -R aurcache:aurcache "$WORKER_DATA_DIR" \
-    && chmod 0755 "$WORKER_DATA_DIR" \
-    && chmod 0700 "$WORKER_DATA_DIR/secrets" \
-    && chown builder:aurbuild "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR" \
-    && chmod 2775 "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR"
 
-COPY --from=builder /usr/local/bin/aurcache-worker /usr/local/bin/aurcache-worker
-# Confines the two places makechrootpkg executes a PKGBUILD outside the chroot.
-# Without it those calls fail with "env: 'aurcache-sandbox': No such file", and
-# every build dies at source download.
-COPY --from=builder /usr/local/bin/aurcache-sandbox /usr/local/bin/aurcache-sandbox
-# Wrapper so devtools' systemd-nspawn works without a systemd manager (see script).
+# Wrapper so devtools' systemd-nspawn works without a systemd manager (see
+# script). Container-only: a real host has a manager and needs none of this.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
-# Confine the two places makechrootpkg executes a PKGBUILD on the worker,
-# outside the chroot. See backend/aurcache-sandbox.
-COPY --chmod=0755 packaging/patch-makechrootpkg.py /usr/local/bin/patch-makechrootpkg
-# Paths a PKGBUILD must never read; see the file for why it is not an env var.
-COPY packaging/sandbox-protected /etc/aurcache/sandbox-protected
 COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
-RUN pacman -S --noconfirm --needed python && /usr/local/bin/patch-makechrootpkg
 # Entrypoint fixes shared-enroll-volume ownership before dropping to the worker.
 COPY --chmod=0755 docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 
 USER aurcache
-WORKDIR /home/aurcache
+WORKDIR /var/lib/aurcache-worker
 
 # Default: enroll and poll for jobs. Override the command for `build-once`.
 ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]

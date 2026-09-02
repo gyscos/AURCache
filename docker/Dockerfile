@@ -44,10 +44,14 @@ COPY --chmod=0755 docker/entrypoint.sh /entrypoint.sh
 # alpm-pkgbuild-bridge parses a PKGBUILD by sourcing it, i.e. by executing
 # attacker-supplied bash in the server process's container. It is installed out
 # of PATH and reached only through a wrapper that confines it; see
-# docker/bridge-wrapper.sh and backend/aurcache-sandbox.
+# packaging/alpm-pkgbuild-bridge-wrapper and backend/aurcache-sandbox.
 ADD --chmod=755 https://gitlab.archlinux.org/archlinux/alpm/alpm-pkgbuild-bridge/-/raw/main/alpm-pkgbuild-bridge.sh?ref_type=heads /usr/local/libexec/alpm-pkgbuild-bridge
 COPY --from=builder --chmod=0755 /app/backend/target/aurcache-sandbox /usr/local/bin/aurcache-sandbox
-COPY --chmod=0755 docker/bridge-wrapper.sh /usr/local/bin/alpm-pkgbuild-bridge
+COPY --chmod=0755 packaging/alpm-pkgbuild-bridge-wrapper /usr/local/bin/alpm-pkgbuild-bridge
+# The wrapper defaults to the native package's layout; this image keeps both
+# under /usr/local, so point it at them rather than forking the script.
+ENV AURCACHE_PKGBUILD_BRIDGE=/usr/local/libexec/alpm-pkgbuild-bridge \
+    AURCACHE_SANDBOX=/usr/local/bin/aurcache-sandbox
 
 WORKDIR /app
 CMD ["/entrypoint.sh"]

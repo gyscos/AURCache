@@ -38,6 +38,20 @@ It listens on **8080** (API and web UI), **8081** (the pacman repository) and
 **8083** (workers). State lives in `/var/lib/aurcache`: the repository, the
 database and the worker CA.
 
+### The PKGBUILD parser is sandboxed
+
+Reading a PKGBUILD means *sourcing* it, so every package the server inspects
+runs bash in the process that holds the database credentials and owns the
+repository. The package therefore ships a wrapper at
+`/usr/lib/aurcache/bin/alpm-pkgbuild-bridge` that confines each parse with
+`aurcache-sandbox`, and the unit puts that directory ahead of `/usr/bin` on
+`PATH` so `alpm-srcinfo` resolves the wrapper rather than the bridge from the
+`alpm-pkgbuild-bridge` package directly.
+
+The unit sets `PATH` *after* its `EnvironmentFile`, so a `PATH` in
+`server.env` cannot drop that directory and quietly unconfine parsing. If you
+override `PATH` by other means, keep `/usr/lib/aurcache/bin` first.
+
 Everything is optional in `server.env`; the defaults work for a single machine.
 Two worth setting before anything else reaches it:
 
@@ -130,9 +144,46 @@ directories are separate, so no extra configuration is needed — point
 ## Building the packages yourself
 
 ```bash
-cd packaging
-makepkg -si
+cd packaging/aurcache-server && makepkg -si
+cd ../aurcache-worker      && makepkg -si
 ```
 
-`makepkg` builds the server, the worker and `aurcache-sandbox` from a release
-tarball, runs the test suite, and produces both packages.
+Two PKGBUILDs rather than one split package: the roles share almost no
+dependencies, and `makepkg` cannot build one half of a split — which the
+container images need, since a worker image has no reason to carry the server.
+
+`makepkg -si` installs the build dependencies itself, with one exception: the
+server's `wasm-bindgen-cli` is an AUR package, so install it with an AUR helper
+first. Its version has to match the `wasm-bindgen` crate in
+`frontend-rs/Cargo.lock` — wasm-bindgen refuses a mismatched pair rather than
+producing a subtly broken bundle. The worker has no such dependency; it does
+not carry the web UI.
+
+Both PKGBUILDs set `options=(!lto)`. makepkg's LTO adds `-flto=auto` to
+`CFLAGS`, and the `cc` crate hands that to the vendored C in `aws-lc-sys` and
+`ring`; their static archives then hold GCC LTO bytecode, which `ld.lld` — the
+linker rustc drives — cannot read. The build fails at link with undefined
+`aws_lc_*` symbols and no error from the build script, which is an unpleasant
+thing to diagnose from scratch. Rust's own LTO is cargo's business and is
+unaffected.
+
+### Cross-compiling
+
+Arch has no cross-compilation mode — no `--target`, and nothing in `devtools` —
+but `CARCH` is a plain shell variable `makepkg` uses to label the package, so
+exporting it and cross-compiling inside `build()` produces a correctly labelled
+result:
+
+```bash
+pacman -S aarch64-linux-gnu-gcc
+cd packaging/aurcache-worker
+CARCH=aarch64 makepkg --nodeps --nocheck
+```
+
+`--nodeps` because dependency resolution would consult the *host's*
+repositories, and `--nocheck` because the tests cannot run binaries built for
+another architecture. This is what the container images do.
+
+Only `x86_64` and `aarch64` are supported. The aarch64 toolchain is in `extra`;
+armv7's is not packaged officially, and Arch Linux ARM ships no x86_64 cross
+toolchain at all — so the images must be built on an x86_64 host.

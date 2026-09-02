@@ -54,7 +54,7 @@
 //!
 //! What this cannot do is protect a secret already in the process environment:
 //! a PKGBUILD reads `$DB_PWD` without touching the filesystem. Callers must
-//! scrub the environment themselves (see docker/bridge-wrapper.sh).
+//! scrub the environment themselves (see packaging/alpm-pkgbuild-bridge-wrapper).
 
 use landlock::{
     ABI, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated,

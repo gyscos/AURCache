@@ -20,4 +20,4 @@ fi
 . /usr/local/bin/aurcache-ssh-agent-setup
 start_build_agent
 
-exec /usr/local/bin/aurcache-worker "$@"
+exec /usr/bin/aurcache-worker "$@"

@@ -146,7 +146,7 @@ fi
 # ---------------------------------------------------------------------------
 echo
 echo "==> phase 2: server-side PKGBUILD parser"
-cp docker/bridge-wrapper.sh "$WORKDIR/"
+cp packaging/alpm-pkgbuild-bridge-wrapper "$WORKDIR/"
 curl -fsSL "https://gitlab.archlinux.org/archlinux/alpm/alpm-pkgbuild-bridge/-/raw/main/alpm-pkgbuild-bridge.sh?ref_type=heads" \
     -o "$WORKDIR/bridge.sh"
 
@@ -157,7 +157,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certifi
     && rm -rf /var/lib/apt/lists/*
 COPY aurcache-sandbox /usr/local/bin/aurcache-sandbox
 COPY bridge.sh /usr/local/libexec/alpm-pkgbuild-bridge
-COPY bridge-wrapper.sh /usr/local/bin/alpm-pkgbuild-bridge
+COPY alpm-pkgbuild-bridge-wrapper /usr/local/bin/alpm-pkgbuild-bridge
+ENV AURCACHE_PKGBUILD_BRIDGE=/usr/local/libexec/alpm-pkgbuild-bridge \
+    AURCACHE_SANDBOX=/usr/local/bin/aurcache-sandbox
 COPY server-probe.sh /probe.sh
 RUN chmod +x /usr/local/bin/aurcache-sandbox /usr/local/libexec/alpm-pkgbuild-bridge \
       /usr/local/bin/alpm-pkgbuild-bridge /probe.sh
