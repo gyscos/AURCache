@@ -43,6 +43,10 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-packager \
         aarch64-linux-gnu-gcc \
     # makepkg refuses to run as root, and rightly: a PKGBUILD is a shell script.
     && useradd --create-home packager \
+    # The armv7 toolchain stage installs each link of the chain as it builds
+    # it, so the unprivileged build user needs pacman without a password.
+    # Nothing else here installs anything -- makepkg runs --nodeps.
+    && echo 'packager ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/packager \
     && install -d -o packager /pkg
 
 ########## Stage 1b: the cross toolchain for the target ##########
