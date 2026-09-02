@@ -72,6 +72,15 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          # armv7's cross toolchain is built from the AUR in a stage of its own
+          # -- seven packages, gcc three times. Locally Docker's layer cache
+          # keeps it, but a CI runner starts cold every time, so the cache is
+          # exported to and restored from GitHub's cache backend. Without this
+          # every publish pays the better part of an hour.
+          # Scoped per image: both steps run in one job and would otherwise
+          # share a cache key, each overwriting the other's entry.
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
           push: true
           context: .
           file: ./docker/worker.Dockerfile
@@ -81,6 +90,15 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          # armv7's cross toolchain is built from the AUR in a stage of its own
+          # -- seven packages, gcc three times. Locally Docker's layer cache
+          # keeps it, but a CI runner starts cold every time, so the cache is
+          # exported to and restored from GitHub's cache backend. Without this
+          # every publish pays the better part of an hour.
+          # Scoped per image: both steps run in one job and would otherwise
+          # share a cache key, each overwriting the other's entry.
+          cache-from: type=gha,scope=hybrid
+          cache-to: type=gha,scope=hybrid,mode=max
           push: true
           context: .
           file: ./docker/hybrid.Dockerfile

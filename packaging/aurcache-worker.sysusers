@@ -1,4 +1,10 @@
-# Users and groups AURCache needs, declared rather than created by a script.
+# Users and groups an AURCache build worker needs, declared rather than
+# created by a script.
+#
+# The server package declares `aurcache` in a file of its own. Two sysusers
+# files may declare one user -- the second is a no-op -- and they must be two
+# files, because pacman refuses to install two packages that ship the same
+# path even when the contents are identical.
 #
 # systemd-sysusers is idempotent by construction and re-applied on boot, where
 # an install script has to be written carefully not to clobber an existing

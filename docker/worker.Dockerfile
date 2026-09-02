@@ -13,8 +13,9 @@
 # target arch, so the image and a native install are the same thing. Run
 # privileged: arch-nspawn / mkarchroot need mount + unshare.
 #
-# amd64 and arm64 only: armv7's cross toolchain is not in Arch's official
-# repositories.
+# amd64, arm64 and armv7. armv7's cross toolchain is not in Arch's official
+# repositories, so it is built from the AUR in a stage of its own -- see the
+# toolchain stages below for why that costs nothing on the other two.
 
 ########## Stage 1: cross-compile and package ##########
 # Runs natively on the builder and cross-compiles, which is the whole reason
@@ -32,11 +33,13 @@
 # even if there were. Building the images therefore needs an amd64 host; on
 # anything else this stage runs emulated and slowly rather than failing, which
 # is worth knowing before wondering why a build takes an hour.
-FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager
-ARG TARGETARCH
+FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager-base
 RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
-    && pacman -Syu --noconfirm --needed base-devel rust git \
+    # rustup rather than the `rust` package: Arch ships std for the host
+    # architecture only, so `cargo build --target aarch64-...` fails with
+    # "can't find crate for `std`". rustup fetches precompiled std per target.
+    && pacman -Syu --noconfirm --needed base-devel rustup git \
         aarch64-linux-gnu-gcc \
     # makepkg refuses to run as root, and rightly: a PKGBUILD is a shell script.
     && useradd --create-home packager \
@@ -45,33 +48,80 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     # and be writable before the drop to `packager`.
     && install -d -o packager /pkg
 
+########## Stage 1b: the cross toolchain for the target ##########
+# amd64 and arm64 need nothing beyond what the base already has: the build is
+# native for one and `aarch64-linux-gnu-gcc` from `extra` covers the other.
+FROM packager-base AS toolchain-amd64
+FROM packager-base AS toolchain-arm64
+
+# armv7h's cross toolchain is not in any official repository, so it is built
+# from the AUR -- seven packages, gcc three times, the better part of an hour.
+#
+# Deliberately *before* any source is copied in. Docker caches this layer and
+# only rebuilds it when the script itself changes, but only if no earlier layer
+# has been invalidated: put it after `COPY . /src` and every code change pays
+# the hour again. CI runners start cold, so the workflow feeds buildx a cache.
+FROM packager-base AS toolchain-armv7
+# Point this at a pacman repository holding prebuilt cross-toolchain packages
+# and the bootstrap is skipped for whatever it carries -- an AURCache instance
+# serves nicely. Anything the repository lacks is still built from the AUR, so
+# an unset or unreachable value costs correctness nothing, only time.
+ARG AURCACHE_TOOLCHAIN_REPO=
+ENV AURCACHE_TOOLCHAIN_REPO=${AURCACHE_TOOLCHAIN_REPO}
+# The repository's section name, which decides the database file pacman asks
+# for. Defaults to what an AURCache instance serves.
+ARG AURCACHE_TOOLCHAIN_REPO_NAME=repo
+ENV AURCACHE_TOOLCHAIN_REPO_NAME=${AURCACHE_TOOLCHAIN_REPO_NAME}
+COPY --chmod=0755 packaging/build-cross-toolchain.sh /usr/local/bin/build-cross-toolchain
+USER packager
+RUN build-cross-toolchain armv7h
+USER root
+
+ARG TARGETARCH
+ARG TARGETVARIANT
+FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
+ARG TARGETARCH
+ARG TARGETVARIANT
+
 COPY --chown=packager . /src
 USER packager
-WORKDIR /src/packaging/aurcache-worker
 # `--skipinteg` because the tarball is this tree rather than a release, and
 # `--nodeps` because the *build* needs nothing from the target architecture:
 # dependencies are recorded in the package and resolved where it is installed.
 RUN set -eux; \
-    case "$TARGETARCH" in \
+    case "${TARGETARCH}${TARGETVARIANT:-}" in \
       amd64) CARCH=x86_64 ;; \
       arm64) CARCH=aarch64 ;; \
-      *) echo "unsupported TARGETARCH=$TARGETARCH (workers build for amd64 and arm64)"; exit 1 ;; \
+      armv7) CARCH=armv7h ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}${TARGETVARIANT:-}"; exit 1 ;; \
     esac; \
-    /src/packaging/make-source-tarball.sh /src aurcache-worker 0.5.0 .; \
     export CARCH; \
-    makepkg --nodeps --skipinteg --noconfirm --nocheck; \
-    mkdir -p /pkg && cp ./*.pkg.tar.zst /pkg/
+    # The triple comes from common.sh, which the PKGBUILD uses too, so the
+    # target rustup installs cannot drift from the one cargo is asked for.
+    rustup default stable; \
+    rustup target add "$(. /src/packaging/common.sh && _aurcache_rust_target)"; \
+    # Both packages: aurcache-worker depends on aurcache-sandbox, which is its
+    # own package because the server needs the same binary and pacman refuses
+    # two packages shipping one path.
+    for p in aurcache-sandbox aurcache-worker; do \
+      cd "/src/packaging/$p"; \
+      /src/packaging/make-source-tarball.sh /src "$p" 0.5.0 .; \
+      makepkg --nodeps --skipinteg --noconfirm --nocheck; \
+      cp ./*.pkg.tar.zst /pkg/; \
+    done
 
 ########## Stage 2: per-arch Arch Linux runtime base ##########
 # Official Arch is x86_64-only; Arch Linux ARM images cover arm64 / armv7.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS runtime-amd64
 FROM --platform=linux/arm64 lopsided/archlinux:latest AS runtime-arm64
+FROM --platform=linux/arm/v7 lopsided/archlinux-arm32v7:latest AS runtime-armv7
 
 # Select the base matching the target arch (buildkit resolves the alias).
 ARG TARGETARCH
+ARG TARGETVARIANT
 
 ########## Stage 2b: the worker image ##########
-FROM runtime-${TARGETARCH} AS final
+FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 
 # devtools provides mkarchroot / makechrootpkg / arch-nspawn.
 #
@@ -101,7 +151,7 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
 # a directory. Both are idempotent.
 COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
 RUN --mount=type=cache,target=/var/cache/pacman/pkg \
-    pacman -U --noconfirm /tmp/pkg/aurcache-worker-*.pkg.tar.zst \
+    pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
     && rm -rf /tmp/pkg \
     && systemd-sysusers \
     && systemd-tmpfiles --create

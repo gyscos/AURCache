@@ -43,10 +43,10 @@ unset AURCACHE_ENROLLMENT_DIR
 # users end up with: they already run privileged, which is what it needs.
 # ---------------------------------------------------------------------------
 if [ -n "${BUILD_ARTIFACT_DIR:-}" ]; then
-    WORKER_BIN=/usr/local/bin/aurcache-worker-docker
+    WORKER_BIN=/usr/bin/aurcache-worker-docker
     WORKER_KIND="legacy container builder"
 else
-    WORKER_BIN=/usr/local/bin/aurcache-worker
+    WORKER_BIN=/usr/bin/aurcache-worker
     WORKER_KIND="devtools chroot builder"
 
     # devtools needs a writable /run and the ability to create mount
@@ -82,8 +82,19 @@ shutdown() {
 }
 trap shutdown TERM INT
 
+# The server parses a PKGBUILD by sourcing it, so every package it inspects runs
+# bash in this process. aurcache-server ships a wrapper that confines each parse
+# with aurcache-sandbox, installed under the same name the parser looks up; it
+# only takes effect if its directory comes first. The systemd unit sets this
+# with Environment=PATH, which a container has no manager to apply.
+export PATH="/usr/lib/aurcache/bin:$PATH"
+if [ "$(command -v alpm-pkgbuild-bridge)" != /usr/lib/aurcache/bin/alpm-pkgbuild-bridge ]; then
+    echo "refusing to start: PKGBUILD parsing would run unconfined" >&2
+    exit 1
+fi
+
 log "starting AURCache server"
-/usr/local/bin/aurcache &
+/usr/bin/aurcache &
 PIDS+=($!)
 
 if [ -n "$WORKER_BIN" ]; then

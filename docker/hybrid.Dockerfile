@@ -8,69 +8,103 @@
 # `aurcache-server` plus one or more `aurcache-worker` containers, which can be
 # scaled and placed independently. See the Build Workers documentation.
 #
-# The base is Arch rather than Debian because the embedded chroot worker needs
-# `devtools`; the server itself is base-agnostic. Run privileged (as the old
-# single-container setups already did) so `arch-nspawn` / `mkarchroot` can
-# create the mounts and namespaces a chroot build requires.
+# The base is Arch because the embedded chroot worker needs `devtools`. Run
+# privileged (as the old single-container setups already did) so `arch-nspawn`
+# / `mkarchroot` can create the mounts and namespaces a chroot build requires.
+#
+# amd64, arm64 and armv7. armv7's cross toolchain is AUR-only, so it is built
+# in a stage of its own that the other two never reach.
 
-ARG FLUTTER_VERSION=3.44.1
 ARG LATEST_COMMIT_SHA=dev
 
-########## Stage 1: web frontend ##########
-FROM --platform=linux/amd64 debian:bookworm-slim AS frontend_builder
-ARG FLUTTER_VERSION
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl xz-utils unzip ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" \
-      | tar -xJ -C /opt
-ENV PATH="/opt/flutter/bin:${PATH}"
-# Flutter refuses to run as root against a git dir it considers "dubious ownership"
-RUN git config --global --add safe.directory /opt/flutter \
-      && flutter config --no-analytics && flutter precache --web
-WORKDIR /app
-COPY frontend /app
-COPY backend/aurcache/Cargo.toml /app
-RUN flutter pub get
-RUN flutter pub run build_runner build --delete-conflicting-outputs
-RUN flutter build web --release --wasm --dart-define APP_VERSION=$(grep '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+########## Stage 1: build every package ##########
+# One stage, on the native build host, cross-compiling for the target — cargo
+# under qemu turns minutes into a great deal longer. Everything this image runs
+# is built here as a real package, so the image installs what a host installs
+# rather than re-declaring the same users, directories and modes by hand.
+#
+# Pinned to amd64 rather than $BUILDPLATFORM: the official Arch image is
+# x86_64-only, so there is no native packager base on an aarch64 builder, and
+# Arch Linux ARM packages no x86_64 cross toolchain either. Building the images
+# therefore wants an amd64 host; on anything else this stage runs emulated and
+# slowly rather than failing.
+FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager-base
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
+    # rustup rather than the `rust` package: Arch ships std for the host
+    # architecture only, so a cross build fails with "can't find crate for
+    # `std`". rustup fetches precompiled std per target, wasm32 included.
+    && pacman -Syu --noconfirm --needed base-devel rustup git \
+        aarch64-linux-gnu-gcc \
+    # makepkg refuses to run as root, and rightly: a PKGBUILD is a shell script.
+    && useradd --create-home packager \
+    && install -d -o packager /pkg
 
-########## Stage 2: all three binaries in one cargo pass ##########
-# Cross-compiled on the build host (no emulation), exactly as the worker image
-# does; Arch's glibc is newer than the builder's, so the binaries load fine.
-FROM --platform=$BUILDPLATFORM rust:1.97 AS builder
+########## Stage 1b: the cross toolchain for the target ##########
+# amd64 and arm64 need nothing more; armv7h's toolchain is AUR-only and is
+# built here, before any source is copied, so Docker's layer cache keeps it
+# across code changes. See docker/worker.Dockerfile for the full reasoning.
+FROM packager-base AS toolchain-amd64
+FROM packager-base AS toolchain-arm64
+
+FROM packager-base AS toolchain-armv7
+# Point this at a pacman repository holding prebuilt cross-toolchain packages
+# and the bootstrap is skipped for whatever it carries -- an AURCache instance
+# serves nicely. Anything the repository lacks is still built from the AUR, so
+# an unset or unreachable value costs correctness nothing, only time.
+ARG AURCACHE_TOOLCHAIN_REPO=
+ENV AURCACHE_TOOLCHAIN_REPO=${AURCACHE_TOOLCHAIN_REPO}
+# The repository's section name, which decides the database file pacman asks
+# for. Defaults to what an AURCache instance serves.
+ARG AURCACHE_TOOLCHAIN_REPO_NAME=repo
+ENV AURCACHE_TOOLCHAIN_REPO_NAME=${AURCACHE_TOOLCHAIN_REPO_NAME}
+COPY --chmod=0755 packaging/build-cross-toolchain.sh /usr/local/bin/build-cross-toolchain
+USER packager
+RUN build-cross-toolchain armv7h
+USER root
+
+ARG TARGETARCH
+ARG TARGETVARIANT
+FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
-WORKDIR /app
-COPY backend/ /app/
-COPY --from=frontend_builder /app/build/web /app/aurcache-api/web
+
+USER packager
+# wasm-bindgen emits the frontend's JS glue and is not in Arch's repositories,
+# so it is built rather than installed. Its version must match the
+# `wasm-bindgen` crate in frontend-rs/Cargo.lock, which `--locked` guarantees
+# by using that crate's own lockfile.
+ENV PATH="/home/packager/.cargo/bin:${PATH}"
+RUN rustup default stable && rustup target add wasm32-unknown-unknown
+# No cache mount here: buildkit creates the mount's parent as root, leaving
+# cargo unable to write ~/.cargo/.crates.toml. The layer caches on its own.
+RUN cargo install wasm-bindgen-cli --locked
+
+COPY --chown=packager . /src
+# `--skipinteg` because the tarball is this tree rather than a release, and
+# `--nodeps` because the build needs nothing from the target architecture:
+# dependencies are recorded in the package and resolved where it is installed.
 RUN set -eux; \
     case "${TARGETARCH}${TARGETVARIANT:-}" in \
-      amd64) RUST_TARGET=x86_64-unknown-linux-gnu; PKGS="" ;; \
-      arm64) RUST_TARGET=aarch64-unknown-linux-gnu; PKGS="gcc-aarch64-linux-gnu" ;; \
-      armv7) RUST_TARGET=armv7-unknown-linux-gnueabihf; PKGS="gcc-arm-linux-gnueabihf" ;; \
+      amd64) CARCH=x86_64 ;; \
+      arm64) CARCH=aarch64 ;; \
+      armv7) CARCH=armv7h ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}${TARGETVARIANT:-}"; exit 1 ;; \
     esac; \
-    if [ -n "$PKGS" ]; then apt-get update && apt-get install -y --no-install-recommends $PKGS; fi; \
-    rustup target add "$RUST_TARGET"; \
-    case "$RUST_TARGET" in \
-      aarch64-*) export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-                        CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-                        AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar ;; \
-      armv7-*)   export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
-                        CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
-                        AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar ;; \
-    esac; \
-    cargo build --release --target "$RUST_TARGET" \
-        -p aurcache -p aurcache-worker -p aurcache-worker-docker -p aurcache-sandbox; \
-    mkdir -p /out; \
-    cp "target/$RUST_TARGET/release/aurcache" \
-       "target/$RUST_TARGET/release/aurcache-worker" \
-       "target/$RUST_TARGET/release/aurcache-worker-docker" \
-       "target/$RUST_TARGET/release/aurcache-sandbox" /out/
+    export CARCH; \
+    # From common.sh, so it cannot drift from the triple cargo is asked for.
+    rustup target add "$(. /src/packaging/common.sh && _aurcache_rust_target)"; \
+    for p in aurcache-sandbox aurcache-server aurcache-worker aurcache-worker-docker; do \
+      cd "/src/packaging/$p"; \
+      /src/packaging/make-source-tarball.sh /src "$p" 0.5.0 .; \
+      makepkg --nodeps --skipinteg --noconfirm --nocheck; \
+      cp ./*.pkg.tar.zst /pkg/; \
+    done
 
-########## Stage 3: per-arch Arch Linux runtime ##########
+########## Stage 2: per-arch Arch Linux runtime ##########
+# Official Arch is x86_64-only; Arch Linux ARM covers arm64.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS runtime-amd64
 FROM --platform=linux/arm64 lopsided/archlinux:latest AS runtime-arm64
 FROM --platform=linux/arm/v7 lopsided/archlinux-arm32v7:latest AS runtime-armv7
@@ -79,84 +113,42 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 
-# devtools provides mkarchroot / makechrootpkg / arch-nspawn.
-#
 # DisableSandbox: pacman 7's Landlock-based download sandbox cannot initialise
 # inside an unprivileged/nested container, which makes every `pacman -Sy` abort.
 # It only affects pacman's own download isolation, not the per-build chroot.
 RUN --mount=type=cache,target=/var/cache/pacman/pkg \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
-        base-devel devtools sudo git fakeroot openssh ca-certificates bash \
     && pacman-key --init \
     && pacman-key --populate \
     && systemd-machine-id-setup
 
-# Two unprivileged users, deliberately separate:
+# Everything this image runs, installed as packages: the four binaries, the two
+# users and their group membership, the directories and their modes, the
+# sudoers entry, the patched makechrootpkg, and the wrapper that confines the
+# server's PKGBUILD parser. pacman pulls devtools and alpm-pkgbuild-bridge as
+# ordinary dependencies.
 #
-#   aurcache - runs the worker process. Owns the mTLS identity and the build
-#              credentials, and is the only user that can read them.
-#   builder  - runs each package build. `makechrootpkg -U builder` names it
-#              explicitly, so a build never inherits the worker's user through
-#              SUDO_USER and never reaches the worker's secrets by file
-#              permissions.
-#
-# They share a group so both can use the caches: builds write SRCDEST, and the
-# worker garbage-collects it. sudo is what lets the unprivileged worker start a
-# build as another user, so the worker itself never needs to be root.
-# `aurbuild` is builder's *primary* group, not a supplementary one. That
-# matters: makechrootpkg carries only the build user's primary uid/gid into the
-# chroot, so a supplementary group does not exist in there and group-write on
-# the bind-mounted caches silently fails with "no write permission for $SRCDEST"
-# — from inside the chroot, after the host-side checks have already passed.
-RUN groupadd aurbuild \
-    && useradd --create-home --shell /bin/bash --gid aurbuild builder \
-    && useradd --create-home --shell /bin/bash --groups aurbuild aurcache \
-    && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder \
-    && echo 'aurcache ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/aurcache \
-    && chmod 0440 /etc/sudoers.d/builder /etc/sudoers.d/aurcache
+# This is the point of packaging: the image stops being a second,
+# hand-maintained copy of the host contract that can drift from the documented
+# one. systemd-sysusers / systemd-tmpfiles run explicitly as well as through
+# pacman's hooks — an image with no systemd manager is exactly where a hook
+# that quietly did not run would go unnoticed until a build failed for want of
+# a directory. Both are idempotent.
+COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
+RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+    pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
+    && rm -rf /tmp/pkg \
+    && systemd-sysusers \
+    && systemd-tmpfiles --create
 
 ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
     WORKER_CACHE_DIR=/var/cache/aurcache-worker
-# Ownership is the second half of the uid split, and it is what protects the
-# worker's secrets even if the Landlock policy is never applied:
-#
-#   data dir   - owned by aurcache, traversable so builds can reach work/,
-#                but identity and secrets inside are aurcache-only.
-#   work/      - owned by *builder*, shared to aurcache by group.
-#   cache dir  - likewise.
-#
-# The build dirs are owned by the build user rather than the worker because
-# makechrootpkg copies only the build user's primary uid/gid into the chroot:
-# supplementary groups do not exist in the chroot's /etc/group, so group-based
-# write access silently fails inside it with "no write permission for $SRCDEST".
-# Ownership by uid is the only form that survives. The worker reaches these
-# through the shared group, which it does not need inside any chroot.
-RUN mkdir -p "$WORKER_DATA_DIR/work" "$WORKER_DATA_DIR/secrets" \
-        "$WORKER_CACHE_DIR" \
-    && chown -R aurcache:aurcache "$WORKER_DATA_DIR" \
-    && chmod 0755 "$WORKER_DATA_DIR" \
-    && chmod 0700 "$WORKER_DATA_DIR/secrets" \
-    && chown builder:aurbuild "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR" \
-    && chmod 2775 "$WORKER_DATA_DIR/work" "$WORKER_CACHE_DIR"
 
-COPY --from=builder /out/aurcache /usr/local/bin/aurcache
-COPY --from=builder /out/aurcache-worker /usr/local/bin/aurcache-worker
-COPY --from=builder /out/aurcache-worker-docker /usr/local/bin/aurcache-worker-docker
-COPY --from=builder /out/aurcache-sandbox /usr/local/bin/aurcache-sandbox
 # Wrapper so devtools' systemd-nspawn works without a systemd manager.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
-# Confine the two places makechrootpkg executes a PKGBUILD on the worker,
-# outside the chroot. See backend/aurcache-sandbox.
-COPY --chmod=0755 packaging/patch-makechrootpkg.py /usr/local/bin/patch-makechrootpkg
-# Paths a PKGBUILD must never read; see the file for why it is not an env var.
-COPY packaging/sandbox-protected /etc/aurcache/sandbox-protected
 COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
-RUN pacman -S --noconfirm --needed python && /usr/local/bin/patch-makechrootpkg
 COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
-
-# add alpm-pkgbuild-bridge (the server's PKGBUILD parser)
-ADD --chmod=755 https://gitlab.archlinux.org/archlinux/alpm/alpm-pkgbuild-bridge/-/raw/main/alpm-pkgbuild-bridge.sh?ref_type=heads /usr/local/bin/alpm-pkgbuild-bridge
 
 # The embedded worker's identity and its expensive base chroot live here.
 # Declaring them as volumes means Compose carries them across a container

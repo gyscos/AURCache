@@ -8,20 +8,24 @@ pkgname=aurcache-server
 pkgver=0.5.0
 pkgrel=1
 pkgdesc="Build server and pacman repository for Arch Linux packages from the AUR"
-arch=(x86_64 aarch64)
+arch=(x86_64 aarch64 armv7h)
 url="https://github.com/Lukas-Heiligenbrunner/AURCache"
 license=(GPL-3.0-or-later)
 # alpm-pkgbuild-bridge is what `alpm-srcinfo` shells out to in order to parse a
 # PKGBUILD; without it every package add fails. It is reached through a
 # confining wrapper this package installs ahead of it on PATH -- see
 # packaging/alpm-pkgbuild-bridge-wrapper.
-depends=(gcc-libs openssl alpm-pkgbuild-bridge)
+# libgit2 and xz are what the binary actually links (`ldd` on the built
+# artifact, not guesswork): libgit2-sys uses the system library when it finds
+# one, which on Arch it does. openssl is deliberately absent -- the TLS stack
+# here is rustls over aws-lc-rs/ring, and nothing links libssl.
+depends=(gcc-libs libgit2 xz alpm-pkgbuild-bridge aurcache-sandbox)
 # rust-wasm supplies the wasm32-unknown-unknown std the frontend compiles
 # against, and wasm-bindgen-cli emits its JS glue. The latter is an AUR package
 # and its version must match the `wasm-bindgen` crate in frontend-rs/Cargo.lock
 # (0.2.127 today) -- wasm-bindgen refuses a mismatched pair outright, which is
 # the one thing about this build that breaks on a version bump elsewhere.
-makedepends=(cargo git rust-wasm wasm-bindgen-cli)
+makedepends=(cargo git libgit2 rust-wasm wasm-bindgen-cli)
 backup=(etc/aurcache/server.env)
 # !lto because makepkg's LTO puts `-flto=auto` into CFLAGS, which the `cc` crate
 # passes to the C in `aws-lc-sys` and `ring`. That yields GCC LTO bytecode in
@@ -50,7 +54,7 @@ build() {
     cd "$_srcdir/backend"
     # `static` embeds the web UI in the binary, which is what makes the native
     # install one unit with nothing to serve separately.
-    _aurcache_cargo_build --features aurcache-api/static -p aurcache -p aurcache-sandbox
+    _aurcache_cargo_build --features aurcache-api/static -p aurcache
 }
 
 check() {

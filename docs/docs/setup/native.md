@@ -36,7 +36,7 @@ systemctl enable --now aurcache
 
 It listens on **8080** (API and web UI), **8081** (the pacman repository) and
 **8083** (workers). State lives in `/var/lib/aurcache`: the repository, the
-database and the worker CA.
+database, the worker CA and the build logs.
 
 ### The PKGBUILD parser is sandboxed
 

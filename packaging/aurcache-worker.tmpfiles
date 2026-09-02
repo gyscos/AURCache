@@ -3,7 +3,6 @@
 # Ownership here is not bookkeeping: it is what protects the worker's secrets
 # even if the Landlock policy is never applied.
 #
-#   /var/lib/aurcache          - the server's state: repo, database, CA.
 #   /var/lib/aurcache-worker   - the worker's, traversable so builds can reach
 #                                work/, with secrets inside readable only by
 #                                the worker.
@@ -17,9 +16,6 @@
 #                                shared group so the worker can still collect
 #                                them.
 
-d /var/lib/aurcache              0750 aurcache aurcache -
-d /var/lib/aurcache/data         0750 aurcache aurcache -
-d /var/lib/aurcache/data/ca      0700 aurcache aurcache -
 
 d /var/lib/aurcache-worker       0755 aurcache aurcache -
 d /var/lib/aurcache-worker/secrets 0700 aurcache aurcache -

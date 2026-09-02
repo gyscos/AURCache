@@ -12,7 +12,7 @@ pkgdesc="Remote build worker for AURCache"
 # armv7h is deliberately absent: its cross toolchain is not in Arch's official
 # repositories, only aarch64's is. Adding it means the AUR toolchain or an
 # emulated build.
-arch=(x86_64 aarch64)
+arch=(x86_64 aarch64 armv7h)
 url="https://github.com/Lukas-Heiligenbrunner/AURCache"
 license=(GPL-3.0-or-later)
 
@@ -23,7 +23,7 @@ license=(GPL-3.0-or-later)
 # Deliberately not base-devel: the compiler toolchain is installed inside each
 # build's chroot by `mkarchroot ... base-devel`, never on the host. The host
 # only downloads and verifies sources, which devtools covers.
-depends=(gcc-libs openssl devtools python)
+depends=(gcc-libs devtools python aurcache-sandbox)
 makedepends=(cargo git)
 # Cross-compiling to aarch64 additionally needs aarch64-linux-gnu-gcc; build()
 # says so if it is missing. It is not in makedepends because it is only needed
@@ -56,7 +56,7 @@ prepare() {
 build() {
     source "$srcdir/$_srcdir/packaging/common.sh"
     cd "$_srcdir/backend"
-    _aurcache_cargo_build -p aurcache-worker -p aurcache-sandbox
+    _aurcache_cargo_build -p aurcache-worker
 }
 
 check() {
