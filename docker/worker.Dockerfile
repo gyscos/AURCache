@@ -34,7 +34,12 @@
 # anything else this stage runs emulated and slowly rather than failing, which
 # is worth knowing before wondering why a build takes an hour.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager-base
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+# The cache id carries the platform: a buildkit cache mount is keyed on its
+# target path, so without this the amd64 packager's x86_64 downloads land in
+# the very cache the arm64 and armv7 runtimes read from. That surfaces as
+# "could not find package in cache" and as signatures from the Arch Linux ARM
+# build system being rejected -- neither of which points at a shared cache.
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-packager \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     # rustup rather than the `rust` package: Arch ships std for the host
     # architecture only, so `cargo build --target aarch64-...` fails with
@@ -122,6 +127,8 @@ ARG TARGETVARIANT
 
 ########## Stage 2b: the worker image ##########
 FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
+# Interpolated into the pacman cache id below.
+ARG TARGETPLATFORM
 
 # devtools provides mkarchroot / makechrootpkg / arch-nspawn.
 #
@@ -130,7 +137,7 @@ FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 # every `pacman -Sy` abort. Disabling it is required for pacman to run at all in
 # this image; it only affects pacman's own download isolation, not the per-build
 # chroot isolation (each build still runs in its own `makechrootpkg` chroot).
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
     && pacman-key --init \
@@ -150,7 +157,7 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
 # that quietly did not run would go unnoticed until a build failed for want of
 # a directory. Both are idempotent.
 COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
     && rm -rf /tmp/pkg \
     && systemd-sysusers \

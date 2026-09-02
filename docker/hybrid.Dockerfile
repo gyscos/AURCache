@@ -29,7 +29,12 @@ ARG LATEST_COMMIT_SHA=dev
 # therefore wants an amd64 host; on anything else this stage runs emulated and
 # slowly rather than failing.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS packager-base
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+# The cache id carries the platform: a buildkit cache mount is keyed on its
+# target path, so without this the amd64 packager's x86_64 downloads land in
+# the very cache the arm64 and armv7 runtimes read from. That surfaces as
+# "could not find package in cache" and as signatures from the Arch Linux ARM
+# build system being rejected -- neither of which points at a shared cache.
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-packager \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     # rustup rather than the `rust` package: Arch ships std for the host
     # architecture only, so a cross build fails with "can't find crate for
@@ -112,11 +117,13 @@ FROM --platform=linux/arm/v7 lopsided/archlinux-arm32v7:latest AS runtime-armv7
 ARG TARGETARCH
 ARG TARGETVARIANT
 FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
+# Interpolated into the pacman cache id below.
+ARG TARGETPLATFORM
 
 # DisableSandbox: pacman 7's Landlock-based download sandbox cannot initialise
 # inside an unprivileged/nested container, which makes every `pacman -Sy` abort.
 # It only affects pacman's own download isolation, not the per-build chroot.
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
     && pacman-key --init \
@@ -136,7 +143,7 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
 # that quietly did not run would go unnoticed until a build failed for want of
 # a directory. Both are idempotent.
 COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
-RUN --mount=type=cache,target=/var/cache/pacman/pkg \
+RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
     && rm -rf /tmp/pkg \
     && systemd-sysusers \
