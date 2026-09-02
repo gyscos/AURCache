@@ -3,7 +3,7 @@
 //! Behind the `fs` feature, which browser consumers leave off along with `db`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Total size in bytes of the files under `path`. Best-effort.
 ///
@@ -36,6 +36,67 @@ pub fn dir_size(path: impl AsRef<Path>) -> u64 {
     }
 
     walk(path.as_ref())
+}
+
+/// Directory holding one log file per build.
+///
+/// Relative by default, like the repository and the source cache, so a
+/// deployment that mounts a single data directory gets this inside it.
+///
+/// Lives here rather than beside the logger because the backfill migration in
+/// `aurcache-db` needs it too, and `aurcache-db` cannot depend on the crate the
+/// logger lives in without a cycle.
+#[must_use]
+pub fn build_log_root() -> PathBuf {
+    std::env::var("AURCACHE_BUILD_LOG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./build_logs"))
+}
+
+/// One path segment, with anything that is not a plain name flattened.
+///
+/// A pkgbase from the AUR cannot contain a separator, but AURCache also builds
+/// from git, where the pkgbase comes from a parsed PKGBUILD and is whatever
+/// that file says. `.` and `..` are handled separately because they survive
+/// character filtering intact and are still traversal.
+///
+/// Distinct names could in principle collapse onto one segment; that needs a
+/// pkgbase containing a character the AUR does not allow, and the cost is a
+/// shared log directory rather than anything escaping the root.
+fn sanitize_segment(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    }
+}
+
+/// Directory holding one package's build logs.
+#[must_use]
+pub fn build_log_dir(pkgbase: &str) -> PathBuf {
+    build_log_root().join(sanitize_segment(pkgbase))
+}
+
+/// Path of one build's log, keyed the way the API is.
+///
+/// `<pkgbase>/<number>.log` rather than the build id: `<pkgbase>/<number>` is
+/// a build's public identity -- what the URLs, the CLI and the screens all use
+/// -- and the id is an internal key none of them show. Naming the files after
+/// the identity means someone reading the directory sees what they see
+/// everywhere else, and deleting a package's logs is one `remove_dir_all`.
+#[must_use]
+pub fn build_log_path(pkgbase: &str, number: i32) -> PathBuf {
+    build_log_dir(pkgbase).join(format!("{number}.log"))
 }
 
 #[cfg(test)]

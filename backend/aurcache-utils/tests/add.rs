@@ -1225,7 +1225,6 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 
     builds::ActiveModel {
         pkg_id: Set(leaf.id),
-        output: Set(None),
         status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
         start_time: Set(Some(1)),
         end_time: Set(Some(2)),
@@ -1334,7 +1333,6 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
 
     builds::ActiveModel {
         pkg_id: Set(leaf.id),
-        output: Set(None),
         status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
         start_time: Set(Some(1)),
         end_time: Set(Some(2)),

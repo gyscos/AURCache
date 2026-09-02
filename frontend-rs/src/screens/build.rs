@@ -83,8 +83,13 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // build emits thousands of lines, so the browser would lay out thousands
     // of elements and the VirtualDom would walk them on every poll.
     let mut log = use_signal(String::new);
-    // Tracked rather than recounted: the API takes "how many lines I already
-    // have", and counting a growing string on every poll is wasted work.
+    // Two counters, because they answer different questions. `byte_offset` is
+    // what the API takes: the server seeks to it in the log file, so a poll
+    // costs what it reads rather than the size of the whole log. `line_count`
+    // is only for display, counted from the chunks as they arrive so the server
+    // never has to think in lines -- which is what let the transport switch to
+    // bytes without losing the "N lines" readout.
+    let mut byte_offset = use_signal(|| 0u64);
     let mut line_count = use_signal(|| 0i32);
     let mut finished = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
@@ -106,10 +111,11 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
 
             loop {
                 // Ask only for what we do not already have.
-                let have = line_count();
+                let have = byte_offset();
                 match client.build_output(&pkgbase, number, Some(have)).await {
                     Ok(chunk) if !chunk.is_empty() => {
                         let added = chunk.lines().count() as i32;
+                        byte_offset += chunk.len() as u64;
                         log.with_mut(|text| {
                             if !text.is_empty() && !text.ends_with('\n') {
                                 text.push('\n');
@@ -185,7 +191,15 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                     class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
                             flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
                     if line_count() == 0 {
-                        span { class: "opacity-60", "waiting for output…" }
+                        // A finished build with nothing to show has no log at
+                        // all -- it never wrote one, or it has been removed --
+                        // which is a different statement from a running build
+                        // that has not written its first line yet.
+                        if finished() {
+                            span { class: "opacity-60", "no log for this build" }
+                        } else {
+                            span { class: "opacity-60", "waiting for output…" }
+                        }
                     } else {
                         "{log}"
                     }

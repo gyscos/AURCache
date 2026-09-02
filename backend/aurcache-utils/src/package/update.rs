@@ -988,7 +988,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1185,7 +1184,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1199,7 +1197,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(grandchild.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1405,7 +1402,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1419,7 +1415,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(grandchild.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1595,7 +1590,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(parent.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1609,7 +1603,6 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(new_dep.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1690,7 +1683,6 @@ mod tests {
         // The first (failed) build record.
         builds::ActiveModel {
             pkg_id: Set(pkg.id),
-            output: Set(None),
             status: Set(Some(BuildStates::FAILED_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
@@ -1815,7 +1807,6 @@ mod tests {
         // Successful build record for child
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            output: Set(None),
             status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),

@@ -12,7 +12,7 @@
 //! different things -- a package was added or already existed, versus a package
 //! was imported or skipped or overwritten -- and flattening both into one
 //! stringly outcome would lose that. Only the transport is shared: one JSON
-//! object per line, read by line offset the way `builds.output` is.
+//! object per line, read by line offset.
 
 use crate::helpers::time::now_secs;
 use crate::operations;

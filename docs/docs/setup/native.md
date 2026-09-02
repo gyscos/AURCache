@@ -38,6 +38,30 @@ It listens on **8080** (API and web UI), **8081** (the pacman repository) and
 **8083** (workers). State lives in `/var/lib/aurcache`: the repository, the
 database, the worker CA and the build logs.
 
+### Build logs are files, not database rows
+
+Each build's log is `build_logs/<pkgbase>/<number>.log` under the server's
+working directory, overridable with `AURCACHE_BUILD_LOG_PATH` — named after the
+build's public identity, the same `<pkgbase>/<number>` the API, the CLI and the
+web UI use. They were a `TEXT`
+column until they got too expensive to be one: appending to a row means the
+database rewrites the whole value, so a 31 MB log cost gigabytes of writes over
+a build's lifetime, and reading a tail meant fetching the entire log to discard
+most of it. A file appends and seeks in proportion to what actually changed.
+
+Two consequences worth knowing:
+
+- **A database backup no longer contains build logs.** They are derived data —
+  the dump format has always excluded them for that reason — but if you were
+  relying on `pg_dump` to capture them, include the log directory instead.
+- **A log whose file is missing is not an error.** The build page shows "no log
+  for this build" rather than failing, which is also what you get for a build
+  that never produced output.
+
+Upgrading moves existing logs out of the database automatically and then drops
+the column. That migration is one-way: take a backup first if the logs matter
+to you.
+
 ### The PKGBUILD parser is sandboxed
 
 Reading a PKGBUILD means *sourcing* it, so every package the server inspects

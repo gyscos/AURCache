@@ -1,4 +1,3 @@
-use itertools::Itertools;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, post};
@@ -12,6 +11,7 @@ use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages};
+use aurcache_utils::build_logger::read_build_output;
 use aurcache_utils::package::update::package_update;
 use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::FromQueryResult;
@@ -45,15 +45,6 @@ pub struct BuildApi;
 /// "No output yet" is the normal state of a freshly started build, and the log
 /// view polls this endpoint from the moment it opens — reporting that as an
 /// error would make every new build's first poll fail.
-fn slice_output(output: Option<String>, startline: Option<i32>) -> String {
-    let output = output.unwrap_or_default();
-    let Some(startline) = startline else {
-        return output;
-    };
-    let skip = usize::try_from(startline).unwrap_or(0);
-    output.lines().skip(skip).join("\n")
-}
-
 #[utoipa::path(
     responses(
             (status = 200, description = "Build output from `startline` onwards; empty if the build has not logged anything yet"),
@@ -62,22 +53,30 @@ fn slice_output(output: Option<String>, startline: Option<i32>) -> String {
     params(
             ("pkgbase", description = "pkgbase of the package"),
             ("number", description = "Build number within that package"),
-            ("startline", description = "Number of leading lines to skip (i.e. how many the caller already has)")
+            ("offset", description = "Bytes of log the caller already has; the response starts there")
     )
 )]
-#[get("/package/<pkgbase>/build/<number>/output?<startline>")]
+#[get("/package/<pkgbase>/build/<number>/output?<offset>")]
 pub async fn build_output(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     number: i32,
-    startline: Option<i32>,
+    offset: Option<u64>,
     _a: Authenticated,
 ) -> Result<String, ApiError> {
     let db = db.inner();
 
-    let build = build_by_number(db, pkgbase, number).await?;
+    // Resolved even though the log path needs neither: an unknown
+    // pkgbase/number must still be a 404 rather than an empty log, which would
+    // be indistinguishable from a build that produced no output.
+    build_by_number(db, pkgbase, number).await?;
 
-    Ok(slice_output(build.output, startline))
+    // A build with no log file is not an error: it may have produced nothing
+    // yet, or its log may have been removed. Callers render the difference.
+    Ok(read_build_output(pkgbase, number, offset.unwrap_or(0))
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .unwrap_or_default())
 }
 
 #[utoipa::path(
@@ -404,43 +403,4 @@ pub async fn retry_build(
         })?;
 
     Ok(Json(build_number))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::slice_output;
-
-    /// A build that exists but has not logged anything is not an error: the log
-    /// view opens (and starts polling) before the first line is ever written.
-    #[test]
-    fn missing_output_reads_as_empty() {
-        assert_eq!(slice_output(None, None), "");
-        assert_eq!(slice_output(None, Some(0)), "");
-        assert_eq!(slice_output(None, Some(5)), "");
-    }
-
-    #[test]
-    fn without_a_startline_the_whole_output_is_returned() {
-        assert_eq!(
-            slice_output(Some("a\nb\nc\n".to_string()), None),
-            "a\nb\nc\n"
-        );
-    }
-
-    #[test]
-    fn startline_skips_the_lines_the_caller_already_has() {
-        let output = Some("a\nb\nc\n".to_string());
-        assert_eq!(slice_output(output.clone(), Some(0)), "a\nb\nc");
-        assert_eq!(slice_output(output.clone(), Some(2)), "c");
-        // Caller is already up to date.
-        assert_eq!(slice_output(output.clone(), Some(3)), "");
-        assert_eq!(slice_output(output, Some(99)), "");
-    }
-
-    /// A nonsensical offset skips nothing rather than wrapping around to a huge
-    /// one, which `as usize` would have done.
-    #[test]
-    fn negative_startline_skips_nothing() {
-        assert_eq!(slice_output(Some("a\nb\n".to_string()), Some(-1)), "a\nb");
-    }
 }

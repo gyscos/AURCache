@@ -50,7 +50,7 @@ async fn ingest_writes_repo_and_files_row_and_parses_version() {
     .unwrap();
     let pkg_id = 1;
 
-    let logger = BuildLogger::new(1, db.clone());
+    let logger = BuildLogger::new("pkg", 1);
     let repo_root = tempfile::tempdir().unwrap();
 
     let artifacts = vec![(

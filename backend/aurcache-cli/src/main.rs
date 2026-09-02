@@ -336,9 +336,12 @@ struct BuildOutputArgs {
     /// Build reference, e.g. `hello/3`.
     build: BuildRef,
 
-    /// Skip output lines before this index.
-    #[arg(long = "start-line")]
-    start_line: Option<i32>,
+    /// Skip this many bytes of log before printing.
+    ///
+    /// Bytes rather than lines: the server seeks to the offset, so the cost is
+    /// proportional to what is read rather than to the whole log.
+    #[arg(long = "offset")]
+    offset: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1130,7 +1133,7 @@ async fn render_build_output(
     args: BuildOutputArgs,
 ) -> Result<()> {
     let output = client
-        .build_output(&args.build.pkgbase, args.build.number, args.start_line)
+        .build_output(&args.build.pkgbase, args.build.number, args.offset)
         .await?;
     match format {
         OutputFormat::Json => print_json(&json!({ "output": output })),

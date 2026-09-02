@@ -17,7 +17,6 @@ pub struct Model {
     /// The public identity of a build is `<pkgbase>/<number>`; [`Self::id`] is
     /// an internal key that no URL, API response or screen shows.
     pub number: i32,
-    pub output: Option<String>,
     pub status: Option<i32>,
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,

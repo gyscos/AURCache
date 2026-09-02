@@ -574,6 +574,10 @@ pub async fn write_rows(
     for file in &orphaned {
         crate::utils::remove_archive_file::forget_archive_file(file);
     }
+    // `--clear` removes every package, so every build log goes with them.
+    if options.clear {
+        crate::build_logger::remove_all_logs().await;
+    }
 
     Ok(Applied { entries, touched })
 }

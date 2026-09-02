@@ -7,7 +7,7 @@
 //! that happened while nobody was watching is still there afterwards.
 //!
 //! `log` is append-only, one JSON object per line, read by line offset the same
-//! way `builds.output` is. Storing outcomes as lines rather than as rows keeps
+//! way a build log is. Storing outcomes as lines rather than as rows keeps
 //! the reader a single query and matches how build output already works.
 
 use crate::helpers::dbtype::database_type;

@@ -14,6 +14,10 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
         .await?
         .ok_or_else(|| anyhow!("id not found"))?;
 
+    // Captured before the delete consumes the model: the logs are stored under
+    // this name and have to be removed after the transaction commits.
+    let pkgbase = pkg.name.clone();
+
     // remove package db entry
     pkg.delete(&txn).await?;
 
@@ -48,6 +52,13 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
         .await?;
 
     txn.commit().await?;
+
+    // Build logs live on disk rather than in a column, so nothing removes them
+    // on our behalf. One directory, because they are stored under the package's
+    // name. After the commit deliberately: a rollback must not leave rows
+    // pointing at logs that are gone, while a stray directory after a commit is
+    // only wasted bytes.
+    crate::build_logger::remove_package_logs(&pkgbase).await;
 
     Ok(())
 }

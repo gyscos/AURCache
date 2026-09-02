@@ -330,14 +330,18 @@ impl AurCacheClient {
 
     /// Fetches raw build output text.
     ///
-    /// When `start_line` is provided, lines before that offset are skipped.
+    /// `offset` is how many *bytes* of the log the caller already has; the
+    /// response starts there. Bytes rather than lines because the server seeks
+    /// to the offset in a file, which is proportional to what is being read
+    /// rather than to the size of the whole log. An offset returned by a
+    /// previous call always lands on a character boundary.
     pub async fn build_output(
         &self,
         pkgbase: &str,
         number: i32,
-        start_line: Option<i32>,
+        offset: Option<u64>,
     ) -> Result<String> {
-        let query = Query::default().opt("startline", start_line);
+        let query = Query::default().opt("offset", offset);
         self.request_text::<Value>(
             Method::GET,
             &format!("/package/{pkgbase}/build/{number}/output"),

@@ -453,6 +453,19 @@ pub async fn job_source(
         .map_err(|e| err(Status::InternalServerError, e))
 }
 
+/// The pkgbase a build belongs to.
+///
+/// Worker routes are keyed by the internal build id while logs are stored under
+/// `<pkgbase>/<number>`, so the name has to be looked up once per request.
+async fn build_pkgbase(db: &DatabaseConnection, pkg_id: i32) -> Result<String, ApiError> {
+    Packages::find_by_id(pkg_id)
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .map(|p| p.name)
+        .ok_or_else(|| err(Status::NotFound, "package not found"))
+}
+
 /// Append build log output.
 #[post("/worker/jobs/<build_id>/logs", data = "<data>")]
 pub async fn job_logs(
@@ -462,7 +475,7 @@ pub async fn job_logs(
     data: Data<'_>,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    worker_complete::assert_owned_active(db, auth.worker.id, build_id)
+    let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
 
@@ -472,8 +485,13 @@ pub async fn job_logs(
         .await
         .map_err(|e| err(Status::BadRequest, e))?;
 
+    // Logs are stored under the build's public identity, and the worker
+    // endpoints are the only ones keyed by the internal id. `build` comes from
+    // the ownership check above, so this costs one lookup for the pkgbase.
+    let pkgbase = build_pkgbase(db, build.pkg_id).await?;
+
     // The worker posts whole chunks, so this needs no buffering task of its own.
-    append_build_output(db, build_id, &text)
+    append_build_output(&pkgbase, build.number, &text)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(())
@@ -557,7 +575,7 @@ pub async fn complete_job(
         // pkgnames, so they would fail validation and requeue the build forever.
         // The server already sets OPTIONS=(!debug), so this only triggers for a
         // worker whose user makepkg.conf re-enables it.
-        let logger = BuildLogger::new(build_id, db.clone());
+        let logger = BuildLogger::new(&pkg.name, build.number);
         let (files, debug_files): (Vec<_>, Vec<_>) = files
             .into_iter()
             .partition(|(name, _)| !is_debug_artifact(&expected, name));
@@ -609,9 +627,10 @@ pub async fn complete_job(
             .map_err(|e| err(Status::InternalServerError, e))?;
     } else {
         if let Some(reason) = &report.reason
+            && let Ok(pkgbase) = build_pkgbase(db, build.pkg_id).await
             && let Err(e) = append_build_output(
-                db,
-                build_id,
+                &pkgbase,
+                build.number,
                 &format!("worker reported failure: {reason}\n"),
             )
             .await
