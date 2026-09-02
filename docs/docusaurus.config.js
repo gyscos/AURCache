@@ -10,7 +10,7 @@ import {themes as prismThemes} from 'prism-react-renderer';
 const config = {
   title: 'AURCache',
   tagline: 'The Archlinux AUR build server',
-  favicon: '../frontend/assets/icons/icon.png',
+  favicon: '../assets/icons/icon.svg',
 
   // Set the production url of your site here
   url: 'https://lukas-heiligenbrunner.github.io',

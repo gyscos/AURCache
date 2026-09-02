@@ -3,15 +3,27 @@ If you want to contribute to the project feel free to checkout the code and try 
 
 ## Build Info
 
-The AURCache project comprises two main components: a Flutter frontend and a Rust backend.
-### Frontend (Flutter)
+The AURCache project comprises two main components, both Rust: a Dioxus frontend
+compiled to WebAssembly and the backend.
 
-To build the Flutter frontend, ensure you have Flutter SDK installed. Then, execute the following commands:
+### Frontend (Rust / Dioxus)
+
+`frontend-rs/` is its own Cargo workspace, because it only builds for
+`wasm32-unknown-unknown` and including it in the backend workspace would break
+`cargo build --workspace`.
 
 ```bash
-cd frontend
-flutter pub get
-flutter build web
+cd frontend-rs
+cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test   # host target: the component logic, not the browser
+```
+
+There is no separate build step for it. `aurcache-api`'s build script compiles
+the frontend to wasm and embeds it under the `static` feature, re-running
+whenever the frontend changes:
+
+```bash
+cd backend && cargo run --features aurcache-api/static -p aurcache
 ```
 
 ### Backend (Rust)
@@ -63,30 +75,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # frontend
-cd frontend
-dart format --set-exit-if-changed .
-flutter analyze --no-fatal-infos
-flutter test
+cd frontend-rs
+cargo fmt -- --check
+cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+cargo test
 ```
 
 The repo root has a `Justfile` with `just format`, `just lint`, and
 `just codegen` for convenience, but note they are more lenient than CI —
-`just lint` runs `cargo clippy` without `-D warnings` and `flutter analyze`
-without `--no-fatal-infos`, so it can pass where CI fails. Use the commands
-above when checking whether a change is ready.
+`just lint` runs `cargo clippy` without `-D warnings`, so it can pass where CI
+fails. Use the commands above when checking whether a change is ready.
 
-### Frontend code generation
+### API types are shared, not mirrored
 
-Models and providers are generated (`json_serializable`, `freezed`,
-`@riverpod`), and the generated `*.g.dart` / `*.freezed.dart` files are **not**
-checked in. After changing an annotated Dart file — or after pulling changes
-that touch one — regenerate them, otherwise `flutter analyze` reports missing
-getters on fields that plainly exist in the source:
-
-```bash
-cd frontend
-flutter pub run build_runner build --delete-conflicting-outputs
-```
+There is no code generation step. The types the API speaks live in
+`aurcache-common` and are used directly by the server, the CLI and the
+frontend, which reaches them through the same `aurcache-client` crate the CLI
+uses. A field added to a response is added once and all three see it — mirroring
+a struct by hand is how the two ends drift apart.
 
 ### Api Docs
 You can access the API docs (scalar) `http://localhost:8080/docs` after starting the backend.

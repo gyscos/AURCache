@@ -7,7 +7,7 @@ import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import Heading from '@theme/Heading';
 import styles from './index.module.css';
 
-const Svg = require('../../../frontend/assets/icons/icon.svg').default;
+const Svg = require('../../../assets/icons/icon.svg').default;
 
 function HomepageHeader() {
   const {siteConfig} = useDocusaurusContext();

@@ -1,6 +1,6 @@
 <p align="center">
     <a href="https://lukas-heiligenbrunner.github.io/AURCache/">
-        <img src="frontend/assets/icons/icon.svg" width="200"></a><!-- </a> being on the same line as the <img> tag is intentional! -->
+        <img src="assets/icons/icon.svg" width="200"></a><!-- </a> being on the same line as the <img> tag is intentional! -->
     <br>
     <br>
     <a href="https://github.com/lukas-heiligenbrunner/aurcache/releases">
@@ -19,7 +19,7 @@
 
 # AURCache
 
-AURCache is a build server and repository for Archlinux packages sourced from the AUR (Arch User Repository). It features a Flutter frontend and Rust backend, enabling users to add packages for building and subsequently serves them as a pacman repository. Notably, AURCache automatically detects when a package is out of date and displays it within the frontend.
+AURCache is a build server and repository for Archlinux packages sourced from the AUR (Arch User Repository). It features a Rust frontend and backend, enabling users to add packages for building and subsequently serves them as a pacman repository. Notably, AURCache automatically detects when a package is out of date and displays it within the frontend.
 
 <p><img src="docs/static/img/screenshot1.png" alt=""/> 
 

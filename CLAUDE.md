@@ -8,9 +8,8 @@ AURCache is a build server and repository for Arch Linux packages sourced from t
 frontend are both Rust. Users add AUR (or git) packages for building; AURCache builds them in
 containers and serves the results as a pacman repository, and detects when packages are out of date.
 
-`frontend-rs/` (Dioxus, compiled to wasm) is the frontend. `frontend/` is the older Flutter UI and is
-**deprecated: do not make changes there.** The two have already diverged — the Flutter sidebar has no
-Packages entry, and its models lag the API — and only the Rust one is built, linted, tested or shipped.
+`frontend-rs/` (Dioxus, compiled to wasm) is the frontend. A Flutter UI used to live in `frontend/`; it
+was removed once it had diverged past usefulness, and `git log` is where to find it if ever needed.
 
 ## Build, test, and lint commands
 
@@ -107,7 +106,6 @@ defect this frontend has had was of that kind.
   screens in `src/screens/`, and the pure filter/sort/paginate helpers in `src/listing.rs` — those are
   where list behaviour is tested, since components cannot be rendered in a unit test. The API client is
   `aurcache-client`, the same one the CLI uses, so API shapes are shared rather than re-declared.
-- `frontend/` is the deprecated Flutter UI. Nothing there is built or tested any more; leave it alone.
 - `docs/` is a separate Docusaurus site used for published documentation.
 
 ## Key conventions

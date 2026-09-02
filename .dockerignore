@@ -6,9 +6,6 @@
 /frontend-rs/dist
 /backend/aurcache-api/web
 
-# The Flutter frontend, replaced by frontend-rs and built by nothing here.
-/frontend
-
 # Not used by any Dockerfile.
 /docs
 /.git

@@ -26,7 +26,7 @@ const images = [
     src: require('@site/static/img/screenshot3.png').default,
     description: (
       <>
-        With its clear and concise Flutter frontend, AURCache is designed to be easy to use. 
+        With its clear and concise web frontend, AURCache is designed to be easy to use. 
         Adding and Managing packages is straightforward, letting you focus on development without complex processes.
         Under the hood, the robust Rust backend guarantees stability and performance, providing a reliable foundation for all your repository needs.
       </>
