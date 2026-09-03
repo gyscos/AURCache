@@ -1,4 +1,8 @@
 mod config;
+mod doctor;
+mod pacman;
+mod repo;
+mod url;
 
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
@@ -9,10 +13,11 @@ use aurcache_client::{
 };
 use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{
     load_config, resolve_runtime_config, save_config, set_token, set_url, summarize_config,
 };
+use dialoguer::Confirm;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -53,6 +58,19 @@ struct Cli {
 enum Command {
     /// Check whether the server is healthy.
     Health,
+    /// Diagnose why builds are not running.
+    Doctor,
+    /// Consume this instance as a pacman repository.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Print a shell completion script.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Inspect the authenticated user.
     UserInfo,
     /// Get dashboard statistics.
@@ -147,6 +165,28 @@ enum WorkerCommand {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+enum RepoCommand {
+    /// Print the `pacman.conf` stanza for this instance.
+    Config(RepoConfigArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct RepoConfigArgs {
+    /// Port the pacman repository is published on.
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Section name, which must match the repository's database files.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// `SigLevel` to write. AURCache does not sign packages, so a stricter
+    /// level than the default refuses everything it serves.
+    #[arg(long)]
+    siglevel: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
 enum ConfigCommand {
     /// Show the saved config location and stored values.
     Show,
@@ -206,8 +246,18 @@ struct AddPackageArgs {
     /// AUR package names and/or git repository URLs. Each entry is treated
     /// as a git URL if it looks like one (contains `@` or a URL scheme like
     /// `https://`), otherwise as an AUR package name.
-    #[arg(required = true)]
+    #[arg(required_unless_present = "from_installed")]
     packages: Vec<String>,
+
+    /// Also add every AUR package already installed on this machine, as
+    /// reported by `pacman -Qm`.
+    #[arg(long)]
+    from_installed: bool,
+
+    /// Skip the confirmation prompt. Required with --from-installed when not
+    /// running on a terminal, because that list is not one to submit unseen.
+    #[arg(long, short = 'y')]
+    yes: bool,
 
     /// Git ref to checkout. Required if any entry is a git URL.
     #[arg(long = "ref")]
@@ -368,6 +418,16 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Config { command } => run_config_command(format, command),
+        // Offline, like `config`: the repo address is arithmetic on the
+        // configured URL, and a new user reaching for this may not have a token
+        // yet. Prompting for one to print three lines of text would be absurd.
+        Command::Repo {
+            command: RepoCommand::Config(args),
+        } => run_repo_config(format, cli.url, args),
+        Command::Completions { shell } => {
+            run_completions(shell);
+            Ok(())
+        }
         command => {
             let runtime = resolve_runtime_config(cli.url, cli.token)?;
             let used_token = runtime.token.clone();
@@ -414,6 +474,10 @@ fn is_unauthorized(err: &anyhow::Error) -> bool {
 async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) -> Result<()> {
     match command {
         Command::Health => run_health(client).await,
+        Command::Doctor => doctor::run_doctor(client, format, client.base_url()).await,
+        Command::Repo { .. } | Command::Completions { .. } => {
+            unreachable!("offline commands are handled before client setup")
+        }
         Command::UserInfo => render_user_info(client, format).await,
         Command::Stats => render_stats(client, format).await,
         Command::Graph => render_graph(client, format).await,
@@ -447,6 +511,29 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
         Command::Worker { command } => run_worker_command(client, format, command).await,
         Command::Raw(args) => run_raw_command(client, args).await,
     }
+}
+
+/// Print the `pacman.conf` stanza, resolving the URL without touching the token.
+fn run_repo_config(
+    format: OutputFormat,
+    cli_url: Option<String>,
+    args: RepoConfigArgs,
+) -> Result<()> {
+    let api_url = config::resolve_url_only(cli_url)?;
+    let config = repo::repo_config(&api_url, args.port, args.name, args.siglevel)?;
+    match format {
+        OutputFormat::Json => print_json(&config),
+        OutputFormat::Text => {
+            repo::print_repo_config(&config);
+            Ok(())
+        }
+    }
+}
+
+fn run_completions(shell: clap_complete::Shell) {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
 }
 
 fn run_config_command(format: OutputFormat, command: ConfigCommand) -> Result<()> {
@@ -637,19 +724,60 @@ async fn render_package(
     render(format, &package, print_package)
 }
 
+/// Show what `--from-installed` found, and get a yes before submitting it.
+///
+/// A machine with a long AUR history produces a long list, and adding it is not
+/// a quiet operation: every entry resolves its dependencies and enqueues builds
+/// for them. So the list is printed and confirmed rather than acted on from one
+/// flag.
+fn confirm_bulk_add(packages: &[String], yes: bool) -> Result<()> {
+    println!("{} package(s) to add:", packages.len());
+    for name in packages {
+        println!("  {name}");
+    }
+
+    if yes {
+        return Ok(());
+    }
+    if !config::is_interactive() {
+        bail!(
+            "refusing to add {} package(s) unconfirmed; pass --yes",
+            packages.len()
+        );
+    }
+
+    let proceed = Confirm::new()
+        .with_prompt("Add these packages?")
+        .default(true)
+        .interact()
+        .context("failed to read confirmation")?;
+    if !proceed {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
 async fn add_package_command(
     client: &AurCacheClient,
     format: OutputFormat,
     args: AddPackageArgs,
 ) -> Result<()> {
-    if !args.patches.is_empty() && args.packages.len() > 1 {
+    let packages = if args.from_installed {
+        let installed = pacman::installed_foreign_packages()?;
+        if installed.is_empty() {
+            bail!("`pacman -Qm` reported no foreign packages, so there is nothing to add");
+        }
+        let packages = pacman::merge_unique(args.packages, installed);
+        confirm_bulk_add(&packages, args.yes)?;
+        packages
+    } else {
+        args.packages
+    };
+
+    if !args.patches.is_empty() && packages.len() > 1 {
         bail!("--patch can only be used when adding a single package");
     }
-    let git_entries = args
-        .packages
-        .iter()
-        .filter(|p| looks_like_git_url(p))
-        .count();
+    let git_entries = packages.iter().filter(|p| looks_like_git_url(p)).count();
     if git_entries > 0 && args.git_ref.is_none() {
         bail!("--ref is required when adding a git repository URL");
     }
@@ -657,7 +785,7 @@ async fn add_package_command(
 
     let patched_files = read_patch_files(&args.patches)?;
     let mut sources = Vec::new();
-    for package in args.packages {
+    for package in packages {
         sources.push(if looks_like_git_url(&package) {
             SourceData::Git {
                 spec: GitSourceSpec {
@@ -1727,7 +1855,7 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddPackageArgs, build_status_label, parse_key_val};
+    use super::{AddPackageArgs, Cli, Command, RepoCommand, build_status_label, parse_key_val};
     use crate::config::ClientConfig;
     use clap::Parser;
 
@@ -1775,6 +1903,68 @@ mod tests {
         assert_eq!(parsed.args.packages, vec!["paru", "yay"]);
         assert_eq!(parsed.args.platforms, vec!["x86_64"]);
         assert_eq!(parsed.args.build_flags, vec!["--noconfirm"]);
+    }
+
+    /// `--from-installed` supplies the list, so requiring a positional one too
+    /// would make the flag impossible to use on its own.
+    #[test]
+    fn from_installed_stands_in_for_the_package_list() {
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: AddPackageArgs,
+        }
+
+        let parsed = Wrapper::parse_from(["test", "--from-installed", "--yes"]);
+        assert!(parsed.args.packages.is_empty());
+        assert!(parsed.args.from_installed);
+        assert!(parsed.args.yes);
+    }
+
+    /// Without it, naming nothing is still a usage error rather than a no-op.
+    #[test]
+    fn a_bare_add_still_requires_a_package() {
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: AddPackageArgs,
+        }
+
+        assert!(Wrapper::try_parse_from(["test"]).is_err());
+    }
+
+    #[test]
+    fn repo_config_takes_the_publishing_knobs() {
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "repo",
+            "config",
+            "--port",
+            "9000",
+            "--name",
+            "mine",
+        ]);
+        let Command::Repo {
+            command: RepoCommand::Config(args),
+        } = cli.command
+        else {
+            panic!("expected repo config");
+        };
+        assert_eq!(args.port, Some(9000));
+        assert_eq!(args.name.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn completions_name_a_shell() {
+        let cli = Cli::parse_from(["aurcache-cli", "completions", "bash"]);
+        assert!(matches!(cli.command, Command::Completions { .. }));
+        assert!(Cli::try_parse_from(["aurcache-cli", "completions", "smash"]).is_err());
+    }
+
+    #[test]
+    fn doctor_takes_no_arguments() {
+        let cli = Cli::parse_from(["aurcache-cli", "doctor"]);
+        assert!(matches!(cli.command, Command::Doctor));
     }
 }
 

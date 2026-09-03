@@ -71,6 +71,20 @@ pub fn resolve_runtime_config(
     })
 }
 
+/// The API URL alone, without resolving — or prompting for — a token.
+///
+/// For commands that only need to know *where* the instance is rather than to
+/// talk to it, so that someone who has not set a token up yet is not asked for
+/// one just to print a `pacman.conf` stanza.
+pub fn resolve_url_only(cli_url: Option<String>) -> Result<String> {
+    let mut config = load_config()?;
+    let (url, prompted) = resolve_url(cli_url, &mut config)?;
+    if prompted {
+        save_config(&config)?;
+    }
+    Ok(url)
+}
+
 pub fn summarize_config(config: &ClientConfig) -> Result<ConfigSummary> {
     Ok(ConfigSummary {
         path: config_path()?.display().to_string(),

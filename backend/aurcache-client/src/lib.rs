@@ -115,6 +115,16 @@ impl AurCacheClient {
     }
 
     /// Calls the health endpoint and returns success when the instance is healthy.
+    /// The API base URL this client was built with.
+    ///
+    /// Exposed because tooling has to talk about the *deployment* as well as
+    /// the API: the pacman repository and the worker protocol are the same host
+    /// on other ports, and this is where that host comes from.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn health(&self) -> Result<()> {
         self.request_empty::<Value>(Method::GET, "/health", &[], None)
             .await

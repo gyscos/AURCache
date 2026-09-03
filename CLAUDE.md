@@ -94,6 +94,11 @@ defect this frontend has had was of that kind.
   `Authorization: Bearer <token>`, resolving `--url`/`--token`, then `AURCACHE_URL`/`AURCACHE_TOKEN`, then
   `~/.config/aurcache-client/config.json`, then an interactive prompt (saved back to the config file). Use
   `--format json` for machine-readable output, or `raw` for endpoints without a dedicated subcommand.
+  Onboarding commands run before the client is built, so they need no token: `repo config` prints the
+  `pacman.conf` stanza (host arithmetic on the configured URL, in `url.rs`), and `completions` emits a
+  shell script. `doctor` walks server → token → fleet → queue and exits non-zero on failure, presenting
+  the `WaitingReason` the server already computes; `pkg add --from-installed` bulk-adds what
+  `pacman -Qm` reports, behind a confirmation.
 - `backend/aurcache-common` is the shared leaf crate: the API types the server, CLI and browser frontend
   all speak, plus small helpers that would otherwise be duplicated or force a heavy dependency. Everything
   in it is dependency-free or behind a feature — `db` (sea-orm derives) and `fs` (filesystem helpers) are

@@ -101,6 +101,34 @@ trusted, so no secret has to be configured. For a worker on another machine —
 where there is no shared volume — see
 [Build Workers](../workers/configuration.md).
 
+## Filling it, and using it
+
+A fresh instance is empty. If the machine you are on already installs packages
+from the AUR, that is the set you probably want mirrored, and `pacman -Qm` is
+what lists it:
+
+```bash
+aurcache-cli pkg add --from-installed
+```
+
+It prints what it found and asks before submitting — adding a package resolves
+its dependencies and enqueues builds for them, so a long list is not something
+to send unseen. Pass `--yes` to skip the prompt in a script, where it is
+otherwise refused rather than assumed.
+
+Once something has built, wire the repository into pacman:
+
+```bash
+aurcache-cli repo config | sudo tee -a /etc/pacman.conf
+sudo pacman -Sy
+```
+
+If a build does not start, [`aurcache-cli doctor`](../workers/managing.md#why-is-a-build-not-starting)
+says why.
+
+`aurcache-cli completions <shell>` prints a completion script for bash, zsh,
+fish, elvish or powershell.
+
 ## Upgrading from a single-container setup
 
 If you already run AURCache as one container, it keeps working: see

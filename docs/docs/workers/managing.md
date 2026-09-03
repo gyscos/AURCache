@@ -35,6 +35,27 @@ Its certificate is still on file, so that is one click.
 
 ## Why is a build not starting?
 
+`aurcache-cli doctor` answers this directly. It walks the chain — server, token,
+fleet, queue — and names the first thing that is actually wrong, with the
+command that fixes it:
+
+```
+$ aurcache-cli doctor
+✓ server   reachable at http://localhost:8080/api
+✓ token    authenticated as you
+✗ workers  1 worker(s) enrolled, none approved
+           → aurcache-cli worker approve 3
+✓ queue    nothing queued
+```
+
+It tells the three fleet failures apart, because they are three different
+mistakes: nothing enrolled, enrolled but never approved, and approved but not
+calling in. The queue check reports the same reasons the Builds page shows,
+[described below](#what-the-builds-page-is-telling-you).
+
+`doctor` exits non-zero if any check fails, so it doubles as a health gate in a
+script, and `--format json` gives the checks as structured output.
+
 `aurcache-cli builds watch` follows the queue and explains what it sees:
 
 ```
