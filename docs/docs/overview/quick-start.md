@@ -101,6 +101,57 @@ trusted, so no secret has to be configured. For a worker on another machine —
 where there is no shared volume — see
 [Build Workers](../workers/configuration.md).
 
+## Or let the CLI do it
+
+If you have `aurcache-cli` (`cargo install aurcache-cli`), it can stand the whole
+thing up. Nothing here needs a token or a running server — it is the command for
+when you have neither:
+
+```bash
+aurcache-cli setup server      # the backend, on this machine
+aurcache-cli setup worker      # one build worker beside it
+aurcache-cli doctor            # check they found each other
+```
+
+The worker approves itself. `setup` gives the pair a shared `enroll` volume, the
+same trick the compose file above uses, so there is no approval step and no
+secret to configure.
+
+Add `--dry-run` to either command to print the `docker run` line instead of
+running it.
+
+More workers on the same machine each need their own name and identity volume:
+
+```bash
+aurcache-cli setup worker --container-name worker-2
+```
+
+A worker on *other* hardware joins over the network, where trust has to be
+explicit — pin the server's CA fingerprint from its startup log:
+
+```bash
+aurcache-cli setup worker \
+  --server-url https://aurcache.example.com:8083 \
+  --ca-fingerprint <sha256> \
+  --arch aarch64
+```
+
+### For TrueNAS, Portainer, Unraid…
+
+Anything that takes a compose file gets one:
+
+```bash
+aurcache-cli setup compose --role bundle    # server + a local worker
+aurcache-cli setup compose --role backend   # server alone
+aurcache-cli setup compose --role worker    # a worker for another machine
+```
+
+`-o -` writes to stdout to paste into a web UI; otherwise it writes
+`docker-compose.yaml` (or `docker-compose.<role>.yaml`) and refuses to clobber an
+existing file without `--force`. The output keeps the comments explaining why the
+worker needs `privileged` and what the `enroll` volume is for, because those are
+the parts worth reading before you deploy it.
+
 ## Filling it, and using it
 
 A fresh instance is empty. If the machine you are on already installs packages

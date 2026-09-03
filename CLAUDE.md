@@ -98,7 +98,12 @@ defect this frontend has had was of that kind.
   `pacman.conf` stanza (host arithmetic on the configured URL, in `url.rs`), and `completions` emits a
   shell script. `doctor` walks server → token → fleet → queue and exits non-zero on failure, presenting
   the `WaitingReason` the server already computes; `pkg add --from-installed` bulk-adds what
-  `pacman -Qm` reports, behind a confirmation.
+  `pacman -Qm` reports, behind a confirmation. `setup compose|server|worker` (in `compose.rs` and
+  `setup.rs`) stands an instance up from nothing — a compose file for TrueNAS-style hosts, or
+  `docker run` locally. The local server/worker pair shares an `enroll` volume so the worker
+  self-approves, mirroring `docker-compose.yaml`; compose output is templated rather than
+  serialized so the explanatory comments survive. `repo config --install` appends to pacman.conf,
+  falling back to `sudo` only on a permission error.
 - `backend/aurcache-common` is the shared leaf crate: the API types the server, CLI and browser frontend
   all speak, plus small helpers that would otherwise be duplicated or force a heavy dependency. Everything
   in it is dependency-free or behind a feature — `db` (sea-orm derives) and `fs` (filesystem helpers) are

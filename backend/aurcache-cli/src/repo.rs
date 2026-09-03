@@ -7,9 +7,13 @@
 //! with nothing left to substitute.
 
 use crate::url::{host_from_url, scheme_from_url};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use aurcache_common::ports::AURCACHE_MIRROR_PORT;
 use serde::Serialize;
+use std::fs;
+use std::io::{ErrorKind, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// What `repo_init` names the repository, and therefore what pacman must call
 /// it: the database files are `repo.db` / `repo.files`, so the section header
@@ -63,6 +67,137 @@ pub fn repo_config(
     })
 }
 
+/// The system pacman configuration, which is where a stanza has to end up.
+pub const PACMAN_CONF: &str = "/etc/pacman.conf";
+
+/// Whether `conf` already declares a `[name]` repository.
+///
+/// Appending a second copy of a section pacman already has is not a harmless
+/// no-op — it warns, and the duplicate outlives whatever made it — so this is
+/// what makes `--install` safe to run twice.
+#[must_use]
+pub fn has_section(conf: &str, name: &str) -> bool {
+    let header = format!("[{name}]");
+    conf.lines().any(|line| {
+        let line = line.trim();
+        // A commented-out section is not a section: someone who disabled it
+        // gets it back, rather than a confusing "already configured".
+        !line.starts_with('#') && line == header
+    })
+}
+
+/// `conf` with `block` appended, separated by exactly one blank line.
+///
+/// pacman does not care about the blank line; a human reading the file after us
+/// does, and a file that does not end in a newline would otherwise splice our
+/// header onto their last line.
+#[must_use]
+pub fn append_stanza(conf: &str, block: &str) -> String {
+    let mut out = conf.to_string();
+    if !out.is_empty() {
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        out.push_str("\n\n");
+    }
+    out.push_str(block);
+    out
+}
+
+/// Write the stanza into `path`, elevating only if we have to.
+///
+/// Tries the unprivileged write first: running as root, or against a file the
+/// user owns, then never prompts for a password. Only a `PermissionDenied`
+/// falls back to `sudo`, which prompts on the terminal — a process cannot raise
+/// its own privileges, but it can hand the work to one that has them.
+pub fn install_stanza(path: &Path, config: &RepoConfig) -> Result<Installed> {
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            bail!("{} does not exist; is this an Arch system?", path.display())
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+
+    if has_section(&existing, &config.name) {
+        return Ok(Installed {
+            path: path.display().to_string(),
+            changed: false,
+            elevated: false,
+        });
+    }
+
+    let updated = append_stanza(&existing, &config.block);
+    match fs::write(path, &updated) {
+        Ok(()) => Ok(Installed {
+            path: path.display().to_string(),
+            changed: true,
+            elevated: false,
+        }),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            append_via_sudo(path, &config.block)?;
+            Ok(Installed {
+                path: path.display().to_string(),
+                changed: true,
+                elevated: true,
+            })
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("failed to write {}", path.display())),
+    }
+}
+
+/// Append through `sudo tee`, which prompts on the terminal.
+///
+/// `tee -a` rather than rewriting the whole file: appending touches only what we
+/// add, so a failure part-way cannot lose a configuration we did not write.
+fn append_via_sudo(path: &Path, block: &str) -> Result<()> {
+    let mut child = Command::new("sudo")
+        .arg("tee")
+        .arg("-a")
+        .arg(path)
+        .stdin(Stdio::piped())
+        // tee echoes what it writes; the caller already showed the stanza.
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "cannot write {} and sudo is not installed; append the stanza yourself",
+                    path.display()
+                )
+            } else {
+                anyhow::Error::new(e).context("failed to run sudo")
+            }
+        })?;
+
+    child
+        .stdin
+        .take()
+        .context("sudo stdin was not available")?
+        .write_all(format!("\n{block}").as_bytes())
+        .context("failed to send the stanza to sudo")?;
+
+    let status = child.wait().context("waiting for sudo")?;
+    if !status.success() {
+        bail!("sudo did not write {}", path.display());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Installed {
+    pub path: String,
+    /// False when the section was already present, which is the common case on
+    /// a second run.
+    pub changed: bool,
+    /// Whether it needed `sudo`.
+    pub elevated: bool,
+}
+
 /// Print the stanza on stdout and the what-to-do-with-it on stderr.
 ///
 /// Split that way on purpose: `aurcache-cli repo config >> pacman.conf` has to
@@ -71,14 +206,15 @@ pub fn repo_config(
 pub fn print_repo_config(config: &RepoConfig) {
     print!("{}", config.block);
     eprintln!();
-    eprintln!("Append the above to /etc/pacman.conf, then refresh:");
-    eprintln!("  aurcache-cli repo config | sudo tee -a /etc/pacman.conf");
-    eprintln!("  sudo pacman -Sy");
+    eprintln!("Add it to /etc/pacman.conf (asks for sudo only if it has to):");
+    eprintln!("  aurcache-cli repo config --install");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_REPO_NAME, repo_config, repo_server_url};
+    use super::{
+        DEFAULT_REPO_NAME, append_stanza, has_section, install_stanza, repo_config, repo_server_url,
+    };
 
     #[test]
     fn the_repo_is_the_api_host_on_the_mirror_port() {
@@ -135,5 +271,96 @@ mod tests {
     #[test]
     fn a_url_without_a_host_is_an_error() {
         assert!(repo_server_url("http://", 8081).is_err());
+    }
+
+    /// What makes `--install` safe to run twice.
+    #[test]
+    fn an_existing_section_is_detected() {
+        let conf = "[options]\nHoldPkg = pacman\n\n[repo]\nServer = http://x/$arch\n";
+        assert!(has_section(conf, "repo"));
+        assert!(!has_section(conf, "other"));
+    }
+
+    /// A section someone commented out is a section they turned off, and they
+    /// should get it back rather than "already configured".
+    #[test]
+    fn a_commented_out_section_does_not_count() {
+        assert!(!has_section("#[repo]\n", "repo"));
+        assert!(!has_section("# [repo]\n", "repo"));
+    }
+
+    /// `[repo-testing]` is a different repository and must not be mistaken for
+    /// `[repo]` by a prefix match.
+    #[test]
+    fn a_longer_name_is_not_the_same_section() {
+        assert!(!has_section("[repo-testing]\n", "repo"));
+    }
+
+    #[test]
+    fn a_section_is_found_despite_indentation() {
+        assert!(has_section("  [repo]  \n", "repo"));
+    }
+
+    /// A file that does not end in a newline would otherwise get our header
+    /// spliced onto its last line.
+    #[test]
+    fn appending_always_separates_with_one_blank_line() {
+        let appended = append_stanza("[options]\nHoldPkg = pacman", "[repo]\n");
+        assert_eq!(appended, "[options]\nHoldPkg = pacman\n\n[repo]\n");
+    }
+
+    #[test]
+    fn trailing_newlines_are_collapsed_not_multiplied() {
+        let appended = append_stanza("[options]\n\n\n", "[repo]\n");
+        assert_eq!(appended, "[options]\n\n[repo]\n");
+    }
+
+    #[test]
+    fn appending_to_an_empty_file_adds_no_leading_blank_line() {
+        assert_eq!(append_stanza("", "[repo]\n"), "[repo]\n");
+    }
+
+    /// The unprivileged path: a writable file must never invoke sudo.
+    #[test]
+    fn a_writable_file_is_installed_without_elevation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pacman.conf");
+        std::fs::write(&path, "[options]\nHoldPkg = pacman\n").unwrap();
+
+        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let result = install_stanza(&path, &config).unwrap();
+
+        assert!(result.changed);
+        assert!(!result.elevated);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[repo]"), "{written}");
+        assert!(
+            written.contains("Server = http://localhost:8081/$arch"),
+            "{written}"
+        );
+    }
+
+    /// Running it twice must not leave two `[repo]` sections behind.
+    #[test]
+    fn installing_twice_changes_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pacman.conf");
+        std::fs::write(&path, "[options]\n").unwrap();
+
+        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        assert!(install_stanza(&path, &config).unwrap().changed);
+        let once = std::fs::read_to_string(&path).unwrap();
+
+        assert!(!install_stanza(&path, &config).unwrap().changed);
+        assert_eq!(once, std::fs::read_to_string(&path).unwrap());
+        assert_eq!(once.matches("[repo]").count(), 1, "{once}");
+    }
+
+    #[test]
+    fn a_missing_pacman_conf_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let err = install_stanza(&dir.path().join("nope.conf"), &config).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 }

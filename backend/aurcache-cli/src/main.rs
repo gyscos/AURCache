@@ -1,7 +1,9 @@
+mod compose;
 mod config;
 mod doctor;
 mod pacman;
 mod repo;
+mod setup;
 mod url;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -60,6 +62,13 @@ enum Command {
     Health,
     /// Diagnose why builds are not running.
     Doctor,
+    /// Stand up a server and/or workers.
+    Setup {
+        // Boxed: these argument structs are much larger than any other variant,
+        // and every parse would otherwise carry that size.
+        #[command(subcommand)]
+        command: Box<SetupCommand>,
+    },
     /// Consume this instance as a pacman repository.
     Repo {
         #[command(subcommand)]
@@ -165,6 +174,174 @@ enum WorkerCommand {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+enum SetupCommand {
+    /// Write a docker-compose file to run elsewhere — TrueNAS, Portainer,
+    /// Unraid, or `docker compose up` on any host.
+    Compose(ComposeArgs),
+    /// Run the AURCache server on this machine with `docker run`.
+    Server(SetupServerArgs),
+    /// Run a build worker on this machine with `docker run`.
+    Worker(SetupWorkerArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ComposeArgs {
+    /// Which services the file should contain.
+    #[arg(long, value_enum, default_value_t = compose::ComposeRole::Bundle)]
+    role: compose::ComposeRole,
+
+    /// Where to write it. `-` writes to stdout.
+    #[arg(long, short = 'o')]
+    output: Option<String>,
+
+    /// Overwrite an existing file.
+    #[arg(long)]
+    force: bool,
+
+    /// Base URL pacman clients use to fetch built packages.
+    #[arg(long)]
+    public_url: Option<String>,
+
+    /// Host names the server's TLS certificate must be valid for.
+    #[arg(long)]
+    tls_sans: Option<String>,
+
+    #[command(flatten)]
+    worker: WorkerKnobs,
+
+    #[command(flatten)]
+    common: SetupCommon,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SetupServerArgs {
+    /// Print the `docker run` command instead of running it.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Base URL pacman clients use to fetch built packages.
+    #[arg(long)]
+    public_url: Option<String>,
+
+    /// Host names the server's TLS certificate must be valid for.
+    #[arg(long)]
+    tls_sans: Option<String>,
+
+    /// Extra arguments passed to `docker run`, before the image.
+    #[arg(last = true)]
+    docker_args: Vec<String>,
+
+    #[command(flatten)]
+    common: SetupCommon,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SetupWorkerArgs {
+    /// Print the `docker run` command instead of running it.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Worker-protocol URL of the server to join, e.g.
+    /// `https://aurcache.example.com:8083`. Defaults to a server on this
+    /// machine, which is also what makes the worker auto-approved.
+    #[arg(long)]
+    server_url: Option<String>,
+
+    /// SHA-256 of the server's CA, from its startup log line
+    /// "Worker CA fingerprint (pin this on workers)". Strongly recommended for
+    /// a server reached over anything but a trusted network.
+    #[arg(long)]
+    ca_fingerprint: Option<String>,
+
+    /// Container name. Give each worker on a host its own.
+    #[arg(long, default_value = setup::WORKER_CONTAINER)]
+    container_name: String,
+
+    /// Volume holding the worker's identity and base chroot. Each worker on a
+    /// host needs its own, or they fight over one identity.
+    #[arg(long)]
+    data_volume: Option<String>,
+
+    /// Volume holding the package cache.
+    #[arg(long)]
+    cache_volume: Option<String>,
+
+    /// Extra arguments passed to `docker run`, before the image.
+    #[arg(last = true)]
+    docker_args: Vec<String>,
+
+    #[command(flatten)]
+    worker: WorkerKnobs,
+
+    #[command(flatten)]
+    common: SetupCommon,
+}
+
+/// Worker settings shared by `setup compose` and `setup worker`.
+#[derive(Args, Debug, Clone)]
+struct WorkerKnobs {
+    /// Name shown in the Workers UI. Defaults to the container's hostname.
+    #[arg(long = "worker-name")]
+    worker_name: Option<String>,
+
+    /// Architecture built natively. Repeat for several. Defaults to the host's.
+    #[arg(long = "arch")]
+    arches: Vec<String>,
+
+    /// Architecture built under emulation — slower, and worth telling apart.
+    #[arg(long = "emulated-arch")]
+    emulated_arches: Vec<String>,
+
+    /// Reserve a pkgbase to this worker. Repeat for several.
+    #[arg(long = "package")]
+    packages: Vec<String>,
+
+    /// Packages built in parallel.
+    #[arg(long)]
+    concurrency: Option<u32>,
+
+    /// Scheduling preference; higher wins.
+    #[arg(long)]
+    priority: Option<i32>,
+
+    /// Shared secret matching the server's `AURCACHE_ENROLLMENT_TOKEN`.
+    #[arg(long)]
+    enrollment_token: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SetupCommon {
+    /// Server image to run.
+    #[arg(long)]
+    server_image: Option<String>,
+
+    /// Worker image to run.
+    #[arg(long)]
+    worker_image: Option<String>,
+
+    /// Log level for the containers.
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+impl WorkerKnobs {
+    fn to_env(&self) -> compose::WorkerEnv {
+        compose::WorkerEnv {
+            url: None,
+            ca_fingerprint: None,
+            enrollment_token: self.enrollment_token.clone(),
+            enrollment_dir: None,
+            name: self.worker_name.clone(),
+            arches: self.arches.clone(),
+            emulated_arches: self.emulated_arches.clone(),
+            packages: self.packages.clone(),
+            concurrency: self.concurrency,
+            priority: self.priority,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
 enum RepoCommand {
     /// Print the `pacman.conf` stanza for this instance.
     Config(RepoConfigArgs),
@@ -172,6 +349,16 @@ enum RepoCommand {
 
 #[derive(Args, Debug, Clone)]
 struct RepoConfigArgs {
+    /// Add the stanza to pacman.conf instead of printing it. Asks for sudo only
+    /// if the file is not already writable, and does nothing if the repository
+    /// is already configured.
+    #[arg(long)]
+    install: bool,
+
+    /// The pacman configuration to write to.
+    #[arg(long, default_value = repo::PACMAN_CONF)]
+    pacman_conf: PathBuf,
+
     /// Port the pacman repository is published on.
     #[arg(long)]
     port: Option<u16>,
@@ -428,6 +615,9 @@ async fn main() -> Result<()> {
             run_completions(shell);
             Ok(())
         }
+        // Also offline: the whole point is standing up an instance that does
+        // not exist yet, so there is nothing to authenticate against.
+        Command::Setup { command } => run_setup_command(format, *command),
         command => {
             let runtime = resolve_runtime_config(cli.url, cli.token)?;
             let used_token = runtime.token.clone();
@@ -475,7 +665,7 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
     match command {
         Command::Health => run_health(client).await,
         Command::Doctor => doctor::run_doctor(client, format, client.base_url()).await,
-        Command::Repo { .. } | Command::Completions { .. } => {
+        Command::Repo { .. } | Command::Completions { .. } | Command::Setup { .. } => {
             unreachable!("offline commands are handled before client setup")
         }
         Command::UserInfo => render_user_info(client, format).await,
@@ -513,6 +703,174 @@ async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) ->
     }
 }
 
+fn run_setup_command(format: OutputFormat, command: SetupCommand) -> Result<()> {
+    match command {
+        SetupCommand::Compose(args) => run_setup_compose(format, args),
+        SetupCommand::Server(args) => run_setup_server(format, args),
+        SetupCommand::Worker(args) => run_setup_worker(format, args),
+    }
+}
+
+fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
+    let defaults = compose::ComposeParams::default();
+    let params = compose::ComposeParams {
+        role: args.role,
+        server_image: args.common.server_image.unwrap_or(defaults.server_image),
+        worker_image: args.common.worker_image.unwrap_or(defaults.worker_image),
+        public_url: args.public_url.unwrap_or(defaults.public_url),
+        log_level: args.common.log_level,
+        tls_sans: args.tls_sans.unwrap_or(defaults.tls_sans),
+        worker: args.worker.to_env(),
+    };
+    let rendered = compose::render_compose(&params);
+
+    let target = args
+        .output
+        .unwrap_or_else(|| args.role.default_filename().to_string());
+    if target == "-" {
+        print!("{rendered}");
+        return Ok(());
+    }
+
+    let path = Path::new(&target);
+    if path.exists() && !args.force {
+        bail!("{target} already exists; pass --force to overwrite it");
+    }
+    std::fs::write(path, &rendered).with_context(|| format!("failed to write {target}"))?;
+
+    match format {
+        OutputFormat::Json => print_json(
+            &json!({ "path": target, "role": format!("{:?}", args.role).to_lowercase() }),
+        ),
+        OutputFormat::Text => {
+            println!("wrote {target}");
+            println!();
+            println!("Start it with:");
+            println!("  docker compose -f {target} up -d");
+            Ok(())
+        }
+    }
+}
+
+fn run_setup_server(format: OutputFormat, args: SetupServerArgs) -> Result<()> {
+    let defaults = compose::ComposeParams::default();
+    let image = args.common.server_image.unwrap_or(defaults.server_image);
+    let public_url = args.public_url.unwrap_or(defaults.public_url);
+    let tls_sans = args.tls_sans.unwrap_or(defaults.tls_sans);
+
+    let run = setup::server_run(
+        &image,
+        &public_url,
+        &args.common.log_level,
+        &tls_sans,
+        &args.docker_args,
+    );
+
+    if args.dry_run {
+        return report_dry_run(format, &run);
+    }
+
+    setup::ensure_local_objects(true)?;
+    setup::execute(&run)?;
+
+    match format {
+        OutputFormat::Json => print_json(&run),
+        OutputFormat::Text => {
+            println!();
+            println!("Server started. Next:");
+            println!("  aurcache-cli setup worker      # a build worker on this machine");
+            println!("  aurcache-cli doctor            # check it came up");
+            Ok(())
+        }
+    }
+}
+
+fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
+    let defaults = compose::ComposeParams::default();
+    let image = args.common.worker_image.unwrap_or(defaults.worker_image);
+
+    // A worker beside the server takes the bundled shortcut: shared network,
+    // shared enrollment volume, no approval step. One pointed anywhere else
+    // cannot, and has to establish trust explicitly.
+    let local = match &args.server_url {
+        None => true,
+        Some(url) => url::host_from_url(url).is_some_and(setup::is_local_host),
+    };
+
+    let mut env = args.worker.to_env();
+    env.ca_fingerprint.clone_from(&args.ca_fingerprint);
+    let env = if local {
+        setup::local_worker_env(env)
+    } else {
+        let server_url = args
+            .server_url
+            .clone()
+            .expect("a non-local worker always has a server URL");
+        if env.ca_fingerprint.is_none() && env.enrollment_token.is_none() {
+            eprintln!(
+                "Warning: no --ca-fingerprint and no --enrollment-token. The worker will \
+                 trust the server on first contact, and will wait for you to approve it \
+                 on the Workers page."
+            );
+        }
+        setup::remote_worker_env(env, &server_url)
+    };
+
+    // Each worker on a host needs its own identity volume, so the default
+    // follows the container name rather than being shared.
+    let data_volume = args
+        .data_volume
+        .unwrap_or_else(|| format!("{}_data", args.container_name.replace('-', "_")));
+    let cache_volume = args
+        .cache_volume
+        .unwrap_or_else(|| format!("{}_cache", args.container_name.replace('-', "_")));
+
+    let run = setup::worker_run(&setup::WorkerRunSpec {
+        image,
+        container_name: args.container_name,
+        env,
+        log_level: args.common.log_level,
+        join_network: local,
+        data_volume,
+        cache_volume,
+        extra: args.docker_args,
+    });
+
+    if args.dry_run {
+        return report_dry_run(format, &run);
+    }
+
+    setup::ensure_local_objects(local)?;
+    setup::execute(&run)?;
+
+    match format {
+        OutputFormat::Json => print_json(&run),
+        OutputFormat::Text => {
+            println!();
+            if local {
+                println!(
+                    "Worker started, and approves itself through the shared enrollment volume."
+                );
+            } else {
+                println!("Worker started. Approve it once it appears:");
+                println!("  aurcache-cli worker list");
+            }
+            println!("  aurcache-cli doctor            # check it connected");
+            Ok(())
+        }
+    }
+}
+
+fn report_dry_run(format: OutputFormat, run: &setup::DockerRun) -> Result<()> {
+    match format {
+        OutputFormat::Json => print_json(run),
+        OutputFormat::Text => {
+            println!("{}", run.command_line());
+            Ok(())
+        }
+    }
+}
+
 /// Print the `pacman.conf` stanza, resolving the URL without touching the token.
 fn run_repo_config(
     format: OutputFormat,
@@ -521,6 +879,26 @@ fn run_repo_config(
 ) -> Result<()> {
     let api_url = config::resolve_url_only(cli_url)?;
     let config = repo::repo_config(&api_url, args.port, args.name, args.siglevel)?;
+
+    if args.install {
+        let installed = repo::install_stanza(&args.pacman_conf, &config)?;
+        return match format {
+            OutputFormat::Json => print_json(&installed),
+            OutputFormat::Text => {
+                if installed.changed {
+                    println!("added [{}] to {}", config.name, installed.path);
+                    println!("  sudo pacman -Sy");
+                } else {
+                    println!(
+                        "[{}] is already configured in {}",
+                        config.name, installed.path
+                    );
+                }
+                Ok(())
+            }
+        };
+    }
+
     match format {
         OutputFormat::Json => print_json(&config),
         OutputFormat::Text => {
@@ -1855,9 +2233,13 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddPackageArgs, Cli, Command, RepoCommand, build_status_label, parse_key_val};
+    use super::{
+        AddPackageArgs, Cli, Command, RepoCommand, SetupCommand, build_status_label, compose,
+        parse_key_val, repo,
+    };
     use crate::config::ClientConfig;
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_key_val_requires_separator() {
@@ -1965,6 +2347,67 @@ mod tests {
     fn doctor_takes_no_arguments() {
         let cli = Cli::parse_from(["aurcache-cli", "doctor"]);
         assert!(matches!(cli.command, Command::Doctor));
+    }
+
+    #[test]
+    fn setup_compose_defaults_to_the_bundle() {
+        let cli = Cli::parse_from(["aurcache-cli", "setup", "compose"]);
+        let Command::Setup { command } = cli.command else {
+            panic!("expected setup");
+        };
+        let SetupCommand::Compose(args) = *command else {
+            panic!("expected compose");
+        };
+        assert_eq!(args.role, compose::ComposeRole::Bundle);
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn setup_worker_collects_repeated_architectures() {
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "setup",
+            "worker",
+            "--dry-run",
+            "--arch",
+            "aarch64",
+            "--arch",
+            "armv7h",
+        ]);
+        let Command::Setup { command } = cli.command else {
+            panic!("expected setup");
+        };
+        let SetupCommand::Worker(args) = *command else {
+            panic!("expected worker");
+        };
+        assert!(args.dry_run);
+        assert_eq!(args.worker.arches, vec!["aarch64", "armv7h"]);
+    }
+
+    /// Everything after `--` belongs to docker, not to us.
+    #[test]
+    fn setup_passes_trailing_arguments_through_to_docker() {
+        let cli = Cli::parse_from(["aurcache-cli", "setup", "server", "--", "--pull=always"]);
+        let Command::Setup { command } = cli.command else {
+            panic!("expected setup");
+        };
+        let SetupCommand::Server(args) = *command else {
+            panic!("expected server");
+        };
+        assert_eq!(args.docker_args, vec!["--pull=always"]);
+    }
+
+    #[test]
+    fn repo_config_can_install() {
+        let cli = Cli::parse_from(["aurcache-cli", "repo", "config", "--install"]);
+        let Command::Repo {
+            command: RepoCommand::Config(args),
+        } = cli.command
+        else {
+            panic!("expected repo config");
+        };
+        assert!(args.install);
+        assert_eq!(args.pacman_conf, PathBuf::from(repo::PACMAN_CONF));
     }
 }
 

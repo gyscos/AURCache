@@ -17,3 +17,7 @@ clap = { version = "4.5.51", features = ["derive", "env"] }
 clap_complete = "4.5"
 dialoguer = "0.12.0"
 dirs = "6.0.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+yaml-rust2 = "0.12.0"

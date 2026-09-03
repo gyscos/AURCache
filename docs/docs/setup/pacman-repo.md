@@ -26,11 +26,25 @@ SigLevel = Optional TrustAll
 Server = http://192.168.1.10:8081/$arch
 ```
 
-The stanza goes to stdout and the instructions to stderr, so it appends cleanly:
+Or have it make the change:
+
+```bash
+aurcache-cli repo config --install
+sudo pacman -Sy
+```
+
+`--install` appends the stanza to `/etc/pacman.conf` and is safe to run twice —
+if the repository is already configured it says so and changes nothing. It tries
+the write unprivileged first, so running as root, or against a file you own, never
+prompts; only a permission error falls back to `sudo`, which asks for your
+password on the terminal. `--pacman-conf` points it at a different file, for a
+container or a chroot.
+
+Without `--install` the stanza goes to stdout and the instructions to stderr, so
+it also appends cleanly by hand:
 
 ```bash
 aurcache-cli repo config | sudo tee -a /etc/pacman.conf
-sudo pacman -Sy
 ```
 
 This needs no API token — it is arithmetic on the configured URL, not a request
