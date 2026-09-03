@@ -178,7 +178,7 @@ pub fn Package(pkgbase: String) -> Element {
                         div { class: "space-y-4 min-w-0",
                             BuildSummary {
                                 pkgbase: pkg.name.clone(),
-                                builds: builds.to_vec(),
+                                builds: builds.clone(),
                                 on_changed: move |()| data.restart(),
                             }
                             Relations { pkg: pkg.clone() }
@@ -280,7 +280,7 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
                         if let Some(description) = description {
                             p { class: "opacity-70 mt-1", "{description}" }
                         }
-                        VersionLine { pkg: pkg.clone() }
+                        VersionLine { pkg }
                     }
                 }
             }
@@ -295,7 +295,7 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
 #[component]
 fn VersionLine(pkg: ExtendedPackage) -> Element {
     let built = pkg.latest_version.clone();
-    let upstream = pkg.upstream_version.clone();
+    let upstream = pkg.upstream_version;
 
     rsx! {
         div { class: "mt-2 flex items-center gap-2 text-sm font-mono flex-wrap",
@@ -368,7 +368,7 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
                     div { class: "flex-1" }
                     // Rebuilding produces a build, so the button belongs with
                     // the builds rather than in the page header.
-                    RebuildButton { pkgbase: pkgbase.clone(), on_changed }
+                    RebuildButton { pkgbase, on_changed }
                 }
 
                 if rows.is_empty() {
@@ -419,11 +419,17 @@ fn BuildRow(label: String, entry: Build, now: i64) -> Element {
 
 #[component]
 fn Relations(pkg: ExtendedPackage) -> Element {
+    let ExtendedPackage {
+        dependencies,
+        dependents,
+        ..
+    } = pkg;
+
     rsx! {
         RelationList {
             title: "Dependencies",
             empty: "Nothing — this package builds on its own.",
-            items: pkg.dependencies.clone(),
+            items: dependencies,
             // Only dependencies gate this package's build. A dependent that is
             // unsatisfied is waiting on *this* package, which is its problem to
             // display, not a reason to flag anything here.
@@ -432,7 +438,7 @@ fn Relations(pkg: ExtendedPackage) -> Element {
         RelationList {
             title: "Dependents",
             empty: "Nothing depends on this package.",
-            items: pkg.dependents.clone(),
+            items: dependents,
             show_blocking: false,
         }
     }
@@ -633,7 +639,7 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                 // without a way through it is reachable only by typing its URL.
                 Link {
                     class: "btn btn-sm btn-block mt-2",
-                    to: Route::PackageConfigFiles { pkgbase: pkg.name.clone() },
+                    to: Route::PackageConfigFiles { pkgbase: pkg.name },
                     "Config files"
                 }
             }
@@ -754,7 +760,8 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
 /// The `git+` prefix is makepkg's way of marking a source as a git repository,
 /// not part of the address.
 fn browsable_url(raw: &str) -> Option<String> {
-    let url = raw.trim().strip_prefix("git+").unwrap_or(raw.trim());
+    let raw = raw.trim();
+    let url = raw.strip_prefix("git+").unwrap_or(raw);
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
@@ -856,7 +863,6 @@ pub fn PlatformField(
                                 // rather than accepted and puzzled over later.
                                 disabled: busy() || draft().is_empty(),
                                 onclick: {
-                                    let pkgbase = pkgbase.clone();
                                     move |_| {
                                         let pkgbase = pkgbase.clone();
                                         async move {
@@ -1306,7 +1312,6 @@ fn BuildFlagsField(pkgbase: String, flags: Vec<String>, on_changed: EventHandler
                                     disabled: busy(),
                                     aria_label: "Remove {flag}",
                                     onclick: {
-                                        let flag = flag.clone();
                                         move |_| {
                                             let flag = flag.clone();
                                             async move {

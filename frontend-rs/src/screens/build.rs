@@ -76,8 +76,6 @@ const POLL_INTERVAL_MS: u32 = 3_000;
 
 #[component]
 pub fn BuildLog(pkgbase: String, number: i32) -> Element {
-    // Cloned for the polling future, which outlives this render.
-    let polled = pkgbase.clone();
     // One string, one text node. Per-line elements would only earn their keep
     // for per-line features — ANSI colour, line numbers, deep links — and a
     // build emits thousands of lines, so the browser would lay out thousands
@@ -97,9 +95,8 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // is what lets someone read back through a long log while it is still
     // being written.
     let mut following = use_signal(|| true);
-
     use_future(move || {
-        let pkgbase = polled.clone();
+        let pkgbase = pkgbase.clone();
         async move {
             let client = match AurCacheClient::new(api_base(), None) {
                 Ok(c) => c,

@@ -41,7 +41,7 @@ pub struct ActiveOperation {
 impl ActiveOperation {
     /// Items resolved so far, however they turned out.
     #[must_use]
-    pub fn resolved_count(&self) -> i32 {
+    pub const fn resolved_count(&self) -> i32 {
         self.completed + self.failed
     }
 }

@@ -49,6 +49,7 @@ pub enum SourceData {
 /// Shared because the CLI and the web UI both accept one field that is either
 /// thing, and two copies of a guess like this would drift into disagreeing
 /// about the same input.
+#[must_use]
 pub fn looks_like_git_url(s: &str) -> bool {
     s.contains('@') || s.contains("://")
 }
@@ -69,13 +70,14 @@ impl FromStr for SourceData {
 
 impl SourceData {
     /// Unique cache key for this source.
+    #[must_use]
     pub fn cache_key(&self) -> String {
         match self {
             Self::Aur { name } => format!("aur:{name}"),
             Self::Git { spec } => {
                 format!("git:{}:{}:{}", spec.url, spec.r#ref, spec.subfolder)
             }
-            Self::Upload { .. } => "upload".to_string(),
+            Self::Upload { .. } => String::from("upload"),
         }
     }
 }

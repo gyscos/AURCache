@@ -77,14 +77,14 @@ pub async fn package_update_all_outdated(
     let client = AurClient::new();
 
     let mut ids_total = vec![];
-    for pkg in &pkg_models {
+    for pkg in pkg_models {
         if pkg.status == BuildStates::SUCCESSFUL_BUILD {
-            let results =
-                package_update_with_client(&client, store, db, pkg.to_owned(), false, tx).await?;
+            let package_name = pkg.name.clone();
+            let results = package_update_with_client(&client, store, db, pkg, false, tx).await?;
             activity_log
                 .add(
                     PackageUpdateActivity {
-                        package: pkg.name.clone(),
+                        package: package_name,
                         forced: false,
                     },
                     ActivityType::UpdatePackage,

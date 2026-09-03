@@ -24,21 +24,15 @@ pub async fn search(
     _a: Authenticated,
 ) -> Result<Json<Vec<ApiPackage>>, BadRequest<String>> {
     if query.len() < 3 {
-        return match get_package_info(query).await {
-            Ok(x) => {
-                // Iterate over the Option, giving either a single result or an empty list.
-                let pkg = x.into_iter().map(ApiPackage::from).collect();
-                Ok(Json(pkg))
-            }
-            Err(e) => Err(BadRequest(e.to_string())),
-        };
+        // Iterate over the Option, giving either a single result or an empty list.
+        return get_package_info(query)
+            .await
+            .map(|pkg| Json(pkg.into_iter().map(ApiPackage::from).collect()))
+            .map_err(|e| BadRequest(e.to_string()));
     }
 
-    match query_aur(query).await {
-        Ok(v) => {
-            let mapped = v.into_iter().map(ApiPackage::from).collect();
-            Ok(Json(mapped))
-        }
-        Err(e) => Err(BadRequest(e.to_string())),
-    }
+    query_aur(query)
+        .await
+        .map(|packages| Json(packages.into_iter().map(ApiPackage::from).collect()))
+        .map_err(|e| BadRequest(e.to_string()))
 }

@@ -1,4 +1,4 @@
-//! The lite export format: what a human authored, not what AURCache worked out.
+//! The lite export format: what a human authored, not what `AURCache` worked out.
 //!
 //! An instance's interesting state is small -- which packages you asked for,
 //! how you configured them, which workers you trust. Build history, logs,
@@ -17,7 +17,7 @@ use utoipa::ToSchema;
 
 /// The format version an importer checks before reading anything else.
 ///
-/// The point of the format is restoring into a *different* AURCache version,
+/// The point of the format is restoring into a *different* `AURCache` version,
 /// so an importer must refuse a dump newer than it understands rather than
 /// guess at fields it has never seen.
 pub const DUMP_SCHEMA_VERSION: u32 = 1;
@@ -43,7 +43,7 @@ pub const TOKENS_FILE: &str = "tokens.json";
 pub struct DumpManifest {
     /// Checked first, and refused if newer than the importer understands.
     pub schema_version: u32,
-    /// Which AURCache wrote it. Informational: the schema version is what
+    /// Which `AURCache` wrote it. Informational: the schema version is what
     /// decides compatibility.
     pub aurcache_version: String,
     /// Unix seconds.
@@ -56,9 +56,9 @@ pub struct DumpManifest {
 
 /// One package, as its owner configured it.
 ///
-/// Everything AURCache derives is absent: status, versions, the resolved
+/// Everything `AURCache` derives is absent: status, versions, the resolved
 /// dependency graph, split package names, provides. A restore rebuilds those.
-#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
 pub struct DumpPackage {
     pub source_data: SourceData,
     /// Expanded from the database's semicolon-delimited column, because a dump

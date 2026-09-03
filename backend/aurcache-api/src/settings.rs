@@ -157,7 +157,7 @@ pub async fn setting_patch(
     input: Json<SettingValue>,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    setting_patch_impl(db.inner(), key, None, input.value.clone()).await
+    setting_patch_impl(db.inner(), key, None, input.into_inner().value).await
 }
 
 #[utoipa::path(
@@ -179,7 +179,7 @@ pub async fn package_setting_patch(
     _a: Authenticated,
 ) -> Result<(), ApiError> {
     let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
-    setting_patch_impl(db.inner(), key, pkg_id, input.value.clone()).await
+    setting_patch_impl(db.inner(), key, pkg_id, input.into_inner().value).await
 }
 
 /// Reset a setting back to its default by deleting any stored override.

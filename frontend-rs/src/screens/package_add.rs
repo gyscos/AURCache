@@ -708,10 +708,7 @@ fn QueuedList(queued: Vec<SourceData>, onremove: EventHandler<String>) -> Elemen
                             button {
                                 class: "btn btn-ghost btn-xs px-1",
                                 "aria-label": "Remove {label}",
-                                onclick: {
-                                    let label = label.clone();
-                                    move |_| onremove.call(label.clone())
-                                },
+                                onclick: move |_| onremove.call(label.clone()),
                                 "✕"
                             }
                         }
@@ -813,10 +810,7 @@ fn results_list(
                             button {
                                 class: if locked { "opacity-50 cursor-not-allowed" } else { "" },
                                 disabled: locked,
-                                onclick: {
-                                    let name = result.name.clone();
-                                    move |_| onpick.call(name.clone())
-                                },
+                                onclick: move |_| onpick.call(result.name.clone()),
                                 // Name and version on one line, the AUR's
                                 // summary under it: a search matches on the
                                 // description too, so without it a result
@@ -1102,15 +1096,15 @@ mod tests {
         }
     }
 
-    fn found(names: &[(&str, &str)]) -> Option<Result<Vec<SearchResult>, String>> {
-        Some(Ok(names
+    fn found(names: &[(&str, &str)]) -> Vec<SearchResult> {
+        names
             .iter()
             .map(|(name, version)| SearchResult {
                 name: (*name).to_string(),
                 version: (*version).to_string(),
                 description: None,
             })
-            .collect()))
+            .collect()
     }
 
     /// An empty box has not asked anything, so it gets a prompt rather than a
@@ -1131,7 +1125,7 @@ mod tests {
     #[test]
     fn a_one_or_two_character_name_is_still_searched() {
         for query in ["a", "zz"] {
-            let html = render(query, found(&[(query, "1.0-1")]));
+            let html = render(query, Some(Ok(found(&[(query, "1.0-1")]))));
             assert!(html.contains(query), "{query} should be listed: {html}");
             assert!(!html.contains("Type a package name"), "{html}");
         }
@@ -1169,7 +1163,10 @@ mod tests {
     fn an_already_added_package_cannot_be_picked() {
         let html = render_with(
             "hello",
-            found(&[("hello", "2.12.1-1"), ("hello-world", "1.0-3")]),
+            Some(Ok(found(&[
+                ("hello", "2.12.1-1"),
+                ("hello-world", "1.0-3"),
+            ]))),
             vec!["hello".to_string()],
         );
         assert!(html.contains("hello"), "still listed: {html}");
@@ -1181,7 +1178,11 @@ mod tests {
     /// a package nobody can add.
     #[test]
     fn a_package_that_is_not_added_stays_selectable() {
-        let html = render_with("hello", found(&[("hello-world", "1.0-3")]), Vec::new());
+        let html = render_with(
+            "hello",
+            Some(Ok(found(&[("hello-world", "1.0-3")]))),
+            Vec::new(),
+        );
         assert!(!html.contains("disabled"), "{html}");
         assert!(!html.contains(">added<"), "{html}");
     }

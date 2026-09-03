@@ -55,7 +55,7 @@ pub fn build_log_root() -> PathBuf {
 
 /// One path segment, with anything that is not a plain name flattened.
 ///
-/// A pkgbase from the AUR cannot contain a separator, but AURCache also builds
+/// A pkgbase from the AUR cannot contain a separator, but `AURCache` also builds
 /// from git, where the pkgbase comes from a parsed PKGBUILD and is whatever
 /// that file says. `.` and `..` are handled separately because they survive
 /// character filtering intact and are still traversal.
@@ -122,7 +122,7 @@ mod tests {
     fn directory_symlink_is_counted_once_not_traversed() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("real")).unwrap();
-        fs::write(tmp.path().join("real/data"), [b'x'; 1_000_000]).unwrap();
+        fs::write(tmp.path().join("real/data"), vec![b'x'; 1_000_000]).unwrap();
         std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("link")).unwrap();
 
         let total = dir_size(tmp.path());

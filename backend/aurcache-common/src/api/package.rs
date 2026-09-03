@@ -28,6 +28,7 @@ pub struct SourceFileList {
 }
 
 /// Effective content of a single source file for an already-added package.
+///
 /// The pristine content is always included so the UI can fall back to it
 /// (and offer a "revert" action) even if the stored patch no longer applies
 /// cleanly to the current upstream source.
@@ -82,7 +83,7 @@ pub struct PackagePatch {
     pub patch: Option<Option<String>>,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct SimplePackage {
     pub id: i32,
@@ -112,7 +113,7 @@ pub struct SimplePackage {
     pub total_size: Option<i64>,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ExtendedPackage {
     pub id: i32,
     pub name: String,
@@ -169,7 +170,7 @@ pub struct ExtendedPackage {
 /// resolved to its pkgbase in one batched RPC request instead of one per
 /// package. Targeting is shared across the batch -- a restore applies the same
 /// platforms and flags to everything it puts back.
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct AddPackages {
     pub platforms: Option<Vec<String>>,
     pub build_flags: Option<Vec<String>>,
@@ -228,7 +229,7 @@ pub struct BulkAddProgress {
 }
 
 /// One built artifact in the repository.
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct PackageFile {
     /// The artifact's filename, which is also its path under the platform's
     /// repository directory.
@@ -243,7 +244,7 @@ pub struct PackageFile {
     pub size: Option<i64>,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct PackageDependency {
     pub id: i32,
     pub name: String,
@@ -263,7 +264,7 @@ pub struct PackageDependency {
     pub satisfied: bool,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "package_type", rename_all = "PascalCase")]
 pub enum PackageSource {
     Aur(AurPackage),
@@ -273,13 +274,13 @@ pub enum PackageSource {
 }
 
 // todo upload package
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct UploadPackage {}
 
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct AurNotFoundPackage {}
 
-#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct AurPackage {
     pub name: String,
     /// Whether the AUR reports the package as flagged out of date by a user.

@@ -181,7 +181,7 @@ impl Fleet {
 
     /// Whether this worker could pick a job up *right now*: recently seen and
     /// not already at its concurrency limit.
-    fn available(&self, w: &WorkerCap, now: i64, liveness_timeout: i64) -> bool {
+    fn available(w: &WorkerCap, now: i64, liveness_timeout: i64) -> bool {
         w.last_seen.is_some_and(|t| t >= now - liveness_timeout) && w.active < w.concurrency
     }
 
@@ -201,7 +201,7 @@ impl Fleet {
             w.id != me.id
                 && w.priority > me.priority
                 && self.capable(w, platform, pkg)
-                && self.available(w, now, liveness_timeout)
+                && Self::available(w, now, liveness_timeout)
         })
     }
 }

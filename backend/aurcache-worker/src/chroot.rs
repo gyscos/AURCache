@@ -3,6 +3,7 @@
 //! the pure argument/parse helpers they rely on live in [`crate::build`].
 
 use anyhow::{Context, Result, bail};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -184,10 +185,11 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
     }
     out.push_str("# Added by aurcache-worker: per-job writable cache first (bound over by\n");
     out.push_str("# the job's private directory), shared read-only cache second.\n");
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "[options]\nCacheDir = {PER_JOB_CACHE_MOUNT} {}\n",
         shared.display()
-    ));
+    );
     out
 }
 

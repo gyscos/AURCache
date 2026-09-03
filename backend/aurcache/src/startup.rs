@@ -37,10 +37,8 @@ pub fn pre_startup_tasks() {
     warn!("This is a dev build! Consider using a stable release.");
 
     for platform in Platforms {
-        if let Err(e) = pacman_repo_utils::repo_init::init_repo(
-            Path::new(&format!("./repo/{platform}")),
-            "repo",
-        ) {
+        let repo_dir = Path::new("./repo").join(platform.to_string());
+        if let Err(e) = pacman_repo_utils::repo_init::init_repo(&repo_dir, "repo") {
             error!("Failed to initialize pacman repo: {e:?}");
         }
     }
@@ -135,7 +133,6 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     // Mirror ranking only knows how to rank x86_64 mirrors, so that is the one
     // architecture AURCache can populate itself.
     let mirrorlist_file = job_config::mirrorlist_path(RANKABLE_ARCH);
-    let mirrorlist_path = mirrorlist_file.display().to_string();
 
     // Check if mirrorlist servers are provided via env var (semicolon-separated)
     // Treat an empty var the same way as an unset var.
@@ -149,13 +146,13 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
             .map(|s| format!("Server = {s}\n"))
             .collect::<String>();
         fs::write(&mirrorlist_file, mirrorlist).await?;
-        info!("Wrote mirrorlist to {mirrorlist_path}");
+        info!("Wrote mirrorlist to {}", mirrorlist_file.display());
     } else if !fs::try_exists(&mirrorlist_file).await.unwrap_or(false) {
         info!("Perform initial load of pacman mirrorlist");
         match pacman_mirrors::get_status(Platform::X86_64).await {
             Ok(status) => {
                 fs::write(&mirrorlist_file, gen_mirrorlist(&status.urls.0)).await?;
-                info!("Wrote mirrorlist to {mirrorlist_path}");
+                info!("Wrote mirrorlist to {}", mirrorlist_file.display());
             }
             Err(e) => {
                 warn!("Failed to get mirror list: {e}");

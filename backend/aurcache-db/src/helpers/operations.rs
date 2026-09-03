@@ -60,18 +60,23 @@ pub async fn append<C: ConnectionTrait, T: Serialize>(
     entries: &[T],
     finished: bool,
 ) -> Result<(), DbErr> {
+    let entries = entries
+        .iter()
+        .filter_map(|entry| {
+            // An entry that will not serialise is dropped rather than failing
+            // the operation: the work is done either way, and losing one line
+            // of the report is better than abandoning the rest of the run.
+            serde_json::to_string(entry).ok()
+        })
+        .collect::<Vec<_>>();
+
     let Some(row) = Operations::find_by_id(id).one(db).await? else {
         return Ok(());
     };
     let mut log = row.log.clone();
     for entry in entries {
-        // An entry that will not serialise is dropped rather than failing the
-        // operation: the work is done either way, and losing one line of the
-        // report is better than abandoning the rest of the run.
-        if let Ok(line) = serde_json::to_string(entry) {
-            log.push_str(&line);
-            log.push('\n');
-        }
+        log.push_str(&entry);
+        log.push('\n');
     }
 
     let mut active = row.into_active_model();

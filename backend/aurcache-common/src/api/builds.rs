@@ -2,7 +2,7 @@ use crate::api::waiting::WaitingReason;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct BuildSummary {
     /// This build's number within its package, counting from 1.

@@ -89,7 +89,8 @@ fn with_base_url(template: &str, base: &str) -> String {
     let mut out = String::new();
     for line in template.lines() {
         if line.trim_start().starts_with("Server =") {
-            out.push_str(&format!("Server = {server}"));
+            out.push_str("Server = ");
+            out.push_str(&server);
         } else {
             out.push_str(line);
         }

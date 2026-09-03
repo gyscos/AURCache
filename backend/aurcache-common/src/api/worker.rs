@@ -104,7 +104,8 @@ impl ApprovalStatus {
     /// One place, so the sea-orm `string_value` attributes and the serde
     /// `rename_all` cannot drift from it unnoticed — the test below holds all
     /// three together.
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Approved => "approved",
@@ -113,14 +114,16 @@ impl ApprovalStatus {
     }
 
     /// Whether this worker can currently take jobs.
-    pub fn can_build(self) -> bool {
+    #[must_use]
+    pub const fn can_build(self) -> bool {
         matches!(self, Self::Approved)
     }
 
     /// Whether it is retired. Revoked rows are kept so build history still
     /// resolves to the machine that produced it, so the list would otherwise
     /// grow without bound.
-    pub fn is_retired(self) -> bool {
+    #[must_use]
+    pub const fn is_retired(self) -> bool {
         matches!(self, Self::Revoked)
     }
 }

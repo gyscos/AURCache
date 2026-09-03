@@ -13,6 +13,9 @@ pub struct EnqueueBuildResult {
     pub inserted: bool,
 }
 
+// See the race explanation in `enqueue_build_if_missing`.
+const NUMBER_RACE_ATTEMPTS: usize = 5;
+
 /// Insert a new pending build with the given `initial_status` if no pending build already exists
 /// for `(pkg_id, platform)`.
 ///
@@ -43,8 +46,6 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     // build; it simply needs the next number. Without the retry that race
     // surfaces as "Missing pending build row", because `DO NOTHING` swallowed
     // an insert that should have happened.
-    const NUMBER_RACE_ATTEMPTS: usize = 5;
-
     for _ in 0..NUMBER_RACE_ATTEMPTS {
         // Read inside the statement rather than in a separate query, so the
         // window a competing insert can land in is as small as the database

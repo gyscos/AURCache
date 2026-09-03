@@ -35,7 +35,7 @@ pub struct RegisterRequest {
 }
 
 /// A worker that does not report its concurrency is assumed to run one build.
-fn default_concurrency() -> u32 {
+const fn default_concurrency() -> u32 {
     1
 }
 

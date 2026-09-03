@@ -17,7 +17,7 @@ pub enum SettingSource {
     Default,
 }
 
-#[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct SettingsEntry<T> {
     pub value: T,
     pub source: SettingSource,
@@ -83,7 +83,8 @@ impl Setting {
     ];
 
     /// This setting's stable key, environment variable, and built-in default.
-    pub fn meta(&self) -> SettingsMeta {
+    #[must_use]
+    pub const fn meta(&self) -> SettingsMeta {
         match self {
             Self::CpuLimit => SettingsMeta {
                 key: "cpu_limit",
@@ -155,6 +156,7 @@ impl Setting {
         }
     }
 
+    #[must_use]
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.meta().key == key)
     }
@@ -174,7 +176,7 @@ mod tests {
     /// test until it is added to `ALL` too.
     #[test]
     fn every_setting_is_reachable_by_its_key() {
-        fn position(setting: &Setting) -> usize {
+        fn position(setting: Setting) -> usize {
             match setting {
                 Setting::CpuLimit => 0,
                 Setting::MemoryLimit => 1,
@@ -195,7 +197,7 @@ mod tests {
             let key = setting.meta().key;
             let found = Setting::from_key(key).unwrap_or_else(|| panic!("{key} is not in ALL"));
             assert_eq!(found.meta().key, key);
-            listed[position(&setting)] = true;
+            listed[position(setting)] = true;
         }
         assert!(
             listed.iter().all(|&seen| seen),

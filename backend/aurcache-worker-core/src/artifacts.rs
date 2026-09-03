@@ -33,7 +33,7 @@ pub fn discover_artifacts(dir: &Path) -> Vec<PathBuf> {
         return out;
     };
     for entry in read.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if is_artifact(&name) {
             out.push(entry.path());
         }

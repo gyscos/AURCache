@@ -719,7 +719,7 @@ fn apply_config(active: &mut packages::ActiveModel, package: &DumpPackage, patch
     active.patch = Set(patch);
 }
 
-fn source_type_of(source_data: &SourceData) -> SourceType {
+const fn source_type_of(source_data: &SourceData) -> SourceType {
     match source_data {
         SourceData::Aur { .. } => SourceType::Aur,
         SourceData::Git { .. } => SourceType::Git,

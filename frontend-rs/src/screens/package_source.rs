@@ -80,9 +80,8 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     // Open the file named in the URL, if any.
     use_effect({
         let pkgbase = pkgbase.clone();
-        let initial_path = initial_path.clone();
         move || {
-            if let Some(path) = initial_path.clone()
+            if let Some(path) = initial_path.as_ref().cloned()
                 && selected.peek().is_none()
             {
                 let pkgbase = pkgbase.clone();
@@ -173,7 +172,6 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     // it; without this the next step is a save, a navigation
                     // back, and a second button.
                     onclick: {
-                        let pkgbase = pkgbase.clone();
                         move |_| {
                             let pkgbase = pkgbase.clone();
                             async move {

@@ -99,23 +99,23 @@ impl Route {
     /// rather than something arbitrary.
     pub fn menu_entry(&self) -> Option<MenuEntry> {
         match self {
-            Route::Dashboard { .. } => Some(MenuEntry::Dashboard),
-            Route::Builds { .. } => Some(MenuEntry::Builds),
+            Self::Dashboard { .. } => Some(MenuEntry::Dashboard),
+            Self::Builds { .. } => Some(MenuEntry::Builds),
             // A single build lives under its package now — same URL, same
             // breadcrumb, same header — so it highlights Packages with the
             // rest of them rather than jumping the menu to Builds.
-            Route::Packages { .. }
-            | Route::PackageAdd { .. }
-            | Route::Package { .. }
-            | Route::PackageBuilds { .. }
-            | Route::Build { .. }
-            | Route::PackageSource { .. }
-            | Route::PackageConfigFiles { .. } => Some(MenuEntry::Packages),
-            Route::Activities { .. } => Some(MenuEntry::Activities),
-            Route::Workers { .. } => Some(MenuEntry::Workers),
-            Route::Settings { .. } => Some(MenuEntry::Settings),
-            Route::ConfigFiles { .. } => Some(MenuEntry::ConfigFiles),
-            Route::NotFound { .. } => None,
+            Self::Packages { .. }
+            | Self::PackageAdd { .. }
+            | Self::Package { .. }
+            | Self::PackageBuilds { .. }
+            | Self::Build { .. }
+            | Self::PackageSource { .. }
+            | Self::PackageConfigFiles { .. } => Some(MenuEntry::Packages),
+            Self::Activities { .. } => Some(MenuEntry::Activities),
+            Self::Workers { .. } => Some(MenuEntry::Workers),
+            Self::Settings { .. } => Some(MenuEntry::Settings),
+            Self::ConfigFiles { .. } => Some(MenuEntry::ConfigFiles),
+            Self::NotFound { .. } => None,
         }
     }
 }

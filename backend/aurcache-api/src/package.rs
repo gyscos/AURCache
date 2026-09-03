@@ -270,7 +270,6 @@ pub async fn active_operations(
     ))
 }
 
-
 #[utoipa::path(
     responses(
             (status = 200, description = "Progress of a bulk add", body = BulkAddProgress),
@@ -616,13 +615,14 @@ pub async fn package_source_preview_file(
     input: Json<SourcePreviewFileRequest>,
     _a: Authenticated,
 ) -> Result<Json<SourceFileContent>, ApiError> {
+    let input = input.into_inner();
     let original_content = store
         .read_file(&input.source, None, &input.path)
         .await
         .map_err(|e| err(Status::NotFound, e))?;
 
     Ok(Json(SourceFileContent {
-        path: input.path.clone(),
+        path: input.path,
         original_content,
         patched_content: None,
         patch_error: None,
@@ -650,8 +650,10 @@ pub async fn package_update_endpoint(
     let db = db.inner();
 
     let pkg_model: packages::Model = package_by_pkgbase(db, pkgbase).await?;
+    let package_name = pkg_model.name.clone();
+    let forced = input.force;
 
-    let pkg_update = package_update(store, db, pkg_model.clone(), input.force, tx)
+    let pkg_update = package_update(store, db, pkg_model, forced, tx)
         .await
         .map(|results| {
             Json(
@@ -668,8 +670,8 @@ pub async fn package_update_endpoint(
 
     al.add(
         PackageUpdateActivity {
-            package: pkg_model.name,
-            forced: input.force,
+            package: package_name,
+            forced,
         },
         ActivityType::UpdatePackage,
         a.username,
@@ -990,7 +992,7 @@ pub async fn get_package(
                 .collect(),
         ),
         upstream_version,
-        split_packages: split_packages.clone(),
+        split_packages,
         files,
         dependencies,
         dependents,

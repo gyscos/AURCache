@@ -49,10 +49,10 @@ impl Pkginfo {
         if line.starts_with('#') {
             return Ok(());
         }
-        let (key, value) = match line.split_once('=') {
-            None => return Ok(()),
-            Some((key, value)) => (key.trim(), value.trim()),
+        let Some((key, value)) = line.split_once('=') else {
+            return Ok(());
         };
+        let (key, value) = (key.trim(), value.trim());
         match key {
             "group" => self.groups.push(value.to_string()),
             "license" => self.licenses.push(value.to_string()),

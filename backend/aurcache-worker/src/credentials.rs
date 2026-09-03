@@ -165,7 +165,10 @@ async fn generate(path: &Path) -> Result<()> {
 pub fn git_ssh_command(known_hosts: Option<&str>) -> String {
     let mut cmd = String::from("ssh");
     match known_hosts {
-        Some(path) => cmd.push_str(&format!(" -o UserKnownHostsFile={path}")),
+        Some(path) => {
+            cmd.push_str(" -o UserKnownHostsFile=");
+            cmd.push_str(path);
+        }
         // Without a known_hosts file ssh would prompt, which hangs a
         // non-interactive build forever; accept-new records on first contact
         // and still fails on a *changed* key.

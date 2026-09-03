@@ -382,8 +382,8 @@ pub(crate) async fn resolve_source_pkgbase(
         SourceData::Aur { name } => SourceData::Aur {
             name: resolve_aur_pkgbase(client, &name).await?,
         },
+        SourceData::Git { spec } => SourceData::Git { spec },
         SourceData::Upload { .. } => bail!("Upload sources are not yet supported"),
-        other => other,
     })
 }
 

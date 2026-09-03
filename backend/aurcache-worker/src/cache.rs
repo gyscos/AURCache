@@ -229,7 +229,7 @@ impl Cache {
             if !ent.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            let pkgbase = ent.file_name().to_string_lossy().to_string();
+            let pkgbase = ent.file_name().to_string_lossy().into_owned();
             let path = ent.path();
             let size = aurcache_common::fs::dir_size(&path);
             let last_used = ent
@@ -262,7 +262,7 @@ fn scan_pkgcache(dir: &Path) -> Vec<CacheEntry> {
         return entries;
     };
     for ent in read.flatten() {
-        let name = ent.file_name().to_string_lossy().to_string();
+        let name = ent.file_name().to_string_lossy().into_owned();
         if !is_package_artifact(&name) {
             continue;
         }
