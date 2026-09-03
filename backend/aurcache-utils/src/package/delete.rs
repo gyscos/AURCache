@@ -1,4 +1,4 @@
-use crate::utils::remove_archive_file::try_remove_archive_file;
+use crate::utils::remove_archive_file::forget_archive_file;
 use anyhow::anyhow;
 use aurcache_db::prelude::{Builds, Files, PackageVcsSources, Packages, Settings};
 use aurcache_db::{builds, files, package_vcs_sources, settings};
@@ -27,15 +27,18 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
         .exec(&txn)
         .await?;
 
-    // remove package files
+    // Read before the delete and removed from disk after the commit: a
+    // rolled-back transaction can put a row back, and nothing can put back a
+    // deleted file.
     let package_files: Vec<files::Model> = Files::find()
         .filter(files::Column::PackageId.eq(pkg_id))
         .all(&txn)
         .await?;
 
-    for file in package_files {
-        try_remove_archive_file(file, &txn).await?;
-    }
+    Files::delete_many()
+        .filter(files::Column::PackageId.eq(pkg_id))
+        .exec(&txn)
+        .await?;
 
     // delete corresponding settings entries
     Settings::delete_many()
@@ -52,6 +55,10 @@ pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
         .await?;
 
     txn.commit().await?;
+
+    for file in &package_files {
+        forget_archive_file(file);
+    }
 
     // Build logs live on disk rather than in a column, so nothing removes them
     // on our behalf. One directory, because they are stored under the package's

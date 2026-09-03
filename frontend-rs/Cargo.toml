@@ -8,6 +8,27 @@ edition = "2024"
 # `cargo build --workspace` on the host target.
 [workspace]
 
+# The same policy `backend/Cargo.toml` sets for its workspace. Duplicated
+# rather than inherited because this is a separate workspace, which is also why
+# it went unlinted until now -- the frontend was already clean under every one
+# of these, so adopting them costs nothing today and stops that from silently
+# ceasing to be true.
+[lints.clippy]
+use_self = "warn"
+or_fun_call = "warn"
+unnecessary_wraps = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+manual_is_variant_and = "warn"
+redundant_clone = "warn"
+assigning_clones = "warn"
+needless_collect = "warn"
+uninlined_format_args = "warn"
+explicit_into_iter_loop = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+cloned_instead_of_copied = "warn"
+
 [dependencies]
 dioxus = { version = "0.7.10", features = ["web", "router"] }
 # The same client the CLI uses, and the same types the server defines. This is

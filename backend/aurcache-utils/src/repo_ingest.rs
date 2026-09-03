@@ -6,7 +6,7 @@
 //! from the worker upload/complete endpoint as well as the legacy Docker path.
 
 use crate::build_logger::BuildLogger;
-use crate::utils::remove_archive_file::try_remove_archive_file;
+use crate::utils::remove_archive_file::forget_archive_file;
 use anyhow::{anyhow, bail};
 use aurcache_db::prelude::{Dependencies, Files};
 use aurcache_db::{dependencies, files};
@@ -262,16 +262,31 @@ pub async fn ingest_pkgs_in(
             .all(&txn)
             .await?;
 
+        let mut dropped = Vec::new();
         for file in stale {
             if !new_file_ids.values().any(|&id| id == file.id) {
                 logger
                     .append(format!("Removing dropped sub-package: {}\n", file.filename))
                     .await;
-                try_remove_archive_file(file, &txn).await?;
+                dropped.push(file);
             }
         }
 
+        if !dropped.is_empty() {
+            let dropped_ids: Vec<i32> = dropped.iter().map(|file| file.id).collect();
+            Files::delete_many()
+                .filter(files::Column::Id.is_in(dropped_ids))
+                .exec(&txn)
+                .await?;
+        }
+
         txn.commit().await?;
+
+        // Off the disk only after the commit: a rolled-back transaction can put
+        // a row back, and nothing can put back a deleted file.
+        for file in &dropped {
+            forget_archive_file(file);
+        }
     }
 
     logger

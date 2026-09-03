@@ -1,10 +1,10 @@
 use anyhow::anyhow;
-use aurcache_common::build_state::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::action::Action;
+use aurcache_db::helpers::builds::latest_successful_version_any_platform;
+use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
-use aurcache_db::prelude::{Builds, Packages};
-use aurcache_db::{builds, packages};
+use aurcache_db::prelude::Packages;
 use aurcache_deps::AurClient;
 use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
@@ -12,10 +12,7 @@ use aurcache_utils::pkg::vercmp;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::vcs_check::sync_vcs_sources;
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait, Order, QuerySelect,
-};
-use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::Sender;
@@ -69,7 +66,7 @@ async fn check_versions(
     let aur_name_refs: Vec<&str> = aur_query_names.iter().map(String::as_str).collect();
 
     let results = if aur_name_refs.is_empty() {
-        vec![]
+        Vec::new()
     } else {
         client
             .multi_info_of(&aur_name_refs)
@@ -81,26 +78,12 @@ async fn check_versions(
         let package_id = package.id;
         let mut package_model: packages::ActiveModel = package.clone().into();
 
-        // Query the latest build.version for this package (most recent by end_time then start_time)
-        let latest_version_row = Builds::find()
-            .select_only()
-            .column(builds::Column::Version)
-            .filter(builds::Column::PkgId.eq(package_id))
-            // Successful builds only: this is compared against the upstream
-            // version to decide whether the package is out of date, and a
-            // failed build of a new version is not that version being built.
-            // Counting it cleared the flag for exactly the packages that most
-            // needed it.
-            .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
-            .order_by(builds::Column::EndTime, Order::Desc)
-            .order_by(builds::Column::StartTime, Order::Desc)
-            .limit(1)
-            .into_tuple::<(String,)>()
-            .one(db)
-            .await?;
-
-        let latest_version: Option<String> =
-            latest_version_row.map(|(v,)| v).filter(|v| !v.is_empty());
+        // Not scoped to a platform: this is compared against the upstream
+        // version to decide whether the package is out of date, which is a
+        // question about the package rather than about one architecture.
+        let latest_version = latest_successful_version_any_platform(db, package_id)
+            .await?
+            .filter(|version| !version.is_empty());
 
         let source_data = package.source_data;
         match source_data {
