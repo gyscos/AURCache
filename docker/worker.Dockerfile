@@ -169,6 +169,14 @@ ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
     WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot \
     WORKER_CACHE_DIR=/var/cache/aurcache-worker
 
+# Persist the identity, the base chroot and the caches even when the worker is
+# started with a bare `docker run` and no `-v`. Without this they sit in the
+# container's writable layer, so recreating the container (an image bump, a
+# config edit) re-enrolls the worker as a new, unapproved machine and rebuilds
+# the base chroot from nothing. `docker run` fills these with anonymous volumes;
+# a compose file or `-v` still overrides them with named ones.
+VOLUME ["/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
+
 # Wrapper so devtools' systemd-nspawn works without a systemd manager (see
 # script). Container-only: a real host has a manager and needs none of this.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn

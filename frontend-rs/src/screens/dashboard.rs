@@ -21,6 +21,12 @@ pub fn Dashboard() -> Element {
             .map_err(|e| e.to_string())
     });
 
+    // The landing page is somewhere to leave open; a slow tick keeps the
+    // totals and the chart roughly current without a reload. No "busy" input —
+    // nothing here is worth a fast poll.
+    crate::poll::use_poll(stats, false);
+    crate::poll::use_poll(graph, false);
+
     rsx! {
         div { class: "space-y-4",
             match &*stats.read_unchecked() {

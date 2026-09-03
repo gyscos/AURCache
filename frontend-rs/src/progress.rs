@@ -305,6 +305,7 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
 
         seen += progress.entries.len();
         for entry in progress.entries {
+            let landed = !matches!(entry.outcome, BulkAddOutcome::Failed { .. });
             update_job(jobs, id, |job| match entry.outcome {
                 BulkAddOutcome::Added => job.succeeded.push((entry.name, "added".to_string())),
                 // Distinguished from added: nothing changed, which is a
@@ -314,6 +315,11 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
                 }
                 BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
             });
+            if landed {
+                // A package the list, if someone has it open, does not know
+                // about yet. Let it re-fetch now rather than on its next tick.
+                crate::poll::packages_changed();
+            }
         }
 
         if progress.finished {
@@ -370,6 +376,7 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
 
         seen += progress.entries.len();
         for entry in progress.entries {
+            let landed = !matches!(entry.outcome, BulkAddOutcome::Failed { .. });
             update_job(jobs, id, |job| match entry.outcome {
                 BulkAddOutcome::Added => job.succeeded.push((entry.name, "added".to_string())),
                 // Distinguished from added: nothing changed, which is a
@@ -379,6 +386,11 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 }
                 BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
             });
+            if landed {
+                // A package the list, if someone has it open, does not know
+                // about yet. Let it re-fetch now rather than on its next tick.
+                crate::poll::packages_changed();
+            }
         }
 
         // The total is whatever the job says, not what the list said when the
@@ -436,6 +448,9 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
 
         seen += progress.entries.len();
         for entry in progress.entries {
+            // "skipped" changed nothing, but the others did; a spare re-fetch
+            // for a skip is cheaper than branching four ways here.
+            let landed = !matches!(entry.outcome, RestoreOutcome::Failed { .. });
             update_job(jobs, id, |job| match entry.outcome {
                 RestoreOutcome::Imported => {
                     job.succeeded.push((entry.pkgbase, "imported".to_string()));
@@ -453,6 +468,9 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 }
                 RestoreOutcome::Failed { error } => job.failed.push((entry.pkgbase, error)),
             });
+            if landed {
+                crate::poll::packages_changed();
+            }
         }
 
         let total = usize::try_from(progress.total).unwrap_or(0);
@@ -501,10 +519,14 @@ async fn add_patched_sources(jobs: Signal<Vec<Job>>, id: u64, request: AddReques
             })
             .await;
 
+        let landed = result.is_ok();
         update_job(jobs, id, |job| match result {
             Ok(()) => job.succeeded.push((label, "added".to_string())),
             Err(e) => job.failed.push((label, e.to_string())),
         });
+        if landed {
+            crate::poll::packages_changed();
+        }
     }
 
     update_job(jobs, id, |job| {

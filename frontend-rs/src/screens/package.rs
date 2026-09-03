@@ -5,8 +5,9 @@
 //! header answers it; everything below is reference material.
 //!
 //! Deliberately not a list of builds. That was the old centrepiece, and it
-//! buried the two builds that matter: the most recent one, and the one whose
-//! output is actually in the repository. The full history is a click away.
+//! buried what matters: for each architecture, the most recent build and — when
+//! that one failed — the older build the repository still serves for it. The
+//! full history is a click away.
 
 use crate::api::client;
 use crate::dates::RelativeDate;
@@ -22,20 +23,54 @@ use dioxus::prelude::*;
 /// duration without fetching a long history the page does not show.
 const BUILD_SAMPLE: u64 = 20;
 
-/// The most recent build, whatever its outcome.
+/// Whether this build's output is what the repository serves for its
+/// architecture.
+fn succeeded(build: &Build) -> bool {
+    matches!(
+        BuildState::from_i32(build.status),
+        Some(BuildState::Successful)
+    )
+}
+
+/// The architectures this package has builds for, ordered the way the platform
+/// picker lists them, with any architecture the package no longer targets (but
+/// still has history for) after those.
+fn platforms_of(builds: &[Build]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for build in builds {
+        if !seen.iter().any(|p| p == &build.platform) {
+            seen.push(build.platform.clone());
+        }
+    }
+    // Stable sort: known architectures fall into picker order, and anything
+    // unrecognised keeps the order it was first seen in, after them.
+    seen.sort_by_key(|p| {
+        crate::platforms::ALL
+            .iter()
+            .position(|a| a == p)
+            .unwrap_or(crate::platforms::ALL.len())
+    });
+    seen
+}
+
+/// The most recent build on one architecture, whatever its outcome.
 ///
 /// The API returns builds newest-first, but that is an ordering this screen
 /// depends on for correctness, so it picks the maximum explicitly rather than
 /// trusting position.
-fn latest(builds: &[Build]) -> Option<&Build> {
-    builds.iter().max_by_key(|b| (b.start_time, b.number))
-}
-
-/// The newest build that succeeded — the one whose packages are in the repo.
-fn in_repo(builds: &[Build]) -> Option<&Build> {
+fn latest_on<'a>(builds: &'a [Build], platform: &str) -> Option<&'a Build> {
     builds
         .iter()
-        .filter(|b| matches!(BuildState::from_i32(b.status), Some(BuildState::Successful)))
+        .filter(|b| b.platform == platform)
+        .max_by_key(|b| (b.start_time, b.number))
+}
+
+/// The newest successful build on one architecture — the one whose packages the
+/// repository serves for it.
+fn in_repo_on<'a>(builds: &'a [Build], platform: &str) -> Option<&'a Build> {
+    builds
+        .iter()
+        .filter(|b| b.platform == platform && succeeded(b))
         .max_by_key(|b| (b.end_time, b.number))
 }
 
@@ -50,7 +85,7 @@ fn in_repo(builds: &[Build]) -> Option<&Build> {
 fn typical_duration(builds: &[Build]) -> Option<i64> {
     let mut durations: Vec<i64> = builds
         .iter()
-        .filter(|b| matches!(BuildState::from_i32(b.status), Some(BuildState::Successful)))
+        .filter(|b| succeeded(b))
         .filter_map(|b| match (b.start_time, b.end_time) {
             (Some(start), Some(end)) if end >= start => Some(end - start),
             _ => None,
@@ -107,6 +142,14 @@ pub fn Package(pkgbase: String) -> Element {
     // URL changes, no request is made, and the previous package stays on
     // screen looking like the one that was clicked.
     let mut data = use_resource(use_reactive(&pkgbase, load));
+
+    // Refresh while this package or one of its recent builds is still in
+    // flight, so a build finishing updates the status and the build summary
+    // without a reload; a slow tick otherwise as a catch-all.
+    let busy = matches!(&*data.read_unchecked(), Some(Ok((pkg, builds)))
+        if BuildState::from_i32(pkg.status).is_some_and(BuildState::is_in_progress)
+            || builds.iter().any(|b| BuildState::from_i32(b.status).is_some_and(BuildState::is_in_progress)));
+    crate::poll::use_poll(data, busy);
 
     rsx! {
         match &*data.read_unchecked() {
@@ -276,21 +319,37 @@ fn VersionLine(pkg: ExtendedPackage) -> Element {
     }
 }
 
-/// The two builds worth knowing about, and how long a build usually takes.
+/// The most recent build on each architecture, and how long a build usually
+/// takes.
+///
+/// One row per architecture rather than a single "latest": a package builds for
+/// each architecture on its own — a PKGBUILD can compile cleanly for x86_64 and
+/// fail to cross-compile for armv7h — and a single latest build shows whichever
+/// architecture ran last while saying nothing about the rest. When an
+/// architecture's most recent build failed, a second line names the older build
+/// its repository still serves.
 #[component]
 fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()>) -> Element {
     let now = now_secs();
-    let newest = latest(&builds);
-    let repo = in_repo(&builds);
-    // Only worth its own row when it is not the build already shown above. When
-    // they differ, that gap is the story: the newest attempt failed and the
-    // repository still holds something older.
-    let show_repo = match (newest, repo) {
-        (Some(newest), Some(repo)) => newest.number != repo.number,
-        (None, Some(_)) => true,
-        _ => false,
-    };
     let typical = typical_duration(&builds);
+
+    // (label, build) in display order: each architecture's most recent build,
+    // and after a failed one the build the repository still serves for it.
+    let mut rows: Vec<(String, Build)> = Vec::new();
+    for platform in platforms_of(&builds) {
+        let Some(newest) = latest_on(&builds, &platform) else {
+            continue;
+        };
+        rows.push((platform.clone(), newest.clone()));
+        // A second line only when that most recent build did not succeed:
+        // otherwise it *is* what the repository serves, so `in_repo_on` would
+        // return the same build and the row would just be noise.
+        if !succeeded(newest)
+            && let Some(repo) = in_repo_on(&builds, &platform)
+        {
+            rows.push(("↳ in repo".to_string(), repo.clone()));
+        }
+    }
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
@@ -312,29 +371,29 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
                     RebuildButton { pkgbase: pkgbase.clone(), on_changed }
                 }
 
-                match newest {
-                    None => rsx! {
-                        p { class: "opacity-60 text-sm", "This package has never been built." }
-                    },
-                    Some(newest) => rsx! {
-                        div { class: "divide-y divide-base-300",
-                            BuildRow { label: "Latest", entry: newest.clone(), now }
-                            if show_repo {
-                                if let Some(repo) = repo {
-                                    BuildRow { label: "In repo", entry: repo.clone(), now }
-                                }
+                if rows.is_empty() {
+                    p { class: "opacity-60 text-sm", "This package has never been built." }
+                } else {
+                    div { class: "divide-y divide-base-300",
+                        for (index, (label, entry)) in rows.iter().enumerate() {
+                            BuildRow {
+                                key: "{index}-{entry.number}",
+                                label: label.clone(),
+                                entry: entry.clone(),
+                                now,
                             }
                         }
-                    },
+                    }
                 }
             }
         }
     }
 }
 
-/// One line of the build summary.
+/// One line of the build summary: an architecture and its most recent build, or
+/// "↳ in repo" and the build still served for it after that one failed.
 ///
-/// "In repo" rather than "latest successful": the label says what it means for
+/// "in repo" rather than "latest successful": the label says what it means for
 /// the reader — this is the version pacman will install right now.
 ///
 /// The prop is `entry`, not `build`: Dioxus generates a props builder whose own
@@ -625,19 +684,30 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
                 ul { class: "divide-y divide-base-300",
                     if built {
                         for file in pkg.files.iter() {
+                            // Arch and size first, at their natural width; the
+                            // filename takes the rest and scrolls sideways
+                            // rather than wrapping. In a 26rem column a
+                            // `name-version-arch.pkg.tar.zst` is wider than the
+                            // row, and wrapping it broke the small fields onto
+                            // their own lines too ("30 MiB" split in two).
                             li { key: "{file.filename}", class: "py-2 flex items-center gap-2",
-                                span { class: "font-mono text-sm break-all", "{file.filename}" }
-                                div { class: "flex-1" }
-                                span { class: "badge badge-ghost badge-xs", "{file.platform}" }
+                                span { class: "badge badge-ghost badge-xs shrink-0", "{file.platform}" }
                                 FileSize { file: file.clone() }
+                                span {
+                                    class: "font-mono text-xs flex-1 min-w-0 overflow-x-auto \
+                                            whitespace-nowrap",
+                                    title: "{file.filename}",
+                                    "{file.filename}"
+                                }
                             }
                         }
                     } else {
+                        // Declared names, not artifacts: these are pkgbase /
+                        // split-package names, short enough to sit on one line.
                         for name in names.iter() {
                             li { key: "{name}", class: "py-2 flex items-center gap-2",
-                                span { class: "font-mono text-sm break-all", "{name}" }
-                                div { class: "flex-1" }
                                 NotTracked { what: "size" }
+                                span { class: "font-mono text-sm break-all min-w-0", "{name}" }
                             }
                         }
                     }
@@ -655,9 +725,10 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
                     span { class: "text-sm", {downloads_label(pkg.downloads)} }
                     span {
                         class: "cursor-help text-xs opacity-40 hover:opacity-80 transition-opacity",
-                        title: "Fetches of this package from the repository. Counted in the \
-                                server and written out periodically, so it can lag by a minute \
-                                and does not count resumed downloads.",
+                        title: "Fetches of this package from the repository, across every version \
+                                and architecture. Up to date on every load — counts still buffered \
+                                in the server are included. Resumed (partial) downloads are not \
+                                counted.",
                         "?"
                     }
                 }
@@ -877,7 +948,11 @@ fn total_size(files: &[PackageFile]) -> Option<u64> {
 fn FileSize(file: PackageFile) -> Element {
     match file.size.and_then(|s| u64::try_from(s).ok()) {
         Some(bytes) => rsx! {
-            span { class: "font-mono text-sm opacity-70", {format_bytes(bytes)} }
+            // `shrink-0` + `whitespace-nowrap` so "30 MiB" keeps its one line
+            // when the row is tight — it is the filename beside it that gives.
+            span { class: "font-mono text-sm opacity-70 shrink-0 whitespace-nowrap",
+                {format_bytes(bytes)}
+            }
         },
         None => rsx! {
             NotTracked { what: "size" }
@@ -900,7 +975,13 @@ fn Field(label: String, children: Element) -> Element {
 mod tests {
     use super::*;
 
-    fn sample(number: i32, status: BuildState, start: Option<i64>, end: Option<i64>) -> Build {
+    fn sample(
+        number: i32,
+        platform: &str,
+        status: BuildState,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Build {
         Build {
             number,
             pkg_name: "hello".to_string(),
@@ -908,69 +989,86 @@ mod tests {
             status: status.as_i32(),
             start_time: start,
             end_time: end,
-            platform: "x86_64".to_string(),
+            platform: platform.to_string(),
             size: None,
             waiting_reason: None,
         }
     }
 
-    /// The newest build is whichever started last, not whichever the API
-    /// happened to return first.
+    /// Each architecture's most recent build is found on its own: the newest
+    /// build overall does not stand in for an architecture that has none.
     #[test]
-    fn the_latest_build_is_the_most_recent_one() {
+    fn the_latest_build_is_per_architecture() {
         let builds = vec![
-            sample(1, BuildState::Successful, Some(100), Some(150)),
-            sample(3, BuildState::Failed, Some(300), Some(310)),
-            sample(2, BuildState::Successful, Some(200), Some(260)),
+            sample(1, "x86_64", BuildState::Successful, Some(100), Some(150)),
+            sample(2, "aarch64", BuildState::Failed, Some(200), Some(210)),
+            sample(3, "x86_64", BuildState::Failed, Some(300), Some(310)),
         ];
-        assert_eq!(latest(&builds).map(|b| b.number), Some(3));
+        assert_eq!(latest_on(&builds, "x86_64").map(|b| b.number), Some(3));
+        assert_eq!(latest_on(&builds, "aarch64").map(|b| b.number), Some(2));
+        assert_eq!(latest_on(&builds, "armv7h"), None);
     }
 
-    /// What is in the repository is the newest *successful* build, which is
-    /// exactly what the latest build is not when the latest one failed.
+    /// The repository serves the newest *successful* build for an architecture,
+    /// which is exactly what its latest build is not once that one has failed.
     #[test]
-    fn the_repo_build_is_the_newest_successful_one() {
+    fn the_repo_build_is_the_newest_successful_one_for_its_architecture() {
         let builds = vec![
-            sample(1, BuildState::Successful, Some(100), Some(150)),
-            sample(3, BuildState::Failed, Some(300), Some(310)),
-            sample(2, BuildState::Successful, Some(200), Some(260)),
+            sample(1, "x86_64", BuildState::Successful, Some(100), Some(150)),
+            sample(2, "x86_64", BuildState::Successful, Some(200), Some(260)),
+            sample(3, "x86_64", BuildState::Failed, Some(300), Some(310)),
         ];
-        assert_eq!(in_repo(&builds).map(|b| b.number), Some(2));
+        assert_eq!(in_repo_on(&builds, "x86_64").map(|b| b.number), Some(2));
         assert_ne!(
-            latest(&builds).map(|b| b.number),
-            in_repo(&builds).map(|b| b.number),
+            latest_on(&builds, "x86_64").map(|b| b.number),
+            in_repo_on(&builds, "x86_64").map(|b| b.number),
             "a failing latest build is the case the second row exists for"
         );
     }
 
-    /// A package whose newest build succeeded needs only one row.
+    /// One architecture failing says nothing about what the repository serves
+    /// for another.
     #[test]
-    fn a_healthy_package_has_one_build_worth_showing() {
+    fn architectures_do_not_share_repo_state() {
         let builds = vec![
-            sample(1, BuildState::Successful, Some(100), Some(150)),
-            sample(2, BuildState::Successful, Some(200), Some(260)),
+            sample(1, "x86_64", BuildState::Successful, Some(100), Some(150)),
+            sample(2, "aarch64", BuildState::Failed, Some(200), Some(210)),
+        ];
+        assert_eq!(in_repo_on(&builds, "x86_64").map(|b| b.number), Some(1));
+        assert_eq!(in_repo_on(&builds, "aarch64"), None);
+    }
+
+    /// Architectures are listed the way the platform picker lists them, whatever
+    /// order builds arrive in; one the package no longer targets still shows if
+    /// it has history, after the recognised ones.
+    #[test]
+    fn platforms_are_listed_in_picker_order() {
+        let builds = vec![
+            sample(1, "armv7h", BuildState::Successful, Some(100), Some(150)),
+            sample(2, "x86_64", BuildState::Successful, Some(200), Some(260)),
+            sample(3, "riscv64", BuildState::Failed, Some(300), Some(310)),
+            sample(4, "aarch64", BuildState::Successful, Some(400), Some(460)),
+            sample(5, "x86_64", BuildState::Failed, Some(500), Some(510)),
         ];
         assert_eq!(
-            latest(&builds).map(|b| b.number),
-            in_repo(&builds).map(|b| b.number)
+            platforms_of(&builds),
+            vec!["x86_64", "aarch64", "armv7h", "riscv64"]
         );
     }
 
-    /// Nothing has succeeded yet, so nothing is in the repository.
+    /// A package with no builds has no architectures to show.
     #[test]
-    fn a_package_that_never_succeeded_has_nothing_in_the_repo() {
-        let builds = vec![sample(1, BuildState::Failed, Some(100), Some(150))];
-        assert!(in_repo(&builds).is_none());
-        assert_eq!(latest(&builds).map(|b| b.number), Some(1));
+    fn a_package_that_never_built_has_no_architectures() {
+        assert!(platforms_of(&[]).is_empty());
     }
 
     /// Median, not mean: the 40-minute outlier must not become "typical".
     #[test]
     fn the_typical_duration_resists_an_outlier() {
         let builds = vec![
-            sample(1, BuildState::Successful, Some(0), Some(60)),
-            sample(2, BuildState::Successful, Some(0), Some(70)),
-            sample(3, BuildState::Successful, Some(0), Some(2400)),
+            sample(1, "x86_64", BuildState::Successful, Some(0), Some(60)),
+            sample(2, "x86_64", BuildState::Successful, Some(0), Some(70)),
+            sample(3, "x86_64", BuildState::Successful, Some(0), Some(2400)),
         ];
         assert_eq!(typical_duration(&builds), Some(70));
     }
@@ -979,9 +1077,9 @@ mod tests {
     #[test]
     fn failed_builds_do_not_count_towards_the_typical_duration() {
         let builds = vec![
-            sample(1, BuildState::Successful, Some(0), Some(600)),
-            sample(2, BuildState::Failed, Some(0), Some(5)),
-            sample(3, BuildState::Failed, Some(0), Some(5)),
+            sample(1, "x86_64", BuildState::Successful, Some(0), Some(600)),
+            sample(2, "x86_64", BuildState::Failed, Some(0), Some(5)),
+            sample(3, "x86_64", BuildState::Failed, Some(0), Some(5)),
         ];
         assert_eq!(typical_duration(&builds), Some(600));
     }
@@ -991,7 +1089,7 @@ mod tests {
     #[test]
     fn a_package_with_no_completed_builds_has_no_typical_duration() {
         assert_eq!(typical_duration(&[]), None);
-        let running = vec![sample(1, BuildState::Active, Some(100), None)];
+        let running = vec![sample(1, "x86_64", BuildState::Active, Some(100), None)];
         assert_eq!(typical_duration(&running), None);
     }
 

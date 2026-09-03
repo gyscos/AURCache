@@ -116,7 +116,7 @@ fn SideMenu() -> Element {
                     }
                     MenuLink {
                         to: Route::Activities {},
-                        label: "Activities",
+                        label: "Activity",
                         active: active == Some(MenuEntry::Activities),
                         icon: rsx! { ActivitiesIcon {} },
                     }

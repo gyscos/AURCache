@@ -10,7 +10,7 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
-use aurcache_common::api::worker::{ApprovalStatus, WorkerSummary};
+use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary};
 use aurcache_common::builder::BuildStates;
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
@@ -174,6 +174,7 @@ impl<'r> FromRequest<'r> for WorkerAuth {
     register_status,
     get_ca,
     list_workers,
+    worker_join_info,
     approve_worker,
     revoke_worker
 ))]
@@ -205,8 +206,17 @@ pub fn worker_protocol_routes() -> Vec<rocket::Route> {
 /// human-facing plane alongside the rest of the REST API and the web UI.
 #[must_use]
 pub fn worker_admin_routes() -> Vec<rocket::Route> {
-    rocket::routes![list_workers, approve_worker, revoke_worker,]
+    rocket::routes![
+        list_workers,
+        worker_join_info,
+        approve_worker,
+        revoke_worker,
+    ]
 }
+
+/// Default worker image, published alongside every release. Overridden per
+/// deployment with `AURCACHE_WORKER_IMAGE` (a private registry, a pinned tag).
+const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest";
 
 // ----------------------------------------------------------------------------
 // Enrollment (no client certificate required)
@@ -853,6 +863,23 @@ pub async fn list_workers(
             })
             .collect(),
     ))
+}
+
+/// The image and port a copy-and-run `docker run` needs, for the Workers page
+/// to show one when the fleet is empty. The host is not here on purpose — the
+/// browser knows the address the page was reached on and the server does not.
+#[utoipa::path(get, path = "/workers/join-info", responses((status = 200, body = WorkerJoinInfo)))]
+#[get("/workers/join-info")]
+pub async fn worker_join_info(_a: Authenticated) -> Json<WorkerJoinInfo> {
+    let image = env::var("AURCACHE_WORKER_IMAGE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_WORKER_IMAGE.to_string());
+    let worker_port = env::var("AURCACHE_WORKER_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
+    Json(WorkerJoinInfo { image, worker_port })
 }
 
 #[utoipa::path(post, path = "/workers/{id}/approve", responses((status = 200)))]

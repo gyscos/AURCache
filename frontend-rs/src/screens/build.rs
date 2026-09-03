@@ -123,9 +123,6 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             text.push_str(&chunk);
                         });
                         line_count += added;
-                        if following() {
-                            scroll_log_to_bottom();
-                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -148,6 +145,23 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         }
     });
 
+    // Keep the view pinned to the newest output while "Follow" is on.
+    //
+    // This has to be an effect, not a call from the poll loop: appending to
+    // `log` only marks the component dirty, and the re-render that actually puts
+    // the new lines in the DOM happens afterwards. Scrolling before that measured
+    // the height of text that was not on screen yet and stopped short of the
+    // bottom -- which is exactly the "jumps down once, then never again" the poll
+    // loop produced. An effect runs after the DOM is patched, so `scrollHeight`
+    // is finally correct. It re-runs when `line_count` grows (a new chunk landed)
+    // or when `following` flips back on (re-pin immediately).
+    use_effect(move || {
+        line_count();
+        if following() {
+            scroll_log_to_bottom();
+        }
+    });
+
     rsx! {
         div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
             div { class: "card-body flex flex-col min-h-0",
@@ -167,11 +181,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             r#type: "checkbox",
                             class: "toggle toggle-sm toggle-primary",
                             checked: following(),
-                            oninput: move |e| {
-                                let on = e.value() == "true";
-                                following.set(on);
-                                if on { scroll_log_to_bottom(); }
-                            },
+                            // The effect below does the scrolling: it reads
+                            // `following`, so turning this on re-pins to the
+                            // bottom on the next render.
+                            oninput: move |e| following.set(e.value() == "true"),
                         }
                     }
                 }

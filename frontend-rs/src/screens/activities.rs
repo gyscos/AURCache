@@ -34,7 +34,7 @@ pub fn Activities() -> Element {
 
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                ListHeader { title: "Activities" }
+                ListHeader { title: "Activity" }
 
                 match &*entries.read_unchecked() {
                     None => rsx! {

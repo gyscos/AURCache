@@ -618,6 +618,10 @@ pub fn use_url_search(
 }
 
 /// Search box and status filter, shared by both lists.
+///
+/// `children` is rendered inline after the status filter, for a list that has
+/// one more control to sit beside it — the packages list puts its "show
+/// dependencies" toggle there. Nothing passes it on the builds list.
 #[component]
 pub fn ListControls(
     query: Signal<String>,
@@ -625,6 +629,7 @@ pub fn ListControls(
     placeholder: String,
     shown: usize,
     total: usize,
+    children: Element,
 ) -> Element {
     let mut query = query;
     let mut status = status;
@@ -663,6 +668,7 @@ pub fn ListControls(
                     }
                 }
             }
+            {children}
             div { class: "flex-1" }
             // Only worth saying when a filter is actually hiding something.
             if shown != total {
@@ -706,7 +712,12 @@ pub fn SortableHeader(
     rsx! {
         th { class,
             button {
-                class: "flex items-center gap-1 hover:opacity-100 opacity-90",
+                // `inline-flex`, not `flex`: a block-level flex container fills
+                // the cell and packs its label at the left, so a `text-right`
+                // header (Size) sorted the same as the values below it but did
+                // not line up with them. Inline-level means the cell's own
+                // text-align places it.
+                class: "inline-flex items-center gap-1 hover:opacity-100 opacity-90",
                 onclick: move |_| sort.set(sort().toggled(column)),
                 aria_sort,
                 "{label}"

@@ -50,6 +50,25 @@ pub struct WorkerSummary {
     pub failed_builds: i32,
 }
 
+/// The deployment-specific pieces the Workers page needs to show a
+/// copy-and-run command for enrolling a new worker.
+///
+/// Only the bits the server actually knows: the image to pull and the port its
+/// worker protocol listens on. The host is left to the browser, which fills it
+/// from the address the page was opened on — the server has no reliable view of
+/// how it is reached from outside.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct WorkerJoinInfo {
+    /// Container image a worker runs, e.g.
+    /// `ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest`. Overridable with
+    /// the `AURCACHE_WORKER_IMAGE` environment variable for private registries
+    /// or pinned tags.
+    pub image: String,
+    /// Port the worker-protocol listener is on (`AURCACHE_WORKER_PORT`,
+    /// default 8083).
+    pub worker_port: u16,
+}
+
 /// Where a worker is in the approval workflow.
 ///
 /// A closed set rather than the string the database holds: the frontend

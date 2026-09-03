@@ -53,6 +53,16 @@ impl BuildState {
             _ => None,
         }
     }
+
+    /// Whether the build has not settled yet — it is running, queued, or held
+    /// behind a dependency. `Successful` and `Failed` are the terminal states.
+    ///
+    /// The UI uses this to decide how eagerly to re-poll: a page showing a
+    /// build in one of these states is a page worth refreshing briskly.
+    #[must_use]
+    pub const fn is_in_progress(self) -> bool {
+        matches!(self, Self::Active | Self::Enqueued | Self::WaitingForDeps)
+    }
 }
 
 pub struct BuildStates;
@@ -93,5 +103,14 @@ mod tests {
     fn an_unknown_value_is_not_guessed() {
         assert_eq!(BuildState::from_i32(99), None);
         assert_eq!(BuildState::from_i32(-1), None);
+    }
+
+    #[test]
+    fn only_running_queued_and_waiting_count_as_in_progress() {
+        assert!(BuildState::Active.is_in_progress());
+        assert!(BuildState::Enqueued.is_in_progress());
+        assert!(BuildState::WaitingForDeps.is_in_progress());
+        assert!(!BuildState::Successful.is_in_progress());
+        assert!(!BuildState::Failed.is_in_progress());
     }
 }

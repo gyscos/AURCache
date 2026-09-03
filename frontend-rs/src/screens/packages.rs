@@ -49,6 +49,17 @@ pub fn Packages(
     sync_url: bool,
 ) -> Element {
     let mut packages = use_resource(load_packages);
+
+    // Re-fetch on a timer so a build finishing, a version check or another
+    // operator's change shows up without a manual reload; briskly while
+    // anything here is still building. And immediately when an add lands,
+    // rather than waiting out that timer — the dialog is a sibling of this
+    // list, so it cannot restart the resource itself.
+    let building = matches!(&*packages.read_unchecked(), Some(Ok(list))
+        if list.iter().any(|p| BuildState::from_i32(p.status).is_some_and(BuildState::is_in_progress)));
+    crate::poll::use_poll(packages, building);
+    crate::poll::use_refetch_on_package_change(packages);
+
     let query = use_url_search(q, sync_url, |q| Route::Packages { q });
     let status = use_signal(|| StatusFilter::ANY);
     // Off by default: the list reads as the set of packages somebody is
@@ -117,18 +128,20 @@ pub fn Packages(
                             placeholder: "Filter packages…",
                             shown: found,
                             total,
-                        }
-                        // Only when there are some. A toggle that reveals
-                        // nothing invites the reader to wonder what it is for.
-                        if dependencies > 0 {
-                            div { class: "flex justify-end -mt-2",
-                                button {
-                                    class: "btn btn-ghost btn-xs",
-                                    onclick: move |_| show_dependencies.toggle(),
-                                    if show_dependencies() {
-                                        "Hide dependencies ({dependencies})"
-                                    } else {
-                                        "Show dependencies ({dependencies})"
+                            // Sits beside the status filter. Only when there
+                            // are dependencies to reveal — a checkbox that
+                            // changes nothing invites the reader to wonder
+                            // what it is for.
+                            if dependencies > 0 {
+                                label { class: "label cursor-pointer gap-2 py-0",
+                                    input {
+                                        r#type: "checkbox",
+                                        class: "checkbox checkbox-sm",
+                                        checked: show_dependencies(),
+                                        onchange: move |e| show_dependencies.set(e.checked()),
+                                    }
+                                    span { class: "label-text text-sm whitespace-nowrap",
+                                        "Dependencies ({dependencies})"
                                     }
                                 }
                             }

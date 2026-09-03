@@ -14,7 +14,7 @@
 use crate::dates::RelativeDate;
 use crate::format::now_secs;
 use crate::listing::ListHeader;
-use aurcache_client::{ApprovalStatus, Worker};
+use aurcache_client::{ApprovalStatus, Worker, WorkerJoinInfo};
 use dioxus::prelude::*;
 
 /// Columns that only appear once there is room for them.
@@ -31,6 +31,13 @@ pub fn Workers() -> Element {
             .await
             .map_err(|e| e.to_string())
     });
+
+    // Keep the fleet view live — a worker that just enrolled, went offline or
+    // picked up a build should appear without a reload. Quick tick while any
+    // worker is building or waiting on approval, a slow one otherwise.
+    let poll_fast = matches!(&*workers.read_unchecked(), Some(Ok(list))
+        if list.iter().any(|w| w.active_builds > 0 || w.status == ApprovalStatus::Pending));
+    crate::poll::use_poll(workers, poll_fast);
 
     let mut show_retired = use_signal(|| false);
     let mut busy = use_signal(|| Option::<i32>::None);
@@ -93,9 +100,7 @@ pub fn Workers() -> Element {
                         div { class: "alert alert-error", span { "Could not load workers: {e}" } }
                     },
                     Some(Ok(list)) if list.is_empty() => rsx! {
-                        div { class: "alert",
-                            span { "No workers have enrolled yet." }
-                        }
+                        AddFirstWorker {}
                     },
                     Some(Ok(list)) => {
                         let waiting = list.iter().filter(|w| w.status == ApprovalStatus::Pending).count();
@@ -142,6 +147,104 @@ fn waiting_message(waiting: usize) -> String {
     match waiting {
         1 => "1 worker is waiting for approval.".to_string(),
         n => format!("{n} workers are waiting for approval."),
+    }
+}
+
+/// The host the browser reached this page on, for the enrol command's
+/// `AURCACHE_URL`. The worker protocol is assumed to sit on the same host — it
+/// does in every ordinary deployment, and the reader can see and edit the line
+/// if theirs is one of the exceptions.
+fn server_host() -> Option<String> {
+    web_sys::window()?
+        .location()
+        .hostname()
+        .ok()
+        .filter(|h| !h.is_empty())
+}
+
+/// A host that resolves to the browser's own machine. A worker container's own
+/// `localhost` is itself, not the host, so a command built from one of these
+/// needs `--network host` to reach the server.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
+}
+
+/// The one-liner shown on an empty Workers page: pull the image, point it at
+/// this server, run it. No volume (the image declares one), no enrollment token
+/// (the operator approves it here).
+///
+/// A loopback host gets `--network host` so a same-machine worker can reach the
+/// server; a routable address is left as-is.
+fn join_command(host: &str, info: &WorkerJoinInfo) -> String {
+    let net = if is_loopback(host) {
+        " --network host"
+    } else {
+        ""
+    };
+    format!(
+        "docker run -d --privileged --tmpfs /run{net} \\\n  \
+         -e AURCACHE_URL=https://{host}:{port} \\\n  {image}",
+        port = info.worker_port,
+        image = info.image,
+    )
+}
+
+/// Shown in place of the workers table when nothing has enrolled: what a worker
+/// is, and a command that adds one.
+#[component]
+fn AddFirstWorker() -> Element {
+    let info = use_resource(|| async move {
+        crate::api::client()?
+            .worker_join_info()
+            .await
+            .map_err(|e| e.to_string())
+    });
+
+    rsx! {
+        div { class: "space-y-3 py-2 max-w-prose",
+            p { class: "text-sm",
+                "No workers have enrolled yet. A worker is a machine that builds \
+                 packages in a clean chroot and uploads them — run this on any \
+                 Linux host with Docker:"
+            }
+            match &*info.read_unchecked() {
+                None => rsx! {
+                    div { class: "flex justify-center p-4",
+                        span { class: "loading loading-spinner" }
+                    }
+                },
+                Some(Err(e)) => rsx! {
+                    div { class: "alert alert-error text-sm",
+                        span { "Could not build the command: {e}" }
+                    }
+                },
+                Some(Ok(info)) => {
+                    let host = server_host();
+                    let loopback = host.as_deref().is_some_and(is_loopback);
+                    let cmd = join_command(host.as_deref().unwrap_or("YOUR_SERVER"), info);
+                    rsx! {
+                        pre {
+                            class: "bg-base-200 rounded p-3 text-xs overflow-x-auto whitespace-pre",
+                            code { class: "font-mono", "{cmd}" }
+                        }
+                        p { class: "text-xs opacity-60",
+                            if host.is_none() {
+                                "Set "
+                                code { class: "font-mono", "YOUR_SERVER" }
+                                " to an address the worker's machine can reach this server on. "
+                            } else if loopback {
+                                code { class: "font-mono", "--network host" }
+                                " lets the container reach the server on this machine; to run a "
+                                "worker elsewhere, drop it and use this server's address instead. "
+                            }
+                            "It appears here as "
+                            span { class: "badge badge-warning badge-sm align-middle", "pending" }
+                            " within a few seconds; approve it and it starts taking builds."
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -322,8 +425,10 @@ fn architectures(worker: &Worker) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatusBadge, StatusBadgeProps, architectures, waiting_message};
-    use aurcache_client::{ApprovalStatus, Worker};
+    use super::{
+        StatusBadge, StatusBadgeProps, architectures, is_loopback, join_command, waiting_message,
+    };
+    use aurcache_client::{ApprovalStatus, Worker, WorkerJoinInfo};
     use dioxus::prelude::*;
 
     fn worker(native: &[&str], emulated: &[&str]) -> Worker {
@@ -367,6 +472,45 @@ mod tests {
     fn the_waiting_notice_counts_properly() {
         assert_eq!(waiting_message(1), "1 worker is waiting for approval.");
         assert_eq!(waiting_message(3), "3 workers are waiting for approval.");
+    }
+
+    /// For a routable host the command points at it on the server's reported
+    /// worker port, pulls the server's reported image, and carries nothing else
+    /// — no `-v`, no token, no `--network host`.
+    #[test]
+    fn the_join_command_is_host_port_and_image_only() {
+        let info = WorkerJoinInfo {
+            image: "registry.example/aurcache-worker:v1".to_string(),
+            worker_port: 9443,
+        };
+        let cmd = join_command("build.example.com", &info);
+        assert!(
+            cmd.contains("AURCACHE_URL=https://build.example.com:9443"),
+            "{cmd}"
+        );
+        assert!(cmd.contains("registry.example/aurcache-worker:v1"), "{cmd}");
+        assert!(cmd.contains("--privileged"), "{cmd}");
+        assert!(!cmd.contains("-v "), "no volume flag: {cmd}");
+        assert!(!cmd.contains("TOKEN"), "no enrollment token: {cmd}");
+        assert!(!cmd.contains("--network"), "routable host: {cmd}");
+    }
+
+    /// A loopback host is the browser's machine, not the worker container's, so
+    /// the command shares the host's network to bridge the gap — and keeps the
+    /// loopback address, which the default TLS SAN covers.
+    #[test]
+    fn the_join_command_adds_host_networking_for_loopback() {
+        assert!(is_loopback("localhost"));
+        assert!(is_loopback("127.0.0.1"));
+        assert!(!is_loopback("aur.example.com"));
+
+        let info = WorkerJoinInfo {
+            image: "img".to_string(),
+            worker_port: 8083,
+        };
+        let cmd = join_command("localhost", &info);
+        assert!(cmd.contains("--network host"), "{cmd}");
+        assert!(cmd.contains("AURCACHE_URL=https://localhost:8083"), "{cmd}");
     }
 
     /// The three states have to be distinguishable at a glance; pending is the

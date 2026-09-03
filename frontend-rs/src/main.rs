@@ -18,6 +18,7 @@ mod dates;
 mod format;
 mod listing;
 mod platforms;
+mod poll;
 mod progress;
 mod routes;
 mod screens;

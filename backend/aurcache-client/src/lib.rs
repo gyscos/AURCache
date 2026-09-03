@@ -11,10 +11,10 @@ use anyhow::{Context, Result};
 pub use aurcache_common::api::activity::Activity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
-pub use aurcache_common::api::operations::{ActiveOperation, kind as operation_kind};
 pub use aurcache_common::api::dump::{
     RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
 };
+pub use aurcache_common::api::operations::{ActiveOperation, kind as operation_kind};
 pub use aurcache_common::api::package::{
     AddPackages as AddPackagesRequest, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
@@ -32,7 +32,7 @@ pub use aurcache_common::api::package::{SourceFileContent, SourceFileList, Sourc
 pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_common::api::stats::{GraphDataPoint, ListStats, UserInfo};
 pub use aurcache_common::api::waiting::WaitingReason;
-pub use aurcache_common::api::worker::{ApprovalStatus, WorkerSummary as Worker};
+pub use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary as Worker};
 pub use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
@@ -512,6 +512,12 @@ impl AurCacheClient {
     /// Lists all enrolled remote build workers and their status.
     pub async fn list_workers(&self) -> Result<Vec<Worker>> {
         self.request_json::<Vec<Worker>, Value>(Method::GET, "/workers", &[], None)
+            .await
+    }
+
+    /// The image and worker-protocol port a new worker's `docker run` needs.
+    pub async fn worker_join_info(&self) -> Result<WorkerJoinInfo> {
+        self.request_json::<WorkerJoinInfo, Value>(Method::GET, "/workers/join-info", &[], None)
             .await
     }
 
