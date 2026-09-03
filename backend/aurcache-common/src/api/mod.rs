@@ -9,6 +9,7 @@ pub mod activity;
 pub mod aur;
 pub mod builds;
 pub mod dump;
+pub mod operations;
 pub mod package;
 pub mod settings;
 pub mod stats;

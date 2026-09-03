@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 pub use aurcache_common::api::activity::Activity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
+pub use aurcache_common::api::operations::{ActiveOperation, kind as operation_kind};
 pub use aurcache_common::api::dump::{
     RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
 };
@@ -326,6 +327,16 @@ impl AurCacheClient {
             None,
         )
         .await
+    }
+
+    /// Long-running operations still in flight.
+    ///
+    /// A bulk add or restore outlives the page that started it, so this is how
+    /// a browser finds one again -- after a reload, or from a tab that never
+    /// started it.
+    pub async fn active_operations(&self) -> Result<Vec<ActiveOperation>> {
+        self.request_json::<Vec<ActiveOperation>, Value>(Method::GET, "/operations", &[], None)
+            .await
     }
 
     /// Fetches raw build output text.

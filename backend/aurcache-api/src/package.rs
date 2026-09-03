@@ -1,4 +1,5 @@
 use crate::models::authenticated::Authenticated;
+use crate::models::operations::ActiveOperation;
 use crate::models::package::{
     AddPackage, PackagePatch, SourceFileContent, SourceFileList, SourceFileUpdate,
     SourcePreviewFileRequest, SourcePreviewRequest, UpdatePackage,
@@ -232,6 +233,43 @@ pub async fn packages_add_endpoint(
         accepted: total,
     })))
 }
+/// Every long-running operation still in flight.
+///
+/// A bulk add or a restore outlives the request that started it and the page
+/// that was watching, so without this there is no way back to one: a browser
+/// that reloaded, navigated away, or never started the job has no id to poll.
+/// Listing them is what lets a job be found again and re-attached to.
+///
+/// Counters only. The entries live behind the per-job endpoints, which is where
+/// a caller that has decided to watch one goes; sending every log to everyone
+/// listing what is running would be the expensive part of a cheap request.
+#[utoipa::path(
+    responses((status = 200, description = "Operations still running", body = Vec<ActiveOperation>)),
+)]
+#[get("/operations")]
+pub async fn active_operations(
+    db: &State<DatabaseConnection>,
+    _a: Authenticated,
+) -> Result<Json<Vec<ActiveOperation>>, ApiError> {
+    let running = operations::active(db.inner())
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
+    Ok(Json(
+        running
+            .into_iter()
+            .map(|job| ActiveOperation {
+                id: job.id,
+                kind: job.kind,
+                created_at: job.created_at,
+                total: job.total,
+                completed: job.completed,
+                failed: job.failed,
+            })
+            .collect(),
+    ))
+}
+
 
 #[utoipa::path(
     responses(

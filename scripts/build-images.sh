@@ -41,11 +41,12 @@ Options:
                             created on demand)
   -h, --help                This message
 
-A multi-platform build cannot be loaded into the local Docker image store --
-that store holds one architecture per tag -- so without --push the result is
-discarded and only the build cache survives. That is still useful for checking
-that every architecture builds; use --platforms with a single platform if you
-want an image you can run.
+Without --push, what happens to the result depends on the daemon's image
+store. The classic store holds one architecture per tag, so a multi-platform
+build is discarded and only the build cache survives -- still useful for
+checking that every architecture builds. Docker's containerd image store holds
+multi-arch images, and this script loads into it when the daemon has it
+enabled. A single-platform build is always loaded.
 EOF
 }
 
@@ -102,9 +103,37 @@ if [[ $platforms == *arm* ]] && [[ ! -e /proc/sys/fs/binfmt_misc/qemu-arm ]] &&
     echo "         register one with: docker run --privileged --rm tonistiigi/binfmt --install all" >&2
 fi
 
-output_args=(--output "type=cacheonly")
+# Where the result goes.
+#
+# The classic image store holds one architecture per tag, so a multi-platform
+# build cannot be loaded into it -- buildx refuses, and the only options are
+# pushing or discarding. Docker's containerd image store does hold multi-arch
+# images, so when the daemon is using it the build can be loaded and run
+# locally. Enable it with, in /etc/docker/daemon.json:
+#
+#   { "features": { "containerd-snapshotter": true } }
+#
+# and restart the daemon. Images in the classic store stop being *visible*
+# while it is active (they are not deleted, and turning it off brings them
+# back), which is worth knowing before switching on a machine with a lot of
+# them.
+containerd_store=0
+if docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
+    containerd_store=1
+fi
+
 if ((push)); then
     output_args=(--push)
+elif ((containerd_store)); then
+    output_args=(--load)
+elif [[ $platforms == *,* ]]; then
+    output_args=(--output "type=cacheonly")
+    echo "note: the daemon uses the classic image store, which cannot hold a"
+    echo "      multi-platform image, so this build will be discarded. Enable"
+    echo "      the containerd image store to keep it, or use --push."
+else
+    # One platform: the classic store can hold that.
+    output_args=(--load)
 fi
 
 build_args=()
@@ -154,6 +183,8 @@ done
 echo
 if ((push)); then
     echo "==> pushed $images as :$tag to $registry"
+elif ((containerd_store)) || [[ $platforms != *,* ]]; then
+    echo "==> built and loaded $images for $platforms"
 else
-    echo "==> built $images for $platforms (not pushed; --push to publish)"
+    echo "==> built $images for $platforms (discarded; --push to publish)"
 fi

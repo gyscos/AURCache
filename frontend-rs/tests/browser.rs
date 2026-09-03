@@ -392,16 +392,17 @@ async fn one_queued_package_can_be_taken_back(session: &Session) {
     );
 }
 
-/// A queue of several packages is submitted as one bulk add, and each one's
-/// outcome comes back separately.
+/// A queue of several packages is submitted as one bulk add, the dialog closes
+/// at once, and each one's outcome arrives on the progress card.
 ///
 /// The failure this guards against is invisible without a browser and a server:
-/// the dialog now starts a job and polls it rather than issuing one request per
-/// package, so a mistake in the polling loop -- never attaching, losing the
-/// offset, not noticing the job finished -- leaves a spinner on screen forever
-/// while the server has long since finished. Two unreachable remotes are used
-/// deliberately: what is being tested is that both outcomes are reported, and
-/// a failure is the outcome this fixture can produce without network.
+/// the add is started by a dialog that then unmounts, and the polling is owned
+/// by the card that outlives it. A mistake in that handover -- never starting,
+/// starting twice, losing the offset, not noticing the job finished -- leaves a
+/// spinner in the corner forever while the server has long since finished. Two
+/// unreachable remotes are used deliberately: what is being tested is that both
+/// outcomes are reported, and a failure is the outcome this fixture can produce
+/// without network.
 async fn a_queue_is_added_as_one_job(session: &Session) {
     session.open("/packages/add").await;
 
@@ -424,13 +425,21 @@ async fn a_queue_is_added_as_one_job(session: &Session) {
         .click_labelled(".modal-action button", "Add 2 packages")
         .await;
 
-    // Both are named, so the job's per-package outcomes reached the screen --
-    // not just the first, and not a single collapsed error for the batch.
+    // The dialog goes as soon as the work is handed over -- the whole point of
+    // the change -- so the rest of the site is usable while the add runs.
+    session
+        .wait_until("the dialog to close", |t| {
+            !t.contains("Type a package name to search the AUR")
+        })
+        .await;
+
+    // Both are named on the card, so the job's per-package outcomes reached the
+    // screen -- not just the first, and not a single collapsed error for the
+    // batch. That they arrive at all is what proves the card took over the
+    // polling from the dialog that started it.
     session
         .wait_until("both packages to be reported", |t| {
-            t.contains("could not be added")
-                && t.contains("bulk-one.git")
-                && t.contains("bulk-two.git")
+            t.contains("bulk-one.git") && t.contains("bulk-two.git")
         })
         .await;
 }

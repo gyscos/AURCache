@@ -20,7 +20,7 @@ use crate::prelude::Operations;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter,
+    QueryFilter, QueryOrder,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -118,6 +118,23 @@ pub async fn close_orphaned<C: ConnectionTrait>(db: &C) -> Result<u64, DbErr> {
         .exec(db)
         .await?;
     Ok(res.rows_affected)
+}
+
+/// Operations still running, oldest first.
+///
+/// `finished_at IS NULL` is the whole definition of running, and startup closes
+/// any row left open by a process that died (see [`close_orphaned`]), so this
+/// cannot report a job that no longer exists.
+///
+/// The log is deliberately not returned: a caller listing what is in flight
+/// wants counters, and a bulk add's log can be long enough that sending every
+/// one of them to draw a progress bar would be the expensive part.
+pub async fn active<C: ConnectionTrait>(db: &C) -> Result<Vec<operations::Model>, DbErr> {
+    Operations::find()
+        .filter(operations::Column::FinishedAt.is_null())
+        .order_by_asc(operations::Column::CreatedAt)
+        .all(db)
+        .await
 }
 
 #[cfg(test)]

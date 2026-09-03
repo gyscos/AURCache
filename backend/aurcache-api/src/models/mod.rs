@@ -6,4 +6,4 @@
 
 pub mod authenticated;
 
-pub use aurcache_common::api::{aur, builds, package, settings, stats};
+pub use aurcache_common::api::{aur, builds, operations, package, settings, stats};

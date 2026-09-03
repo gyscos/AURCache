@@ -160,14 +160,14 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
     let mut preview = use_signal(Vec::<RestoreEntry>::new);
-    let mut done = use_signal(|| Option::<String>::None);
+    // Where a started restore goes once the dialog closes.
+    let jobs = crate::progress::use_jobs();
 
     let mut reset = move || {
         file_name.set(String::new());
         bytes.set(Vec::new());
         preview.set(Vec::new());
         error.set(None);
-        done.set(None);
         hovering.set(false);
         busy.set(false);
     };
@@ -201,7 +201,6 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
                 // previewed; showing the old result against the new name would
                 // be worse than showing nothing.
                 preview.set(Vec::new());
-                done.set(None);
                 error.set(None);
                 file_name.set(name);
                 bytes.set(content.to_vec());
@@ -216,7 +215,6 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
         }
         busy.set(true);
         error.set(None);
-        done.set(None);
         let client = match crate::api::client() {
             Ok(client) => client,
             Err(e) => {
@@ -240,7 +238,24 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
                 if dry_run {
                     preview.set(accepted.preview);
                 } else if let Some(job_id) = accepted.job_id {
-                    follow(client, job_id, preview, done, error).await;
+                    // Handed to the progress card and the dialog closes, rather
+                    // than holding the page until every package is imported. A
+                    // restore of a few hundred packages runs for minutes, and
+                    // there is no reason the rest of the site -- adding a
+                    // package included -- should be unreachable meanwhile.
+                    //
+                    // The same handover an add does, for the same reason and
+                    // through the same machinery: the job is already detached
+                    // server-side and its progress is a log read by offset, so
+                    // nothing is lost by not watching from here.
+                    crate::progress::watch_restore(
+                        jobs,
+                        job_id,
+                        accepted.total,
+                        format!("Restoring {}", file_name()),
+                    );
+                    open.set(false);
+                    reset();
                 }
             }
             Err(e) => error.set(Some(e.to_string())),
@@ -302,9 +317,6 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
                     if let Some(message) = error() {
                         div { class: "alert alert-error text-sm", span { "{message}" } }
                     }
-                    if let Some(message) = done() {
-                        div { class: "alert alert-success text-sm", span { "{message}" } }
-                    }
                     if !preview().is_empty() {
                         RestoreReport { entries: preview(), blocked: blocked() }
                     }
@@ -327,45 +339,6 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
             }
             div { class: "modal-backdrop", onclick: close }
         }
-    }
-}
-
-/// Poll a running import to the end.
-///
-/// The server does not need anyone watching -- the work continues if this dialog
-/// closes -- so this only reports.
-async fn follow(
-    client: aurcache_client::AurCacheClient,
-    job_id: i32,
-    mut preview: Signal<Vec<RestoreEntry>>,
-    mut done: Signal<Option<String>>,
-    mut error: Signal<Option<String>>,
-) {
-    loop {
-        match client.restore_progress(job_id, 0).await {
-            Ok(progress) => {
-                preview.set(progress.entries.clone());
-                if progress.finished {
-                    done.set(Some(format!(
-                        "Restored {} of {} package(s){}.",
-                        progress.completed,
-                        progress.total,
-                        if progress.failed > 0 {
-                            format!(", {} failed", progress.failed)
-                        } else {
-                            String::new()
-                        }
-                    )));
-                    return;
-                }
-            }
-            Err(e) => {
-                // The import is still running; we have only lost sight of it.
-                error.set(Some(format!("Lost track of the restore: {e}")));
-                return;
-            }
-        }
-        gloo_timers::future::sleep(std::time::Duration::from_millis(700)).await;
     }
 }
 

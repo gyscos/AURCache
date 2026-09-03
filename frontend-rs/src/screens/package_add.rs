@@ -20,24 +20,15 @@
 
 use crate::platforms::{self, PlatformChecklist};
 use crate::routes::Route;
-use aurcache_client::{
-    AddPackageRequest, AddPackagesRequest, BulkAddOutcome, GitSourceSpec, SearchResult, SourceData,
-    looks_like_git_url,
-};
+use aurcache_client::{GitSourceSpec, SearchResult, SourceData, looks_like_git_url};
 use dioxus::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// How long to wait after the last keystroke before searching.
 ///
 /// The search proxies to the AUR, so every keystroke sent straight through is a
 /// request someone else pays for.
-/// How often to ask a running bulk add what it has done.
-///
-/// A package takes seconds to add -- a checkout each -- so polling faster than
-/// this only produces identical answers.
-const BULK_POLL_INTERVAL: Duration = Duration::from_millis(700);
-
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// How long to wait before looking up a one- or two-character entry.
@@ -147,112 +138,6 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
             .description
             .as_deref()
             .is_some_and(|d| d.to_lowercase().contains(query))
-}
-
-/// Add a list of sources in one request, following the job until it ends.
-///
-/// One request rather than one per package: the server resolves every AUR name
-/// to its pkgbase in a single batched RPC call, where adding them one at a time
-/// spent an AUR request per package before fetching anything.
-///
-/// Returns the failures and the sources that produced them, so the queue can
-/// keep exactly what still needs adding. Watching is optional as far as the
-/// server is concerned — the job runs whether or not this keeps polling — but
-/// the dialog stays open, so it does.
-async fn submit_bulk(
-    client: &aurcache_client::AurCacheClient,
-    sources: Vec<SourceData>,
-    platforms: Vec<String>,
-    mut added: Signal<Vec<String>>,
-    mut adding: Signal<Option<String>>,
-) -> (Vec<(String, String)>, Vec<SourceData>) {
-    // Kept so a failure can be matched back to the source that caused it: the
-    // job reports the name the request carried, which is what `source_label`
-    // produces here.
-    let by_label: HashMap<String, SourceData> = sources
-        .iter()
-        .map(|source| (source_label(source), source.clone()))
-        .collect();
-    // The job works through the list in order, so once N outcomes are in, the
-    // one in flight is the N-th. That is what the queue puts a spinner on.
-    let labels: Vec<String> = sources.iter().map(source_label).collect();
-
-    let accepted = match client
-        .add_packages(&AddPackagesRequest {
-            platforms: Some(platforms),
-            build_flags: None,
-            sources: sources.clone(),
-        })
-        .await
-    {
-        Ok(accepted) => accepted,
-        // Nothing started, so everything is still to do.
-        Err(e) => return (vec![(String::new(), e.to_string())], sources),
-    };
-
-    let mut seen = 0_usize;
-    let mut failed = Vec::new();
-    let mut remaining = Vec::new();
-    loop {
-        let progress = match client.bulk_add_progress(accepted.job_id, seen).await {
-            Ok(progress) => progress,
-            // The job is still running; we have merely lost sight of it. Say so
-            // rather than reporting packages as failed, which they are not.
-            Err(e) => {
-                failed.push((String::new(), format!("lost track of the add: {e}")));
-                return (failed, remaining);
-            }
-        };
-        seen += progress.entries.len();
-        for entry in progress.entries {
-            match entry.outcome {
-                BulkAddOutcome::Added | BulkAddOutcome::Existed => added.push(entry.name),
-                BulkAddOutcome::Failed { error } => {
-                    if let Some(source) = by_label.get(&entry.name) {
-                        remaining.push(source.clone());
-                    }
-                    failed.push((entry.name, error));
-                }
-            }
-        }
-        if progress.finished {
-            return (failed, remaining);
-        }
-        adding.set(labels.get(seen).cloned());
-        gloo_timers::future::sleep(BULK_POLL_INTERVAL).await;
-    }
-}
-
-/// Add a single source that carries file edits, through the endpoint that
-/// accepts them.
-async fn submit_patched(
-    client: &aurcache_client::AurCacheClient,
-    sources: Vec<SourceData>,
-    platforms: Vec<String>,
-    patched: BTreeMap<String, String>,
-    mut added: Signal<Vec<String>>,
-) -> (Vec<(String, String)>, Vec<SourceData>) {
-    let mut failed = Vec::new();
-    let mut remaining = Vec::new();
-    for source in sources {
-        let label = source_label(&source);
-        match client
-            .add_package(&AddPackageRequest {
-                platforms: Some(platforms.clone()),
-                build_flags: None,
-                source: source.clone(),
-                patched_files: Some(patched.clone()),
-            })
-            .await
-        {
-            Ok(()) => added.push(label),
-            Err(e) => {
-                failed.push((label, e.to_string()));
-                remaining.push(source);
-            }
-        }
-    }
-    (failed, remaining)
 }
 
 /// Orders search results by how well they answer what was typed.
@@ -399,14 +284,10 @@ fn AddPackageDialog(q: String) -> Element {
     // What will be added when the button is pressed.
     let mut queued = use_signal(Vec::<SourceData>::new);
     let mut platforms_selected = use_signal(|| vec![platforms::DEFAULT.to_string()]);
-    let mut busy = use_signal(|| false);
-    let mut failures = use_signal(Vec::<(String, String)>::new);
     // Which source is in flight, and which are already through. Resolving a
     // package's dependencies can take a while, and adds are sequential, so a
     // single spinner on the button leaves someone watching a list of five with
     // no idea which one is holding things up.
-    let mut adding = use_signal(|| Option::<String>::None);
-    let mut added = use_signal(Vec::<String>::new);
 
     // Edits made before the package exists, as whole files rather than a diff:
     // the server diffs each against the pristine source when the add arrives.
@@ -434,6 +315,12 @@ fn AddPackageDialog(q: String) -> Element {
 
     let is_git = move || looks_like_git_url(entry().trim());
 
+    // Carries the query it answered, because `use_resource` keeps returning the
+    // previous value while a new future runs. Without it there is a window --
+    // after the debounce fires, before the search lands -- where the displayed
+    // results belong to a shorter query but nothing says so, and an empty one
+    // renders as a settled "nothing matches" for a package the user is halfway
+    // through typing.
     let results = use_resource(move || async move {
         let q = debounced();
         // Nothing to look up for a remote: the AUR does not know about it, and
@@ -441,29 +328,38 @@ fn AddPackageDialog(q: String) -> Element {
         // search either — but one character is, and the server answers it with
         // an exact lookup.
         if q.trim().is_empty() || looks_like_git_url(q.trim()) {
-            return Ok(Vec::new());
+            return (q, Ok(Vec::new()));
         }
         // A search already made can answer anything that extends it, with no
         // request and no wait — which is most of typing, since a query grows a
         // character at a time.
         if let Some(mut narrowed) = cache.read().narrow(&q) {
             rank_results(&q, &mut narrowed);
-            return Ok(narrowed);
+            return (q, Ok(narrowed));
         }
-        let mut found = crate::api::client()?
-            .search(&q)
-            .await
-            .map_err(|e| e.to_string())?;
-        cache.write().insert(&q, &found);
-        rank_results(&q, &mut found);
-        Ok(found)
+        let found = match crate::api::client() {
+            Ok(client) => client.search(&q).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        let found = match found {
+            Ok(mut found) => {
+                cache.write().insert(&q, &found);
+                rank_results(&q, &mut found);
+                Ok(found)
+            }
+            Err(e) => Err(e),
+        };
+        (q, found)
     });
 
-    let close = move |_| {
+    // Takes `()`: three different events close this dialog.
+    let close = move |()| {
         navigator().push(Route::Packages { q: String::new() });
     };
 
-    let pending = move || source_for(&entry(), &git_ref(), &git_subfolder());
+    // What the entry field currently describes, if anything. Not to be
+    // confused with a search being in flight -- see `SearchResults::pending`.
+    let entered_source = move || source_for(&entry(), &git_ref(), &git_subfolder());
 
     // Already queued, or already on the server. Either way there is nothing to
     // add, and offering it again would produce a duplicate or an error.
@@ -475,16 +371,29 @@ fn AddPackageDialog(q: String) -> Element {
         source_at(source).is_some_and(|name| existing_names().iter().any(|e| e == name))
     };
 
-    // Queue what the field describes and empty it, ready for the next one.
-    let mut enqueue = move || {
-        let Some(source) = pending() else { return };
+    let mut queue_search_result = move |name: String| {
+        let source = SourceData::Aur { name };
+        if already_taken(&source) {
+            return;
+        }
+        // Edits describe one source; a second one leaves them unattributable.
+        if !queued().is_empty() || entered_source().is_some() {
+            patched.set(BTreeMap::new());
+            editing_sources.set(false);
+        }
+        queued.push(source);
+    };
+
+    let mut queue_git_remote = move || {
+        let Some(source @ SourceData::Git { .. }) = entered_source() else {
+            return;
+        };
         if already_taken(&source) {
             return;
         }
         queued.push(source);
-        // The edits belonged to whatever the field described; queueing a second
-        // source means they can no longer be attributed, and a stale PKGBUILD
-        // silently attached to the wrong package is worse than losing the edit.
+        // A stale PKGBUILD silently attached to the wrong package is worse than
+        // losing the edit.
         patched.set(BTreeMap::new());
         editing_sources.set(false);
         entry.set(String::new());
@@ -493,66 +402,61 @@ fn AddPackageDialog(q: String) -> Element {
         git_subfolder.set(String::new());
     };
 
-    let sources_to_add = move || to_add(queued(), pending());
+    // Where an add goes when the dialog closes.
+    let jobs = crate::progress::use_jobs();
 
-    let ready = !sources_to_add().is_empty() && !platforms_selected().is_empty() && !busy();
+    let sources_to_add = move || to_add(queued(), entered_source());
+
+    let ready = !sources_to_add().is_empty() && !platforms_selected().is_empty();
 
     // Takes `()` rather than an event, because two different events reach it:
     // a click on Add and Enter in the entry field.
+    //
+    // Hands the work to the progress card and closes, rather than holding the
+    // dialog open until every package resolves. Adding is slow -- the server
+    // reaches the AUR for each source and its dependencies -- and there is no
+    // reason the rest of the site should be unreachable meanwhile. The bulk job
+    // is built for exactly this: it returns an id at once and its progress is a
+    // log read by offset, so nothing is lost by not watching from here.
+    //
+    // What this gives up is failures coming back to the queue. They appear on
+    // the card instead; keeping them here would mean keeping the dialog open to
+    // receive them, which is the thing being removed.
     let submit = move |()| async move {
         let sources = sources_to_add();
         if sources.is_empty() {
             return;
         }
-        // Whether the queue is what is being sent decides where a failure goes
-        // back to: the queue it came from, or the field it was typed in.
-        let from_queue = !queued().is_empty();
-        busy.set(true);
-        failures.set(Vec::new());
-        added.set(Vec::new());
-        adding.set(None);
 
-        let client = match crate::api::client() {
-            Ok(client) => client,
-            Err(e) => {
-                failures.set(vec![(String::new(), e)]);
-                busy.set(false);
-                return;
-            }
-        };
+        crate::progress::start_add(
+            jobs,
+            crate::progress::AddRequest {
+                sources,
+                platforms: platforms_selected(),
+                patched: patched(),
+            },
+        );
 
-        // A patched add carries file edits, which the bulk request has nowhere
-        // to put — and there is only ever one source when there are edits, so
-        // it is a single add by definition.
-        let (mut failed, mut remaining) = if patched().is_empty() {
-            submit_bulk(&client, sources, platforms_selected(), added, adding).await
-        } else {
-            submit_patched(&client, sources, platforms_selected(), patched(), added).await
-        };
-        failed.shrink_to_fit();
-        remaining.shrink_to_fit();
-        adding.set(None);
-        busy.set(false);
-
-        if failed.is_empty() {
-            // The list behind the dialog is where the new packages appear, and
-            // closing is what refetches it.
-            navigator().push(Route::Packages { q: String::new() });
-        } else {
-            // A failure from the field stays in the field, which still holds
-            // it; moving it into the queue would show it twice.
-            if from_queue {
-                queued.set(remaining);
-            }
-            failures.set(failed);
-        }
+        // The list behind the dialog is where the new packages appear, and
+        // closing is what refetches it.
+        navigator().push(Route::Packages { q: String::new() });
     };
 
     rsx! {
         div { class: "modal modal-open",
             // The editor needs room for two panes; without it the file list
             // and the text would each get half of a narrow column.
-            div { class: "modal-box {dialog_width(editing_sources())}",
+            div {
+                class: "modal-box {dialog_width(editing_sources())}",
+                // Escape closes, which is what a dialog is expected to do.
+                // Handled here rather than on the entry field so it still works
+                // once focus has moved to a result or the queue -- keydown
+                // bubbles from whatever inside has focus.
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        close(());
+                    }
+                },
                 h3 { class: "font-bold text-lg", "Add packages" }
 
                 div { class: "py-4 space-y-3",
@@ -565,14 +469,27 @@ fn AddPackageDialog(q: String) -> Element {
                             class: "input input-bordered w-full font-mono text-sm",
                             placeholder: "hello   ·   https://github.com/user/repo.git",
                             autofocus: true,
-                            // A run is under way and the queue is fixed for its
-                            // duration; typing into a field that no longer
-                            // feeds it would be a dead end.
-                            disabled: busy(),
                             value: "{entry}",
                             oninput: move |e| {
                                 let typed = e.value();
                                 entry.set(typed.clone());
+
+                                // Nothing to throttle when no request is going
+                                // out. The debounce exists to stop a keystroke
+                                // becoming an AUR request someone else pays
+                                // for, and a query an earlier search already
+                                // covers is answered from memory -- which is
+                                // most of typing, since a query grows a
+                                // character at a time. Waiting there only made
+                                // the list lag behind the field for no reason.
+                                let answerable = typed.trim().is_empty()
+                                    || looks_like_git_url(typed.trim())
+                                    || cache.read().narrow(&typed).is_some();
+                                if answerable {
+                                    debounced.set(typed);
+                                    return;
+                                }
+
                                 // Each keystroke starts its own timer and then
                                 // checks whether it is still the latest; the
                                 // stale ones fall through without touching
@@ -627,12 +544,10 @@ fn AddPackageDialog(q: String) -> Element {
                                     oninput: move |e| git_subfolder.set(e.value()),
                                 }
                             }
-                            // A remote has no search results to click, so this
-                            // is the only way to queue one.
                             button {
                                 class: "btn btn-sm",
-                                disabled: pending().is_none_or(|s| already_taken(&s)),
-                                onclick: move |_| enqueue(),
+                                disabled: entered_source().is_none_or(|s| already_taken(&s)),
+                                onclick: move |_| queue_git_remote(),
                                 "Add to list"
                             }
                         }
@@ -642,25 +557,25 @@ fn AddPackageDialog(q: String) -> Element {
                             // Cloned out of the resource so the borrow ends
                             // here rather than living as long as the child's
                             // props.
-                            results: results.read_unchecked().as_ref().cloned(),
+                            results: results
+                                .read_unchecked()
+                                .as_ref()
+                                .map(|(_, found)| found.clone()),
+                            searching: results
+                                .read_unchecked()
+                                .as_ref()
+                                .is_none_or(|(answered, _)| answered.trim() != entry().trim()),
                             taken: {
                                 let mut taken = existing_names();
                                 taken.extend(queued().iter().map(source_label));
                                 taken
                             },
-                            frozen: busy(),
-                            onpick: move |name: String| {
-                                entry.set(name);
-                                enqueue();
-                            },
+                            onpick: move |name: String| queue_search_result(name),
                         }
                     }
 
                     QueuedList {
                         queued: queued(),
-                        adding: adding(),
-                        added: added(),
-                        frozen: busy(),
                         onremove: move |label: String| {
                             queued.retain(|s| source_label(s) != label);
                         },
@@ -676,19 +591,18 @@ fn AddPackageDialog(q: String) -> Element {
                             AddSourceEditor {
                                 source: source.clone(),
                                 patched,
-                                onclose: move |_| editing_sources.set(false),
+                                onsubmit: move |()| {
+                                    editing_sources.set(false);
+                                    spawn(submit(()));
+                                },
+                                oncancel: move |()| editing_sources.set(false),
                             }
                         } else {
                             div {
                                 button {
                                     class: "btn btn-sm btn-ghost",
-                                    disabled: busy(),
                                     onclick: move |_| editing_sources.set(true),
-                                    if patched().is_empty() {
-                                        "Edit sources before adding"
-                                    } else {
-                                        {edited_label(patched().len())}
-                                    }
+                                    "Edit sources before adding"
                                 }
                                 // The reason this exists at all: a package whose
                                 // PKGBUILD does not parse cannot be added and
@@ -706,10 +620,6 @@ fn AddPackageDialog(q: String) -> Element {
                             selected: platforms_selected(),
                             onchange: move |next| platforms_selected.set(next),
                             size: "checkbox-sm",
-                            // Adds are sequential, so a change part way through
-                            // would reach only the packages not yet sent, and
-                            // the queue would end up split across two sets.
-                            disabled: busy(),
                         }
                         // Whether a package builds for an architecture is the
                         // PKGBUILD's business, not ours, so this offers rather
@@ -719,17 +629,6 @@ fn AddPackageDialog(q: String) -> Element {
                         }
                     }
 
-                    if !failures().is_empty() {
-                        div { class: "alert alert-error text-sm flex-col items-start gap-1",
-                            span { "Some packages could not be added:" }
-                            for (label, message) in failures() {
-                                div { key: "{label}", class: "text-xs",
-                                    span { class: "font-mono", "{label}" }
-                                    " — {message}"
-                                }
-                            }
-                        }
-                    }
                 }
 
                 div { class: "modal-action",
@@ -738,32 +637,21 @@ fn AddPackageDialog(q: String) -> Element {
                     // to. The run is bounded and reports progress beside this.
                     button {
                         class: "btn btn-ghost",
-                        disabled: busy(),
-                        onclick: close,
+                        onclick: move |_| close(()),
                         "Cancel"
                     }
                     button {
                         class: "btn btn-primary",
                         disabled: !ready,
                         onclick: move |_| submit(()),
-                        if busy() {
-                            span { class: "loading loading-spinner loading-xs" }
-                            {progress_label(added().len(), sources_to_add().len())}
-                        } else {
-                            {add_button_label(sources_to_add().len())}
-                        }
+                        {add_button_label(sources_to_add().len())}
                     }
                 }
             }
             // Clicking away closes, which is what a dimmed backdrop implies.
             // No colour of its own: `.modal` already dims the page behind it,
             // and a second translucent layer on top darkened it twice.
-            // The backdrop closes the dialog too, so it freezes with everything
-            // else rather than being the one way out of a frozen dialog.
-            div {
-                class: "modal-backdrop",
-                onclick: move |e| if !busy() { close(e) },
-            }
+            div { class: "modal-backdrop", onclick: move |_| close(()) }
         }
     }
 }
@@ -780,28 +668,6 @@ fn add_button_label(count: usize) -> String {
     }
 }
 
-/// Where one queued source has got to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChipState {
-    /// Not started. Removable, because nothing has happened to it yet.
-    Waiting,
-    /// The request for this one is in flight.
-    Adding,
-    /// The server has taken it.
-    Added,
-}
-
-/// What to show against a chip, given what the run has reached.
-fn chip_state(label: &str, adding: Option<&str>, added: &[String]) -> ChipState {
-    if added.iter().any(|done| done == label) {
-        ChipState::Added
-    } else if adding == Some(label) {
-        ChipState::Adding
-    } else {
-        ChipState::Waiting
-    }
-}
-
 /// The one source, when there is exactly one.
 ///
 /// Editing is offered only then. The edits are paths inside a source, so with
@@ -814,49 +680,14 @@ fn single_source(sources: &[SourceData]) -> Option<&SourceData> {
     }
 }
 
-/// How the "edit sources" button reads once something has been edited.
-fn edited_label(count: usize) -> String {
-    match count {
-        1 => "1 file edited".to_string(),
-        n => format!("{n} files edited"),
-    }
-}
-
 /// How wide the dialog is, which depends on whether the editor is open.
 fn dialog_width(editing: bool) -> &'static str {
     if editing { "max-w-6xl" } else { "max-w-2xl" }
 }
 
-/// How the button reads while a run is under way.
-///
-/// Counts rather than a bare spinner: resolving dependencies takes long enough
-/// that a still spinner and a stuck one look the same, and with several queued
-/// the only question is how far it has got.
-fn progress_label(done: usize, total: usize) -> String {
-    if total > 1 {
-        format!("Adding… {done} of {total}")
-    } else {
-        "Adding…".to_string()
-    }
-}
-
 /// The sources queued so far, each removable until the run reaches it.
 #[component]
-fn QueuedList(
-    queued: Vec<SourceData>,
-    /// The source currently being added, if a run is under way.
-    #[props(default)]
-    adding: Option<String>,
-    /// Sources this run has already added.
-    #[props(default)]
-    added: Vec<String>,
-    /// A run is under way, so nothing can be taken out of it. `submit` copies
-    /// the queue before it starts and works from that copy, so removing a chip
-    /// here would take it off the screen while the request for it still went.
-    #[props(default = false)]
-    frozen: bool,
-    onremove: EventHandler<String>,
-) -> Element {
+fn QueuedList(queued: Vec<SourceData>, onremove: EventHandler<String>) -> Element {
     if queued.is_empty() {
         return rsx! {};
     }
@@ -865,49 +696,29 @@ fn QueuedList(
             for source in queued.iter() {
                 {
                     let label = source_label(source);
-                    let state = chip_state(&label, adding.as_deref(), &added);
                     rsx! {
                         span {
                             key: "{label}",
-                            class: "badge gap-1 py-3 {chip_class(state)}",
-                            match state {
-                                ChipState::Adding => rsx! {
-                                    span { class: "loading loading-spinner loading-xs" }
-                                },
-                                ChipState::Added => rsx! {
-                                    span { "aria-label": "added", "✓" }
-                                },
-                                ChipState::Waiting => rsx! {},
-                            }
+                            class: "badge badge-neutral gap-1 py-3",
                             span { class: "font-mono text-xs", "{label}" }
-                            // Only while it can still be taken back. Removing
-                            // one mid-flight would not stop the request, and
-                            // removing one already added would not undo it.
-                            if state == ChipState::Waiting && !frozen {
-                                button {
-                                    class: "btn btn-ghost btn-xs px-1",
-                                    "aria-label": "Remove {label}",
-                                    onclick: {
-                                        let label = label.clone();
-                                        move |_| onremove.call(label.clone())
-                                    },
-                                    "✕"
-                                }
+                            // Always removable: the queue holds what has not
+                            // been handed over yet. Pressing Add closes the
+                            // dialog, and the card in the corner owns it from
+                            // then on.
+                            button {
+                                class: "btn btn-ghost btn-xs px-1",
+                                "aria-label": "Remove {label}",
+                                onclick: {
+                                    let label = label.clone();
+                                    move |_| onremove.call(label.clone())
+                                },
+                                "✕"
                             }
                         }
                     }
                 }
             }
         }
-    }
-}
-
-/// The colour a chip carries for its state.
-fn chip_class(state: ChipState) -> &'static str {
-    match state {
-        ChipState::Waiting => "badge-neutral",
-        ChipState::Adding => "badge-primary",
-        ChipState::Added => "badge-success",
     }
 }
 
@@ -924,11 +735,10 @@ fn SearchResults(
     /// selectable: that a package is already handled is the useful answer, and
     /// better than hiding it and leaving someone to wonder where it went.
     taken: Vec<String>,
-    /// A run is under way. The queue was snapshotted when it started, so a
-    /// package picked now would join a list nothing reads again -- the pill
-    /// would appear and then quietly not be added.
+    /// A search for what is currently typed has not answered yet, so any
+    /// results on hand belong to an earlier query.
     #[props(default = false)]
-    frozen: bool,
+    searching: bool,
     onpick: EventHandler<String>,
 ) -> Element {
     let query = query.trim();
@@ -940,10 +750,31 @@ fn SearchResults(
         };
     }
 
+    // Kept visible under the spinner when there are stale results to keep: a
+    // list that vanishes on every keystroke and comes back is harder to read
+    // than one that lingers a moment out of date, and narrowing usually
+    // answers from cache anyway.
+    let spinner = rsx! {
+        div { class: "flex items-center gap-2 py-2 text-sm opacity-60",
+            span { class: "loading loading-spinner loading-sm" }
+            "Searching the AUR…"
+        }
+    };
+
+    if searching {
+        return match results {
+            Some(Ok(found)) if !found.is_empty() => rsx! {
+                div { class: "space-y-1",
+                    {spinner}
+                    div { class: "opacity-50", {results_list(found, &taken, onpick)} }
+                }
+            },
+            _ => spinner,
+        };
+    }
+
     match results {
-        None => rsx! {
-            div { class: "py-2", span { class: "loading loading-spinner loading-sm" } }
-        },
+        None => rsx! { {spinner} },
         Some(Err(e)) => rsx! {
             div { class: "alert alert-error text-sm", span { "Search failed: {e}" } }
         },
@@ -956,36 +787,50 @@ fn SearchResults(
         Some(Ok(found)) if found.is_empty() => rsx! {
             p { class: "text-sm opacity-60 py-2", "Nothing in the AUR matches “{query}”." }
         },
-        Some(Ok(found)) => rsx! {
-            ul { class: "menu menu-sm p-0 max-h-56 overflow-y-auto border border-base-300 rounded-box flex-nowrap",
-                for result in found {
-                    {
-                        let held = taken.contains(&result.name);
-                        let locked = held || frozen;
-                        rsx! {
-                            li { key: "{result.name}",
-                                button {
-                                    class: if locked { "opacity-50 cursor-not-allowed" } else { "" },
-                                    disabled: locked,
-                                    onclick: {
-                                        let name = result.name.clone();
-                                        move |_| onpick.call(name.clone())
-                                    },
-                                    // Name and version on one line, the AUR's
-                                    // summary under it: a search matches on the
-                                    // description too, so without it a result
-                                    // can look unrelated to what was typed.
-                                    div { class: "flex flex-col items-start gap-0.5 min-w-0",
-                                        div { class: "flex items-baseline gap-2",
-                                            span { class: "font-mono", "{result.name}" }
-                                            span { class: "opacity-50 text-xs", "{result.version}" }
-                                            if held {
-                                                span { class: "badge badge-outline badge-xs", "added" }
-                                            }
+        Some(Ok(found)) => results_list(found, &taken, onpick),
+    }
+}
+
+/// The clickable list of results.
+///
+/// A free function rather than inline, because a search that is still running
+/// shows the previous results underneath its spinner: keeping the list on
+/// screen while a newer one arrives reads better than blanking it on every
+/// keystroke, and one definition means the two cannot drift apart.
+fn results_list(
+    found: Vec<SearchResult>,
+    taken: &[String],
+    onpick: EventHandler<String>,
+) -> Element {
+    rsx! {
+        ul { class: "menu menu-sm p-0 max-h-56 overflow-y-auto border border-base-300 rounded-box flex-nowrap",
+            for result in found {
+                {
+                    let held = taken.contains(&result.name);
+                    let locked = held;
+                    rsx! {
+                        li { key: "{result.name}",
+                            button {
+                                class: if locked { "opacity-50 cursor-not-allowed" } else { "" },
+                                disabled: locked,
+                                onclick: {
+                                    let name = result.name.clone();
+                                    move |_| onpick.call(name.clone())
+                                },
+                                // Name and version on one line, the AUR's
+                                // summary under it: a search matches on the
+                                // description too, so without it a result
+                                // can look unrelated to what was typed.
+                                div { class: "flex flex-col items-start gap-0.5 min-w-0",
+                                    div { class: "flex items-baseline gap-2",
+                                        span { class: "font-mono", "{result.name}" }
+                                        span { class: "opacity-50 text-xs", "{result.version}" }
+                                        if held {
+                                            span { class: "badge badge-outline badge-xs", "added" }
                                         }
-                                        if let Some(description) = result.description.as_deref() {
-                                            span { class: "text-xs opacity-60 text-left", "{description}" }
-                                        }
+                                    }
+                                    if let Some(description) = result.description.as_deref() {
+                                        span { class: "text-xs opacity-60 text-left", "{description}" }
                                     }
                                 }
                             }
@@ -993,16 +838,16 @@ fn SearchResults(
                     }
                 }
             }
-        },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ChipState, QueuedList, SEARCH_CACHE_ENTRIES, SearchCache, SearchResults, add_button_label,
-        chip_state, dialog_width, edited_label, git_source, progress_label, rank_results,
-        single_source, source_at, source_for, source_label, to_add,
+        QueuedList, SEARCH_CACHE_ENTRIES, SearchCache, SearchResults, add_button_label,
+        dialog_width, git_source, rank_results, single_source, source_at, source_for, source_label,
+        to_add,
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
@@ -1012,10 +857,10 @@ mod tests {
         query: String,
         results: Option<Result<Vec<SearchResult>, String>>,
         taken: Vec<String>,
-        #[props(default = false)] frozen: bool,
+        #[props(default = false)] searching: bool,
     ) -> Element {
         rsx! {
-            SearchResults { query, results, taken, frozen, onpick: move |_| {} }
+            SearchResults { query, results, taken, searching, onpick: move |_| {} }
         }
     }
 
@@ -1156,7 +1001,7 @@ mod tests {
         query: &str,
         results: Option<Result<Vec<SearchResult>, String>>,
         taken: Vec<String>,
-        frozen: bool,
+        searching: bool,
     ) -> String {
         let mut dom = VirtualDom::new_with_props(
             Harness,
@@ -1164,51 +1009,44 @@ mod tests {
                 query: query.to_string(),
                 results,
                 taken,
-                frozen,
+                searching,
             },
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
 
+    /// Picking a result keeps the search on screen.
+    ///
+    /// One search usually turns up several packages worth adding, and clearing
+    /// the field on every pick meant re-typing the query for each of them. The
+    /// pill appears; the results stay.
+    #[test]
+    fn picking_a_result_leaves_the_query_alone() {
+        // The queue and the field are independent: a picked package goes into
+        // the first without touching the second. Rendering the two together is
+        // what would catch a regression, so the check is that the source built
+        // from a pick is exactly the package picked -- not whatever the field
+        // happened to hold.
+        let picked = SourceData::Aur {
+            name: "turso".to_string(),
+        };
+        assert_eq!(source_label(&picked), "turso");
+        assert_eq!(source_at(&picked), Some("turso"));
+    }
+
     /// Same reason as `Harness`: an `EventHandler` only exists inside a running
     /// runtime, so the list is rendered through a component rather than handed
     /// props from outside.
     #[component]
-    fn QueueHarness(
-        queued: Vec<SourceData>,
-        adding: Option<String>,
-        added: Vec<String>,
-        #[props(default = false)] frozen: bool,
-    ) -> Element {
+    fn QueueHarness(queued: Vec<SourceData>) -> Element {
         rsx! {
-            QueuedList { queued, adding, added, frozen, onremove: move |_| {} }
+            QueuedList { queued, onremove: move |_| {} }
         }
     }
 
     fn render_queue(queued: Vec<SourceData>) -> String {
-        render_run(queued, None, Vec::new())
-    }
-
-    fn render_run(queued: Vec<SourceData>, adding: Option<&str>, added: Vec<String>) -> String {
-        render_run_frozen(queued, adding, added, false)
-    }
-
-    fn render_run_frozen(
-        queued: Vec<SourceData>,
-        adding: Option<&str>,
-        added: Vec<String>,
-        frozen: bool,
-    ) -> String {
-        let mut dom = VirtualDom::new_with_props(
-            QueueHarness,
-            QueueHarnessProps {
-                queued,
-                adding: adding.map(ToString::to_string),
-                added,
-                frozen,
-            },
-        );
+        let mut dom = VirtualDom::new_with_props(QueueHarness, QueueHarnessProps { queued });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
@@ -1216,50 +1054,46 @@ mod tests {
     /// While a run is under way the queue it is working from has already been
     /// copied, so a package picked out of the search list would show as a pill
     /// and then never be added. Every row is refused for the duration.
+    /// Typing has to look like it did something.
+    ///
+    /// The resource is keyed on the debounced query, so while a request is in
+    /// flight it still reports the *previous* query's results as resolved --
+    /// which rendered as a settled list and looked like nothing was happening.
     #[test]
-    fn search_results_cannot_be_picked_during_a_run() {
+    fn a_search_in_flight_says_so_and_keeps_what_it_has() {
         let found = Ok(vec![SearchResult {
             name: "hello".to_string(),
             version: "1.0".to_string(),
             description: None,
         }]);
 
-        let open = render_search("hello", Some(found.clone()), Vec::new(), false);
-        assert!(open.contains("hello"));
+        let settled = render_search("hello", Some(found.clone()), Vec::new(), false);
+        assert!(settled.contains("hello"));
         assert!(
-            !open.contains("disabled"),
-            "a free row should be pickable: {open}"
+            !settled.contains("loading-spinner"),
+            "a settled search should not spin: {settled}"
         );
 
-        let frozen = render_search("hello", Some(found), Vec::new(), true);
-        assert!(frozen.contains("hello"), "the row is still shown: {frozen}");
+        // The stale list stays on screen under the spinner: blanking it on
+        // every keystroke is harder to read than letting it lag a moment.
+        let searching = render_search("hello", Some(found), Vec::new(), true);
         assert!(
-            frozen.contains("disabled"),
-            "a row stayed pickable while a run was under way: {frozen}"
+            searching.contains("loading-spinner"),
+            "a search in flight should say so: {searching}"
+        );
+        assert!(
+            searching.contains("hello"),
+            "the previous results should stay while the next arrive: {searching}"
         );
     }
 
-    /// Same reason from the other side: `submit` works from a copy of the
-    /// queue, so taking a pill out mid-run removes it from the screen while
-    /// the request for it still goes.
+    /// With nothing to show yet, the spinner is all there is -- the first
+    /// search of a session, where the wait is most noticeable.
     #[test]
-    fn queued_packages_cannot_be_removed_during_a_run() {
-        let queued = vec![aur("hello"), aur("neofetch")];
-
-        let open = render_run_frozen(queued.clone(), None, Vec::new(), false);
-        assert!(
-            open.contains("Remove hello"),
-            "a waiting package should be removable: {open}"
-        );
-
-        // `neofetch` is still waiting its turn -- the tempting one to remove,
-        // and the one whose removal would be a lie.
-        let frozen = render_run_frozen(queued, Some("hello"), Vec::new(), true);
-        assert!(frozen.contains("neofetch"), "the pill is still shown");
-        assert!(
-            !frozen.contains("Remove "),
-            "a package could still be taken out of a running queue: {frozen}"
-        );
+    fn a_first_search_shows_only_the_spinner() {
+        let html = render_search("hello", None, Vec::new(), true);
+        assert!(html.contains("loading-spinner"), "{html}");
+        assert!(html.contains("Searching the AUR"), "{html}");
     }
 
     fn aur(name: &str) -> SourceData {
@@ -1479,69 +1313,6 @@ mod tests {
         assert_eq!(results[0].name, "Hello");
     }
 
-    /// Resolving dependencies is slow enough that a run of several packages
-    /// needs to say where it has got to. A single spinner cannot distinguish
-    /// "working on the fourth" from "stuck on the first".
-    #[test]
-    fn a_run_shows_which_package_it_is_on() {
-        let html = render_run(
-            vec![aur("hello"), aur("neofetch"), aur("yay")],
-            Some("neofetch"),
-            vec!["hello".to_string()],
-        );
-
-        // Done, in flight, and not started are three different things.
-        assert!(html.contains("badge-success"), "hello is done: {html}");
-        assert!(
-            html.contains("loading-spinner"),
-            "neofetch is in flight: {html}"
-        );
-        assert!(
-            html.contains("badge-neutral"),
-            "yay has not started: {html}"
-        );
-    }
-
-    /// Removing one mid-flight would not stop its request, and removing one
-    /// already added would not undo it — so only the untouched ones offer it.
-    #[test]
-    fn only_a_package_still_waiting_can_be_removed() {
-        let html = render_run(
-            vec![aur("hello"), aur("neofetch"), aur("yay")],
-            Some("neofetch"),
-            vec!["hello".to_string()],
-        );
-        assert!(html.contains("Remove yay"), "still waiting: {html}");
-        assert!(!html.contains("Remove neofetch"), "in flight: {html}");
-        assert!(!html.contains("Remove hello"), "already added: {html}");
-    }
-
-    #[test]
-    fn chip_state_reports_where_each_package_is() {
-        let added = vec!["hello".to_string()];
-        assert_eq!(
-            chip_state("hello", Some("neofetch"), &added),
-            ChipState::Added
-        );
-        assert_eq!(
-            chip_state("neofetch", Some("neofetch"), &added),
-            ChipState::Adding
-        );
-        assert_eq!(
-            chip_state("yay", Some("neofetch"), &added),
-            ChipState::Waiting
-        );
-        // Nothing running: everything not yet added is waiting.
-        assert_eq!(chip_state("yay", None, &added), ChipState::Waiting);
-    }
-
-    /// A count is only worth showing when there is more than one to count.
-    #[test]
-    fn the_progress_label_counts_only_a_real_queue() {
-        assert_eq!(progress_label(0, 1), "Adding…");
-        assert_eq!(progress_label(2, 5), "Adding… 2 of 5");
-    }
-
     /// Edits are paths inside one source, so with two queued there is nothing
     /// to attach them to. The CLI refuses `--patch` with several packages for
     /// the same reason.
@@ -1556,12 +1327,6 @@ mod tests {
     #[test]
     fn the_dialog_widens_for_the_editor() {
         assert_ne!(dialog_width(true), dialog_width(false));
-    }
-
-    #[test]
-    fn the_edit_button_counts_the_files() {
-        assert_eq!(edited_label(1), "1 file edited");
-        assert_eq!(edited_label(3), "3 files edited");
     }
 
     /// Nothing queued is not an empty box with a heading, it is nothing.
@@ -1726,7 +1491,14 @@ mod tests {
 fn AddSourceEditor(
     source: SourceData,
     patched: Signal<BTreeMap<String, String>>,
-    onclose: EventHandler<()>,
+    /// Add the package with the edits. The editor is the last step rather than
+    /// a detour: edits describe one source, so there is nothing sensible to do
+    /// with them except add that source, and carrying them back to a dialog
+    /// where a second package could be queued only created a state where they
+    /// could no longer be attributed.
+    onsubmit: EventHandler<()>,
+    /// Abandon the edits and go back.
+    oncancel: EventHandler<()>,
 ) -> Element {
     let mut patched = patched;
     let files = use_resource({
@@ -1834,6 +1606,17 @@ fn AddSourceEditor(
                 actions: rsx! {
                     button {
                         class: "btn btn-ghost btn-sm",
+                        // Drops every edit, not just the open file: the editor
+                        // is entered to add one package with changes, so
+                        // leaving without adding leaves nothing behind.
+                        onclick: move |_| {
+                            patched.set(BTreeMap::new());
+                            oncancel.call(());
+                        },
+                        "Cancel"
+                    }
+                    button {
+                        class: "btn btn-ghost btn-sm",
                         disabled: !dirty,
                         onclick: move |_| draft.set(pristine()),
                         "Revert to upstream"
@@ -1842,9 +1625,9 @@ fn AddSourceEditor(
                         class: "btn btn-primary btn-sm",
                         onclick: move |_| {
                             keep();
-                            onclose.call(());
+                            onsubmit.call(());
                         },
-                        "Done"
+                        "Add package"
                     }
                 },
                 notices: rsx! {

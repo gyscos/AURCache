@@ -18,6 +18,7 @@ mod dates;
 mod format;
 mod listing;
 mod platforms;
+mod progress;
 mod routes;
 mod screens;
 mod shell;
@@ -40,8 +41,12 @@ fn App() -> Element {
     // Provided here so changing the format in the sidebar re-renders the dates
     // on the current page rather than only on the next navigation.
     dates::use_date_style_provider();
+    // Above the router, so an add's progress card survives navigating away
+    // from the page that started it -- which is the point of it existing.
+    progress::use_jobs_provider();
 
     rsx! {
         Router::<Route> {}
+        progress::ProgressOverlay {}
     }
 }
