@@ -37,9 +37,22 @@ pub fn scheme_from_url(url: &str) -> &str {
     url.split_once("://").map_or("http", |(scheme, _)| scheme)
 }
 
+/// Whether the host names the machine we are on.
+///
+/// Two callers, for the same underlying reason: a worker beside the server can
+/// take the local shortcut, and a `localhost` published URL is the unconfigured
+/// default rather than an address any other machine could use.
+#[must_use]
+pub fn is_loopback(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{host_from_url, scheme_from_url};
+    use super::{host_from_url, is_loopback, scheme_from_url};
 
     #[test]
     fn a_host_is_read_out_of_the_usual_shapes() {
@@ -83,6 +96,15 @@ mod tests {
         assert_eq!(host_from_url(""), None);
         assert_eq!(host_from_url("http://"), None);
         assert_eq!(host_from_url("http:///api"), None);
+    }
+
+    #[test]
+    fn loopback_names_are_recognised() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"] {
+            assert!(is_loopback(host), "{host}");
+        }
+        assert!(!is_loopback("aurcache.example.com"));
+        assert!(!is_loopback("192.168.1.10"));
     }
 
     #[test]

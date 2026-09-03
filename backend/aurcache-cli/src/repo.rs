@@ -6,7 +6,7 @@
 //! the same host on the mirror port. So this command prints the finished block
 //! with nothing left to substitute.
 
-use crate::url::{host_from_url, scheme_from_url};
+use crate::url::{host_from_url, is_loopback, scheme_from_url};
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_common::ports::AURCACHE_MIRROR_PORT;
 use serde::Serialize;
@@ -48,14 +48,47 @@ pub fn repo_server_url(api_url: &str, port: u16) -> Result<String> {
     ))
 }
 
+/// The `Server =` value for an instance that reported publishing at
+/// `public_url`, as reached from here at `api_url`.
+///
+/// Scheme, port and path always come from the server: it is the only party that
+/// knows whether the repository sits on a non-default port, under a path, or
+/// behind a reverse proxy. The host is decided here, because that is the part
+/// the server cannot know — it sees only how it was reached, not how the
+/// machine editing `pacman.conf` gets there.
+pub fn server_url_from_public(public_url: &str, api_url: &str) -> Result<String> {
+    let host = match host_from_url(public_url) {
+        // A published host naming a real address is a deliberate statement of
+        // how clients should reach the repository, and outranks whatever
+        // address we happen to be talking to.
+        Some(published) if !is_loopback(published) => published.to_string(),
+        // `localhost` is the unconfigured default and is only ever right on the
+        // server itself. Substitute the address that demonstrably works here.
+        _ => host_from_url(api_url)
+            .ok_or_else(|| anyhow!("could not read a host out of the API URL `{api_url}`"))?
+            .to_string(),
+    };
+    Ok(aurcache_common::repo::server_url_for_host(
+        public_url, &host,
+    ))
+}
+
 /// Build the stanza for the instance at `api_url`.
+///
+/// `published` is what the server said about itself, when it could be asked.
+/// An explicit `port` outranks it: someone passing `--port` is correcting us,
+/// not asking to be corrected.
 pub fn repo_config(
     api_url: &str,
     port: Option<u16>,
     name: Option<String>,
     siglevel: Option<String>,
+    published: Option<&str>,
 ) -> Result<RepoConfig> {
-    let server = repo_server_url(api_url, port.unwrap_or(AURCACHE_MIRROR_PORT))?;
+    let server = match (port, published) {
+        (None, Some(public_url)) => server_url_from_public(public_url, api_url)?,
+        (port, _) => repo_server_url(api_url, port.unwrap_or(AURCACHE_MIRROR_PORT))?,
+    };
     let name = name.unwrap_or_else(|| DEFAULT_REPO_NAME.to_string());
     let siglevel = siglevel.unwrap_or_else(|| DEFAULT_SIGLEVEL.to_string());
     let block = format!("[{name}]\nSigLevel = {siglevel}\nServer = {server}\n");
@@ -241,7 +274,7 @@ mod tests {
     /// the instance builds, so the CLI must not expand it.
     #[test]
     fn the_block_is_three_lines_and_keeps_the_arch_variable() {
-        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let config = repo_config("http://localhost:8080/api", None, None, None, None).unwrap();
         let lines: Vec<&str> = config.block.lines().collect();
         assert_eq!(lines.len(), 3, "{:?}", config.block);
         assert_eq!(lines[0], format!("[{DEFAULT_REPO_NAME}]"));
@@ -257,6 +290,7 @@ mod tests {
             Some(9000),
             Some("mine".to_string()),
             Some("Never".to_string()),
+            None,
         )
         .unwrap();
         assert!(config.block.contains("[mine]"), "{:?}", config.block);
@@ -327,7 +361,7 @@ mod tests {
         let path = dir.path().join("pacman.conf");
         std::fs::write(&path, "[options]\nHoldPkg = pacman\n").unwrap();
 
-        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let config = repo_config("http://localhost:8080/api", None, None, None, None).unwrap();
         let result = install_stanza(&path, &config).unwrap();
 
         assert!(result.changed);
@@ -347,7 +381,7 @@ mod tests {
         let path = dir.path().join("pacman.conf");
         std::fs::write(&path, "[options]\n").unwrap();
 
-        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let config = repo_config("http://localhost:8080/api", None, None, None, None).unwrap();
         assert!(install_stanza(&path, &config).unwrap().changed);
         let once = std::fs::read_to_string(&path).unwrap();
 
@@ -356,10 +390,73 @@ mod tests {
         assert_eq!(once.matches("[repo]").count(), 1, "{once}");
     }
 
+    /// The bug this exists to fix: a deployment publishing on a non-default
+    /// port was previously given 8081 regardless.
+    #[test]
+    fn the_servers_port_and_path_are_taken_over_the_default() {
+        let config = repo_config(
+            "http://192.168.1.5:8080/api",
+            None,
+            None,
+            None,
+            Some("http://localhost:9000/arch"),
+        )
+        .unwrap();
+        assert_eq!(config.server, "http://192.168.1.5:9000/arch/$arch");
+    }
+
+    /// A published host that names a real address was configured deliberately —
+    /// a reverse proxy, say — and the client should use it rather than the
+    /// address we happen to be talking to.
+    #[test]
+    fn a_real_published_host_outranks_the_api_host() {
+        let config = repo_config(
+            "http://192.168.1.5:8080/api",
+            None,
+            None,
+            None,
+            Some("https://aurcache.example.com/repo"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.server,
+            "https://aurcache.example.com:8081/repo/$arch"
+        );
+    }
+
+    /// `localhost` is the unconfigured default: right only on the server
+    /// itself, so the address that works from here replaces it.
+    #[test]
+    fn a_localhost_publication_is_replaced_with_a_usable_host() {
+        let config = repo_config(
+            "http://192.168.1.5:8080/api",
+            None,
+            None,
+            None,
+            Some("http://localhost:8081"),
+        )
+        .unwrap();
+        assert_eq!(config.server, "http://192.168.1.5:8081/$arch");
+    }
+
+    /// Someone passing `--port` is correcting us, not asking to be corrected.
+    #[test]
+    fn an_explicit_port_outranks_the_servers_answer() {
+        let config = repo_config(
+            "http://192.168.1.5:8080/api",
+            Some(9999),
+            None,
+            None,
+            Some("http://localhost:9000"),
+        )
+        .unwrap();
+        assert!(config.server.contains(":9999/"), "{}", config.server);
+    }
+
     #[test]
     fn a_missing_pacman_conf_is_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
-        let config = repo_config("http://localhost:8080/api", None, None, None).unwrap();
+        let config = repo_config("http://localhost:8080/api", None, None, None, None).unwrap();
         let err = install_stanza(&dir.path().join("nope.conf"), &config).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }

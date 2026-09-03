@@ -117,6 +117,7 @@ pub fn init_api(
                 (path = "/api", api = crate::auth::AuthApi, tags = ["Auth"]),
                 (path = "/api", api = crate::build::BuildApi, tags = ["Build"]),
                 (path = "/api", api = crate::health::HealthApi, tags = ["Health"]),
+                (path = "/api", api = crate::repo::RepoApi, tags = ["Repo"]),
                 (path = "/api", api = crate::package::PackageApi, tags = ["Package"]),
                 (path = "/api", api = crate::stats::StatsApi, tags = ["Stats"]),
                 (path = "/api", api = crate::dump::DumpApi, tags = ["Dump"]),

@@ -29,6 +29,7 @@ pub use aurcache_common::api::package::{
     AddPackage as AddPackageRequest, SourcePreviewFileRequest, SourcePreviewRequest,
 };
 pub use aurcache_common::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
+pub use aurcache_common::api::repo::RepoInfo;
 pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_common::api::stats::{GraphDataPoint, ListStats, UserInfo};
 pub use aurcache_common::api::waiting::WaitingReason;
@@ -123,6 +124,12 @@ impl AurCacheClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// How this instance publishes its pacman repository.
+    pub async fn repo_info(&self) -> Result<RepoInfo> {
+        self.request_json::<RepoInfo, Value>(Method::GET, "/repo/info", &[], None)
+            .await
     }
 
     pub async fn health(&self) -> Result<()> {

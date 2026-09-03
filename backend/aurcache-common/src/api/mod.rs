@@ -11,6 +11,7 @@ pub mod builds;
 pub mod dump;
 pub mod operations;
 pub mod package;
+pub mod repo;
 pub mod settings;
 pub mod stats;
 pub mod waiting;

@@ -15,6 +15,7 @@ pub mod builder;
 #[cfg(feature = "fs")]
 pub mod fs;
 pub mod ports;
+pub mod repo;
 pub mod settings;
 pub mod source;
 pub mod worker;

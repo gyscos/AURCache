@@ -15,6 +15,7 @@ pub mod init;
 // the server serialises, instead of a hand-mirrored copy.
 pub mod models;
 mod package;
+mod repo;
 mod settings;
 pub mod spa;
 mod stats;

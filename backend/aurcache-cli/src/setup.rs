@@ -19,6 +19,9 @@
 //! for the approve button, which is the single most common first-run stumble.
 
 use crate::compose::{ENROLLMENT_DIR, WorkerEnv};
+/// Whether a worker can take the local shortcut — shared volume, shared network,
+/// no fingerprint — or has to be configured as a remote one.
+pub use crate::url::is_loopback as is_local_host;
 use anyhow::{Context, Result, bail};
 use aurcache_common::ports::{AURCACHE_HTTP_PORT, AURCACHE_MIRROR_PORT, AURCACHE_WORKER_PORT};
 use serde::Serialize;
@@ -231,18 +234,6 @@ pub fn remote_worker_env(mut env: WorkerEnv, server_url: &str) -> WorkerEnv {
     env.url = Some(server_url.to_string());
     env.enrollment_dir = None;
     env
-}
-
-/// Whether the address names this machine.
-///
-/// Decides whether a worker can take the local shortcut — shared volume, shared
-/// network, no fingerprint — or has to be configured as a remote one.
-#[must_use]
-pub fn is_local_host(host: &str) -> bool {
-    matches!(
-        host,
-        "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
-    )
 }
 
 /// Create a docker object, treating "it already exists" as success.

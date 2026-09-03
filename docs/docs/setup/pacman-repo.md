@@ -47,10 +47,16 @@ it also appends cleanly by hand:
 aurcache-cli repo config | sudo tee -a /etc/pacman.conf
 ```
 
-This needs no API token — it is arithmetic on the configured URL, not a request
-— so it works before the instance is otherwise set up. `--port`, `--name` and
-`--siglevel` override the defaults for a deployment that publishes the
-repository somewhere else.
+With a token configured, it asks the server how it actually publishes the
+repository rather than assuming the default port — a deployment behind a reverse
+proxy, on another port, or under a path is described correctly. The host is still
+decided locally, because the server only sees how *it* was reached: a published
+address that names a real host is kept, and the `localhost` default is replaced
+with the address that works from here.
+
+Without a token it falls back to the configured URL's host on the default port,
+so it still works before the instance is otherwise set up. `--offline` forces
+that fallback; `--port`, `--name` and `--siglevel` override the result outright.
 
 `$arch` is pacman's own variable and is deliberately left unexpanded: one stanza
 serves every architecture the instance builds for.

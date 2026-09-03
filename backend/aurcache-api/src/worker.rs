@@ -77,7 +77,7 @@ fn env_i64(key: &str, default: i64) -> i64 {
 }
 
 /// Base URL workers should use for the public pacman repo (`[repo] Server`).
-fn public_repo_url() -> String {
+pub(crate) fn public_repo_url() -> String {
     env::var("AURCACHE_PUBLIC_URL").unwrap_or_else(|_| {
         format!(
             "http://localhost:{}",
@@ -98,24 +98,15 @@ fn repo_template() -> String {
 }
 
 /// Pure form of [`repo_template`].
+///
+/// The host substitution is shared with the CLI, which answers the same
+/// question for a `pacman.conf` — see [`aurcache_common::repo`].
 fn render_repo_template(public_url: &str) -> String {
-    let trimmed = public_url.trim_end_matches('/');
-    // Split off the scheme, then replace only the host portion of the
-    // authority, keeping any port and path intact.
-    let (scheme, rest) = match trimmed.split_once("://") {
-        Some((scheme, rest)) => (scheme, rest),
-        None => ("http", trimmed),
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
-    };
-    let port = authority.rsplit_once(':').map_or_else(
-        || format!(":{}", aurcache_common::ports::AURCACHE_MIRROR_PORT),
-        |(_, port)| format!(":{port}"),
+    let server = aurcache_common::repo::server_url_for_host(
+        public_url,
+        aurcache_common::worker::REPO_HOST_PLACEHOLDER,
     );
-    let placeholder = aurcache_common::worker::REPO_HOST_PLACEHOLDER;
-    format!("[repo]\nSigLevel = Never\nServer = {scheme}://{placeholder}{port}{path}/$arch\n")
+    format!("[repo]\nSigLevel = Never\nServer = {server}\n")
 }
 
 /// Directory the server reads per-arch mirrorlists from (x86_64 only today).

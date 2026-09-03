@@ -85,6 +85,21 @@ pub fn resolve_url_only(cli_url: Option<String>) -> Result<String> {
     Ok(url)
 }
 
+/// The configured token, if there is one, without prompting for it.
+///
+/// For commands that can do their job without talking to the server but do it
+/// better when they can. Prompting would turn an optional improvement into a
+/// mandatory credential.
+pub fn stored_token(cli_token: Option<String>) -> Result<Option<String>> {
+    let token = match cli_token {
+        Some(token) => Some(token),
+        None => load_config()?.token,
+    };
+    Ok(token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty()))
+}
+
 pub fn summarize_config(config: &ClientConfig) -> Result<ConfigSummary> {
     Ok(ConfigSummary {
         path: config_path()?.display().to_string(),

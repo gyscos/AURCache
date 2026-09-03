@@ -52,6 +52,7 @@ pub fn build_api() -> Vec<Route> {
         package_source_preview_file,
         cancel_build,
         health,
+        crate::repo::repo_info,
         activity,
         settings,
         package_settings,
