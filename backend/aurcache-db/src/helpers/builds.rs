@@ -102,3 +102,82 @@ pub fn latest_successful_version_expr() -> Expr {
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::latest_successful_version_any_platform;
+    use crate::migration::Migrator;
+    use aurcache_common::builder::BuildStates;
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn setup() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared("INSERT INTO packages (id, name) VALUES (1, 'cargo-diet')")
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn build(db: &DatabaseConnection, number: i32, status: i32, version: &str, start: i64) {
+        db.execute_unprepared(&format!(
+            "INSERT INTO builds (pkg_id, number, status, start_time, platform, version) \
+             VALUES (1, {number}, {status}, {start}, 'x86_64', '{version}')"
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// A failed build says nothing about what is in the repository.
+    ///
+    /// This is what made an out-of-date package unbuildable: upstream moved to
+    /// 1.4.1-1, the build of it failed, and the update path -- which asked for
+    /// the latest build of *any* outcome -- refused every retry with "already
+    /// up to date (version 1.4.1-1)" about a version nothing had ever built.
+    #[tokio::test]
+    async fn a_failed_build_is_not_a_built_version() {
+        let db = setup().await;
+        build(&db, 6, BuildStates::FAILED_BUILD, "1.4.1-1", 100).await;
+
+        assert_eq!(
+            latest_successful_version_any_platform(&db, 1)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// And a failed *newer* attempt does not hide the older success: the
+    /// repository still serves what that success produced.
+    #[tokio::test]
+    async fn a_later_failure_does_not_hide_an_earlier_success() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "1.4.0-1", 100).await;
+        build(&db, 6, BuildStates::FAILED_BUILD, "1.4.1-1", 200).await;
+
+        assert_eq!(
+            latest_successful_version_any_platform(&db, 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.4.0-1")
+        );
+    }
+
+    /// A success at the version being asked for is what should stop a
+    /// redundant rebuild, and still does.
+    #[tokio::test]
+    async fn a_successful_build_reports_its_version() {
+        let db = setup().await;
+        build(&db, 6, BuildStates::SUCCESSFUL_BUILD, "1.4.1-1", 100).await;
+
+        assert_eq!(
+            latest_successful_version_any_platform(&db, 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1.4.1-1")
+        );
+    }
+}

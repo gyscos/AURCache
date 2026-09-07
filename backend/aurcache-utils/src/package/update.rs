@@ -18,7 +18,7 @@ use aurcache_deps::{AurClient, DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
+    QueryFilter, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -229,16 +229,19 @@ async fn package_update_with_client_inner(
     // With the update, it's possible some dependencies are no longer needed.
     remove_orphaned_packages(services.db, pkg_model.id).await?;
 
-    let latest_build = Builds::find()
-        .filter(builds::Column::PkgId.eq(pkg_model.id))
-        .order_by_desc(builds::Column::StartTime)
-        .one(services.db)
-        .await?;
+    // Only a *successful* build makes a version "already built". This used to
+    // ask for the latest build of any outcome, which meant a failed attempt at
+    // the new version blocked every retry of it: upstream moves to 1.4.1-1, the
+    // build fails, the package stays flagged out of date, and pressing Update
+    // answers "already up to date (version 1.4.1-1)" about a version that is
+    // nowhere in the repository. Nothing could shift it but a forced build.
+    let built_version = aurcache_db::helpers::builds::latest_successful_version_any_platform(
+        services.db,
+        pkg_model.id,
+    )
+    .await?;
 
-    if let Some(build) = latest_build
-        && !force
-        && build.version == upstream_version
-    {
+    if !force && built_version.as_deref() == Some(upstream_version.as_str()) {
         bail!("Latest build is already up to date (version {upstream_version})");
     }
 
