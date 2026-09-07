@@ -75,7 +75,7 @@ mod tests {
         .unwrap();
 
         let row = db
-            .query_one(sea_orm::Statement::from_string(
+            .query_one_raw(sea_orm::Statement::from_string(
                 db.get_database_backend(),
                 "SELECT package_affinity, priority, concurrency FROM workers WHERE id = 1"
                     .to_string(),

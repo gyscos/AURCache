@@ -1,7 +1,7 @@
 //! Queries over a package's built artifacts.
 
 use crate::{files, packages};
-use sea_orm::sea_query::{Alias, Asterisk, CaseStatement, Expr, Query, SimpleExpr};
+use sea_orm::sea_query::{Alias, Asterisk, CaseStatement, Expr, ExprTrait, Query};
 
 /// Total size of every artifact belonging to the package row in the *enclosing*
 /// query, as a correlated scalar subquery.
@@ -16,30 +16,24 @@ use sea_orm::sea_query::{Alias, Asterisk, CaseStatement, Expr, Query, SimpleExpr
 /// does not decode into an `i64`; SQLite reads the cast as its own INTEGER
 /// affinity and is unaffected.
 #[must_use]
-pub fn total_artifact_size_expr() -> SimpleExpr {
-    SimpleExpr::SubQuery(
-        None,
-        Box::new(
-            Query::select()
-                .expr(
-                    CaseStatement::new().case(
-                        Expr::col(Asterisk).count().eq(Expr::col((
-                            files::Entity,
-                            files::Column::Size,
-                        ))
-                        .count()),
-                        Expr::col((files::Entity, files::Column::Size))
-                            .sum()
-                            .cast_as(Alias::new("BIGINT")),
-                    ),
-                )
-                .from(files::Entity)
-                .and_where(
-                    Expr::col((files::Entity, files::Column::PackageId))
-                        .equals((packages::Entity, packages::Column::Id)),
-                )
-                .to_owned()
-                .into_sub_query_statement(),
-        ),
+pub fn total_artifact_size_expr() -> Expr {
+    Expr::from(
+        Query::select()
+            .expr(
+                CaseStatement::new().case(
+                    Expr::col(Asterisk)
+                        .count()
+                        .eq(Expr::col((files::Entity, files::Column::Size)).count()),
+                    Expr::col((files::Entity, files::Column::Size))
+                        .sum()
+                        .cast_as(Alias::new("BIGINT")),
+                ),
+            )
+            .from(files::Entity)
+            .and_where(
+                Expr::col((files::Entity, files::Column::PackageId))
+                    .equals((packages::Entity, packages::Column::Id)),
+            )
+            .to_owned(),
     )
 }

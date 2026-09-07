@@ -18,7 +18,7 @@
 use crate::download_counts;
 use crate::helpers::time::now_secs;
 use crate::prelude::DownloadCounts;
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
 use std::collections::HashMap;
 use std::sync::Mutex;

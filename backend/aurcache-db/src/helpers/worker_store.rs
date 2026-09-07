@@ -98,7 +98,7 @@ pub async fn register_worker<C: ConnectionTrait>(
         )
         .to_owned();
 
-    db.execute(db.get_database_backend().build(&insert)).await?;
+    db.execute(&insert).await?;
 
     find_worker_by_fingerprint(db, reg.fingerprint)
         .await?
@@ -393,7 +393,7 @@ mod tests {
         revoke_worker(&db, w.id, 3).await.unwrap();
 
         let row = db
-            .query_one(sea_orm::Statement::from_string(
+            .query_one_raw(sea_orm::Statement::from_string(
                 db.get_database_backend(),
                 "SELECT status, worker_id FROM builds WHERE id = 1".to_string(),
             ))

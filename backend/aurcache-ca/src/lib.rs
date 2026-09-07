@@ -9,8 +9,8 @@
 
 use anyhow::{Context, anyhow};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -88,19 +88,18 @@ impl Ca {
     }
 
     /// Reconstruct an issuer usable for signing from the persisted CA material.
-    fn issuer(&self) -> anyhow::Result<(rcgen::Certificate, KeyPair)> {
+    ///
+    /// rcgen 0.14 models this directly: the CA certificate and the key that
+    /// signs with it are one `Issuer`, where before they were a pair that every
+    /// call site had to keep together and pass in the right order.
+    fn issuer(&self) -> anyhow::Result<Issuer<'static, KeyPair>> {
         let ca_key = KeyPair::from_pem(&self.key_pem).context("parsing CA key")?;
-        let ca_params = CertificateParams::from_ca_cert_pem(&self.cert_pem)
-            .context("parsing CA cert for signing")?;
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .context("reconstructing CA issuer")?;
-        Ok((ca_cert, ca_key))
+        Issuer::from_ca_cert_pem(&self.cert_pem, ca_key).context("parsing CA cert for signing")
     }
 
     /// Issue a server certificate for the given subject alt names, signed by the CA.
     pub fn issue_server_cert(&self, sans: Vec<String>) -> anyhow::Result<(String, String)> {
-        let (ca_cert, ca_key) = self.issuer()?;
+        let issuer = self.issuer()?;
         let key = KeyPair::generate().context("generating server key")?;
         let mut params = CertificateParams::new(sans)?;
         params
@@ -109,7 +108,7 @@ impl Ca {
         params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
         params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &issuer)
             .context("signing server cert")?;
         Ok((cert.pem(), key.serialize_pem()))
     }
@@ -121,7 +120,7 @@ impl Ca {
         validity_days: i64,
     ) -> anyhow::Result<SignedWorkerCert> {
         let fingerprint = fingerprint_from_csr_pem(csr_pem)?;
-        let (ca_cert, ca_key) = self.issuer()?;
+        let issuer = self.issuer()?;
 
         let mut csr =
             CertificateSigningRequestParams::from_pem(csr_pem).context("parsing worker CSR")?;
@@ -129,9 +128,7 @@ impl Ca {
         csr.params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
         csr.params.not_after = not_after;
 
-        let cert = csr
-            .signed_by(&ca_cert, &ca_key)
-            .context("signing worker CSR")?;
+        let cert = csr.signed_by(&issuer).context("signing worker CSR")?;
         Ok(SignedWorkerCert {
             cert_pem: cert.pem(),
             not_after: not_after.unix_timestamp(),
@@ -171,7 +168,7 @@ fn pem_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// SHA-256 fingerprint (hex, lowercase) of a raw SubjectPublicKeyInfo DER slice.

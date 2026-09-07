@@ -1,7 +1,8 @@
 use anyhow::Context;
 use aurcache_db::api_tokens;
 use aurcache_db::prelude::ApiTokens;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand_core::TryRng;
 use reqwest::header::AUTHORIZATION;
 use rocket::get;
 use rocket::http::{Cookie, CookieJar, SameSite, Status};
@@ -54,7 +55,14 @@ pub fn hash_api_token(token: &str) -> String {
 
 fn generate_api_token() -> String {
     let mut bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    // `SysRng` is rand 0.10's name for what was `OsRng`, and reading from it is
+    // now fallible: the OS can refuse entropy. Refusing to mint a token is the
+    // only safe answer -- a token from a degraded source is worse than none --
+    // and the old `fill_bytes` panicked on the same condition, so this keeps
+    // the behaviour while naming the reason.
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("system entropy unavailable; refusing to mint an API token");
     hex::encode(bytes)
 }
 

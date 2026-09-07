@@ -32,7 +32,7 @@ async fn backfill(db: &SchemaManagerConnection<'_>) -> Result<usize, DbErr> {
     // Joined to `packages` because logs are named after a build's public
     // identity, `<pkgbase>/<number>`, not its row id.
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             backend,
             "SELECT b.id AS id, b.number AS number, p.name AS pkgbase \
              FROM builds b JOIN packages p ON p.id = b.pkg_id \
@@ -54,7 +54,7 @@ async fn backfill(db: &SchemaManagerConnection<'_>) -> Result<usize, DbErr> {
         // selecting every log at once would hold the whole history in memory
         // just to write it straight back out.
         let Some(value) = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT output FROM builds WHERE id = $1",
                 [id.into()],
@@ -117,7 +117,7 @@ impl MigrationTrait for Migration {
         db.execute_unprepared(sql).await?;
 
         let rows = db
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 backend,
                 "SELECT b.id AS id, b.number AS number, p.name AS pkgbase \
                  FROM builds b JOIN packages p ON p.id = b.pkg_id",
@@ -131,7 +131,7 @@ impl MigrationTrait for Migration {
             let Ok(text) = std::fs::read_to_string(build_log_path(&pkgbase, number)) else {
                 continue;
             };
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE builds SET output = $1 WHERE id = $2",
                 [text.into(), id.into()],

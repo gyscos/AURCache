@@ -640,9 +640,7 @@ async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
 
     // The `label` rather than the `input`: clicking it toggles the checkbox the
     // way a person does, and it is the element carrying the text to match on.
-    session
-        .click_labelled("label", "Dependencies (2)")
-        .await;
+    session.click_labelled("label", "Dependencies (2)").await;
     session
         .wait_until("the dependency to appear", |t| t.contains("libfoo"))
         .await;
@@ -657,9 +655,7 @@ async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
     // And back, so the next scenario sees the list as it found it. The same
     // control both ways now that it is a checkbox rather than a pair of
     // differently-labelled buttons.
-    session
-        .click_labelled("label", "Dependencies (2)")
-        .await;
+    session.click_labelled("label", "Dependencies (2)").await;
     session
         .wait_until("the dependency to go again", |t| !t.contains("libfoo"))
         .await;

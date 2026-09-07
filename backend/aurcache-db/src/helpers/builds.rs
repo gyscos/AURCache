@@ -3,7 +3,7 @@
 use crate::prelude::Builds;
 use crate::{builds, packages};
 use aurcache_common::builder::BuildStates;
-use sea_orm::sea_query::{Alias, Expr, Func, Query, SimpleExpr};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
     Select,
@@ -74,35 +74,31 @@ pub async fn latest_successful_version_any_platform<C: ConnectionTrait>(
 /// that has been enqueued but has not determined a version yet holds an empty
 /// string, which means "not known", not "the empty version".
 #[must_use]
-pub fn latest_successful_version_expr() -> SimpleExpr {
-    SimpleExpr::SubQuery(
-        None,
-        Box::new(
-            Query::select()
-                .expr(Func::cust(Alias::new("NULLIF")).args([
-                    SimpleExpr::from(Expr::col((builds::Entity, builds::Column::Version))),
-                    Expr::val("").into(),
-                ]))
-                .from(builds::Entity)
-                .and_where(
-                    Expr::col((builds::Entity, builds::Column::PkgId))
-                        .equals((packages::Entity, packages::Column::Id)),
-                )
-                .and_where(
-                    Expr::col((builds::Entity, builds::Column::Status))
-                        .eq(BuildStates::SUCCESSFUL_BUILD),
-                )
-                .order_by_expr(
-                    Func::coalesce([
-                        SimpleExpr::from(Expr::col((builds::Entity, builds::Column::EndTime))),
-                        Expr::col((builds::Entity, builds::Column::StartTime)).into(),
-                    ])
-                    .into(),
-                    Order::Desc,
-                )
-                .limit(1)
-                .to_owned()
-                .into_sub_query_statement(),
-        ),
+pub fn latest_successful_version_expr() -> Expr {
+    Expr::from(
+        Query::select()
+            .expr(Func::cust(Alias::new("NULLIF")).args([
+                (Expr::col((builds::Entity, builds::Column::Version))),
+                Expr::val(""),
+            ]))
+            .from(builds::Entity)
+            .and_where(
+                Expr::col((builds::Entity, builds::Column::PkgId))
+                    .equals((packages::Entity, packages::Column::Id)),
+            )
+            .and_where(
+                Expr::col((builds::Entity, builds::Column::Status))
+                    .eq(BuildStates::SUCCESSFUL_BUILD),
+            )
+            .order_by_expr(
+                Func::coalesce([
+                    (Expr::col((builds::Entity, builds::Column::EndTime))),
+                    Expr::col((builds::Entity, builds::Column::StartTime)),
+                ])
+                .into(),
+                Order::Desc,
+            )
+            .limit(1)
+            .to_owned(),
     )
 }

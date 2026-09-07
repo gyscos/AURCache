@@ -13,10 +13,10 @@ tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls"] }
-rcgen = { version = "0.13", features = ["pem"] }
-sha2 = "0.10"
+rcgen = { version = "0.14", features = ["pem"] }
+sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22.1"
+base64 = "0.23"
 flate2 = { workspace = true }
 tar = { workspace = true }
 percent-encoding = "2.3"
@@ -24,3 +24,6 @@ aurcache-common = { path = "../aurcache-common" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# For the cross-check that the worker's own fingerprint matches the one the
+# server derives from the CSR, through an entirely different parser.
+aurcache-ca = { path = "../aurcache-ca" }

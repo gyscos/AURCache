@@ -39,7 +39,8 @@ use aurcache_db::{packages, settings};
 use flate2::read::GzDecoder;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    TransactionTrait,
 };
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::UnboundedSender;

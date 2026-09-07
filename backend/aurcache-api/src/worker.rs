@@ -121,7 +121,7 @@ fn mirrorlist_dir() -> PathBuf {
 /// needing to agree, at the cost of one resend per worker.
 fn mirrorlist_checksum(content: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(content.as_bytes()))
+    hex::encode(Sha256::digest(content.as_bytes()))
 }
 
 /// Decide what to put in a job descriptor for the mirrorlist.

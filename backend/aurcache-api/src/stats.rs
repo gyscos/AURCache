@@ -16,7 +16,7 @@ use aurcache_db::prelude::{Builds, Packages};
 use rocket::http::Status;
 use rocket::{State, get};
 use sea_orm::prelude::BigDecimal;
-use sea_orm::sea_query::{Expr, Func, SimpleExpr};
+use sea_orm::sea_query::{Expr, ExprTrait, Func};
 use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm::{DbBackend, FromQueryResult, PaginatorTrait, Statement};
@@ -160,7 +160,7 @@ async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
     let unique: BuildTimeStruct = Builds::find()
         .select_only()
         .column_as(
-            SimpleExpr::from(Func::avg(
+            Expr::from(Func::avg(
                 Expr::col(builds::Column::EndTime).sub(Expr::col(builds::Column::StartTime)),
             )),
             "avg_build_time",

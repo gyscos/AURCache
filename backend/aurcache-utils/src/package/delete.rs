@@ -3,7 +3,8 @@ use anyhow::anyhow;
 use aurcache_db::prelude::{Builds, Files, PackageVcsSources, Packages, Settings};
 use aurcache_db::{builds, files, package_vcs_sources, settings};
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter, TransactionTrait,
+    ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter,
+    TransactionTrait,
 };
 
 pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<()> {

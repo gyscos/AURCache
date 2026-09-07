@@ -206,7 +206,7 @@ mod tests {
 
         // attempt_count defaults to 0; lease columns default to NULL.
         let row = db
-            .query_one(sea_orm::Statement::from_string(
+            .query_one_raw(sea_orm::Statement::from_string(
                 db.get_database_backend(),
                 "SELECT attempt_count, worker_id, lease_expires_at FROM builds WHERE id = 1"
                     .to_string(),
@@ -232,7 +232,7 @@ mod tests {
         .unwrap();
 
         let row = db
-            .query_one(sea_orm::Statement::from_string(
+            .query_one_raw(sea_orm::Statement::from_string(
                 db.get_database_backend(),
                 "SELECT status, native_arches FROM workers WHERE id = 1".to_string(),
             ))
@@ -252,7 +252,7 @@ mod tests {
 
         for idx in &["idx_builds_status_platform", "idx_builds_worker_id"] {
             let row = db
-                .query_one(sea_orm::Statement::from_string(
+                .query_one_raw(sea_orm::Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT name FROM sqlite_master WHERE type='index' AND name='{idx}'"),
                 ))

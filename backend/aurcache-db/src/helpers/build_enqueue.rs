@@ -2,7 +2,7 @@ use crate::builds;
 use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
 use pacman_mirrors::platforms::Platform;
-use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query, SimpleExpr};
+use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     IntoActiveModel, QueryFilter,
@@ -24,20 +24,16 @@ const NUMBER_RACE_ATTEMPTS: usize = 5;
 /// got the marker verbatim, and every enqueue there failed with `syntax error
 /// at or near ")"`. Nothing caught it because the tests all run on SQLite --
 /// hence the test below, which renders both backends.
-fn next_build_number_expr(pkg_id: i32) -> SimpleExpr {
-    SimpleExpr::SubQuery(
-        None,
-        Box::new(
-            Query::select()
-                .expr(
-                    Func::coalesce([Expr::col(builds::Column::Number).max(), Expr::val(0).into()])
-                        .add(1),
-                )
-                .from(builds::Entity)
-                .and_where(Expr::col(builds::Column::PkgId).eq(pkg_id))
-                .to_owned()
-                .into_sub_query_statement(),
-        ),
+fn next_build_number_expr(pkg_id: i32) -> Expr {
+    Expr::from(
+        Query::select()
+            .expr(
+                Func::coalesce([Expr::col(builds::Column::Number).max(), Expr::val(0)])
+                    .add(1),
+            )
+            .from(builds::Entity)
+            .and_where(Expr::col(builds::Column::PkgId).eq(pkg_id))
+            .to_owned(),
     )
 }
 
@@ -99,7 +95,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
             .on_conflict(OnConflict::new().do_nothing().to_owned())
             .to_owned();
 
-        let result = db.execute(db.get_database_backend().build(&insert)).await?;
+        let result = db.execute(&insert).await?;
 
         let existing = Builds::find()
             .filter(builds::Column::PkgId.eq(pkg_id))

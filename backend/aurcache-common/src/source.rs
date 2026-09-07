@@ -61,10 +61,14 @@ impl From<GitSourceSpec> for SourceData {
 }
 
 impl FromStr for SourceData {
-    type Err = anyhow::Error;
+    /// The error this actually produces, rather than `anyhow::Error` wrapping
+    /// it. sea-orm 2.0 requires a `std::error::Error` here, and naming the real
+    /// one is better than boxing it: `?` still converts it into `anyhow` at
+    /// every call site that wants that.
+    type Err = serde_json::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(serde_json::from_str(s)?)
+        serde_json::from_str(s)
     }
 }
 

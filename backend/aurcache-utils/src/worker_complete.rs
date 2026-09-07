@@ -16,7 +16,7 @@ use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, QuerySelect, TransactionTrait,
+    QueryFilter, QuerySelect, TransactionSession, TransactionTrait,
 };
 use std::collections::HashMap;
 

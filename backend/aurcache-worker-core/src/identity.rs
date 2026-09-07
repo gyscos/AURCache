@@ -7,7 +7,7 @@
 //! across the whole enrollment lifecycle.
 
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -47,7 +47,10 @@ impl Identity {
             key
         };
 
-        let fingerprint = spki_fingerprint(key.public_key_der().as_ref());
+        // `subject_public_key_info` is rcgen 0.14's name for what 0.13 called
+        // `public_key_der`: the same SPKI DER, so the fingerprint -- which is
+        // every worker's stable identity -- is unchanged by the upgrade.
+        let fingerprint = spki_fingerprint(&key.subject_public_key_info());
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             key,
@@ -139,6 +142,29 @@ mod tests {
         let b = Identity::load_or_create(dir.path()).unwrap();
         assert_eq!(a.fingerprint, b.fingerprint);
         assert_eq!(a.fingerprint.len(), 64);
+    }
+
+    /// The worker computes its fingerprint from its own keypair with `rcgen`;
+    /// the server computes it from the CSR with `x509-parser`. They are two
+    /// implementations of "SHA-256 of the SubjectPublicKeyInfo DER", and every
+    /// worker's identity depends on them agreeing.
+    ///
+    /// Worth a test of its own because nothing else compares the two: the CA's
+    /// own tests check `x509-parser` against itself, so a change on the rcgen
+    /// side -- an upgrade renaming `public_key_der` to
+    /// `subject_public_key_info`, say -- would pass everything and silently
+    /// re-enroll every existing worker as a new machine.
+    #[test]
+    fn the_worker_and_the_server_agree_on_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(dir.path()).unwrap();
+        let csr = identity.generate_csr("worker-1").unwrap();
+
+        let from_server = aurcache_ca::fingerprint_from_csr_pem(&csr).unwrap();
+        assert_eq!(
+            identity.fingerprint, from_server,
+            "the worker and the server derived different identities from one key"
+        );
     }
 
     #[test]
