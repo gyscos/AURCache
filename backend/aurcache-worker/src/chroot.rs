@@ -141,11 +141,21 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
 /// setting take effect at all -- the previous arrangement only reached the
 /// chroot when it was first created, so a setting changed afterwards was
 /// silently ignored until the chroot was rebuilt.
-pub fn install_makepkg_dropin(root: &Path, overrides: &str) -> Result<()> {
-    let dir = root.join("etc/makepkg.conf.d");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join("aurcache.conf");
-    std::fs::write(&path, overrides).with_context(|| format!("writing {}", path.display()))?;
+pub async fn install_makepkg_dropin(root: &Path, staged: &Path) -> Result<()> {
+    let dest = root.join("etc/makepkg.conf.d/aurcache.conf");
+    // Through `sudo`, because the chroot belongs to root and this worker
+    // deliberately does not. The file is staged in the job's own directory
+    // first, so nothing writes into the chroot except this one copy -- which is
+    // the same division `mkarchroot -M` used to provide.
+    let mut cmd = Command::new("sudo");
+    cmd.arg("install").arg("-Dm644").arg(staged).arg(&dest);
+    let (log, status) = run_capture(cmd).await?;
+    if !status.success() {
+        bail!(
+            "installing makepkg overrides into {}:\n{log}",
+            dest.display()
+        );
+    }
     Ok(())
 }
 
@@ -187,65 +197,61 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
 /// default so nothing else has to change.
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
-/// Write the per-package `pacman.conf` and mirrorlist to a staging directory
-/// the caller seeds the base chroot from.
+/// Write the per-package makepkg overrides, `pacman.conf` and mirrorlist to a
+/// staging directory the caller seeds the base chroot from.
 ///
-/// The makepkg settings are not here: they go into the chroot's
-/// `makepkg.conf.d/` via [`install_makepkg_dropin`], so the chroot keeps its own
-/// defaults rather than having them replaced.
+/// The makepkg file here is *only* the overrides, not a whole `makepkg.conf`:
+/// [`install_makepkg_dropin`] puts it in the chroot's `makepkg.conf.d/`, so the
+/// chroot keeps its own defaults rather than having them replaced.
 pub fn write_configs(
     dir: &Path,
+    makepkg_conf: &str,
     pacman_conf: &str,
     mirrorlist: Option<&str>,
     shared_pkg_cache: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
+    let makepkg = dir.join("makepkg.conf");
     let pacman = dir.join("pacman.conf");
+
+    std::fs::write(&makepkg, makepkg_conf).context("writing makepkg overrides")?;
     std::fs::write(&pacman, with_cache_dirs(pacman_conf, shared_pkg_cache))
         .context("writing pacman.conf")?;
     if let Some(list) = mirrorlist {
         std::fs::write(dir.join("mirrorlist"), list).context("writing mirrorlist")?;
     }
-    Ok(pacman)
+    Ok((makepkg, pacman))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The overrides are written as a drop-in, not as a whole `makepkg.conf`.
+    /// The staged makepkg file is the job's overrides verbatim.
     ///
-    /// The chroot's own file stays in place, which is what keeps this worker
-    /// independent of however the host machine is configured to build.
+    /// Nothing from the host is mixed in: that is the point of the drop-in, and
+    /// a merged file here would mean the chroot's own defaults had been replaced
+    /// by whatever the build machine happens to be configured for.
+    ///
+    /// Installing it into the chroot needs root and is left to the real build.
     #[test]
-    fn overrides_are_installed_as_a_dropin() {
-        let root = tempfile::tempdir().unwrap();
-        install_makepkg_dropin(root.path(), "PKGDEST=/output\n").unwrap();
+    fn only_the_jobs_overrides_are_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (makepkg, _pacman) = write_configs(
+            dir.path(),
+            "PKGDEST=/output\nMAKEFLAGS=-j4\n",
+            "[options]\n",
+            None,
+            None,
+        )
+        .unwrap();
 
-        let dropin = root.path().join("etc/makepkg.conf.d/aurcache.conf");
-        assert_eq!(
-            std::fs::read_to_string(&dropin).unwrap(),
-            "PKGDEST=/output\n"
-        );
+        let staged = std::fs::read_to_string(&makepkg).unwrap();
+        assert_eq!(staged, "PKGDEST=/output\nMAKEFLAGS=-j4\n");
         assert!(
-            !root.path().join("etc/makepkg.conf").exists(),
-            "the chroot's own makepkg.conf must not be replaced"
-        );
-    }
-
-    /// Rewritten on every build, so a per-package `makepkg_conf` setting takes
-    /// effect instead of being frozen into the chroot when it was created.
-    #[test]
-    fn the_dropin_is_replaced_not_appended() {
-        let root = tempfile::tempdir().unwrap();
-        install_makepkg_dropin(root.path(), "PKGDEST=/first\n").unwrap();
-        install_makepkg_dropin(root.path(), "PKGDEST=/second\n").unwrap();
-
-        let dropin = root.path().join("etc/makepkg.conf.d/aurcache.conf");
-        assert_eq!(
-            std::fs::read_to_string(&dropin).unwrap(),
-            "PKGDEST=/second\n"
+            !staged.contains("CARCH") && !staged.contains("BUILDENV"),
+            "the host's defaults must not be merged in: {staged}"
         );
     }
 }

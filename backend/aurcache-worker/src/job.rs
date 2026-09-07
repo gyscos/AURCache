@@ -141,8 +141,9 @@ async fn run_job_inner(
     // the host it reaches the server on (see aurcache_worker_core::repo).
     let pacman_conf =
         aurcache_worker_core::repo::append_to_pacman_conf(&job.pacman_conf, client.repo_section());
-    let pacman_conf = chroot::write_configs(
+    let (makepkg_overrides, pacman_conf) = chroot::write_configs(
         &cfg_dir,
+        &credentials::augment_makepkg_conf(&job.makepkg_conf, credential.as_ref()),
         &pacman_conf,
         job.mirrorlist.as_deref(),
         cache.pacman_pkg().as_deref(),
@@ -159,11 +160,9 @@ async fn run_job_inner(
     // Writing it per build is also what makes a per-package `makepkg_conf`
     // setting apply at all -- installing it once at creation froze whatever the
     // first build happened to use.
-    chroot::install_makepkg_dropin(
-        &root,
-        &credentials::augment_makepkg_conf(&job.makepkg_conf, credential.as_ref()),
-    )
-    .context("installing makepkg overrides")?;
+    chroot::install_makepkg_dropin(&root, &makepkg_overrides)
+        .await
+        .context("installing makepkg overrides")?;
 
     // 3. Import trusted PGP keys into the shared keyring.
     if let Some(gnupg) = cache.gnupg_home() {
