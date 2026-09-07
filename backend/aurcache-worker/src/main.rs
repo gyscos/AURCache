@@ -102,7 +102,13 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // After the key is ensured, so a first start has one to load rather than
     // needing a restart. Held for the worker's lifetime: dropping it kills the
     // agent, so no stray agent outlives us holding a credential.
-    let _agent = match agent::start(&cfg.core.data_dir, credentials::resolve(&cfg).path()).await {
+    let _agent = match agent::start(
+        &cfg.core.data_dir,
+        credentials::resolve(&cfg).path(),
+        &cfg.build_user,
+    )
+    .await
+    {
         Ok(Some(a)) => {
             // Children inherit this, which is how `makechrootpkg` -- and the
             // build inside the chroot -- reach the agent.

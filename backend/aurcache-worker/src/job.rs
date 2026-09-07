@@ -143,7 +143,11 @@ async fn run_job_inner(
         aurcache_worker_core::repo::append_to_pacman_conf(&job.pacman_conf, client.repo_section());
     let (makepkg_overrides, pacman_conf) = chroot::write_configs(
         &cfg_dir,
-        &credentials::augment_makepkg_conf(&job.makepkg_conf, credential.as_ref()),
+        &credentials::augment_makepkg_conf(
+            &job.makepkg_conf,
+            credential.as_ref(),
+            agent_socket().as_deref(),
+        ),
         &pacman_conf,
         job.mirrorlist.as_deref(),
         cache.pacman_pkg().as_deref(),
@@ -214,10 +218,7 @@ async fn run_job_inner(
     // packages of that shape do their own clone inside the chroot. Assuming
     // authenticated fetches only ever happen through `source=` was what left
     // that unbuildable.
-    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
-        && let Some(dir) = std::path::Path::new(&sock).parent()
-        && dir.exists()
-    {
+    if let Some(dir) = agent_socket().as_deref().and_then(Path::parent) {
         binds.push((dir.to_path_buf(), dir.to_path_buf()));
     }
 
@@ -305,6 +306,16 @@ where
     if !batch.is_empty() {
         log(&client, build_id, &batch).await;
     }
+}
+
+/// The build ssh-agent's socket, if this worker started one.
+///
+/// Read from the environment because that is where the worker publishes it at
+/// startup, and it is the same value the bind mount and the chroot's
+/// `makepkg.conf` drop-in both have to name.
+fn agent_socket() -> Option<PathBuf> {
+    let sock = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK")?);
+    sock.exists().then_some(sock)
 }
 
 /// Spawn `makechrootpkg`, stream its output as logs, and poll for local

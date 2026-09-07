@@ -3,9 +3,14 @@
 //! A build needs to *use* the worker's SSH key -- some PKGBUILDs fetch from
 //! private repositories -- while never being able to read it. The key belongs
 //! to the worker's user; builds run as a different, unprivileged one. An agent
-//! is what bridges that: it holds the key in this process's own child and hands
-//! out signatures over a socket, so a build authenticates without the key
-//! material ever being within its reach.
+//! is what bridges that: it holds the key and hands out signatures over a
+//! socket, so a build authenticates without the key material ever being within
+//! its reach.
+//!
+//! The agent runs *as the build user*. That is not a matter of taste --
+//! OpenSSH's `ssh-agent` checks the peer uid on every connection and refuses
+//! every one that is not its own, so an agent belonging to the worker cannot be
+//! used by a build however the socket is owned or moded.
 //!
 //! Started here, by the worker, rather than by a shell script in the container
 //! entrypoints. That was the arrangement before, and it meant the native
@@ -26,6 +31,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 /// Directory the socket lives in, under the worker's data directory.
@@ -37,7 +43,10 @@ use tokio::process::{Child, Command};
 const AGENT_DIR: &str = "agent";
 const SOCKET_FILE: &str = "agent.sock";
 
-/// The group builds run as, which must be able to reach the socket.
+/// The group shared by the worker and the users it builds as.
+///
+/// The socket's directory belongs to it, so the build user can create the
+/// socket there and the worker can still watch for it appearing.
 const BUILD_GROUP: &str = "aurbuild";
 
 /// A running ssh-agent holding the build credential.
@@ -70,6 +79,15 @@ impl BuildAgent {
 
 impl Drop for BuildAgent {
     fn drop(&mut self) {
+        // The process *group*: the agent runs under a `sudo` that may have
+        // forked rather than exec'd in place, and which of the two happens is a
+        // sudoers detail rather than something to depend on. `start` puts the
+        // whole thing in its own group so this takes it down either way.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: signalling a group we created ourselves; if it is already
+            // gone the call fails harmlessly and we ignore the result.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+        }
         self.child.start_kill().ok();
         std::fs::remove_file(&self.socket).ok();
     }
@@ -77,51 +95,153 @@ impl Drop for BuildAgent {
 
 /// Start an agent holding `key`, and publish its socket to builds.
 ///
+/// The agent is started **as `build_user`**, because `ssh-agent` serves only
+/// its own uid. Started as the worker, it was reachable in the sense that a
+/// build could open the socket -- and useless, because the agent hung up on it:
+/// `communication with agent failed` on one side, `uid mismatch: peer euid 921
+/// != uid 922` in the journal on the other.
+///
+/// Handing the agent to the build user does not hand it the key. The worker
+/// reads the key with its own privileges and writes it into `ssh-add -`, which
+/// takes a key on stdin, so the material goes from the worker's memory into the
+/// agent without ever being a file the build user could open. What that user
+/// gains is the ability to *use* the key while the agent lives, which is the
+/// whole point, and an agent does not give back what it holds.
+///
 /// Returns `None` when there is no key to load, which is the ordinary case for
 /// a worker that builds nothing needing authentication.
-pub async fn start(data_dir: &Path, key: &Path) -> Result<Option<BuildAgent>> {
+pub async fn start(data_dir: &Path, key: &Path, build_user: &str) -> Result<Option<BuildAgent>> {
     if !key.exists() {
         return Ok(None);
     }
 
     let dir = data_dir.join(AGENT_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Traversable by the build group and nobody else: builds reach the socket
-    // through it, and the key is not in here at all.
-    set_group_and_mode(&dir, 0o750)?;
+    // Group-writable, because the process creating the socket in here is the
+    // build user rather than us. Both are in `aurbuild`; nobody else reaches
+    // the directory, and the key is not in it at all.
+    set_group_and_mode(&dir, 0o770)?;
 
     let socket = dir.join(SOCKET_FILE);
     // A socket left by a previous run: ssh-agent refuses to bind over it.
     std::fs::remove_file(&socket).ok();
 
-    // `-D` keeps it in the foreground as our child, so its lifetime is ours.
-    // The alternative -- letting it daemonize and parsing the shell snippet it
-    // prints -- leaves an agent behind whenever the worker dies badly.
-    let child = Command::new("ssh-agent")
-        .arg("-D")
-        .arg("-a")
-        .arg(&socket)
-        .kill_on_drop(true)
-        .spawn()
-        .context("starting ssh-agent")?;
+    // `-D` keeps it in the foreground, so its lifetime is tied to this process
+    // tree. The alternative -- letting it daemonize and parsing the shell
+    // snippet it prints -- leaves an agent behind whenever the worker dies
+    // badly.
+    let socket_arg = socket.display().to_string();
+    let mut spawn = as_user(build_user, &["ssh-agent", "-D", "-a", &socket_arg]);
+    // Its own process group, so `Drop` can take down the agent together with
+    // the `sudo` that started it.
+    spawn.process_group(0);
+    let child = spawn.spawn().context("starting ssh-agent")?;
 
     wait_for_socket(&socket).await?;
-    set_group_and_mode(&socket, 0o660)?;
+    // The socket is left exactly as ssh-agent made it: the build user's own,
+    // mode 0600. That is already the access we want -- it is the only uid the
+    // agent will talk to -- and it is not ours to change.
 
-    let added = Command::new("ssh-add")
-        .arg(key)
-        .env("SSH_AUTH_SOCK", &socket)
-        .output()
+    let material = std::fs::read(key).with_context(|| format!("reading {}", key.display()))?;
+    add_key(build_user, &socket, &material)
         .await
-        .context("running ssh-add")?;
-    if !added.status.success() {
-        anyhow::bail!(
-            "ssh-add refused the build credential: {}",
-            String::from_utf8_lossy(&added.stderr).trim()
-        );
-    }
+        .context("loading the build credential into the agent")?;
 
     Ok(Some(BuildAgent { socket, child }))
+}
+
+/// Write `material` into the running agent through `ssh-add -`.
+async fn add_key(build_user: &str, socket: &Path, material: &[u8]) -> Result<()> {
+    // `env` rather than `Command::env`: the command goes through `sudo`, which
+    // strips the environment it was given.
+    let auth_sock = format!("SSH_AUTH_SOCK={}", socket.display());
+    let mut cmd = as_user(build_user, &["env", &auth_sock, "ssh-add", "-"]);
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running ssh-add")?;
+
+    let mut stdin = child.stdin.take().context("ssh-add has no stdin")?;
+    stdin
+        .write_all(material)
+        .await
+        .context("writing the key to ssh-add")?;
+    // Closed explicitly: ssh-add reads stdin to EOF, so holding the pipe open
+    // would deadlock the wait below.
+    drop(stdin);
+
+    let out = child.wait_with_output().await.context("running ssh-add")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ssh-add refused the build credential: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Build a command that runs `argv` as `build_user`.
+///
+/// Directly when the worker already *is* that user, and through `sudo`
+/// otherwise. The direct case is not a micro-optimisation: it is what lets a
+/// container that builds as root work with no sudoers entry at all.
+fn as_user(build_user: &str, argv: &[&str]) -> Command {
+    let mut cmd = if is_current_user(build_user) {
+        Command::new(argv[0])
+    } else {
+        // `-n`: fail rather than block on a password prompt nobody can answer.
+        let mut sudo = Command::new("sudo");
+        sudo.args(["-n", "-u", build_user]);
+        sudo.arg(argv[0]);
+        sudo
+    };
+    cmd.args(&argv[1..]);
+    cmd
+}
+
+/// Whether `name` is the user this process is already running as.
+///
+/// Compared by uid rather than by name, so the two spellings of one account do
+/// not send us through `sudo` to become ourselves.
+#[cfg(unix)]
+fn is_current_user(name: &str) -> bool {
+    // SAFETY: `getuid` reads process state and cannot fail.
+    let me = unsafe { libc::getuid() };
+    user_id(name) == Some(me)
+}
+
+/// Resolve a user name through the passwd *database*, not `/etc/passwd`.
+///
+/// The file is only one source: this host resolves its own login through nss
+/// and has no line for it, and the same is true wherever accounts come from
+/// LDAP, sssd or systemd-homed. Reading the file would report those users as
+/// nonexistent -- here, as "not us", sending the worker through `sudo` to
+/// become the user it already is.
+#[cfg(unix)]
+fn user_id(name: &str) -> Option<u32> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // Generous enough for any real entry; `getpwnam_r` reports ERANGE rather
+    // than overrunning it, and we treat that as "no such user" like any other
+    // failure.
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: `c_name` is NUL-terminated and outlives the call, `pwd` and
+    // `found` are valid out-parameters, and `buf` is the scratch space the
+    // call is told the length of. The `_r` form keeps its result in ours
+    // rather than in static storage, so concurrent callers do not race.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            &raw mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut found,
+        )
+    };
+    (rc == 0 && !found.is_null()).then_some(pwd.pw_uid)
 }
 
 /// ssh-agent creates its socket a moment after starting.
@@ -196,7 +316,64 @@ mod tests {
     async fn no_key_means_no_agent() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert!(start(dir.path(), &missing).await.unwrap().is_none());
+        assert!(
+            start(dir.path(), &missing, "builder")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The agent has to *be* the build user, because `ssh-agent` serves only
+    /// its own uid. Running it as the worker is what made every authenticated
+    /// fetch fail with `uid mismatch` while the socket looked perfectly
+    /// reachable.
+    #[test]
+    fn a_different_build_user_is_reached_through_sudo() {
+        let cmd = as_user("someone-else", &["ssh-agent", "-D", "-a", "/s"]);
+        let std = cmd.as_std();
+        let argv: Vec<_> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(std.get_program(), "sudo");
+        // `-n`, or a worker with no sudo rights hangs on a prompt instead of
+        // reporting that it cannot start an agent.
+        assert_eq!(argv[..3], ["-n", "-u", "someone-else"]);
+        assert_eq!(argv[3], "ssh-agent");
+        assert_eq!(argv.last().unwrap(), "/s");
+    }
+
+    /// Being the build user already -- a container that builds as root -- must
+    /// not require a sudoers entry to start an agent.
+    #[test]
+    fn being_the_build_user_needs_no_sudo() {
+        let me = users_own_name().expect("`id -un` names this process's user");
+        let cmd = as_user(&me, &["ssh-agent", "-D"]);
+        assert_ne!(cmd.as_std().get_program(), "sudo");
+        assert_eq!(cmd.as_std().get_program(), "ssh-agent");
+    }
+
+    /// The uid lookup is what decides between those two, so it has to agree
+    /// with the passwd database on a real account.
+    #[test]
+    fn the_uid_lookup_reads_the_passwd_database() {
+        assert_eq!(user_id("root"), Some(0));
+        assert!(user_id("definitely-not-a-real-user-name").is_none());
+        assert!(is_current_user(&users_own_name().unwrap()));
+        // The database, not the file: this host's own login has no line in
+        // `/etc/passwd`, and resolving it is exactly what this must do.
+        assert!(user_id(&users_own_name().unwrap()).is_some());
+        assert!(!is_current_user("definitely-not-a-real-user-name"));
+    }
+
+    /// The name this process's uid goes by, asked of the system rather than of
+    /// a file, so it answers on a host whose accounts are not local.
+    fn users_own_name() -> Option<String> {
+        let out = std::process::Command::new("id").arg("-un").output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// The group lookup reads the real database; an absent group is not an

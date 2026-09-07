@@ -183,16 +183,30 @@ pub fn git_ssh_command(known_hosts: Option<&str>) -> String {
 /// without `makechrootpkg` having to forward environment variables. Keeping it
 /// worker-side means credentials never enter the server's job configuration.
 ///
-/// The export is **guarded on the agent socket being present**, because one
-/// file serves two environments: `download_sources()` runs on the worker, where
-/// `SSH_AUTH_SOCK` is set and the agent is reachable, while the same
-/// `makepkg.conf` is also read inside the chroot, where it deliberately is not.
-/// Guarded, the export simply does not apply in there and ordinary git
-/// operations inside the chroot behave as if AURCache had never touched the
-/// config.
+/// `SSH_AUTH_SOCK` is **set here rather than inherited**, and that is what makes
+/// the credential work inside the chroot as well as outside.
+///
+/// `makechrootpkg` preserves `SSH_AUTH_SOCK` for `download_sources()`, which
+/// runs on the worker -- but the build proper runs through a generated
+/// `chrootbuild` script under `arch-nspawn`, which carries no environment in at
+/// all. So a guard on the variable already being set holds only outside, and a
+/// PKGBUILD that clones in `prepare()` -- as `unreal-engine` must, makepkg
+/// having no shallow-clone support -- saw no agent.
+///
+/// Naming the socket explicitly works in both: the same path is bound into the
+/// chroot, so the guard is on the socket *existing* rather than on an
+/// environment this file cannot count on. Where there is no agent the guard
+/// fails and git behaves as if AURCache had never touched the config.
 #[must_use]
-pub fn augment_makepkg_conf(base: &str, credential: Option<&StagedCredential>) -> String {
+pub fn augment_makepkg_conf(
+    base: &str,
+    credential: Option<&StagedCredential>,
+    agent_socket: Option<&Path>,
+) -> String {
     let Some(cred) = credential else {
+        return base.to_string();
+    };
+    let Some(socket) = agent_socket else {
         return base.to_string();
     };
     let mut out = base.to_string();
@@ -200,13 +214,16 @@ pub fn augment_makepkg_conf(base: &str, credential: Option<&StagedCredential>) -
         out.push('\n');
     }
     out.push_str("# Added by aurcache-worker: build credentials (see credentials.rs).\n");
-    out.push_str("# Guarded on the agent socket so ordinary git operations still work inside\n");
-    out.push_str("# the chroot, where no agent is reachable: the export applies on the worker\n");
-    out.push_str("# (which is where makepkg fetches sources) and nowhere else.\n");
+    out.push_str("# The socket is named rather than inherited: arch-nspawn carries no\n");
+    out.push_str("# environment into the chroot, so a build that fetches there would\n");
+    out.push_str("# otherwise see no agent. Guarded on the socket existing, so a worker\n");
+    out.push_str("# without a credential is unaffected.\n");
     out.push_str(&format!(
-        "if [ -n \"${{SSH_AUTH_SOCK:-}}\" ] && [ -S \"$SSH_AUTH_SOCK\" ]; then\n    \
-         export GIT_SSH_COMMAND=\"{}\"\nfi\n",
-        cred.git_ssh_command
+        "if [ -S \"{sock}\" ]; then\n    \
+         export SSH_AUTH_SOCK=\"{sock}\"\n    \
+         export GIT_SSH_COMMAND=\"{cmd}\"\nfi\n",
+        sock = socket.display(),
+        cmd = cred.git_ssh_command
     ));
     out
 }
@@ -354,12 +371,13 @@ mod tests {
     #[test]
     fn makepkg_conf_gains_the_export_only_when_a_credential_exists() {
         let base = "PKGDEST=/output";
-        assert_eq!(augment_makepkg_conf(base, None), base);
+        assert_eq!(augment_makepkg_conf(base, None, None), base);
 
         let cred = StagedCredential {
             git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
-        let augmented = augment_makepkg_conf(base, Some(&cred));
+        let augmented =
+            augment_makepkg_conf(base, Some(&cred), Some(Path::new("/run/a/agent.sock")));
         assert!(augmented.starts_with("PKGDEST=/output\n"));
         assert!(
             augmented
@@ -367,25 +385,54 @@ mod tests {
         );
     }
 
-    /// The export must be guarded on the agent socket. The same `makepkg.conf`
-    /// is read on the worker (where the agent is reachable) and inside the
-    /// chroot (where it is not); unguarded, ordinary git operations in a
-    /// PKGBUILD would be pointed at a socket that does not exist there.
+    /// The socket is named, not inherited, and the export is guarded on it
+    /// existing.
+    ///
+    /// `arch-nspawn` carries no environment into the chroot, so a guard on
+    /// `$SSH_AUTH_SOCK` already being set held only outside it -- and a
+    /// PKGBUILD that clones in `prepare()` therefore saw no agent at all. The
+    /// same path is bound into the chroot, so naming it works in both places
+    /// while a worker without an agent is still left alone.
     #[test]
-    fn the_export_is_guarded_so_it_does_not_apply_in_the_chroot() {
+    fn the_export_names_the_socket_and_is_guarded_on_it() {
         let cred = StagedCredential {
             git_ssh_command: "ssh -o StrictHostKeyChecking=accept-new".to_string(),
         };
-        let conf = augment_makepkg_conf("PKGDEST=/output", Some(&cred));
+        let conf = augment_makepkg_conf(
+            "PKGDEST=/output",
+            Some(&cred),
+            Some(Path::new("/var/lib/aurcache-worker/agent/agent.sock")),
+        );
 
-        assert!(conf.contains("SSH_AUTH_SOCK"));
+        assert!(
+            conf.contains("export SSH_AUTH_SOCK=\"/var/lib/aurcache-worker/agent/agent.sock\"")
+        );
         assert!(conf.trim_end().ends_with("fi"));
-        // The guard must wrap the export, not sit beside it.
-        let guard = conf.find("if [ -n").expect("guard present");
-        let export = conf.find("export GIT_SSH_COMMAND").expect("export present");
-        assert!(guard < export, "export must be inside the guard");
-        // The key path must not leak into a config the chroot also reads.
+        // The guard must wrap both exports, not sit beside them.
+        let guard = conf
+            .find("if [ -S \"/var/lib/aurcache-worker/agent/agent.sock\" ]")
+            .expect("guard names the socket");
+        let sock = conf.find("export SSH_AUTH_SOCK").expect("socket export");
+        let git = conf.find("export GIT_SSH_COMMAND").expect("git export");
+        assert!(
+            guard < sock && guard < git,
+            "exports must be inside the guard"
+        );
+        // The key path must never leak into a config the chroot also reads.
         assert!(!conf.contains("/staged/id_ed25519"));
+    }
+
+    /// No agent means no exports at all, so a worker without a credential
+    /// builds exactly as it would if none of this existed.
+    #[test]
+    fn without_an_agent_the_config_is_untouched() {
+        let cred = StagedCredential {
+            git_ssh_command: "ssh".to_string(),
+        };
+        assert_eq!(
+            augment_makepkg_conf("PKGDEST=/output", Some(&cred), None),
+            "PKGDEST=/output"
+        );
     }
 
     #[test]
