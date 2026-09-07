@@ -6,13 +6,27 @@
 //! answer an operator wants -- would this package build on a smaller machine --
 //! is the high-water mark of that total.
 //!
-//! Sampled rather than measured. A cgroup would give an exact `memory.peak`,
-//! but the worker runs `systemd-nspawn` through a wrapper precisely because
-//! there is no systemd manager to put the build in a scope, so there is no
-//! cgroup of its own to read. Sampling `/proc` needs nothing but the kernel
-//! that is already there. The cost is that a spike shorter than the interval is
-//! invisible, which is worth stating: this is a floor on what the build needed,
-//! not a bound.
+//! Sampled rather than measured, and that is a trade rather than a necessity.
+//!
+//! A per-build cgroup would give an exact `memory.peak`, and cgroups need no
+//! systemd -- `mkdir` a directory under `/sys/fs/cgroup`, write a pid into
+//! `cgroup.procs`, read `memory.peak`. What stands in the way is narrower:
+//!
+//!  * `docker/nspawn-wrapper.sh` forces `--keep-unit`, so the build reuses the
+//!    worker's own cgroup rather than getting one. Reading that cgroup would
+//!    measure the worker and every concurrent build together.
+//!  * Giving each build a cgroup means enabling the memory controller in
+//!    `cgroup.subtree_control`, which cgroup v2 refuses while processes sit
+//!    directly in that cgroup -- so the worker would first have to move itself
+//!    into a leaf, restructuring the hierarchy it was handed.
+//!  * That hierarchy is not always the worker's to restructure. A container
+//!    needs a writable `/sys/fs/cgroup`; a native install runs under a systemd
+//!    unit, where the subtree belongs to systemd unless the unit sets
+//!    `Delegate=yes`.
+//!
+//! Sampling `/proc` needs none of that and behaves the same everywhere. The
+//! cost is that a spike shorter than the interval is invisible: this is a floor
+//! on what the build needed, not a bound.
 //!
 //! Prefers PSS over RSS. Summing RSS across a tree counts every shared page
 //! once per process, and a build with eight parallel compilers sharing libc

@@ -63,9 +63,10 @@ package peaked at 6 GiB turns that into a number you can act on.
 Two caveats:
 
 - **Sampled once a second**, so it is a floor on what the build needed rather
-  than a bound; a spike shorter than that is invisible. There is no cgroup to
-  read an exact figure from, because the worker runs `systemd-nspawn` without a
-  systemd manager to place the build in a scope of its own.
+  than a bound; a spike shorter than that is invisible. An exact figure would
+  need a cgroup per build, which the worker does not create: `systemd-nspawn`
+  is run with `--keep-unit`, so a build shares the worker's cgroup with every
+  other build running beside it.
 - **A dash means not reported**, not zero: an older worker, the legacy container
   builder (which does not sample), or a build that ended before the first
   sample.
