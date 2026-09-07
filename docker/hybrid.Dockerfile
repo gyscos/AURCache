@@ -82,14 +82,28 @@ ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 
 USER packager
 # wasm-bindgen emits the frontend's JS glue and is not in Arch's repositories,
-# so it is built rather than installed. Its version must match the
-# `wasm-bindgen` crate in frontend-rs/Cargo.lock, which `--locked` guarantees
-# by using that crate's own lockfile.
+# so it is built rather than installed. Its schema version has to match the
+# `wasm-bindgen` crate the frontend links against *exactly* -- the CLI refuses
+# a wasm file emitted by any other version -- so the version to install is read
+# out of frontend-rs/Cargo.lock rather than taken as whatever crates.io serves
+# as latest.
+#
+# `--locked` does not do that, which is worth being explicit about because it
+# reads as though it might: it pins the versions the CLI's *own* build resolves,
+# from the lockfile published alongside it, and says nothing about which release
+# is selected. Unpinned, this worked until wasm-bindgen 0.2.128 was published
+# and every build began failing with "rust Wasm file schema version: 0.2.127 /
+# this binary schema version: 0.2.128".
 ENV PATH="/home/packager/.cargo/bin:${PATH}"
 RUN rustup default stable && rustup target add wasm32-unknown-unknown
+# The lockfile alone, ahead of the source, so that the expensive `cargo install`
+# below is invalidated when the pinned version changes and not by a code edit.
+COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
 # No cache mount here: buildkit creates the mount's parent as root, leaving
 # cargo unable to write ~/.cargo/.crates.toml. The layer caches on its own.
-RUN cargo install wasm-bindgen-cli --locked
+RUN wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
+    && test -n "$wb_version" \
+    && cargo install wasm-bindgen-cli --locked --version "$wb_version"
 
 COPY --chown=packager . /src
 # `--skipinteg` because the tarball is this tree rather than a release, and
