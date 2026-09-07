@@ -157,8 +157,19 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
 # that quietly did not run would go unnoticed until a build failed for want of
 # a directory. Both are idempotent.
 COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
+# The sync database is refreshed *here* rather than inherited from the layer
+# above, even though that layer has just done the same thing. `pacman -U`
+# resolves this package's dependencies against whatever database the image
+# carries, and the layer that populated it is cached across builds while the
+# repositories behind it are not: Arch Linux ARM rotates a superseded package
+# out of its pool within weeks. So a code change invalidates this layer, the
+# cached database still names python-dulwich-1.1.0-1, and every mirror answers
+# 404 for a file none of them has kept -- which reads as the mirrors being
+# broken rather than as the database being stale. Re-syncing in the same layer
+# as the install is what keeps the two from drifting apart.
 RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
-    pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
+    pacman -Syu --noconfirm --needed \
+    && pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
     && rm -rf /tmp/pkg \
     && systemd-sysusers \
     && systemd-tmpfiles --create
