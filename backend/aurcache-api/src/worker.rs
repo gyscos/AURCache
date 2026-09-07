@@ -293,8 +293,19 @@ pub async fn register_worker(
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
 
-    // Issue the leaf certificate once and cache it on the worker row.
-    if worker.signed_cert.is_none() {
+    // Issue the leaf certificate, or re-issue one this CA did not sign.
+    //
+    // The second case is a CA that has been regenerated -- a deployment that
+    // lost the directory holding it, most often. Every certificate issued by
+    // the old CA is then unverifiable, and a worker presenting one fails mTLS
+    // with `BadSignature` on every request. Caching the certificate for ever
+    // meant re-registration handed the same dead certificate back, so the
+    // worker could never recover on its own however many times it restarted.
+    let needs_cert = match worker.signed_cert.as_deref() {
+        None => true,
+        Some(cert) => !ca.issued(cert),
+    };
+    if needs_cert {
         let signed = ca
             .sign_worker_csr(&input.csr_pem, worker_cert_validity_days())
             .map_err(|e| err(Status::InternalServerError, e))?;

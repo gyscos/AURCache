@@ -81,6 +81,34 @@ impl Ca {
         &self.cert_pem
     }
 
+    /// Whether this CA issued `cert_pem`.
+    ///
+    /// A real signature check against the CA's public key, not a comparison of
+    /// issuer names: the point is to catch a certificate signed by a *previous* CA,
+    /// and a regenerated CA keeps the same subject.
+    ///
+    /// Any certificate that cannot be parsed answers `false`. This only ever
+    /// decides whether to re-issue, so treating the unreadable as not-ours costs a
+    /// signature and is the safe direction.
+    #[must_use]
+    pub fn issued(&self, cert_pem: &str) -> bool {
+        use x509_parser::prelude::FromDer;
+
+        let Ok(ca_der) = pem_to_der(&self.cert_pem) else {
+            return false;
+        };
+        let Ok((_, ca)) = x509_parser::certificate::X509Certificate::from_der(&ca_der) else {
+            return false;
+        };
+        let Ok(leaf_der) = pem_to_der(cert_pem) else {
+            return false;
+        };
+        let Ok((_, leaf)) = x509_parser::certificate::X509Certificate::from_der(&leaf_der) else {
+            return false;
+        };
+        leaf.verify_signature(Some(ca.public_key())).is_ok()
+    }
+
     /// SHA-256 fingerprint of the CA certificate (hex, lowercase).
     pub fn ca_cert_fingerprint(&self) -> anyhow::Result<String> {
         let der = pem_to_der(&self.cert_pem)?;
@@ -195,6 +223,55 @@ fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A certificate this CA signed is recognised as its own.
+    #[test]
+    fn a_ca_recognises_the_certificates_it_issued() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["worker-1".to_string()]).unwrap();
+        let csr_pem = params.serialize_request(&key).unwrap().pem().unwrap();
+        let signed = ca.sign_worker_csr(&csr_pem, 365).unwrap();
+
+        assert!(ca.issued(&signed.cert_pem));
+    }
+
+    /// And one signed by a *different* CA is not -- which is the whole point.
+    ///
+    /// A regenerated CA keeps the same subject name, so this has to be a real
+    /// signature check: comparing issuer names would call the old certificate
+    /// ours and leave the worker presenting something nothing can verify.
+    #[test]
+    fn a_ca_rejects_a_certificate_from_a_previous_ca() {
+        let old_dir = tempfile::tempdir().unwrap();
+        let old_ca = Ca::load_or_create(old_dir.path()).unwrap();
+
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["worker-1".to_string()]).unwrap();
+        let csr_pem = params.serialize_request(&key).unwrap().pem().unwrap();
+        let from_old = old_ca.sign_worker_csr(&csr_pem, 365).unwrap();
+
+        // A fresh CA, as a deployment that lost its data directory would build.
+        let new_dir = tempfile::tempdir().unwrap();
+        let new_ca = Ca::load_or_create(new_dir.path()).unwrap();
+
+        assert!(
+            !new_ca.issued(&from_old.cert_pem),
+            "a certificate from the previous CA must be re-issued, not reused"
+        );
+        assert!(new_ca.issued(&new_ca.sign_worker_csr(&csr_pem, 365).unwrap().cert_pem));
+    }
+
+    /// Garbage is not ours, and must not panic on the way to saying so.
+    #[test]
+    fn unparseable_input_is_not_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        assert!(!ca.issued(""));
+        assert!(!ca.issued("-----BEGIN CERTIFICATE-----\nnonsense\n-----END CERTIFICATE-----\n"));
+    }
 
     #[test]
     fn creates_and_reloads_stable_ca() {

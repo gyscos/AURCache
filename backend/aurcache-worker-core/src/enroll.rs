@@ -76,11 +76,31 @@ pub async fn ensure_enrolled(
         // Reuse the CA we already pinned rather than re-running trust-on-first-use.
         let ca_pem = identity.ca_pem()?;
         match WorkerClient::enrollment(&cfg.aurcache_url, &ca_pem) {
-            Ok(client) => match client.register(&register_request(cfg, csr_pem, kind)).await {
-                Ok(status) => tracing::info!("Re-registered (status: {})", status.status),
-                Err(e) => tracing::warn!(
-                    "Re-registration failed, continuing with the persisted configuration: {e:#}"
-                ),
+            Ok(client) => match client
+                .register(&register_request(cfg, csr_pem.clone(), kind))
+                .await
+            {
+                Ok(status) => {
+                    tracing::info!("Re-registered (status: {})", status.status);
+                    // Adopt a certificate the server has re-issued instead of
+                    // discarding it. The server re-issues when the one it had
+                    // on file was signed by a CA it no longer has, and a worker
+                    // that ignored the replacement kept presenting a
+                    // certificate nothing could verify.
+                    if let Some(client) = try_finish_enrollment(cfg, identity, &status)? {
+                        return Ok(client);
+                    }
+                }
+                Err(e) => {
+                    // A rotated CA looks exactly like this: the pinned CA
+                    // cannot verify the server's new certificate, so the
+                    // connection fails before any of the above can run.
+                    if let Some(client) =
+                        recover_from_rotated_ca(cfg, identity, &csr_pem, kind, &e).await?
+                    {
+                        return Ok(client);
+                    }
+                }
             },
             Err(e) => tracing::warn!("Could not build enrollment client: {e:#}"),
         }
@@ -126,6 +146,70 @@ pub async fn ensure_enrolled(
             .await
             .context("polling enrollment status")?;
     }
+}
+
+/// Re-pin the server's CA and enrol again, when the pinned one has stopped
+/// working because the server's CA was regenerated.
+///
+/// Only attempted when `AURCACHE_SERVER_CA_FINGERPRINT` is configured, and the
+/// newly fetched CA is checked against it. That is the whole reason this is
+/// safe to do automatically: re-pinning on a failed connection is otherwise
+/// indistinguishable from accepting whatever an attacker offers, which is
+/// precisely what pinning exists to prevent.
+///
+/// Without a configured fingerprint the situation is reported rather than
+/// papered over, because only the operator can tell a legitimate rotation from
+/// an interception.
+///
+/// Returns `None` when recovery was not attempted or did not apply, leaving the
+/// caller to carry on with the persisted configuration -- a server that is
+/// merely not listening yet must not cost a worker its enrolment.
+async fn recover_from_rotated_ca(
+    cfg: &CoreConfig,
+    identity: &Identity,
+    csr_pem: &str,
+    kind: &str,
+    cause: &anyhow::Error,
+) -> Result<Option<WorkerClient>> {
+    let Some(expected) = cfg.server_ca_fingerprint.as_deref() else {
+        tracing::warn!(
+            "Re-registration failed ({cause:#}). If the server's CA was regenerated \
+             this worker cannot tell that apart from an interception, so it will keep \
+             using the CA it pinned. Set AURCACHE_SERVER_CA_FINGERPRINT to let it \
+             recover on its own, or remove the pinned CA to enrol afresh."
+        );
+        return Ok(None);
+    };
+
+    let Ok(fresh_ca) = fetch_and_pin_ca(&cfg.aurcache_url, Some(expected)).await else {
+        // Unreachable, or offering a CA that fails the fingerprint check. Either
+        // way this is not a rotation we can act on.
+        tracing::warn!(
+            "Re-registration failed, continuing with the persisted configuration: {cause:#}"
+        );
+        return Ok(None);
+    };
+
+    if identity.ca_pem().is_ok_and(|pinned| pinned == fresh_ca) {
+        // Same CA as before, so the failure was something else -- the server
+        // starting up, most likely.
+        tracing::warn!(
+            "Re-registration failed, continuing with the persisted configuration: {cause:#}"
+        );
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        "The server's CA has changed and matches the configured fingerprint; \
+         re-enrolling with the new one"
+    );
+    let client = WorkerClient::enrollment(&cfg.aurcache_url, &fresh_ca)?;
+    publish_csr_to_enrollment_dir(cfg, &identity.fingerprint, csr_pem);
+    let status = client
+        .register(&register_request(cfg, csr_pem.to_string(), kind))
+        .await
+        .context("re-registering after the server CA changed")?;
+    try_finish_enrollment(cfg, identity, &status)
 }
 
 /// If the status carries a signed certificate, persist it and build the

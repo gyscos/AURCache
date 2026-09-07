@@ -32,6 +32,15 @@ export AURCACHE_TLS_SANS="${AURCACHE_TLS_SANS:-localhost}"
 # enrollment directory cannot also grant it.
 unset AURCACHE_ENROLLMENT_DIR
 
+# Name the embedded worker for what it is.
+#
+# Its default name is the hostname, which inside Docker is the container id --
+# so every recreate produced a row called something like `b3f4a648533a`, and the
+# Workers page read as a crowd of strangers rather than one worker that had come
+# back. It is not a machine anyone chose to add; it is the one that ships in the
+# box, and it should say so. Still overridable for a host running more than one.
+export WORKER_NAME="${WORKER_NAME:-bundled}"
+
 # ---------------------------------------------------------------------------
 # Which builder.
 #
