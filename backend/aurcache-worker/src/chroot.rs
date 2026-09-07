@@ -25,9 +25,11 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 
 /// Build a `Command` that runs a privileged `devtools` program via `sudo`.
 ///
-/// The worker runs as an unprivileged `builder` user inside the container:
-/// `sudo` provides the root needed for chroot ops and, crucially, sets
-/// `SUDO_USER` so `makechrootpkg` runs `makepkg` as `builder` (never root).
+/// The worker runs as the unprivileged `aurcache` user; `sudo` provides the
+/// root that mounting, unsharing and chrooting need. Which user the *build*
+/// runs as is passed explicitly with `-U` rather than left to `makechrootpkg`'s
+/// `SUDO_USER` inference, so it is `builder` and never `aurcache` -- see
+/// `build::build_command`.
 ///
 /// Only `GNUPGHOME` is preserved: it is the one variable the worker actually
 /// exports (see [`import_pgp_keys`]). `SRCDEST`/`PKGDEST` are passed to
