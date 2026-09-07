@@ -2,7 +2,7 @@ use crate::builds;
 use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
 use pacman_mirrors::platforms::Platform;
-use sea_orm::sea_query::{Expr, OnConflict, Query};
+use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     IntoActiveModel, QueryFilter,
@@ -15,6 +15,31 @@ pub struct EnqueueBuildResult {
 
 // See the race explanation in `enqueue_build_if_missing`.
 const NUMBER_RACE_ATTEMPTS: usize = 5;
+
+/// `(SELECT COALESCE(MAX(number), 0) + 1 FROM builds WHERE pkg_id = <pkg_id>)`.
+///
+/// Assembled through the query builder rather than written as a raw fragment.
+/// The raw form spelled the bound value `?`, which sea-query only substitutes
+/// for backends whose placeholder *is* `?`: SQLite got `pkg_id = 7`, Postgres
+/// got the marker verbatim, and every enqueue there failed with `syntax error
+/// at or near ")"`. Nothing caught it because the tests all run on SQLite --
+/// hence the test below, which renders both backends.
+fn next_build_number_expr(pkg_id: i32) -> SimpleExpr {
+    SimpleExpr::SubQuery(
+        None,
+        Box::new(
+            Query::select()
+                .expr(
+                    Func::coalesce([Expr::col(builds::Column::Number).max(), Expr::val(0).into()])
+                        .add(1),
+                )
+                .from(builds::Entity)
+                .and_where(Expr::col(builds::Column::PkgId).eq(pkg_id))
+                .to_owned()
+                .into_sub_query_statement(),
+        ),
+    )
+}
 
 /// Insert a new pending build with the given `initial_status` if no pending build already exists
 /// for `(pkg_id, platform)`.
@@ -50,10 +75,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
         // Read inside the statement rather than in a separate query, so the
         // window a competing insert can land in is as small as the database
         // allows.
-        let next_number = Expr::cust_with_values(
-            "(SELECT COALESCE(MAX(number), 0) + 1 FROM builds WHERE pkg_id = ?)",
-            [pkg_id],
-        );
+        let next_number = next_build_number_expr(pkg_id);
 
         let insert = Query::insert()
             .into_table(builds::Entity)
@@ -129,4 +151,30 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     active.status = Set(Some(STATUS_ENQUEUED));
     let updated = active.update(db).await?;
     Ok(Some(updated))
+}
+
+#[cfg(test)]
+mod build_number_tests {
+    use super::next_build_number_expr;
+    use sea_orm::DatabaseBackend;
+    use sea_orm::sea_query::Query;
+
+    /// Every supported backend has to bind the package id. A backend that
+    /// renders a bare `?` is emitting a placeholder the driver will not fill.
+    #[test]
+    fn next_build_number_binds_the_package_id_on_every_backend() {
+        let select = Query::select().expr(next_build_number_expr(7)).to_owned();
+
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            let sql = backend.build(&select).to_string();
+            assert!(
+                sql.contains('7'),
+                "{backend:?} dropped the package id: {sql}"
+            );
+            assert!(
+                !sql.contains('?'),
+                "{backend:?} left an unsubstituted placeholder: {sql}"
+            );
+        }
+    }
 }
