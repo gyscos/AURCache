@@ -29,7 +29,7 @@ INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, 
   ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1),
   -- Dependency-only packages: nobody asked for these, something else needs
   -- them. They are what the dashboard's second package count counts, and what
-  -- the package list keeps behind its "Show dependencies" toggle.
+  -- the package list keeps behind its "Dependencies" checkbox.
   ('libfoo',                 1, 0, '2.3.1-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"libfoo"}',                 0),
   ('libbar',                 1, 0, '0.9-2',     '', 'x86_64', 'aur', '{"type":"aur","name":"libbar"}',                 0),
   -- A git-sourced package. It has no AUR entry at all, so its description,
@@ -111,7 +111,7 @@ UPDATE builds SET status = 1, version = '2.12.1-1'
 WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');
 
 -- A second, newer build of `hello` that failed. The package page shows both
--- "Latest" and "In repo" only when they differ, and that gap -- newest attempt
+-- "Latest" and "in repo" only when they differ, and that gap -- newest attempt
 -- broken, repository still serving something older -- is the case worth having
 -- on screen.
 INSERT INTO builds (pkg_id, number, status, start_time, end_time, platform, version)

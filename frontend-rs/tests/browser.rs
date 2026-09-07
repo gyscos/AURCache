@@ -621,7 +621,7 @@ async fn removing_a_package_takes_it_out_of_the_list(session: &Session) {
     );
 }
 
-/// The list shows what was asked for; the toggle adds what was pulled in.
+/// The list shows what was asked for; the checkbox adds what was pulled in.
 ///
 /// The half a rendering test cannot reach is the absence: a marker can only
 /// assert that something is on the page, and the whole point of the default is
@@ -638,8 +638,10 @@ async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
         "a dependency was listed without being asked for: {listed}"
     );
 
+    // The `label` rather than the `input`: clicking it toggles the checkbox the
+    // way a person does, and it is the element carrying the text to match on.
     session
-        .click_labelled("button", "Show dependencies (2)")
+        .click_labelled("label", "Dependencies (2)")
         .await;
     session
         .wait_until("the dependency to appear", |t| t.contains("libfoo"))
@@ -652,9 +654,11 @@ async fn dependencies_stay_out_of_the_list_until_asked_for(session: &Session) {
         "a revealed dependency was not marked as one: {shown}"
     );
 
-    // And back, so the next scenario sees the list as it found it.
+    // And back, so the next scenario sees the list as it found it. The same
+    // control both ways now that it is a checkbox rather than a pair of
+    // differently-labelled buttons.
     session
-        .click_labelled("button", "Hide dependencies (2)")
+        .click_labelled("label", "Dependencies (2)")
         .await;
     session
         .wait_until("the dependency to go again", |t| !t.contains("libfoo"))

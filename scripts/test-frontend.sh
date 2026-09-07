@@ -177,7 +177,7 @@ ROUTES=(
     # The list is what somebody asked for; the closure is behind a toggle that
     # says how much it is hiding. Whether it actually hides them is an
     # interaction test -- a marker can only assert presence.
-    "/packages|Show dependencies (2)|dependencies are behind a toggle"
+    "/packages|Dependencies (2)|dependencies are behind a checkbox"
     # One label per state, because one label for all of them said the same
     # thing of a package that is fine, one that failed and one already queued.
     # That a queued package offers nothing is a unit test -- a marker can only
@@ -198,7 +198,7 @@ ROUTES=(
     # page as it was rather than reloading it.
     "/packages/add|Filter packages|the add dialog leaves the list behind it"
     "/package/hello|Dependencies|package detail (depth 2)"
-    "/package/hello|In repo|package detail shows what is in the repo"
+    "/package/hello|in repo|package detail shows what is in the repo"
     "/package/hello|hello-docs-2.12.1-2-x86_64.pkg.tar.zst|the built artifacts are listed by filename"
     "/package/hello|1.2 MiB|each artifact reports its size"
     "/package/hello|Total|the artifacts add up to a total"
