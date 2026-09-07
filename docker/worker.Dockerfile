@@ -191,7 +191,6 @@ VOLUME ["/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
 # Wrapper so devtools' systemd-nspawn works without a systemd manager (see
 # script). Container-only: a real host has a manager and needs none of this.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
-COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
 # Entrypoint fixes shared-enroll-volume ownership before dropping to the worker.
 COPY --chmod=0755 docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 

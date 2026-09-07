@@ -7,6 +7,7 @@
 //!
 //! See `design/remote-workers.md`.
 
+pub mod agent;
 pub mod build;
 pub mod cache;
 pub mod cgroup;

@@ -195,6 +195,31 @@ async fn run_job_inner(
     // PKGBUILD chooses to run there.
     let mut binds = cfg.bind_mounts.clone();
     binds.extend(pkg_cache_bind);
+    // The ssh-agent socket, so a PKGBUILD that fetches from a private
+    // repository can authenticate *inside* the chroot.
+    //
+    // Not a hole in the credential design but the point of it: this used to be
+    // withheld because the alternative was mounting the key itself, which a
+    // build could then read and keep. The agent removed that -- it hands out
+    // signatures, never key material -- so the build gets the use of the
+    // credential and none of the possession. Agent hijacking for the duration
+    // of a build remains possible and accepted, as it already was for source
+    // fetching on the worker.
+    //
+    // Bound at the same path inside, because `SSH_AUTH_SOCK` is inherited from
+    // the worker and has to name something that exists in both.
+    //
+    // The clone `unreal-engine` needs is in `prepare()`, not `source=`: makepkg
+    // has no shallow-clone support and the engine's history is enormous, so
+    // packages of that shape do their own clone inside the chroot. Assuming
+    // authenticated fetches only ever happen through `source=` was what left
+    // that unbuildable.
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK")
+        && let Some(dir) = std::path::Path::new(&sock).parent()
+        && dir.exists()
+    {
+        binds.push((dir.to_path_buf(), dir.to_path_buf()));
+    }
 
     let ctx = WorkerContext { cfg, cgroups };
     let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;

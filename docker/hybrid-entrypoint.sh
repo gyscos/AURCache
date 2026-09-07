@@ -118,10 +118,6 @@ log "starting AURCache server"
 PIDS+=($!)
 
 if [ -n "$WORKER_BIN" ]; then
-        # shellcheck source=/dev/null
-    . /usr/local/bin/aurcache-ssh-agent-setup
-    start_build_agent
-
     log "starting embedded worker: $WORKER_KIND"
     log "NOTE: the hybrid image is deprecated. Migrate to the separate"
     log "      aurcache-server and aurcache-worker images when convenient."

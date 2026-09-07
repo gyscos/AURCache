@@ -37,10 +37,4 @@ if [ -d /sys/fs/cgroup ]; then
     done
 fi
 
-# Hold the build credential in an agent rather than handing builds the key
-# file, which they cannot read (see docker/ssh-agent-setup.sh).
-# shellcheck source=/dev/null
-. /usr/local/bin/aurcache-ssh-agent-setup
-start_build_agent
-
 exec /usr/bin/aurcache-worker "$@"

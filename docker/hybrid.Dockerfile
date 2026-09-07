@@ -183,7 +183,6 @@ ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
 
 # Wrapper so devtools' systemd-nspawn works without a systemd manager.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
-COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
 COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
 
 # State that must outlive the container.

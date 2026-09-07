@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aurcache_worker::agent;
 use aurcache_worker::config::Config;
 use aurcache_worker::executor::ChrootExecutor;
 use aurcache_worker::{credentials, oneshot};
@@ -97,6 +98,30 @@ async fn announce_build_credential(cfg: &Config) {
 async fn run(cfg: Arc<Config>) -> Result<()> {
     let identity = Identity::load_or_create(&cfg.core.data_dir)?;
     announce_build_credential(&cfg).await;
+
+    // After the key is ensured, so a first start has one to load rather than
+    // needing a restart. Held for the worker's lifetime: dropping it kills the
+    // agent, so no stray agent outlives us holding a credential.
+    let _agent = match agent::start(&cfg.core.data_dir, credentials::resolve(&cfg).path()).await {
+        Ok(Some(a)) => {
+            // Children inherit this, which is how `makechrootpkg` -- and the
+            // build inside the chroot -- reach the agent.
+            unsafe { std::env::set_var("SSH_AUTH_SOCK", a.socket()) };
+            tracing::info!(
+                "Build credential available through {}",
+                a.socket().display()
+            );
+            Some(a)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                "Could not start the build ssh-agent ({e:#}); packages with \
+                 authenticated sources will fail"
+            );
+            None
+        }
+    };
     let core: Arc<CoreConfig> = Arc::new(cfg.core.clone());
 
     // The server may not be reachable yet (e.g. still starting in the same
