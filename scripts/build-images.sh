@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Build the multi-architecture worker and hybrid images.
+# Build the multi-architecture server, worker and hybrid images.
 #
-# The same thing the publish workflow does, runnable by hand. Both images
-# install AURCache as Arch packages, which the packager stage cross-compiles on
-# the build host; only the runtime stages are per-architecture, so an emulated
-# build spends its time on `pacman -U` rather than on cargo.
+# The same thing the publish workflow does, runnable by hand.
+#
+#   aurcache-server  the backend alone -- what a split deployment runs.
+#   aurcache-worker  a build worker, for a split deployment.
+#   aurcache         the hybrid (server + embedded worker) compatibility image.
+#
+# The worker and hybrid images install AURCache as Arch packages, which the
+# packager stage cross-compiles on the build host; only their runtime stages are
+# per-architecture, so an emulated build spends its time on `pacman -U` rather
+# than on cargo. The server image is Debian and cross-compiles the same way.
 #
 #   scripts/build-images.sh docker.example.com
 #   scripts/build-images.sh --push --tag v0.5.0 docker.example.com
@@ -28,7 +34,8 @@ usage() {
     cat <<'EOF'
 Options:
   -t, --tag TAG             Image tag (default: latest)
-  -i, --images LIST         Comma-separated: worker, hybrid (default: both)
+  -i, --images LIST         Comma-separated: server, worker, hybrid
+                            (default: all three)
   -p, --platforms LIST      Target platforms (default: linux/amd64,linux/arm64,linux/arm/v7)
       --push                Push to the registry; without it the images are
                             built and discarded (see the note below)
@@ -51,7 +58,7 @@ EOF
 }
 
 tag=latest
-images=worker,hybrid
+images=server,worker,hybrid
 platforms=$DEFAULT_PLATFORMS
 push=0
 toolchain_repo=
@@ -152,10 +159,12 @@ fi
 # `aurcache-hybrid` because that is the name deployments predating the split
 # already pull.
 declare -A DOCKERFILES=(
+    [server]=docker/Dockerfile
     [worker]=docker/worker.Dockerfile
     [hybrid]=docker/hybrid.Dockerfile
 )
 declare -A IMAGE_NAMES=(
+    [server]=aurcache-server
     [worker]=aurcache-worker
     [hybrid]=aurcache
 )
@@ -164,18 +173,23 @@ IFS=',' read -r -a selected <<<"$images"
 for image in "${selected[@]}"; do
     dockerfile=${DOCKERFILES[$image]:-}
     if [[ -z $dockerfile ]]; then
-        echo "error: unknown image '$image' (expected worker or hybrid)" >&2
+        echo "error: unknown image '$image' (expected server, worker or hybrid)" >&2
         exit 2
     fi
 
     ref="$registry/${IMAGE_NAMES[$image]}:$tag"
     echo
     echo "==> $image -> $ref  [$platforms]"
+    # The cross-toolchain args belong to the Arch packager stages. The server
+    # image is Debian and declares neither, and buildkit warns about a build arg
+    # no stage consumes, so it is built without them.
+    image_build_args=("${build_args[@]}")
+    [[ $image == server ]] && image_build_args=()
     docker buildx build "${builder_args[@]}" \
         --platform "$platforms" \
         --file "$REPO_ROOT/$dockerfile" \
         --tag "$ref" \
-        "${build_args[@]}" \
+        "${image_build_args[@]}" \
         "${output_args[@]}" \
         "$REPO_ROOT"
 done

@@ -1,4 +1,3 @@
-ARG TARGET_ARCH=linux/amd64
 ARG LATEST_COMMIT_SHA=dev
 # Must stay on the same Debian release as the runtime stage below: the default
 # `rust:1.96.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
@@ -31,11 +30,20 @@ RUN rustup target add wasm32-unknown-unknown \
     && test -n "$wb_version" \
     && cargo install wasm-bindgen-cli --locked --version "$wb_version"
 
-ARG TARGET_ARCH
+# Which architecture to cross-compile for. `TARGETPLATFORM` is what buildx sets
+# per target in a multi-platform build, so it is the default; `TARGET_ARCH`
+# stays as an explicit override for the publish workflow, which builds one
+# architecture at a time and names it itself. build-rust.sh accepts either
+# spelling and rejects anything it does not recognise.
+ARG TARGETPLATFORM
+ARG TARGET_ARCH=
 ADD docker/build-rust.sh /root
-RUN bash /root/build-rust.sh $TARGET_ARCH
+RUN bash /root/build-rust.sh "${TARGET_ARCH:-$TARGETPLATFORM}"
 
-FROM --platform=$TARGET_ARCH debian:bookworm-slim
+# No `--platform` here: buildx already builds this stage for the target, and
+# pinning it to a build arg meant the runtime base and the binary above could
+# be selected by two different values and disagree.
+FROM debian:bookworm-slim
 # Podman/Docker is no longer used at runtime (remote workers build packages),
 # so the server just needs a minimal glibc base. This must stay on the same
 # Debian release as the builder stage above (see the note there). Runtime deps:
