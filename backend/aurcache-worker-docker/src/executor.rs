@@ -346,6 +346,8 @@ impl DockerExecutor {
 }
 
 impl Executor for DockerExecutor {
+    const KIND: &'static str = "docker";
+
     async fn run_job(
         &self,
         client: Arc<WorkerClient>,

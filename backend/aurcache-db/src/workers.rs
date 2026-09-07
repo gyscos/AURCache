@@ -32,6 +32,10 @@ pub struct Model {
     pub last_seen: Option<i64>,
     /// Worker software version reported at enrollment/heartbeat.
     pub version: Option<String>,
+    /// Which build strategy the worker runs -- `chroot`, `docker`. Free-form,
+    /// so a new executor needs no migration. `None` for a worker that enrolled
+    /// before the column existed.
+    pub kind: Option<String>,
     /// Comma-separated exact pkgbase names this worker is specially provisioned
     /// for (credentials, licensed toolchain, scratch space). A package named by
     /// *any* approved worker may only be built by workers that name it.

@@ -18,6 +18,19 @@ use crate::client::WorkerClient;
 
 /// Builds one claimed job to completion.
 pub trait Executor: Send + Sync + 'static {
+    /// Stable identifier for this build strategy, reported at registration so
+    /// the fleet can be told apart on the Workers page: `chroot`, `docker`.
+    ///
+    /// A free-form string rather than a closed enum, and deliberately so: a
+    /// future executor should be able to name itself without the server needing
+    /// to know about it first. The server stores and displays whatever arrives.
+    ///
+    /// An associated *const* rather than a method, because the two workers build
+    /// their executor on opposite sides of enrollment -- the chroot worker
+    /// enrolls first, the docker worker constructs first -- so the kind has to
+    /// be readable without an instance.
+    const KIND: &'static str;
+
     /// Run a job and return its terminal report.
     ///
     /// Implementations must not panic — the runner wraps the call and reports a

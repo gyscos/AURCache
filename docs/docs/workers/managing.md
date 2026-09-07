@@ -5,7 +5,24 @@ sidebar_position: 4
 # Managing workers
 
 The **Workers** page lists every worker that has ever enrolled, with its status,
-architectures, reserved packages and priority.
+architectures, reserved packages, priority, build strategy and version.
+
+## Build strategies
+
+The **Type** column says how each worker builds:
+
+| Type | Meaning |
+|---|---|
+| `chroot` | The `devtools` chroot worker — the supported strategy. |
+| `docker` | The legacy container builder, **deprecated**. Shown highlighted. |
+| `—` | The worker enrolled before workers reported this; restarting it fills it in. |
+
+A worker reports whatever it calls itself, so a future build strategy appears
+here without the server needing to know about it in advance.
+
+This is the quickest way to answer "is anything still on the legacy builder?"
+before retiring it — it builds in a reused container image rather than a clean
+chroot, and supports neither build caches nor build credentials.
 
 ## Approving
 

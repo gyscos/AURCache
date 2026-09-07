@@ -34,6 +34,13 @@ pub struct WorkerSummary {
     pub last_seen: Option<i64>,
     /// Worker software version reported at enrollment or heartbeat.
     pub version: Option<String>,
+    /// Which build strategy it runs -- `chroot`, `docker`. `None` for a worker
+    /// that enrolled before this was reported.
+    ///
+    /// Free-form rather than a closed set: the server stores and shows whatever
+    /// a worker calls itself, so a new executor needs no change here.
+    #[serde(default)]
+    pub kind: Option<String>,
     /// Whether it has checked in recently enough to be considered connected.
     ///
     /// Derived server-side from `last_seen` and the liveness timeout, because

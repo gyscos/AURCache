@@ -32,12 +32,13 @@ pub fn publish_csr_to_enrollment_dir(cfg: &CoreConfig, fingerprint: &str, csr_pe
 /// Registration is how a worker reports its configuration, and *all* of it can
 /// have changed since the machine last booted, so this is rebuilt from `cfg`
 /// every time rather than cached.
-fn register_request(cfg: &CoreConfig, csr_pem: String) -> RegisterRequest {
+fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> RegisterRequest {
     RegisterRequest {
         name: cfg.name.clone(),
         native_arches: cfg.native_arches.clone(),
         emulated_arches: cfg.emulated_arches.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        kind: kind.to_string(),
         csr_pem,
         enrollment_token: cfg.enrollment_token.clone(),
         packages: cfg.packages.clone(),
@@ -62,7 +63,11 @@ fn register_request(cfg: &CoreConfig, csr_pem: String) -> RegisterRequest {
 /// one `docker compose up`, so a worker will regularly reach the server before
 /// it is listening. Failing to register then must not stop a worker that is
 /// already able to build — it proceeds on its persisted configuration.
-pub async fn ensure_enrolled(cfg: &CoreConfig, identity: &Identity) -> Result<WorkerClient> {
+pub async fn ensure_enrolled(
+    cfg: &CoreConfig,
+    identity: &Identity,
+    kind: &str,
+) -> Result<WorkerClient> {
     tracing::info!("Worker fingerprint: {}", identity.fingerprint);
 
     let csr_pem = identity.generate_csr(&cfg.name)?;
@@ -71,7 +76,7 @@ pub async fn ensure_enrolled(cfg: &CoreConfig, identity: &Identity) -> Result<Wo
         // Reuse the CA we already pinned rather than re-running trust-on-first-use.
         let ca_pem = identity.ca_pem()?;
         match WorkerClient::enrollment(&cfg.aurcache_url, &ca_pem) {
-            Ok(client) => match client.register(&register_request(cfg, csr_pem)).await {
+            Ok(client) => match client.register(&register_request(cfg, csr_pem, kind)).await {
                 Ok(status) => tracing::info!("Re-registered (status: {})", status.status),
                 Err(e) => tracing::warn!(
                     "Re-registration failed, continuing with the persisted configuration: {e:#}"
@@ -100,7 +105,7 @@ pub async fn ensure_enrolled(cfg: &CoreConfig, identity: &Identity) -> Result<Wo
     publish_csr_to_enrollment_dir(cfg, &identity.fingerprint, &csr_pem);
 
     let mut status = enroll_client
-        .register(&register_request(cfg, csr_pem))
+        .register(&register_request(cfg, csr_pem, kind))
         .await
         .context("registering")?;
 

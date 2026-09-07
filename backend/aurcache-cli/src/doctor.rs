@@ -345,6 +345,7 @@ mod tests {
             priority: 0,
             last_seen: online.then_some(1),
             version: None,
+            kind: None,
             online,
             active_builds: 0,
             successful_builds: 0,

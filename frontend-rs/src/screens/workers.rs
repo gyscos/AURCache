@@ -281,6 +281,7 @@ fn WorkersTable(
                         th { "Architectures" }
                         th { class: "{WIDE_ONLY}", "Reserved for" }
                         th { class: "{WIDE_ONLY}", "Priority" }
+                        th { class: "{WIDE_ONLY}", "Type" }
                         th { class: "{WIDE_ONLY}", "Version" }
                         th { class: "{WIDE_ONLY}", "Last seen" }
                         th { "" }
@@ -326,6 +327,9 @@ fn WorkersTable(
                                         "{worker.priority}"
                                     }
                                 }
+                            }
+                            td { class: "{WIDE_ONLY}",
+                                KindBadge { worker: worker.clone() }
                             }
                             td { class: "{WIDE_ONLY} text-sm opacity-70",
                                 {worker.version.clone().unwrap_or_else(|| "—".to_string())}
@@ -402,6 +406,39 @@ fn StatusBadge(status: ApprovalStatus) -> Element {
     }
 }
 
+/// Which build strategy a worker runs.
+///
+/// The kind is whatever the worker called itself, so this renders an unknown
+/// value rather than falling back to a default -- a new executor should show up
+/// on this page without the frontend having been taught about it.
+///
+/// The one exception is the legacy container builder, which is deprecated and
+/// worth flagging: "which of my workers are still on it" is the question an
+/// operator asks before removing it.
+#[component]
+fn KindBadge(worker: Worker) -> Element {
+    let Some(kind) = worker.kind.as_deref() else {
+        return rsx! {
+            span {
+                class: "opacity-40",
+                title: "This worker enrolled before workers reported a type; restarting it fills this in.",
+                "—"
+            }
+        };
+    };
+    let (class, title) = if kind == "docker" {
+        (
+            "badge-warning",
+            "The legacy container builder, which is deprecated. Migrate to the chroot worker.",
+        )
+    } else {
+        ("badge-ghost", "The build strategy this worker reported.")
+    };
+    rsx! {
+        span { class: "badge {class} badge-sm font-mono whitespace-nowrap", title: "{title}", "{kind}" }
+    }
+}
+
 /// What a worker can build, and how.
 ///
 /// Emulated architectures are marked rather than listed alongside the native
@@ -443,6 +480,7 @@ mod tests {
             priority: 0,
             last_seen: None,
             version: None,
+            kind: None,
             // These tests are about how architectures are described; the
             // liveness and record columns have their own below.
             online: false,

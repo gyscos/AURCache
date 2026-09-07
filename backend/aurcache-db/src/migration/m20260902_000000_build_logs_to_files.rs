@@ -152,10 +152,20 @@ mod tests {
 
     /// Migrate up to, but not including, this migration, so a row can be
     /// planted in the schema as it stood before the move.
+    ///
+    /// Found by name rather than as "one before the end": this used to assume
+    /// it was the last migration registered, so the next migration added after
+    /// it silently ran this one too, and the test then failed inserting into a
+    /// column this migration had just dropped.
     async fn db_before_this_migration() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
+        let this = Migration.name();
+        let before = Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == this)
+            .expect("this migration is registered with the migrator");
         // Fully qualified: sea_query also defines a `try_from` on u32.
-        let upto = <u32 as TryFrom<usize>>::try_from(Migrator::migrations().len() - 1).unwrap();
+        let upto = <u32 as TryFrom<usize>>::try_from(before).unwrap();
         Migrator::up(&db, Some(upto)).await.unwrap();
         db
     }

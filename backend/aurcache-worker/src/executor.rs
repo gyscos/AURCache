@@ -35,6 +35,8 @@ impl ChrootExecutor {
 }
 
 impl Executor for ChrootExecutor {
+    const KIND: &'static str = "chroot";
+
     async fn run_job(
         &self,
         client: Arc<WorkerClient>,

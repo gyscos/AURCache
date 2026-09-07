@@ -22,6 +22,9 @@ pub struct WorkerRegistration<'a> {
     pub native_arches: &'a str,
     pub emulated_arches: &'a str,
     pub version: &'a str,
+    /// Build strategy the worker runs (`chroot`, `docker`); empty from a worker
+    /// predating the field, which is stored as `None`.
+    pub kind: &'a str,
     /// Comma-separated exact pkgbase names this worker is provisioned for.
     pub package_affinity: &'a str,
     /// Scheduling preference; higher wins.
@@ -42,6 +45,10 @@ pub async fn register_worker<C: ConnectionTrait>(
     reg: &WorkerRegistration<'_>,
 ) -> Result<workers::Model, DbErr> {
     let now = now_secs();
+    // Empty means the worker predates the field, which is "unknown" rather than
+    // any particular strategy -- so it is stored as NULL and shown as unknown,
+    // not guessed at.
+    let kind: Option<&str> = Some(reg.kind).filter(|k| !k.is_empty());
     // Insert-if-absent keyed on the unique cert_fingerprint. On conflict we keep
     // the existing row (status/approval preserved) and refresh what the worker
     // reported.
@@ -55,6 +62,7 @@ pub async fn register_worker<C: ConnectionTrait>(
             workers::Column::EmulatedArches,
             workers::Column::LastSeen,
             workers::Column::Version,
+            workers::Column::Kind,
             workers::Column::PackageAffinity,
             workers::Column::Priority,
             workers::Column::Concurrency,
@@ -67,6 +75,7 @@ pub async fn register_worker<C: ConnectionTrait>(
             reg.emulated_arches.into(),
             now.into(),
             reg.version.into(),
+            kind.into(),
             reg.package_affinity.into(),
             reg.priority.into(),
             reg.concurrency.into(),
@@ -80,6 +89,7 @@ pub async fn register_worker<C: ConnectionTrait>(
                     workers::Column::EmulatedArches,
                     workers::Column::LastSeen,
                     workers::Column::Version,
+                    workers::Column::Kind,
                     workers::Column::PackageAffinity,
                     workers::Column::Priority,
                     workers::Column::Concurrency,
@@ -213,10 +223,50 @@ mod tests {
             native_arches: "x86_64",
             emulated_arches: "",
             version: "0.1.0",
+            kind: "chroot",
             package_affinity: "",
             priority: 0,
             concurrency: 1,
         }
+    }
+
+    /// The kind is stored as reported, and re-registration updates it: a
+    /// machine switched from the container builder to the chroot one is the
+    /// same worker, and the page must not keep showing the old strategy.
+    #[tokio::test]
+    async fn registration_records_and_refreshes_the_kind() {
+        let db = setup().await;
+        let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+        assert_eq!(w.kind.as_deref(), Some("chroot"));
+
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                kind: "docker",
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.kind.as_deref(), Some("docker"));
+    }
+
+    /// A worker predating the field reports nothing, which is "unknown" rather
+    /// than any particular strategy -- stored as NULL so the page can say so
+    /// instead of guessing at the default.
+    #[tokio::test]
+    async fn an_unreported_kind_is_stored_as_unknown() {
+        let db = setup().await;
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                kind: "",
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(w.kind.is_none());
     }
 
     #[tokio::test]

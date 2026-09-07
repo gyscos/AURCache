@@ -281,6 +281,7 @@ pub async fn register_worker(
             native_arches: &input.native_arches.join(","),
             emulated_arches: &input.emulated_arches.join(","),
             version: &input.version,
+            kind: &input.kind,
             package_affinity: &input.packages.join(","),
             priority: input.priority,
             // Clamped to at least 1: a worker reporting 0 would be treated as
@@ -865,6 +866,7 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         priority: worker.priority,
         last_seen: worker.last_seen,
         version: worker.version,
+        kind: worker.kind,
         online: is_online(worker.last_seen, now, timeout),
         active_builds: tally.active,
         successful_builds: tally.successful,

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use aurcache_worker::config::Config;
 use aurcache_worker::executor::ChrootExecutor;
 use aurcache_worker::{credentials, oneshot};
+use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::identity::Identity;
 use aurcache_worker_core::runner::Runner;
 use aurcache_worker_core::{config::CoreConfig, enroll};
@@ -102,7 +103,7 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // compose stack) or may briefly go away. Retry enrollment with backoff
     // instead of crashing, so the worker is resilient to server restarts.
     let client = loop {
-        match enroll::ensure_enrolled(&core, &identity).await {
+        match enroll::ensure_enrolled(&core, &identity, ChrootExecutor::KIND).await {
             Ok(client) => break client,
             Err(e) => {
                 tracing::warn!(

@@ -7,6 +7,7 @@
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 
+use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::identity::Identity;
 use aurcache_worker_core::runner::Runner;
 use aurcache_worker_core::{config::CoreConfig, enroll};
@@ -45,7 +46,7 @@ async fn main() -> Result<()> {
     // The server may not be reachable yet (it may be starting alongside this
     // process) or may briefly go away. Retry rather than crashing.
     let client = loop {
-        match enroll::ensure_enrolled(&core, &identity).await {
+        match enroll::ensure_enrolled(&core, &identity, DockerExecutor::KIND).await {
             Ok(client) => break client,
             Err(e) => {
                 tracing::warn!(

@@ -53,6 +53,16 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -n "$CHROME" ] || fail "no chrome/chromium found; set CHROME=/path/to/browser"
 command -v wasm-bindgen >/dev/null 2>&1 || fail "wasm-bindgen not installed (cargo install wasm-bindgen-cli)"
+# Version, not just presence. wasm-bindgen refuses a wasm file emitted by any
+# other release of itself, and the resulting error names schema versions rather
+# than the fix -- so the check that costs a second here saves reading a page of
+# bindgen output. The wanted version is the frontend's lockfile, the same source
+# the container images pin from.
+wb_want=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' \
+    "$PROJECT_DIR/frontend-rs/Cargo.lock")
+wb_have=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')
+[ -n "$wb_want" ] || fail "could not read the wasm-bindgen version from frontend-rs/Cargo.lock"
+[ "$wb_have" = "$wb_want" ] || fail "wasm-bindgen $wb_have installed but the frontend needs $wb_want (cargo install wasm-bindgen-cli --version $wb_want)"
 command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 not installed"
 rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown \
     || fail "rust target wasm32-unknown-unknown not installed"

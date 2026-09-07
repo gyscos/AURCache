@@ -155,7 +155,7 @@ async fn fake_worker_protocol_roundtrip() {
     // The shared enrollment token makes the server auto-approve it.
     let cfg = CoreConfig::from_env();
     let identity = Identity::load_or_create(&cfg.data_dir).unwrap();
-    let client: WorkerClient = ensure_enrolled(&cfg, &identity)
+    let client: WorkerClient = ensure_enrolled(&cfg, &identity, "chroot")
         .await
         .expect("worker should enroll and be auto-approved via token");
 

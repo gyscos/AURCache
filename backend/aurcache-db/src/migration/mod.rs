@@ -22,6 +22,7 @@ mod m20260831_000002_build_size;
 mod m20260831_000003_bulk_adds;
 mod m20260901_000000_operations;
 mod m20260902_000000_build_logs_to_files;
+mod m20260906_000000_worker_kind;
 
 pub struct Migrator;
 
@@ -58,6 +59,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000003_bulk_adds::Migration),
             Box::new(m20260901_000000_operations::Migration),
             Box::new(m20260902_000000_build_logs_to_files::Migration),
+            Box::new(m20260906_000000_worker_kind::Migration),
         ]
     }
 }
