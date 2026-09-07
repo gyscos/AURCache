@@ -358,7 +358,12 @@ fn RowAction(pkgbase: String, action: Option<Action>, on_changed: EventHandler<(
                 span { class: "text-xs text-error", title: "{message}", "failed" }
             }
             button {
-                class: "btn btn-ghost btn-xs",
+                // `relative`, because the spinner below is positioned over the
+                // label rather than laid out beside it. Adding it to the flow
+                // widened the button mid-click, which pushed the whole column
+                // sideways and shifted the status badges of every row -- a list
+                // that moves while you are clicking it.
+                class: "btn btn-ghost btn-xs relative",
                 disabled: busy(),
                 // A button inside a clickable row has to claim its own click,
                 // or pressing it also navigates away.
@@ -389,9 +394,13 @@ fn RowAction(pkgbase: String, action: Option<Action>, on_changed: EventHandler<(
                     }
                 },
                 if busy() {
-                    span { class: "loading loading-spinner loading-xs" }
+                    span { class: "loading loading-spinner loading-xs absolute inset-0 m-auto" }
                 }
-                {action.label()}
+                // Hidden rather than removed: it still occupies its space, so
+                // the button stays exactly as wide as its label whatever it is
+                // doing. That holds for any label without a reserved width to
+                // keep in step with the longest one.
+                span { class: if busy() { "invisible" } else { "" }, {action.label()} }
             }
         }
     }
