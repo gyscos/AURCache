@@ -141,8 +141,42 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
 /// setting take effect at all -- the previous arrangement only reached the
 /// chroot when it was first created, so a setting changed afterwards was
 /// silently ignored until the chroot was rebuilt.
+/// Settings `makechrootpkg` chooses for itself, which a drop-in must not touch.
+///
+/// It appends `BUILDDIR=/build PKGDEST=/pkgdest ...` to the chroot's
+/// `/etc/makepkg.conf`, skipping any it finds already set. Those paths are
+/// bind-mounted into the build; ours are not. While the server's `PKGDEST` sat
+/// in that same file, makechrootpkg's line was appended after it and won -- so
+/// it was always a no-op for a chroot build. From a drop-in, which makepkg
+/// sources *after* the base file, it would win instead, and the build fails
+/// immediately:
+///
+/// ```text
+/// ==> ERROR: Failed to create the directory $PKGDEST (/output).
+/// ```
+const CHROOT_OWNED_SETTINGS: [&str; 5] =
+    ["BUILDDIR", "PKGDEST", "SRCPKGDEST", "SRCDEST", "LOGDEST"];
+
+/// Drop assignments to the settings `makechrootpkg` owns.
+fn without_chroot_owned(overrides: &str) -> String {
+    overrides
+        .lines()
+        .filter(|line| {
+            let key = line.trim_start().split('=').next().unwrap_or("").trim();
+            !CHROOT_OWNED_SETTINGS.contains(&key)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 pub async fn install_makepkg_dropin(root: &Path, staged: &Path) -> Result<()> {
     let dest = root.join("etc/makepkg.conf.d/aurcache.conf");
+    let filtered = without_chroot_owned(
+        &std::fs::read_to_string(staged)
+            .with_context(|| format!("reading {}", staged.display()))?,
+    );
+    let staged = &staged.with_extension("dropin");
+    std::fs::write(staged, filtered).with_context(|| format!("writing {}", staged.display()))?;
     // Through `sudo`, because the chroot belongs to root and this worker
     // deliberately does not. The file is staged in the job's own directory
     // first, so nothing writes into the chroot except this one copy -- which is
@@ -227,6 +261,30 @@ pub fn write_configs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `makechrootpkg` picks the build directories, and a drop-in must not
+    /// override them: it bind-mounts `/pkgdest` and friends, and `/output` --
+    /// which the server sends as a default -- exists nowhere in the chroot.
+    #[test]
+    fn the_chroots_own_directories_are_left_alone() {
+        let filtered = without_chroot_owned(
+            "PKGDEST=/output\nMAKEFLAGS=-j4\nSRCDEST=/srcdest\nPACKAGER='x'\nBUILDDIR=/b\n",
+        );
+        assert_eq!(filtered, "MAKEFLAGS=-j4\nPACKAGER='x'\n");
+    }
+
+    /// Only exact assignments go; a comment mentioning one stays, and so does
+    /// anything whose name merely starts the same way.
+    #[test]
+    fn filtering_matches_the_setting_not_the_text() {
+        let filtered = without_chroot_owned(
+            "# PKGDEST is chosen by makechrootpkg\nPKGDEST_EXTRA=1\nPKGDEST=/output\n",
+        );
+        assert_eq!(
+            filtered,
+            "# PKGDEST is chosen by makechrootpkg\nPKGDEST_EXTRA=1\n"
+        );
+    }
 
     /// The staged makepkg file is the job's overrides verbatim.
     ///
