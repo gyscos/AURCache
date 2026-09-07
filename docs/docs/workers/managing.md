@@ -60,16 +60,21 @@ It is most useful on a build that failed with exit 137, which is an OOM kill and
 says nothing else about itself. Knowing the last successful build of the same
 package peaked at 6 GiB turns that into a number you can act on.
 
-Two caveats:
+The figure is exact, not sampled: each build runs in a cgroup of its own and
+this is that cgroup's `memory.peak`, so it covers every process in the tree with
+no polling and no blind spot.
 
-- **Sampled once a second**, so it is a floor on what the build needed rather
-  than a bound; a spike shorter than that is invisible. An exact figure would
-  need a cgroup per build, which the worker does not create: `systemd-nspawn`
-  is run with `--keep-unit`, so a build shares the worker's cgroup with every
-  other build running beside it.
-- **A dash means not reported**, not zero: an older worker, the legacy container
-  builder (which does not sample), or a build that ended before the first
-  sample.
+**A dash means not reported**, not zero. That happens when:
+
+- the worker predates this, or is the deprecated container builder — Docker
+  exposes no peak figure on cgroup v2, where `max_usage` no longer exists;
+- the worker could not prepare a cgroup subtree. A container needs
+  `privileged`, which `mkarchroot` and `arch-nspawn` already require, so the
+  published images qualify. A native install needs `Delegate=yes` on the unit,
+  which `aurcache-worker.service` sets; systemd otherwise owns that subtree.
+- the kernel is older than 5.19, which is where `memory.peak` arrived.
+
+Builds run either way — this measures the work, it does not do it.
 
 ## Why is a build not starting?
 

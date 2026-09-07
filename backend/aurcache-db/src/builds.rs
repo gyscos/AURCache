@@ -30,8 +30,9 @@ pub struct Model {
     /// predates the column. Per platform, since a build is: a package's total
     /// is the sum across every platform it builds for.
     pub size: Option<i64>,
-    /// High-water mark of the build process tree's memory, in bytes, as the
-    /// worker sampled it. `None` for a build whose worker did not report one.
+    /// High-water mark of the build process tree's memory, in bytes: the
+    /// `memory.peak` of the cgroup the build ran in. `None` for a build whose
+    /// worker did not report one.
     pub peak_memory: Option<i64>,
     /// Id of the worker that holds the active lease on this build, if any.
     pub worker_id: Option<i32>,

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 
+use crate::cgroup::Hierarchy;
 use crate::config::Config;
 use crate::job;
 
@@ -22,14 +23,32 @@ pub struct ChrootExecutor {
     /// garbage-collector never evicts a sibling job's in-progress `SRCDEST`
     /// when `concurrency > 1`.
     active_pkgbases: Arc<Mutex<HashSet<String>>>,
+    /// The prepared cgroup subtree each build's cgroup is created under, so
+    /// `memory.peak` reports one build rather than the worker and its siblings.
+    ///
+    /// `None` where the subtree could not be prepared. Builds still run; they
+    /// report no memory figure, which the page shows as unknown.
+    cgroups: Option<Hierarchy>,
 }
 
 impl ChrootExecutor {
     #[must_use]
     pub fn new(cfg: Arc<Config>) -> Self {
+        // Once, at startup: the hierarchy has to be rearranged before any build
+        // runs, and rearranging it per build would move the worker repeatedly.
+        let cgroups = match Hierarchy::prepare() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(
+                    "No per-build cgroup, so builds will not report peak memory ({e:#}).                      A container needs `privileged`; a native install needs                      `Delegate=yes` on the unit."
+                );
+                None
+            }
+        };
         Self {
             cfg,
             active_pkgbases: Arc::new(Mutex::new(HashSet::new())),
+            cgroups,
         }
     }
 }
@@ -51,6 +70,7 @@ impl Executor for ChrootExecutor {
 
         let report = job::run_job(
             &self.cfg,
+            self.cgroups.as_ref(),
             &client,
             job,
             cancel,

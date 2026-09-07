@@ -154,7 +154,7 @@ pub fn Builds(q: String) -> Element {
                                             }
                                             td {
                                                 class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
-                                                title: "Peak memory of the build's process tree, sampled once a second.",
+                                                title: "Peak memory of the build's whole process tree, from its cgroup.",
                                                 {build_peak_memory(build)}
                                             }
                                             td { BuildStatusBadge { status: build.status } }
@@ -197,10 +197,10 @@ fn build_size(build: &Build) -> String {
 
 /// How much memory a build needed at its peak.
 ///
-/// A dash where the worker reported nothing: an older worker, the legacy
-/// container builder, or a build too short to sample. That is a different
-/// statement from a build that used no memory, which cannot happen -- so it is
-/// never rendered as `0 B`.
+/// A dash where the worker reported nothing: an older worker, the deprecated
+/// container builder, or a worker without a cgroup subtree to measure in. That
+/// is a different statement from a build that used no memory, which cannot
+/// happen -- so it is never rendered as `0 B`.
 fn build_peak_memory(build: &Build) -> String {
     build
         .peak_memory

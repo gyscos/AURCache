@@ -20,6 +20,7 @@ use aurcache_worker_core::{artifacts, report};
 
 use crate::build;
 use crate::cache::Cache;
+use crate::cgroup::Hierarchy;
 use crate::chroot;
 use crate::config::Config;
 use crate::credentials;
@@ -33,6 +34,7 @@ use crate::credentials;
 /// later retry and `WORKER_DATA_DIR/work/` would grow without bound.
 pub async fn run_job(
     cfg: &Config,
+    cgroups: Option<&Hierarchy>,
     client: &Arc<WorkerClient>,
     job: JobDescriptor,
     cancel: Arc<AtomicBool>,
@@ -44,7 +46,17 @@ pub async fn run_job(
         .join("work")
         .join(job.build_id.to_string());
 
-    let report = match run_job_inner(cfg, client, &job, &cancel, &active_pkgbases, &workdir).await {
+    let report = match run_job_inner(
+        cfg,
+        cgroups,
+        client,
+        &job,
+        &cancel,
+        &active_pkgbases,
+        &workdir,
+    )
+    .await
+    {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("build setup failed: {e:#}");
@@ -66,6 +78,7 @@ pub async fn run_job(
 
 async fn run_job_inner(
     cfg: &Config,
+    cgroups: Option<&Hierarchy>,
     client: &Arc<WorkerClient>,
     job: &JobDescriptor,
     cancel: &AtomicBool,
@@ -174,7 +187,8 @@ async fn run_job_inner(
     let mut binds = cfg.bind_mounts.clone();
     binds.extend(pkg_cache_bind);
 
-    let report = run_build(cfg, client, job, &pkgdir, &cache, &binds, cancel).await?;
+    let ctx = WorkerContext { cfg, cgroups };
+    let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
 
     // 5. Fold this job's downloads into the shared cache, then bound it. Only
     //    after `makechrootpkg` has exited: promoting mid-build would move
@@ -267,8 +281,17 @@ where
 /// batches. Letting the child inherit the worker's stdio instead sends the
 /// build's output to the worker's own container logs, where the user reading
 /// the build page cannot see it.
+/// What this worker brings to a build, as against what the job describes.
+///
+/// Grouped because they travel together and are both "how this machine builds"
+/// rather than "what is being built".
+struct WorkerContext<'a> {
+    cfg: &'a Config,
+    cgroups: Option<&'a Hierarchy>,
+}
+
 async fn run_build(
-    cfg: &Config,
+    ctx: &WorkerContext<'_>,
     client: &Arc<WorkerClient>,
     job: &JobDescriptor,
     pkgdir: &Path,
@@ -279,17 +302,35 @@ async fn run_build(
     let build_id = job.build_id;
     let srcdest = cache.srcdest(&job.pkgbase);
     let argv = build::build_command(
-        &cfg.chroot_dir,
+        &ctx.cfg.chroot_dir,
         &format!("job-{build_id}"),
         binds,
         &job.build_flags,
-        &cfg.build_user,
+        &ctx.cfg.build_user,
     );
 
     tracing::debug!("$ sudo {}", argv.join(" "));
+    // One cgroup for this build. The child places itself into it between fork
+    // and exec, so every descendant -- nspawn, makepkg, each compiler -- is
+    // accounted to it, and `memory.peak` is the whole tree's high-water mark.
+    //
+    // A hierarchy the worker could not prepare means no figure, never a failed
+    // build: this measures the work, it does not do it.
+    let build_cgroup = ctx.cgroups.map(|h| h.for_build(build_id)).transpose()?;
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
+        if let Some(cg) = &build_cgroup {
+            // Opened per spawn: the retry below runs this closure again, and a
+            // descriptor consumed by the first attempt is gone by then.
+            let handle = cg.procs_handle().map_err(std::io::Error::other)?;
+            // SAFETY: `join_current_process` is one write to a descriptor
+            // opened before the fork, which is async-signal-safe. Nothing else
+            // runs in this hook.
+            unsafe {
+                cmd.pre_exec(move || crate::cgroup::BuildCgroup::join_current_process(&handle));
+            }
+        }
         // Capture the build's output instead of letting it inherit the
         // worker's stdio. Without this the log a user sees ends at
         // "[worker] starting build" and everything makepkg prints — including
@@ -314,10 +355,6 @@ async fn run_build(
             spawn(&argv).context("spawning build")?
         }
     };
-
-    // Measure the tree from here on. Started after the spawn so there is a pid
-    // to root it at, and dropped with this function, which stops the sampler.
-    let memory = child.id().map(crate::memory::PeakMemory::watching);
 
     // Poll for cancellation / timeout while the child runs. Local self-abort and
     // the build timeout are checked every 5s (cheap, in-process); the remote
@@ -344,7 +381,7 @@ async fn run_build(
     })
     .collect::<Vec<_>>();
 
-    let timeout = cfg.core.build_timeout;
+    let timeout = ctx.cfg.core.build_timeout;
     let remote_poll = Duration::from_secs(30);
     let mut last_remote_poll = std::time::Instant::now();
     let mut canceled = false;
@@ -383,7 +420,9 @@ async fn run_build(
     // Attached after the fact rather than threaded through every constructor:
     // how much a build used is orthogonal to why it ended, and a timeout or a
     // cancellation is exactly when the number is most worth having.
-    let peak_memory_bytes = memory.as_ref().and_then(super::memory::PeakMemory::peak);
+    let peak_memory_bytes = build_cgroup
+        .as_ref()
+        .and_then(crate::cgroup::BuildCgroup::peak_bytes);
     let mut report = if timed_out {
         report::timeout_failure(started.elapsed().as_secs())
     } else {

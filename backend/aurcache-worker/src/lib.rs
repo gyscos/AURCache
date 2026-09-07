@@ -9,10 +9,10 @@
 
 pub mod build;
 pub mod cache;
+pub mod cgroup;
 pub mod chroot;
 pub mod config;
 pub mod credentials;
 pub mod executor;
 pub mod job;
-pub mod memory;
 pub mod oneshot;

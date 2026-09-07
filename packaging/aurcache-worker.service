@@ -42,6 +42,18 @@ Environment=WORKER_CACHE_DIR=/var/cache/aurcache-worker
 # aurcache-sandbox. Adding directives above without understanding that trade
 # will produce builds that fail in confusing ways.
 #
+# Hand the unit's cgroup subtree over rather than managing it.
+#
+# The worker gives each build a cgroup of its own so `memory.peak` reports one
+# build rather than the worker and every build running beside it. Creating one
+# means enabling the memory controller in `cgroup.subtree_control`, which is
+# systemd's to do unless it delegates -- and it also means the worker moves
+# itself into a leaf first, because cgroup v2 refuses to enable a controller
+# while processes sit directly in that cgroup.
+#
+# Without this the worker still builds; builds simply report no memory figure.
+Delegate=yes
+
 # What is safe to keep:
 PrivateTmp=yes
 ProtectHome=yes

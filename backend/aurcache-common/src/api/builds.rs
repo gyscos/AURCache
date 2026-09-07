@@ -27,10 +27,12 @@ pub struct BuildSummary {
     pub size: Option<i64>,
     /// High-water mark of the build's process tree memory, in bytes.
     ///
-    /// `None` for a build whose worker did not report one: an older worker, the
-    /// legacy container builder, or a build that ended before the first sample.
-    /// Sampled once a second, so it is a floor on what the build needed rather
-    /// than a bound -- a spike shorter than that is invisible.
+    /// Exact rather than sampled: the build runs in a cgroup of its own and
+    /// this is that cgroup's `memory.peak`, covering every process in the tree.
+    ///
+    /// `None` where no figure was reported -- an older worker, the deprecated
+    /// container builder (Docker exposes no peak on cgroup v2), or a worker
+    /// whose cgroup subtree could not be prepared.
     pub peak_memory: Option<i64>,
     /// Why this build is stuck, when it is `ENQUEUED` and *no* approved worker
     /// can currently take it. `None` for everything else, including a build
