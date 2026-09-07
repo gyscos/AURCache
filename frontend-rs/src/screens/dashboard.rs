@@ -1,6 +1,7 @@
 //! The landing page: how the instance is doing, at a glance.
 
 use crate::format::{format_bytes, format_secs};
+use crate::listing::ViewParams;
 use crate::routes::Route;
 use aurcache_client::{GraphDataPoint, ListStats};
 use dioxus::prelude::*;
@@ -106,13 +107,13 @@ fn StatTiles(stats: ListStats) -> Element {
                 // packages do I have"; dependencies are along for the ride, so
                 // they sit underneath rather than inflating the headline.
                 note: "{all_packages} with dependencies",
-                to: Route::Packages { q: String::new() },
+                to: Route::Packages { view: ViewParams::default(), q: String::new() },
             }
             StatTile {
                 label: "Builds",
                 value: "{stats.total_builds}",
                 note: "{stats.recent_builds} this week",
-                to: Route::Builds { q: String::new() },
+                to: Route::Builds { view: ViewParams::default(), q: String::new() },
             }
             StatTile {
                 label: "Succeeded",

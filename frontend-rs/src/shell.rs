@@ -5,6 +5,7 @@
 //! `MenuShell`, without needing to measure the viewport in Rust.
 
 use crate::dates::DateStylePicker;
+use crate::listing::ViewParams;
 use crate::routes::{MenuEntry, Route};
 use crate::theme::ThemePicker;
 use dioxus::prelude::*;
@@ -103,13 +104,13 @@ fn SideMenu() -> Element {
                         icon: rsx! { DashboardIcon {} },
                     }
                     MenuLink {
-                        to: Route::Packages { q: String::new() },
+                        to: Route::Packages { view: ViewParams::default(), q: String::new() },
                         label: "Packages",
     active: active == Some(MenuEntry::Packages),
                         icon: rsx! { PackagesIcon {} },
                     }
                     MenuLink {
-                        to: Route::Builds { q: String::new() },
+                        to: Route::Builds { view: ViewParams::default(), q: String::new() },
                         label: "Builds",
     active: active == Some(MenuEntry::Builds),
                         icon: rsx! { BuildsIcon {} },
@@ -460,10 +461,16 @@ mod tests {
 
     /// Links are rendered as real `href`s, which is what makes them copyable
     /// and middle-clickable. A handler-only menu would render bare `<a>`s.
+    ///
+    /// The list routes spread their filter into the query, and dioxus writes
+    /// the `?` even when nothing follows it, so those two are `/builds?` until
+    /// DioxusLabs/dioxus#5793 lands. Matching the prefix accepts that and
+    /// nothing more -- a link that grew real query content would still fail
+    /// `an_empty_search_leaves_no_trace_in_the_url`.
     #[test]
     fn menu_entries_are_real_links() {
         let html = render_at("/");
-        for href in ["/builds", "/packages", "/settings", "/workers"] {
+        for href in ["/builds?", "/packages?", "/settings", "/workers"] {
             assert!(
                 html.contains(&format!("href=\"{href}\"")),
                 "no link to {href}: {html}"
@@ -484,7 +491,7 @@ mod tests {
     #[test]
     fn links_are_paths_not_fragments() {
         let html = render_at("/");
-        for route in ["/builds", "/packages", "/settings"] {
+        for route in ["/builds?", "/packages?", "/settings"] {
             assert!(
                 html.contains(&format!("href=\"{route}\"")),
                 "no plain-path link to {route}: {html}"

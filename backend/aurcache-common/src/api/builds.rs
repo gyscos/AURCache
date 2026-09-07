@@ -34,6 +34,14 @@ pub struct BuildSummary {
     /// container builder (Docker exposes no peak on cgroup v2), or a worker
     /// whose cgroup subtree could not be prepared.
     pub peak_memory: Option<i64>,
+    /// The worker that ran this build, by name.
+    ///
+    /// `None` where no worker has claimed it -- a queued build -- and for
+    /// builds recorded before builds remembered which worker ran them. The
+    /// name rather than the id because it is what the lists show and what an
+    /// operator searches for; a renamed worker relabels its history, which is
+    /// the same thing the Workers page does.
+    pub worker_name: Option<String>,
     /// Why this build is stuck, when it is `ENQUEUED` and *no* approved worker
     /// can currently take it. `None` for everything else, including a build
     /// merely waiting behind a busy worker — see

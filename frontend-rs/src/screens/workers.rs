@@ -13,8 +13,10 @@
 
 use crate::dates::RelativeDate;
 use crate::format::now_secs;
-use crate::listing::ListHeader;
+use crate::listing::{ListHeader, ViewParams};
+use crate::routes::Route;
 use aurcache_client::{ApprovalStatus, Worker, WorkerJoinInfo};
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
 /// Columns that only appear once there is room for them.
@@ -282,7 +284,6 @@ fn WorkersTable(
                         th { class: "{WIDE_ONLY}", "Reserved for" }
                         th { class: "{WIDE_ONLY}", "Priority" }
                         th { class: "{WIDE_ONLY}", "Type" }
-                        th { class: "{WIDE_ONLY}", "Version" }
                         th { class: "{WIDE_ONLY}", "Last seen" }
                         th { "" }
                     }
@@ -330,9 +331,6 @@ fn WorkersTable(
                             }
                             td { class: "{WIDE_ONLY}",
                                 KindBadge { worker: worker.clone() }
-                            }
-                            td { class: "{WIDE_ONLY} text-sm opacity-70",
-                                {worker.version.clone().unwrap_or_else(|| "—".to_string())}
                             }
                             td { class: "{WIDE_ONLY} text-sm opacity-70",
                                 if worker.last_seen.is_some() {
@@ -406,7 +404,28 @@ fn StatusBadge(status: ApprovalStatus) -> Element {
     }
 }
 
-/// Which build strategy a worker runs.
+/// How a worker describes itself: its build strategy, at the version running it.
+///
+/// Joined with `@`, the "artifact at version" spelling npm and Go established,
+/// so it reads as one token without a legend. Not `:`, which would be actively
+/// misleading here -- `docker` is itself one of the kinds, so `docker:0.5.0`
+/// reads as an image tag rather than as a kind at a version. Not `/`, which
+/// reads as a path segment.
+///
+/// The two halves are independently absent. A worker that enrolled before
+/// either was reported has neither; one that predates only the kind still has a
+/// version worth showing, so that case renders the version alone rather than a
+/// stray separator.
+fn kind_label(worker: &Worker) -> Option<String> {
+    match (worker.kind.as_deref(), worker.version.as_deref()) {
+        (Some(kind), Some(version)) => Some(format!("{kind}@{version}")),
+        (Some(kind), None) => Some(kind.to_string()),
+        (None, Some(version)) => Some(version.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Which build strategy a worker runs, and at what version.
 ///
 /// The kind is whatever the worker called itself, so this renders an unknown
 /// value rather than falling back to a default -- a new executor should show up
@@ -417,7 +436,7 @@ fn StatusBadge(status: ApprovalStatus) -> Element {
 /// operator asks before removing it.
 #[component]
 fn KindBadge(worker: Worker) -> Element {
-    let Some(kind) = worker.kind.as_deref() else {
+    let Some(label) = kind_label(&worker) else {
         return rsx! {
             span {
                 class: "opacity-40",
@@ -426,16 +445,19 @@ fn KindBadge(worker: Worker) -> Element {
             }
         };
     };
-    let (class, title) = if kind == "docker" {
+    let (class, title) = if worker.kind.as_deref() == Some("docker") {
         (
             "badge-warning",
             "The legacy container builder, which is deprecated. Migrate to the chroot worker.",
         )
     } else {
-        ("badge-ghost", "The build strategy this worker reported.")
+        (
+            "badge-ghost",
+            "The build strategy this worker reported, and the version it runs.",
+        )
     };
     rsx! {
-        span { class: "badge {class} badge-sm font-mono whitespace-nowrap", title: "{title}", "{kind}" }
+        span { class: "badge {class} badge-sm font-mono whitespace-nowrap", title: "{title}", "{label}" }
     }
 }
 
@@ -463,7 +485,8 @@ fn architectures(worker: &Worker) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        StatusBadge, StatusBadgeProps, architectures, is_loopback, join_command, waiting_message,
+        StatusBadge, StatusBadgeProps, architectures, is_loopback, join_command, kind_label,
+        waiting_message,
     };
     use aurcache_client::{ApprovalStatus, Worker, WorkerJoinInfo};
     use dioxus::prelude::*;
@@ -488,6 +511,35 @@ mod tests {
             successful_builds: 0,
             failed_builds: 0,
         }
+    }
+
+    /// One column, so the two values are joined rather than shown side by side.
+    #[test]
+    fn the_type_column_names_the_kind_at_its_version() {
+        let mut w = worker(&["x86_64"], &[]);
+        w.kind = Some("chroot".to_string());
+        w.version = Some("0.5.0".to_string());
+        assert_eq!(kind_label(&w).as_deref(), Some("chroot@0.5.0"));
+    }
+
+    /// Each half can be missing on its own, and a worker that reports a version
+    /// but no kind is not hypothetical -- enrolments from before kind reporting
+    /// look exactly like that. Neither case may render a dangling separator.
+    #[test]
+    fn a_missing_half_does_not_leave_a_separator() {
+        let mut w = worker(&["x86_64"], &[]);
+
+        w.kind = Some("chroot".to_string());
+        w.version = None;
+        assert_eq!(kind_label(&w).as_deref(), Some("chroot"));
+
+        w.kind = None;
+        w.version = Some("0.1.0".to_string());
+        assert_eq!(kind_label(&w).as_deref(), Some("0.1.0"));
+
+        // Nothing reported at all is the em dash the cell renders itself.
+        w.version = None;
+        assert_eq!(kind_label(&w), None);
     }
 
     /// Emulation works but is slow. A fleet that reads as four native aarch64
@@ -599,7 +651,15 @@ fn Liveness(worker: Worker) -> Element {
                 title: liveness_hint(worker.online),
             }
             if worker.active_builds > 0 {
-                span { class: "whitespace-nowrap",
+                // Straight to what this machine is building, rather than to
+                // every build it has ever run with the filter still to apply.
+                Link {
+                    class: "whitespace-nowrap hover:underline",
+                    to: Route::Builds {
+                        view: ViewParams::with_status(BuildState::Active),
+                        q: worker.name.clone(),
+                    },
+                    title: "Show what this worker is building",
                     "{worker.active_builds} building"
                 }
             } else if worker.online {
@@ -636,9 +696,27 @@ fn rate_class(rate: f64) -> &'static str {
 #[component]
 fn Record(worker: Worker, fleet_finished: i32) -> Element {
     let finished = worker.successful_builds + worker.failed_builds;
+    // Filtering is by name because that is what the Builds list matches on and
+    // what it shows in its own Worker column, so the destination explains the
+    // filter it arrived with. A name is not unique the way the fingerprint is;
+    // two machines sharing one would list together, which is a truthful answer
+    // to "builds from a worker called this" and the same answer the Builds page
+    // gives to anyone typing it into the search box.
+    let filter = Route::Builds {
+        view: ViewParams::default(),
+        q: worker.name.clone(),
+    };
     if finished == 0 {
         return rsx! {
-            span { class: "text-sm opacity-40", "no builds yet" }
+            Link {
+                class: "text-sm opacity-40 hover:opacity-70",
+                to: filter,
+                // Still a link with nothing finished: a worker part-way through
+                // its first build has something to show, and the count here
+                // only covers builds that ended.
+                title: "Show this worker's builds",
+                "no builds yet"
+            }
         };
     }
 
@@ -650,7 +728,10 @@ fn Record(worker: Worker, fleet_finished: i32) -> Element {
     };
 
     rsx! {
-        div { class: "text-sm leading-tight",
+        Link {
+            class: "text-sm leading-tight block hover:underline",
+            to: filter,
+            title: "Show this worker's builds",
             div { class: "flex items-center gap-1 whitespace-nowrap",
                 span { class: rate_class(rate), "{rate:.0}%" }
                 span { class: "opacity-60", "of {finished}" }

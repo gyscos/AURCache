@@ -51,6 +51,17 @@ pub enum Relation {
         to = "super::packages::Column::Id"
     )]
     Packages,
+    /// The worker that ran this build.
+    ///
+    /// Joined left, never inner: `worker_id` is null for a build nobody has
+    /// claimed yet, and an inner join would silently drop exactly the queued
+    /// builds a list is most often consulted about.
+    #[sea_orm(
+        belongs_to = "super::workers::Entity",
+        from = "Column::WorkerId",
+        to = "super::workers::Column::Id"
+    )]
+    Workers,
 }
 
 impl Related<super::packages::Entity> for Entity {

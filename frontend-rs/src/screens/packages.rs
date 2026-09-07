@@ -8,8 +8,8 @@
 use crate::api::client;
 use crate::format::format_bytes;
 use crate::listing::{
-    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
-    filter_packages, paginate, sort_packages, use_url_search,
+    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
+    filter_packages, paginate, sort_packages, use_url_search, use_url_view,
 };
 use crate::routes::Route;
 use crate::status::StatusBadge;
@@ -39,6 +39,9 @@ async fn load_packages() -> Result<Vec<SimplePackage>, String> {
 
 #[component]
 pub fn Packages(
+    /// Filter and sort, carried in the query string.
+    #[props(default)]
+    view: ViewParams,
     q: String,
     /// Whether this list owns the URL's fragment.
     ///
@@ -60,12 +63,25 @@ pub fn Packages(
     crate::poll::use_poll(packages, building);
     crate::poll::use_refetch_on_package_change(packages);
 
-    let query = use_url_search(q, sync_url, |q| Route::Packages { q });
-    let status = use_signal(|| StatusFilter::ANY);
+    const DEFAULT_SORT: Sort = Sort {
+        key: SortKey::Name,
+        dir: SortDir::Asc,
+    };
+    let status = use_signal(|| view.status_filter());
     // Off by default: the list reads as the set of packages somebody is
     // maintaining, and a dependency closure buries that under packages nobody
-    // chose.
-    let mut show_dependencies = use_signal(|| false);
+    // chose. The URL can ask for them.
+    let mut show_dependencies = use_signal(|| view.dependencies);
+    let sort = use_signal(|| view.sort_or(DEFAULT_SORT));
+
+    // Rebuilt from live state, so the term and the controls write one route
+    // between them instead of each dropping the other's half.
+    let to_route = move |q: String| Route::Packages {
+        view: ViewParams::from_state(status(), sort(), DEFAULT_SORT, show_dependencies()),
+        q,
+    };
+    let query = use_url_search(q, sync_url, to_route);
+    use_url_view(query, sync_url, to_route);
     let mut page = use_signal(|| 0usize);
 
     // Anything that changes which rows exist puts you back at the start.
@@ -76,10 +92,6 @@ pub fn Packages(
         &(query(), status(), show_dependencies()),
         move |_| page.set(0),
     ));
-    let sort = use_signal(|| Sort {
-        key: SortKey::Name,
-        dir: SortDir::Asc,
-    });
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",

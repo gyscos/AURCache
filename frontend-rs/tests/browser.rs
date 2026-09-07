@@ -614,10 +614,14 @@ async fn removing_a_package_takes_it_out_of_the_list(session: &Session) {
     session
         .wait_until("the package to leave the list", |t| !t.contains("2048.c"))
         .await;
+    // `/packages?`, not `/packages`: the list spreads its filter and sort into
+    // the query, and dioxus writes the `?` even with nothing after it
+    // (DioxusLabs/dioxus#5792, fixed by the open #5793). The query itself must
+    // still be empty for a default view, which is asserted in the unit tests.
+    let url = session.url().await;
     assert!(
-        session.url().await.ends_with("/packages"),
-        "removal did not land back on the list: {}",
-        session.url().await
+        url.trim_end_matches('?').ends_with("/packages"),
+        "removal did not land back on the list: {url}"
     );
 }
 

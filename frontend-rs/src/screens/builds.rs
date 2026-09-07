@@ -4,8 +4,8 @@ use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::{format_bytes, format_duration};
 use crate::listing::{
-    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, StatusFilter,
-    filter_builds, paginate, sort_builds, use_url_search,
+    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
+    filter_builds, paginate, sort_builds, use_url_search, use_url_view,
 };
 use crate::routes::Route;
 use crate::status::BuildStatusBadge;
@@ -30,7 +30,7 @@ async fn load_builds() -> Result<Vec<Build>, String> {
 }
 
 #[component]
-pub fn Builds(q: String) -> Element {
+pub fn Builds(view: ViewParams, q: String) -> Element {
     let builds = use_resource(load_builds);
 
     // A build list only grows and its rows change state as work runs, so keep
@@ -41,13 +41,22 @@ pub fn Builds(q: String) -> Element {
     crate::poll::use_poll(builds, building);
     crate::poll::use_refetch_on_package_change(builds);
 
-    let query = use_url_search(q, true, |q| Route::Builds { q });
-    let status = use_signal(|| StatusFilter::ANY);
     // Newest first: a build list is a log.
-    let sort = use_signal(|| Sort {
+    const DEFAULT_SORT: Sort = Sort {
         key: SortKey::Time,
         dir: SortDir::Desc,
-    });
+    };
+    let status = use_signal(|| view.status_filter());
+    let sort = use_signal(|| view.sort_or(DEFAULT_SORT));
+    // Everything the URL carries is rebuilt from live state, so the term and
+    // the controls write the same route rather than each dropping the other's
+    // half.
+    let to_route = move |q: String| Route::Builds {
+        view: ViewParams::from_state(status(), sort(), DEFAULT_SORT, false),
+        q,
+    };
+    let query = use_url_search(q, true, to_route);
+    use_url_view(query, true, to_route);
     let mut page = use_signal(|| 0usize);
 
     // Changing what is listed puts you back at the start; see the same effect
@@ -101,6 +110,7 @@ pub fn Builds(q: String) -> Element {
                                         SortableHeader { label: "Started", column: SortKey::Time, sort, class: "{WIDE_ONLY}" }
                                         th { class: "{WIDE_ONLY}", "Duration" }
                                         th { class: "{WIDE_ONLY}", "Platform" }
+                                        SortableHeader { label: "Worker", column: SortKey::Worker, sort, class: "{WIDE_ONLY}" }
                                         SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
                                         th { class: "{WIDE_ONLY} text-right", "Peak RAM" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
@@ -148,7 +158,19 @@ pub fn Builds(q: String) -> Element {
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 {format_duration(build.start_time, build.end_time)}
                                             }
-                                            td { class: "{WIDE_ONLY} text-sm opacity-70", "{build.platform}" }
+                                            td { class: "{WIDE_ONLY} text-sm opacity-70",
+                                                if let Some(worker) = build.worker_name.as_deref() {
+                                                    "{worker}"
+                                                } else {
+                                                    // Not "no worker": nobody
+                                                    // has claimed it yet.
+                                                    span {
+                                                        class: "opacity-40",
+                                                        title: "Not claimed by a worker yet.",
+                                                        "—"
+                                                    }
+                                                }
+                                            }
                                             td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
                                                 {build_size(build)}
                                             }

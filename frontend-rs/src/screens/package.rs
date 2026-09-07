@@ -12,6 +12,7 @@
 use crate::api::client;
 use crate::dates::RelativeDate;
 use crate::format::{format_bytes, format_duration, now_secs};
+use crate::listing::ViewParams;
 use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
@@ -235,7 +236,7 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
                             h1 { class: "card-title block leading-8 break-all",
                                 Link {
                                     class: "opacity-60 link-hover",
-                                    to: Route::Packages { q: String::new() },
+                                    to: Route::Packages { view: ViewParams::default(), q: String::new() },
                                     "Packages"
                                 }
                                 span { class: "opacity-30 mx-2", "/" }
@@ -998,6 +999,7 @@ mod tests {
             platform: platform.to_string(),
             size: None,
             peak_memory: None,
+            worker_name: None,
             waiting_reason: None,
         }
     }
@@ -1392,7 +1394,10 @@ fn RemoveCard(pkgbase: String) -> Element {
                 confirming.set(false);
                 // The package may no longer exist, so going back to it would
                 // land on an error page.
-                navigator().push(Route::Packages { q: String::new() });
+                navigator().push(Route::Packages {
+                    view: ViewParams::default(),
+                    q: String::new(),
+                });
             }
             Err(e) => error.set(Some(e)),
         }

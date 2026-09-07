@@ -10,7 +10,7 @@ use aurcache_common::api::waiting::WaitingReason;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
-use aurcache_db::{builds, packages};
+use aurcache_db::{builds, packages, workers};
 use aurcache_utils::build_logger::read_build_output;
 use aurcache_utils::package::update::package_update;
 use aurcache_utils::snapshot::SnapshotStore;
@@ -165,6 +165,9 @@ fn build_row_select() -> Select<Builds> {
         .column(builds::Column::Platform)
         .column(builds::Column::Size)
         .column(builds::Column::PeakMemory)
+        // Left, so a queued build -- which has no worker yet -- still lists.
+        .join(JoinType::LeftJoin, builds::Relation::Workers.def())
+        .column_as(workers::Column::Name, "worker_name")
 }
 
 /// A listed build as queried, including the row id the response omits.
@@ -183,6 +186,7 @@ struct BuildRow {
     platform: String,
     size: Option<i64>,
     peak_memory: Option<i64>,
+    worker_name: Option<String>,
 }
 
 impl BuildRow {
@@ -197,6 +201,7 @@ impl BuildRow {
             platform: self.platform,
             size: self.size,
             peak_memory: self.peak_memory,
+            worker_name: self.worker_name,
             waiting_reason,
         }
     }

@@ -1,6 +1,8 @@
 //! A build's log output.
 
 use crate::api::api_base;
+use crate::listing::ViewParams;
+use crate::routes::Route;
 use aurcache_client::AurCacheClient;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
@@ -90,6 +92,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     let mut byte_offset = use_signal(|| 0u64);
     let mut line_count = use_signal(|| 0i32);
     let mut finished = use_signal(|| false);
+    // Filled from the same poll that decides when the log stops, so a build
+    // claimed while this page is open names its worker without a reload.
+    let mut worker_name = use_signal(|| None::<String>);
     let mut error = use_signal(|| Option::<String>::None);
     // "Follow" pins the view to the bottom as output arrives; switching it off
     // is what lets someone read back through a long log while it is still
@@ -130,11 +135,12 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
 
                 // Stop polling once the build reaches a terminal state, but only
                 // after the fetch above, so the last lines are never missed.
-                if let Ok(build) = client.get_build(&pkgbase, number).await
-                    && !matches!(BuildState::from_i32(build.status), Some(BuildState::Active))
-                {
-                    finished.set(true);
-                    return;
+                if let Ok(build) = client.get_build(&pkgbase, number).await {
+                    worker_name.set(build.worker_name.clone());
+                    if !matches!(BuildState::from_i32(build.status), Some(BuildState::Active)) {
+                        finished.set(true);
+                        return;
+                    }
                 }
 
                 gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
@@ -169,6 +175,16 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         span { class: "badge badge-info badge-sm gap-1",
                             span { class: "loading loading-spinner loading-xs" }
                             "running"
+                        }
+                    }
+                    if let Some(worker) = worker_name() {
+                        // Beside the state, because "what is it doing" and
+                        // "where" are one question when a build misbehaves.
+                        Link {
+                            class: "font-mono text-sm opacity-70 hover:underline",
+                            to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
+                            title: "Show this worker's builds",
+                            "{worker}"
                         }
                     }
                     div { class: "flex-1" }

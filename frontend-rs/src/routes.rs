@@ -16,6 +16,7 @@
 // suppression is unlikely to hide anything of ours.
 #![allow(unreachable_code)]
 
+use crate::listing::ViewParams;
 use crate::screens::*;
 use crate::shell::MenuShell;
 use dioxus::prelude::*;
@@ -37,12 +38,17 @@ pub enum Route {
         // truncated. A fragment writes nothing when empty and is one opaque
         // string. Nothing here is server-rendered and the filtering is
         // client-side, so keeping the term out of the request costs nothing.
-        #[route("/builds#:q")]
-        Builds { q: String },
+        // Filter and sort ride in the query as one spread segment, so their
+        // encoding belongs to `ViewParams` rather than to the router. A *named*
+        // parameter cannot be used here: dioxus writes `name=` whether or not
+        // there is a value, so `?:status` alone hung a `?status=` on every
+        // unfiltered URL. See `ViewParams` for the one `?` that still escapes.
+        #[route("/builds?:..view#:q")]
+        Builds { view: ViewParams, q: String },
 
 
-        #[route("/packages#:q")]
-        Packages { q: String },
+        #[route("/packages?:..view#:q")]
+        Packages { view: ViewParams, q: String },
         // A dialog over the list rather than a page, but with a URL of its own
         // so it can be linked to and Back closes it.
         #[route("/packages/add#:q")]
@@ -123,6 +129,7 @@ impl Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aurcache_common::build_state::BuildState;
     use std::str::FromStr;
 
     fn entry_for(path: &str) -> Option<MenuEntry> {
@@ -160,13 +167,33 @@ mod tests {
     /// A page with no search must not carry a marker for one. This is the
     /// concrete reason the term is in the fragment: dioxus writes `?q=` even
     /// for an empty value, so every unfiltered URL would have grown one.
+    ///
+    /// The lists now spread their filter and sort into the query, and dioxus
+    /// emits the `?` before consulting the type, so an unfiltered list ends in
+    /// a bare `?` (DioxusLabs/dioxus#5792, fixed by the open #5793). That much
+    /// is tolerated; anything *after* it is not, which is what keeps
+    /// `ViewParams` honest about writing nothing for a default view.
     #[test]
     fn an_empty_search_leaves_no_trace_in_the_url() {
-        assert_eq!(
-            Route::Packages { q: String::new() }.to_string(),
-            "/packages"
-        );
-        assert_eq!(Route::Builds { q: String::new() }.to_string(), "/builds");
+        for url in [
+            Route::Packages {
+                view: ViewParams::default(),
+                q: String::new(),
+            }
+            .to_string(),
+            Route::Builds {
+                view: ViewParams::default(),
+                q: String::new(),
+            }
+            .to_string(),
+        ] {
+            let query = url.split_once('?').map_or("", |(_, q)| q);
+            assert!(
+                query.is_empty(),
+                "a default view wrote query {query:?} into {url:?}"
+            );
+        }
+        // No query segment on this route, so not even the `?` is allowed.
         assert_eq!(
             Route::PackageAdd { q: String::new() }.to_string(),
             "/packages/add"
@@ -179,7 +206,10 @@ mod tests {
     fn a_url_without_a_fragment_is_an_empty_search() {
         assert_eq!(
             Route::from_str("/packages").unwrap(),
-            Route::Packages { q: String::new() }
+            Route::Packages {
+                view: ViewParams::default(),
+                q: String::new()
+            }
         );
     }
 
@@ -203,14 +233,25 @@ mod tests {
     fn routes_round_trip_through_their_url() {
         for route in [
             Route::Dashboard {},
-            Route::Builds { q: String::new() },
+            Route::Builds {
+                view: ViewParams::default(),
+                q: String::new(),
+            },
+            // Filter and sort round-trip through the query, beside a term in
+            // the fragment.
+            Route::Builds {
+                view: ViewParams::with_status(BuildState::Active),
+                q: "freyja".to_string(),
+            },
             // A search term goes in the fragment, and these are the shapes that
             // broke it as a query parameter: `&` split the value in two, and an
             // empty one still wrote a marker into every unfiltered URL.
             Route::Builds {
+                view: ViewParams::default(),
                 q: "a&b".to_string(),
             },
             Route::Packages {
+                view: ViewParams::default(),
                 q: "aewm++".to_string(),
             },
             Route::PackageAdd {
@@ -220,7 +261,10 @@ mod tests {
                 pkgbase: "hello".into(),
                 number: 42,
             },
-            Route::Packages { q: String::new() },
+            Route::Packages {
+                view: ViewParams::default(),
+                q: String::new(),
+            },
             Route::Package {
                 pkgbase: "hello".into(),
             },

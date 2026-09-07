@@ -17,6 +17,8 @@ pub enum SortKey {
     Status,
     Time,
     Size,
+    /// The worker that ran a build. Builds only; packages have no worker.
+    Worker,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +95,40 @@ impl StatusFilter {
         Self(id.parse::<i32>().ok().and_then(BuildState::from_i32))
     }
 
+    /// How this filter is spelled in a URL.
+    ///
+    /// Not [`Self::id`]: that is the numeric wire value, which is right for a
+    /// `<select>` where nobody reads it and wrong for a path someone may read
+    /// or share -- `/builds/status/building` says what `/builds/status/0` does
+    /// not. `Active` is spelled "building" because that is the word the rest of
+    /// the UI uses for it, including the Workers page link that lands here.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self.0 {
+            None => "any",
+            Some(BuildState::Active) => "building",
+            Some(BuildState::Successful) => "successful",
+            Some(BuildState::Failed) => "failed",
+            Some(BuildState::Enqueued) => "enqueued",
+            Some(BuildState::WaitingForDeps) => "waiting",
+        }
+    }
+
+    /// Parse [`Self::slug`], falling back to "any" for anything unrecognised:
+    /// a hand-edited or outdated URL should show every build rather than an
+    /// error page.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Self {
+        Self(match slug {
+            "building" => Some(BuildState::Active),
+            "successful" => Some(BuildState::Successful),
+            "failed" => Some(BuildState::Failed),
+            "enqueued" => Some(BuildState::Enqueued),
+            "waiting" => Some(BuildState::WaitingForDeps),
+            _ => None,
+        })
+    }
+
     fn matches(self, status: i32) -> bool {
         self.0
             .is_none_or(|wanted| BuildState::from_i32(status) == Some(wanted))
@@ -147,7 +183,9 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
             // A package row carries no timestamp, so the package list does
             // not offer this column; falling back to name would present an
             // ordering that has nothing to do with time.
-            SortKey::Time => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            // Packages have no worker or time of their own; both fall back to
+            // the name so the column headers stay interchangeable.
+            SortKey::Time | SortKey::Worker => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             // `Option`'s own ordering is what this wants: `None` sorts below
             // every `Some`, so unrecorded sizes group at one end rather than
             // among the small ones, and land last under the descending order a
@@ -176,7 +214,14 @@ pub fn filter_builds(builds: &[Build], query: &str, status: StatusFilter) -> Vec
 /// the match is a substring one, and `hello/3` finds the one. Matching only the
 /// package meant typing what the row said found nothing.
 fn build_id(build: &Build) -> String {
-    format!("{}/{}", build.pkg_name, build.number)
+    match build.worker_name.as_deref() {
+        // The worker is part of what the row shows, so it is part of what the
+        // filter matches -- the same rule that put the build number in here.
+        // It is also what the Workers page links to, which is how "show me
+        // this machine's builds" is spelled.
+        Some(worker) => format!("{}/{} {worker}", build.pkg_name, build.number),
+        None => format!("{}/{}", build.pkg_name, build.number),
+    }
 }
 
 pub fn sort_builds(builds: &mut [Build], sort: Sort) {
@@ -192,6 +237,16 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
             SortKey::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             SortKey::Time => a.start_time.cmp(&b.start_time),
             SortKey::Size => a.size.cmp(&b.size),
+            // Unclaimed builds have no worker. `None` sorts before `Some`, so
+            // ascending puts the queue first and descending puts it last --
+            // either way they group together rather than scattering.
+            SortKey::Worker => a
+                .worker_name
+                .as_deref()
+                .map(str::to_lowercase)
+                .cmp(&b.worker_name.as_deref().map(str::to_lowercase))
+                // Within one worker, newest first, as the name grouping does.
+                .then(b.number.cmp(&a.number)),
         };
         match sort.dir {
             SortDir::Asc => ordering,
@@ -202,6 +257,72 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A default view writes nothing, which is what keeps `/packages?` from
+    /// becoming `/packages?s=any&o=name-asc&d=0`.
+    #[test]
+    fn a_default_view_encodes_to_nothing() {
+        assert_eq!(ViewParams::default().to_string(), "");
+    }
+
+    /// Only what differs from the list's own default is written, so an
+    /// untouched list has a clean URL and a changed one says what changed.
+    #[test]
+    fn only_non_default_state_reaches_the_url() {
+        let default_sort = Sort {
+            key: SortKey::Name,
+            dir: SortDir::Asc,
+        };
+        let untouched =
+            ViewParams::from_state(StatusFilter::ANY, default_sort, default_sort, false);
+        assert_eq!(untouched.to_string(), "");
+
+        let changed = ViewParams::from_state(
+            StatusFilter(Some(BuildState::Failed)),
+            Sort {
+                key: SortKey::Worker,
+                dir: SortDir::Desc,
+            },
+            default_sort,
+            true,
+        );
+        assert_eq!(changed.to_string(), "s=failed&o=worker-desc&d=1");
+    }
+
+    /// Whatever `Display` writes must parse back to the same view: the URL is
+    /// the only place this state lives across a reload.
+    #[test]
+    fn a_view_round_trips_through_its_query() {
+        for view in [
+            ViewParams::default(),
+            ViewParams::with_status(BuildState::Active),
+            ViewParams {
+                status: Some(BuildState::Failed),
+                sort: Some(Sort {
+                    key: SortKey::Size,
+                    dir: SortDir::Desc,
+                }),
+                dependencies: true,
+            },
+        ] {
+            let encoded = view.to_string();
+            assert_eq!(ViewParams::from(encoded.as_str()), view, "{encoded:?}");
+        }
+    }
+
+    /// A hand-edited or outdated URL shows a list rather than an error: unknown
+    /// keys and values fall back to the default instead of being rejected.
+    #[test]
+    fn an_unparsable_query_falls_back_to_the_default_view() {
+        assert_eq!(ViewParams::from("s=nonsense"), ViewParams::default());
+        assert_eq!(ViewParams::from("o=bogus-sideways"), ViewParams::default());
+        assert_eq!(ViewParams::from("whatever"), ViewParams::default());
+        // A key we do not know is ignored, and the rest still applies.
+        assert_eq!(
+            ViewParams::from("zz=1&s=failed").status,
+            Some(BuildState::Failed)
+        );
+    }
     use super::*;
 
     fn package(name: &str, status: BuildState, outofdate: i32) -> SimplePackage {
@@ -366,6 +487,7 @@ mod tests {
             platform: "x86_64".to_string(),
             size: None,
             peak_memory: None,
+            worker_name: None,
             waiting_reason: None,
         }
     }
@@ -594,7 +716,9 @@ const URL_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 pub fn use_url_search(
     initial: String,
     sync: bool,
-    to_route: fn(String) -> Route,
+    // Not a `fn` pointer: the builds list has a status filter to carry through
+    // the same URL, so the route a term maps to depends on more than the term.
+    to_route: impl Fn(String) -> Route + Clone + 'static,
 ) -> Signal<String> {
     let term = use_signal(|| initial);
 
@@ -605,6 +729,7 @@ pub fn use_url_search(
         // Reads `term`, so it re-runs when the box changes and not on every
         // unrelated render.
         let value = term();
+        let to_route = to_route.clone();
         spawn(async move {
             gloo_timers::future::sleep(URL_DEBOUNCE).await;
             // Only the last keystroke of a burst writes: the earlier timers find
@@ -819,4 +944,198 @@ pub fn Pager(
             }
         }
     }
+}
+
+impl SortKey {
+    /// The spelling used in a URL.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Status => "status",
+            Self::Time => "time",
+            Self::Size => "size",
+            Self::Worker => "worker",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "name" => Some(Self::Name),
+            "status" => Some(Self::Status),
+            "time" => Some(Self::Time),
+            "size" => Some(Self::Size),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+}
+
+impl SortDir {
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "asc" => Some(Self::Asc),
+            "desc" => Some(Self::Desc),
+            _ => None,
+        }
+    }
+}
+
+/// The filter and sort of a list, carried in the URL's query string.
+///
+/// A spread query segment (`?:..view`), so the *whole* query is this type and
+/// its encoding is ours. That is what makes it usable at all: dioxus writes a
+/// named parameter as `name=` whether or not it has a value, so `?:status`
+/// alone put a dangling `?status=` on every unfiltered URL. Owning the string
+/// means a default view writes nothing.
+///
+/// One `?` survives, because the generated `Display` emits it before this type
+/// is consulted (`router-macro/src/query.rs`, `write!(f, "?{}", ...)`), so an
+/// unfiltered list is `/packages?`. That is DioxusLabs/dioxus#5792, and #5793
+/// is the one-line fix; when it lands the trailing `?` disappears with no
+/// change here. `an_empty_search_leaves_no_trace_in_the_url` allows it and
+/// nothing else.
+///
+/// Values are slugs rather than the numeric `StatusFilter::id`, since a URL is
+/// read and shared: `?s=failed&o=name-desc` says what `?s=2&o=0-1` does not.
+/// Neither `&` nor `=` is in dioxus's `QUERY_ASCII_SET`, so they survive
+/// unescaped and the query stays legible.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ViewParams {
+    pub status: Option<BuildState>,
+    /// `None` means "the list's own default order", so the common view carries
+    /// no `o=` at all rather than spelling out what it would have done anyway.
+    pub sort: Option<Sort>,
+    pub dependencies: bool,
+}
+
+impl ViewParams {
+    /// Build from live control state, dropping anything that matches the
+    /// list's default so an untouched list has a clean URL.
+    #[must_use]
+    pub fn from_state(
+        status: StatusFilter,
+        sort: Sort,
+        default_sort: Sort,
+        dependencies: bool,
+    ) -> Self {
+        Self {
+            status: status.0,
+            sort: (sort != default_sort).then_some(sort),
+            dependencies,
+        }
+    }
+
+    /// The sort to apply, given what this list would use by default.
+    #[must_use]
+    pub fn sort_or(&self, default_sort: Sort) -> Sort {
+        self.sort.unwrap_or(default_sort)
+    }
+
+    #[must_use]
+    pub fn status_filter(&self) -> StatusFilter {
+        StatusFilter(self.status)
+    }
+
+    /// A view filtered to one status and nothing else, for links into a list.
+    #[must_use]
+    pub fn with_status(status: BuildState) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::default()
+        }
+    }
+}
+
+impl std::fmt::Display for ViewParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sep = "";
+        if self.status.is_some() {
+            write!(f, "s={}", StatusFilter(self.status).slug())?;
+            sep = "&";
+        }
+        if let Some(sort) = self.sort {
+            write!(f, "{sep}o={}-{}", sort.key.slug(), sort.dir.slug())?;
+            sep = "&";
+        }
+        if self.dependencies {
+            write!(f, "{sep}d=1")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<&str> for ViewParams {
+    /// Parse what [`Display`] writes. Unrecognised keys and values are ignored
+    /// rather than rejected: a hand-edited or outdated URL should still show a
+    /// list, and `FromQuery` has nowhere to report an error to anyway.
+    fn from(query: &str) -> Self {
+        let mut view = Self::default();
+        for (key, value) in query.split('&').filter_map(|p| p.split_once('=')) {
+            match key {
+                "s" => view.status = StatusFilter::from_slug(value).0,
+                "o" => {
+                    if let Some((key, dir)) = value.split_once('-')
+                        && let (Some(key), Some(dir)) =
+                            (SortKey::from_slug(key), SortDir::from_slug(dir))
+                    {
+                        view.sort = Some(Sort { key, dir });
+                    }
+                }
+                "d" => view.dependencies = value == "1",
+                _ => {}
+            }
+        }
+        view
+    }
+}
+
+/// Keep the URL in step with the filter and sort controls.
+///
+/// `replace`, never `push`, for the same reason the search box uses it: a
+/// person narrowing a list is refining one view, not walking a trail, and Back
+/// should leave the list rather than undo a dropdown one notch at a time. That
+/// is also why this is one hook rather than one per control -- every change
+/// rewrites the whole route from live state, so the term and the controls
+/// cannot overwrite each other's half of the URL.
+///
+/// `to_route` reads the control signals itself, so this only has to fire when
+/// one of them changes; the term is read with `peek` because the search box
+/// already has its own debounced writer and subscribing here would race it.
+///
+/// `sync` matches `use_url_search`: the packages list passes `false` behind the
+/// add dialog, which owns the URL there. A parameter rather than the caller
+/// skipping the hook, because Dioxus identifies hooks by order.
+pub fn use_url_view(
+    term: Signal<String>,
+    sync: bool,
+    to_route: impl Fn(String) -> Route + Clone + 'static,
+) {
+    // Seeded with the route we arrived on, *not* `None`. Starting empty made
+    // the first effect run navigate to the URL the page was already showing;
+    // that re-entered the router on mount and the app intermittently failed to
+    // come up at all. Nothing is written until a control actually moves.
+    let seed = to_route.clone();
+    let mut previous = use_signal(move || seed(term.peek().clone()));
+    use_effect(move || {
+        if !sync {
+            return;
+        }
+        let route = to_route(term.peek().clone());
+        // Unchanged means an unrelated render rather than a control moving, and
+        // replacing again would be a wasted navigation.
+        if *previous.peek() == route {
+            return;
+        }
+        previous.set(route.clone());
+        navigator().replace(route);
+    });
 }

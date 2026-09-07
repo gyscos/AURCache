@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::listing::ViewParams;
 use aurcache_client::{
     AddPackageRequest, AddPackagesRequest, BulkAddOutcome, RestoreOutcome, SourceData,
 };
@@ -669,7 +670,7 @@ fn JobCard(id: u64) -> Element {
                 if job.finished && !failed {
                     Link {
                         class: "btn btn-ghost btn-xs self-start",
-                        to: crate::routes::Route::Packages { q: String::new() },
+                        to: crate::routes::Route::Packages { view: ViewParams::default(), q: String::new() },
                         "View packages"
                     }
                 }

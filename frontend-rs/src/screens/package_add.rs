@@ -18,6 +18,7 @@
 //! up, and the platforms are almost always the same for all of them — asking
 //! once beats reopening the dialog per package and re-picking them each time.
 
+use crate::listing::ViewParams;
 use crate::platforms::{self, PlatformChecklist};
 use crate::routes::Route;
 use aurcache_client::{GitSourceSpec, SearchResult, SourceData, looks_like_git_url};
@@ -354,7 +355,10 @@ fn AddPackageDialog(q: String) -> Element {
 
     // Takes `()`: three different events close this dialog.
     let close = move |()| {
-        navigator().push(Route::Packages { q: String::new() });
+        navigator().push(Route::Packages {
+            view: ViewParams::default(),
+            q: String::new(),
+        });
     };
 
     // What the entry field currently describes, if anything. Not to be
@@ -439,7 +443,10 @@ fn AddPackageDialog(q: String) -> Element {
 
         // The list behind the dialog is where the new packages appear, and
         // closing is what refetches it.
-        navigator().push(Route::Packages { q: String::new() });
+        navigator().push(Route::Packages {
+            view: ViewParams::default(),
+            q: String::new(),
+        });
     };
 
     rsx! {

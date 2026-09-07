@@ -164,7 +164,7 @@ ROUTES=(
     # The tiles that link somewhere only render with a router above them, which
     # the unit tests cannot stand up — so this is where they are covered.
     "/|Repository|the dashboard shows its headline numbers"
-    "/|href=\"/packages\"|a counted tile links to what it counts"
+    "/|href=\"/packages?\"|a counted tile links to what it counts"
     # Dependencies are counted apart from what was asked for. The fixture has
     # 10 requested and 2 dependency-only packages; both tiles are links, so
     # this is the only place they render.

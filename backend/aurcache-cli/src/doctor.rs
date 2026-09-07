@@ -364,6 +364,7 @@ mod tests {
             platform: "x86_64".to_string(),
             size: None,
             peak_memory: None,
+            worker_name: None,
             waiting_reason,
         }
     }
