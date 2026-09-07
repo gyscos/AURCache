@@ -16,7 +16,8 @@ use aurcache_db::prelude::{Builds, Packages};
 use rocket::http::Status;
 use rocket::{State, get};
 use sea_orm::prelude::BigDecimal;
-use sea_orm::{ColumnTrait, QueryFilter};
+use sea_orm::sea_query::{Expr, Func, SimpleExpr};
+use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
 use sea_orm::{DatabaseConnection, EntityTrait};
 use sea_orm::{DbBackend, FromQueryResult, PaginatorTrait, Statement};
 use utoipa::OpenApi;
@@ -149,22 +150,24 @@ async fn count_packages(db: &DatabaseConnection, requested: bool) -> anyhow::Res
 
 /// Average duration of a successful build, in seconds.
 ///
-/// The query is dialect-neutral, so it is issued with the SQLite backend on
-/// every database. Missing or unrepresentable averages read as `0`.
+/// Missing or unrepresentable averages read as `0`.
 async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
     #[derive(Debug, FromQueryResult)]
     struct BuildTimeStruct {
         avg_build_time: Option<BigDecimal>,
     }
 
-    let unique: BuildTimeStruct =
-        BuildTimeStruct::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            r"SELECT AVG((builds.end_time - builds.start_time)) AS avg_build_time
-        FROM builds
-        WHERE builds.end_time IS NOT NULL AND builds.status = 1;",
-            [],
-        ))
+    let unique: BuildTimeStruct = Builds::find()
+        .select_only()
+        .column_as(
+            SimpleExpr::from(Func::avg(
+                Expr::col(builds::Column::EndTime).sub(Expr::col(builds::Column::StartTime)),
+            )),
+            "avg_build_time",
+        )
+        .filter(builds::Column::EndTime.is_not_null())
+        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+        .into_model::<BuildTimeStruct>()
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("No Average build time"))?;

@@ -13,11 +13,13 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
-use aurcache_common::build_state::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
-use aurcache_db::helpers::builds::latest_successful_version_any_platform;
+use aurcache_db::helpers::builds::{
+    latest_successful_version_any_platform, latest_successful_version_expr,
+};
 use aurcache_db::helpers::downloads::DownloadCounter;
+use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::helpers::operations;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Files, Packages};
@@ -39,7 +41,6 @@ use tracing::warn;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
-use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
 use sea_orm::{
     ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
@@ -753,39 +754,13 @@ async fn list_packages(
     page: Option<u64>,
     dependencies: bool,
 ) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
-    // correlated subquery: picks the version from builds for the package ordered by most
-    // recent timestamp (end_time preferred, fallback to start_time)
-    // Successful builds only. This is the version that is *in the repository*,
-    // which is what the field is read as everywhere it is shown. Taking the
-    // newest attempt regardless of outcome meant a failed build of a new
-    // version reported that version as built, and the version check then
-    // compared upstream against it and cleared the out-of-date flag — so an
-    // upstream release whose first build failed stopped being flagged at all.
-    //
-    // `NULLIF` because `builds.version` is NOT NULL DEFAULT '': a build that
-    // has been enqueued but has not determined a version yet holds an empty
-    // string, which means "not known", not "the empty version".
-    let latest_version_subquery = format!(
-        "(SELECT NULLIF(b.version, '') \
-        FROM builds b \
-        WHERE b.pkg_id = packages.id AND b.status = {successful} \
-        ORDER BY COALESCE(b.end_time, b.start_time) DESC \
-        LIMIT 1)",
-        successful = BuildStates::SUCCESSFUL_BUILD
-    );
-
-    // Same all-or-nothing rule the package page applies to its own total: the
-    // `CASE` yields NULL unless every artifact has a recorded size, so a
-    // partial sum never reaches the column. A package with no artifacts sums
-    // over no rows and is NULL too, which is what "nothing built yet" should
-    // show.
-    //
-    // `CAST(... AS BIGINT)` because Postgres widens `SUM(bigint)` to `numeric`,
-    // which does not decode into an `i64`; SQLite reads the cast as its own
-    // INTEGER affinity and is unaffected.
-    let total_size_subquery = "(SELECT CASE WHEN COUNT(*) = COUNT(f.size) \
-        THEN CAST(SUM(f.size) AS BIGINT) END \
-        FROM files f WHERE f.package_id = packages.id)";
+    // Both of these are correlated subqueries over the package row, so they
+    // report per row without a query per package. The "successful builds only"
+    // rule matters: taking the newest attempt regardless of outcome meant a
+    // failed build of a new version reported that version as built, and the
+    // version check then compared upstream against it and cleared the
+    // out-of-date flag — so an upstream release whose first build failed
+    // stopped being flagged at all.
 
     let all: Vec<SimplePackage> = Packages::find()
         .select_only()
@@ -803,8 +778,8 @@ async fn list_packages(
         // build that produced a blank one. The detail endpoint below already
         // reported it this way, so coercing here made one field mean two
         // different things depending on which route you asked.
-        .column_as(Expr::cust(&latest_version_subquery), "latest_version")
-        .column_as(Expr::cust(total_size_subquery), "total_size")
+        .column_as(latest_successful_version_expr(), "latest_version")
+        .column_as(total_artifact_size_expr(), "total_size")
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
@@ -832,24 +807,14 @@ async fn list_package_relations(
         ),
     };
 
-    // The version in the repository for the joined package, on the same
-    // "successful builds only" rule the rest of this module uses.
-    let built_version_subquery = format!(
-        "(SELECT NULLIF(b.version, '') \
-        FROM builds b \
-        WHERE b.pkg_id = packages.id AND b.status = {successful} \
-        ORDER BY COALESCE(b.end_time, b.start_time) DESC \
-        LIMIT 1)",
-        successful = BuildStates::SUCCESSFUL_BUILD
-    );
-
     let rows = Dependencies::find()
         .select_only()
         .column_as(packages::Column::Id, "id")
         .column_as(packages::Column::Name, "name")
         .column(dependencies::Column::VersionConstraint)
         .column_as(packages::Column::Status, "status")
-        .column_as(Expr::cust(&built_version_subquery), "built_version")
+        // The repository version of the joined package, on the same rule.
+        .column_as(latest_successful_version_expr(), "built_version")
         .join(JoinType::InnerJoin, relation)
         .filter(filter_col.eq(pkg_id))
         .order_by_asc(dependencies::Column::Id)

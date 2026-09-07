@@ -15,8 +15,11 @@
 //! nobody bills against: an approximate popularity number that costs nothing to
 //! serve beats an exact one that costs a write per request.
 
+use crate::download_counts;
 use crate::helpers::time::now_secs;
-use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
+use crate::prelude::DownloadCounts;
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -91,16 +94,16 @@ impl DownloadCounter {
             pkgname_of(file_name).is_some_and(|name| pkgnames.iter().any(|p| p == name))
         };
 
-        let stmt = Statement::from_string(
-            db.get_database_backend(),
-            "SELECT file_name, count FROM download_counts".to_string(),
-        );
-        let stored: i64 = StoredRow::find_by_statement(stmt)
+        let stored: i64 = DownloadCounts::find()
+            .select_only()
+            .column(download_counts::Column::FileName)
+            .column(download_counts::Column::Count)
+            .into_tuple::<(String, i64)>()
             .all(db)
             .await?
             .into_iter()
-            .filter(|row| wanted(&row.file_name))
-            .map(|row| row.count)
+            .filter(|(file_name, _)| wanted(file_name))
+            .map(|(_, count)| count)
             .sum();
 
         Ok(stored + self.pending_matching(&wanted))
@@ -144,14 +147,26 @@ async fn write_counts<C: ConnectionTrait>(
 ) -> Result<(), DbErr> {
     let now = now_secs();
     for (file_name, delta) in counts {
-        let stmt = Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "INSERT INTO download_counts (file_name, count, last_download) VALUES ($1, $2, $3) \
-             ON CONFLICT (file_name) DO UPDATE SET \
-               count = download_counts.count + $2, last_download = $3",
-            [file_name.as_str().into(), (*delta).into(), now.into()],
-        );
-        db.execute(stmt).await?;
+        let row = download_counts::ActiveModel {
+            file_name: Set(file_name.clone()),
+            count: Set(*delta),
+            last_download: Set(Some(now)),
+        };
+        DownloadCounts::insert(row)
+            .on_conflict(
+                OnConflict::column(download_counts::Column::FileName)
+                    // The *stored* count plus this delta, not the value the
+                    // insert proposed: qualifying the column with the table
+                    // name is what distinguishes it from the excluded row.
+                    .value(
+                        download_counts::Column::Count,
+                        Expr::col((DownloadCounts, download_counts::Column::Count)).add(*delta),
+                    )
+                    .value(download_counts::Column::LastDownload, now)
+                    .to_owned(),
+            )
+            .exec(db)
+            .await?;
     }
     Ok(())
 }
@@ -169,17 +184,11 @@ fn pkgname_of(file_name: &str) -> Option<&str> {
     stem.rsplitn(4, '-').nth(3).filter(|name| !name.is_empty())
 }
 
-#[derive(FromQueryResult)]
-struct StoredRow {
-    file_name: String,
-    count: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::migration::Migrator;
-    use sea_orm::{Database, DatabaseConnection};
+    use sea_orm::{ColumnTrait, Database, DatabaseConnection, QueryFilter};
     use sea_orm_migration::MigratorTrait;
 
     async fn setup() -> DatabaseConnection {
@@ -197,19 +206,14 @@ mod tests {
     /// exists to prevent -- so it lives here, where "has it been flushed yet"
     /// is the actual question.
     async fn stored(db: &DatabaseConnection, file_name: &str) -> i64 {
-        #[derive(FromQueryResult)]
-        struct Row {
-            count: i64,
-        }
-        Row::find_by_statement(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "SELECT COALESCE(SUM(count), 0) AS count FROM download_counts WHERE file_name = $1",
-            [file_name.into()],
-        ))
-        .one(db)
-        .await
-        .unwrap()
-        .map_or(0, |row| row.count)
+        // `file_name` is the primary key, so this is the one row or none; the
+        // absent row is what "never downloaded" looks like in this table.
+        DownloadCounts::find()
+            .filter(download_counts::Column::FileName.eq(file_name))
+            .one(db)
+            .await
+            .unwrap()
+            .map_or(0, |row| row.count)
     }
 
     const HELLO: &str = "hello-1.0-1-x86_64.pkg.tar.zst";

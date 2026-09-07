@@ -3,6 +3,7 @@ pub mod builds;
 pub mod dbtype;
 pub mod dependency_resolution;
 pub mod downloads;
+pub mod files;
 pub mod operations;
 pub mod time;
 pub mod worker_jobs;
