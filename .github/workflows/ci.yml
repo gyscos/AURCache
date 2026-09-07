@@ -95,6 +95,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The e2e suite builds the images, which read the PKGBUILDs from the
+          # AUR submodules under packaging/.
+          submodules: recursive
 
       - name: Set up Docker
         uses: docker/setup-docker-action@v5

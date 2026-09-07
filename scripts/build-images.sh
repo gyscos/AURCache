@@ -57,6 +57,24 @@ enabled. A single-platform build is always loaded.
 EOF
 }
 
+# The PKGBUILDs are submodules of the AUR repositories they are published from,
+# so a fresh clone has empty directories until they are checked out. Without
+# this the failure is a confusing one deep inside makepkg or the image build,
+# about a PKGBUILD that is simply not there.
+require_packaging_submodules() {
+    local missing=()
+    local pkg
+    for pkg in "$@"; do
+        [[ -f "$REPO_ROOT/packaging/$pkg/PKGBUILD" ]] || missing+=("$pkg")
+    done
+    if ((${#missing[@]})); then
+        echo "error: no PKGBUILD for: ${missing[*]}" >&2
+        echo "       packaging/ holds git submodules of the AUR repositories." >&2
+        echo "       Check them out with:  git submodule update --init" >&2
+        exit 2
+    fi
+}
+
 tag=latest
 images=server,worker,hybrid
 platforms=$DEFAULT_PLATFORMS
@@ -168,6 +186,12 @@ declare -A IMAGE_NAMES=(
     [worker]=aurcache-worker
     [hybrid]=aurcache
 )
+
+# The worker and hybrid images build these as Arch packages; the server image
+# does not, but checking unconditionally keeps the message the same wherever it
+# is hit.
+require_packaging_submodules aurcache-sandbox aurcache-worker aurcache-server \
+    aurcache-worker-docker
 
 IFS=',' read -r -a selected <<<"$images"
 for image in "${selected[@]}"; do

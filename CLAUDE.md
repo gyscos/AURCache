@@ -11,6 +11,25 @@ containers and serves the results as a pacman repository, and detects when packa
 `frontend-rs/` (Dioxus, compiled to wasm) is the frontend. A Flutter UI used to live in `frontend/`; it
 was removed once it had diverged past usefulness, and `git log` is where to find it if ever needed.
 
+## Packaging lives in AUR submodules
+
+`packaging/aurcache-{sandbox,worker,server,worker-docker}` are **git submodules**
+of the AUR repositories the packages are published from, so the PKGBUILD in the
+tree and the one users install from cannot drift. A fresh clone has empty
+directories until:
+
+```bash
+git submodule update --init
+```
+
+The image builds and `scripts/build-packages.sh` read those PKGBUILDs, so both
+refuse with an explicit message rather than failing obscurely when they are not
+checked out. CI checks them out with `submodules: recursive`.
+
+They clone over `https://aur.archlinux.org/<pkg>.git` and push over
+`ssh://aur@aur.archlinux.org/<pkg>.git` (`pushurl` in `.gitmodules`), so cloning
+needs no AUR account and only a maintainer can publish.
+
 ## Build, test, and lint commands
 
 ```bash
@@ -54,6 +73,10 @@ cd docs && yarn install --frozen-lockfile && yarn build
 
 # end-to-end smoke test
 ./scripts/test-e2e.sh hello
+
+# build the Arch packages from this tree (and optionally install them)
+./scripts/build-packages.sh --install
+./scripts/build-packages.sh --packages aurcache-server
 ```
 
 ### Which end-to-end suite to run

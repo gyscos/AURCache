@@ -26,6 +26,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # packaging/ holds AUR submodules; the image builds read the
+          # PKGBUILDs from them.
+          submodules: recursive
       - id: repo_name_lc
         uses: ASzc/change-string-case-action@v8
         with:
