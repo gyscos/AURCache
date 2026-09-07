@@ -27,10 +27,7 @@ const NUMBER_RACE_ATTEMPTS: usize = 5;
 fn next_build_number_expr(pkg_id: i32) -> Expr {
     Expr::from(
         Query::select()
-            .expr(
-                Func::coalesce([Expr::col(builds::Column::Number).max(), Expr::val(0)])
-                    .add(1),
-            )
+            .expr(Func::coalesce([Expr::col(builds::Column::Number).max(), Expr::val(0)]).add(1))
             .from(builds::Entity)
             .and_where(Expr::col(builds::Column::PkgId).eq(pkg_id))
             .to_owned(),

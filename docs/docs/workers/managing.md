@@ -50,6 +50,26 @@ A retired machine that comes back re-enrolls and appears as revoked with a
 recent "last seen", which is the signal to approve it again if you want it back.
 Its certificate is still on file, so that is one click.
 
+## How much memory did a build need?
+
+The Builds list has a **Peak RAM** column: the high-water mark of the build's
+whole process tree — `makechrootpkg`, `systemd-nspawn`, `makepkg`, and one
+compiler per core, measured together.
+
+It is most useful on a build that failed with exit 137, which is an OOM kill and
+says nothing else about itself. Knowing the last successful build of the same
+package peaked at 6 GiB turns that into a number you can act on.
+
+Two caveats:
+
+- **Sampled once a second**, so it is a floor on what the build needed rather
+  than a bound; a spike shorter than that is invisible. There is no cgroup to
+  read an exact figure from, because the worker runs `systemd-nspawn` without a
+  systemd manager to place the build in a scope of its own.
+- **A dash means not reported**, not zero: an older worker, the legacy container
+  builder (which does not sample), or a build that ended before the first
+  sample.
+
 ## Why is a build not starting?
 
 `aurcache-cli doctor` answers this directly. It walks the chain — server, token,

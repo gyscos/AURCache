@@ -102,6 +102,7 @@ pub fn Builds(q: String) -> Element {
                                         th { class: "{WIDE_ONLY}", "Duration" }
                                         th { class: "{WIDE_ONLY}", "Platform" }
                                         SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
+                                        th { class: "{WIDE_ONLY} text-right", "Peak RAM" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                     }
                                 }
@@ -151,6 +152,11 @@ pub fn Builds(q: String) -> Element {
                                             td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
                                                 {build_size(build)}
                                             }
+                                            td {
+                                                class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
+                                                title: "Peak memory of the build's process tree, sampled once a second.",
+                                                {build_peak_memory(build)}
+                                            }
                                             td { BuildStatusBadge { status: build.status } }
                                         }
                                     }
@@ -186,5 +192,18 @@ fn build_size(build: &Build) -> String {
     build
         .size
         .and_then(|size| u64::try_from(size).ok())
+        .map_or_else(|| "—".to_string(), format_bytes)
+}
+
+/// How much memory a build needed at its peak.
+///
+/// A dash where the worker reported nothing: an older worker, the legacy
+/// container builder, or a build too short to sample. That is a different
+/// statement from a build that used no memory, which cannot happen -- so it is
+/// never rendered as `0 B`.
+fn build_peak_memory(build: &Build) -> String {
+    build
+        .peak_memory
+        .and_then(|bytes| u64::try_from(bytes).ok())
         .map_or_else(|| "—".to_string(), format_bytes)
 }

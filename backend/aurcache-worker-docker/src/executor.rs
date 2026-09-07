@@ -330,6 +330,8 @@ impl DockerExecutor {
                 exit_code: Some(0),
                 reason: None,
                 canceled: false,
+                // The legacy container builder does not sample the build tree.
+                peak_memory_bytes: None,
             },
             Some(code) => CompleteReport {
                 success: false,
@@ -339,6 +341,8 @@ impl DockerExecutor {
                     c => format!("build failed (exit {c})"),
                 }),
                 canceled: false,
+                // The legacy container builder does not sample the build tree.
+                peak_memory_bytes: None,
             },
             None => report::setup_failure("build container exited without a status"),
         })

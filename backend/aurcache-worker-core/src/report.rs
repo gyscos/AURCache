@@ -20,6 +20,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
             exit_code: Some(0),
             reason: None,
             canceled: false,
+            peak_memory_bytes: None,
         };
     }
     let code = status.code();
@@ -34,6 +35,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         exit_code: code,
         reason: Some(reason),
         canceled: false,
+        peak_memory_bytes: None,
     }
 }
 
@@ -46,6 +48,7 @@ pub fn setup_failure(reason: impl std::fmt::Display) -> CompleteReport {
         exit_code: None,
         reason: Some(reason.to_string()),
         canceled: false,
+        peak_memory_bytes: None,
     }
 }
 
@@ -63,6 +66,7 @@ fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
         exit_code,
         reason: Some("build canceled".to_string()),
         canceled: true,
+        peak_memory_bytes: None,
     }
 }
 
@@ -74,6 +78,7 @@ pub fn timeout_failure(secs: u64) -> CompleteReport {
         exit_code: Some(124),
         reason: Some(format!("build timed out after {secs}s")),
         canceled: false,
+        peak_memory_bytes: None,
     }
 }
 

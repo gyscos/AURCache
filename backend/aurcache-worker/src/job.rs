@@ -315,6 +315,10 @@ async fn run_build(
         }
     };
 
+    // Measure the tree from here on. Started after the spawn so there is a pid
+    // to root it at, and dropped with this function, which stops the sampler.
+    let memory = child.id().map(crate::memory::PeakMemory::watching);
+
     // Poll for cancellation / timeout while the child runs. Local self-abort and
     // the build timeout are checked every 5s (cheap, in-process); the remote
     // cancel flag is polled less often (an HTTP round-trip) to avoid hammering
@@ -376,8 +380,15 @@ async fn run_build(
         let _ = pump.await;
     }
 
-    if timed_out {
-        return Ok(report::timeout_failure(started.elapsed().as_secs()));
-    }
-    Ok(report::classify_exit(status, canceled))
+    // Attached after the fact rather than threaded through every constructor:
+    // how much a build used is orthogonal to why it ended, and a timeout or a
+    // cancellation is exactly when the number is most worth having.
+    let peak_memory_bytes = memory.as_ref().and_then(super::memory::PeakMemory::peak);
+    let mut report = if timed_out {
+        report::timeout_failure(started.elapsed().as_secs())
+    } else {
+        report::classify_exit(status, canceled)
+    };
+    report.peak_memory_bytes = peak_memory_bytes;
+    Ok(report)
 }

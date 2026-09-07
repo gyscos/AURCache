@@ -606,6 +606,14 @@ pub async fn complete_job(
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
 
+    // Before the branch below: an OOM-killed build never reaches the success
+    // path, and that is the build whose memory figure matters most.
+    if let Some(peak) = report.peak_memory_bytes
+        && let Err(e) = worker_complete::record_peak_memory(db, build_id, peak).await
+    {
+        tracing::warn!("Failed to record peak memory for build {build_id}: {e}");
+    }
+
     let dir = staging_dir(build_id);
     if report.success {
         let files = read_staging(&dir)

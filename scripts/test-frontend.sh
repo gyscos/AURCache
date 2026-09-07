@@ -174,6 +174,7 @@ ROUTES=(
     # The chart is SVG, so a real element proves it drew rather than errored.
     "/|<svg|the build graph renders"
     "/builds|Duration|builds list"
+    "/builds|6.4 GiB|a build's peak memory is reported"
     # The fixture holds more builds than fit on a page. That the second page
     # holds different rows is an interaction test; this is only that the
     # controls are there and say where you are.

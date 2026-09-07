@@ -188,6 +188,13 @@ pub struct CompleteReport {
     /// True when the build stopped because it was canceled.
     #[serde(default)]
     pub canceled: bool,
+    /// High-water mark of the build process tree's memory, in bytes.
+    ///
+    /// `None` when the worker could not measure it -- an old worker, a build
+    /// that ended before the first sample, or a `/proc` it could not read.
+    /// Distinct from a build that genuinely used nothing, which cannot happen.
+    #[serde(default)]
+    pub peak_memory_bytes: Option<i64>,
 }
 
 /// Worker's poll response for cancel on a specific job.

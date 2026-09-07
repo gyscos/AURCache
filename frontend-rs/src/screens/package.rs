@@ -997,6 +997,7 @@ mod tests {
             end_time: end,
             platform: platform.to_string(),
             size: None,
+            peak_memory: None,
             waiting_reason: None,
         }
     }

@@ -28,6 +28,8 @@ tar = { workspace = true }
 percent-encoding = "2.3"
 aurcache-common = { path = "../aurcache-common" }
 aurcache-worker-core = { path = "../aurcache-worker-core" }
+# The page size, for reading RSS out of /proc; see src/memory.rs.
+libc = "0.2"
 
 [dev-dependencies]
 aurcache-worker-core = { path = "../aurcache-worker-core" }

@@ -321,3 +321,9 @@ UPDATE builds
                   WHERE b2.pkg_id = builds.pkg_id
                     AND b2.platform = builds.platform
                     AND b2.status = 1);
+
+-- Peak memory for the `hello` builds, so the Builds list renders a real figure
+-- in that column rather than only the dash every other row shows. The two
+-- states matter: a build that reported one, and the builds that did not.
+UPDATE builds SET peak_memory = 6871947673
+WHERE pkg_id = (SELECT id FROM packages WHERE name = 'hello');

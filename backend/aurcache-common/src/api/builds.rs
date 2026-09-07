@@ -25,6 +25,13 @@ pub struct BuildSummary {
     /// before the size was recorded. This is one platform's output; a package's
     /// total covers every platform it builds for.
     pub size: Option<i64>,
+    /// High-water mark of the build's process tree memory, in bytes.
+    ///
+    /// `None` for a build whose worker did not report one: an older worker, the
+    /// legacy container builder, or a build that ended before the first sample.
+    /// Sampled once a second, so it is a floor on what the build needed rather
+    /// than a bound -- a spike shorter than that is invisible.
+    pub peak_memory: Option<i64>,
     /// Why this build is stuck, when it is `ENQUEUED` and *no* approved worker
     /// can currently take it. `None` for everything else, including a build
     /// merely waiting behind a busy worker — see

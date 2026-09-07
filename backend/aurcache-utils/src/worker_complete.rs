@@ -72,6 +72,29 @@ pub async fn lock_lease<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Record the peak memory a worker reported for a build.
+///
+/// Written before the success/failure branch, because a build that was
+/// OOM-killed is exactly when the number is worth having and that build will
+/// never reach the success path.
+///
+/// Best-effort rather than compare-and-swap: unlike the version and the size,
+/// this publishes nothing and decides nothing, so a build whose lease was
+/// reclaimed mid-flight is not worth failing a completion over. A stale write
+/// records a measurement that did happen, for a build that did run.
+pub async fn record_peak_memory<C: ConnectionTrait>(
+    db: &C,
+    build_id: i32,
+    peak_memory_bytes: i64,
+) -> Result<(), DbErr> {
+    Builds::update_many()
+        .col_expr(builds::Column::PeakMemory, Some(peak_memory_bytes).into())
+        .filter(builds::Column::Id.eq(build_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// Record the authoritative built version (extracted from the uploaded package
 /// files) on the build and its package.
 ///
@@ -338,6 +361,25 @@ mod tests {
     /// builds it has finished, how many failed, its share of the fleet -- is
     /// counted from this column. Clearing it on completion left every one of
     /// them at zero for a fleet that had built everything in the repository.
+    /// The figure has to survive to the row, and it must land for a *failed*
+    /// build too: an OOM kill is the case it exists for, and that build never
+    /// reaches the success path.
+    #[tokio::test]
+    async fn peak_memory_is_recorded_for_a_failed_build() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+
+        record_peak_memory(&db, 1, 6 * 1024 * 1024 * 1024)
+            .await
+            .unwrap();
+        complete_failure(&db, 1, 1).await.unwrap();
+
+        let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
+        assert_eq!(row.peak_memory, Some(6 * 1024 * 1024 * 1024));
+        assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
+    }
+
     #[tokio::test]
     async fn a_finished_build_still_names_the_worker_that_ran_it() {
         let db = setup().await;

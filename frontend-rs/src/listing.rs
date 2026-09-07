@@ -365,6 +365,7 @@ mod tests {
             end_time: None,
             platform: "x86_64".to_string(),
             size: None,
+            peak_memory: None,
             waiting_reason: None,
         }
     }
