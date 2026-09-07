@@ -4,8 +4,10 @@
 //! self-abort (the server will have requeued them).
 
 use anyhow::Result;
-use aurcache_common::worker::{ClaimRequest, CompleteReport, Heartbeat, JobDescriptor};
-use std::collections::HashMap;
+use aurcache_common::worker::{
+    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistPreference,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,12 +29,54 @@ pub struct Runner<E: Executor> {
     last_contact: AtomicU64,
     /// Bounds concurrent builds.
     permits: Arc<Semaphore>,
+    /// Mirrorlists the server has sent, by architecture: `arch -> (checksum,
+    /// content)`. The checksums go out with each claim so the server can skip
+    /// resending what has not changed; the content is what a job then uses.
+    ///
+    /// Memory only. Losing it on restart costs one resend, and a restart is
+    /// exactly when a worker should re-read the deployment's configuration
+    /// anyway.
+    mirrorlists: Mutex<BTreeMap<String, (String, String)>>,
 }
 
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Resolve `job.mirrorlist` to the content the build should actually use, and
+/// keep `held` in step with what the server has said.
+///
+/// A free function rather than a method so the rule can be tested without a
+/// server, a client or an executor -- and so there is exactly one copy of it.
+///
+/// Precedence: the worker's own mirrorlist, then the server's for this arch,
+/// then nothing at all (the image's `/etc/pacman.d/mirrorlist`).
+fn resolve_job_mirrorlist(
+    local: Option<&str>,
+    held: &mut BTreeMap<String, (String, String)>,
+    job: &mut JobDescriptor,
+) {
+    if let Some(local) = local {
+        job.mirrorlist = Some(local.to_string());
+        return;
+    }
+    match (&job.mirrorlist, job.mirrorlist_unchanged) {
+        // Sent afresh: use it, and remember it for the next claim.
+        (Some(content), _) => {
+            if let Some(checksum) = &job.mirrorlist_checksum {
+                held.insert(job.arch.clone(), (checksum.clone(), content.clone()));
+            }
+        }
+        // Withheld because we already hold it.
+        (None, true) => job.mirrorlist = held.get(&job.arch).map(|(_, c)| c.clone()),
+        // The server has none for this arch. Drop anything stale rather than
+        // reuse it, or a mirrorlist removed on the server would live on here.
+        (None, false) => {
+            held.remove(&job.arch);
+        }
+    }
 }
 
 impl<E: Executor> Runner<E> {
@@ -45,6 +89,7 @@ impl<E: Executor> Runner<E> {
             active: Mutex::new(HashMap::new()),
             last_contact: AtomicU64::new(now_secs()),
             permits: Arc::new(Semaphore::new(concurrency)),
+            mirrorlists: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -78,10 +123,12 @@ impl<E: Executor> Runner<E> {
             let claim = ClaimRequest {
                 native_arches: self.cfg.native_arches.clone(),
                 emulated_arches: self.cfg.emulated_arches.clone(),
+                mirrorlist: self.mirrorlist_preference().await,
             };
             match self.client.claim(&claim).await {
-                Ok(Some(job)) => {
+                Ok(Some(mut job)) => {
                     self.mark_contact();
+                    self.apply_mirrorlist(&mut job).await;
                     let this = Arc::clone(&self);
                     tokio::spawn(async move {
                         this.run_one(job).await;
@@ -100,6 +147,35 @@ impl<E: Executor> Runner<E> {
                 }
             }
         }
+    }
+
+    /// What to tell the server about mirrorlists on the next claim.
+    async fn mirrorlist_preference(&self) -> MirrorlistPreference {
+        if self.cfg.mirrorlist.is_some() {
+            return MirrorlistPreference::Local;
+        }
+        MirrorlistPreference::Server {
+            checksums: self
+                .mirrorlists
+                .lock()
+                .await
+                .iter()
+                .map(|(arch, (checksum, _))| (arch.clone(), checksum.clone()))
+                .collect(),
+        }
+    }
+
+    /// Resolve `job.mirrorlist` to the content the build should actually use.
+    ///
+    /// Done here so everything downstream -- the executor, the chroot -- keeps
+    /// seeing one field holding the final content, and none of them has to know
+    /// that it may have arrived on an earlier job.
+    ///
+    /// Precedence: this worker's own mirrorlist, then the server's for this
+    /// arch, then nothing at all (the image's `/etc/pacman.d/mirrorlist`).
+    async fn apply_mirrorlist(&self, job: &mut JobDescriptor) {
+        let mut held = self.mirrorlists.lock().await;
+        resolve_job_mirrorlist(self.cfg.mirrorlist.as_deref(), &mut held, job);
     }
 
     /// Execute a single job with panic-safe, always-emitted completion.
@@ -191,5 +267,110 @@ impl<E: Executor> Runner<E> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mirrorlist_tests {
+    use aurcache_common::worker::{JobDescriptor, MirrorlistPreference};
+    use std::collections::BTreeMap;
+
+    use super::resolve_job_mirrorlist as apply;
+
+    fn job(
+        arch: &str,
+        mirrorlist: Option<&str>,
+        checksum: Option<&str>,
+        unchanged: bool,
+    ) -> JobDescriptor {
+        JobDescriptor {
+            build_id: 1,
+            pkgbase: "hello".into(),
+            arch: arch.into(),
+            build_flags: vec![],
+            makepkg_conf: String::new(),
+            pacman_conf: String::new(),
+            mirrorlist: mirrorlist.map(ToString::to_string),
+            mirrorlist_checksum: checksum.map(ToString::to_string),
+            mirrorlist_unchanged: unchanged,
+            pgp_keys: vec![],
+        }
+    }
+
+    /// Content that arrives is used and remembered, so the next claim can
+    /// advertise it and the server can skip resending.
+    #[test]
+    fn content_is_used_and_cached() {
+        let mut held = BTreeMap::new();
+        let mut j = job("x86_64", Some("Server = a\n"), Some("abc"), false);
+        apply(None, &mut held, &mut j);
+        assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
+        assert_eq!(
+            held["x86_64"],
+            ("abc".to_string(), "Server = a\n".to_string())
+        );
+    }
+
+    /// Withheld content is filled in from the cache: this is what makes the
+    /// build see a mirrorlist that arrived on an earlier job.
+    #[test]
+    fn unchanged_is_filled_from_the_cache() {
+        let mut held = BTreeMap::new();
+        held.insert(
+            "x86_64".to_string(),
+            ("abc".to_string(), "Server = a\n".to_string()),
+        );
+        let mut j = job("x86_64", None, None, true);
+        apply(None, &mut held, &mut j);
+        assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
+    }
+
+    /// "The server has none" must clear the cache rather than reuse it, or a
+    /// mirrorlist removed on the server would live on in every worker.
+    #[test]
+    fn no_server_mirrorlist_drops_the_cached_one() {
+        let mut held = BTreeMap::new();
+        held.insert(
+            "x86_64".to_string(),
+            ("abc".to_string(), "Server = a\n".to_string()),
+        );
+        let mut j = job("x86_64", None, None, false);
+        apply(None, &mut held, &mut j);
+        assert!(j.mirrorlist.is_none());
+        assert!(held.is_empty(), "a stale entry would outlive the server's");
+    }
+
+    /// A worker's own mirrorlist wins over anything the server sends.
+    #[test]
+    fn a_local_mirrorlist_wins() {
+        let mut held = BTreeMap::new();
+        let mut j = job("x86_64", Some("Server = server\n"), Some("abc"), false);
+        apply(Some("Server = mine\n"), &mut held, &mut j);
+        assert_eq!(j.mirrorlist.as_deref(), Some("Server = mine\n"));
+    }
+
+    /// Caches are per architecture: a worker building two of them must not
+    /// hand one arch's mirrors to the other.
+    #[test]
+    fn caches_do_not_cross_architectures() {
+        let mut held = BTreeMap::new();
+        let mut x = job("x86_64", Some("Server = x\n"), Some("cx"), false);
+        apply(None, &mut held, &mut x);
+        let mut a = job("aarch64", Some("Server = a\n"), Some("ca"), false);
+        apply(None, &mut held, &mut a);
+        assert_eq!(held["x86_64"].1, "Server = x\n");
+        assert_eq!(held["aarch64"].1, "Server = a\n");
+    }
+
+    /// The default preference is "I hold nothing", which is what a worker
+    /// predating the field sends, so it keeps receiving the content in full.
+    #[test]
+    fn the_default_preference_holds_nothing() {
+        assert_eq!(
+            MirrorlistPreference::default(),
+            MirrorlistPreference::Server {
+                checksums: BTreeMap::new()
+            }
+        );
     }
 }

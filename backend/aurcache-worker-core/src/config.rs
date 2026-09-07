@@ -65,6 +65,17 @@ pub struct CoreConfig {
     /// Takes precedence over [`Self::repo_host`], which is the narrower case of
     /// the same thing.
     pub repo_url: Option<String>,
+    /// A mirrorlist this worker uses in place of anything the server sends.
+    ///
+    /// From `WORKER_MIRRORLIST_SERVERS` (a `;`-separated server list, rendered
+    /// into `Server =` lines) or `WORKER_MIRRORLIST_FILE` (a path to a ready
+    /// mirrorlist). Set for a worker whose local mirrors beat the server's --
+    /// a worker on other hardware, or on the far side of a slow link from the
+    /// mirror the server happens to prefer.
+    ///
+    /// When this is set the server is told not to send one at all, rather than
+    /// sending bytes the worker would discard.
+    pub mirrorlist: Option<String>,
 }
 
 /// Read an environment variable, treating blank values as unset.
@@ -184,6 +195,40 @@ impl CoreConfig {
                 .unwrap_or(3 * 60 * 60),
             repo_host: env_opt("AURCACHE_REPO_HOST"),
             repo_url: env_opt("AURCACHE_REPO_URL"),
+            mirrorlist: local_mirrorlist(),
+        }
+    }
+}
+
+/// The worker's own mirrorlist, if it has been given one.
+///
+/// `WORKER_MIRRORLIST_SERVERS` wins over `WORKER_MIRRORLIST_FILE`: it is the
+/// more specific statement of intent, and an unreadable file should not
+/// silently override an explicit list. A file that cannot be read is a warning
+/// and not a failure -- the worker then takes the server's mirrorlist, which is
+/// what it would have done with neither variable set.
+fn local_mirrorlist() -> Option<String> {
+    if let Some(servers) = env_opt("WORKER_MIRRORLIST_SERVERS") {
+        let rendered: String = servers
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("Server = {s}\n"))
+            .collect();
+        if !rendered.is_empty() {
+            return Some(rendered);
+        }
+    }
+    let path = env_opt("WORKER_MIRRORLIST_FILE")?;
+    match std::fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => Some(content),
+        Ok(_) => {
+            tracing::warn!("WORKER_MIRRORLIST_FILE {path} is empty; using the server's mirrorlist");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("WORKER_MIRRORLIST_FILE {path} unreadable ({e}); using the server's");
+            None
         }
     }
 }

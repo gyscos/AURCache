@@ -75,6 +75,37 @@ pub struct RegisterStatus {
 /// `$arch` / `$repo` substitution.
 pub const REPO_HOST_PLACEHOLDER: &str = "%AURCACHE_HOST%";
 
+/// What a worker wants the server to do about this build's mirrorlist.
+///
+/// The checksum is one the *server* produced and sent alongside a mirrorlist;
+/// the worker only echoes it back. Nothing on the worker side computes a
+/// digest, so the two ends cannot disagree about the algorithm.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum MirrorlistPreference {
+    /// The worker has its own mirrorlist and wants none sent.
+    Local,
+    /// The worker takes the server's, and holds these checksums keyed by
+    /// architecture. Keyed because a claim is sent *before* the server picks a
+    /// job, so the worker does not yet know which of the arches it builds this
+    /// answer will be for. Empty means it holds nothing yet.
+    Server {
+        #[serde(default)]
+        checksums: std::collections::BTreeMap<String, String>,
+    },
+}
+
+/// A worker that says nothing holds nothing, so it is sent the mirrorlist in
+/// full. That is what a worker predating this field does, which is why the
+/// default has to be this variant rather than [`MirrorlistPreference::Local`].
+impl Default for MirrorlistPreference {
+    fn default() -> Self {
+        Self::Server {
+            checksums: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// A worker's request to claim a job, advertising the arches it can build so
 /// the server can route native vs emulated work.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -82,6 +113,11 @@ pub struct ClaimRequest {
     pub native_arches: Vec<String>,
     #[serde(default)]
     pub emulated_arches: Vec<String>,
+    /// What the worker already holds, so the server can skip resending an
+    /// unchanged mirrorlist. Unlike the arch fields this *is* read: it says
+    /// something about the caller that only the caller knows.
+    #[serde(default)]
+    pub mirrorlist: MirrorlistPreference,
 }
 
 /// Everything a worker needs to build a package without ever contacting the AUR.
@@ -100,9 +136,23 @@ pub struct JobDescriptor {
     pub makepkg_conf: String,
     /// Rendered `pacman.conf` for the build.
     pub pacman_conf: String,
-    /// Per-arch mirrorlist content when the server has one for this arch;
-    /// `None` means the worker falls back to its image's built-in mirrorlist.
+    /// Per-arch mirrorlist content when the server has one for this arch and
+    /// the worker does not already hold it. `None` together with
+    /// `mirrorlist_unchanged == false` means the server has none, and the
+    /// worker falls back to its image's built-in mirrorlist.
     pub mirrorlist: Option<String>,
+    /// Checksum of the `mirrorlist` sent above, for the worker to echo back on
+    /// its next claim. Absent whenever no content was sent.
+    #[serde(default)]
+    pub mirrorlist_checksum: Option<String>,
+    /// The server has a mirrorlist for this arch and it matches the checksum
+    /// the worker sent, so the content was omitted; keep using what you have.
+    ///
+    /// Only ever true in response to a claim that carried a checksum, so a
+    /// worker predating this field never sees it and keeps receiving the
+    /// content in full.
+    #[serde(default)]
+    pub mirrorlist_unchanged: bool,
     /// `validpgpkeys` the worker must trust before building.
     #[serde(default)]
     pub pgp_keys: Vec<String>,
@@ -160,12 +210,58 @@ mod tests {
             makepkg_conf: "PACKAGER=x".into(),
             pacman_conf: "[repo]".into(),
             mirrorlist: Some("Server = https://example/\\$repo".into()),
+            mirrorlist_checksum: Some("abc123".into()),
+            mirrorlist_unchanged: false,
             pgp_keys: vec!["ABCDEF".into()],
         };
         let back = round_trip(&job);
         assert_eq!(job.build_id, back.build_id);
         assert_eq!(job.pgp_keys, back.pgp_keys);
         assert_eq!(job.mirrorlist, back.mirrorlist);
+        assert_eq!(job.mirrorlist_checksum, back.mirrorlist_checksum);
+    }
+
+    /// A worker predating the mirrorlist fields sends no `mirrorlist` on its
+    /// claim. That has to read as "I hold nothing", so the server keeps sending
+    /// the content in full and the old worker behaves exactly as before.
+    #[test]
+    fn a_claim_without_a_mirrorlist_preference_holds_nothing() {
+        let old = r#"{"native_arches":["x86_64"],"emulated_arches":[]}"#;
+        let claim: ClaimRequest = serde_json::from_str(old).expect("deserialize old claim");
+        assert_eq!(claim.mirrorlist, MirrorlistPreference::default());
+        assert_eq!(
+            claim.mirrorlist,
+            MirrorlistPreference::Server {
+                checksums: std::collections::BTreeMap::new()
+            }
+        );
+    }
+
+    /// Conversely, a job descriptor from a server predating those fields still
+    /// deserializes: the worker sees content with no checksum and simply uses
+    /// it without caching.
+    #[test]
+    fn a_job_descriptor_without_the_new_fields_deserializes() {
+        let old = r#"{"build_id":1,"pkgbase":"hello","arch":"x86_64","build_flags":[],
+            "makepkg_conf":"","pacman_conf":"","mirrorlist":"Server = a\n","pgp_keys":[]}"#;
+        let job: JobDescriptor = serde_json::from_str(old).expect("deserialize old descriptor");
+        assert_eq!(job.mirrorlist.as_deref(), Some("Server = a\n"));
+        assert!(job.mirrorlist_checksum.is_none());
+        assert!(!job.mirrorlist_unchanged);
+    }
+
+    /// The preference is tagged, so adding a variant later does not silently
+    /// deserialize as an existing one.
+    #[test]
+    fn mirrorlist_preference_round_trips() {
+        assert_eq!(
+            round_trip(&MirrorlistPreference::Local),
+            MirrorlistPreference::Local
+        );
+        let mut checksums = std::collections::BTreeMap::new();
+        checksums.insert("x86_64".to_string(), "abc".to_string());
+        let held = MirrorlistPreference::Server { checksums };
+        assert_eq!(round_trip(&held), held);
     }
 
     #[test]

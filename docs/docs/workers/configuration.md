@@ -48,6 +48,26 @@ crawling through emulation somewhere else.
 
 See [Routing builds to specific workers](./routing.md).
 
+## Mirrorlist
+
+By default a worker needs none of this: the server sends the mirrorlist for the
+build's architecture with each job, and a worker that gets none uses its image's
+own `/etc/pacman.d/mirrorlist`.
+
+Set one of these when this worker's mirrors beat the server's — a worker on
+other hardware, or across a slow link from the mirror the server prefers.
+
+| Variable | Type | Description | Default |
+|---|---|---|---|
+| `WORKER_MIRRORLIST_SERVERS` | String | Semicolon-separated mirror URLs, used instead of the server's | empty |
+| `WORKER_MIRRORLIST_FILE` | Path | A ready mirrorlist file inside the container | empty |
+
+`WORKER_MIRRORLIST_SERVERS` wins if both are set. Either one makes the worker
+tell the server not to send a mirrorlist at all, so nothing is transferred that
+would only be discarded.
+
+See [Mirrorlist](../Configuration/mirrorlist.md) for the server side.
+
 ## Build credentials
 
 | Variable | Type | Description | Default |

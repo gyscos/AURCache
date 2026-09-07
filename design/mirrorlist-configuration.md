@@ -9,7 +9,9 @@ non-x86_64 architecture is impossible without that architecture's mirrorlist,
 because Arch and Arch Linux ARM do not share a URL layout. See
 "Per-arch dependency resolution" below.
 
-Status: **proposed**. Nothing here is implemented yet.
+Status: the mirrorlist half is **implemented**. The per-arch dependency
+resolution half (second part of this document) is **not**, and is deliberately
+optional -- see the judgement recorded there.
 
 ---
 
@@ -133,15 +135,25 @@ claim revalidates a checksum:
 ```rust
 /// What the worker wants for this build's mirrorlist.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", tag = "mode")]
 pub enum MirrorlistPreference {
     /// The worker has its own; send nothing.
     Local,
-    /// The worker takes the server's, and currently holds this checksum.
-    /// `None` means it holds none yet.
-    Server { checksum: Option<String> },
+    /// The worker takes the server's, and holds these checksums by arch.
+    Server { checksums: BTreeMap<String, String> },
 }
 ```
+
+**Keyed by architecture, and this was a correction made while implementing.**
+The claim is sent *before* the server picks a job, so the worker does not yet
+know which of the architectures it builds the answer will be for. A single
+checksum cannot express that. It is a map of checksums, not of contents, so it
+stays small.
+
+**The server computes the checksum; the worker only echoes it back.** Nothing on
+the worker side digests anything, so the two ends cannot disagree about the
+algorithm, and changing it later costs one resend per worker rather than a
+coordinated upgrade.
 
 `#[serde(default)]` resolving to `Server { checksum: None }` makes an older
 worker behave exactly as today: it sends nothing, the server reads "holds
@@ -149,8 +161,16 @@ none", and the content is included every time. An older *server* ignores the
 new field and always sends content, which a newer worker simply accepts. Safe
 in both directions.
 
-`JobDescriptor.mirrorlist` correspondingly becomes three-valued — unchanged,
-new content, or none configured — rather than today's `Option<String>`.
+`JobDescriptor` correspondingly becomes three-valued — unchanged, new content,
+or none configured. Encoded as the existing `mirrorlist: Option<String>` plus
+`mirrorlist_checksum` and a `mirrorlist_unchanged` flag rather than as an enum,
+so an older worker still deserializes it. `unchanged` is only ever true in
+answer to a claim that carried a checksum, which an older worker never sends, so
+such a worker keeps receiving the content in full.
+
+Distinguishing "keep what you have" from "the server has none" matters: the
+second has to make the worker *drop* its cached list, or a mirrorlist removed on
+the server would live on in every worker.
 
 The worker keeps a small local `arch -> (checksum, content)` cache, so
 alternating between architectures does not refetch.
@@ -170,10 +190,11 @@ Claim-time revalidation is strictly better here:
 * **No staleness window.** Every build uses the current list. Registration-time
   delivery would hold a worker's list until it restarted, and would need a
   second mechanism to fix that.
-* **No per-arch map.** A job has exactly one architecture, so only that arch's
-  list is ever in play — the "arch-keyed map filtered to the worker's declared
-  arches" an earlier draft proposed is not needed at all. This matters because
-  a worker may build several arches (`native_arches` + `emulated_arches`).
+* **No per-arch map of mirrorlist *contents*.** A job has exactly one
+  architecture, so only that arch's list is ever sent. The claim still carries
+  one checksum per arch the worker holds, because it precedes job selection —
+  but checksums are small, where the "arch-keyed map of contents filtered to
+  the worker's declared arches" an earlier draft proposed was not.
 * **Nothing sent when nothing changed**, and nothing sent at all to a worker
   that overrides locally.
 

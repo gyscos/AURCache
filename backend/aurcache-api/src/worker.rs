@@ -13,8 +13,8 @@ use aurcache_ca::Ca;
 use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary};
 use aurcache_common::builder::BuildStates;
 use aurcache_common::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
-    RegisterStatus,
+    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, MirrorlistPreference,
+    RegisterRequest, RegisterStatus,
 };
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
@@ -109,9 +109,53 @@ fn render_repo_template(public_url: &str) -> String {
     format!("[repo]\nSigLevel = Never\nServer = {server}\n")
 }
 
-/// Directory the server reads per-arch mirrorlists from (x86_64 only today).
+/// Directory the server reads per-arch mirrorlists from.
 fn mirrorlist_dir() -> PathBuf {
     PathBuf::from(env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()))
+}
+
+/// Checksum identifying one mirrorlist's content.
+///
+/// Computed only here. A worker never digests anything -- it echoes back the
+/// value it was sent -- so this can change algorithm without any worker
+/// needing to agree, at the cost of one resend per worker.
+fn mirrorlist_checksum(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// Decide what to put in a job descriptor for the mirrorlist.
+///
+/// Returns `(content, checksum, unchanged)`. The mirrorlist is deployment
+/// configuration rather than build configuration, but it is delivered on the
+/// claim because it *changes* -- `MIRROR_RANK_SCHEDULE` rewrites it on a
+/// schedule -- and the claim is the only exchange that recurs. Revalidating a
+/// checksum keeps that from meaning the same bytes with every job.
+fn resolve_mirrorlist(
+    held: &MirrorlistPreference,
+    arch: &str,
+    current: Option<String>,
+) -> (Option<String>, Option<String>, bool) {
+    // A worker with its own mirrorlist would discard anything sent, so nothing
+    // is computed or sent for it.
+    if matches!(held, MirrorlistPreference::Local) {
+        return (None, None, false);
+    }
+    let Some(content) = current else {
+        // No mirrorlist for this arch: the worker drops whatever it cached and
+        // falls back to its image's own. `unchanged` stays false precisely so
+        // it can tell this apart from "keep what you have".
+        return (None, None, false);
+    };
+    let checksum = mirrorlist_checksum(&content);
+    let MirrorlistPreference::Server { checksums } = held else {
+        unreachable!("Local handled above");
+    };
+    if checksums.get(arch).map(String::as_str) == Some(checksum.as_str()) {
+        (None, None, true)
+    } else {
+        (Some(content), Some(checksum), false)
+    }
 }
 
 /// Conventional PKGDEST inside a worker's build environment. Workers may patch
@@ -342,12 +386,12 @@ pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, ApiError> {
 /// worker declared, so those values must come from one consistent source rather
 /// than from whatever the caller asserts about itself. The row is refreshed on
 /// every re-registration, which happens on each worker boot.
-#[post("/worker/jobs/claim", data = "<_claim>")]
+#[post("/worker/jobs/claim", data = "<claim>")]
 pub async fn claim_job(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
     auth: WorkerAuth,
-    _claim: Json<ClaimRequest>,
+    claim: Json<ClaimRequest>,
 ) -> Result<Option<Json<JobDescriptor>>, ApiError> {
     let db = db.inner();
 
@@ -364,7 +408,7 @@ pub async fn claim_job(
         return Ok(None);
     };
 
-    let descriptor = build_descriptor(db, store, &build)
+    let descriptor = build_descriptor(db, store, &build, &claim.mirrorlist)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(Some(Json(descriptor)))
@@ -374,6 +418,7 @@ async fn build_descriptor(
     db: &DatabaseConnection,
     store: &SnapshotStore,
     build: &aurcache_db::builds::Model,
+    held_mirrorlist: &MirrorlistPreference,
 ) -> anyhow::Result<JobDescriptor> {
     let pkg = Packages::find_by_id(build.pkg_id)
         .one(db)
@@ -387,7 +432,11 @@ async fn build_descriptor(
         build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST)).await;
 
     let arch = build.platform.as_str().to_string();
-    let mirrorlist = mirrorlist_for(&arch, &mirrorlist_dir()).await;
+    let (mirrorlist, mirrorlist_checksum, mirrorlist_unchanged) = resolve_mirrorlist(
+        held_mirrorlist,
+        &arch,
+        mirrorlist_for(&arch, &mirrorlist_dir()).await,
+    );
 
     // Best-effort PGP keys from the parsed .SRCINFO; the worker can still
     // self-extract if parsing failed.
@@ -420,6 +469,8 @@ async fn build_descriptor(
         makepkg_conf,
         pacman_conf,
         mirrorlist,
+        mirrorlist_checksum,
+        mirrorlist_unchanged,
         pgp_keys,
     })
 }
@@ -904,6 +955,90 @@ pub async fn revoke_worker(
 #[cfg(test)]
 mod repo_template_tests {
     use super::render_repo_template;
+    use aurcache_common::worker::MirrorlistPreference;
+    use std::collections::BTreeMap;
+
+    fn holding(arch: &str, checksum: &str) -> MirrorlistPreference {
+        let mut checksums = BTreeMap::new();
+        checksums.insert(arch.to_string(), checksum.to_string());
+        MirrorlistPreference::Server { checksums }
+    }
+
+    /// A worker that holds nothing is sent the content, with the checksum it
+    /// should echo back next time. This is also what a worker predating the
+    /// field does, since `MirrorlistPreference` defaults to holding nothing.
+    #[test]
+    fn a_worker_holding_nothing_is_sent_the_mirrorlist() {
+        let (content, checksum, unchanged) = super::resolve_mirrorlist(
+            &MirrorlistPreference::default(),
+            "x86_64",
+            Some("Server = http://mirror/\n".to_string()),
+        );
+        assert_eq!(content.as_deref(), Some("Server = http://mirror/\n"));
+        assert!(checksum.is_some(), "a checksum must accompany the content");
+        assert!(!unchanged);
+    }
+
+    /// The point of the whole exchange: matching checksum, no bytes resent.
+    #[test]
+    fn a_matching_checksum_withholds_the_content() {
+        let list = "Server = http://mirror/\n".to_string();
+        let (_, checksum, _) = super::resolve_mirrorlist(
+            &MirrorlistPreference::default(),
+            "x86_64",
+            Some(list.clone()),
+        );
+        let (content, checksum2, unchanged) =
+            super::resolve_mirrorlist(&holding("x86_64", &checksum.unwrap()), "x86_64", Some(list));
+        assert!(content.is_none(), "content should not be resent");
+        assert!(checksum2.is_none());
+        assert!(unchanged, "the worker must be told to keep what it has");
+    }
+
+    /// A checksum held for one architecture says nothing about another, which
+    /// is why the claim carries a map rather than a single value.
+    #[test]
+    fn a_checksum_for_another_arch_does_not_match() {
+        let list = "Server = http://mirror/\n".to_string();
+        let (_, checksum, _) = super::resolve_mirrorlist(
+            &MirrorlistPreference::default(),
+            "x86_64",
+            Some(list.clone()),
+        );
+        let (content, _, unchanged) = super::resolve_mirrorlist(
+            &holding("x86_64", &checksum.unwrap()),
+            "aarch64",
+            Some(list),
+        );
+        assert!(content.is_some(), "aarch64 has not been sent this list");
+        assert!(!unchanged);
+    }
+
+    /// `unchanged == false` with no content is how "the server has none" is
+    /// told apart from "keep what you have" -- the worker must drop a stale
+    /// entry rather than reuse it.
+    #[test]
+    fn no_server_mirrorlist_is_not_reported_as_unchanged() {
+        let (content, checksum, unchanged) =
+            super::resolve_mirrorlist(&holding("x86_64", "whatever"), "x86_64", None);
+        assert!(content.is_none());
+        assert!(checksum.is_none());
+        assert!(!unchanged);
+    }
+
+    /// A worker with its own mirrorlist is sent nothing at all.
+    #[test]
+    fn a_local_worker_is_sent_nothing() {
+        let (content, checksum, unchanged) = super::resolve_mirrorlist(
+            &MirrorlistPreference::Local,
+            "x86_64",
+            Some("Server = http://mirror/\n".to_string()),
+        );
+        assert!(content.is_none());
+        assert!(checksum.is_none());
+        assert!(!unchanged);
+    }
+
     use aurcache_common::worker::REPO_HOST_PLACEHOLDER;
 
     /// Only the host is replaced: the scheme, port and path describe how the

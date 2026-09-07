@@ -68,7 +68,7 @@ impl AurClient {
 
     async fn refresh_official_repo_cache_if_needed(&self) -> Result<(), Error> {
         fs::create_dir_all(&self.official_repo_cache_dir)?;
-        let mirrors = mirror_servers(&self.official_mirrorlist_path)?;
+        let mirrors = official_mirror_servers(&self.official_mirrorlist_path)?;
         if mirrors.is_empty() {
             return Err(Error::Rpc(
                 "No official repo mirrors configured".to_string(),
@@ -144,6 +144,31 @@ fn cache_is_stale(path: &Path) -> Result<bool, Error> {
         .duration_since(modified)
         .map_err(|e| Error::Rpc(e.to_string()))?;
     Ok(age.as_secs() > OFFICIAL_REPO_CACHE_TTL_SECS)
+}
+
+/// Mirrors to fetch the official repository *databases* from.
+///
+/// `OFFICIAL_MIRRORLIST_SERVERS` (a `;`-separated server list, same shape as
+/// `MIRRORLIST_SERVERS_X86_64`) takes precedence over the mirrorlist file.
+///
+/// Separate from what workers are given because the two want different things:
+/// this fetches three small `.db` files hourly and wants a mirror that is
+/// close and reliable, while a worker bulk-downloads packages and may sit on
+/// entirely different hardware. Sharing one setting is a fine default and a
+/// poor requirement.
+fn official_mirror_servers(path: &Path) -> Result<Vec<String>, Error> {
+    if let Ok(servers) = std::env::var("OFFICIAL_MIRRORLIST_SERVERS") {
+        let configured: Vec<String> = servers
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if !configured.is_empty() {
+            return Ok(configured);
+        }
+    }
+    mirror_servers(path)
 }
 
 fn mirror_servers(path: &Path) -> Result<Vec<String>, Error> {

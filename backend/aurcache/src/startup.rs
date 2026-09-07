@@ -116,7 +116,6 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     backfill_build_sizes(db).await;
     close_orphaned_operations(db).await;
 
-    // todo arm mirrorlists unsupported for now!
     let mirrorlist_dir = mirrorlist_dir();
     if let Err(e) = fs::create_dir_all(&mirrorlist_dir).await {
         warn!(
@@ -130,29 +129,45 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     // `mirrorlist.<arch>` and no fallback logic is needed anywhere else.
     adopt_shared_mirrorlist().await;
 
-    // Mirror ranking only knows how to rank x86_64 mirrors, so that is the one
-    // architecture AURCache can populate itself.
-    let mirrorlist_file = job_config::mirrorlist_path(RANKABLE_ARCH);
-
-    // Check if mirrorlist servers are provided via env var (semicolon-separated)
-    // Treat an empty var the same way as an unset var.
-    if let Ok(servers) = env::var("MIRRORLIST_SERVERS_X86_64")
-        && !servers.trim().is_empty()
-    {
-        info!("Using mirrorlist from MIRRORLIST_SERVERS_X86_64 env var");
+    // `MIRRORLIST_SERVERS_<ARCH>` for any architecture AURCache builds for, not
+    // x86_64 alone. Arch and Arch Linux ARM do not share a URL layout --
+    // `$repo/os/$arch` against `$arch/$repo` -- so an ARM mirrorlist cannot be
+    // derived from the x86_64 one by substituting the architecture; it has to
+    // be configured separately or not at all.
+    for platform in Platform::ALL {
+        let arch = platform.as_str();
+        let Some(servers) = env::var(mirrorlist_env_var(arch))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let path = job_config::mirrorlist_path(arch);
         let mirrorlist = servers
             .split(';')
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| format!("Server = {s}\n"))
             .collect::<String>();
-        fs::write(&mirrorlist_file, mirrorlist).await?;
-        info!("Wrote mirrorlist to {}", mirrorlist_file.display());
-    } else if !fs::try_exists(&mirrorlist_file).await.unwrap_or(false) {
+        fs::write(&path, mirrorlist).await?;
+        info!(
+            "Wrote {arch} mirrorlist from {} to {}",
+            mirrorlist_env_var(arch),
+            path.display()
+        );
+    }
+
+    // Ranking only knows how to rank x86_64 mirrors, so that is the one
+    // architecture AURCache can populate for itself when nothing is configured.
+    // Every other arch is configured or absent, and absent is fine: the worker
+    // then uses its own image's mirrorlist.
+    let ranked = job_config::mirrorlist_path(RANKABLE_ARCH);
+    if !fs::try_exists(&ranked).await.unwrap_or(false) {
         info!("Perform initial load of pacman mirrorlist");
         match pacman_mirrors::get_status(Platform::X86_64).await {
             Ok(status) => {
-                fs::write(&mirrorlist_file, gen_mirrorlist(&status.urls.0)).await?;
-                info!("Wrote mirrorlist to {}", mirrorlist_file.display());
+                fs::write(&ranked, gen_mirrorlist(&status.urls.0)).await?;
+                info!("Wrote mirrorlist to {}", ranked.display());
             }
             Err(e) => {
                 warn!("Failed to get mirror list: {e}");
@@ -279,5 +294,27 @@ async fn close_orphaned_operations(db: &DatabaseConnection) {
         Ok(0) => {}
         Ok(closed) => warn!("Closed {closed} operation(s) left running by a restart"),
         Err(e) => warn!("could not close interrupted operations: {e}"),
+    }
+}
+
+/// The environment variable naming an architecture's mirrorlist servers.
+///
+/// `x86_64` -> `MIRRORLIST_SERVERS_X86_64`, which is the name deployments
+/// already set, so generalising costs no existing configuration.
+fn mirrorlist_env_var(arch: &str) -> String {
+    format!("MIRRORLIST_SERVERS_{}", arch.to_uppercase())
+}
+
+#[cfg(test)]
+mod mirrorlist_env_tests {
+    use super::mirrorlist_env_var;
+
+    /// The x86_64 name is the one already documented and deployed; the others
+    /// follow the same rule rather than being spelled out by hand.
+    #[test]
+    fn env_var_names_follow_the_architecture() {
+        assert_eq!(mirrorlist_env_var("x86_64"), "MIRRORLIST_SERVERS_X86_64");
+        assert_eq!(mirrorlist_env_var("aarch64"), "MIRRORLIST_SERVERS_AARCH64");
+        assert_eq!(mirrorlist_env_var("armv7h"), "MIRRORLIST_SERVERS_ARMV7H");
     }
 }

@@ -162,6 +162,8 @@ async fn fake_worker_protocol_roundtrip() {
     let claim_req = ClaimRequest {
         native_arches: vec!["x86_64".to_string()],
         emulated_arches: vec![],
+        // Holds nothing, so the server sends any mirrorlist in full.
+        mirrorlist: Default::default(),
     };
 
     // --- Happy path: claim build 1 (oldest), upload a good artifact, complete.

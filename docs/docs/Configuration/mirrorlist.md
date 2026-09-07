@@ -9,7 +9,15 @@ Moreover, a mirrorlist can be manually passed, if you want to manage the mirrorl
 
 :::info
 
-Only **x86_64** build architecture is supported to set mirrorlist and rerank mirrors at the moment.
+A mirrorlist can be set for **any** build architecture with
+`MIRRORLIST_SERVERS_<ARCH>`. Automatic **ranking** is x86_64-only: it ranks
+official Arch mirrors, and there is no equivalent for Arch Linux ARM. Other
+architectures are configured explicitly or left unset — and unset is fine, since
+a worker then uses its own image's mirrorlist.
+
+Arch and Arch Linux ARM do not share a URL layout (`$repo/os/$arch` against
+`$arch/$repo`), so an ARM mirrorlist cannot be derived from the x86_64 one by
+substituting the architecture. It has to be configured separately.
 
 :::
 
@@ -19,6 +27,9 @@ Only **x86_64** build architecture is supported to set mirrorlist and rerank mir
 | MIRROR_RANK_SCHEDULE                | String(CRON) | Auto mirrorlist rank schedule in cronjob syntax with seconds (null to disable) | 0 0 2 * * 0 (once a week) |
 | MIRRORLIST_PATH_X86_64                | String       | directory containing mirrorlist inside aurcache container                 | /app/config/pacman_x86_64 |
 | MIRRORLIST_SERVERS_X86_64                | String       | semicolon-separated list of mirror URLs (disables auto ranking)                 | null |
+| MIRRORLIST_SERVERS_AARCH64                | String       | the same, for aarch64 workers (no auto ranking for this arch)                 | null |
+| MIRRORLIST_SERVERS_ARMV7H                | String       | the same, for armv7h workers                 | null |
+| OFFICIAL_MIRRORLIST_SERVERS                | String       | mirrors used for the server's **own** official-repo database lookups           | the x86_64 list |
 
 ## Manually set mirrorlist via env var
 
@@ -122,10 +133,49 @@ networks:
     driver: bridge
 ```
 
-The mirrorlist is configured on the **server** only. Workers do not need a copy:
-the server ships the effective mirrorlist to each worker as part of the build
-job, so a mirrorlist set here applies to every worker, including remote and
-foreign-architecture ones.
+## Where the mirrorlist is used
+
+A mirrorlist set here applies to every worker, including remote and
+foreign-architecture ones: the server sends the one matching the build's
+architecture with each job. Workers need no configuration for this to work.
+
+The server also fetches the official repository **databases** (`core`, `extra`,
+`multilib`) to decide whether a dependency already exists in the official repos
+and so needs no AUR build. That fetch is small and hourly, and by default uses
+the same x86_64 mirrors. Set `OFFICIAL_MIRRORLIST_SERVERS` to point it
+elsewhere — useful when the server should read its index from a mirror close to
+*it* while workers download packages from mirrors close to *them*.
+
+## Overriding the mirrorlist on a worker
+
+A worker on other hardware, or on the far side of a slow link from the mirror
+the server prefers, can use its own mirrors instead. Set either variable on the
+**worker**:
+
+| Variable | Type | Description |
+|---|---|---|
+| WORKER_MIRRORLIST_SERVERS | String | semicolon-separated mirror URLs, used in place of the server's |
+| WORKER_MIRRORLIST_FILE | String | path to a ready mirrorlist file inside the worker container |
+
+`WORKER_MIRRORLIST_SERVERS` wins if both are set. A worker configured this way
+tells the server not to send one at all.
+
+Resolution order for each build:
+
+1. the worker's own mirrorlist, if configured
+2. the server's mirrorlist for that architecture, if it has one
+3. the worker image's own `/etc/pacman.d/mirrorlist`
+
+Nothing is required at either end: with no configuration anywhere, the server
+ranks x86_64 mirrors for itself and foreign-architecture workers use their
+image's defaults.
+
+:::note Bandwidth
+The mirrorlist travels with a build job, but only when it has actually changed.
+Each job carries a checksum of the list the worker already holds, and the server
+resends the content only on a mismatch — so a rerank reaches every worker on its
+next build without shipping the same bytes with every job.
+:::
 
 :::note Hybrid image
 In the [hybrid compatibility

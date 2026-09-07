@@ -12,6 +12,13 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// Every platform AURCache builds for.
+    ///
+    /// Here rather than spelled out at each use, so that adding one is a change
+    /// in this file alone -- the callers that iterate architectures (mirrorlist
+    /// configuration, official-repo caches) then pick it up for free.
+    pub const ALL: [Self; 3] = [Self::X86_64, Self::Aarch64, Self::Armv7h];
+
     /// Returns the string representation of the platform.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
