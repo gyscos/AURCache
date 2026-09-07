@@ -93,6 +93,17 @@ if [ "$(command -v alpm-pkgbuild-bridge)" != /usr/lib/aurcache/bin/alpm-pkgbuild
     exit 1
 fi
 
+# Same delegation the split worker image does, minus the sudo: this entrypoint
+# already runs as root. The embedded worker is dropped to `aurcache` below, and
+# without this it cannot create the per-build cgroup that reports peak memory.
+if [ -d /sys/fs/cgroup ]; then
+    for f in /sys/fs/cgroup \
+             /sys/fs/cgroup/cgroup.procs \
+             /sys/fs/cgroup/cgroup.subtree_control; do
+        chown aurcache:aurcache "$f" 2>/dev/null || true
+    done
+fi
+
 log "starting AURCache server"
 /usr/bin/aurcache &
 PIDS+=($!)

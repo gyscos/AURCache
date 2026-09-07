@@ -1784,6 +1784,10 @@ fn print_worker_list(workers: &[Worker]) {
                 w.id.to_string(),
                 w.name.clone(),
                 format!("{:?}", w.status).to_lowercase(),
+                // Which build strategy: `chroot`, `docker`, or whatever a
+                // future executor calls itself. A dash for a worker that
+                // enrolled before workers reported one.
+                w.kind.clone().unwrap_or_else(|| "-".to_string()),
                 or_dash(&w.native_arches),
                 or_dash(&w.emulated_arches),
                 or_dash(&w.package_affinity),
@@ -1805,6 +1809,7 @@ fn print_worker_list(workers: &[Worker]) {
             "id",
             "name",
             "status",
+            "kind",
             "native",
             "emulated",
             "affinity",

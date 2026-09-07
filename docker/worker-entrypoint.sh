@@ -14,6 +14,29 @@ if [ -n "${AURCACHE_ENROLLMENT_DIR:-}" ]; then
     sudo chown "$(id -u):$(id -g)" "${AURCACHE_ENROLLMENT_DIR}" 2>/dev/null || true
 fi
 
+# Hand this container's cgroup subtree to the worker user.
+#
+# The worker gives each build a cgroup of its own so `memory.peak` reports one
+# build rather than the whole container. Creating one means writing under
+# /sys/fs/cgroup, and while a privileged container mounts that read-write, it is
+# owned by root and the worker deliberately runs as `aurcache`.
+#
+# The native unit gets this for free: systemd's `Delegate=yes` chowns the unit's
+# subtree to its `User=`. A container has no systemd to do it, so do the same
+# thing here with the sudo the worker already has. Chowning the namespace root
+# reaches only this container's own subtree -- in a private cgroup namespace
+# that directory *is* the container's cgroup.
+#
+# Best-effort: an unprivileged container has /sys/fs/cgroup read-only, and the
+# worker then reports no memory figure and builds exactly as before.
+if [ -d /sys/fs/cgroup ]; then
+    for f in /sys/fs/cgroup \
+             /sys/fs/cgroup/cgroup.procs \
+             /sys/fs/cgroup/cgroup.subtree_control; do
+        sudo chown "$(id -u):$(id -g)" "$f" 2>/dev/null || true
+    done
+fi
+
 # Hold the build credential in an agent rather than handing builds the key
 # file, which they cannot read (see docker/ssh-agent-setup.sh).
 # shellcheck source=/dev/null

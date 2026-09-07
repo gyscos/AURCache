@@ -186,12 +186,26 @@ COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
 COPY --chmod=0755 docker/ssh-agent-setup.sh /usr/local/bin/aurcache-ssh-agent-setup
 COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
 
-# The embedded worker's identity and its expensive base chroot live here.
-# Declaring them as volumes means Compose carries them across a container
-# recreate even for deployments whose compose file predates the worker and
-# therefore mounts neither — so upgrading does not orphan the worker's identity
-# (which would enroll a new worker every restart) or rebuild the base chroot.
-VOLUME ["/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
+# State that must outlive the container.
+#
+#   /app/data                 the internal CA that signs every worker's
+#                             certificate.
+#   /var/lib/aurcache-worker  the embedded worker's identity, and its base chroot.
+#   /var/cache/aurcache-worker  its package and source caches.
+#
+# `/app/data` was missing here, and its absence was worse than it looks: losing
+# the CA invalidates the certificate of *every* worker that ever enrolled, so a
+# recreate orphaned the whole fleet and not just the embedded worker. The two
+# directories below were declared without the one that makes them useful.
+#
+# Declaring them means `docker compose up` carries them across a recreate even
+# for a compose file that mounts none of them. That is not universal, though:
+# an orchestrator that deletes and recreates the container rather than updating
+# it in place -- TrueNAS's app system among them -- starts each deployment with
+# fresh anonymous volumes, and the embedded worker then enrolls as a new machine
+# every single time. A deployment that updates regularly should mount named
+# volumes here explicitly rather than trusting the anonymous ones to survive.
+VOLUME ["/app/data", "/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
 
 WORKDIR /app
 CMD ["/usr/local/bin/hybrid-entrypoint"]
