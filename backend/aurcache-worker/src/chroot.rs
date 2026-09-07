@@ -45,13 +45,10 @@ pub fn devtools(program: &str) -> Command {
 /// Ensure the shared base chroot exists and is reasonably fresh. Idempotent.
 ///
 /// * Creates `<chroot_dir>/root` via `mkarchroot` seeded with the job's
-///   `pacman.conf` / `makepkg.conf` on first use.
+///   `pacman.conf` on first use. The chroot keeps the `makepkg.conf` its own
+///   `pacman` installs; this worker's settings arrive as a drop-in instead.
 /// * Otherwise refreshes it with `arch-nspawn … pacman -Syu`.
-pub async fn ensure_base_chroot(
-    chroot_dir: &Path,
-    pacman_conf: &Path,
-    makepkg_conf: &Path,
-) -> Result<PathBuf> {
+pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
     // Serialize base-chroot creation/refresh: concurrent jobs must not race to
     // build or `-Syu` the same shared root.
     let _guard = BASE_CHROOT_LOCK.lock().await;
@@ -72,11 +69,21 @@ pub async fn ensure_base_chroot(
         return Ok(root);
     }
 
+    // No `-M`. `mkarchroot` would copy a makepkg.conf into the chroot, and its
+    // default is the *host's* -- which is the operator's own build
+    // configuration, not this service's. A developer machine with
+    // `BUILDENV=(... ccache ...)` is entirely ordinary, and carrying that into a
+    // clean `base-devel` chroot fails every build before it compiles anything:
+    //
+    //   ==> ERROR: Cannot find the ccache binary required for compiler cache usage.
+    //
+    // Left alone, the chroot keeps the `makepkg.conf` its own `pacman` package
+    // installed: complete, correct for the chroot's architecture, and owing
+    // nothing to whatever the host happens to be configured for. What this
+    // worker wants to change goes in `makepkg.conf.d/` instead.
     let mut cmd = devtools("mkarchroot");
     cmd.arg("-C")
         .arg(pacman_conf)
-        .arg("-M")
-        .arg(makepkg_conf)
         .arg(&root)
         .arg("base-devel")
         // git+ssh sources are fetched by makepkg *inside* the chroot, and
@@ -119,44 +126,27 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
     Ok(())
 }
 
-/// This worker image's own makepkg defaults, used as the base layer for the
-/// job's `makepkg.conf`.
-const SYSTEM_MAKEPKG_CONF: &str = "/etc/makepkg.conf";
-
-/// Layer the server's makepkg settings on top of a full default `makepkg.conf`.
+/// Install the job's makepkg overrides into the chroot's `makepkg.conf.d/`.
 ///
-/// The server sends only what it wants to force (`PKGDEST`, `MAKEFLAGS`,
-/// `PACKAGER`, plus any user-provided `makepkg.conf` setting). That was fine
-/// when it was written to `~/.config/pacman/makepkg.conf`, which makepkg sources
-/// *after* the system file — but it is now handed to `mkarchroot -M`, which
-/// installs it as the chroot's **entire** `/etc/makepkg.conf`. On its own it
-/// leaves makepkg with no `PKGEXT`/`SRCEXT`/`CARCH`/compression settings, and
-/// every build dies with:
+/// `makepkg` sources `$MAKEPKG_CONF` and then every `$MAKEPKG_CONF.d/*.conf`
+/// (see `source_makepkg_config` in `/usr/share/makepkg/util/config.sh`), so a
+/// drop-in wins over the base without replacing it. That is what lets the
+/// chroot keep its own complete, architecture-correct defaults while this
+/// worker still forces `PKGDEST`, `MAKEFLAGS`, `PACKAGER` and the operator's
+/// own `makepkg_conf` setting.
 ///
-/// ```text
-/// ==> ERROR: $PKGEXT does not contain a valid package suffix (needs '.pkg.tar*', got '')
-/// ==> ERROR: Could not download sources.
-/// ```
-///
-/// The defaults have to come from the worker rather than the server: they are
-/// architecture-specific (`CARCH`, `CHOST`, `CFLAGS`), and the server may
-/// dispatch a job to a worker of a different architecture than its own.
-/// Overrides are appended last so they still win.
-fn merge_makepkg_conf(system_defaults: Option<&str>, overrides: &str) -> String {
-    let Some(base) = system_defaults else {
-        return overrides.to_string();
-    };
-    let mut out = String::with_capacity(base.len() + overrides.len() + 96);
-    out.push_str(base);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("\n# --- AURCache job overrides (applied last, win over defaults) ---\n");
-    out.push_str(overrides);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+/// Written to the *base* chroot before each build: `makechrootpkg` copies the
+/// base into a per-job chroot when it runs, so the drop-in travels with it.
+/// Rewriting it per build is also what makes a per-package `makepkg_conf`
+/// setting take effect at all -- the previous arrangement only reached the
+/// chroot when it was first created, so a setting changed afterwards was
+/// silently ignored until the chroot was rebuilt.
+pub fn install_makepkg_dropin(root: &Path, overrides: &str) -> Result<()> {
+    let dir = root.join("etc/makepkg.conf.d");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("aurcache.conf");
+    std::fs::write(&path, overrides).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Append the worker's cache layout to a server-rendered `pacman.conf`.
@@ -197,79 +187,65 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
 /// default so nothing else has to change.
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
-/// Write the per-package `makepkg.conf` / `pacman.conf` / mirrorlist to a
-/// staging directory the caller seeds the base chroot from.
+/// Write the per-package `pacman.conf` and mirrorlist to a staging directory
+/// the caller seeds the base chroot from.
+///
+/// The makepkg settings are not here: they go into the chroot's
+/// `makepkg.conf.d/` via [`install_makepkg_dropin`], so the chroot keeps its own
+/// defaults rather than having them replaced.
 pub fn write_configs(
     dir: &Path,
-    makepkg_conf: &str,
     pacman_conf: &str,
     mirrorlist: Option<&str>,
     shared_pkg_cache: Option<&Path>,
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
-    let makepkg = dir.join("makepkg.conf");
     let pacman = dir.join("pacman.conf");
-
-    let system_defaults = std::fs::read_to_string(SYSTEM_MAKEPKG_CONF).ok();
-    if system_defaults.is_none() {
-        tracing::warn!(
-            "{SYSTEM_MAKEPKG_CONF} not readable; using server-provided makepkg.conf alone \
-             (builds will fail if it lacks PKGEXT/SRCEXT)"
-        );
-    }
-    let merged = merge_makepkg_conf(system_defaults.as_deref(), makepkg_conf);
-
-    std::fs::write(&makepkg, merged).context("writing makepkg.conf")?;
     std::fs::write(&pacman, with_cache_dirs(pacman_conf, shared_pkg_cache))
         .context("writing pacman.conf")?;
     if let Some(list) = mirrorlist {
         std::fs::write(dir.join("mirrorlist"), list).context("writing mirrorlist")?;
     }
-    Ok((makepkg, pacman))
+    Ok(pacman)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A trimmed stand-in for the distro file; PKGEXT/SRCEXT are the fields
-    /// whose absence makepkg rejects outright.
-    const DEFAULTS: &str = "CARCH=\"x86_64\"\nCHOST=\"x86_64-pc-linux-gnu\"\n\
-                            PKGEXT='.pkg.tar.zst'\nSRCEXT='.src.tar.gz'\n";
-
+    /// The overrides are written as a drop-in, not as a whole `makepkg.conf`.
+    ///
+    /// The chroot's own file stays in place, which is what keeps this worker
+    /// independent of however the host machine is configured to build.
     #[test]
-    fn merge_keeps_defaults_makepkg_requires() {
-        let merged = merge_makepkg_conf(Some(DEFAULTS), "PKGDEST=/output\n");
-        assert!(merged.contains("PKGEXT='.pkg.tar.zst'"));
-        assert!(merged.contains("SRCEXT='.src.tar.gz'"));
-        assert!(merged.contains("CARCH=\"x86_64\""));
-        assert!(merged.contains("PKGDEST=/output"));
-    }
+    fn overrides_are_installed_as_a_dropin() {
+        let root = tempfile::tempdir().unwrap();
+        install_makepkg_dropin(root.path(), "PKGDEST=/output\n").unwrap();
 
-    /// Overrides must come after the defaults so they actually take effect —
-    /// makepkg.conf is sourced as bash, so the last assignment wins.
-    #[test]
-    fn overrides_are_appended_after_defaults() {
-        let merged = merge_makepkg_conf(
-            Some("PKGDEST=/system\nPKGEXT='.pkg.tar.zst'\n"),
-            "PKGDEST=/output\n",
+        let dropin = root.path().join("etc/makepkg.conf.d/aurcache.conf");
+        assert_eq!(
+            std::fs::read_to_string(&dropin).unwrap(),
+            "PKGDEST=/output\n"
         );
-        let first = merged.find("PKGDEST=/system").expect("default present");
-        let last = merged.find("PKGDEST=/output").expect("override present");
-        assert!(last > first, "override must come after the default");
+        assert!(
+            !root.path().join("etc/makepkg.conf").exists(),
+            "the chroot's own makepkg.conf must not be replaced"
+        );
     }
 
+    /// Rewritten on every build, so a per-package `makepkg_conf` setting takes
+    /// effect instead of being frozen into the chroot when it was created.
     #[test]
-    fn merge_falls_back_to_overrides_when_no_system_file() {
-        let merged = merge_makepkg_conf(None, "PKGDEST=/output\n");
-        assert_eq!(merged, "PKGDEST=/output\n");
-    }
+    fn the_dropin_is_replaced_not_appended() {
+        let root = tempfile::tempdir().unwrap();
+        install_makepkg_dropin(root.path(), "PKGDEST=/first\n").unwrap();
+        install_makepkg_dropin(root.path(), "PKGDEST=/second\n").unwrap();
 
-    #[test]
-    fn merge_inserts_newline_between_sections() {
-        let merged = merge_makepkg_conf(Some("PKGEXT='.pkg.tar.zst'"), "PKGDEST=/output");
-        assert!(merged.contains("PKGEXT='.pkg.tar.zst'\n"));
-        assert!(merged.ends_with('\n'));
+        let dropin = root.path().join("etc/makepkg.conf.d/aurcache.conf");
+        assert_eq!(
+            std::fs::read_to_string(&dropin).unwrap(),
+            "PKGDEST=/second\n"
+        );
     }
 }

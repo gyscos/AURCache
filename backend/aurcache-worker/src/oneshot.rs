@@ -22,10 +22,12 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     }
     tracing::info!("Building {} locally", pkgdir.display());
 
-    // Seed the base chroot from the host's default configs.
+    // Seed the base chroot from the host's pacman.conf: a local one-shot build
+    // is explicitly "build this the way this machine would", so the host's
+    // repositories are the right ones. `makepkg.conf` is still left to the
+    // chroot's own, matching what a served build gets.
     let pacman_conf = existing("/etc/pacman.conf")?;
-    let makepkg_conf = existing("/etc/makepkg.conf")?;
-    chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf, &makepkg_conf)
+    chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf)
         .await
         .context("preparing base chroot")?;
 
