@@ -217,6 +217,7 @@ async fn run_job_inner(
             &job.pkgbase,
             cfg.core.builddir_max_bytes,
             cfg.core.builddir_min_free,
+            std::time::Duration::from_secs(cfg.core.builddir_max_age_secs),
         );
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));

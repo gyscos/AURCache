@@ -193,13 +193,30 @@ nothing noticeable.
 - Before the build rather than after, so the limits bound usage going in.
 - Never the tree the current build is about to use -- even when that tree is
   itself what breaches the cap, since evicting it defeats the point of asking.
-- **Cheapest to rebuild first, not least recently used.** Plain LRU is
-  backwards here. The tree worth keeping is the one that took four hours, and
-  that is exactly the package built rarely enough to look stale beside a dozen
-  small ones rebuilt daily -- so LRU would reliably discard the only tree that
-  justified the feature. Each build stamps what it cost alongside the size, and
-  eviction takes the cheapest first; `mtime` only breaks ties. A tree stamped
-  before cost was recorded sorts as free to discard.
+- **Nothing is evicted while the cache is within its limits.** Disk nothing
+  else needs is not worth reclaiming, and a tree kept is a rebuild avoided.
+  Eviction happens only under real pressure, never as a tidy-up.
+- **Abandoned trees go first**, meaning nothing has touched them in
+  `WORKER_BUILDDIR_MAX_AGE_SECS` (default 30 days). This is what stops a tree
+  outliving its package: a worker is never told that a package was deleted from
+  the server, and an expensive tree is the last thing the next rule would give
+  up, so `unreal-engine`'s 130 GB would otherwise sit there indefinitely.
+  Ordering rather than a sweep -- while there is room, an abandoned tree costs
+  nothing.
+- **Then worst value density -- rebuild seconds per byte.** Not age, and not
+  cost alone. LRU is backwards among live trees: the one worth keeping took
+  four hours, and that is exactly the package built rarely enough to look stale
+  beside a dozen small ones rebuilt daily. But cost alone is wrong the other
+  way, because a huge tree only earns its place while there is room for it.
+  `unreal-engine` at four hours over 130 GB is ~1.0e-7 s/byte; a thirty-second
+  package over 200 MB is ~1.4e-7. The big tree is the *worst* value per byte
+  despite costing the most, and freeing 130 GB by dropping it costs four hours
+  where freeing the same space in small trees costs over five. So it is kept
+  while there is room and given up first when space is genuinely short.
+- A staleness threshold and one ratio, rather than a weighted score over age,
+  size and cost: those weights would be invented, and there is no evidence here
+  to choose them with. A tree stamped before cost was recorded sorts as free to
+  discard.
 - Worker settings rather than server ones: it is the worker's disk.
 - Best-effort. Failing to reclaim is reported and the build proceeds; refusing
   to build over it would turn a full disk into an idle worker.

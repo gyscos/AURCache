@@ -50,6 +50,8 @@ pub struct CoreConfig {
     pub build_timeout: u64,
     /// Total bytes the persistent build cache may occupy.
     pub builddir_max_bytes: u64,
+    /// Seconds an unused build tree is kept before it is expired.
+    pub builddir_max_age_secs: u64,
     /// Bytes to keep free on the persistent build-tree filesystem.
     pub builddir_min_free: u64,
     /// Overrides the host used in the `[repo]` section, for deployments where
@@ -202,6 +204,14 @@ impl CoreConfig {
             builddir_max_bytes: env_opt("WORKER_BUILDDIR_MAX_BYTES")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200 * 1024 * 1024 * 1024),
+            // How long an unused tree is kept. Expiry is what stops a tree
+            // outliving its package: the server never tells a worker that a
+            // package was deleted, and an expensive tree is the last thing
+            // eviction would choose, so without this it would sit forever.
+            // 30 days -- long enough not to punish a package built monthly.
+            builddir_max_age_secs: env_opt("WORKER_BUILDDIR_MAX_AGE_SECS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 24 * 60 * 60),
             // Secondary floor, covering what the cap cannot see: a small disk,
             // or one shared with something else that grew.
             builddir_min_free: env_opt("WORKER_BUILDDIR_MIN_FREE")
