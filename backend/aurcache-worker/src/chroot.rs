@@ -280,10 +280,7 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
     };
     let mut removed = 0;
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        // `job-<build id>`, and `job-<build id>-<pid>` once devtools has added
-        // the suffix `-T` gives it.
-        if !name.to_string_lossy().starts_with("job-") {
+        if !is_stale_copy(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let path = entry.path();
@@ -296,6 +293,16 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
         tracing::info!("removed {removed} stale chroot cop(ies) from a previous run");
     }
     removed
+}
+
+/// Whether a name in the chroot directory is a per-build copy.
+///
+/// `job-<build id>`, and `job-<build id>-<pid>` once devtools has added the
+/// suffix `-T` gives it. The copy's lock sits *beside* it rather than inside
+/// and is removed along with the copy it belongs to, so matching it here as
+/// well reported twice as many reclaimed as there were.
+fn is_stale_copy(name: &str) -> bool {
+    name.starts_with("job-") && !name.ends_with(".lock")
 }
 
 /// Remove one chroot copy, whatever kind of thing it is.
@@ -333,6 +340,17 @@ async fn remove_copy(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lock beside a copy is removed with it, so matching it separately
+    /// double-counts what was reclaimed. The base chroot must never match.
+    #[test]
+    fn only_per_build_copies_are_swept() {
+        assert!(is_stale_copy("job-604"));
+        assert!(is_stale_copy("job-604-2844759"));
+        assert!(!is_stale_copy("job-604-2844759.lock"));
+        assert!(!is_stale_copy("root"));
+        assert!(!is_stale_copy("root.lock"));
+    }
 
     /// `makechrootpkg` picks the build directories, and a drop-in must not
     /// override them: it bind-mounts `/pkgdest` and friends, and `/output` --
