@@ -96,6 +96,10 @@ async fn announce_build_credential(cfg: &Config) {
 }
 
 async fn run(cfg: Arc<Config>) -> Result<()> {
+    // Before anything can claim work: no build of ours is running yet, so a
+    // per-build chroot still on disk belongs to a run that is already over.
+    aurcache_worker::chroot::remove_stale_copies(&cfg.chroot_dir).await;
+
     let identity = Identity::load_or_create(&cfg.core.data_dir)?;
     announce_build_credential(&cfg).await;
 

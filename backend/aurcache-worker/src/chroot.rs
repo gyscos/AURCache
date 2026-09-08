@@ -260,6 +260,76 @@ pub fn write_configs(
     Ok((makepkg, pacman))
 }
 
+/// Delete per-build chroot copies left behind by earlier runs.
+///
+/// Each build's copy is temporary now (`makechrootpkg -T`), so in the ordinary
+/// case there is nothing here to find. A worker that was killed mid-build
+/// leaves one anyway, and a worker upgraded from a version that never passed
+/// `-T` leaves every copy it ever made -- which is how this host reached 26 of
+/// them and 362G before the disk filled.
+///
+/// Startup is the safe moment: this worker is running no builds yet, so every
+/// `job-*` under the chroot directory is by definition garbage. It is *not*
+/// safe to run later, and two workers must not share a chroot directory.
+///
+/// Never fatal. Failing to reclaim space is worth reporting and carrying on;
+/// refusing to start over it would turn a full disk into an offline worker.
+pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(chroot_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // `job-<build id>`, and `job-<build id>-<pid>` once devtools has added
+        // the suffix `-T` gives it.
+        if !name.to_string_lossy().starts_with("job-") {
+            continue;
+        }
+        let path = entry.path();
+        match remove_copy(&path).await {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!("could not remove stale chroot {}: {e:#}", path.display()),
+        }
+    }
+    if removed > 0 {
+        tracing::info!("removed {removed} stale chroot cop(ies) from a previous run");
+    }
+    removed
+}
+
+/// Remove one chroot copy, whatever kind of thing it is.
+///
+/// A copy on btrfs is a subvolume snapshot, and `rm -rf` cannot delete a
+/// subvolume -- it empties it and then fails on the directory itself. This is
+/// the same distinction `delete_chroot` makes inside devtools.
+async fn remove_copy(path: &Path) -> Result<()> {
+    let mut show = Command::new("btrfs");
+    show.arg("subvolume").arg("show").arg(path);
+    // A missing `btrfs` binary means this cannot be a subvolume.
+    let is_subvolume = matches!(run_capture(show).await, Ok((_, status)) if status.success());
+
+    let mut cmd = Command::new("sudo");
+    if is_subvolume {
+        cmd.arg("btrfs").arg("subvolume").arg("delete").arg(path);
+    } else {
+        // `--one-file-system`, as devtools does: an unmount that failed leaves
+        // something mounted under here, and this must not walk into it.
+        cmd.arg("rm")
+            .arg("--recursive")
+            .arg("--force")
+            .arg("--one-file-system")
+            .arg(path);
+    }
+    let (log, status) = run_capture(cmd).await?;
+    if !status.success() {
+        bail!("removing {}:\n{log}", path.display());
+    }
+    // devtools keeps the copy's lock beside it, not inside it.
+    std::fs::remove_file(path.with_extension("lock")).ok();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

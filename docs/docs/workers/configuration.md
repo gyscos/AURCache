@@ -119,6 +119,38 @@ and its generated SSH key; if it is lost, the worker re-enrolls as a new,
 unapproved worker and generates a new key, which the remote will no longer
 accept.
 
+### Putting the chroot on other storage
+
+Builds are the bulk of a worker's disk use, and some packages are extravagant:
+`unreal-engine` needs around 300&nbsp;GB live. `WORKER_CHROOT_DIR` moves the base
+chroot and the per-build copies somewhere with room, leaving the small stuff
+(`WORKER_CACHE_DIR` is usually a few GB) where it is.
+
+Whatever you point it at has to behave like a real Unix filesystem. A base
+chroot contains setuid binaries, thousands of hardlinks, files owned by several
+users, and a couple of files carrying `security.capability` extended attributes
+(`newuidmap` and `newgidmap`, used for user-namespace id mapping).
+
+- **A local filesystem, or a network block device** (iSCSI, formatted on the
+  worker) supports all of it, because the filesystem is local either way.
+- **NFS** works if the export is `no_root_squash` and the client does not mount
+  it `nosuid`. Two caveats: `security.*` xattrs are not carried over NFS, so
+  those file capabilities are lost -- harmless unless a package builds something
+  in a rootless user namespace -- and builds are a many-small-files workload,
+  which NFS is not fast at.
+- **SMB/CIFS** cannot represent Unix ownership, setuid bits or hardlinks. The
+  chroot cannot be created on it at all.
+
+:::tip btrfs makes per-build copies free
+`makechrootpkg` snapshots the base chroot when the chroot directory is btrfs and
+`root` is a subvolume, and copies it wholesale otherwise -- 7--12&nbsp;GB of
+rsync per build on ext4, against a copy-on-write snapshot that costs almost
+nothing. If you are formatting new storage for this, make it btrfs and create
+`root` as a subvolume. This applies to local and block storage; a chroot on NFS
+is a directory tree on the server's filesystem, so it takes the copying path
+whatever the server's pool is made of.
+:::
+
 ## Timing
 
 | Variable | Type | Description | Default |

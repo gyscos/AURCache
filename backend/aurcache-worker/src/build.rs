@@ -65,6 +65,20 @@ pub fn build_command(
         // from `SUDO_USER`, which is whoever invoked us — so the worker's own
         // user would run the build, and a build could then read the worker's
         // mTLS identity and credentials by ordinary file permissions.
+        // Delete the copy when the build ends, which devtools only does for a
+        // temporary chroot: `delete_chroot` is called under `(( temp_chroot ))`
+        // and nowhere else. Without it every build left a full chroot behind
+        // for good -- 26 of them, 362G, until the disk filled and took a
+        // four-hour build with it.
+        //
+        // Ordering matters: `-T` appends `-$$` to the copy name and `-l`
+        // *assigns* it, so a `-T` before the label would have its suffix
+        // overwritten and the copy would outlive the build after all.
+        //
+        // Letting devtools do the deleting rather than doing it ourselves is
+        // what keeps this correct on btrfs, where the copy is a subvolume
+        // snapshot that `rm -rf` cannot remove.
+        "-T".to_string(),
         "-U".to_string(),
         build_user.to_string(),
     ];
@@ -111,6 +125,13 @@ mod tests {
         assert!(joined.contains("makechrootpkg -c -r /chroot -l job-42"));
         // Builds must never inherit the worker's user via SUDO_USER.
         assert!(joined.contains("-U builder"));
+        // The copy has to be temporary, or it is never deleted.
+        assert!(joined.contains(" -T "), "{joined}");
+        // ... and `-T` must follow `-l`, which assigns the name it suffixes.
+        assert!(
+            joined.find(" -l ") < joined.find(" -T "),
+            "-T must come after -l: {joined}"
+        );
         assert!(joined.contains("-- --nocheck"));
     }
 
