@@ -285,6 +285,7 @@ mod mirrorlist_tests {
     ) -> JobDescriptor {
         JobDescriptor {
             build_id: 1,
+            persistent_builddir: false,
             pkgbase: "hello".into(),
             arch: arch.into(),
             build_flags: vec![],

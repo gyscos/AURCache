@@ -273,6 +273,11 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
 
 /// Mount point a job's private pacman cache is bound over. Matches pacman's
 /// default so nothing else has to change.
+/// Where `makechrootpkg` points `BUILDDIR` inside the chroot. A persistent
+/// build tree is bound here, so makepkg's own layout is unchanged and only the
+/// lifetime differs.
+pub const BUILDDIR_MOUNT: &str = "/build";
+
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
 /// Write the per-package makepkg overrides, `pacman.conf` and mirrorlist to a

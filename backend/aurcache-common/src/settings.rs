@@ -36,6 +36,9 @@ pub struct ApplicationSettings {
     /// locally; nothing writes a per-client choice back here.
     pub date_format: SettingsEntry<String>,
     pub build_on_new_version: SettingsEntry<bool>,
+    /// Keep this package's build tree between builds instead of starting from
+    /// an empty one. See `design/persistent-build-directory.md`.
+    pub persistent_builddir: SettingsEntry<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +56,7 @@ pub enum Setting {
     VersionCheckInterval,
     AutoUpdateInterval,
     BuildOnNewVersion,
+    PersistentBuilddir,
     DateFormat,
     JobTimeout,
     BuilderImage,
@@ -68,13 +72,14 @@ impl Setting {
     /// `date_format` and `build_on_new_version` were served by `GET /settings`
     /// but rejected by `PATCH /settings/<key>` as unknown, so neither could be
     /// changed through the API at all.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::CpuLimit,
         Self::MemoryLimit,
         Self::MaxConcurrentBuilds,
         Self::VersionCheckInterval,
         Self::AutoUpdateInterval,
         Self::BuildOnNewVersion,
+        Self::PersistentBuilddir,
         Self::DateFormat,
         Self::JobTimeout,
         Self::BuilderImage,
@@ -133,6 +138,14 @@ impl Setting {
                 env_name: Some("BUILD_ON_NEW_VERSION"),
                 default: "false",
             },
+            // Off by default: a clean tree per build is the guarantee chroot
+            // builds exist to provide, and reuse trades it away. Worth it only
+            // where a rebuild costs hours.
+            Self::PersistentBuilddir => SettingsMeta {
+                key: "persistent_builddir",
+                env_name: Some("PERSISTENT_BUILDDIR"),
+                default: "false",
+            },
             Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
                 env_name: Some("JOB_TIMEOUT"),
@@ -184,11 +197,12 @@ mod tests {
                 Setting::VersionCheckInterval => 3,
                 Setting::AutoUpdateInterval => 4,
                 Setting::BuildOnNewVersion => 5,
-                Setting::DateFormat => 6,
-                Setting::JobTimeout => 7,
-                Setting::BuilderImage => 8,
-                Setting::MakepkgConf => 9,
-                Setting::PacmanConf => 10,
+                Setting::PersistentBuilddir => 6,
+                Setting::DateFormat => 7,
+                Setting::JobTimeout => 8,
+                Setting::BuilderImage => 9,
+                Setting::MakepkgConf => 10,
+                Setting::PacmanConf => 11,
             }
         }
 

@@ -52,6 +52,76 @@ impl Cache {
         Self::ensured(self.root.join("srcdest").join(sanitize(pkgbase)))
     }
 
+    /// Persistent build tree root for one architecture, bound over `/build`
+    /// when a package asks to keep its tree between builds.
+    ///
+    /// Keyed by platform and *not* by package: makepkg already namespaces the
+    /// tree as `$BUILDDIR/$pkgbase/src`, so keying by package here would nest
+    /// the name twice. Platform must be in the key though -- a build tree holds
+    /// compiled objects, unlike `srcdest`, whose downloads are architecture
+    /// independent -- and it also keeps a native and an emulated build of one
+    /// package from sharing a tree on the same worker.
+    ///
+    /// Only ever populated for packages that opted in, because the bind only
+    /// happens for those; see `design/persistent-build-directory.md`.
+    pub fn builddir(&self, platform: &str) -> Option<PathBuf> {
+        Self::ensured(self.root.join("builddir").join(sanitize(platform)))
+    }
+
+    /// Drop persistent build trees until the filesystem has `min_free` bytes
+    /// spare, oldest first, never touching `keep`.
+    ///
+    /// Measured as *free space* rather than as a size budget over the trees.
+    /// Summing them would mean walking directories that reach 130 GB and
+    /// millions of files, which costs minutes per build; `statvfs` is constant
+    /// time. It is also the question actually worth asking -- an operator cares
+    /// that the disk does not fill, which is the failure this whole feature was
+    /// written after, not that some notional allowance was respected.
+    ///
+    /// Whole trees, never partial contents: half a tree is worse than none,
+    /// because makepkg would treat it as resumable.
+    ///
+    /// Best-effort. Failing to reclaim space is worth reporting and carrying
+    /// on; refusing to build over it would turn a full disk into an idle
+    /// worker.
+    pub fn reclaim_builddirs(&self, platform: &str, keep: &str, min_free: u64) {
+        let Some(root) = self.builddir(platform) else {
+            return;
+        };
+        if min_free == 0 {
+            return;
+        }
+
+        // Oldest first. `mtime` on the tree root moves whenever a build writes
+        // into it, which makes it a serviceable "last used".
+        let mut trees: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy() != keep)
+            .filter_map(|e| {
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((modified, e.path()))
+            })
+            .collect();
+        trees.sort_by_key(|(modified, _)| *modified);
+
+        for (_, path) in trees {
+            match free_bytes(&root) {
+                Some(free) if free >= min_free => return,
+                None => return,
+                Some(_) => {}
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::info!(
+                    "reclaimed persistent build tree {} to free space",
+                    path.display()
+                ),
+                Err(e) => tracing::warn!("could not reclaim {}: {e}", path.display()),
+            }
+        }
+    }
+
     /// Shared persistent GnuPG home for validpgpkeys.
     pub fn gnupg_home(&self) -> Option<PathBuf> {
         Self::ensured(self.root.join("gnupg"))
@@ -509,4 +579,16 @@ mod pkgcache_tests {
         assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst").exists());
         assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst.sig").exists());
     }
+}
+
+/// Free bytes on the filesystem holding `path`.
+#[cfg(unix)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; `stat` is a
+    // valid out-parameter.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) };
+    (rc == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
 }

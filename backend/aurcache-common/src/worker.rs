@@ -140,6 +140,11 @@ pub struct JobDescriptor {
     pub arch: String,
     #[serde(default)]
     pub build_flags: Vec<String>,
+    /// Keep the build tree between builds rather than starting from an empty
+    /// one. Resolved server-side from the package's settings, because only the
+    /// server knows them; the worker decides where such a tree lives.
+    #[serde(default)]
+    pub persistent_builddir: bool,
     /// Rendered `makepkg.conf` for the build.
     pub makepkg_conf: String,
     /// Rendered `pacman.conf` for the build.
@@ -219,6 +224,7 @@ mod tests {
     fn job_descriptor_round_trips() {
         let job = JobDescriptor {
             build_id: 42,
+            persistent_builddir: false,
             pkgbase: "hello".into(),
             arch: "x86_64".into(),
             build_flags: vec!["--nocheck".into()],

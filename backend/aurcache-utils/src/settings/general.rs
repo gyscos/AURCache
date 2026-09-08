@@ -204,6 +204,7 @@ impl SettingsTraits for ApplicationSettings {
             builder_image: get_setting(Setting::BuilderImage, pkgid, db).await,
             date_format: get_setting(Setting::DateFormat, pkgid, db).await,
             build_on_new_version: get_setting(Setting::BuildOnNewVersion, pkgid, db).await,
+            persistent_builddir: get_setting(Setting::PersistentBuilddir, pkgid, db).await,
         })
     }
 

@@ -199,6 +199,30 @@ async fn run_job_inner(
     // PKGBUILD chooses to run there.
     let mut binds = cfg.bind_mounts.clone();
     binds.extend(pkg_cache_bind);
+    // A build tree that outlives the chroot, for packages that asked for one.
+    //
+    // Bound over `/build`, which is where `makechrootpkg` points `BUILDDIR`, so
+    // makepkg lays out `$BUILDDIR/$pkgbase/src` inside it exactly as it would
+    // otherwise -- the tree simply survives the copy being deleted. makepkg
+    // only clears `$srcdir` under `--cleanbuild`, which nothing here passes, so
+    // an existing tree is kept and sources are re-extracted over it.
+    //
+    // Only when the package opted in: reuse trades away the clean tree a chroot
+    // build otherwise guarantees. See `design/persistent-build-directory.md`.
+    if job.persistent_builddir {
+        // Before the build, so the reserve is what bounds usage going in
+        // rather than a post-hoc tidy. Never drops this package's own tree.
+        cache.reclaim_builddirs(&job.arch, &job.pkgbase, cfg.core.builddir_min_free);
+        if let Some(dir) = cache.builddir(&job.arch) {
+            binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
+        } else {
+            tracing::warn!(
+                "{} asked for a persistent build directory but one could not be \
+                 prepared; building in the chroot's own /build instead",
+                job.pkgbase
+            );
+        }
+    }
     // The ssh-agent socket, so a PKGBUILD that fetches from a private
     // repository can authenticate *inside* the chroot.
     //

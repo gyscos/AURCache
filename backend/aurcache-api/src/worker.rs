@@ -12,6 +12,7 @@ use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
 use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary};
 use aurcache_common::builder::BuildStates;
+use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, MirrorlistPreference,
     RegisterRequest, RegisterStatus,
@@ -25,6 +26,7 @@ use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
 use aurcache_utils::repo_ingest::{
     LeaseGuard, ingest_pkgs, is_debug_artifact, validate_artifact_names,
 };
+use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::worker_complete;
 use rocket::data::ToByteUnit;
@@ -473,11 +475,19 @@ async fn build_descriptor(
         .map(ToString::to_string)
         .collect();
 
+    // Resolved here rather than on the worker: settings are the server's,
+    // with the package overriding the global default.
+    let persistent_builddir =
+        ApplicationSettings::get::<bool>(Setting::PersistentBuilddir, Some(build.pkg_id), db)
+            .await
+            .value;
+
     Ok(JobDescriptor {
         build_id: build.id,
         pkgbase: pkg.name,
         arch,
         build_flags,
+        persistent_builddir,
         makepkg_conf,
         pacman_conf,
         mirrorlist,

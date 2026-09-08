@@ -3,7 +3,9 @@
 Plan for keeping a package's build tree between builds, so a long compilation
 is not repeated from scratch, and so a failure late in a build is recoverable.
 
-Status: **not implemented**. This document is the design.
+Status: **implemented**, except where noted under "What this does not
+solve". The reclaim policy below differs from what was first designed; the
+reason is recorded there.
 
 ---
 
@@ -141,19 +143,33 @@ for one, which is also what keeps the reclaim policy below small.
 
 ## Reclaiming space
 
-A budget over `<cache>/builddir`, enforced before a build starts, evicting whole
-`<platform>/<pkgbase>` directories least-recently-used until the total fits.
+**A free-space reserve, not a size budget.** Before a build that will use a
+persistent tree, drop trees oldest-first until the filesystem has
+`WORKER_BUILDDIR_MIN_FREE` bytes spare (default 50 GiB).
 
-- Whole directories, never partial contents: half a build tree is worse than
-  none, because makepkg would treat it as resumable.
-- Before the build rather than after, so the budget is what bounds peak usage.
+This was designed as a budget over the total size of `<cache>/builddir`, and
+changed during implementation. Summing the trees means walking directories that
+reach 130 GB and millions of files, which costs minutes on every build;
+`statvfs` is constant time. It is also the better question: an operator cares
+that the disk does not fill -- the failure this whole feature was written after
+-- not that a notional allowance was respected. A budget would also have been
+wrong whenever anything *else* on the same filesystem grew.
+
+- Whole trees, never partial contents: half a tree is worse than none, because
+  makepkg would treat it as resumable.
+- Before the build rather than after, so the reserve bounds usage going in.
 - Never the tree the current build is about to use.
+- Least-recently-used by the tree root's `mtime`, which moves whenever a build
+  writes into it.
+- A worker setting rather than a server one: it is the worker's disk.
+- Best-effort. Failing to reclaim is reported and the build proceeds; refusing
+  to build over it would turn a full disk into an idle worker.
 - The existing startup sweep is unaffected -- it removes `job-*` chroot copies,
   which are a different thing in a different directory.
 
-`unreal-engine` alone is ~130 GB, so the budget has to be an operator setting
-rather than a constant, and the default should be small enough that switching
-the feature on for one package cannot fill a disk by surprise.
+The reserve does not bound a *single* build: `unreal-engine` can grow by ~130 GB
+after the check passes. Nothing short of a quota would, and the reserve at least
+means the disk starts with room and other packages' trees give way first.
 
 ## What this does not solve
 

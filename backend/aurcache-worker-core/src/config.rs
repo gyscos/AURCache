@@ -48,6 +48,8 @@ pub struct CoreConfig {
     /// Per-build timeout in seconds (`0` disables the worker-side timeout;
     /// the build is killed and reported as a timeout when exceeded).
     pub build_timeout: u64,
+    /// Bytes to keep free on the persistent build-tree filesystem.
+    pub builddir_min_free: u64,
     /// Overrides the host used in the `[repo]` section, for deployments where
     /// the address used to reach the worker protocol is not the address that
     /// serves the package repository.
@@ -190,6 +192,13 @@ impl CoreConfig {
             poll_interval: env_opt("WORKER_POLL_INTERVAL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
+            // Free space to keep spare on the build-tree filesystem. A
+            // worker setting, not a server one: it is this machine's disk.
+            // Default 50 GiB, which is generous for ordinary packages and
+            // deliberately not enough to make one opt-in fill a disk unnoticed.
+            builddir_min_free: env_opt("WORKER_BUILDDIR_MIN_FREE")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50 * 1024 * 1024 * 1024),
             build_timeout: env_opt("WORKER_BUILD_TIMEOUT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3 * 60 * 60),
