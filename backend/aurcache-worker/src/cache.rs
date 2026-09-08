@@ -68,8 +68,10 @@ impl Cache {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
     }
 
-    /// Name of the file caching a tree's measured size, written after each
-    /// build so reclaim never has to walk one.
+    /// Name of the file recording a tree's measured size and what its last
+    /// build cost, written after each build so reclaim never has to walk one.
+    /// Two whitespace-separated numbers: bytes, then seconds. A stamp with
+    /// only the first is from before cost was recorded.
     const SIZE_STAMP: &'static str = ".aurcache-size";
 
     /// Record how big a package's persistent tree is, so reclaim can total the
@@ -79,7 +81,7 @@ impl Cache {
     /// already took minutes or hours. Measuring during reclaim instead would
     /// mean walking every candidate on every build, and these trees reach
     /// 130 GB and millions of files.
-    pub fn record_builddir_size(&self, platform: &str, pkgbase: &str) {
+    pub fn record_builddir_size(&self, platform: &str, pkgbase: &str, build_secs: u64) {
         let Some(tree) = self.builddir(platform).map(|r| r.join(sanitize(pkgbase))) else {
             return;
         };
@@ -87,7 +89,8 @@ impl Cache {
             return;
         }
         let size = dir_size(&tree);
-        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), size.to_string()) {
+        let stamp = format!("{size} {build_secs}");
+        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), stamp) {
             tracing::debug!("could not record size of {}: {e}", tree.display());
         }
     }
@@ -108,6 +111,14 @@ impl Cache {
     /// is walked once and stamped. So the usual case totals the cache by
     /// reading a handful of small files.
     ///
+    /// Cheapest to rebuild goes first, **not** least recently used. Plain LRU
+    /// is backwards here: the tree worth keeping is the one that took four
+    /// hours, and that is exactly the package built rarely enough to look
+    /// stale beside a dozen small ones rebuilt daily. Evicting by what a
+    /// rebuild costs keeps the expensive tree until nothing cheaper is left.
+    /// Age only breaks ties, and a tree stamped before cost was recorded
+    /// sorts as free to discard.
+    ///
     /// Whole trees, never partial contents: half a tree is worse than none,
     /// because makepkg would treat it as resumable.
     ///
@@ -120,22 +131,22 @@ impl Cache {
 
         // Oldest first. `mtime` on the tree root moves whenever a build writes
         // into it, which makes it a serviceable "last used".
-        let mut trees: Vec<(std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&root)
+        let mut trees: Vec<(u64, std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&root)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
                 let modified = e.metadata().ok()?.modified().ok()?;
                 let path = e.path();
-                let size = Self::stamped_size(&path);
-                Some((modified, path, size))
+                let (size, cost) = Self::stamped(&path);
+                Some((cost, modified, path, size))
             })
             .collect();
-        trees.sort_by_key(|(modified, _, _)| *modified);
+        trees.sort_by_key(|(cost, modified, _, _)| (*cost, *modified));
 
-        let mut total: u64 = trees.iter().map(|(_, _, size)| size).sum();
+        let mut total: u64 = trees.iter().map(|(_, _, _, size)| size).sum();
 
-        for (_, path, size) in trees {
+        for (_, _, path, size) in trees {
             let over_budget = max_bytes > 0 && total > max_bytes;
             let short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
             if !over_budget && !short_of_free {
@@ -159,17 +170,20 @@ impl Cache {
         }
     }
 
-    /// A tree's recorded size, measuring and stamping it if no stamp is there.
-    fn stamped_size(tree: &Path) -> u64 {
+    /// A tree's recorded size in bytes and what its last build cost in
+    /// seconds, measuring and stamping the size if no stamp is there.
+    fn stamped(tree: &Path) -> (u64, u64) {
         let stamp = tree.join(Self::SIZE_STAMP);
-        if let Ok(text) = std::fs::read_to_string(&stamp)
-            && let Ok(size) = text.trim().parse()
-        {
-            return size;
+        if let Ok(text) = std::fs::read_to_string(&stamp) {
+            let mut fields = text.split_whitespace();
+            if let Some(Ok(size)) = fields.next().map(str::parse) {
+                let cost = fields.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+                return (size, cost);
+            }
         }
         let size = dir_size(tree);
-        let _ = std::fs::write(&stamp, size.to_string());
-        size
+        let _ = std::fs::write(&stamp, format!("{size} 0"));
+        (size, 0)
     }
 
     /// Shared persistent GnuPG home for validpgpkeys.
@@ -554,23 +568,29 @@ mod pkgcache_tests {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
-    /// Oldest trees go first, the budget is what decides how many, and the
-    /// tree the build is about to use is never one of them -- even when it is
-    /// itself what breaches the budget, since evicting it would defeat the
-    /// whole point of having asked for it.
+    /// Cheap trees go first and the expensive one survives, even though it is
+    /// the oldest -- plain LRU would have discarded exactly the tree worth
+    /// keeping. The tree the build is about to use is never evicted either,
+    /// even when it is itself what breaches the cap.
     #[test]
-    fn reclaim_evicts_oldest_but_never_the_one_in_use() {
+    fn reclaim_evicts_cheapest_and_never_the_one_in_use() {
         use std::time::{Duration, SystemTime};
 
         let tmp = tempfile::tempdir().unwrap();
         let c = cache(tmp.path(), 0);
         let root = c.builddir("x86_64").unwrap();
 
-        // Three trees of 100 bytes each, aged oldest -> newest.
-        for (name, age) in [("old", 300), ("mid", 200), ("wanted", 100)] {
+        // "costly" is both the oldest and the most expensive to rebuild: four
+        // hours against thirty seconds. Age alone would evict it first.
+        for (name, age, cost) in [
+            ("costly", 300, 14400),
+            ("cheap-old", 200, 30),
+            ("cheap-new", 100, 30),
+            ("wanted", 50, 5),
+        ] {
             let tree = root.join(name);
             std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+            std::fs::write(tree.join(Cache::SIZE_STAMP), format!("100 {cost}")).unwrap();
             let when = SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&tree)
                 .unwrap()
@@ -578,11 +598,18 @@ mod pkgcache_tests {
                 .unwrap();
         }
 
-        // Room for one tree, so two must go -- but "wanted" is in use.
-        c.reclaim_builddirs("x86_64", "wanted", 150, 0);
+        // Room for two of the four trees.
+        c.reclaim_builddirs("x86_64", "wanted", 250, 0);
 
-        assert!(!root.join("old").exists(), "oldest should go first");
-        assert!(!root.join("mid").exists(), "second oldest should follow");
+        assert!(
+            !root.join("cheap-old").exists(),
+            "cheapest and oldest goes first"
+        );
+        assert!(!root.join("cheap-new").exists(), "then the other cheap one");
+        assert!(
+            root.join("costly").exists(),
+            "the four-hour tree must outlive the thirty-second ones"
+        );
         assert!(
             root.join("wanted").exists(),
             "the tree this build needs must survive"
@@ -599,11 +626,11 @@ mod pkgcache_tests {
         std::fs::create_dir_all(tree.join("deep")).unwrap();
         write(&tree.join("deep").join("blob"), 4096);
 
-        assert_eq!(Cache::stamped_size(&tree), 4096);
+        assert_eq!(Cache::stamped(&tree), (4096, 0));
         // And it is stamped, so the walk happens once.
         assert_eq!(
             std::fs::read_to_string(tree.join(Cache::SIZE_STAMP)).unwrap(),
-            "4096"
+            "4096 0"
         );
     }
 

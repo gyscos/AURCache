@@ -3,10 +3,14 @@ mod deps;
 mod model;
 pub mod paths;
 mod repo;
+mod satisfy;
+mod version;
 
 pub use client::AurClient;
 pub use deps::{deps_from_srcinfo, parse_dep};
-pub use model::{DependencyResolution, Error, Package, PkgDeps};
+pub use model::{Dependency, DependencyResolution, Error, Package, PkgDeps, Resolutions};
+pub use satisfy::{Match, MatchKind, SatisfyIndex};
+pub use version::satisfies_constraint;
 
 /// Convert a search result into the API shape.
 ///

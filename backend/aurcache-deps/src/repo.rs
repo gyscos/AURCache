@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -7,11 +7,15 @@ use alpm_compress::tarball::TarballReader;
 use url::Url;
 
 use crate::client::AurClient;
-use crate::deps::parse_dep;
 use crate::model::Error;
+use crate::satisfy::SatisfyIndex;
 
 const OFFICIAL_REPO_NAMES: &[&str] = &["core", "extra", "multilib"];
 const OFFICIAL_REPO_CACHE_TTL_SECS: u64 = 60 * 60;
+/// Every pacman repository directory holds its database under this name --
+/// AURCache's own (written by `repo_ingest`) and the cached official ones
+/// alike.
+const REPO_DB_FILE: &str = "repo.db.tar.gz";
 
 pub(crate) fn default_repo_root() -> PathBuf {
     std::env::var("AURCACHE_REPO_PATH")
@@ -42,32 +46,73 @@ pub(crate) fn default_official_repo_cache_dir() -> PathBuf {
 }
 
 impl AurClient {
-    pub(crate) fn local_repo_dependency_exists(&self, dep_name: &str) -> Result<bool, Error> {
+    /// Index AURCache's own repository for `wanted`.
+    ///
+    /// Restricted to `platforms`, because the repository is laid out one
+    /// directory per platform (see `repo_ingest`) and a package built only for
+    /// `aarch64` cannot satisfy an `x86_64` build. An empty list means every
+    /// platform present, which is what a backfill with no per-package platform
+    /// list wants.
+    pub(crate) fn local_repo_index(
+        &self,
+        wanted: &HashSet<&str>,
+        platforms: &[String],
+    ) -> Result<SatisfyIndex, Error> {
         if !self.repo_root.exists() {
-            return Ok(false);
+            return Ok(SatisfyIndex::new());
         }
 
-        let archives = fs::read_dir(&self.repo_root)?
-            .map(|entry| entry.map(|entry| entry.path().join("repo.db.tar.gz")))
-            .collect::<Result<Vec<_>, _>>()?;
+        let archives: Vec<PathBuf> = if platforms.is_empty() {
+            fs::read_dir(&self.repo_root)?
+                .map(|entry| entry.map(|entry| entry.path().join(REPO_DB_FILE)))
+                .collect::<Result<_, _>>()?
+        } else {
+            platforms
+                .iter()
+                .map(|platform| self.repo_root.join(platform).join(REPO_DB_FILE))
+                .collect()
+        };
 
-        any_archive_provides(archives, dep_name)
+        index_archives(archives, wanted)
     }
 
-    pub(crate) async fn cached_official_dependency_exists(
+    /// Index `core`, `extra` and `multilib` for `wanted`, refreshing the
+    /// cached databases first if they have aged out.
+    pub(crate) async fn official_repo_index(
         &self,
-        dep_name: &str,
-    ) -> Result<bool, Error> {
+        wanted: &HashSet<&str>,
+    ) -> Result<SatisfyIndex, Error> {
         self.refresh_official_repo_cache_if_needed().await?;
         let archives = OFFICIAL_REPO_NAMES.iter().map(|repo_name| {
             self.official_repo_cache_dir
                 .join(cache_file_name(repo_name))
         });
-        any_archive_provides(archives, dep_name)
+        index_archives(archives, wanted)
     }
 
+    /// Bring the cached official databases up to date, downloading only the
+    /// ones that have aged out.
+    ///
+    /// The mirrorlist is read only if something actually needs downloading. It
+    /// is written by the mirror-ranking scheduler, so on a fresh instance it
+    /// may not exist yet -- and a resolution that could have been answered
+    /// entirely from a warm cache should not fail because of that.
     async fn refresh_official_repo_cache_if_needed(&self) -> Result<(), Error> {
         fs::create_dir_all(&self.official_repo_cache_dir)?;
+
+        let mut stale = Vec::new();
+        for repo_name in OFFICIAL_REPO_NAMES {
+            let archive_path = self
+                .official_repo_cache_dir
+                .join(cache_file_name(repo_name));
+            if cache_is_stale(&archive_path)? {
+                stale.push((*repo_name, archive_path));
+            }
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+
         let mirrors = official_mirror_servers(&self.official_mirrorlist_path)?;
         if mirrors.is_empty() {
             return Err(Error::Rpc(
@@ -75,13 +120,7 @@ impl AurClient {
             ));
         }
 
-        for repo_name in OFFICIAL_REPO_NAMES {
-            let archive_path = self
-                .official_repo_cache_dir
-                .join(cache_file_name(repo_name));
-            if !cache_is_stale(&archive_path)? {
-                continue;
-            }
+        for (repo_name, archive_path) in stale {
             self.download_official_repo_db(&mirrors, repo_name, &archive_path)
                 .await?;
         }
@@ -104,8 +143,17 @@ impl AurClient {
             }
         }
 
-        Err(last_error
-            .unwrap_or_else(|| Error::Rpc("Failed to download official repo db".to_string())))
+        // Deliberately fatal. Answering "not found in the official
+        // repositories" when the truth is "could not ask" sends every ordinary
+        // `core`/`extra` name off to be resolved against the AUR, where a
+        // `provides` search can turn `glibc` into something to build.
+        Err(last_error.unwrap_or_else(|| {
+            Error::Rpc(format!(
+                "could not refresh the {repo_name} database from any mirror; \
+                 dependency resolution cannot tell what the official \
+                 repositories hold"
+            ))
+        }))
     }
 
     /// Downloads `url` to `archive_path`, disabling reqwest's transparent gzip
@@ -194,21 +242,32 @@ fn cache_file_name(repo_name: &str) -> String {
     format!("{repo_name}.db.tar.gz")
 }
 
-/// Returns true if any of the given `repo.db`-style archives provides `dep_name`
-/// (by package name or `%PROVIDES%`). Missing archive paths are skipped.
-fn any_archive_provides(
+/// Index every entry in `archive_paths` that answers to one of `wanted`.
+///
+/// One pass per archive, keeping only the names asked about, so the cost
+/// scales with the dependency list rather than with the repository. Asking
+/// each archive about each name in turn -- which is what this replaced --
+/// re-decompressed `extra.db` (~15k entries, ~9 MB) once per dependency, so a
+/// package with a hundred-odd dependencies paid for hundreds of full passes.
+///
+/// Missing archive paths are skipped: a platform with nothing built yet has no
+/// database, which is an empty index rather than an error.
+fn index_archives(
     archive_paths: impl IntoIterator<Item = PathBuf>,
-    dep_name: &str,
-) -> Result<bool, Error> {
+    wanted: &HashSet<&str>,
+) -> Result<SatisfyIndex, Error> {
+    let mut index = SatisfyIndex::new();
+    if wanted.is_empty() {
+        return Ok(index);
+    }
+
     for archive_path in archive_paths {
         if !archive_path.exists() {
             continue;
         }
-        if repo_archive_provides(&archive_path, dep_name)? {
-            return Ok(true);
-        }
+        index_archive(&archive_path, wanted, &mut index)?;
     }
-    Ok(false)
+    Ok(index)
 }
 
 /// Wrap a repo-database decoding failure, keeping the original as the source.
@@ -216,7 +275,11 @@ fn repo_db_error(e: impl std::error::Error + Send + Sync + 'static) -> Error {
     Error::RepoDb(Box::new(e))
 }
 
-fn repo_archive_provides(archive_path: &Path, dep_name: &str) -> Result<bool, Error> {
+fn index_archive(
+    archive_path: &Path,
+    wanted: &HashSet<&str>,
+    index: &mut SatisfyIndex,
+) -> Result<(), Error> {
     let mut reader = TarballReader::try_from(archive_path).map_err(repo_db_error)?;
     for entry in reader.entries().map_err(repo_db_error)? {
         let mut entry = entry.map_err(repo_db_error)?;
@@ -226,28 +289,36 @@ fn repo_archive_provides(archive_path: &Path, dep_name: &str) -> Result<bool, Er
 
         let content =
             String::from_utf8(entry.content().map_err(repo_db_error)?).map_err(repo_db_error)?;
-        if desc_matches_dependency(&content, dep_name) {
-            return Ok(true);
-        }
+        index_desc(&content, wanted, index);
     }
-    Ok(false)
+    Ok(())
 }
 
-/// Parses `name` and `provides` from a desc file content string without strict validation,
-/// so it works for both signed and unsigned packages (no %PGPSIG% required).
-fn desc_matches_dependency(content: &str, dep_name: &str) -> bool {
+/// Read one `desc` entry into `index`.
+///
+/// Just the pacman-database half: pulling the fields out of the `%SECTION%`
+/// format. What counts as a match, and how one ranks, is
+/// [`SatisfyIndex::insert_package`]'s. A database old enough to omit `%BASE%`
+/// falls back to `%NAME%`.
+fn index_desc(content: &str, wanted: &HashSet<&str>, index: &mut SatisfyIndex) {
     let sections = parse_desc_sections(content);
-    if sections
-        .get("NAME")
-        .and_then(|v| v.first())
-        .map(String::as_str)
-        == Some(dep_name)
-    {
-        return true;
-    }
-    sections
-        .get("PROVIDES")
-        .is_some_and(|provides| provides.iter().any(|p| parse_dep(p).0 == dep_name))
+    let first = |key: &str| {
+        sections
+            .get(key)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    };
+
+    let Some(name) = first("NAME") else {
+        return;
+    };
+    index.insert_package(
+        name,
+        first("BASE").unwrap_or(name),
+        first("VERSION"),
+        sections.get("PROVIDES").into_iter().flatten(),
+        wanted,
+    );
 }
 
 /// Extracts all sections from a pacman desc file into a map of section name → values.
@@ -372,15 +443,16 @@ mod tests {
             cache_dir.path().to_path_buf(),
         );
 
+        let index = client
+            .official_repo_index(&HashSet::from(["git", "not-a-real-package"]))
+            .await
+            .expect(
+                "download_to_path must send Accept-Encoding: identity; \
+                 otherwise the mock rejects the request (404) and the \
+                 lookup fails",
+            );
         assert!(
-            client
-                .cached_official_dependency_exists("git")
-                .await
-                .expect(
-                    "download_to_path must send Accept-Encoding: identity; \
-                     otherwise the mock rejects the request (404) and the \
-                     lookup fails"
-                ),
+            index.best_match("git", |_| true).is_some(),
             "expected 'git' to be found in the cached official repo DBs"
         );
 
@@ -394,11 +466,35 @@ mod tests {
             "cached archive should be gzip-compressed on disk (gzip magic bytes)"
         );
 
-        assert!(
-            !client
-                .cached_official_dependency_exists("not-a-real-package")
-                .await
-                .unwrap()
+        assert!(index.best_match("not-a-real-package", |_| true).is_none());
+    }
+
+    /// A warm cache answers on its own. The mirrorlist is only consulted to
+    /// *refresh* stale databases, so a fresh instance whose mirror ranking has
+    /// not run yet -- or one whose mirrors are briefly unreachable -- still
+    /// resolves against what it already has.
+    #[tokio::test]
+    async fn a_fresh_cache_needs_no_mirrorlist() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        for repo_name in OFFICIAL_REPO_NAMES {
+            fs::write(
+                cache_dir.path().join(cache_file_name(repo_name)),
+                build_repo_db_tar_gz("git", None),
+            )
+            .unwrap();
+        }
+
+        let client = AurClient::with_urls_and_paths(
+            "http://unused.invalid/rpc/v5",
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            PathBuf::from("/nonexistent/mirrorlist"),
+            cache_dir.path().to_path_buf(),
         );
+
+        let index = client
+            .official_repo_index(&HashSet::from(["git"]))
+            .await
+            .expect("a warm cache must not require a mirrorlist");
+        assert!(index.best_match("git", |_| true).is_some());
     }
 }

@@ -501,7 +501,7 @@ async fn run_build(
     // on a build that already took minutes, instead of walking every candidate
     // on every future build.
     if job.persistent_builddir {
-        cache.record_builddir_size(&job.arch, &job.pkgbase);
+        cache.record_builddir_size(&job.arch, &job.pkgbase, started.elapsed().as_secs());
     }
 
     let mut report = if timed_out {

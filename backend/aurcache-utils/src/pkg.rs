@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use alpm_types::{Version, VersionRequirement};
 
-pub use aurcache_deps::parse_dep;
+pub use aurcache_deps::{parse_dep, satisfies_constraint};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraint(pub VersionRequirement);
@@ -33,21 +33,6 @@ pub fn vercmp(a: &str, b: &str) -> Option<Ordering> {
         (Ok(a), Ok(b)) => Some(a.cmp(&b)),
         _ => None,
     }
-}
-
-/// Check if a built version satisfies a version constraint stored as a plain string.
-pub fn satisfies_constraint(built_version: &str, constraint: &str) -> bool {
-    let constraint = constraint.trim();
-    if constraint.is_empty() {
-        return true;
-    }
-    let Ok(built) = Version::from_str(built_version) else {
-        return false;
-    };
-    let Ok(req) = VersionRequirement::from_str(constraint) else {
-        return false;
-    };
-    req.is_satisfied_by(&built)
 }
 
 /// Insert a dependency constraint into a map. For constraints in the same
@@ -88,6 +73,81 @@ pub fn merge_constraint_into(
     };
     constraints.insert(name.to_string(), merged);
     Ok(())
+}
+
+/// The dependencies a package declares.
+///
+/// The single answer to "what does this pkgbase need?". Both the add path and
+/// the resync path used to derive this, from the same `PkgDeps`, with their
+/// own near-copies of the merge loop — and only one of them kept the declared
+/// order.
+pub struct DependencySet {
+    /// Names in declared order, deduplicated.
+    ///
+    /// The order is load-bearing: it decides the order dependencies are
+    /// planned and therefore the order their builds are enqueued. Iterating
+    /// `constraints` instead would vary between processes and make identical
+    /// input produce different build orders.
+    pub names: Vec<String>,
+    /// The merged constraint for each name.
+    pub constraints: HashMap<String, Option<Constraint>>,
+}
+
+impl DependencySet {
+    /// Runtime and build-time dependencies together: AURCache needs both
+    /// present before it can build anything.
+    pub fn of(deps: &aurcache_deps::PkgDeps) -> anyhow::Result<Self> {
+        Self::parse(deps.depends.iter().chain(deps.make_depends.iter()))
+    }
+
+    /// Parse and merge raw `name>=version` strings.
+    pub fn parse<'a>(deps: impl Iterator<Item = &'a String>) -> anyhow::Result<Self> {
+        let mut set = Self {
+            names: Vec::new(),
+            constraints: HashMap::new(),
+        };
+        for dep in deps {
+            let (name, constraint) = parse_dep(dep);
+            // The constraint map's keys are exactly the dependency set, so a
+            // membership check there is the dedupe.
+            if !set.constraints.contains_key(name) {
+                set.names.push(name.to_string());
+            }
+            merge_constraint_into(&mut set.constraints, name, parse_dep_constraint(constraint))?;
+        }
+        Ok(set)
+    }
+
+    /// The constraint recorded for `name`, in the plain string form that both
+    /// resolution and the `dependencies` rows use. Empty means unversioned.
+    #[must_use]
+    pub fn constraint_of(&self, name: &str) -> String {
+        self.constraints
+            .get(name)
+            .cloned()
+            .flatten()
+            .map(|constraint| constraint.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Name/constraint pairs in declared order, ready to borrow
+    /// [`aurcache_deps::Dependency`] values from.
+    #[must_use]
+    pub fn to_pairs(&self) -> Vec<(String, String)> {
+        self.names
+            .iter()
+            .map(|name| (name.clone(), self.constraint_of(name)))
+            .collect()
+    }
+}
+
+/// Borrow a [`DependencySet::to_pairs`] result as resolver input.
+#[must_use]
+pub fn as_dependencies(pairs: &[(String, String)]) -> Vec<aurcache_deps::Dependency<'_>> {
+    pairs
+        .iter()
+        .map(|(name, constraint)| aurcache_deps::Dependency::new(name, constraint))
+        .collect()
 }
 
 pub fn parse_dep_constraint(constraint: &str) -> Option<Constraint> {
@@ -150,24 +210,6 @@ mod tests {
     }
 
     #[test]
-    fn test_satisfies_constraint() {
-        assert!(satisfies_constraint("2.0", ">=1.0"));
-        assert!(satisfies_constraint("2.0", ">=2.0"));
-        assert!(!satisfies_constraint("1.0", ">=2.0"));
-        assert!(satisfies_constraint("1.0", "<=2.0"));
-        assert!(satisfies_constraint("2.0", "<=2.0"));
-        assert!(!satisfies_constraint("3.0", "<=2.0"));
-        assert!(satisfies_constraint("1.5", "=1.5"));
-        assert!(!satisfies_constraint("1.6", "=1.5"));
-        assert!(satisfies_constraint("2.0", ">1.0"));
-        assert!(!satisfies_constraint("1.0", ">1.0"));
-        assert!(satisfies_constraint("1.0", "<2.0"));
-        assert!(!satisfies_constraint("2.0", "<2.0"));
-        assert!(satisfies_constraint("2.0", ""));
-        assert!(satisfies_constraint("2.0", ">=1.0-2"));
-    }
-
-    #[test]
     fn test_merge_constraint_into_last_wins() {
         let mut constraints = HashMap::new();
         merge_constraint_into(&mut constraints, "glibc", parse_dep_constraint(">=2.0")).unwrap();
@@ -206,6 +248,19 @@ pub fn architectures_for_platforms(platforms: &str) -> Vec<alpm_types::SystemArc
             Platform::Aarch64 => SystemArchitecture::Aarch64,
             Platform::Armv7h => SystemArchitecture::Armv7h,
         })
+        .collect()
+}
+
+/// The platform names in a stored `platforms` string.
+///
+/// Dependency resolution scopes AURCache's own repository by these, since it
+/// is stored one directory per platform and another platform's build cannot
+/// satisfy this one's.
+#[must_use]
+pub fn platform_names(platforms: &str) -> Vec<String> {
+    pacman_mirrors::platforms::Platform::parse_many(platforms)
+        .filter_map(Result::ok)
+        .map(|platform| platform.as_str().to_string())
         .collect()
 }
 

@@ -5,12 +5,42 @@ use aurcache_db::{
     packages::{self, SourceData, SourceType},
 };
 use aurcache_deps::AurClient;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use sea_orm::{ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, Set};
 use sea_orm_migration::MigratorTrait;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path, query_param},
 };
+
+/// A client pointed at `rpc_url`, with an official-repo cache that is present,
+/// readable and empty.
+///
+/// "The official repositories hold nothing" has to be said with real files.
+/// Resolution refuses to guess when it cannot read them — a corrupt or absent
+/// cache used to be indistinguishable from "not found there", which sent
+/// ordinary `core` names off to be built from the AUR — so a test that wants
+/// everything to fall through to the AUR has to say so explicitly.
+fn client_with_empty_official_cache(rpc_url: String) -> (tempfile::TempDir, AurClient) {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_dir = tmp.path().join("official-cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    for repo_name in ["core", "extra", "multilib"] {
+        let file = std::fs::File::create(cache_dir.join(format!("{repo_name}.db.tar.gz"))).unwrap();
+        tar::Builder::new(GzEncoder::new(file, Compression::default()))
+            .finish()
+            .unwrap();
+    }
+
+    let client = AurClient::with_urls_and_paths(
+        rpc_url,
+        tmp.path().join("repo"),
+        tmp.path().join("no-such-mirrorlist"),
+        cache_dir,
+    );
+    (tmp, client)
+}
 
 #[tokio::test]
 async fn backfill_creates_dependency_links() {
@@ -88,7 +118,8 @@ async fn backfill_creates_dependency_links() {
     .await
     .unwrap();
 
-    let client = AurClient::with_urls(format!("{}/rpc/v5", mock_server.uri()));
+    let (_cache, client) =
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
     backfill_dependencies(&client, &db).await.unwrap();
 
     let child = packages::Entity::find()
@@ -232,7 +263,8 @@ async fn backfill_multi_dep_package() {
     .await
     .unwrap();
 
-    let client = AurClient::with_urls(format!("{}/rpc/v5", mock_server.uri()));
+    let (_cache, client) =
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
     backfill_dependencies(&client, &db).await.unwrap();
 
     // libaegis inserted as placeholder dep
@@ -387,7 +419,8 @@ async fn backfill_resolves_provider_dependencies() {
     .await
     .unwrap();
 
-    let client = AurClient::with_urls(format!("{}/rpc/v5", mock_server.uri()));
+    let (_cache, client) =
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
     backfill_dependencies(&client, &db).await.unwrap();
 
     let parent = packages::Entity::find()
@@ -532,7 +565,8 @@ async fn backfill_prefers_existing_local_provider() {
     .await
     .unwrap();
 
-    let client = AurClient::with_urls(format!("{}/rpc/v5", mock_server.uri()));
+    let (_cache, client) =
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
     backfill_dependencies(&client, &db).await.unwrap();
 
     let parent = packages::Entity::find()

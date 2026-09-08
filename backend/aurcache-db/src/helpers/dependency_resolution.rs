@@ -1,15 +1,20 @@
-//! Shared dependency-resolution helpers used by both the schema migration and
-//! the `aurcache-utils` package pipeline.
+//! Dependency resolution against the packages AURCache tracks.
 //!
-//! These live in `aurcache-db` because it is the lowest crate that can see both
-//! the `packages` entity and the `AurClient` (via `aurcache-deps`), which lets
-//! the migration and the runtime code share a single implementation.
+//! This lives in `aurcache-db` because it is the lowest crate that can see
+//! both the `packages` entity and the `AurClient` (via `aurcache-deps`), which
+//! lets the schema migration and the runtime package pipeline share one
+//! implementation.
+//!
+//! It is deliberately thin. Deciding *what satisfies a dependency name* is
+//! `aurcache-deps`' job and is the same question whatever the source, so all
+//! this does is describe the tracked packages in the shape
+//! [`SatisfyIndex`] understands and hand it over. Matching, ranking and
+//! ordering all happen once, in
+//! [`AurClient::resolve_dependencies`](aurcache_deps::AurClient::resolve_dependencies).
 
-use aurcache_deps::{AurClient, DependencyResolution, parse_dep};
-use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
-use std::collections::HashMap;
+use aurcache_deps::{AurClient, Dependency, Resolutions, SatisfyIndex};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait};
 
-use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_SUCCESS};
 use crate::packages;
 
 /// A package that can satisfy a dependency: either a row already in the
@@ -38,102 +43,74 @@ impl From<&packages::Model> for PackageCandidate {
     }
 }
 
-/// Resolve dependency names to their source (official / local repo / AUR).
+/// Resolve `deps` to what should happen about each of them.
 ///
-/// Local matches (already-tracked packages, their split packages or provides)
-/// take precedence; anything left over is resolved against the AUR/official
-/// repositories via the [`AurClient`].
-pub async fn resolve_dependency_resolutions<C: ConnectionTrait>(
+/// `planned` are packages an in-flight add intends to insert. An add resolves
+/// its whole dependency graph before writing anything, so a package planned
+/// earlier in the same add is not yet in the database — without offering them
+/// here, a dependency satisfied by a sibling in the same add would be resolved
+/// against the AUR and planned a second time. Callers with nothing in flight
+/// pass `&[]`.
+///
+/// `platforms` scopes AURCache's own repository, which is stored one directory
+/// per platform; empty means every platform present.
+pub async fn resolve_dependencies<C: ConnectionTrait>(
     client: &AurClient,
     db: &C,
-    dep_names: &[String],
-) -> Result<HashMap<String, DependencyResolution>, aurcache_deps::Error> {
-    resolve_dependency_resolutions_with_planned(client, db, dep_names, &[]).await
-}
-
-/// As [`resolve_dependency_resolutions`], but also considering packages an
-/// in-flight add intends to insert.
-///
-/// An add resolves its whole dependency graph before writing anything, so a
-/// package planned earlier in the same add is not yet visible in the database
-/// — without this, a dependency satisfied by a sibling in the same add would
-/// be resolved again against the AUR and planned twice.
-pub async fn resolve_dependency_resolutions_with_planned<C: ConnectionTrait>(
-    client: &AurClient,
-    db: &C,
-    dep_names: &[String],
+    deps: &[Dependency<'_>],
     planned: &[PackageCandidate],
-) -> Result<HashMap<String, DependencyResolution>, aurcache_deps::Error> {
-    let mut resolutions = resolve_local_dependency_resolutions(db, dep_names, planned)
+    platforms: &[String],
+) -> Result<Resolutions, aurcache_deps::Error> {
+    let wanted = deps.iter().map(|dep| dep.name).collect();
+    let tracked = tracked_index(db, planned, &wanted)
         .await
         .map_err(|e| aurcache_deps::Error::Rpc(e.to_string()))?;
-    let unresolved = dep_names
-        .iter()
-        .filter(|dep_name| !resolutions.contains_key(dep_name.as_str()))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if unresolved.is_empty() {
-        return Ok(resolutions);
-    }
 
-    resolutions.extend(client.resolve_dependencies(&unresolved).await?);
-    Ok(resolutions)
+    client.resolve_dependencies(deps, &tracked, platforms).await
 }
 
-async fn resolve_local_dependency_resolutions<C: ConnectionTrait>(
+/// Index every package AURCache tracks, plus anything `planned`, under the
+/// names each one answers to.
+///
+/// Every row counts, whatever state its last build left it in. A row's status
+/// says how its build went, not whether a dependency on it is real, and what
+/// actually gates a dependent is the dependee's latest *successful build*
+/// (`helpers::builds::dependency_satisfied`) — which no filter here could
+/// speak for. Restricting this to `ACTIVE`/`SUCCESS`/`ENQUEUED`, as it once
+/// did, only meant a `Failed` or `WaitingForDeps` package went unrecognised
+/// here and was picked up a stage later by its artifact sitting in the
+/// repository, which reports "already available" and records no dependency
+/// link at all.
+async fn tracked_index<C: ConnectionTrait>(
     db: &C,
-    dep_names: &[String],
     planned: &[PackageCandidate],
-) -> Result<HashMap<String, DependencyResolution>, DbErr> {
-    let mut local_packages: Vec<PackageCandidate> = packages::Entity::find()
-        .filter(packages::Column::Status.is_in([STATUS_ACTIVE, STATUS_SUCCESS, STATUS_ENQUEUED]))
-        .all(db)
-        .await?
+    wanted: &std::collections::HashSet<&str>,
+) -> Result<SatisfyIndex, DbErr> {
+    let rows = packages::Entity::find().all(db).await?;
+    let candidates = rows
         .iter()
         .map(PackageCandidate::from)
-        .collect();
-    local_packages.extend_from_slice(planned);
+        .chain(planned.iter().cloned());
 
-    Ok(dep_names
-        .iter()
-        .filter_map(|dep_name| {
-            find_local_dependee_pkgbase(&local_packages, dep_name)
-                .map(|pkgbase| (dep_name.clone(), DependencyResolution::Local { pkgbase }))
-        })
-        .collect())
-}
-
-fn find_local_dependee_pkgbase(
-    local_packages: &[PackageCandidate],
-    dep_name: &str,
-) -> Option<String> {
-    local_packages
-        .iter()
-        .filter_map(|pkg| local_match_rank(pkg, dep_name).map(|rank| (rank, pkg.name.as_str())))
-        .min_by(|(left_rank, left_name), (right_rank, right_name)| {
-            left_rank.cmp(right_rank).then(left_name.cmp(right_name))
-        })
-        .map(|(_, pkgbase)| pkgbase.to_string())
-}
-
-fn local_match_rank(pkg: &PackageCandidate, dep_name: &str) -> Option<u8> {
-    if pkg.name == dep_name {
-        return Some(0);
-    }
-    if json_list_contains(pkg.split_packages.as_deref(), dep_name, false) {
-        return Some(1);
-    }
-    json_list_contains(pkg.provides.as_deref(), dep_name, true).then_some(2)
-}
-
-fn json_list_contains(json: Option<&str>, dep_name: &str, parse_relation: bool) -> bool {
-    parse_json_list(json).into_iter().any(|value| {
-        if parse_relation {
-            parse_dep(&value).0 == dep_name
-        } else {
-            value == dep_name
+    let mut index = SatisfyIndex::new();
+    for candidate in candidates {
+        // A row's own name is its pkgbase, and it carries the `provides` for
+        // the base as a whole.
+        index.insert_package(
+            &candidate.name,
+            &candidate.name,
+            // Nothing here has a version: these are matched to decide whether
+            // a dependency *edge* should exist, and the edge records the
+            // constraint for the build queue to check against real builds.
+            None,
+            parse_json_list(candidate.provides.as_deref()),
+            wanted,
+        );
+        for split in parse_json_list(candidate.split_packages.as_deref()) {
+            index.insert_package(&split, &candidate.name, None, Vec::<String>::new(), wanted);
         }
-    })
+    }
+    Ok(index)
 }
 
 fn parse_json_list(json: Option<&str>) -> Vec<String> {

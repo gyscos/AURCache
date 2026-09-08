@@ -31,8 +31,7 @@ pub(crate) struct AddContext {
 struct PackageInsertSpec {
     pkgbase: String,
     version: String,
-    dep_names: Vec<String>,
-    dep_constraints: HashMap<String, Option<crate::pkg::Constraint>>,
+    deps: crate::pkg::DependencySet,
     pkgnames: Vec<String>,
     provides: Vec<String>,
     source_type: SourceType,
@@ -92,11 +91,6 @@ impl AddPlan {
     }
 }
 
-struct DependencyRequirements {
-    dep_names: Vec<String>,
-    dep_constraints: HashMap<String, Option<crate::pkg::Constraint>>,
-}
-
 fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
     flags
         .into_iter()
@@ -134,27 +128,6 @@ pub(crate) fn build_add_context(
         platforms_str,
         build_flags_str,
     }
-}
-
-fn collect_dependency_requirements<'a>(
-    deps: impl Iterator<Item = &'a String>,
-) -> anyhow::Result<DependencyRequirements> {
-    let mut dep_constraints: HashMap<String, Option<crate::pkg::Constraint>> = HashMap::new();
-    let mut dep_names: Vec<String> = Vec::new();
-    for dep in deps {
-        let (name, constraint) = crate::pkg::parse_dep(dep);
-        let constraint = crate::pkg::parse_dep_constraint(constraint);
-        // The constraint map's keys are exactly the dependency set, so a
-        // membership check there is the dedupe.
-        if !dep_constraints.contains_key(name) {
-            dep_names.push(name.to_string());
-        }
-        crate::pkg::merge_constraint_into(&mut dep_constraints, name, constraint)?;
-    }
-    Ok(DependencyRequirements {
-        dep_names,
-        dep_constraints,
-    })
 }
 
 pub(crate) async fn package_exists(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<bool> {
@@ -223,14 +196,11 @@ async fn resolve_srcinfo_to_spec(
     let sourceinfo = store.sourceinfo(source_data, patch.as_deref()).await?;
     let deps = aurcache_deps::deps_from_srcinfo(&sourceinfo, architectures);
     let pkgbase = sourceinfo.base.name.to_string();
-    let requirements =
-        collect_dependency_requirements(deps.depends.iter().chain(deps.make_depends.iter()))?;
 
     Ok(PackageInsertSpec {
         pkgbase,
         version: sourceinfo.base.version.to_string(),
-        dep_names: requirements.dep_names,
-        dep_constraints: requirements.dep_constraints,
+        deps: crate::pkg::DependencySet::of(&deps)?,
         pkgnames: deps.pkgnames,
         provides: deps.provides,
         patch,
@@ -475,18 +445,6 @@ pub(crate) async fn ensure_aur_package_exists_recursive(
     Ok(())
 }
 
-pub(crate) async fn resolve_dependency_resolutions(
-    client: &aurcache_deps::AurClient,
-    db: &DatabaseConnection,
-    dep_names: &[String],
-) -> anyhow::Result<HashMap<String, DependencyResolution>> {
-    aurcache_db::helpers::dependency_resolution::resolve_dependency_resolutions(
-        client, db, dep_names,
-    )
-    .await
-    .map_err(|e| anyhow!("Failed to resolve dependencies: {e}"))
-}
-
 /// Plan a package and, recursively, every AUR dependency it needs.
 ///
 /// Writes nothing: results accumulate into `plan` so the whole graph can be
@@ -500,16 +458,18 @@ async fn plan_package_with_deps(
     visited: &mut HashSet<String>,
     plan: &mut AddPlan,
 ) -> anyhow::Result<()> {
-    let resolved_deps = if package_spec.dep_names.is_empty() {
-        HashMap::new()
+    let pairs = package_spec.deps.to_pairs();
+    let resolved_deps = if pairs.is_empty() {
+        aurcache_deps::Resolutions::default()
     } else {
         // Packages planned earlier in this add are not in the database yet, so
-        // they are offered as candidates alongside the rows that are.
-        aurcache_db::helpers::dependency_resolution::resolve_dependency_resolutions_with_planned(
+        // they are offered alongside the rows that are.
+        aurcache_db::helpers::dependency_resolution::resolve_dependencies(
             client,
             db,
-            &package_spec.dep_names,
+            &crate::pkg::as_dependencies(&pairs),
             &plan.candidates(),
+            &crate::pkg::platform_names(&context.platforms_str),
         )
         .await
         .map_err(|e| {
@@ -520,59 +480,56 @@ async fn plan_package_with_deps(
         })?
     };
 
+    if !resolved_deps.unresolved.is_empty() {
+        // Not fatal: `makepkg` may still find it, and a PKGBUILD can name a
+        // dependency AURCache has no way to see. Worth saying out loud, though
+        // — this used to be where a typo, or a package dropped from the AUR,
+        // disappeared without trace and resurfaced as an opaque build failure.
+        tracing::warn!(
+            "{}: nothing provides {}",
+            package_spec.pkgbase,
+            resolved_deps.unresolved.join(", ")
+        );
+    }
+
     // Iterate the declared dependency order rather than the resolution map's:
     // a HashMap's order varies per process, which would make the plan order —
     // and therefore the order builds are enqueued in — differ between runs for
     // identical input.
-    let mut dep_pkgbases_seen: HashSet<String> = HashSet::new();
-    for dep_name in &package_spec.dep_names {
-        let Some(resolution) = resolved_deps.get(dep_name) else {
-            continue;
-        };
-        let dep_base = match resolution {
-            DependencyResolution::Official => continue,
-            DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
-                pkgbase
-            }
-        };
-        if dep_base == &package_spec.pkgbase {
-            continue;
-        }
-        if dep_pkgbases_seen.insert(dep_base.clone())
-            && matches!(resolution, DependencyResolution::Aur { .. })
-        {
-            plan_dependency_recursive(client, store, db, dep_base, context, visited, plan).await?;
-        }
-    }
-
-    let split_packages = split_packages_json(&package_spec.pkgbase, &package_spec.pkgnames)?;
-    let provides = provides_json(&package_spec.provides)?;
-
     let mut dep_constraints_by_pkgbase: HashMap<String, Option<crate::pkg::Constraint>> =
         HashMap::new();
-    for dep_name in &package_spec.dep_names {
+    let mut planned_pkgbases: HashSet<String> = HashSet::new();
+    for (dep_name, _) in &pairs {
         let Some(resolution) = resolved_deps.get(dep_name) else {
             continue;
         };
-        let dep_pkgbase = match resolution {
-            DependencyResolution::Official => continue,
-            DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
-                pkgbase
-            }
+        let (dep_pkgbase, needs_building) = match resolution {
+            // Already installable as a binary: nothing to build, and no row to
+            // link to.
+            DependencyResolution::Available => continue,
+            DependencyResolution::Local { pkgbase } => (pkgbase, false),
+            DependencyResolution::Aur { pkgbase } => (pkgbase, true),
         };
         if dep_pkgbase == &package_spec.pkgbase {
             continue;
         }
-        let constraint = package_spec
-            .dep_constraints
-            .get(dep_name)
-            .cloned()
-            .flatten();
 
+        // Several dependency names can share a pkgbase (a split package's
+        // outputs, or a name plus something it provides), so plan it once —
+        // but merge every one of their constraints onto the single edge.
+        if planned_pkgbases.insert(dep_pkgbase.clone()) && needs_building {
+            plan_dependency_recursive(client, store, db, dep_pkgbase, context, visited, plan)
+                .await?;
+        }
         crate::pkg::merge_constraint_into(
             &mut dep_constraints_by_pkgbase,
             dep_pkgbase,
-            constraint,
+            package_spec
+                .deps
+                .constraints
+                .get(dep_name)
+                .cloned()
+                .flatten(),
         )?;
     }
 
@@ -583,6 +540,9 @@ async fn plan_package_with_deps(
             version_constraint: constraint.map(|c| c.to_string()).unwrap_or_default(),
         });
     }
+
+    let split_packages = split_packages_json(&package_spec.pkgbase, &package_spec.pkgnames)?;
+    let provides = provides_json(&package_spec.provides)?;
 
     // Pushed after its dependencies, keeping the plan dependency-first.
     plan.packages.push(PlannedPackage {

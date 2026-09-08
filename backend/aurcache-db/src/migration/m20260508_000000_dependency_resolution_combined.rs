@@ -2,11 +2,11 @@ use crate::builds;
 use crate::dependencies;
 use crate::files;
 use crate::helpers::dbtype::database_type;
-use crate::helpers::dependency_resolution::resolve_dependency_resolutions;
+use crate::helpers::dependency_resolution::resolve_dependencies;
 use crate::packages;
 use crate::settings;
 use async_recursion::async_recursion;
-use aurcache_deps::{AurClient, DependencyResolution};
+use aurcache_deps::{AurClient, Dependency, DependencyResolution};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -678,19 +678,40 @@ async fn ensure_deps(
         return Ok(());
     }
 
-    // 5. Batch-resolve which dep names are AUR packages
-    let resolved_deps = match resolve_dependency_resolutions(client, db, &dep_names).await {
+    // 5. Batch-resolve which dep names are AUR packages.
+    //
+    // No platform scoping: a backfill has no per-package platform list to
+    // work from, so AURCache's whole repository counts, which is what this
+    // did before platforms were considered at all.
+    let deps_to_resolve: Vec<Dependency<'_>> = dep_names
+        .iter()
+        .map(|name| {
+            Dependency::new(
+                name.as_str(),
+                dep_constraints
+                    .get(name.as_str())
+                    .map_or("", String::as_str),
+            )
+        })
+        .collect();
+    let resolved_deps = match resolve_dependencies(client, db, &deps_to_resolve, &[], &[]).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("dependency resolution failed for {pkgbase}: {e}");
             return Ok(());
         }
     };
+    if !resolved_deps.unresolved.is_empty() {
+        tracing::warn!(
+            "{pkgbase}: no package provides {}",
+            resolved_deps.unresolved.join(", ")
+        );
+    }
 
     let mut base_to_constraint: HashMap<String, String> = HashMap::new();
-    for (name, resolution) in &resolved_deps {
+    for (name, resolution) in &resolved_deps.found {
         let base = match resolution {
-            DependencyResolution::Official => continue,
+            DependencyResolution::Available => continue,
             DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
                 pkgbase
             }
@@ -709,10 +730,11 @@ async fn ensure_deps(
     let local_pkgbases: Vec<&str> = {
         let mut seen = HashSet::new();
         resolved_deps
+            .found
             .values()
             .filter_map(|resolution| match resolution {
                 DependencyResolution::Local { pkgbase } => Some(pkgbase.as_str()),
-                DependencyResolution::Aur { .. } | DependencyResolution::Official => None,
+                DependencyResolution::Aur { .. } | DependencyResolution::Available => None,
             })
             .filter(|resolved_pkgbase| *resolved_pkgbase != pkgbase)
             .filter(|pkgbase| seen.insert((*pkgbase).to_string()))
@@ -723,10 +745,11 @@ async fn ensure_deps(
     let aur_pkgbases: Vec<&str> = {
         let mut seen = HashSet::new();
         resolved_deps
+            .found
             .values()
             .filter_map(|resolution| match resolution {
                 DependencyResolution::Aur { pkgbase } => Some(pkgbase.as_str()),
-                DependencyResolution::Official | DependencyResolution::Local { .. } => None,
+                DependencyResolution::Available | DependencyResolution::Local { .. } => None,
             })
             .filter(|resolved_pkgbase| *resolved_pkgbase != pkgbase)
             .filter(|b| seen.insert((*b).to_string()))

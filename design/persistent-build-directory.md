@@ -123,9 +123,16 @@ emulated architecture.
 
 `pkg/` persists too. It is staging output, recreated per run, and harmless.
 
-## Opt-in, per package
+## On by default
 
-Off by default, though for a narrower reason than first assumed.
+On by default, and the reason it can be is that the risk assumed at first
+does not exist.
+
+This is what an AUR helper on a workstation already does: `paru` and `yay` keep
+their build trees between builds, across a very large number of users, and
+trouble is rare. The chroot is still built from a fresh snapshot every time --
+only the tree survives -- so the guarantee that actually matters, a clean
+toolchain, is untouched.
 
 Re-applied patches were the worry, and they are **not** a problem. Tested with
 `libpng12`, whose `prepare()` does `patch -Np1` against a tarball source: three
@@ -144,19 +151,19 @@ killed build left something half-written. Such a failure produces a package
 that is quietly incorrect rather than one that fails loudly, which is the
 expensive kind.
 
-That risk, plus disk, is the case for off by default -- not build hygiene in
-general. The chroot itself is still fresh every build; only the tree persists.
+That residual risk is real but rare, and it is the same mechanism as the
+benefit -- so it is a reason to keep an escape hatch, not a reason to default to
+throwing four hours of work away. The setting stays so a package that does turn
+out to mind can be excluded without deleting directories on a worker by hand.
 
 Resolved through `ApplicationSettings` like every other package setting, with
 the established precedence `Package -> Env -> Global -> Default`. The packages
 that want it are the ones where a rebuild costs hours, and there are few.
 
-Opt-in is what decides whether the bind happens at all. When the setting is off
-the build gets the ordinary `/build` inside the ephemeral chroot copy and
-nothing survives it; when it is on, the host directory is bound over `/build`
-and makepkg's own `<pkgbase>/` namespacing keeps packages apart inside it. So
-`<cache>/builddir/<platform>` only ever contains trees for packages that asked
-for one, which is also what keeps the reclaim policy below small.
+The setting decides whether the bind happens at all. When it is off the build
+gets the ordinary `/build` inside the ephemeral chroot copy and nothing survives
+it; when on, the host directory is bound over `/build` and makepkg's own
+`<pkgbase>/` namespacing keeps packages apart inside it.
 
 ## Reclaiming space
 
@@ -186,8 +193,13 @@ nothing noticeable.
 - Before the build rather than after, so the limits bound usage going in.
 - Never the tree the current build is about to use -- even when that tree is
   itself what breaches the cap, since evicting it defeats the point of asking.
-- Least-recently-used by the tree root's `mtime`, which moves whenever a build
-  writes into it.
+- **Cheapest to rebuild first, not least recently used.** Plain LRU is
+  backwards here. The tree worth keeping is the one that took four hours, and
+  that is exactly the package built rarely enough to look stale beside a dozen
+  small ones rebuilt daily -- so LRU would reliably discard the only tree that
+  justified the feature. Each build stamps what it cost alongside the size, and
+  eviction takes the cheapest first; `mtime` only breaks ties. A tree stamped
+  before cost was recorded sorts as free to discard.
 - Worker settings rather than server ones: it is the worker's disk.
 - Best-effort. Failing to reclaim is reported and the build proceeds; refusing
   to build over it would turn a full disk into an idle worker.

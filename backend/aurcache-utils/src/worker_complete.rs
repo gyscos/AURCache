@@ -277,26 +277,18 @@ async fn dependencies_ready<C: ConnectionTrait>(
     platform: Platform,
 ) -> Result<bool, DbErr> {
     for dep in all_deps {
-        if !dependency_satisfied(db, dep.dependee_id, platform, &dep.version_constraint).await? {
+        if !aurcache_db::helpers::builds::dependency_satisfied(
+            db,
+            dep.dependee_id,
+            platform.as_str(),
+            &dep.version_constraint,
+        )
+        .await?
+        {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-async fn dependency_satisfied<C: ConnectionTrait>(
-    db: &C,
-    dependee_id: i32,
-    platform: Platform,
-    constraint: &str,
-) -> Result<bool, DbErr> {
-    let Some(version) =
-        aurcache_db::helpers::builds::latest_successful_version(db, dependee_id, platform.as_str())
-            .await?
-    else {
-        return Ok(false);
-    };
-    Ok(crate::pkg::satisfies_constraint(&version, constraint))
 }
 
 async fn promote_dependent<C: ConnectionTrait>(

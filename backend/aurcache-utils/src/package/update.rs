@@ -1,6 +1,5 @@
 use crate::package::add::{
-    ensure_aur_package_exists_recursive, provides_json, resolve_dependency_resolutions,
-    split_packages_json,
+    ensure_aur_package_exists_recursive, provides_json, split_packages_json,
 };
 use crate::snapshot::SnapshotStore;
 use alpm_types::Version;
@@ -297,8 +296,7 @@ async fn sync_dependency_graph(
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<DependencyGraph> {
-    let dep_constraints_by_pkgbase =
-        resolve_dependency_constraints(services, pkg_model, deps).await?;
+    let dep_constraints_by_pkgbase = resolve_dependency_edges(services, pkg_model, deps).await?;
 
     ensure_missing_dependency_packages(services, pkg_model, &dep_constraints_by_pkgbase).await?;
 
@@ -345,20 +343,63 @@ async fn sync_dependency_graph(
     Ok(DependencyGraph { deps: deps_map })
 }
 
-/// Collect and resolve dependency constraints to pkgbase names.
-async fn resolve_dependency_constraints(
+/// The dependency edges `pkg_model` should have, keyed by dependee pkgbase.
+///
+/// The same reduction the add path performs in `plan_package_with_deps`:
+/// resolve every declared dependency, drop the ones already available as
+/// binaries, and merge the constraints of every name that landed on the same
+/// pkgbase onto one edge. The difference is only what happens afterwards —
+/// an add plans rows, a resync reconciles the ones already there.
+async fn resolve_dependency_edges(
     services: &Services<'_>,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
-    let dep_constraints = collect_dependency_constraints(deps)?;
-    resolve_dependency_constraints_by_pkgbase(
+    let declared = crate::pkg::DependencySet::of(deps)?;
+    if declared.names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let pairs = declared.to_pairs();
+    let resolved_deps = aurcache_db::helpers::dependency_resolution::resolve_dependencies(
         services.client,
         services.db,
-        &pkg_model.name,
-        &dep_constraints,
+        &crate::pkg::as_dependencies(&pairs),
+        &[],
+        &crate::pkg::platform_names(&pkg_model.platforms),
     )
-    .await
+    .await?;
+
+    if !resolved_deps.unresolved.is_empty() {
+        tracing::warn!(
+            "{}: nothing provides {}",
+            pkg_model.name,
+            resolved_deps.unresolved.join(", ")
+        );
+    }
+
+    let mut by_pkgbase: HashMap<String, Option<crate::pkg::Constraint>> = HashMap::new();
+    for (dep_name, _) in &pairs {
+        let Some(resolution) = resolved_deps.get(dep_name) else {
+            continue;
+        };
+        let dep_pkgbase = match resolution {
+            DependencyResolution::Available => continue,
+            DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
+                pkgbase
+            }
+        };
+        if dep_pkgbase == &pkg_model.name {
+            continue;
+        }
+        crate::pkg::merge_constraint_into(
+            &mut by_pkgbase,
+            dep_pkgbase,
+            declared.constraints.get(dep_name).cloned().flatten(),
+        )?;
+    }
+
+    Ok(by_pkgbase)
 }
 
 /// Ensure all resolved dependency packages exist in the database,
@@ -401,58 +442,6 @@ async fn fetch_dep_packages_map(
         .into_iter()
         .map(|pkg| (pkg.name.clone(), pkg))
         .collect())
-}
-
-/// Merge depends and make_depends into a single map of package name → optional version constraint.
-fn collect_dependency_constraints(
-    deps: &PkgDeps,
-) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
-    let mut dep_constraints: HashMap<String, Option<crate::pkg::Constraint>> = HashMap::new();
-    for dep in deps.depends.iter().chain(deps.make_depends.iter()) {
-        let (name, constraint) = aurcache_deps::parse_dep(dep);
-        let constraint = crate::pkg::parse_dep_constraint(constraint);
-        crate::pkg::merge_constraint_into(&mut dep_constraints, name, constraint)?;
-    }
-
-    Ok(dep_constraints)
-}
-
-/// Resolve dependency names to their pkgbase and merge constraints keyed by pkgbase.
-async fn resolve_dependency_constraints_by_pkgbase(
-    client: &AurClient,
-    db: &DatabaseConnection,
-    pkgbase: &str,
-    dep_constraints: &HashMap<String, Option<crate::pkg::Constraint>>,
-) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
-    if dep_constraints.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let dep_names = dep_constraints.keys().cloned().collect::<Vec<_>>();
-    let resolved_deps = resolve_dependency_resolutions(client, db, &dep_names).await?;
-
-    let mut dep_constraints_by_pkgbase: HashMap<String, Option<crate::pkg::Constraint>> =
-        HashMap::new();
-    for (dep_name, resolution) in resolved_deps {
-        let dep_pkgbase = match resolution {
-            DependencyResolution::Official => continue,
-            DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
-                pkgbase
-            }
-        };
-        if dep_pkgbase == pkgbase {
-            continue;
-        }
-        let constraint = dep_constraints.get(dep_name.as_str()).cloned().flatten();
-
-        crate::pkg::merge_constraint_into(
-            &mut dep_constraints_by_pkgbase,
-            &dep_pkgbase,
-            constraint,
-        )?;
-    }
-
-    Ok(dep_constraints_by_pkgbase)
 }
 
 /// Insert, update, or remove dependency rows to match the current constraint set.

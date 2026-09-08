@@ -9,7 +9,7 @@ use futures::future::try_join_all;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    PaginatorTrait, QueryFilter, TransactionTrait,
 };
 
 use tokio::sync::broadcast::Sender;
@@ -218,21 +218,14 @@ async fn dependencies_satisfied(
         .await?;
 
     for dep in deps {
-        let Some((version,)) = Builds::find()
-            .select_only()
-            .column(builds::Column::Version)
-            .filter(builds::Column::PkgId.eq(dep.dependee_id))
-            .filter(builds::Column::Platform.eq(platform.as_str()))
-            .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
-            .order_by_desc(builds::Column::EndTime)
-            .into_tuple::<(String,)>()
-            .one(db)
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        if !crate::pkg::satisfies_constraint(&version, &dep.version_constraint) {
+        if !aurcache_db::helpers::builds::dependency_satisfied(
+            db,
+            dep.dependee_id,
+            platform.as_str(),
+            &dep.version_constraint,
+        )
+        .await?
+        {
             return Ok(false);
         }
     }

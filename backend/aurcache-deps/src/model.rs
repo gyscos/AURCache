@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -38,14 +40,70 @@ pub struct PkgDeps {
 }
 
 /// Where a resolved dependency was found.
+///
+/// The three variants are three different *outcomes*, not three places:
+/// nothing to do, link to something we track, or go build it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencyResolution {
-    /// Satisfied by an official Arch Linux repository or the local repo.
-    Official,
-    /// Satisfied by a package already present in the local AURCache repo.
+    /// Already installable as a binary, from an official Arch repository or
+    /// from AURCache's own -- so there is nothing to build and nothing to
+    /// record.
+    ///
+    /// Deliberately not called `Official`: a package AURCache built itself
+    /// lands here too, whenever the database had no row to offer for it. The
+    /// old name said "official repository" while the code also meant "our own
+    /// repository", and the two disagreed about whether a dependency link
+    /// should exist.
+    Available,
+    /// Satisfied by a package AURCache tracks. The only variant that can
+    /// become a dependency edge, which is why it is the only one resolved
+    /// against the database.
     Local { pkgbase: String },
-    /// Must be built from the AUR.
+    /// Not available anywhere yet; must be built from the AUR.
     Aur { pkgbase: String },
+}
+
+/// One dependency to resolve: the name, and the version it was declared with.
+#[derive(Debug, Clone, Copy)]
+pub struct Dependency<'a> {
+    pub name: &'a str,
+    /// A pacman constraint such as `">=2.0"`, or empty for an unversioned
+    /// dependency.
+    pub constraint: &'a str,
+}
+
+impl<'a> Dependency<'a> {
+    #[must_use]
+    pub fn new(name: &'a str, constraint: &'a str) -> Self {
+        Self { name, constraint }
+    }
+
+    /// An unversioned dependency, for callers that have only a name.
+    #[must_use]
+    pub fn unversioned(name: &'a str) -> Self {
+        Self::new(name, "")
+    }
+}
+
+/// The outcome of resolving a set of dependencies.
+#[derive(Debug, Default, Clone)]
+pub struct Resolutions {
+    /// Where each dependency was found.
+    pub found: HashMap<String, DependencyResolution>,
+    /// Names that matched nothing: no repository holds them, no AUR package
+    /// carries the name, and nothing declares them in `provides`.
+    ///
+    /// Reported rather than silently dropped. A typo, or a dependency removed
+    /// from the AUR, used to vanish during resolution and resurface much later
+    /// as an opaque `makepkg` failure with nothing pointing back to here.
+    pub unresolved: Vec<String>,
+}
+
+impl Resolutions {
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&DependencyResolution> {
+        self.found.get(name)
+    }
 }
 
 /// Package metadata returned by the AUR RPC v5 `/info` or `/search` endpoints.

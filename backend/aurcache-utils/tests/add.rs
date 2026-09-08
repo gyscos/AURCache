@@ -38,7 +38,7 @@ struct TestEnv {
     client: AurClient,
     _repo_dir: TempDir,
     _official_dir: TempDir,
-    _repo_root: std::path::PathBuf,
+    repo_root: std::path::PathBuf,
     official_cache_dir: std::path::PathBuf,
     aur_root: TempDir,
     checkout_dir: TempDir,
@@ -87,7 +87,7 @@ async fn setup_env() -> TestEnv {
         client,
         _repo_dir: repo_dir,
         _official_dir: official_dir,
-        _repo_root: repo_root,
+        repo_root,
         official_cache_dir,
         aur_root,
         checkout_dir,
@@ -156,15 +156,45 @@ fn seed_official_repo_cache_empty(cache_dir: &Path) {
     }
 }
 
+/// Serve `repo_name`'s database holding `packages`, as `(name, version,
+/// provides)`.
+///
+/// The version is spelled out per package because resolution checks it: a
+/// repository entry only answers a dependency whose constraint it actually
+/// satisfies, so a fixture that wants to *be* the answer has to be new enough
+/// to qualify.
+/// Write AURCache's own `repo.db.tar.gz` for x86_64, as if these packages had
+/// been built.
+fn write_local_repo_db(env: &TestEnv, packages: &[(&str, &str, Vec<&str>)]) {
+    let platform_repo = env.repo_root.join("x86_64");
+    fs::create_dir_all(&platform_repo).expect("failed to create platform repo dir");
+    fs::write(
+        platform_repo.join("repo.db.tar.gz"),
+        repo_archive_bytes(
+            &packages
+                .iter()
+                .map(|(name, version, provides)| {
+                    (
+                        (*name).to_string(),
+                        (*version).to_string(),
+                        provides.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
+    )
+    .expect("failed to write local repo db");
+}
+
 async fn mock_official_repo_db(
     server: &MockServer,
     repo_name: &str,
-    packages: Vec<(&str, Vec<&str>)>,
+    packages: Vec<(&str, &str, Vec<&str>)>,
 ) {
     let bytes = repo_archive_bytes(
         &packages
             .into_iter()
-            .map(|(name, provides)| (name.to_string(), provides))
+            .map(|(name, version, provides)| (name.to_string(), version.to_string(), provides))
             .collect::<Vec<_>>(),
     );
     Mock::given(method("GET"))
@@ -174,17 +204,17 @@ async fn mock_official_repo_db(
         .await;
 }
 
-fn repo_archive_bytes(packages: &[(String, Vec<&str>)]) -> Vec<u8> {
+fn repo_archive_bytes(packages: &[(String, String, Vec<&str>)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     let encoder = GzEncoder::new(&mut bytes, Compression::default());
     let mut builder = Builder::new(encoder);
-    for (name, provides) in packages {
-        let dir_name = format!("{name}-1.0.0-1");
+    for (name, version, provides) in packages {
+        let dir_name = format!("{name}-{version}");
         append_tar_dir(&mut builder, &dir_name);
         append_tar_file(
             &mut builder,
             &format!("{dir_name}/desc"),
-            &repo_desc(name, provides),
+            &repo_desc(name, version, provides),
         );
     }
     builder.finish().expect("failed to finalize repo archive");
@@ -215,12 +245,12 @@ fn append_tar_file<W: std::io::Write>(builder: &mut Builder<W>, path: &str, cont
         .expect("failed to append file");
 }
 
-fn repo_desc(name: &str, provides: &[&str]) -> String {
+fn repo_desc(name: &str, version: &str, provides: &[&str]) -> String {
     let mut desc = format!(
-        "%FILENAME%\n{name}-1.0.0-1-x86_64.pkg.tar.zst\n\n\
+        "%FILENAME%\n{name}-{version}-x86_64.pkg.tar.zst\n\n\
          %NAME%\n{name}\n\n\
          %BASE%\n{name}\n\n\
-         %VERSION%\n1.0.0-1\n\n\
+         %VERSION%\n{version}\n\n\
          %DESC%\n{name}\n\n\
          %CSIZE%\n1\n\n\
          %ISIZE%\n1\n\n\
@@ -642,7 +672,7 @@ async fn scenario_f_system_deps_only() {
         .mount(&env.server)
         .await;
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
-    mock_official_repo_db(&env.server, "core", vec![("glibc", vec![])]).await;
+    mock_official_repo_db(&env.server, "core", vec![("glibc", "2.42-1", vec![])]).await;
 
     let result = add_pkg_via_rpc(&env, "my-pkg").await;
     assert!(
@@ -838,7 +868,12 @@ async fn scenario_i_official_provider_prevents_aur_dependency_addition() {
         .mount(&env.server)
         .await;
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
-    mock_official_repo_db(&env.server, "core", vec![("libglvnd", vec!["virtual-dep"])]).await;
+    mock_official_repo_db(
+        &env.server,
+        "core",
+        vec![("libglvnd", "1.7.0-1", vec!["virtual-dep"])],
+    )
+    .await;
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -954,6 +989,82 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
         aur_provider_count, 0,
         "local providers should win over AUR providers"
     );
+}
+
+/// The states a package can be left in do not decide whether a dependency on
+/// it is real.
+///
+/// A `Failed` or `WaitingForDeps` row used to be invisible to resolution,
+/// which resolved the name a stage later against AURCache's own repository --
+/// where a prior successful build's artifact still sits -- and reported it as
+/// already available. The dependent then got no dependency link at all, so
+/// nothing would ever rebuild it when the dependency was fixed.
+#[tokio::test]
+async fn scenario_l_settled_states_still_link_as_dependencies() {
+    for status in [BuildStates::FAILED_BUILD, BuildStates::WAITING_FOR_DEPS] {
+        let env = setup_env().await;
+        packages::ActiveModel {
+            name: Set("local-dep".to_string()),
+            status: Set(status),
+            out_of_date: Set(0),
+            upstream_version: Set(Some("1.0.0".to_string())),
+            latest_build: Set(None),
+            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(packages::SourceType::Aur),
+            source_data: Set(SourceData::Aur {
+                name: "local-dep".into(),
+            }),
+            directly_requested: Set(false),
+            split_packages: Set(None),
+            provides: Set(None),
+            ..Default::default()
+        }
+        .save(&env.db)
+        .await
+        .unwrap();
+
+        // Its artifact is still in the repository, which is what used to
+        // answer for it.
+        fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
+        mock_official_repo_db(&env.server, "core", vec![]).await;
+        write_local_repo_db(&env, &[("local-dep", "1.0.0-1", vec![])]);
+
+        mock_rpc_info(
+            &env.server,
+            "parent-pkg",
+            rpc_deps_json("parent-pkg", "parent-pkg", &["local-dep"], &[], "1.0.0"),
+        )
+        .await;
+        create_aur_git_repo(env.aur_root.path(), "parent-pkg", "1.0.0", &["local-dep"]);
+
+        let result = add_pkg_via_rpc(&env, "parent-pkg").await;
+        assert!(result.is_ok(), "{status}: {result:?}");
+
+        let parent = Packages::find()
+            .filter(packages::Column::Name.eq("parent-pkg"))
+            .one(&env.db)
+            .await
+            .unwrap()
+            .expect("parent package should exist");
+        let local_dep = Packages::find()
+            .filter(packages::Column::Name.eq("local-dep"))
+            .one(&env.db)
+            .await
+            .unwrap()
+            .expect("local dep should exist");
+
+        let link = Dependencies::find()
+            .filter(dependencies::Column::DependentId.eq(parent.id))
+            .filter(dependencies::Column::DependeeId.eq(local_dep.id))
+            .one(&env.db)
+            .await
+            .unwrap();
+        assert!(
+            link.is_some(),
+            "status {status} lost its dependency link to an already-built package"
+        );
+    }
 }
 
 #[tokio::test]

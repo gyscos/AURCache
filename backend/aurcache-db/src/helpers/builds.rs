@@ -43,6 +43,27 @@ pub async fn latest_successful_version<C: ConnectionTrait>(
         .map(|row| row.map(|(version,)| version))
 }
 
+/// Whether `dependee_id`'s newest successful build on `platform` satisfies
+/// `constraint`.
+///
+/// The one answer to "is this dependency ready?". Two paths ask it — a build
+/// finishing and deciding whether to promote its dependents, and a build being
+/// queued and deciding whether it may start — and they used to run separate
+/// queries that ordered differently: one by `end_time` alone, the other by
+/// `end_time` with `start_time` as the tie-break. A build with no recorded end
+/// time could therefore be picked by one and not the other, so the same
+/// dependency read as ready to the queue and not ready to the builder.
+pub async fn dependency_satisfied<C: ConnectionTrait>(
+    db: &C,
+    dependee_id: i32,
+    platform: &str,
+    constraint: &str,
+) -> Result<bool, DbErr> {
+    Ok(latest_successful_version(db, dependee_id, platform)
+        .await?
+        .is_some_and(|version| aurcache_deps::satisfies_constraint(&version, constraint)))
+}
+
 /// The version of the most recently *successful* build of `pkg_id` across all
 /// platforms.
 ///

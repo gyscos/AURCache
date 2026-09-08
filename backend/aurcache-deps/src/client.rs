@@ -11,8 +11,11 @@ use url::Url;
 const MAX_RPC_URL_BYTES: usize = 7_600;
 
 use crate::deps::deps_from_packages;
-use crate::model::{DependencyResolution, Error, Package, PackageResponse, PkgDeps};
+use crate::model::{
+    Dependency, DependencyResolution, Error, Package, PackageResponse, PkgDeps, Resolutions,
+};
 use crate::repo::{default_official_mirrorlist_path, default_official_repo_cache_dir};
+use crate::satisfy::{MatchKind, SatisfyIndex};
 
 /// Client for the AUR RPC and Arch Linux official package search APIs.
 ///
@@ -39,6 +42,26 @@ impl Default for AurClient {
 pub(crate) fn snapshot_url(rpc_url: &str, pkgbase: &str) -> String {
     let base = rpc_url.trim_end_matches("/rpc/v5").trim_end_matches('/');
     format!("{base}/cgit/aur.git/snapshot/{pkgbase}.tar.gz")
+}
+
+/// Move every dependency `resolve` can answer out of `remaining` and into
+/// `resolutions`.
+///
+/// The stages of [`AurClient::resolve_dependencies`] differ only in how they
+/// answer, so this holds what they share: ask, record a hit, leave a miss for
+/// the next stage.
+fn take_resolved(
+    remaining: &mut Vec<Dependency<'_>>,
+    resolutions: &mut Resolutions,
+    resolve: impl Fn(&Dependency<'_>) -> Option<DependencyResolution>,
+) {
+    remaining.retain(|dep| match resolve(dep) {
+        Some(resolution) => {
+            resolutions.found.insert(dep.name.to_string(), resolution);
+            false
+        }
+        None => true,
+    });
 }
 
 impl AurClient {
@@ -184,71 +207,157 @@ impl AurClient {
         self.rpc_fetch(url).await
     }
 
-    /// Resolve a list of dependency names to their sources (AUR, official, or local repo).
+    /// Resolve dependencies to what should happen about each of them.
     ///
-    /// Dependencies not found anywhere are omitted from the result map.
+    /// The outcome is a pure function of three independent facts about a name:
+    ///
+    /// - **tracked** -- `tracked` holds a package claiming the name: AURCache
+    ///   has a row for it, or an in-flight add is about to insert one. A
+    ///   statement about ownership, not about anything having been built, so a
+    ///   package whose last build failed still counts. Version constraints are
+    ///   deliberately not consulted (see below).
+    /// - **published** -- a repository database lists a package providing the
+    ///   name at a version satisfying the constraint: AURCache's own
+    ///   repository for the platforms being built, or the cached
+    ///   `core`/`extra`/`multilib`. Note this is what the *database* says, not
+    ///   that the file is still on disk, and that the official databases are
+    ///   fetched for `x86_64` only.
+    /// - **in the AUR** -- an AUR package carries the name, or declares it in
+    ///   `provides`.
+    ///
+    /// | tracked | published | in the AUR | outcome |
+    /// |---|---|---|---|
+    /// | yes | — | — | [`DependencyResolution::Local`] |
+    /// | no | yes | — | [`DependencyResolution::Available`] |
+    /// | no | no | yes | [`DependencyResolution::Aur`] |
+    /// | no | no | no | [`Resolutions::unresolved`] |
+    ///
+    /// Read down the columns and the rule is one sentence: **ownership decides
+    /// first, availability second.** A package AURCache tracks is its
+    /// responsibility whether or not a binary of it happens to exist; a
+    /// package it does not track is someone else's, so an existing binary is
+    /// used and only a missing one is built.
+    ///
+    /// The implementation evaluates that table left to right, stopping as soon
+    /// as a column settles it. That is an evaluation order, not the
+    /// definition: no stage can see what an earlier one concluded, and the
+    /// answer for a name does not depend on the other names in the batch.
+    ///
+    /// # Why the columns are in this order
+    ///
+    /// Each boundary is load-bearing, so none of them may be swapped for
+    /// convenience:
+    ///
+    /// - **tracked before published.** AURCache's own repository is part of
+    ///   "published", so without this a package AURCache tracks *and* has
+    ///   already built once resolves as merely available, and the dependency
+    ///   edge is never recorded -- nothing then rebuilds its dependents when
+    ///   it changes. This is the bug the column order exists to prevent. With
+    ///   the order right, "published" is reachable for one of our own packages
+    ///   only when no row exists at all -- a deleted package whose artifact
+    ///   remains -- and there `Available` is correct, since there is nothing
+    ///   to link to.
+    /// - **published before the AUR.** A name a repository holds *and* the AUR
+    ///   carries must resolve to the published package; resolving it to the
+    ///   AUR would have AURCache build something that already exists.
+    /// - **exact AUR name before `provides`.** A package carrying the name
+    ///   outright is a better answer than one that merely declares it.
+    ///
+    /// Cost happens to agree with all three, which is why short-circuiting is
+    /// free rather than a compromise: the first column is in memory, the
+    /// second on disk, and only the third and fourth touch the network -- and
+    /// the fourth has no bulk form, so it costs one request per name left.
+    ///
+    /// # Why `tracked` is a parameter
+    ///
+    /// Not merely because this crate has no database. The set of packages that
+    /// can satisfy a dependency is not the set any query returns: during an
+    /// add it also includes packages that add has *planned* but not yet
+    /// inserted, since the whole graph is resolved before anything is written.
+    /// Only the caller knows those. A version of this that fetched its own
+    /// rows would still have to be handed the in-flight half, so the parameter
+    /// buys correctness at no cost in coupling.
+    ///
+    /// It also removes an ordering hazard that used to be real: the database
+    /// was once a *separate function* callers had to remember to run first,
+    /// and calling this one alone reported every package AURCache had already
+    /// built as merely available.
+    ///
+    /// # Which columns check the version constraint
+    ///
+    /// Only "published". A repository hit *ends* resolution -- the binary
+    /// is used as it is, and nothing downstream will ever look at its version
+    /// again -- so a repository holding `foo-1.0` must not answer for
+    /// `foo>=2.0`. A tracked hit defers instead: the edge it produces records
+    /// the constraint, and the build queue re-checks it against each new
+    /// build, which is both later and better informed than anything decidable
+    /// here. The AUR columns have nothing to check, since the version will be
+    /// whatever the build produces.
     pub async fn resolve_dependencies(
         &self,
-        dep_names: &[&str],
-    ) -> Result<HashMap<String, DependencyResolution>, Error> {
-        if dep_names.is_empty() {
-            return Ok(HashMap::new());
-        }
+        deps: &[Dependency<'_>],
+        tracked: &SatisfyIndex,
+        platforms: &[String],
+    ) -> Result<Resolutions, Error> {
+        let mut resolutions = Resolutions::default();
 
-        // The repositories answer first, from disk, and only what they cannot
-        // answer is asked of the AUR.
-        //
-        // Order matters for cost, not for correctness: this used to resolve
-        // every name against the RPC up front and then discover most of them in
-        // the repositories a line later. Nearly every package depends on
-        // `glibc` and friends, so most of what went out was thrown away -- and
-        // a package whose dependencies are *all* in the repositories, which is
-        // the common case, now costs no RPC call at all rather than one.
-        let mut resolutions = HashMap::new();
-        let mut unresolved: Vec<&str> = Vec::new();
+        // A pkgbase can name the same dependency in `depends` and
+        // `makedepends`, and its split packages multiply that again.
+        let mut remaining: Vec<Dependency<'_>> = Vec::new();
         let mut seen = HashSet::new();
-        for dep_name in dep_names {
-            if !seen.insert(*dep_name) {
-                continue;
-            }
-
-            // AURCache's own repository first, then core/extra/multilib: a
-            // package we build ourselves takes precedence over an official one
-            // of the same name, which is the point of building it.
-            if self.local_repo_dependency_exists(dep_name)?
-                || self.official_dependency_exists(dep_name).await
-            {
-                resolutions.insert(dep_name.to_string(), DependencyResolution::Official);
-            } else {
-                unresolved.push(*dep_name);
+        for dep in deps {
+            if seen.insert(dep.name) {
+                remaining.push(*dep);
             }
         }
 
-        if unresolved.is_empty() {
+        take_resolved(&mut remaining, &mut resolutions, |dep| {
+            tracked
+                .best_match(dep.name, |_| true)
+                .map(|found| DependencyResolution::Local {
+                    pkgbase: found.pkgbase.clone(),
+                })
+        });
+        if remaining.is_empty() {
             return Ok(resolutions);
         }
 
-        // One request for every remaining name, not one per name: `resolve_bases`
-        // chunks by URL length, so this is a single call for any realistic
-        // dependency list.
-        let exact_aur_bases = self.resolve_bases(&unresolved).await?;
-        for dep_name in unresolved {
-            if let Some(pkgbase) = exact_aur_bases.get(dep_name) {
-                resolutions.insert(
-                    dep_name.to_string(),
-                    DependencyResolution::Aur {
-                        pkgbase: pkgbase.clone(),
-                    },
-                );
-                continue;
-            }
+        let wanted: HashSet<&str> = remaining.iter().map(|dep| dep.name).collect();
+        let repositories = {
+            let mut index = self.local_repo_index(&wanted, platforms)?;
+            index.extend(self.official_repo_index(&wanted).await?);
+            index
+        };
+        take_resolved(&mut remaining, &mut resolutions, |dep| {
+            repositories
+                .best_match(dep.name, |candidate| candidate.satisfies(dep.constraint))
+                .map(|_| DependencyResolution::Available)
+        });
+        if remaining.is_empty() {
+            return Ok(resolutions);
+        }
 
-            // Nothing provides it under its own name, so ask which package
-            // declares it in `provides`. One request per such name -- there is
-            // no bulk form of this query -- but they are rare by the time a
-            // name has survived every check above.
-            if let Some(pkgbase) = self.provider_pkgbase(dep_name).await? {
-                resolutions.insert(dep_name.to_string(), DependencyResolution::Aur { pkgbase });
+        // One request for every remaining name, not one per name:
+        // `resolve_bases` chunks by URL length, so this is a single call for
+        // any realistic dependency list.
+        let names: Vec<&str> = remaining.iter().map(|dep| dep.name).collect();
+        let exact_aur_bases = self.resolve_bases(&names).await?;
+        take_resolved(&mut remaining, &mut resolutions, |dep| {
+            exact_aur_bases
+                .get(dep.name)
+                .map(|pkgbase| DependencyResolution::Aur {
+                    pkgbase: pkgbase.clone(),
+                })
+        });
+
+        for dep in remaining {
+            match self.aur_provider_pkgbase(dep.name).await? {
+                Some(pkgbase) => {
+                    resolutions
+                        .found
+                        .insert(dep.name.to_string(), DependencyResolution::Aur { pkgbase });
+                }
+                None => resolutions.unresolved.push(dep.name.to_string()),
             }
         }
 
@@ -318,29 +427,38 @@ impl AurClient {
         Ok(bytes)
     }
 
-    /// Whether `dep_name` is satisfied by an official repository.
+    /// The AUR package base that declares `dep_name` in its `provides`.
     ///
-    /// A cache refresh/lookup failure (no mirrorlist yet, mirror unreachable)
-    /// answers `false` rather than aborting resolution: the dependency then
-    /// falls through to the AUR lookup, which is the desired behaviour.
-    pub(crate) async fn official_dependency_exists(&self, dep_name: &str) -> bool {
-        self.cached_official_dependency_exists(dep_name)
-            .await
-            .unwrap_or(false)
-    }
-
-    async fn provider_pkgbase(&self, dep_name: &str) -> Result<Option<String>, Error> {
+    /// Ranked through [`SatisfyIndex`] like every other source, so an AUR
+    /// package carrying the name outright beats one that merely provides it.
+    /// This used to take whichever pkgbase sorted first alphabetically, which
+    /// meant a virtual dependency was built from a package chosen by nothing
+    /// more than its initial.
+    async fn aur_provider_pkgbase(&self, dep_name: &str) -> Result<Option<String>, Error> {
         let packages = self
             .rpc_fetch(self.rpc_search_url(dep_name, "provides")?)
             .await?;
-        Ok(packages
-            .into_iter()
-            .min_by(|left, right| {
-                left.package_base
-                    .cmp(&right.package_base)
-                    .then(left.name.cmp(&right.name))
-            })
-            .map(|pkg| pkg.package_base))
+
+        // Indexed by hand rather than through `insert_package`, because the
+        // RPC's *search* response carries only identity fields -- no
+        // `provides`, unlike `info`. The query is the evidence instead: every
+        // result provides `dep_name` by construction, since the server
+        // filtered on exactly that. Re-deriving the claim from the response
+        // body would find nothing and quietly resolve every virtual
+        // dependency to nothing at all.
+        let mut index = SatisfyIndex::new();
+        for package in &packages {
+            let kind = if package.name == dep_name {
+                MatchKind::Name
+            } else {
+                MatchKind::Provides
+            };
+            index.insert(dep_name, &package.package_base, kind, None);
+        }
+
+        Ok(index
+            .best_match(dep_name, |_| true)
+            .map(|found| found.pkgbase.clone()))
     }
 }
 

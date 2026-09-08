@@ -138,13 +138,21 @@ impl Setting {
                 env_name: Some("BUILD_ON_NEW_VERSION"),
                 default: "false",
             },
-            // Off by default: a clean tree per build is the guarantee chroot
-            // builds exist to provide, and reuse trades it away. Worth it only
-            // where a rebuild costs hours.
+            // On by default. This is what an AUR helper on a workstation
+            // already does -- paru and yay keep their build trees between
+            // builds and trouble is rare -- and the failure that was assumed
+            // to make it risky does not exist: `extract_sources` unpacks over
+            // the tree and bsdtar overwrites, so `prepare()` always patches
+            // pristine sources. The chroot is still rebuilt from a fresh
+            // snapshot every time; only the tree survives.
+            //
+            // Kept as a setting rather than made unconditional so a package
+            // that does turn out to mind has a remedy that is not "delete a
+            // directory on the worker by hand".
             Self::PersistentBuilddir => SettingsMeta {
                 key: "persistent_builddir",
                 env_name: Some("PERSISTENT_BUILDDIR"),
-                default: "false",
+                default: "true",
             },
             Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
