@@ -125,11 +125,26 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             text.push_str(&chunk);
                         });
                         line_count += added;
+                        if error.peek().is_some() {
+                            error.set(None);
+                        }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // A successful poll clears a previous failure: the
+                        // banner should describe now, not the worst moment so
+                        // far.
+                        if error.peek().is_some() {
+                            error.set(None);
+                        }
+                    }
                     Err(e) => {
+                        // Report and keep polling. Returning here abandoned the
+                        // log for the life of the page, so one timeout on a
+                        // slow connection meant a running build stopped
+                        // updating until it was reloaded by hand -- and the
+                        // first fetch is the most likely to time out, being the
+                        // whole log at once.
                         error.set(Some(e.to_string()));
-                        return;
                     }
                 }
 
