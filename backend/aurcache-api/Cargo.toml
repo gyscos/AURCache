@@ -38,6 +38,7 @@ aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-utils = {path = "../aurcache-utils"}
 pacman-mirrors = {path = "../pacman-mirrors"}
 aurcache-common = {path = "../aurcache-common"}
+rocket_async_compression = "0.6.1"
 
 [features]
 default = []

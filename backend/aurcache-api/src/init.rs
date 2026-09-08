@@ -14,6 +14,7 @@ use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
 use rocket::http::private::cookie::Key;
 use rocket::{Config, routes};
+use rocket_async_compression::Compression;
 use rocket_oauth2::HyperRustlsAdapter;
 use sea_orm::DatabaseConnection;
 use std::env;
@@ -177,6 +178,26 @@ pub fn init_api(
         }
 
         let mut rock = rocket::custom(config)
+            // Compress here rather than only at whatever proxy is in front.
+            //
+            // A build log is the most compressible thing this server sends and
+            // the largest: unreal-engine's reached 4.3 MB, which a phone on a
+            // mobile connection could not fetch before the request timed out.
+            // It compresses about 11x.
+            //
+            // Doing it in the application rather than in the reverse proxy
+            // matters for two reasons. A deployment may have no proxy at all,
+            // and where there is one it is often somewhere else entirely --
+            // this instance reaches its proxy over a WireGuard tunnel, so
+            // compressing at the proxy still drags the uncompressed body across
+            // the wire. A proxy that compresses as well simply passes an
+            // already-encoded response through.
+            //
+            // The repository file server is a separate Rocket (`init_repo`), so
+            // this cannot touch package downloads -- which are `.pkg.tar.zst`
+            // and must never be re-compressed. The fairing's own defaults also
+            // skip images, video, archives and `text/event-stream`.
+            .attach(Compression::fairing())
             .manage(db.clone())
             .manage(tx)
             .manage(OauthEnabled(oauth_config.is_ok()))
