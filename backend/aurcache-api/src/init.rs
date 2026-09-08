@@ -14,7 +14,7 @@ use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
 use rocket::http::private::cookie::Key;
 use rocket::{Config, routes};
-use rocket_async_compression::Compression;
+use rocket_async_compression::{Compression, Level};
 use rocket_oauth2::HyperRustlsAdapter;
 use sea_orm::DatabaseConnection;
 use std::env;
@@ -197,7 +197,7 @@ pub fn init_api(
             // this cannot touch package downloads -- which are `.pkg.tar.zst`
             // and must never be re-compressed. The fairing's own defaults also
             // skip images, video, archives and `text/event-stream`.
-            .attach(Compression::fairing())
+            .attach(Compression::with_level(Level::Precise(4)))
             .manage(db.clone())
             .manage(tx)
             .manage(OauthEnabled(oauth_config.is_ok()))
