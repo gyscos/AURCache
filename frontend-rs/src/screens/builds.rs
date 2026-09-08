@@ -158,6 +158,7 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 {format_duration(build.start_time, build.end_time)}
                                             }
+                                            td { class: "{WIDE_ONLY} text-sm opacity-70", "{build.platform}" }
                                             td { class: "{WIDE_ONLY} text-sm opacity-70",
                                                 if let Some(worker) = build.worker_name.as_deref() {
                                                     "{worker}"

@@ -246,10 +246,43 @@ async fn interactions() {
     following_a_dependency_loads_that_package(&session).await;
     a_second_page_holds_different_builds(&session).await;
     a_build_can_be_found_by_the_name_the_list_shows(&session).await;
+    every_row_has_a_cell_for_every_column(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
     removing_a_package_takes_it_out_of_the_list(&session).await;
 
     session.stop().await;
+}
+
+/// Every body row must have exactly as many cells as the table has headers.
+///
+/// Nothing else catches a misaligned column. A unit test cannot render a
+/// component, and the route checks only assert that some text appears
+/// *somewhere* on the page -- so when a `td` was replaced rather than added,
+/// every column after it shifted one to the left, the last one rendered empty,
+/// and both suites stayed green while the page was visibly wrong.
+async fn every_row_has_a_cell_for_every_column(session: &Session) {
+    for path in ["/builds", "/packages", "/workers"] {
+        session.open(path).await;
+        session.wait_for("table tbody tr").await;
+        // Reports "ok" explicitly rather than an empty string on success:
+        // `eval` yields `Default` when a script fails, so an assertion of
+        // "nothing was reported" would pass for a check that never ran.
+        let report: String = session
+            .eval(
+                "const t = document.querySelector('table');
+                 if (!t) { return 'no table'; }
+                 const cols = t.querySelectorAll('thead th').length;
+                 const rows = [...t.querySelectorAll('tbody tr')];
+                 if (!cols || !rows.length) { return `nothing to check: cols=${cols} rows=${rows.length}`; }
+                 const bad = rows
+                     .map((r, i) => [i, r.querySelectorAll('td').length])
+                     .filter(([, n]) => n !== cols);
+                 return bad.length ? `${cols} headers but rows ${JSON.stringify(bad)}` : 'ok';"
+                    .to_string(),
+            )
+            .await;
+        assert_eq!(report, "ok", "{path}: row cells do not match header count");
+    }
 }
 
 /// Typing in the filter narrows the list *and* updates the address bar.
