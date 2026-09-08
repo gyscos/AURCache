@@ -217,7 +217,6 @@ async fn run_job_inner(
             &job.pkgbase,
             cfg.core.builddir_max_bytes,
             cfg.core.builddir_min_free,
-            std::time::Duration::from_secs(cfg.core.builddir_max_age_secs),
         );
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
@@ -502,7 +501,7 @@ async fn run_build(
     // on a build that already took minutes, instead of walking every candidate
     // on every future build.
     if job.persistent_builddir {
-        cache.record_builddir_size(&job.arch, &job.pkgbase, started.elapsed().as_secs());
+        cache.record_builddir_size(&job.arch, &job.pkgbase);
     }
 
     let mut report = if timed_out {

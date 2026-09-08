@@ -167,61 +167,53 @@ it; when on, the host directory is bound over `/build` and makepkg's own
 
 ## Reclaiming space
 
-**Two limits, because each is useless alone.** Before a build that will use a
-persistent tree, drop trees oldest-first until the cache is within
-`WORKER_BUILDDIR_MAX_BYTES` (default 200 GiB) *and* the filesystem has
-`WORKER_BUILDDIR_MIN_FREE` bytes spare (default 50 GiB).
+Sizing storage for the packages you build is the operator's job. This is not a
+cache that tries to be clever about what to keep; it is a way to collect old and
+unused build trees, and **age is the main factor**.
 
-This was first designed as a size budget, implemented as a free-space floor,
-and is now both. The floor alone was wrong: on a NAS pool with terabytes spare
-it never triggers, so trees accumulate indefinitely -- the cache would grow
-into the terabytes before anything reclaimed it, and "the disk is not full yet"
-is not a reason to keep every build tree ever made. The cap is what bounds the
-cache independently of how large the underlying storage is. But a cap alone
-cannot see the rest of the machine, so the floor still covers a small disk, or
-one shared with something else that grew.
+Least recently used first, until the cache is within `WORKER_BUILDDIR_MAX_BYTES`
+(default 200 GiB) *and* the filesystem has `WORKER_BUILDDIR_MIN_FREE` bytes
+spare (default 50 GiB). Two limits because each is useless alone: a free-space
+floor never triggers on a large pool, so the cap is what bounds the cache
+whatever the storage underneath it, while a cap cannot see the rest of the
+machine, so the floor still covers a small disk or one shared with something
+that grew.
 
-Sizes come from a `.aurcache-size` stamp each build leaves in its tree, so
-reclaim totals the cache by reading a handful of small files. A tree without a
-stamp is walked once and stamped. This is what makes a cap affordable at all:
-summing by walking would mean traversing 130 GB and millions of files on every
-build, whereas measuring once after a build that already took hours costs
-nothing noticeable.
+**Nothing is evicted while the cache is within both limits.** Disk that nothing
+else needs is not worth reclaiming, and a tree kept is a rebuild avoided. It
+follows that the tree of a deleted package is left alone until the space is
+actually wanted -- which is the right time to notice, since a worker is never
+told a package went away and being unused is the only evidence there is. Under
+pressure it sorts to the front on its own, because nothing has touched it.
 
-- Whole trees, never partial contents: half a tree is worse than none, because
-  makepkg would treat it as resumable.
-- Before the build rather than after, so the limits bound usage going in.
-- Never the tree the current build is about to use -- even when that tree is
-  itself what breaches the cap, since evicting it defeats the point of asking.
-- **Nothing is evicted while the cache is within its limits.** Disk nothing
-  else needs is not worth reclaiming, and a tree kept is a rebuild avoided.
-  Eviction happens only under real pressure, never as a tidy-up.
-- **Abandoned trees go first**, meaning nothing has touched them in
-  `WORKER_BUILDDIR_MAX_AGE_SECS` (default 30 days). This is what stops a tree
-  outliving its package: a worker is never told that a package was deleted from
-  the server, and an expensive tree is the last thing the next rule would give
-  up, so `unreal-engine`'s 130 GB would otherwise sit there indefinitely.
-  Ordering rather than a sweep -- while there is room, an abandoned tree costs
-  nothing.
-- **Then worst value density -- rebuild seconds per byte.** Not age, and not
-  cost alone. LRU is backwards among live trees: the one worth keeping took
-  four hours, and that is exactly the package built rarely enough to look stale
-  beside a dozen small ones rebuilt daily. But cost alone is wrong the other
-  way, because a huge tree only earns its place while there is room for it.
-  `unreal-engine` at four hours over 130 GB is ~1.0e-7 s/byte; a thirty-second
-  package over 200 MB is ~1.4e-7. The big tree is the *worst* value per byte
-  despite costing the most, and freeing 130 GB by dropping it costs four hours
-  where freeing the same space in small trees costs over five. So it is kept
-  while there is room and given up first when space is genuinely short.
-- A staleness threshold and one ratio, rather than a weighted score over age,
-  size and cost: those weights would be invented, and there is no evidence here
-  to choose them with. A tree stamped before cost was recorded sorts as free to
-  discard.
-- Worker settings rather than server ones: it is the worker's disk.
-- Best-effort. Failing to reclaim is reported and the build proceeds; refusing
-  to build over it would turn a full disk into an idle worker.
-- The existing startup sweep is unaffected -- it removes `job-*` chroot copies,
-  which are a different thing in a different directory.
+### Ranking by rebuild cost was tried and removed
+
+It seemed obvious that a four-hour tree should outlive a thirty-second one, and
+that a huge tree should be given up first once space is short -- which together
+point at value density, rebuild seconds per byte. Both premises were wrong.
+
+The numerator was wrong: the stamp recorded *build duration*, but a tree only
+saves the part it makes unnecessary. Measured on `libpng12`, a cold build took
+19 s and a warm one 11 s, so the tree saved 8 s and not 19 -- and that fraction
+varies per package, so it is not a constant to divide out.
+
+With the right numerator the ratio stops discriminating at all. Time saved is
+roughly proportional to what a tree holds, because most of it is download the
+tree spares you. `libpng12` saves 8 s over 17.9 MB (4.5e-07 s/byte);
+`unreal-engine` saves hours over 130 GB (8.3e-08). Five times apart, against the
+500x spread build duration had suggested. A ratio that near-constant sorts
+nothing, so it is complexity that ranks noise.
+
+An age threshold for "abandoned" trees was removed with it. Age is the primary
+key now, so a deleted package's tree reaches the front unaided, and expiring it
+on a timer would have broken the rule above by reclaiming space nothing wanted.
+
+Sizes still come from a `.aurcache-size` stamp each build leaves behind, since
+the cap needs a total; a tree without one is walked once and stamped. Whole
+trees only, never partial contents -- half a tree is worse than none, because
+makepkg would treat it as resumable. Never the tree the current build is about
+to use. Best-effort: failing to reclaim is reported and the build proceeds,
+since refusing to build over it would turn a full disk into an idle worker.
 
 Neither limit bounds a *single* build: `unreal-engine` can grow by ~130 GB after
 the check passes. Nothing short of a filesystem quota would.

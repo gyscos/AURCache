@@ -68,10 +68,8 @@ impl Cache {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
     }
 
-    /// Name of the file recording a tree's measured size and what its last
-    /// build cost, written after each build so reclaim never has to walk one.
-    /// Two whitespace-separated numbers: bytes, then seconds. A stamp with
-    /// only the first is from before cost was recorded.
+    /// Name of the file caching a tree's measured size, written after each
+    /// build so reclaim never has to walk one.
     const SIZE_STAMP: &'static str = ".aurcache-size";
 
     /// Record how big a package's persistent tree is, so reclaim can total the
@@ -81,7 +79,7 @@ impl Cache {
     /// already took minutes or hours. Measuring during reclaim instead would
     /// mean walking every candidate on every build, and these trees reach
     /// 130 GB and millions of files.
-    pub fn record_builddir_size(&self, platform: &str, pkgbase: &str, build_secs: u64) {
+    pub fn record_builddir_size(&self, platform: &str, pkgbase: &str) {
         let Some(tree) = self.builddir(platform).map(|r| r.join(sanitize(pkgbase))) else {
             return;
         };
@@ -89,124 +87,74 @@ impl Cache {
             return;
         }
         let size = dir_size(&tree);
-        let stamp = format!("{size} {build_secs}");
-        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), stamp) {
+        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), size.to_string()) {
             tracing::debug!("could not record size of {}: {e}", tree.display());
         }
     }
 
-    /// Drop persistent build trees, oldest first, until the cache is within
-    /// `max_bytes` *and* the filesystem has `min_free` bytes spare. Never
-    /// touches `keep`.
+    /// Drop persistent build trees, least recently used first, until the cache
+    /// is within `max_bytes` *and* the filesystem has `min_free` bytes spare.
+    /// Never touches `keep`.
     ///
-    /// Two limits because they answer different questions, and each is useless
-    /// alone. A free-space floor does nothing on a large pool -- trees would
-    /// grow into the terabytes before it ever triggered -- so `max_bytes` is
-    /// what actually bounds the cache, independently of how big the underlying
-    /// storage is. But a cap alone cannot see the rest of the machine, so the
-    /// floor still covers a small disk, or one shared with something else that
-    /// grew.
+    /// **Nothing is evicted while the cache is within its limits.** Disk that
+    /// nothing else needs is not worth reclaiming, and a tree kept is a rebuild
+    /// avoided, so eviction is only ever a response to pressure -- never a
+    /// tidy-up. It follows that a tree belonging to a deleted package is left
+    /// alone until the space is actually wanted, which is the right time to
+    /// notice: a worker is never told that a package went away, and being
+    /// unused is the only evidence available.
+    ///
+    /// Least recently used, and deliberately nothing cleverer. Ranking by what
+    /// a rebuild costs was tried and removed: the time a tree saves is roughly
+    /// proportional to what it holds -- most of it is download the tree spares
+    /// you -- so cost per byte comes out near constant and sorts nothing.
+    /// Measured, it spans about 5x across packages as different as `libpng12`
+    /// (17.9 MB, saves 8 s) and `unreal-engine` (130 GB, saves hours), against
+    /// the 500x spread that *build duration* suggested. Duration was the wrong
+    /// number: a warm `libpng12` build still took 11 s of the cold 19 s, so the
+    /// tree saved 8 s and not 19.
+    ///
+    /// Two limits, because each is useless alone. A free-space floor does
+    /// nothing on a large pool -- trees would grow into the terabytes before it
+    /// triggered -- so `max_bytes` is what bounds the cache whatever the
+    /// storage underneath it. A cap alone cannot see the rest of the machine,
+    /// so the floor still covers a small disk, or one shared with something
+    /// else that grew.
     ///
     /// Sizes come from the stamp each build leaves behind; a tree without one
     /// is walked once and stamped. So the usual case totals the cache by
     /// reading a handful of small files.
-    ///
-    /// **Nothing is evicted while the cache is within its limits.** Disk that
-    /// nothing else needs is not worth reclaiming, and a tree kept is a rebuild
-    /// avoided, so eviction happens only under real pressure -- never as a
-    /// tidy-up.
-    ///
-    /// Under pressure, trees go in this order: **abandoned ones first**, then
-    /// by worst *value density* -- rebuild seconds per byte.
-    ///
-    /// Abandoned first is what stops a tree outliving the package it belongs
-    /// to. A worker is never told that a package was deleted from the server,
-    /// and an expensive tree is the last thing density would ever give up, so
-    /// `unreal-engine`'s 130 GB could otherwise sit there indefinitely after
-    /// the package went away. Nothing having touched it in `max_age` is the
-    /// available evidence that it is dead. Ordering and not a sweep, because an
-    /// abandoned tree costs nothing while there is room for it.
-    ///
-    /// Density for the rest, rather than age or cost alone.
-    ///
-    /// Plain LRU is backwards among live trees: the one worth keeping is the
-    /// one that took four hours, and that is exactly the package built rarely
-    /// enough to look stale beside a dozen small ones rebuilt daily. But cost
-    /// alone is wrong in the other direction, because a huge tree only earns
-    /// its place while there is room for it. `unreal-engine` is four hours over
-    /// 130 GB, about 1.0e-7 s/byte; a thirty-second package over 200 MB is
-    /// 1.4e-7. The big tree is the *worst* value per byte despite being the
-    /// most expensive -- and freeing 130 GB by dropping it costs four hours,
-    /// where freeing the same space in small trees costs over five.
-    ///
-    /// So the expensive tree is kept while there is room and given up first
-    /// when space is genuinely short, which is when it stops being worth its
-    /// footprint.
-    ///
-    /// A staleness threshold and one ratio, rather than a weighted score over
-    /// age, size and cost: those weights would be invented, and there is no
-    /// evidence here to choose them with. A tree stamped before cost was
-    /// recorded sorts as free to discard.
     ///
     /// Whole trees, never partial contents: half a tree is worse than none,
     /// because makepkg would treat it as resumable.
     ///
     /// Best-effort. Failing to reclaim is worth reporting and carrying on;
     /// refusing to build over it would turn a full disk into an idle worker.
-    pub fn reclaim_builddirs(
-        &self,
-        platform: &str,
-        keep: &str,
-        max_bytes: u64,
-        min_free: u64,
-        max_age: std::time::Duration,
-    ) {
+    pub fn reclaim_builddirs(&self, platform: &str, keep: &str, max_bytes: u64, min_free: u64) {
         let Some(root) = self.builddir(platform) else {
             return;
         };
 
         // Oldest first. `mtime` on the tree root moves whenever a build writes
-        // into it, which makes it a serviceable "last used".
-        let mut trees: Vec<(u64, std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&root)
+        // into it, which makes it a serviceable "last used" -- and a tree whose
+        // package was deleted simply stops being touched, so it drifts to the
+        // front on its own.
+        let mut trees: Vec<(std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&root)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
                 let modified = e.metadata().ok()?.modified().ok()?;
                 let path = e.path();
-                let (size, cost) = Self::stamped(&path);
-                Some((cost, modified, path, size))
+                let size = Self::stamped_size(&path);
+                Some((modified, path, size))
             })
             .collect();
-        // Abandoned trees first, then worst value per byte. Density is
-        // compared by cross-multiplying rather than dividing, to stay in
-        // integers: cost_a/size_a < cost_b/size_b is the same as
-        // cost_a*size_b < cost_b*size_a. A zero-size tree frees nothing by
-        // going, so it sorts last.
-        let now = std::time::SystemTime::now();
-        let abandoned = |modified: &std::time::SystemTime| {
-            !max_age.is_zero()
-                && now
-                    .duration_since(*modified)
-                    .is_ok_and(|unused_for| unused_for > max_age)
-        };
-        trees.sort_by(
-            |(cost_a, mtime_a, _, size_a), (cost_b, mtime_b, _, size_b)| {
-                abandoned(mtime_b).cmp(&abandoned(mtime_a)).then_with(|| {
-                    match (*size_a == 0, *size_b == 0) {
-                        (true, false) => std::cmp::Ordering::Greater,
-                        (false, true) => std::cmp::Ordering::Less,
-                        _ => (u128::from(*cost_a) * u128::from(*size_b))
-                            .cmp(&(u128::from(*cost_b) * u128::from(*size_a)))
-                            .then(mtime_a.cmp(mtime_b)),
-                    }
-                })
-            },
-        );
+        trees.sort_by_key(|(modified, _, _)| *modified);
 
-        let mut total: u64 = trees.iter().map(|(_, _, _, size)| size).sum();
+        let mut total: u64 = trees.iter().map(|(_, _, size)| size).sum();
 
-        for (_, _, path, size) in trees {
+        for (_, path, size) in trees {
             let over_budget = max_bytes > 0 && total > max_bytes;
             let short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
             if !over_budget && !short_of_free {
@@ -230,20 +178,19 @@ impl Cache {
         }
     }
 
-    /// A tree's recorded size in bytes and what its last build cost in
-    /// seconds, measuring and stamping the size if no stamp is there.
-    fn stamped(tree: &Path) -> (u64, u64) {
+    /// A tree's recorded size, measuring and stamping it if no stamp is there.
+    /// Tolerates a stamp carrying more than one field, from the brief time a
+    /// rebuild cost was recorded alongside.
+    fn stamped_size(tree: &Path) -> u64 {
         let stamp = tree.join(Self::SIZE_STAMP);
-        if let Ok(text) = std::fs::read_to_string(&stamp) {
-            let mut fields = text.split_whitespace();
-            if let Some(Ok(size)) = fields.next().map(str::parse) {
-                let cost = fields.next().and_then(|c| c.parse().ok()).unwrap_or(0);
-                return (size, cost);
-            }
+        if let Ok(text) = std::fs::read_to_string(&stamp)
+            && let Some(Ok(size)) = text.split_whitespace().next().map(str::parse)
+        {
+            return size;
         }
         let size = dir_size(tree);
-        let _ = std::fs::write(&stamp, format!("{size} 0"));
-        (size, 0)
+        let _ = std::fs::write(&stamp, size.to_string());
+        size
     }
 
     /// Shared persistent GnuPG home for validpgpkeys.
@@ -628,29 +575,21 @@ mod pkgcache_tests {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
-    /// Among trees of one size, the cheap ones go first and the expensive one
-    /// survives even though it is the oldest -- plain LRU would have discarded
-    /// exactly the tree worth keeping. The tree the build is about to use is
-    /// never evicted either, even when it is itself what breaches the cap.
+    /// Least recently used goes first, and the tree the build is about to use
+    /// is never evicted -- even when it is itself what breaches the cap, since
+    /// dropping it would defeat the point of keeping trees at all.
     #[test]
-    fn reclaim_evicts_cheapest_and_never_the_one_in_use() {
+    fn reclaim_evicts_oldest_but_never_the_one_in_use() {
         use std::time::{Duration, SystemTime};
 
         let tmp = tempfile::tempdir().unwrap();
         let c = cache(tmp.path(), 0);
         let root = c.builddir("x86_64").unwrap();
 
-        // "costly" is both the oldest and the most expensive to rebuild: four
-        // hours against thirty seconds. Age alone would evict it first.
-        for (name, age, cost) in [
-            ("costly", 300, 14400),
-            ("cheap-old", 200, 30),
-            ("cheap-new", 100, 30),
-            ("wanted", 50, 5),
-        ] {
+        for (name, age) in [("old", 300), ("mid", 200), ("wanted", 100)] {
             let tree = root.join(name);
             std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join(Cache::SIZE_STAMP), format!("100 {cost}")).unwrap();
+            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
             let when = SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&tree)
                 .unwrap()
@@ -658,60 +597,21 @@ mod pkgcache_tests {
                 .unwrap();
         }
 
-        // Room for two of the four trees.
-        c.reclaim_builddirs("x86_64", "wanted", 250, 0, Duration::ZERO);
+        // Room for one tree, so two must go -- but "wanted" is in use.
+        c.reclaim_builddirs("x86_64", "wanted", 150, 0);
 
-        assert!(
-            !root.join("cheap-old").exists(),
-            "cheapest and oldest goes first"
-        );
-        assert!(!root.join("cheap-new").exists(), "then the other cheap one");
-        assert!(
-            root.join("costly").exists(),
-            "the four-hour tree must outlive the thirty-second ones"
-        );
+        assert!(!root.join("old").exists(), "oldest goes first");
+        assert!(!root.join("mid").exists(), "then the next oldest");
         assert!(
             root.join("wanted").exists(),
             "the tree this build needs must survive"
         );
     }
 
-    /// A huge tree is given up before small ones when space runs short, even
-    /// though it cost the most to build: it is the worst value per byte, and
-    /// dropping it frees more than every small tree put together. It only
-    /// earns its place while the cache is within its limits.
-    #[test]
-    fn a_huge_tree_goes_before_small_ones_when_space_is_short() {
-        use std::time::Duration;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let c = cache(tmp.path(), 0);
-        let root = c.builddir("x86_64").unwrap();
-
-        // 4 hours over 130 GB is ~1.0e-7 s/byte; 30 s over 200 MB is ~1.4e-7.
-        for (name, size, cost) in [
-            ("huge", 130_000_000_000u64, 14400u64),
-            ("small-a", 200_000_000, 30),
-            ("small-b", 200_000_000, 30),
-        ] {
-            let tree = root.join(name);
-            std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join(Cache::SIZE_STAMP), format!("{size} {cost}")).unwrap();
-        }
-
-        c.reclaim_builddirs("x86_64", "none", 1_000_000_000, 0, Duration::ZERO);
-
-        assert!(
-            !root.join("huge").exists(),
-            "the giant tree is the worst value per byte and goes first"
-        );
-        assert!(root.join("small-a").exists());
-        assert!(root.join("small-b").exists());
-    }
-
-    /// Room to spare means nothing is touched -- not even a tree abandoned two
-    /// months ago. Reclaiming disk nothing else wants would trade a rebuild for
-    /// no gain.
+    /// Room to spare means nothing is touched, however old. Reclaiming disk
+    /// nothing else wants would trade a rebuild for no gain -- and it is what
+    /// makes the tree of a deleted package cost nothing until the space is
+    /// actually needed.
     #[test]
     fn nothing_is_evicted_while_there_is_room() {
         use std::time::{Duration, SystemTime};
@@ -720,70 +620,21 @@ mod pkgcache_tests {
         let c = cache(tmp.path(), 0);
         let root = c.builddir("x86_64").unwrap();
 
-        let tree = root.join("abandoned");
+        let tree = root.join("ancient");
         std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(tree.join(Cache::SIZE_STAMP), "100 30").unwrap();
-        let when = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
+        std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+        let when = SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60);
         std::fs::File::open(&tree)
             .unwrap()
             .set_modified(when)
             .unwrap();
 
         // A cap nothing comes close to.
-        c.reclaim_builddirs(
-            "x86_64",
-            "none",
-            u64::MAX,
-            0,
-            Duration::from_secs(30 * 24 * 60 * 60),
-        );
+        c.reclaim_builddirs("x86_64", "none", u64::MAX, 0);
 
         assert!(
             tree.exists(),
             "an unused tree is not worth reclaiming while there is room for it"
-        );
-    }
-
-    /// Once space is short, the abandoned tree goes first even though it is the
-    /// most expensive to rebuild -- otherwise a tree outlives the package it
-    /// belongs to, since the worker is never told a package was deleted and
-    /// density would never give up the costly one.
-    #[test]
-    fn an_abandoned_tree_goes_first_once_space_is_short() {
-        use std::time::{Duration, SystemTime};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let c = cache(tmp.path(), 0);
-        let root = c.builddir("x86_64").unwrap();
-
-        for (name, age_days) in [("abandoned", 60), ("recent", 1)] {
-            let tree = root.join(name);
-            std::fs::create_dir_all(&tree).unwrap();
-            // Expensive, so trimming would never pick it.
-            std::fs::write(tree.join(Cache::SIZE_STAMP), "100 14400").unwrap();
-            let when = SystemTime::now() - Duration::from_secs(age_days * 24 * 60 * 60);
-            std::fs::File::open(&tree)
-                .unwrap()
-                .set_modified(when)
-                .unwrap();
-        }
-
-        // Room for one of the two, so exactly one must go.
-        c.reclaim_builddirs(
-            "x86_64",
-            "none",
-            150,
-            0,
-            Duration::from_secs(30 * 24 * 60 * 60),
-        );
-
-        assert!(
-            !root.join("abandoned").exists(),
-            "the abandoned tree goes first, however costly it was to build"
-        );
-        assert!(
-            root.join("recent").exists(),
-            "a tree still in use is kept over one nothing has touched"
         );
     }
 
@@ -797,11 +648,11 @@ mod pkgcache_tests {
         std::fs::create_dir_all(tree.join("deep")).unwrap();
         write(&tree.join("deep").join("blob"), 4096);
 
-        assert_eq!(Cache::stamped(&tree), (4096, 0));
+        assert_eq!(Cache::stamped_size(&tree), 4096);
         // And it is stamped, so the walk happens once.
         assert_eq!(
             std::fs::read_to_string(tree.join(Cache::SIZE_STAMP)).unwrap(),
-            "4096 0"
+            "4096"
         );
     }
 
