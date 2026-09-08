@@ -132,6 +132,13 @@ Resolved through `ApplicationSettings` like every other package setting, with
 the established precedence `Package -> Env -> Global -> Default`. The packages
 that want it are the ones where a rebuild costs hours, and there are few.
 
+Opt-in is what decides whether the bind happens at all. When the setting is off
+the build gets the ordinary `/build` inside the ephemeral chroot copy and
+nothing survives it; when it is on, the host directory is bound over `/build`
+and makepkg's own `<pkgbase>/` namespacing keeps packages apart inside it. So
+`<cache>/builddir/<platform>` only ever contains trees for packages that asked
+for one, which is also what keeps the reclaim policy below small.
+
 ## Reclaiming space
 
 A budget over `<cache>/builddir`, enforced before a build starts, evicting whole
@@ -160,6 +167,32 @@ saving is likely and unproven.
 Exposing `--repackage` as a per-build action would make the salvage explicit
 rather than depending on the build system's incrementality. That is a separate
 change and is not proposed here.
+
+## Rejected: making `BUILDDIR` equal `startdir`
+
+makepkg takes a different branch when `BUILDDIR` *is* `startdir`, giving
+`srcdir=$BUILDDIR/src` -- the layout a plain `makepkg` produces, where `..`
+from `$srcdir` is the directory holding the PKGBUILD and its local sources.
+Setting `BUILDDIR=/startdir` in the drop-in would therefore make PKGBUILDs like
+`unreal-engine`'s `../unreal-engine.sh` resolve, and it would work: `/startdir`
+is bind-mounted read-write (`--bind`, not `--bind-ro` -- the "not writeable"
+warning is file ownership), makepkg already runs with `cd /startdir`, and
+`makepkg.conf.d` drop-ins are sourced after `/etc/makepkg.conf`, so they
+override the `BUILDDIR=/build` that `makechrootpkg` appends.
+
+It is rejected because it makes AURCache lie. A package that built here would
+still fail under `extra-x86_64-build`, or for anyone running `makepkg` in a
+clean chroot -- so the service would ship packages whose PKGBUILDs are broken
+and hide the evidence, moving the failure onto users' machines. `$startdir` is
+discouraged in PKGBUILDs for exactly this reason; makepkg copies local sources
+into `$srcdir`, and `$srcdir/unreal-engine.sh` is the portable form.
+
+The right fix for such a package is to patch the PKGBUILD, which also benefits
+everyone else building it.
+
+Symlinking `/startdir`'s contents into `/build/<pkgbase>/` was considered and is
+strictly worse: it produces a hybrid layout matching neither convention, and
+risks shadowing the `src` and `pkg` directories makepkg creates there.
 
 ## Rejected: preserving the chroot copy
 
