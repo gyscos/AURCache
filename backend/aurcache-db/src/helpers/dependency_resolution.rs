@@ -14,6 +14,7 @@
 
 use aurcache_deps::{AurClient, Dependency, Resolutions, SatisfyIndex};
 use sea_orm::{ConnectionTrait, DbErr, EntityTrait};
+use std::collections::HashSet;
 
 use crate::packages;
 
@@ -43,6 +44,81 @@ impl From<&packages::Model> for PackageCandidate {
     }
 }
 
+/// The packages AURCache tracks, read once and reused.
+///
+/// Resolution needs every row, because a dependency can be satisfied by a
+/// package's own name, one of its split packages, or something it declares in
+/// `provides` -- none of which a `WHERE` clause can match against, since the
+/// last two are JSON columns. That makes each read a full table scan, so how
+/// long one snapshot may be reused is a correctness question, and a deliberate
+/// one:
+///
+/// - **An add** loads once. It resolves its whole graph before writing
+///   anything -- `persist_plan` does every insert at the end, in one
+///   transaction -- so the rows cannot change underneath it, and the packages
+///   it intends to add travel separately as `planned`. Planning a package with
+///   a hundred dependencies used to re-read the table once per package
+///   planned.
+/// - **A resync** loads once; it resolves a single package.
+/// - **The backfill migration** must load per package: it inserts rows as it
+///   recurses, so a snapshot would go stale and a package inserted earlier in
+///   the run would be resolved against the AUR and added a second time.
+///
+/// Held as a named value rather than cached invisibly so that each caller's
+/// choice is one it had to make.
+pub struct TrackedPackages {
+    candidates: Vec<PackageCandidate>,
+}
+
+impl TrackedPackages {
+    /// Read every tracked package.
+    ///
+    /// Every row counts, whatever state its last build left it in. A row's
+    /// status says how its build went, not whether a dependency on it is real,
+    /// and what actually gates a dependent is the dependee's latest
+    /// *successful build* ([`crate::helpers::builds::dependency_satisfied`]) —
+    /// which no filter here could speak for. Restricting this to
+    /// `ACTIVE`/`SUCCESS`/`ENQUEUED`, as it once did, only meant a `Failed` or
+    /// `WaitingForDeps` package went unrecognised here and was picked up a
+    /// stage later by its artifact sitting in the repository, which reports
+    /// "already published" and records no dependency link at all.
+    pub async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, DbErr> {
+        Ok(Self {
+            candidates: packages::Entity::find()
+                .all(db)
+                .await?
+                .iter()
+                .map(PackageCandidate::from)
+                .collect(),
+        })
+    }
+
+    /// Index the loaded rows, plus anything `planned`, under the names each
+    /// one answers to -- keeping only the names in `wanted`.
+    fn index(&self, planned: &[PackageCandidate], wanted: &HashSet<&str>) -> SatisfyIndex {
+        let mut index = SatisfyIndex::new();
+        for candidate in self.candidates.iter().chain(planned) {
+            // A row's own name is its pkgbase, and it carries the `provides`
+            // for the base as a whole.
+            index.insert_package(
+                &candidate.name,
+                &candidate.name,
+                // Nothing here has a version: these are matched to decide
+                // whether a dependency *edge* should exist, and the edge
+                // records the constraint for the build queue to check against
+                // real builds.
+                None,
+                parse_json_list(candidate.provides.as_deref()),
+                wanted,
+            );
+            for split in parse_json_list(candidate.split_packages.as_deref()) {
+                index.insert_package(&split, &candidate.name, None, Vec::<String>::new(), wanted);
+            }
+        }
+        index
+    }
+}
+
 /// Resolve `deps` to what should happen about each of them.
 ///
 /// `planned` are packages an in-flight add intends to insert. An add resolves
@@ -54,63 +130,17 @@ impl From<&packages::Model> for PackageCandidate {
 ///
 /// `platforms` scopes AURCache's own repository, which is stored one directory
 /// per platform; empty means every platform present.
-pub async fn resolve_dependencies<C: ConnectionTrait>(
+pub async fn resolve_dependencies(
     client: &AurClient,
-    db: &C,
+    tracked: &TrackedPackages,
     deps: &[Dependency<'_>],
     planned: &[PackageCandidate],
     platforms: &[String],
 ) -> Result<Resolutions, aurcache_deps::Error> {
     let wanted = deps.iter().map(|dep| dep.name).collect();
-    let tracked = tracked_index(db, planned, &wanted)
+    client
+        .resolve_dependencies(deps, &tracked.index(planned, &wanted), platforms)
         .await
-        .map_err(|e| aurcache_deps::Error::Rpc(e.to_string()))?;
-
-    client.resolve_dependencies(deps, &tracked, platforms).await
-}
-
-/// Index every package AURCache tracks, plus anything `planned`, under the
-/// names each one answers to.
-///
-/// Every row counts, whatever state its last build left it in. A row's status
-/// says how its build went, not whether a dependency on it is real, and what
-/// actually gates a dependent is the dependee's latest *successful build*
-/// (`helpers::builds::dependency_satisfied`) — which no filter here could
-/// speak for. Restricting this to `ACTIVE`/`SUCCESS`/`ENQUEUED`, as it once
-/// did, only meant a `Failed` or `WaitingForDeps` package went unrecognised
-/// here and was picked up a stage later by its artifact sitting in the
-/// repository, which reports "already available" and records no dependency
-/// link at all.
-async fn tracked_index<C: ConnectionTrait>(
-    db: &C,
-    planned: &[PackageCandidate],
-    wanted: &std::collections::HashSet<&str>,
-) -> Result<SatisfyIndex, DbErr> {
-    let rows = packages::Entity::find().all(db).await?;
-    let candidates = rows
-        .iter()
-        .map(PackageCandidate::from)
-        .chain(planned.iter().cloned());
-
-    let mut index = SatisfyIndex::new();
-    for candidate in candidates {
-        // A row's own name is its pkgbase, and it carries the `provides` for
-        // the base as a whole.
-        index.insert_package(
-            &candidate.name,
-            &candidate.name,
-            // Nothing here has a version: these are matched to decide whether
-            // a dependency *edge* should exist, and the edge records the
-            // constraint for the build queue to check against real builds.
-            None,
-            parse_json_list(candidate.provides.as_deref()),
-            wanted,
-        );
-        for split in parse_json_list(candidate.split_packages.as_deref()) {
-            index.insert_package(&split, &candidate.name, None, Vec::<String>::new(), wanted);
-        }
-    }
-    Ok(index)
 }
 
 fn parse_json_list(json: Option<&str>) -> Vec<String> {

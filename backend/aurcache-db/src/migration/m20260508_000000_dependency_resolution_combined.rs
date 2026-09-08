@@ -2,7 +2,7 @@ use crate::builds;
 use crate::dependencies;
 use crate::files;
 use crate::helpers::dbtype::database_type;
-use crate::helpers::dependency_resolution::resolve_dependencies;
+use crate::helpers::dependency_resolution::{TrackedPackages, resolve_dependencies};
 use crate::packages;
 use crate::settings;
 use async_recursion::async_recursion;
@@ -694,13 +694,19 @@ async fn ensure_deps(
             )
         })
         .collect();
-    let resolved_deps = match resolve_dependencies(client, db, &deps_to_resolve, &[], &[]).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("dependency resolution failed for {pkgbase}: {e}");
-            return Ok(());
-        }
-    };
+    // Loaded per package rather than once for the run: `ensure_deps` inserts
+    // rows as it recurses, so a snapshot taken outside this loop would go
+    // stale and a package added earlier in the backfill would be resolved
+    // against the AUR and inserted a second time.
+    let tracked = TrackedPackages::load(db).await?;
+    let resolved_deps =
+        match resolve_dependencies(client, &tracked, &deps_to_resolve, &[], &[]).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("dependency resolution failed for {pkgbase}: {e}");
+                return Ok(());
+            }
+        };
     if !resolved_deps.unresolved.is_empty() {
         tracing::warn!(
             "{pkgbase}: no package provides {}",

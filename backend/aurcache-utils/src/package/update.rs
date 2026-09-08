@@ -361,9 +361,13 @@ async fn resolve_dependency_edges(
     }
 
     let pairs = declared.to_pairs();
+    // One package, one resolution, so the snapshot lives no longer than this
+    // call.
+    let tracked =
+        aurcache_db::helpers::dependency_resolution::TrackedPackages::load(services.db).await?;
     let resolved_deps = aurcache_db::helpers::dependency_resolution::resolve_dependencies(
         services.client,
-        services.db,
+        &tracked,
         &crate::pkg::as_dependencies(&pairs),
         &[],
         &crate::pkg::platform_names(&pkg_model.platforms),

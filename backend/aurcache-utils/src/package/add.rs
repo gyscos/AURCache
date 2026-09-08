@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
-use aurcache_db::helpers::dependency_resolution::PackageCandidate;
+use aurcache_db::helpers::dependency_resolution::{PackageCandidate, TrackedPackages};
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
@@ -50,6 +50,21 @@ struct PlannedPackage {
     provides: Option<String>,
     /// Only the package the user actually asked for; dependencies are not.
     directly_requested: bool,
+}
+
+/// What a plan is built against: services and settings, all read-only for the
+/// duration of the plan.
+///
+/// Grouped for the same reason `update`'s `Services` is -- the planning
+/// recursion threads every one of these through unchanged, and passing them
+/// individually made each hop a seven-argument call.
+struct PlanContext<'a> {
+    client: &'a aurcache_deps::AurClient,
+    store: &'a SnapshotStore,
+    db: &'a DatabaseConnection,
+    /// The tracked packages, read once for the whole plan.
+    tracked: &'a TrackedPackages,
+    context: &'a AddContext,
 }
 
 /// A dependency edge, held by *name* because planned packages have no id until
@@ -233,12 +248,19 @@ async fn finalize_package_add(
     let mut plan = AddPlan::default();
     let requested = package_spec.pkgbase.clone();
 
+    // One snapshot for the whole plan: nothing is written until `persist_plan`,
+    // so re-reading the packages table for each package planned would return
+    // the same rows every time.
+    let tracked = TrackedPackages::load(db).await?;
     plan_package_with_deps(
-        client,
-        store,
-        db,
+        &PlanContext {
+            client,
+            store,
+            db,
+            tracked: &tracked,
+            context,
+        },
         package_spec,
-        context,
         &mut visited,
         &mut plan,
     )
@@ -383,14 +405,14 @@ pub(crate) async fn add_resolved_source(
 #[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn plan_dependency_recursive(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
+    plan_context: &PlanContext<'_>,
     pkgbase: &str,
-    context: &AddContext,
     visited: &mut HashSet<String>,
     plan: &mut AddPlan,
 ) -> anyhow::Result<()> {
+    let PlanContext {
+        store, db, context, ..
+    } = plan_context;
     // `visited` is the plan's name set: it already prevents planning the same
     // pkgbase twice, so the plan needs no separate "already planned?" lookup.
     if !visited.insert(pkgbase.to_string()) {
@@ -411,7 +433,7 @@ async fn plan_dependency_recursive(
         &architectures_for_platforms(&context.platforms_str),
     )
     .await?;
-    plan_package_with_deps(client, store, db, package_spec, context, visited, plan).await
+    plan_package_with_deps(plan_context, package_spec, visited, plan).await
 }
 
 pub(crate) async fn ensure_aur_package_exists_recursive(
@@ -431,12 +453,16 @@ pub(crate) async fn ensure_aur_package_exists_recursive(
     };
     let mut visited = HashSet::new();
     let mut plan = AddPlan::default();
+    let tracked = TrackedPackages::load(db).await?;
     plan_dependency_recursive(
-        client,
-        store,
-        db,
+        &PlanContext {
+            client,
+            store,
+            db,
+            tracked: &tracked,
+            context: &context,
+        },
         pkgbase,
-        &context,
         &mut visited,
         &mut plan,
     )
@@ -450,14 +476,17 @@ pub(crate) async fn ensure_aur_package_exists_recursive(
 /// Writes nothing: results accumulate into `plan` so the whole graph can be
 /// persisted in one transaction afterwards.
 async fn plan_package_with_deps(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
+    plan_context: &PlanContext<'_>,
     package_spec: PackageInsertSpec,
-    context: &AddContext,
     visited: &mut HashSet<String>,
     plan: &mut AddPlan,
 ) -> anyhow::Result<()> {
+    let &PlanContext {
+        client,
+        tracked,
+        context,
+        ..
+    } = plan_context;
     let pairs = package_spec.deps.to_pairs();
     let resolved_deps = if pairs.is_empty() {
         aurcache_deps::Resolutions::default()
@@ -466,7 +495,7 @@ async fn plan_package_with_deps(
         // they are offered alongside the rows that are.
         aurcache_db::helpers::dependency_resolution::resolve_dependencies(
             client,
-            db,
+            tracked,
             &crate::pkg::as_dependencies(&pairs),
             &plan.candidates(),
             &crate::pkg::platform_names(&context.platforms_str),
@@ -518,8 +547,7 @@ async fn plan_package_with_deps(
         // outputs, or a name plus something it provides), so plan it once —
         // but merge every one of their constraints onto the single edge.
         if planned_pkgbases.insert(dep_pkgbase.clone()) && needs_building {
-            plan_dependency_recursive(client, store, db, dep_pkgbase, context, visited, plan)
-                .await?;
+            plan_dependency_recursive(plan_context, dep_pkgbase, visited, plan).await?;
         }
         crate::pkg::merge_constraint_into(
             &mut dep_constraints_by_pkgbase,
