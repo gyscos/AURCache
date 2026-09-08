@@ -125,10 +125,27 @@ emulated architecture.
 
 ## Opt-in, per package
 
-Off by default. A clean tree per build is the guarantee chroot builds exist to
-provide, and reuse trades it away: a poisoned checkout, a half-applied patch or
-a stale generated file would silently affect later builds, and the symptom would
-appear far from the cause.
+Off by default, though for a narrower reason than first assumed.
+
+Re-applied patches were the worry, and they are **not** a problem. Tested with
+`libpng12`, whose `prepare()` does `patch -Np1` against a tarball source: three
+consecutive `makepkg -o` runs against one persistent `BUILDDIR` all exited 0
+with no "reversed (or previously applied)" anywhere. `extract_sources` unpacks
+over the existing tree and bsdtar overwrites, so `prepare()` always sees
+pristine sources. A file the tarball contains is restored even if the previous
+run scribbled on it.
+
+What survives re-extraction is everything the tarball does *not* contain --
+confirmed in the same test: a planted `config.cache` and `png.o` were both
+still there afterwards. That is the actual risk, and it is inseparable from the
+benefit: leftover object files are what make an incremental rebuild fast, and
+also what makes it wrong when compiler flags changed underneath them, or when a
+killed build left something half-written. Such a failure produces a package
+that is quietly incorrect rather than one that fails loudly, which is the
+expensive kind.
+
+That risk, plus disk, is the case for off by default -- not build hygiene in
+general. The chroot itself is still fresh every build; only the tree persists.
 
 Resolved through `ApplicationSettings` like every other package setting, with
 the established precedence `Package -> Env -> Global -> Default`. The packages
