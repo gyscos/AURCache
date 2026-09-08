@@ -44,24 +44,57 @@ pub(crate) fn snapshot_url(rpc_url: &str, pkgbase: &str) -> String {
     format!("{base}/cgit/aur.git/snapshot/{pkgbase}.tar.gz")
 }
 
-/// Move every dependency `resolve` can answer out of `remaining` and into
-/// `resolutions`.
+/// What each source says about one dependency name.
 ///
-/// The stages of [`AurClient::resolve_dependencies`] differ only in how they
-/// answer, so this holds what they share: ask, record a hit, leave a miss for
-/// the next stage.
-fn take_resolved(
-    remaining: &mut Vec<Dependency<'_>>,
-    resolutions: &mut Resolutions,
-    resolve: impl Fn(&Dependency<'_>) -> Option<DependencyResolution>,
-) {
-    remaining.retain(|dep| match resolve(dep) {
-        Some(resolution) => {
-            resolutions.found.insert(dep.name.to_string(), resolution);
-            false
+/// The columns of the truth table in
+/// [`AurClient::resolve_dependencies`], gathered separately so that combining
+/// them is a pure function. [`Evidence::outcome`] is the only encoding of the
+/// precedence rule anywhere in the crate: changing what beats what means
+/// changing those three branches and nothing else.
+#[derive(Debug, Default, Clone)]
+struct Evidence {
+    /// The pkgbase of a tracked package claiming the name.
+    tracked: Option<String>,
+    /// A repository lists the name at a version satisfying the constraint.
+    published: bool,
+    /// The pkgbase the AUR could build for it.
+    aur: Option<String>,
+}
+
+impl Evidence {
+    /// Combine the evidence. `None` means nothing anywhere provides the name.
+    fn outcome(&self) -> Option<DependencyResolution> {
+        if let Some(pkgbase) = &self.tracked {
+            return Some(DependencyResolution::Local {
+                pkgbase: pkgbase.clone(),
+            });
         }
-        None => true,
-    });
+        if self.published {
+            return Some(DependencyResolution::Available);
+        }
+        if let Some(pkgbase) = &self.aur {
+            return Some(DependencyResolution::Aur {
+                pkgbase: pkgbase.clone(),
+            });
+        }
+        None
+    }
+}
+
+/// The names no column has settled yet, in declared order.
+///
+/// Gathering a column costs something -- a disk read, a network round trip --
+/// so each is asked only about what is still open. That this is safe is not a
+/// second statement of the precedence rule: it *asks* [`Evidence::outcome`],
+/// which returns on the first column that answers, so a column that gets
+/// skipped provably could not have changed the result. Reordering the
+/// gathering below can change how much work happens, never the answer.
+fn undecided<'a>(evidence: &[(Dependency<'a>, Evidence)]) -> Vec<&'a str> {
+    evidence
+        .iter()
+        .filter(|(_, found)| found.outcome().is_none())
+        .map(|(dep, _)| dep.name)
+        .collect()
 }
 
 impl AurClient {
@@ -299,68 +332,71 @@ impl AurClient {
         tracked: &SatisfyIndex,
         platforms: &[String],
     ) -> Result<Resolutions, Error> {
-        let mut resolutions = Resolutions::default();
-
         // A pkgbase can name the same dependency in `depends` and
         // `makedepends`, and its split packages multiply that again.
-        let mut remaining: Vec<Dependency<'_>> = Vec::new();
         let mut seen = HashSet::new();
+        let mut evidence: Vec<(Dependency<'_>, Evidence)> = Vec::new();
         for dep in deps {
             if seen.insert(dep.name) {
-                remaining.push(*dep);
+                evidence.push((*dep, Evidence::default()));
             }
         }
 
-        take_resolved(&mut remaining, &mut resolutions, |dep| {
-            tracked
+        // Column 1: what the caller already tracks. In memory; costs nothing.
+        for (dep, found) in &mut evidence {
+            found.tracked = tracked
                 .best_match(dep.name, |_| true)
-                .map(|found| DependencyResolution::Local {
-                    pkgbase: found.pkgbase.clone(),
-                })
-        });
-        if remaining.is_empty() {
-            return Ok(resolutions);
+                .map(|matched| matched.pkgbase.clone());
         }
 
-        let wanted: HashSet<&str> = remaining.iter().map(|dep| dep.name).collect();
-        let repositories = {
-            let mut index = self.local_repo_index(&wanted, platforms)?;
-            index.extend(self.official_repo_index(&wanted).await?);
-            index
-        };
-        take_resolved(&mut remaining, &mut resolutions, |dep| {
-            repositories
-                .best_match(dep.name, |candidate| candidate.satisfies(dep.constraint))
-                .map(|_| DependencyResolution::Available)
-        });
-        if remaining.is_empty() {
-            return Ok(resolutions);
+        // Column 2: what the repositories publish. From disk.
+        let open = undecided(&evidence);
+        if !open.is_empty() {
+            let wanted: HashSet<&str> = open.iter().copied().collect();
+            let mut repositories = self.local_repo_index(&wanted, platforms)?;
+            repositories.extend(self.official_repo_index(&wanted).await?);
+            for (dep, found) in &mut evidence {
+                if found.outcome().is_some() {
+                    continue;
+                }
+                found.published = repositories
+                    .best_match(dep.name, |candidate| candidate.satisfies(dep.constraint))
+                    .is_some();
+            }
         }
 
-        // One request for every remaining name, not one per name:
-        // `resolve_bases` chunks by URL length, so this is a single call for
-        // any realistic dependency list.
-        let names: Vec<&str> = remaining.iter().map(|dep| dep.name).collect();
-        let exact_aur_bases = self.resolve_bases(&names).await?;
-        take_resolved(&mut remaining, &mut resolutions, |dep| {
-            exact_aur_bases
-                .get(dep.name)
-                .map(|pkgbase| DependencyResolution::Aur {
-                    pkgbase: pkgbase.clone(),
-                })
-        });
+        // Column 3: the AUR, by exact package name. One request for every
+        // remaining name, not one per name: `resolve_bases` chunks by URL
+        // length, so this is a single call for any realistic dependency list.
+        let open = undecided(&evidence);
+        if !open.is_empty() {
+            let exact_aur_bases = self.resolve_bases(&open).await?;
+            for (dep, found) in &mut evidence {
+                if found.outcome().is_some() {
+                    continue;
+                }
+                found.aur = exact_aur_bases.get(dep.name).cloned();
+            }
+        }
 
-        for dep in remaining {
-            match self.aur_provider_pkgbase(dep.name).await? {
-                Some(pkgbase) => {
-                    resolutions
-                        .found
-                        .insert(dep.name.to_string(), DependencyResolution::Aur { pkgbase });
+        // Column 4: the AUR, by `provides`. No bulk form, so one request each
+        // -- which is why it is asked last, of the fewest names.
+        for (dep, found) in &mut evidence {
+            if found.outcome().is_some() {
+                continue;
+            }
+            found.aur = self.aur_provider_pkgbase(dep.name).await?;
+        }
+
+        let mut resolutions = Resolutions::default();
+        for (dep, found) in evidence {
+            match found.outcome() {
+                Some(resolution) => {
+                    resolutions.found.insert(dep.name.to_string(), resolution);
                 }
                 None => resolutions.unresolved.push(dep.name.to_string()),
             }
         }
-
         Ok(resolutions)
     }
 
@@ -459,6 +495,77 @@ impl AurClient {
         Ok(index
             .best_match(dep_name, |_| true)
             .map(|found| found.pkgbase.clone()))
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::Evidence;
+    use crate::model::DependencyResolution;
+
+    fn evidence(tracked: bool, published: bool, aur: bool) -> Evidence {
+        Evidence {
+            tracked: tracked.then(|| "tracked-base".to_string()),
+            published,
+            aur: aur.then(|| "aur-base".to_string()),
+        }
+    }
+
+    /// Every combination of the three columns, so the precedence rule is
+    /// pinned by a test rather than by the order of statements that happen to
+    /// gather it. No repository, no database, no network.
+    #[test]
+    fn the_truth_table_holds_for_every_combination() {
+        let local = Some(DependencyResolution::Local {
+            pkgbase: "tracked-base".to_string(),
+        });
+        let available = Some(DependencyResolution::Available);
+        let aur = Some(DependencyResolution::Aur {
+            pkgbase: "aur-base".to_string(),
+        });
+
+        // (tracked, published, aur) -> outcome
+        let cases = [
+            ((true, true, true), local.clone()),
+            ((true, true, false), local.clone()),
+            ((true, false, true), local.clone()),
+            ((true, false, false), local),
+            ((false, true, true), available.clone()),
+            ((false, true, false), available),
+            ((false, false, true), aur),
+            ((false, false, false), None),
+        ];
+
+        for ((tracked, published, in_aur), expected) in cases {
+            assert_eq!(
+                evidence(tracked, published, in_aur).outcome(),
+                expected,
+                "tracked={tracked} published={published} aur={in_aur}"
+            );
+        }
+    }
+
+    /// The property the short-circuit in `undecided` relies on: once a column
+    /// answers, no later column can change the outcome. If this ever stops
+    /// holding, skipping the remaining columns stops being safe.
+    #[test]
+    fn later_columns_cannot_override_an_earlier_answer() {
+        for published in [false, true] {
+            for in_aur in [false, true] {
+                assert_eq!(
+                    evidence(true, published, in_aur).outcome(),
+                    evidence(true, false, false).outcome(),
+                    "a tracked package must decide regardless of later columns"
+                );
+            }
+        }
+        for in_aur in [false, true] {
+            assert_eq!(
+                evidence(false, true, in_aur).outcome(),
+                evidence(false, true, false).outcome(),
+                "a published package must decide regardless of the AUR"
+            );
+        }
     }
 }
 
