@@ -212,7 +212,12 @@ async fn run_job_inner(
     if job.persistent_builddir {
         // Before the build, so the reserve is what bounds usage going in
         // rather than a post-hoc tidy. Never drops this package's own tree.
-        cache.reclaim_builddirs(&job.arch, &job.pkgbase, cfg.core.builddir_min_free);
+        cache.reclaim_builddirs(
+            &job.arch,
+            &job.pkgbase,
+            cfg.core.builddir_max_bytes,
+            cfg.core.builddir_min_free,
+        );
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
         } else {
@@ -492,6 +497,13 @@ async fn run_build(
     let peak_memory_bytes = build_cgroup
         .as_ref()
         .and_then(crate::cgroup::BuildCgroup::peak_bytes);
+    // Measure the tree now rather than during the next reclaim: the cost rides
+    // on a build that already took minutes, instead of walking every candidate
+    // on every future build.
+    if job.persistent_builddir {
+        cache.record_builddir_size(&job.arch, &job.pkgbase);
+    }
+
     let mut report = if timed_out {
         report::timeout_failure(started.elapsed().as_secs())
     } else {

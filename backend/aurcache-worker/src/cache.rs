@@ -68,58 +68,108 @@ impl Cache {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
     }
 
-    /// Drop persistent build trees until the filesystem has `min_free` bytes
-    /// spare, oldest first, never touching `keep`.
+    /// Name of the file caching a tree's measured size, written after each
+    /// build so reclaim never has to walk one.
+    const SIZE_STAMP: &'static str = ".aurcache-size";
+
+    /// Record how big a package's persistent tree is, so reclaim can total the
+    /// cache without walking it.
     ///
-    /// Measured as *free space* rather than as a size budget over the trees.
-    /// Summing them would mean walking directories that reach 130 GB and
-    /// millions of files, which costs minutes per build; `statvfs` is constant
-    /// time. It is also the question actually worth asking -- an operator cares
-    /// that the disk does not fill, which is the failure this whole feature was
-    /// written after, not that some notional allowance was respected.
+    /// Called once after a build, where the cost rides on top of something that
+    /// already took minutes or hours. Measuring during reclaim instead would
+    /// mean walking every candidate on every build, and these trees reach
+    /// 130 GB and millions of files.
+    pub fn record_builddir_size(&self, platform: &str, pkgbase: &str) {
+        let Some(tree) = self.builddir(platform).map(|r| r.join(sanitize(pkgbase))) else {
+            return;
+        };
+        if !tree.is_dir() {
+            return;
+        }
+        let size = dir_size(&tree);
+        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), size.to_string()) {
+            tracing::debug!("could not record size of {}: {e}", tree.display());
+        }
+    }
+
+    /// Drop persistent build trees, oldest first, until the cache is within
+    /// `max_bytes` *and* the filesystem has `min_free` bytes spare. Never
+    /// touches `keep`.
+    ///
+    /// Two limits because they answer different questions, and each is useless
+    /// alone. A free-space floor does nothing on a large pool -- trees would
+    /// grow into the terabytes before it ever triggered -- so `max_bytes` is
+    /// what actually bounds the cache, independently of how big the underlying
+    /// storage is. But a cap alone cannot see the rest of the machine, so the
+    /// floor still covers a small disk, or one shared with something else that
+    /// grew.
+    ///
+    /// Sizes come from the stamp each build leaves behind; a tree without one
+    /// is walked once and stamped. So the usual case totals the cache by
+    /// reading a handful of small files.
     ///
     /// Whole trees, never partial contents: half a tree is worse than none,
     /// because makepkg would treat it as resumable.
     ///
-    /// Best-effort. Failing to reclaim space is worth reporting and carrying
-    /// on; refusing to build over it would turn a full disk into an idle
-    /// worker.
-    pub fn reclaim_builddirs(&self, platform: &str, keep: &str, min_free: u64) {
+    /// Best-effort. Failing to reclaim is worth reporting and carrying on;
+    /// refusing to build over it would turn a full disk into an idle worker.
+    pub fn reclaim_builddirs(&self, platform: &str, keep: &str, max_bytes: u64, min_free: u64) {
         let Some(root) = self.builddir(platform) else {
             return;
         };
-        if min_free == 0 {
-            return;
-        }
 
         // Oldest first. `mtime` on the tree root moves whenever a build writes
         // into it, which makes it a serviceable "last used".
-        let mut trees: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&root)
+        let mut trees: Vec<(std::time::SystemTime, PathBuf, u64)> = std::fs::read_dir(&root)
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy() != keep)
             .filter_map(|e| {
                 let modified = e.metadata().ok()?.modified().ok()?;
-                Some((modified, e.path()))
+                let path = e.path();
+                let size = Self::stamped_size(&path);
+                Some((modified, path, size))
             })
             .collect();
-        trees.sort_by_key(|(modified, _)| *modified);
+        trees.sort_by_key(|(modified, _, _)| *modified);
 
-        for (_, path) in trees {
-            match free_bytes(&root) {
-                Some(free) if free >= min_free => return,
-                None => return,
-                Some(_) => {}
+        let mut total: u64 = trees.iter().map(|(_, _, size)| size).sum();
+
+        for (_, path, size) in trees {
+            let over_budget = max_bytes > 0 && total > max_bytes;
+            let short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
+            if !over_budget && !short_of_free {
+                return;
+            }
+            // The tree this build is about to use is the one thing worth
+            // keeping, even when it is itself what breaches the budget.
+            if path.file_name().is_some_and(|n| n == keep) {
+                continue;
             }
             match std::fs::remove_dir_all(&path) {
-                Ok(()) => tracing::info!(
-                    "reclaimed persistent build tree {} to free space",
-                    path.display()
-                ),
+                Ok(()) => {
+                    total = total.saturating_sub(size);
+                    tracing::info!(
+                        "reclaimed persistent build tree {} ({size} bytes)",
+                        path.display()
+                    );
+                }
                 Err(e) => tracing::warn!("could not reclaim {}: {e}", path.display()),
             }
         }
+    }
+
+    /// A tree's recorded size, measuring and stamping it if no stamp is there.
+    fn stamped_size(tree: &Path) -> u64 {
+        let stamp = tree.join(Self::SIZE_STAMP);
+        if let Ok(text) = std::fs::read_to_string(&stamp)
+            && let Ok(size) = text.trim().parse()
+        {
+            return size;
+        }
+        let size = dir_size(tree);
+        let _ = std::fs::write(&stamp, size.to_string());
+        size
     }
 
     /// Shared persistent GnuPG home for validpgpkeys.
@@ -504,6 +554,59 @@ mod pkgcache_tests {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
+    /// Oldest trees go first, the budget is what decides how many, and the
+    /// tree the build is about to use is never one of them -- even when it is
+    /// itself what breaches the budget, since evicting it would defeat the
+    /// whole point of having asked for it.
+    #[test]
+    fn reclaim_evicts_oldest_but_never_the_one_in_use() {
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+
+        // Three trees of 100 bytes each, aged oldest -> newest.
+        for (name, age) in [("old", 300), ("mid", 200), ("wanted", 100)] {
+            let tree = root.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+            let when = SystemTime::now() - Duration::from_secs(age);
+            std::fs::File::open(&tree)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+
+        // Room for one tree, so two must go -- but "wanted" is in use.
+        c.reclaim_builddirs("x86_64", "wanted", 150, 0);
+
+        assert!(!root.join("old").exists(), "oldest should go first");
+        assert!(!root.join("mid").exists(), "second oldest should follow");
+        assert!(
+            root.join("wanted").exists(),
+            "the tree this build needs must survive"
+        );
+    }
+
+    /// A tree with no stamp is measured rather than counted as free.
+    #[test]
+    fn an_unstamped_tree_is_measured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+        let tree = root.join("unstamped");
+        std::fs::create_dir_all(tree.join("deep")).unwrap();
+        write(&tree.join("deep").join("blob"), 4096);
+
+        assert_eq!(Cache::stamped_size(&tree), 4096);
+        // And it is stamped, so the walk happens once.
+        assert_eq!(
+            std::fs::read_to_string(tree.join(Cache::SIZE_STAMP)).unwrap(),
+            "4096"
+        );
+    }
+
     #[test]
     fn only_finished_archives_are_promoted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -591,4 +694,24 @@ fn free_bytes(path: &Path) -> Option<u64> {
     // valid out-parameter.
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) };
     (rc == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Bytes occupied under `path`, following no symlinks.
+///
+/// Only ever called for a tree with no size stamp -- the first reclaim after
+/// one appears, or one left by an older version.
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }

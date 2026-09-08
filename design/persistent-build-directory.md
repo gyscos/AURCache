@@ -143,33 +143,42 @@ for one, which is also what keeps the reclaim policy below small.
 
 ## Reclaiming space
 
-**A free-space reserve, not a size budget.** Before a build that will use a
-persistent tree, drop trees oldest-first until the filesystem has
+**Two limits, because each is useless alone.** Before a build that will use a
+persistent tree, drop trees oldest-first until the cache is within
+`WORKER_BUILDDIR_MAX_BYTES` (default 200 GiB) *and* the filesystem has
 `WORKER_BUILDDIR_MIN_FREE` bytes spare (default 50 GiB).
 
-This was designed as a budget over the total size of `<cache>/builddir`, and
-changed during implementation. Summing the trees means walking directories that
-reach 130 GB and millions of files, which costs minutes on every build;
-`statvfs` is constant time. It is also the better question: an operator cares
-that the disk does not fill -- the failure this whole feature was written after
--- not that a notional allowance was respected. A budget would also have been
-wrong whenever anything *else* on the same filesystem grew.
+This was first designed as a size budget, implemented as a free-space floor,
+and is now both. The floor alone was wrong: on a NAS pool with terabytes spare
+it never triggers, so trees accumulate indefinitely -- the cache would grow
+into the terabytes before anything reclaimed it, and "the disk is not full yet"
+is not a reason to keep every build tree ever made. The cap is what bounds the
+cache independently of how large the underlying storage is. But a cap alone
+cannot see the rest of the machine, so the floor still covers a small disk, or
+one shared with something else that grew.
+
+Sizes come from a `.aurcache-size` stamp each build leaves in its tree, so
+reclaim totals the cache by reading a handful of small files. A tree without a
+stamp is walked once and stamped. This is what makes a cap affordable at all:
+summing by walking would mean traversing 130 GB and millions of files on every
+build, whereas measuring once after a build that already took hours costs
+nothing noticeable.
 
 - Whole trees, never partial contents: half a tree is worse than none, because
   makepkg would treat it as resumable.
-- Before the build rather than after, so the reserve bounds usage going in.
-- Never the tree the current build is about to use.
+- Before the build rather than after, so the limits bound usage going in.
+- Never the tree the current build is about to use -- even when that tree is
+  itself what breaches the cap, since evicting it defeats the point of asking.
 - Least-recently-used by the tree root's `mtime`, which moves whenever a build
   writes into it.
-- A worker setting rather than a server one: it is the worker's disk.
+- Worker settings rather than server ones: it is the worker's disk.
 - Best-effort. Failing to reclaim is reported and the build proceeds; refusing
   to build over it would turn a full disk into an idle worker.
 - The existing startup sweep is unaffected -- it removes `job-*` chroot copies,
   which are a different thing in a different directory.
 
-The reserve does not bound a *single* build: `unreal-engine` can grow by ~130 GB
-after the check passes. Nothing short of a quota would, and the reserve at least
-means the disk starts with room and other packages' trees give way first.
+Neither limit bounds a *single* build: `unreal-engine` can grow by ~130 GB after
+the check passes. Nothing short of a filesystem quota would.
 
 ## What this does not solve
 

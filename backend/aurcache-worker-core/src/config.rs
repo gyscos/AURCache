@@ -48,6 +48,8 @@ pub struct CoreConfig {
     /// Per-build timeout in seconds (`0` disables the worker-side timeout;
     /// the build is killed and reported as a timeout when exceeded).
     pub build_timeout: u64,
+    /// Total bytes the persistent build cache may occupy.
+    pub builddir_max_bytes: u64,
     /// Bytes to keep free on the persistent build-tree filesystem.
     pub builddir_min_free: u64,
     /// Overrides the host used in the `[repo]` section, for deployments where
@@ -192,10 +194,16 @@ impl CoreConfig {
             poll_interval: env_opt("WORKER_POLL_INTERVAL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
-            // Free space to keep spare on the build-tree filesystem. A
-            // worker setting, not a server one: it is this machine's disk.
-            // Default 50 GiB, which is generous for ordinary packages and
-            // deliberately not enough to make one opt-in fill a disk unnoticed.
+            // What bounds the persistent build cache. A cap rather than only
+            // a free-space floor, because a floor does nothing on a large pool:
+            // trees would grow into the terabytes before it ever triggered.
+            // Default 200 GiB -- enough for one very large tree, small enough
+            // that opting in a second makes an operator choose.
+            builddir_max_bytes: env_opt("WORKER_BUILDDIR_MAX_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(200 * 1024 * 1024 * 1024),
+            // Secondary floor, covering what the cap cannot see: a small disk,
+            // or one shared with something else that grew.
             builddir_min_free: env_opt("WORKER_BUILDDIR_MIN_FREE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50 * 1024 * 1024 * 1024),
