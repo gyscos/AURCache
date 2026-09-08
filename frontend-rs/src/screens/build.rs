@@ -3,9 +3,41 @@
 use crate::api::api_base;
 use crate::listing::ViewParams;
 use crate::routes::Route;
+use crate::status::BuildStatusBadge;
 use aurcache_client::AurCacheClient;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
+
+/// Whether the build has stopped changing, so the poll loop can stop with it.
+///
+/// Only `Successful` and `Failed` settle. Testing for "not `Active`" instead
+/// counted *enqueued* and *waiting for deps* as over, which showed a freshly
+/// queued build as finished and stopped the page updating when it later
+/// started.
+///
+/// An unrecognised state from a newer server does not settle: being wrong that
+/// way costs one poll per interval, while being wrong the other way is the bug
+/// above.
+fn settled(status: i32) -> bool {
+    BuildState::from_i32(status).is_some_and(|s| !s.is_in_progress())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_terminal_states_settle() {
+        assert!(settled(BuildState::Successful.as_i32()));
+        assert!(settled(BuildState::Failed.as_i32()));
+        assert!(!settled(BuildState::Active.as_i32()));
+        // The regression: queued is not finished.
+        assert!(!settled(BuildState::Enqueued.as_i32()));
+        assert!(!settled(BuildState::WaitingForDeps.as_i32()));
+        // A state this build of the UI has never heard of keeps it polling.
+        assert!(!settled(99));
+    }
+}
 
 /// The screen behind `/package/:pkgbase/build/:number`.
 #[component]
@@ -92,6 +124,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     let mut byte_offset = use_signal(|| 0u64);
     let mut line_count = use_signal(|| 0i32);
     let mut finished = use_signal(|| false);
+    // The build's real state, not just "is it over". "Not building" also covers
+    // *enqueued* and *waiting for deps*, and collapsing those into a boolean is
+    // what told someone their freshly queued build had already finished.
+    let mut status = use_signal(|| None::<i32>);
     // Filled from the same poll that decides when the log stops, so a build
     // claimed while this page is open names its worker without a reload.
     let mut worker_name = use_signal(|| None::<String>);
@@ -152,7 +188,18 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 // after the fetch above, so the last lines are never missed.
                 if let Ok(build) = client.get_build(&pkgbase, number).await {
                     worker_name.set(build.worker_name.clone());
-                    if !matches!(BuildState::from_i32(build.status), Some(BuildState::Active)) {
+                    status.set(Some(build.status));
+                    // Only a *settled* build stops the loop. `is_in_progress`
+                    // answers exactly this and keeps the queued states on the
+                    // right side of it; testing for `Active` alone treated an
+                    // enqueued build as over, so the page announced "finished"
+                    // and -- because this returns -- never updated again when
+                    // the build actually started.
+                    //
+                    // An unrecognised state from a newer server counts as in
+                    // progress: being wrong that way costs one poll per
+                    // interval, while being wrong the other way is this bug.
+                    if settled(build.status) {
                         finished.set(true);
                         return;
                     }
@@ -184,13 +231,18 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
             div { class: "card-body flex flex-col min-h-0",
                 div { class: "flex items-center gap-3",
-                    if finished() {
-                        span { class: "badge badge-ghost badge-sm", "finished" }
-                    } else {
-                        span { class: "badge badge-info badge-sm gap-1",
-                            span { class: "loading loading-spinner loading-xs" }
-                            "running"
+                    // The same badge the lists use, so a state means the same
+                    // thing everywhere and a new one added server-side breaks
+                    // the exhaustive match instead of rendering as a guess.
+                    if let Some(state) = status() {
+                        span { class: "flex items-center gap-2",
+                            BuildStatusBadge { status: state }
+                            if !finished() {
+                                span { class: "loading loading-spinner loading-xs opacity-60" }
+                            }
                         }
+                    } else {
+                        span { class: "badge badge-ghost badge-sm", "…" }
                     }
                     if let Some(worker) = worker_name() {
                         // Beside the state, because "what is it doing" and
