@@ -1,0 +1,179 @@
+# Persistent build directories
+
+Plan for keeping a package's build tree between builds, so a long compilation
+is not repeated from scratch, and so a failure late in a build is recoverable.
+
+Status: **not implemented**. This document is the design.
+
+---
+
+## The failure that prompted it
+
+`unreal-engine` compiled for 3h47m, reported `BUILD SUCCESSFUL`, and then died
+in `package()`:
+
+```
+install: cannot stat '../unreal-engine.sh': No such file or directory
+==> Removing chroot copy [/var/lib/aurcache-chroot/job-645-3001993]...done
+```
+
+Every byte of those four hours was inside the chroot copy, and the copy was
+deleted the moment the build ended. Nothing was recoverable. A retry would have
+started again from an empty tree -- and would have hit the same `package()` bug,
+because that failure is a PKGBUILD portability defect, not a transient one.
+
+The salvage that *should* have been available is `makepkg --repackage`, which
+skips download, extract, `prepare()` and `build()` and runs only `package()`
+against the existing `$srcdir`. Minutes rather than hours. It needs the build
+tree to still exist.
+
+## What persists today, and what does not
+
+| | keyed by | persists | holds |
+|---|---|---|---|
+| `SRCDEST` | pkgbase | **yes** | what makepkg *downloads* |
+| `BUILDDIR` | -- | **no** | what makepkg *extracts and builds* |
+
+`SRCDEST` is already per-package and persistent
+(`<cache>/srcdest/<pkgbase>`, 21 packages and 4.2 GB on the reference
+worker). It is bind-mounted into the chroot and survives everything. It is
+not shared between packages, deliberately: a single pooled `SRCDEST` was
+considered and rejected, because concurrent chain builds race on the same
+partial downloads.
+
+`BUILDDIR` is `/build` inside the chroot copy, so it dies with the copy.
+
+For most packages this is barely noticeable -- the sources are in `SRCDEST` and
+extraction is local. For `unreal-engine` it is the whole cost, because the
+UnrealEngine tree is **not declared in `source=()`**. It is cloned inside
+`prepare()`:
+
+```bash
+git clone --depth=1 --branch=${pkgver}-release git@github.com:EpicGames/UnrealEngine "${pkgname}"
+```
+
+so makepkg's download cache never sees it. `srcdest/unreal-engine` holds only
+the 1.59 GB toolchain tarball, while the build needed 129 GB. Everything else is
+fetched again on every attempt.
+
+That PKGBUILD is written expecting the tree to survive:
+
+```bash
+# Download Unreal Engine source or update if the folder exists
+if [[ ! -d "${pkgname}" ]]; then
+  git clone --depth=1 ...
+else
+  ...
+  git fetch --depth=1 origin tag ${pkgver}-release
+```
+
+The `else` branch has never once executed here.
+
+## Why this is possible at all
+
+makepkg only removes `$srcdir` when `--cleanbuild` is passed:
+
+```bash
+if (( CLEANBUILD )); then
+    rm -rf "$srcdir"; mkdir -p "$srcdir"
+fi
+cd_safe "$srcdir"
+extract_sources
+```
+
+Neither `makechrootpkg` nor AURCache passes it -- our makepkg arguments are
+`--noconfirm --noprogressbar --nocolor`, and `makechrootpkg`'s own `-C` is
+*checkpkg*, an unrelated flag. So an existing tree is kept and sources are
+re-extracted over it. Persistence requires no makepkg change; it requires only
+that `/build` outlive the chroot.
+
+## Layout
+
+makepkg derives the tree from `BUILDDIR` (makepkg lines 1295-1300):
+
+```bash
+if [[ $BUILDDIR -ef "$startdir" ]]; then
+	srcdir="$BUILDDIR/src"
+else
+	srcdir="$BUILDDIR/$pkgbase/src"
+	pkgdirbase="$BUILDDIR/$pkgbase/pkg"
+fi
+```
+
+Under `makechrootpkg`, `BUILDDIR=/build` and `startdir=/startdir`, so the second
+branch applies and the tree is `/build/<pkgbase>/src`.
+
+**makepkg therefore namespaces by pkgbase already.** A per-package host
+directory would nest the name twice for no gain. The host side needs to key by
+*platform* only:
+
+```
+<cache>/builddir/<platform>   →  bound at /build
+                                 └── <pkgbase>/src
+                                 └── <pkgbase>/pkg
+```
+
+Platform, because a build tree holds compiled objects. `SRCDEST` can be
+pkgbase-only since downloads are architecture-independent; an x86_64 and an
+aarch64 tree sharing a directory would corrupt each other. Keying by platform
+also removes the same-package race on a worker that builds a native and an
+emulated architecture.
+
+`pkg/` persists too. It is staging output, recreated per run, and harmless.
+
+## Opt-in, per package
+
+Off by default. A clean tree per build is the guarantee chroot builds exist to
+provide, and reuse trades it away: a poisoned checkout, a half-applied patch or
+a stale generated file would silently affect later builds, and the symptom would
+appear far from the cause.
+
+Resolved through `ApplicationSettings` like every other package setting, with
+the established precedence `Package -> Env -> Global -> Default`. The packages
+that want it are the ones where a rebuild costs hours, and there are few.
+
+## Reclaiming space
+
+A budget over `<cache>/builddir`, enforced before a build starts, evicting whole
+`<platform>/<pkgbase>` directories least-recently-used until the total fits.
+
+- Whole directories, never partial contents: half a build tree is worse than
+  none, because makepkg would treat it as resumable.
+- Before the build rather than after, so the budget is what bounds peak usage.
+- Never the tree the current build is about to use.
+- The existing startup sweep is unaffected -- it removes `job-*` chroot copies,
+  which are a different thing in a different directory.
+
+`unreal-engine` alone is ~130 GB, so the budget has to be an operator setting
+rather than a constant, and the default should be small enough that switching
+the feature on for one package cannot fill a disk by surprise.
+
+## What this does not solve
+
+A retry still re-runs `prepare()` and `build()`. `prepare()` does
+`git reset --hard`, which resets tracked files but leaves untracked build output
+(`Intermediate/`, `Binaries/`), so UnrealBuildTool should skip most compilation
+-- but that is an expectation, not a measurement, and it should be measured
+before being claimed. The guaranteed saving is the clone; the incremental-build
+saving is likely and unproven.
+
+Exposing `--repackage` as a per-build action would make the salvage explicit
+rather than depending on the build system's incrementality. That is a separate
+change and is not proposed here.
+
+## Rejected: preserving the chroot copy
+
+The first instinct after the `unreal-engine` failure was to stop passing
+`makechrootpkg -T` on failure, keeping the chroot for post-mortem.
+
+It is the wrong lever. What had value was `$srcdir`; the chroot was merely the
+container it sat in. The chroot's own contents -- `base-devel`, `git`,
+`openssh` -- are reproducible and cheap, a btrfs snapshot of the base costing
+close to nothing. With a persistent `BUILDDIR` the chroot becomes genuinely
+disposable, `-T` stays correct, and the thing worth keeping is no longer inside
+the thing being deleted.
+
+Keeping a failed chroot still has some value -- the exact set and versions of
+installed `makedepends` explain some failures -- but it is a diagnostic
+convenience, not recovery, and it would not have saved the four hours in any
+automatic way.
