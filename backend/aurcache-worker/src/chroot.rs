@@ -68,6 +68,9 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
         {
             tracing::warn!("chroot refresh returned non-zero:\n{log}");
         }
+        // Existing chroots too: this arrived after the first ones were built,
+        // and a chroot is long-lived.
+        ensure_multilib(&root).await;
         return Ok(root);
     }
 
@@ -96,7 +99,46 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     if !status.success() {
         bail!("mkarchroot failed:\n{log}");
     }
+    ensure_multilib(&root).await;
     Ok(root)
+}
+
+/// Install the 32-bit toolchain, where the architecture has one.
+///
+/// `base-devel` builds 64-bit only, so every `lib32-*` package -- which
+/// compiles with `-m32` -- failed at configure with the singularly unhelpful
+/// "C compiler cannot create executables". Sixteen of them did before this
+/// existed, while the packages that happened to declare `gcc-multilib` among
+/// their `makedepends` succeeded, which made it look like an intermittent
+/// problem with particular packages rather than a missing toolchain.
+///
+/// **In a transaction of its own, and never folded into `mkarchroot` or the
+/// `-Syu`.** pacman aborts an entire transaction when a single target cannot be
+/// resolved, so asking for this alongside `base-devel` would mean an
+/// architecture without multilib -- every one except x86_64 -- silently getting
+/// no toolchain at all rather than merely no 32-bit one. The container builder
+/// learned this the expensive way; `docker/add-aur.sh` carries the scar.
+///
+/// Best-effort for the same reason: absence is the expected case off x86_64,
+/// not a failure worth refusing to build over.
+async fn ensure_multilib(root: &Path) {
+    let mut cmd = devtools("arch-nspawn");
+    cmd.arg(root).args([
+        "pacman",
+        "-S",
+        "--needed",
+        "--noconfirm",
+        "--noprogressbar",
+        "multilib-devel",
+    ]);
+    match run_capture(cmd).await {
+        Ok((_, status)) if status.success() => {}
+        Ok((log, _)) => tracing::debug!(
+            "multilib-devel not installed (expected off x86_64); \
+             lib32-* packages will not build here:\n{log}"
+        ),
+        Err(e) => tracing::warn!("could not check for multilib-devel: {e:#}"),
+    }
 }
 
 /// Import the job's trusted PGP keys into a keyring inside the chroot copy's
