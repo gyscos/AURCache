@@ -696,15 +696,24 @@ pub async fn package_del(
     pkgbase: &str,
     a: Authenticated,
     al: &State<ActivityLog>,
+    store: &State<Arc<SnapshotStore>>,
 ) -> Result<(), ApiError> {
     let db = db.inner();
 
     // query this before removing package ownership!
     let pkg = package_by_pkgbase(db, pkgbase).await?;
+    let source_data = pkg.source_data.clone();
 
     package_remove(db, pkg.id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+
+    // The clone made for this package, now that nothing refers to it. Failing
+    // to remove it is not worth failing the delete over: the package is gone,
+    // and the boot-time prune sweeps whatever is left.
+    if let Err(e) = store.remove_checkout(&source_data).await {
+        warn!("could not remove source checkout for {pkgbase}: {e}");
+    }
 
     al.add(
         PackageDeleteActivity { package: pkg.name },

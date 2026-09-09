@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use aurcache_common::builder::BuildStates;
+use aurcache_common::source::SourceData;
 use aurcache_db::helpers::operations;
 use aurcache_db::prelude::{Builds, Files, Packages};
 use aurcache_db::{builds, files, packages};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
+use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
 use sea_orm::prelude::Expr;
@@ -344,6 +346,36 @@ async fn backfill_build_sizes(db: &DatabaseConnection) {
 
 /// Close out operations that were running when the server stopped.
 ///
+/// Remove source checkouts left behind by packages that no longer exist.
+///
+/// Run at boot, before the build queue, the schedulers and the API are
+/// started: [`SnapshotStore::prune_orphaned_checkouts`] cannot tell a clone
+/// that is in progress from one that is stranded, and at this point nothing
+/// else is resolving sources.
+///
+/// Boot is also the only moment that catches every way a checkout is
+/// stranded. Deleting a package removes its own checkout, but an add clones
+/// every package it plans before writing a single row, so an add that fails
+/// part-way leaves clones no row ever referred to. `/app` is persisted, so
+/// nothing else will ever clear them.
+pub async fn prune_source_checkouts(db: &DatabaseConnection, store: &SnapshotStore) {
+    let live: Vec<SourceData> = match Packages::find().all(db).await {
+        Ok(packages) => packages.into_iter().map(|pkg| pkg.source_data).collect(),
+        // Without the full list, every checkout looks orphaned. Removing them
+        // would be a slow, silent re-clone of everything at best.
+        Err(e) => {
+            warn!("could not list packages, skipping source checkout prune: {e}");
+            return;
+        }
+    };
+
+    match store.prune_orphaned_checkouts(&live).await {
+        Ok(0) => {}
+        Ok(removed) => info!("removed {removed} orphaned source checkout(s)"),
+        Err(e) => warn!("source checkout prune did not complete: {e}"),
+    }
+}
+
 /// See [`operations::close_orphaned`]; this only reports what it did.
 async fn close_orphaned_operations(db: &DatabaseConnection) {
     match operations::close_orphaned(db).await {

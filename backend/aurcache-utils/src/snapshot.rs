@@ -373,6 +373,92 @@ impl SnapshotStore {
         (oldest, newest)
     }
 
+    /// Forget a source: its cached snapshot and its persistent checkout.
+    ///
+    /// Called when a package is deleted, so the clone made for it does not
+    /// outlive it. Absent directories are not an error -- a package that was
+    /// never resolved has no checkout, and neither does one whose checkout a
+    /// previous prune already took.
+    pub async fn remove_checkout(&self, source_data: &SourceData) -> anyhow::Result<()> {
+        let cache_key = source_data.cache_key();
+        self.cache.lock().await.pop(&cache_key);
+
+        let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context(format!("could not remove checkout {}", path.display()))),
+        }
+    }
+
+    /// Remove every checkout under the root that no live source claims.
+    ///
+    /// Deleting a package is not the only way to strand a checkout, which is
+    /// why this exists alongside [`SnapshotStore::remove_checkout`] rather than
+    /// as a backstop for it. An add resolves its whole dependency graph --
+    /// cloning each package it plans -- before `persist_plan` writes a single
+    /// row, so an add that fails part-way leaves clones behind that no row ever
+    /// referred to and no delete path will ever visit. `remove_orphaned_
+    /// packages` likewise deletes rows directly, without going through
+    /// `package_delete`.
+    ///
+    /// Directories are matched by sanitized cache key, the same name
+    /// [`SnapshotStore`] checks out into. Sanitisation is many-to-one, so two
+    /// sources can want the same directory; that can only make this keep a
+    /// directory it might have removed, never remove one still in use.
+    ///
+    /// Best-effort per entry: a directory that cannot be removed is logged and
+    /// skipped, since one unreadable checkout should not stop the rest. Returns
+    /// how many were removed.
+    ///
+    /// **Call this only while nothing else is using the store.** It does not
+    /// coordinate with in-flight fetches, so a clone that has begun but not yet
+    /// been registered looks exactly like an orphan.
+    pub async fn prune_orphaned_checkouts(&self, keep: &[SourceData]) -> anyhow::Result<usize> {
+        let live: std::collections::HashSet<String> = keep
+            .iter()
+            .map(|source| sanitize_cache_key(&source.cache_key()))
+            .collect();
+
+        let mut entries = match tokio::fs::read_dir(&self.checkout_root).await {
+            Ok(entries) => entries,
+            // Nothing has been checked out yet, so nothing can be orphaned.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "could not read checkout root {}",
+                    self.checkout_root.display()
+                )));
+            }
+        };
+
+        let mut removed = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            // Only directories: a checkout is one, and anything else under the
+            // root was put there by something that is not this store.
+            if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| live.contains(name)) {
+                continue;
+            }
+            let path = entry.path();
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    tracing::info!("removed orphaned source checkout {}", path.display());
+                    removed += 1;
+                }
+                Err(e) => tracing::warn!(
+                    "could not remove orphaned source checkout {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        Ok(removed)
+    }
+
     pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<bool> {
         let cache_key = source_data.cache_key();
         let previous = {
@@ -1255,5 +1341,100 @@ license=('MIT')
 
         let after_refresh = store.sourceinfo(&source, Some(&patch)).await.unwrap();
         assert_eq!(after_refresh.base.version.to_string(), "2.0-1");
+    }
+
+    /// A deleted package's clone must not outlive it.
+    #[tokio::test]
+    async fn remove_checkout_takes_the_directory_and_the_cached_entry() {
+        let aur_root = tempfile::tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "foo", "1.0");
+        let (store, checkout_dir) = test_store(aur_root.path());
+        let source = SourceData::Aur {
+            name: "foo".to_string(),
+        };
+
+        store.sourceinfo(&source, None).await.unwrap();
+        let path = checkout_dir
+            .path()
+            .join(sanitize_cache_key(&source.cache_key()));
+        assert!(path.is_dir(), "the fetch should have left a checkout");
+        assert!(store.cache.lock().await.contains(&source.cache_key()));
+
+        store.remove_checkout(&source).await.unwrap();
+
+        assert!(!path.exists(), "the checkout outlived the package");
+        assert!(
+            !store.cache.lock().await.contains(&source.cache_key()),
+            "the snapshot outlived the package"
+        );
+    }
+
+    /// Deleting a package that was never resolved has no checkout to remove,
+    /// and that is not a failure.
+    #[tokio::test]
+    async fn remove_checkout_is_a_noop_when_there_is_nothing_to_remove() {
+        let aur_root = tempfile::tempdir().unwrap();
+        let (store, _checkout_dir) = test_store(aur_root.path());
+
+        store
+            .remove_checkout(&SourceData::Aur {
+                name: "never-fetched".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The case no delete path can reach: a checkout whose package was never
+    /// written, as an add that fails part-way through leaves behind.
+    #[tokio::test]
+    async fn prune_removes_only_the_checkouts_no_source_claims() {
+        let aur_root = tempfile::tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "kept", "1.0");
+        create_aur_git_repo(aur_root.path(), "stranded", "1.0");
+        let (store, checkout_dir) = test_store(aur_root.path());
+
+        let kept = SourceData::Aur {
+            name: "kept".to_string(),
+        };
+        let stranded = SourceData::Aur {
+            name: "stranded".to_string(),
+        };
+        store.sourceinfo(&kept, None).await.unwrap();
+        store.sourceinfo(&stranded, None).await.unwrap();
+
+        // A file rather than a directory: not this store's, so not its business.
+        let stray = checkout_dir.path().join("notes.txt");
+        std::fs::write(&stray, "not a checkout").unwrap();
+
+        let removed = store
+            .prune_orphaned_checkouts(std::slice::from_ref(&kept))
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(
+            checkout_dir
+                .path()
+                .join(sanitize_cache_key(&kept.cache_key()))
+                .is_dir(),
+            "pruned a checkout a live package still needs"
+        );
+        assert!(
+            !checkout_dir
+                .path()
+                .join(sanitize_cache_key(&stranded.cache_key()))
+                .exists()
+        );
+        assert!(stray.exists(), "removed something that is not a checkout");
+    }
+
+    /// Nothing has been checked out yet, so nothing can be orphaned -- the
+    /// state every instance is in on its first boot.
+    #[tokio::test]
+    async fn prune_tolerates_a_checkout_root_that_does_not_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(root.path().join("never-created"));
+
+        assert_eq!(store.prune_orphaned_checkouts(&[]).await.unwrap(), 0);
     }
 }

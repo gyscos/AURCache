@@ -53,6 +53,10 @@ async fn main() {
     // stores on the same checkout directories with no shared locking.
     let store = Arc::new(SnapshotStore::new());
 
+    // Before anything else can resolve a source: a prune cannot distinguish a
+    // clone in flight from a stranded one.
+    startup::prune_source_checkouts(&db, &store).await;
+
     let build_queue_handle = init_build_queue(db.clone(), tx.clone());
     let version_check_handle = start_update_version_checking(db.clone(), tx.clone(), store.clone());
     let auto_update_handle = start_auto_update_job(db.clone(), tx.clone(), store.clone());
