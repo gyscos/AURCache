@@ -464,13 +464,18 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
 /// by the close. `None` if the lock could not be taken at all, which is worth
 /// carrying on without -- an unlocked refresh is what happened before this
 /// existed, and refusing to build over it would be a worse trade.
+///
+/// Opened **read-only**, which is not a detail: `mkarchroot` creates the lock
+/// as root and leaves it `0644`, while the worker is not root, so asking for
+/// write access fails with `EACCES` and the lock is never taken -- silently,
+/// since this is best-effort. `flock(2)` places an exclusive lock through a
+/// read-only descriptor perfectly well; the open mode and the lock mode are
+/// unrelated. There is nothing to create here either: by the time a chroot can
+/// be refreshed, `mkarchroot` has made both it and its lock.
 async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
     let path = root.with_extension("lock");
     let taken = tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = std::fs::File::open(&path)?;
         file.lock()?;
         std::io::Result::Ok(file)
     })
