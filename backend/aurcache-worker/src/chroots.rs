@@ -656,7 +656,6 @@ impl Chroots {
             merged.as_os_str(),
             work.as_os_str(),
             empty.as_os_str(),
-            fresh.as_os_str(),
         ])
         .await?;
         sudo(&[
@@ -669,19 +668,11 @@ impl Chroots {
             merged.as_os_str(),
         ])
         .await?;
-        // `--reflink=auto` so this costs metadata on a filesystem that can
-        // share extents, and a real copy only where it must.
-        let copied = sudo(&[
-            "cp".as_ref(),
-            "-a".as_ref(),
-            "--reflink=auto".as_ref(),
-            format!("{}/.", merged.display()).as_ref(),
-            fresh.as_os_str(),
-        ])
-        .await;
+
+        let built = self.build_flattened(root, &merged, &fresh).await;
         let _ = sudo(&["umount".as_ref(), merged.as_os_str()]).await;
         let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), staging.as_os_str()]).await;
-        copied?;
+        built?;
 
         // Two renames, and a crash between them leaves no `root` -- which the
         // next start treats as "no chroot yet" and rebuilds, slow but correct.
@@ -699,6 +690,62 @@ impl Chroots {
         drop(root_lock);
         tracing::info!("flattened {} chroot layers into the base", published.len());
         Ok(())
+    }
+
+    /// Materialise the merged view as a plain directory, writing only what
+    /// differs from the base.
+    ///
+    /// Seeded with hardlinks, then rsynced from the merged view: unchanged
+    /// files -- nearly all of them -- cost an inode and no data, and only the
+    /// files the layers actually changed are written. A straight copy of the
+    /// merged view costs the whole chroot instead, which on a filesystem
+    /// without reflinks is 1.3 GB of writes to reproduce something almost
+    /// identical to what is already there.
+    ///
+    /// Hardlinks are safe here for the reason they are unsafe for a chroot
+    /// copy: rsync replaces a file by renaming a temporary over it, so a
+    /// changed file breaks its link rather than being written through into the
+    /// base. A *build* modifies files in place, which is why builds never get
+    /// hardlinked chroots.
+    ///
+    /// Writing into `root` directly would be simpler still and is not allowed:
+    /// it is a lower layer of the mount being read, and mutating a live lower
+    /// is undefined however sound the bookkeeping looks.
+    async fn build_flattened(&self, root: &Path, merged: &Path, fresh: &Path) -> Result<()> {
+        let seeded = sudo(&[
+            "cp".as_ref(),
+            "-al".as_ref(),
+            root.as_os_str(),
+            fresh.as_os_str(),
+        ])
+        .await
+        .is_ok();
+        if !seeded {
+            // btrfs refuses to link across subvolumes, and a base chroot is
+            // one. Overlays are not chosen on btrfs, so this is a path for the
+            // operator who set the mode by hand -- copy the whole view.
+            tracing::info!("cannot hardlink the base chroot; copying it whole instead");
+            let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), fresh.as_os_str()]).await;
+            sudo(&["mkdir".as_ref(), "-p".as_ref(), fresh.as_os_str()]).await?;
+            return sudo(&[
+                "cp".as_ref(),
+                "-a".as_ref(),
+                "--reflink=auto".as_ref(),
+                format!("{}/.", merged.display()).as_ref(),
+                fresh.as_os_str(),
+            ])
+            .await;
+        }
+        // `-X` because a chroot's binaries carry file capabilities, and a
+        // flatten that dropped them would leave a subtly different chroot.
+        sudo(&[
+            "rsync".as_ref(),
+            "-aX".as_ref(),
+            "--delete".as_ref(),
+            format!("{}/", merged.display()).as_ref(),
+            format!("{}/", fresh.display()).as_ref(),
+        ])
+        .await
     }
 
     /// Chroot copies currently mounted, from `/proc/self/mountinfo`.
