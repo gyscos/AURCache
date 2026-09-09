@@ -167,6 +167,42 @@ fn mounts_under(mountinfo: &str, dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// What a refresh should do this time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// The chroot is current enough to build against.
+    NotDue,
+    /// Nothing is reading the stack: update the top of it where it lies.
+    InPlace,
+    /// Something is reading the stack: put the update in a layer over it.
+    NewLayer,
+    /// Stacked as deep as it is allowed to go, with no chance yet to flatten.
+    /// Leave the chroot as it is rather than run into the kernel's limit on
+    /// lower layers, which would fail a build rather than a refresh.
+    Refuse,
+}
+
+/// Decide what a refresh should do.
+///
+/// `hold` is whether the base chroot's lock was taken. That is what makes
+/// writing to the stack safe: a build holds it shared for as long as it is
+/// mounted, so holding it exclusively means nothing can be reading.
+///
+/// In place is allowed however deep the stack already is, which is deliberate
+/// rather than an oversight of the cap: writing to the top layer does not add
+/// one, so the reason for the cap does not apply to it.
+fn plan(due: bool, idle: bool, hold: bool, depth: usize) -> Plan {
+    if !due {
+        Plan::NotDue
+    } else if idle && hold {
+        Plan::InPlace
+    } else if depth >= HARD_MAX_LAYERS {
+        Plan::Refuse
+    } else {
+        Plan::NewLayer
+    }
+}
+
 /// Whether the base chroot is due another `pacman -Syu`.
 ///
 /// `None` -- not refreshed since this worker started -- is always due: the
@@ -584,69 +620,76 @@ impl Chroots {
         let root = chroot::create_base_chroot(&self.dir, pacman_conf).await?;
         // Before anything else, and whether or not a refresh is due. A worker
         // at the hard cap has stopped stacking and needs this more than it
-        // needs anything else -- doing it after the early returns below meant a
-        // worker that reached the cap never flattened again, even once it went
-        // idle, and stayed stale for good. Costs a `read_dir` when there is
-        // nothing to do.
+        // needs anything else. Costs a `read_dir` when there is nothing to do.
         self.flatten_when_deep(&root).await;
 
+        // One refresh at a time, and held across the whole of it: it is what
+        // stops a layer being stacked over a top layer that is being written,
+        // and what makes a build arriving mid-refresh wait for it rather than
+        // start a second one.
         let mut last = self.last_refresh.lock().await;
-        if !refresh_due(last.map(|at| at.elapsed()), self.interval) {
-            tracing::debug!("base chroot is current; not adding a layer");
-            return Ok(root);
-        }
 
-        // Nothing is reading the stack: update what is on top of it, in place.
-        // A new layer is only ever needed because the current top might be in
-        // use -- when it is not, writing into it is correct and costs nothing.
-        // How deep the stack already is does not come into it: the top is the
-        // layer that wins, so updating it is what a build ends up seeing.
-        //
-        // The lock is what makes it safe, and what makes it bounded. A build
-        // starting here waits for the update instead of mounting something
-        // being written; a build already running holds the lock shared, so this
-        // finds it busy and adds a layer instead.
+        let due = refresh_due(last.map(|at| at.elapsed()), self.interval);
         let published = self.layers();
-        if self.mounted_copies().is_empty()
-            && let chroot::BaseLock::Held(lock) = chroot::try_lock_base(&root).await
-        {
-            let updated = if published.is_empty() {
-                chroot::ensure_base_chroot(&self.dir, pacman_conf)
-                    .await
-                    .map(|_| ())
-            } else {
-                self.update_top_layer(&root, &published).await
-            };
-            drop(lock);
-            match updated {
-                Ok(()) => {
-                    tracing::debug!(
-                        "updated the chroot in place ({} layer(s) deep)",
-                        published.len()
-                    );
-                    *last = Some(Instant::now());
-                    return Ok(root);
-                }
-                Err(e) => tracing::warn!("could not update the chroot in place: {e:#}"),
-            }
-        }
+        let idle = due && self.mounted_copies().is_empty();
+        // Taken before the decision so it can be held *through* the update. A
+        // build starting meanwhile blocks on it; a build already running holds
+        // it shared, which is how "something is reading the stack" is found
+        // out.
+        let lock = if idle {
+            chroot::try_lock_base(&root).await
+        } else {
+            chroot::BaseLock::Unavailable
+        };
 
-        let published = published.len();
-        if published >= HARD_MAX_LAYERS {
-            tracing::warn!(
-                "{published} chroot layers and flattening them keeps failing; \
-                 not updating the chroot further"
-            );
-            return Ok(root);
+        match plan(
+            due,
+            idle,
+            matches!(lock, chroot::BaseLock::Held(_)),
+            published.len(),
+        ) {
+            Plan::NotDue => tracing::debug!("base chroot is current; leaving it alone"),
+            Plan::InPlace => {
+                let updated = if published.is_empty() {
+                    chroot::ensure_base_chroot(&self.dir, pacman_conf)
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.update_top_layer(&root, &published).await
+                };
+                drop(lock);
+                match updated {
+                    // Stamped on completion rather than on start: a refresh
+                    // that took a quarter of an hour has just produced a
+                    // current chroot, and stamping when it began would have the
+                    // next build call it stale immediately.
+                    Ok(()) => {
+                        tracing::debug!(
+                            "updated the chroot in place ({} layer(s) deep)",
+                            published.len()
+                        );
+                        *last = Some(Instant::now());
+                    }
+                    Err(e) => tracing::warn!("could not update the chroot in place: {e:#}"),
+                }
+            }
+            Plan::NewLayer => {
+                drop(lock);
+                match self.add_update_layer(&root).await {
+                    // Stamped only on success, so a failure is retried by the
+                    // next build rather than waiting out the interval.
+                    Ok(()) => *last = Some(Instant::now()),
+                    Err(e) => tracing::warn!("could not update the chroot: {e:#}"),
+                }
+                drop(last);
+                self.flatten_when_deep(&root).await;
+            }
+            Plan::Refuse => tracing::warn!(
+                "{} chroot layers and flattening them keeps failing; \
+                 not updating the chroot further",
+                published.len()
+            ),
         }
-        match self.add_update_layer(&root).await {
-            // Stamped only on success, so a failure is retried by the next
-            // build rather than waiting out the interval.
-            Ok(()) => *last = Some(Instant::now()),
-            Err(e) => tracing::warn!("could not update the chroot: {e:#}"),
-        }
-        drop(last);
-        self.flatten_when_deep(&root).await;
         Ok(root)
     }
 
@@ -1231,6 +1274,22 @@ mod tests {
     fn who_owns_the_copy_decides_who_takes_it_down() {
         assert!(Strategy::Overlay.needs_release());
         assert!(!Strategy::DevtoolsCopy.needs_release());
+    }
+
+    /// The whole decision, in one place. The row that is easiest to lose in a
+    /// later edit is the third: updating in place is allowed at the hard cap,
+    /// because it does not add a layer and the cap exists to bound layers.
+    #[test]
+    fn what_a_refresh_does() {
+        assert_eq!(plan(false, true, true, 0), Plan::NotDue);
+        assert_eq!(plan(true, true, true, 0), Plan::InPlace);
+        assert_eq!(plan(true, true, true, HARD_MAX_LAYERS), Plan::InPlace);
+        // A build is reading the stack, so the update goes over it.
+        assert_eq!(plan(true, false, false, 3), Plan::NewLayer);
+        // Idle, but the lock went elsewhere: treat it as in use.
+        assert_eq!(plan(true, true, false, 3), Plan::NewLayer);
+        // Nowhere left to stack.
+        assert_eq!(plan(true, false, false, HARD_MAX_LAYERS), Plan::Refuse);
     }
 
     /// A worker that has just started refreshes whatever the interval says --
