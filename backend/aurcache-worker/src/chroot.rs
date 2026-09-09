@@ -53,6 +53,14 @@ pub fn devtools(program: &str) -> Command {
 ///   `pacman.conf` on first use. The chroot keeps the `makepkg.conf` its own
 ///   `pacman` installs; this worker's settings arrive as a drop-in instead.
 /// * Otherwise refreshes it with `arch-nspawn … pacman -Syu`.
+///
+/// **The caller must hold `root.lock`** while this runs, or hold nothing
+/// because there was no lock to hold. `makechrootpkg` takes it shared across
+/// `sync_chroot` so it never clones a half-updated chroot, and an overlay
+/// build holds it shared for its whole life because its lower layer must not
+/// change -- but `arch-nspawn`, which is how the chroot gets updated, takes no
+/// lock at all, so devtools' care only ever covered devtools' own writers.
+/// [`crate::chroots::Chroots::refresh`] is what decides that here.
 pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
     // Serialize base-chroot creation/refresh: concurrent jobs must not race to
     // build or `-Syu` the same shared root.
@@ -63,20 +71,6 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     let root = chroot_dir.join("root");
 
     if root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists()) {
-        // Hold the lock devtools takes, for as long as we mutate what it
-        // copies. `makechrootpkg` takes `root.lock` *shared* across
-        // `sync_chroot` precisely so it never clones a half-updated chroot --
-        // but `arch-nspawn`, which is how the chroot gets updated, takes no
-        // lock at all. So devtools' care only ever covered devtools' own
-        // writers, and the writer here is not one of them: with concurrent
-        // builds, one job's `pacman -Syu` could run while another job's copy
-        // was being taken.
-        //
-        // In-process serialisation cannot stand in for this. The copy happens
-        // inside `makechrootpkg` and is released the moment it finishes, while
-        // all this process can observe is a child that then builds for hours.
-        let _lock = lock_base_chroot(&root).await;
-
         // Refresh existing chroot; a failure here is non-fatal for the build.
         let mut cmd = devtools("arch-nspawn");
         cmd.arg(&root).args(["pacman", "-Syu", "--noconfirm"]);
@@ -458,11 +452,48 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
     removed
 }
 
-/// Take devtools' `root.lock` exclusively, waiting out any copy in flight.
+/// What asking for the base chroot's lock produced.
+pub enum BaseLock {
+    /// Held. The base chroot is ours to change until this is dropped.
+    Held(std::fs::File),
+    /// Someone else holds it: a copy being taken, or an overlay build using
+    /// the base as its lower layer.
+    Busy,
+    /// There is no usable lock here at all. Not a reason to refuse to work --
+    /// that is what happened before any of this existed.
+    Unavailable,
+}
+
+/// Ask for devtools' `root.lock` exclusively, without waiting.
 ///
-/// See [`open_base_lock`] for why it is opened read-only.
-async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
-    open_base_lock(root, true).await
+/// Never blocks, and that is the point. An overlay build holds the lock
+/// *shared* for its whole life, so a blocking wait here would hold up every
+/// job start behind it for as long as the longest build runs. A refresh that
+/// cannot have the chroot right now simply happens later; being a few minutes
+/// out of date is a smaller problem than a worker that starts no builds.
+pub async fn try_lock_base(root: &Path) -> BaseLock {
+    let path = root.with_extension("lock");
+    let taken = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    })
+    .await;
+    match taken {
+        Ok(Ok(Some(file))) => BaseLock::Held(file),
+        Ok(Ok(None)) => BaseLock::Busy,
+        Ok(Err(e)) => {
+            tracing::warn!("could not lock the base chroot: {e}");
+            BaseLock::Unavailable
+        }
+        Err(e) => {
+            tracing::warn!("could not lock the base chroot: {e}");
+            BaseLock::Unavailable
+        }
+    }
 }
 
 /// Take devtools' `root.lock` *shared*, which is what `sync_chroot` does while
@@ -473,7 +504,7 @@ async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
 /// build: several may read it at once, and a refresh -- which takes it
 /// exclusively -- waits for them.
 pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
-    open_base_lock(root, false).await
+    open_base_lock(root).await
 }
 
 /// Open and lock the base chroot's lock file.
@@ -490,15 +521,11 @@ pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
 /// be taken at all, which is worth carrying on without -- that is what
 /// happened before this existed, and refusing to build over it would be a
 /// worse trade.
-async fn open_base_lock(root: &Path, exclusive: bool) -> Option<std::fs::File> {
+async fn open_base_lock(root: &Path) -> Option<std::fs::File> {
     let path = root.with_extension("lock");
     let taken = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
-        if exclusive {
-            file.lock()?;
-        } else {
-            file.lock_shared()?;
-        }
+        file.lock_shared()?;
         std::io::Result::Ok(file)
     })
     .await;
@@ -554,21 +581,35 @@ fn is_subvolume_ino(fs_type: i64, inode: u64) -> bool {
 /// per crashed build, forever. `statfs` and the inode number need no
 /// privileges.
 fn is_btrfs_subvolume(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let Some(fs_type) = fs_type(path) else {
         return false;
     };
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is a NUL-terminated path and `buf` is a valid statfs.
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
-        return false;
-    }
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    is_subvolume_ino(buf.f_type as i64, meta.ino())
+    is_subvolume_ino(fs_type, meta.ino())
+}
+
+/// The filesystem type under `path`, from `statfs`.
+fn fs_type(path: &Path) -> Option<i64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated path and `buf` is a valid statfs.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some(buf.f_type as i64)
+}
+
+/// Whether `path` is on btrfs, where `makechrootpkg` copies a chroot by taking
+/// a snapshot and there is nothing for an overlay to save.
+#[must_use]
+pub fn is_btrfs(path: &Path) -> bool {
+    fs_type(path) == Some(BTRFS_SUPER_MAGIC)
 }
 
 /// Remove one chroot copy, whatever kind of thing it is.

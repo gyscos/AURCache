@@ -114,7 +114,7 @@ simply for being old. Size pressure is the honest bound for that pool.
 | `WORKER_CHROOT_DIR` | Path | Base chroot and per-job copies | `<data dir>/chroot` |
 | `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
 | `WORKER_CHROOT_REFRESH_INTERVAL` | Integer | Seconds a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `900` |
-| `WORKER_CHROOT_OVERLAY` | Boolean | Mount each build's chroot as an overlay instead of copying the base | off |
+| `WORKER_CHROOT_OVERLAY` | `auto`/on/off | Mount each build's chroot as an overlay instead of copying the base | `auto` |
 
 The base chroot is brought up to date with `pacman -Syu` before a build, but
 not more often than `WORKER_CHROOT_REFRESH_INTERVAL`. The refresh takes around
@@ -137,23 +137,35 @@ is a snapshot and costs nothing; everywhere else it is an `rsync` of the whole
 chroot -- around 800 MB per build, which on an SSD is both slow and wear you
 did not ask for.
 
-`WORKER_CHROOT_OVERLAY=1` mounts the base read-only as an overlay's lower layer
+`WORKER_CHROOT_OVERLAY` mounts the base read-only as an overlay's lower layer
 instead, with a directory of the build's own on top. The mount takes about 15
 milliseconds and the upper layer holds only what the build changed, which for
 an ordinary package is a few hundred kilobytes. The base cannot be written
 through the mount, so builds are as isolated from each other as they were with
 copies.
 
-It is off by default because copying is what every worker has done, and because
-the upper layer needs a filesystem that supports whiteouts and trusted extended
-attributes: ext4, XFS and btrfs do, ZFS does from 2.2, and NFS does not. Where
-the mount cannot be made the build falls back to copying and logs a warning
-rather than failing.
+It defaults to `auto`, which decides at startup, because the right answer is a
+property of the machine rather than a preference:
+
+* On **btrfs** the worker copies. A copy there is already a snapshot -- 0.29
+  seconds and no space -- so an overlay would save nothing and cost something
+  (see below).
+* Anywhere else the worker **tries to mount an overlay**, and uses one if the
+  kernel allows it. The check is a real mount, because nothing else is
+  conclusive: an upper layer needs whiteouts and trusted extended attributes,
+  which ext4, XFS and btrfs have, ZFS has from 2.2, and NFS does not -- and a
+  container may not be permitted to mount at all.
+* If that mount fails, it copies, and says so once at startup.
+
+Set it to `1` or `0` to decide yourself. An unrecognised value means `auto`, so
+a typo cannot quietly disable something you were trying to enable.
 
 One consequence is worth knowing: a live overlay's lower layer must not change,
-so the base chroot cannot be refreshed while any overlay build is running. The
-refresh waits for them to finish. A worker that never goes idle will therefore
-go longer between refreshes than `WORKER_CHROOT_REFRESH_INTERVAL` suggests.
+so the base chroot cannot be refreshed while an overlay build is using it. The
+refresh does not wait -- waiting would hold up every job start behind it for as
+long as the longest build runs -- it simply happens at the next build that
+finds the chroot free. A worker that is never idle will therefore go longer
+between refreshes than `WORKER_CHROOT_REFRESH_INTERVAL` suggests.
 
 ### Putting the chroot on other storage
 

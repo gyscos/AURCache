@@ -44,8 +44,10 @@ pub struct ChrootExecutor {
 }
 
 impl ChrootExecutor {
-    #[must_use]
-    pub fn new(cfg: Arc<Config>) -> Self {
+    /// Async because it settles how chroots are made before any job arrives:
+    /// the answer needs a real mount to be sure of, and finding out per build
+    /// would mean a warning per build on a filesystem that cannot do it.
+    pub async fn new(cfg: Arc<Config>) -> Self {
         // Once, at startup: the hierarchy has to be rearranged before any build
         // runs, and rearranging it per build would move the worker repeatedly.
         let cgroups = match Hierarchy::prepare() {
@@ -62,9 +64,10 @@ impl ChrootExecutor {
             chroots: Chroots::new(
                 cfg.chroot_dir.clone(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
-                cfg.chroot_overlay,
+                cfg.chroot_mode,
             ),
         });
+        shared.chroots.detect().await;
         Self {
             cfg,
             shared,

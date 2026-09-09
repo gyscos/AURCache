@@ -120,10 +120,40 @@ fn refresh_due(since_last: Option<Duration>, interval: Duration) -> bool {
     since_last.is_none_or(|elapsed| elapsed >= interval)
 }
 
+/// What the operator asked for, before the machine gets a say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChrootMode {
+    /// Decide at startup: overlay where a copy would be expensive, and where
+    /// the kernel and filesystem actually allow one.
+    Auto,
+    /// Always try to mount overlays.
+    Overlay,
+    /// Always let devtools copy.
+    Copy,
+}
+
+impl ChrootMode {
+    /// Parse the `WORKER_CHROOT_OVERLAY` setting. Anything unrecognised is
+    /// `Auto`, which is also the default: a typo should not silently turn off
+    /// something the operator was trying to turn on.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1" | "true" | "yes" | "on") => Self::Overlay,
+            Some("0" | "false" | "no" | "off") => Self::Copy,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// The chroots on this worker: one base, and a copy per build.
 pub struct Chroots {
     dir: PathBuf,
-    strategy: Strategy,
+    /// Resolved once by [`Chroots::detect`]. Unresolved means copying, which
+    /// is what a worker did before any of this and is never wrong, only
+    /// sometimes slow.
+    strategy: std::sync::OnceLock<Strategy>,
+    mode: ChrootMode,
     /// When the base chroot was last brought up to date, and the lock that
     /// serialises doing so. One lock for both, because "is it due" and "make
     /// it current" have to be one decision or two builds starting together
@@ -131,20 +161,111 @@ pub struct Chroots {
     last_refresh: Mutex<Option<Instant>>,
     /// How long a refresh counts as current.
     interval: Duration,
-    /// Whether to try mounting overlays instead of letting devtools copy.
-    overlay: bool,
 }
 
 impl Chroots {
     #[must_use]
-    pub fn new(dir: PathBuf, interval: Duration, overlay: bool) -> Self {
+    pub fn new(dir: PathBuf, interval: Duration, mode: ChrootMode) -> Self {
         Self {
             dir,
-            strategy: Strategy::DevtoolsCopy,
+            strategy: std::sync::OnceLock::new(),
+            mode,
             last_refresh: Mutex::new(None),
             interval,
-            overlay,
         }
+    }
+
+    /// How chroots will be made. Copying until [`Chroots::detect`] says
+    /// otherwise.
+    fn strategy(&self) -> Strategy {
+        self.strategy
+            .get()
+            .copied()
+            .unwrap_or(Strategy::DevtoolsCopy)
+    }
+
+    /// Decide once, at startup, how this worker makes chroots.
+    ///
+    /// Asking the machine rather than the operator, because the answer is a
+    /// property of the machine: btrfs already copies a chroot for free by
+    /// snapshotting it, and there an overlay would buy nothing while making
+    /// refreshes wait for builds. Everywhere else a copy is a full `rsync` of
+    /// the base -- 810MB per build on the ZFS worker this was measured on --
+    /// and an overlay is worth having *if the kernel will mount one*, which
+    /// only a real mount can answer: ZFS below 2.2 has no whiteouts, NFS never
+    /// will, and a container may not be allowed to mount at all.
+    pub async fn detect(&self) {
+        let chosen = match self.mode {
+            ChrootMode::Copy => Strategy::DevtoolsCopy,
+            ChrootMode::Overlay => Strategy::Overlay,
+            ChrootMode::Auto => {
+                if chroot::is_btrfs(&self.dir) {
+                    tracing::info!(
+                        "chroot copies are btrfs snapshots on {}; not mounting overlays",
+                        self.dir.display()
+                    );
+                    Strategy::DevtoolsCopy
+                } else if let Err(e) = self.probe_overlay().await {
+                    tracing::info!("copying chroots: an overlay could not be mounted ({e:#})");
+                    Strategy::DevtoolsCopy
+                } else {
+                    tracing::info!(
+                        "mounting overlay chroots: copies on {} are not cheap",
+                        self.dir.display()
+                    );
+                    Strategy::Overlay
+                }
+            }
+        };
+        let _ = self.strategy.set(chosen);
+    }
+
+    /// Mount an overlay and take it straight down again, to find out whether
+    /// this filesystem and this kernel will have one.
+    /// With a lower layer of its own rather than the base chroot, which need
+    /// not exist yet: a worker's first start has no chroot at all, and probing
+    /// against a missing lower answers "no overlays here" for a reason that
+    /// has nothing to do with the filesystem -- once, for the life of the
+    /// process, on every fresh worker there is.
+    async fn probe_overlay(&self) -> Result<()> {
+        let layers = self.dir.join(OVERLAY_DIR).join(".probe");
+        let lower = layers.join("lower");
+        let upper = layers.join("upper");
+        let work = layers.join("work");
+        let merged = layers.join("merged");
+        let options = overlay_options(&lower, &upper, &work)
+            .context("chroot paths cannot be expressed as overlay options")?;
+
+        let outcome = async {
+            sudo(&[
+                "mkdir".as_ref(),
+                "-p".as_ref(),
+                lower.as_os_str(),
+                upper.as_os_str(),
+                work.as_os_str(),
+                merged.as_os_str(),
+            ])
+            .await
+            .context("preparing the probe directories")?;
+            sudo(&[
+                "mount".as_ref(),
+                "-t".as_ref(),
+                "overlay".as_ref(),
+                "overlay".as_ref(),
+                "-o".as_ref(),
+                options.as_ref(),
+                merged.as_os_str(),
+            ])
+            .await
+            .context("mounting a probe overlay")
+        }
+        .await;
+
+        if outcome.is_ok() {
+            let _ = sudo(&["umount".as_ref(), merged.as_os_str()]).await;
+        }
+        let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), layers.as_os_str()]).await;
+        outcome
     }
 
     /// Ensure the base chroot exists and is reasonably fresh.
@@ -164,6 +285,30 @@ impl Chroots {
             tracing::debug!("base chroot is current; not refreshing");
             return Ok(root);
         }
+        // Only while nothing else is using the base. A copy being taken must
+        // not see it half-updated, and an overlay's lower layer must not change
+        // at all while it is mounted -- and neither is worth waiting for here,
+        // because this holds the lock every job start needs, and an overlay is
+        // held for the length of a build. So a busy base means "later", not
+        // "queue up behind it". `last` is deliberately not stamped, so the next
+        // build tries again rather than waiting out the whole interval.
+        if root.exists() {
+            match chroot::try_lock_base(&root).await {
+                chroot::BaseLock::Held(lock) => {
+                    let root = chroot::ensure_base_chroot(&self.dir, pacman_conf).await?;
+                    drop(lock);
+                    *last = Some(Instant::now());
+                    return Ok(root);
+                }
+                chroot::BaseLock::Busy => {
+                    tracing::info!("base chroot is in use by a build; refreshing it later");
+                    return Ok(root);
+                }
+                // No lock to be had. Refresh anyway: unlocked is how every
+                // worker did this until recently.
+                chroot::BaseLock::Unavailable => {}
+            }
+        }
         let root = chroot::ensure_base_chroot(&self.dir, pacman_conf).await?;
         *last = Some(Instant::now());
         Ok(root)
@@ -177,7 +322,7 @@ impl Chroots {
     /// an upper layer will not start being able to, and one line per build is
     /// how an operator notices they are paying for copies they did not expect.
     pub async fn acquire(&self, label: &str) -> Result<Lease> {
-        if self.overlay {
+        if matches!(self.strategy(), Strategy::Overlay) {
             match self.mount_overlay(label).await {
                 Ok(lock) => {
                     return Ok(Lease {
@@ -194,7 +339,7 @@ impl Chroots {
         Ok(Lease {
             dir: self.dir.clone(),
             label: label.to_string(),
-            strategy: self.strategy,
+            strategy: Strategy::DevtoolsCopy,
             released: false,
             lock: None,
         })
@@ -389,6 +534,17 @@ mod tests {
         assert_eq!(lease.chroot_dir(), Path::new("/var/lib/aurcache-chroot"));
         assert_eq!(lease.label(), "job-42");
         assert!(lease.devtools_owns_copy());
+    }
+
+    /// A typo should not quietly turn off something the operator was turning
+    /// on -- anything unrecognised means "let the machine decide".
+    #[test]
+    fn an_unrecognised_mode_asks_the_machine() {
+        assert_eq!(ChrootMode::parse(Some("1")), ChrootMode::Overlay);
+        assert_eq!(ChrootMode::parse(Some(" yes ")), ChrootMode::Overlay);
+        assert_eq!(ChrootMode::parse(Some("off")), ChrootMode::Copy);
+        assert_eq!(ChrootMode::parse(None), ChrootMode::Auto);
+        assert_eq!(ChrootMode::parse(Some("overlay")), ChrootMode::Auto);
     }
 
     /// An overlay names all three layers, and the base is the one it must not
