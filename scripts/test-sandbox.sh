@@ -75,7 +75,7 @@ echo legit > /shared/srcdest-other/victim-source
 # denies the read even when file permissions would allow it.
 mkdir -p /var/lib/aurcache-worker/secrets
 echo SSH-KEY-MATERIAL > /var/lib/aurcache-worker/secrets/id_ed25519
-echo MTLS-KEY-MATERIAL > /var/lib/aurcache-worker/identity.key
+echo MTLS-KEY-MATERIAL > /var/lib/aurcache-worker/worker-key.pem
 chown -R builder: /var/lib/aurcache-worker
 cp /fixture/PKGBUILD /job/pkg/PKGBUILD
 chown -R builder: /job /shared
