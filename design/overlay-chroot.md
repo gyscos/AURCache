@@ -100,6 +100,25 @@ build is reading is touched, so:
 * the write volume of a refresh is the size of the upgrade, not the size of the
   chroot.
 
+### What a layer actually holds
+
+Measured: 8.9 MB, of which 8.7 MB is `/var/lib/pacman/sync`. Downloaded
+packages are not in it at all, because `arch-nspawn` binds the host's package
+cache -- a refresh writes databases, not payload.
+
+Which makes the last bullet optimistic. A refresh writes the upgrade *plus* the
+sync databases, and it writes the databases even when nothing upgrades, which
+was three days out of three on the reference worker. Discarding a layer whose
+only content is databases is tempting and wrong: those databases are what the
+next build's `pacman -S` resolves against, and a chroot left with stale ones
+installs versions the mirror no longer serves. The refresh exists as much for
+them as for the base's own packages.
+
+Removing that cost means keeping the databases out of the layers entirely -- a
+worker-managed `/var/lib/pacman/sync` bind-mounted into each build, as the
+package cache already is. That changes what a build's chroot is assembled from
+rather than how it is refreshed, and is not proposed here.
+
 That last point is the one that decides between this and the simpler
 alternative of a whole new base per refresh; see below.
 
