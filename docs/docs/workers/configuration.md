@@ -113,6 +113,16 @@ simply for being old. Size pressure is the honest bound for that pool.
 | `WORKER_DATA_DIR` | Path | Worker identity, credentials, chroots | `/var/lib/aurcache-worker` |
 | `WORKER_CHROOT_DIR` | Path | Base chroot and per-job copies | `<data dir>/chroot` |
 | `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
+| `WORKER_CHROOT_REFRESH_INTERVAL` | Integer | Seconds a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `900` |
+
+The base chroot is brought up to date with `pacman -Syu` before a build, but
+not more often than `WORKER_CHROOT_REFRESH_INTERVAL`. The refresh takes around
+13 seconds and only one build may hold the chroot while it runs, so paying it
+per build delayed every build start in a burst; measured over a day on one
+worker, 23 of 26 refreshes upgraded nothing at all, because Arch's repositories
+move a few times a day rather than a few times an hour. Lower it if you would
+rather have the newest dependencies than the fastest starts; `0` restores the
+old behaviour.
 
 `WORKER_DATA_DIR` **must be a persisted volume.** It holds the worker's identity
 and its generated SSH key; if it is lost, the worker re-enrolls as a new,

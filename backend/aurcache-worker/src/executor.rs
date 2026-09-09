@@ -10,6 +10,7 @@ use aurcache_worker_core::executor::Executor;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::cgroup::Hierarchy;
@@ -58,7 +59,10 @@ impl ChrootExecutor {
         };
         let shared = Arc::new(Shared {
             active_pkgbases: Mutex::new(HashSet::new()),
-            chroots: Chroots::new(cfg.chroot_dir.clone()),
+            chroots: Chroots::new(
+                cfg.chroot_dir.clone(),
+                Duration::from_secs(cfg.chroot_refresh_interval),
+            ),
         });
         Self {
             cfg,

@@ -15,6 +15,8 @@
 use crate::chroot;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// How a build's chroot copy is made and destroyed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,24 +38,59 @@ impl Strategy {
     }
 }
 
+/// Whether the base chroot is due another `pacman -Syu`.
+///
+/// `None` -- not refreshed since this worker started -- is always due: the
+/// worker may have been down for a week. An interval of zero is "before every
+/// build", which is what this did before it was measured.
+fn refresh_due(since_last: Option<Duration>, interval: Duration) -> bool {
+    since_last.is_none_or(|elapsed| elapsed >= interval)
+}
+
 /// The chroots on this worker: one base, and a copy per build.
 pub struct Chroots {
     dir: PathBuf,
     strategy: Strategy,
+    /// When the base chroot was last brought up to date, and the lock that
+    /// serialises doing so. One lock for both, because "is it due" and "make
+    /// it current" have to be one decision or two builds starting together
+    /// both find it due.
+    last_refresh: Mutex<Option<Instant>>,
+    /// How long a refresh counts as current.
+    interval: Duration,
 }
 
 impl Chroots {
     #[must_use]
-    pub fn new(dir: PathBuf) -> Self {
+    pub fn new(dir: PathBuf, interval: Duration) -> Self {
         Self {
             dir,
             strategy: Strategy::DevtoolsCopy,
+            last_refresh: Mutex::new(None),
+            interval,
         }
     }
 
     /// Ensure the base chroot exists and is reasonably fresh.
+    ///
+    /// Reasonably, not perfectly: the refresh costs ~13s and upgrades nothing
+    /// on the large majority of builds, because Arch's repositories move a few
+    /// times a day rather than a few times an hour. Paying it per build also
+    /// serialised build starts behind each other, since only one may hold the
+    /// chroot at a time.
+    ///
+    /// A chroot that does not exist yet is always made, whatever the interval
+    /// says -- there is nothing to be stale.
     pub async fn refresh(&self, pacman_conf: &Path) -> Result<PathBuf> {
-        chroot::ensure_base_chroot(&self.dir, pacman_conf).await
+        let root = self.dir.join("root");
+        let mut last = self.last_refresh.lock().await;
+        if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval) {
+            tracing::debug!("base chroot is current; not refreshing");
+            return Ok(root);
+        }
+        let root = chroot::ensure_base_chroot(&self.dir, pacman_conf).await?;
+        *last = Some(Instant::now());
+        Ok(root)
     }
 
     /// Take a chroot for one build. Give it back with [`Lease::release`].
@@ -160,6 +197,18 @@ mod tests {
         assert_eq!(lease.chroot_dir(), Path::new("/var/lib/aurcache-chroot"));
         assert_eq!(lease.label(), "job-42");
         assert!(lease.devtools_owns_copy());
+    }
+
+    /// A worker that has just started refreshes whatever the interval says --
+    /// it may have been down for a week -- and an interval of zero keeps the
+    /// old behaviour of refreshing before every build.
+    #[test]
+    fn a_refresh_is_due_when_it_has_never_happened_or_has_aged_out() {
+        let interval = Duration::from_secs(900);
+        assert!(refresh_due(None, interval));
+        assert!(!refresh_due(Some(Duration::from_secs(60)), interval));
+        assert!(refresh_due(Some(Duration::from_secs(900)), interval));
+        assert!(refresh_due(Some(Duration::from_secs(60)), Duration::ZERO));
     }
 
     /// Nothing to give back while devtools owns the copy, which is what makes

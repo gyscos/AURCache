@@ -63,6 +63,20 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     let root = chroot_dir.join("root");
 
     if root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists()) {
+        // Hold the lock devtools takes, for as long as we mutate what it
+        // copies. `makechrootpkg` takes `root.lock` *shared* across
+        // `sync_chroot` precisely so it never clones a half-updated chroot --
+        // but `arch-nspawn`, which is how the chroot gets updated, takes no
+        // lock at all. So devtools' care only ever covered devtools' own
+        // writers, and the writer here is not one of them: with concurrent
+        // builds, one job's `pacman -Syu` could run while another job's copy
+        // was being taken.
+        //
+        // In-process serialisation cannot stand in for this. The copy happens
+        // inside `makechrootpkg` and is released the moment it finishes, while
+        // all this process can observe is a child that then builds for hours.
+        let _lock = lock_base_chroot(&root).await;
+
         // Refresh existing chroot; a failure here is non-fatal for the build.
         let mut cmd = devtools("arch-nspawn");
         cmd.arg(&root).args(["pacman", "-Syu", "--noconfirm"]);
@@ -442,6 +456,36 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
         tracing::info!("removed {removed} stale chroot cop(ies) from a previous run");
     }
     removed
+}
+
+/// Take devtools' `root.lock` exclusively, waiting out any copy in flight.
+///
+/// Returns the open file: the lock is held until it is dropped, and released
+/// by the close. `None` if the lock could not be taken at all, which is worth
+/// carrying on without -- an unlocked refresh is what happened before this
+/// existed, and refusing to build over it would be a worse trade.
+async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
+    let path = root.with_extension("lock");
+    let taken = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        file.lock()?;
+        std::io::Result::Ok(file)
+    })
+    .await;
+    match taken {
+        Ok(Ok(file)) => Some(file),
+        Ok(Err(e)) => {
+            tracing::warn!("could not lock the base chroot: {e}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("could not lock the base chroot: {e}");
+            None
+        }
+    }
 }
 
 /// Whether a name in the chroot directory is a per-build copy.

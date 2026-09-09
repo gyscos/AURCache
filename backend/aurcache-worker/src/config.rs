@@ -43,6 +43,14 @@ pub struct Config {
     /// very different sizes and refill costs, and a shared budget would let
     /// large VCS checkouts starve the package cache (or vice versa).
     pub pkgcache_max_size: u64,
+    /// How long a freshly `-Syu`'d base chroot counts as current, in seconds
+    /// (`0` refreshes before every build, which is what this used to do).
+    ///
+    /// The refresh costs ~13s and, measured over a day on the reference
+    /// worker, 23 of 26 of them upgraded nothing at all: Arch's repositories
+    /// move a few times a day, not a few times an hour. Every build paid for
+    /// that, serially, before it could start.
+    pub chroot_refresh_interval: u64,
     /// Package cache TTL in seconds. Defaults to `0` (disabled) because a
     /// cached package's mtime is its *download* time — pacman does not touch
     /// it on a cache hit — so age-evicting would discard a package used daily
@@ -92,6 +100,9 @@ impl Config {
             pkgcache_ttl: env_opt("WORKER_PKGCACHE_TTL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
+            chroot_refresh_interval: env_opt("WORKER_CHROOT_REFRESH_INTERVAL")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15 * 60),
             core,
         }
     }

@@ -28,7 +28,10 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     // repositories are the right ones. `makepkg.conf` is still left to the
     // chroot's own, matching what a served build gets.
     let pacman_conf = existing("/etc/pacman.conf")?;
-    let chroots = Chroots::new(cfg.chroot_dir.clone());
+    let chroots = Chroots::new(
+        cfg.chroot_dir.clone(),
+        std::time::Duration::from_secs(cfg.chroot_refresh_interval),
+    );
     chroots
         .refresh(&pacman_conf)
         .await
