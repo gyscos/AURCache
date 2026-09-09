@@ -131,6 +131,7 @@ dependencies = [
  "thirtyfour",
  "tokio",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

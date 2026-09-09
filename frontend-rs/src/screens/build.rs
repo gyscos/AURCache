@@ -3,10 +3,13 @@
 use crate::api::api_base;
 use crate::listing::ViewParams;
 use crate::routes::Route;
+use crate::shell::{CheckIcon, CopyIcon};
 use crate::status::BuildStatusBadge;
 use aurcache_client::AurCacheClient;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
+use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
 
 /// Whether the build has stopped changing, so the poll loop can stop with it.
 ///
@@ -36,6 +39,93 @@ mod tests {
         assert!(!settled(BuildState::WaitingForDeps.as_i32()));
         // A state this build of the UI has never heard of keeps it polling.
         assert!(!settled(99));
+    }
+
+    /// Signals only have a home inside a running component, so the button is
+    /// rendered through a harness rather than handed `Signal` props from a
+    /// test function.
+    #[component]
+    fn CopyButtonHarness(log: String, copied: bool) -> Element {
+        let log_signal = use_signal(move || log);
+        let copied_signal = use_signal(move || copied);
+        let error = use_signal(|| None::<String>);
+        rsx! { LogCopyButton { log: log_signal, copied: copied_signal, error } }
+    }
+
+    fn render_copy_button(log: &str, copied: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            CopyButtonHarness,
+            CopyButtonHarnessProps {
+                log: log.to_string(),
+                copied,
+            },
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    thread_local! {
+        /// Lets a test reach the signal a rendered harness owns. A signal has
+        /// no life outside a component, so this is the only way to change one
+        /// between renders.
+        static LATE_LOG: std::cell::RefCell<Option<Signal<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[component]
+    fn LateLogHarness() -> Element {
+        let log = use_signal(String::new);
+        LATE_LOG.with(|cell| *cell.borrow_mut() = Some(log));
+        let copied = use_signal(|| false);
+        let error = use_signal(|| None::<String>);
+        rsx! { LogCopyButton { log, copied, error } }
+    }
+
+    /// A log arrives after the first render — always, since the page fetches
+    /// it — and the button has to arrive with it. Component props are memoized
+    /// on signals whose identity never changes, so a button that only `peek`s
+    /// at the log is never re-run: it stayed hidden for the whole life of the
+    /// page, on every build.
+    #[test]
+    fn the_copy_button_appears_when_the_log_arrives() {
+        let mut dom = VirtualDom::new(LateLogHarness);
+        dom.rebuild_in_place();
+        assert!(
+            !dioxus_ssr::render(&dom).contains("Copy"),
+            "nothing to copy before the log arrives"
+        );
+
+        let mut log = LATE_LOG.with(|cell| *cell.borrow().as_ref().unwrap());
+        dom.in_runtime(|| log.set("make: *** [all] Error 1".to_string()));
+        dom.render_immediate(&mut dioxus_core::NoOpMutations);
+
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("Copy"),
+            "the button must arrive with the log: {html:?}"
+        );
+    }
+
+    /// Nothing to copy: a build that has not written its first line yet, or a
+    /// finished one whose log has been removed, is not offered a copy button.
+    #[test]
+    fn the_copy_button_appears_only_once_there_is_a_log() {
+        assert!(
+            !render_copy_button("", false).contains("Copy"),
+            "an empty log should show no copy button"
+        );
+    }
+
+    /// The checkmark is the promise that the paste will land, so it must not
+    /// hang around after the button has gone back to work.
+    #[test]
+    fn the_copy_button_shows_a_checkmark_after_copying() {
+        let html = render_copy_button("make: nothing to be done for `all'.", true);
+        assert!(html.contains("Copied"), "{html}");
+        assert!(
+            !html.contains(">Copy<"),
+            "the label should flip to Copied: {html}"
+        );
     }
 }
 
@@ -132,6 +222,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // claimed while this page is open names its worker without a reload.
     let mut worker_name = use_signal(|| None::<String>);
     let mut error = use_signal(|| Option::<String>::None);
+    // True for a couple of seconds after a successful copy, so the button
+    // swaps its icon and label to say the log is now on the clipboard.
+    let copied = use_signal(|| false);
     // "Follow" pins the view to the bottom as output arrives; switching it off
     // is what lets someone read back through a long log while it is still
     // being written.
@@ -255,6 +348,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         }
                     }
                     div { class: "flex-1" }
+                    LogCopyButton { log, copied, error }
                     label { class: "label cursor-pointer gap-2",
                         span { class: "label-text text-sm", "Follow" }
                         input {
@@ -313,5 +407,75 @@ fn scroll_log_to_bottom() {
         .and_then(|d| d.get_element_by_id("build-log"))
     {
         el.set_scroll_top(el.scroll_height());
+    }
+}
+
+/// Copy the whole log to the clipboard.
+///
+/// Split from `BuildLog` so the button's presence and its "copied" state are
+/// render-testable: the interesting browser part — asking the browser for its
+/// clipboard — cannot be, and lives in the onclick. The button only appears
+/// once there is something to copy, and flips to a checkmark for a couple of
+/// seconds after a successful copy so someone pasting knows it landed.
+#[component]
+fn LogCopyButton(
+    log: Signal<String>,
+    mut copied: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) -> Element {
+    // `read`, not `peek`: props are memoized on signals that never change
+    // identity, so a component that only peeks is never re-run. Peeking here
+    // left the button hidden for the whole life of a page whose log arrived
+    // after the first render — which is every page.
+    if log.read().is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        button {
+            class: "btn btn-ghost btn-xs gap-1.5",
+            title: "Copy the whole build log to the clipboard",
+            disabled: copied(),
+            onclick: move |_| async move {
+                // The whole log is one string in memory, so nothing extra is
+                // fetched — the button copies everything written so far.
+                let text = log();
+                let Some(clipboard) = web_sys::window()
+                    .map(|w| w.navigator().clipboard())
+                    // Outside a secure context `navigator.clipboard` is
+                    // undefined, and web-sys hands that straight back as a
+                    // `Clipboard` rather than `None`. Calling `write_text` on
+                    // it throws through the wasm boundary, which takes the page
+                    // down instead of showing the message below — and http on a
+                    // LAN address is an ordinary way to reach this UI.
+                    .filter(|c| !AsRef::<JsValue>::as_ref(c).is_undefined())
+                else {
+                    error.set(Some(
+                        "Clipboard is unavailable on this connection \
+                         (it needs a secure context, like https or localhost)."
+                            .to_string(),
+                    ));
+                    return;
+                };
+                match JsFuture::from(clipboard.write_text(&text)).await {
+                    Ok(_) => {
+                        copied.set(true);
+                        // Let the checkmark say its piece, then give the button
+                        // back its job.
+                        gloo_timers::future::TimeoutFuture::new(2000).await;
+                        copied.set(false);
+                    }
+                    Err(_) => error.set(Some(
+                        "Could not copy the build log to the clipboard.".to_string(),
+                    )),
+                }
+            },
+            if copied() {
+                CheckIcon {}
+                span { "Copied" }
+            } else {
+                CopyIcon {}
+                span { "Copy" }
+            }
+        }
     }
 }

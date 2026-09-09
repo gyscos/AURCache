@@ -363,6 +363,38 @@ fn PlusIcon() -> Element {
     }
 }
 
+/// Button-sized icon base: the 4-unit glyphs that sit in buttons next to
+/// text, smaller than the 5-unit `Icon` ones that line a menu row.
+#[component]
+fn ButtonIcon(path: &'static str) -> Element {
+    rsx! {
+        svg {
+            class: "h-4 w-4 shrink-0",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            path { d: path }
+        }
+    }
+}
+
+/// Copy-to-clipboard, on the build log's copy button.
+#[component]
+pub(crate) fn CopyIcon() -> Element {
+    rsx! {
+        ButtonIcon { path: "M9 5h10a2 2 0 0 1 2 2v10M15 7H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Z" }
+    }
+}
+
+/// Checkmark, swapped in for `CopyIcon` once the copy has landed.
+#[component]
+pub(crate) fn CheckIcon() -> Element {
+    rsx! { ButtonIcon { path: "M20 6 9 17l-5-5" } }
+}
+
 #[component]
 fn ActivitiesIcon() -> Element {
     rsx! { Icon { path: "M4 6h16M4 12h16M4 18h10" } }
