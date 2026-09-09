@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use aurcache_common::builder::BuildStates;
@@ -40,6 +40,62 @@ pub fn pre_startup_tasks() {
         let repo_dir = Path::new("./repo").join(platform.to_string());
         if let Err(e) = pacman_repo_utils::repo_init::init_repo(&repo_dir, "repo") {
             error!("Failed to initialize pacman repo: {e:?}");
+        }
+    }
+
+    warn_about_ephemeral_data();
+}
+
+/// Whether a directory will be thrown away with the container it is in.
+///
+/// A mount -- volume or bind -- is a different filesystem from the image's own
+/// layers, so a data directory sharing a device with `/` inside a container is
+/// a data directory nobody mounted. Outside a container it shares that device
+/// on any ordinary installation, and means nothing.
+const fn is_ephemeral(in_container: bool, root_dev: u64, data_dev: u64) -> bool {
+    in_container && root_dev == data_dev
+}
+
+/// Say so, once, when the server's data is on a container's writable layer.
+///
+/// It is worth saying because the loss is silent and total: the container is
+/// replaced on the next image update and the packages, the database and every
+/// build log go with it. Warning is deliberately preferred to declaring
+/// `VOLUME /app` in the image, which would make the data survive in an
+/// anonymous volume the operator cannot find, cannot back up, and loses to
+/// `docker volume prune` or a service rescheduled onto another Swarm node --
+/// a failure that looks like success until it does not.
+fn warn_about_ephemeral_data() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let in_container =
+            Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists();
+        let Ok(root_dev) = std::fs::metadata("/").map(|m| m.dev()) else {
+            return;
+        };
+
+        let ephemeral: Vec<String> = [
+            PathBuf::from("./repo"),
+            aurcache_common::fs::build_log_root(),
+            PathBuf::from(env::var("AURCACHE_CA_DIR").unwrap_or_else(|_| "./data/ca".to_string())),
+        ]
+        .into_iter()
+        .filter(|dir| {
+            std::fs::metadata(dir)
+                .map(|m| is_ephemeral(in_container, root_dev, m.dev()))
+                .unwrap_or(false)
+        })
+        .map(|dir| dir.display().to_string())
+        .collect();
+
+        if !ephemeral.is_empty() {
+            warn!(
+                "Not persisted, and lost when this container is replaced: {}. \
+                 Mount /app (or these paths individually) to keep them.",
+                ephemeral.join(", ")
+            );
         }
     }
 }
@@ -316,5 +372,19 @@ mod mirrorlist_env_tests {
         assert_eq!(mirrorlist_env_var("x86_64"), "MIRRORLIST_SERVERS_X86_64");
         assert_eq!(mirrorlist_env_var("aarch64"), "MIRRORLIST_SERVERS_AARCH64");
         assert_eq!(mirrorlist_env_var("armv7h"), "MIRRORLIST_SERVERS_ARMV7H");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ephemeral;
+
+    /// Sharing a device with `/` means "nobody mounted this" only inside a
+    /// container. On a normal install it is simply where the data lives.
+    #[test]
+    fn only_an_unmounted_container_path_is_ephemeral() {
+        assert!(is_ephemeral(true, 55, 55));
+        assert!(!is_ephemeral(true, 55, 64768));
+        assert!(!is_ephemeral(false, 55, 55));
     }
 }
