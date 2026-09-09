@@ -62,6 +62,7 @@ impl ChrootExecutor {
             chroots: Chroots::new(
                 cfg.chroot_dir.clone(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
+                cfg.chroot_overlay,
             ),
         });
         Self {

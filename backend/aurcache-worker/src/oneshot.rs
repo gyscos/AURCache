@@ -31,6 +31,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     let chroots = Chroots::new(
         cfg.chroot_dir.clone(),
         std::time::Duration::from_secs(cfg.chroot_refresh_interval),
+        cfg.chroot_overlay,
     );
     chroots
         .refresh(&pacman_conf)

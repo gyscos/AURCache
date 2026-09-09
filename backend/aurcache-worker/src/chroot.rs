@@ -460,23 +460,45 @@ pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
 
 /// Take devtools' `root.lock` exclusively, waiting out any copy in flight.
 ///
-/// Returns the open file: the lock is held until it is dropped, and released
-/// by the close. `None` if the lock could not be taken at all, which is worth
-/// carrying on without -- an unlocked refresh is what happened before this
-/// existed, and refusing to build over it would be a worse trade.
+/// See [`open_base_lock`] for why it is opened read-only.
+async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
+    open_base_lock(root, true).await
+}
+
+/// Take devtools' `root.lock` *shared*, which is what `sync_chroot` does while
+/// it copies.
+///
+/// An overlay uses the base chroot as its lower layer for the whole build, not
+/// for the instant of a copy, so it holds the same shared lock for the whole
+/// build: several may read it at once, and a refresh -- which takes it
+/// exclusively -- waits for them.
+pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
+    open_base_lock(root, false).await
+}
+
+/// Open and lock the base chroot's lock file.
 ///
 /// Opened **read-only**, which is not a detail: `mkarchroot` creates the lock
 /// as root and leaves it `0644`, while the worker is not root, so asking for
 /// write access fails with `EACCES` and the lock is never taken -- silently,
-/// since this is best-effort. `flock(2)` places an exclusive lock through a
+/// since this is best-effort. `flock(2)` places either kind of lock through a
 /// read-only descriptor perfectly well; the open mode and the lock mode are
 /// unrelated. There is nothing to create here either: by the time a chroot can
-/// be refreshed, `mkarchroot` has made both it and its lock.
-async fn lock_base_chroot(root: &Path) -> Option<std::fs::File> {
+/// be refreshed or overlaid, `mkarchroot` has made both it and its lock.
+///
+/// The lock is held until the returned file is dropped. `None` if it could not
+/// be taken at all, which is worth carrying on without -- that is what
+/// happened before this existed, and refusing to build over it would be a
+/// worse trade.
+async fn open_base_lock(root: &Path, exclusive: bool) -> Option<std::fs::File> {
     let path = root.with_extension("lock");
     let taken = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
-        file.lock()?;
+        if exclusive {
+            file.lock()?;
+        } else {
+            file.lock_shared()?;
+        }
         std::io::Result::Ok(file)
     })
     .await;

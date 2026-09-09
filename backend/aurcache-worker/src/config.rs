@@ -51,6 +51,16 @@ pub struct Config {
     /// move a few times a day, not a few times an hour. Every build paid for
     /// that, serially, before it could start.
     pub chroot_refresh_interval: u64,
+    /// Mount each build's chroot as an overlay on the base instead of letting
+    /// `makechrootpkg` copy it.
+    ///
+    /// Off by default: copying is what every worker has done, and on btrfs it
+    /// is already a snapshot. Worth turning on where the chroot lives on a
+    /// filesystem with no cheap copy -- ext4, or ZFS below 2.2 -- where every
+    /// build otherwise rsyncs the whole base chroot. A filesystem that cannot
+    /// carry an upper layer (NFS, ZFS below 2.2) falls back to copying with a
+    /// warning rather than failing the build.
+    pub chroot_overlay: bool,
     /// Package cache TTL in seconds. Defaults to `0` (disabled) because a
     /// cached package's mtime is its *download* time — pacman does not touch
     /// it on a cache hit — so age-evicting would discard a package used daily
@@ -103,6 +113,8 @@ impl Config {
             chroot_refresh_interval: env_opt("WORKER_CHROOT_REFRESH_INTERVAL")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15 * 60),
+            chroot_overlay: env_opt("WORKER_CHROOT_OVERLAY")
+                .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
             core,
         }
     }

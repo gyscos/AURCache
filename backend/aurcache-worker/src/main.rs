@@ -101,6 +101,7 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     aurcache_worker::chroots::Chroots::new(
         cfg.chroot_dir.clone(),
         std::time::Duration::from_secs(cfg.chroot_refresh_interval),
+        cfg.chroot_overlay,
     )
     .sweep()
     .await;

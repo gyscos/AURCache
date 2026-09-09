@@ -114,6 +114,7 @@ simply for being old. Size pressure is the honest bound for that pool.
 | `WORKER_CHROOT_DIR` | Path | Base chroot and per-job copies | `<data dir>/chroot` |
 | `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
 | `WORKER_CHROOT_REFRESH_INTERVAL` | Integer | Seconds a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `900` |
+| `WORKER_CHROOT_OVERLAY` | Boolean | Mount each build's chroot as an overlay instead of copying the base | off |
 
 The base chroot is brought up to date with `pacman -Syu` before a build, but
 not more often than `WORKER_CHROOT_REFRESH_INTERVAL`. The refresh takes around
@@ -128,6 +129,31 @@ old behaviour.
 and its generated SSH key; if it is lost, the worker re-enrolls as a new,
 unapproved worker and generates a new key, which the remote will no longer
 accept.
+
+### Overlay chroots
+
+`makechrootpkg` gives each build a copy of the base chroot. On btrfs that copy
+is a snapshot and costs nothing; everywhere else it is an `rsync` of the whole
+chroot -- around 800 MB per build, which on an SSD is both slow and wear you
+did not ask for.
+
+`WORKER_CHROOT_OVERLAY=1` mounts the base read-only as an overlay's lower layer
+instead, with a directory of the build's own on top. The mount takes about 15
+milliseconds and the upper layer holds only what the build changed, which for
+an ordinary package is a few hundred kilobytes. The base cannot be written
+through the mount, so builds are as isolated from each other as they were with
+copies.
+
+It is off by default because copying is what every worker has done, and because
+the upper layer needs a filesystem that supports whiteouts and trusted extended
+attributes: ext4, XFS and btrfs do, ZFS does from 2.2, and NFS does not. Where
+the mount cannot be made the build falls back to copying and logs a warning
+rather than failing.
+
+One consequence is worth knowing: a live overlay's lower layer must not change,
+so the base chroot cannot be refreshed while any overlay build is running. The
+refresh waits for them to finish. A worker that never goes idle will therefore
+go longer between refreshes than `WORKER_CHROOT_REFRESH_INTERVAL` suggests.
 
 ### Putting the chroot on other storage
 
