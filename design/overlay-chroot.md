@@ -126,6 +126,30 @@ Publication is a rename so a crash mid-refresh leaves `.tmp` rubbish rather
 than a half-written layer in the stack. Builds already running keep the stack
 they mounted; the next build gets the longer one.
 
+## A new layer only when the old one is in use
+
+A refresh needs a *new* layer for one reason: the current top of the stack may
+be in use by a build. When it is not, the refresh writes into it instead, and
+the stack does not grow at all.
+
+What makes that correct is that overlayfs reads lower layers newest-first, so
+the top of the stack is the copy a build sees. Updating anything below it --
+the base included -- would leave an older file shadowing a newer one. So "in
+place" follows the top of the stack, whatever it happens to be: the newest
+layer, or the base itself when nothing is stacked.
+
+The precondition is the same either way: nothing may read the stack while any
+part of it is written. The base chroot's lock provides it -- held exclusively
+by the update, shared by every build's mount -- so a build starting mid-update
+waits for it, and a build already running makes the update stack a layer
+instead. Two refreshes cannot overlap at all, because a worker holds one lock
+across the whole of one.
+
+The practical effect is that layers accumulate only while builds are running.
+A worker that is idle when a refresh comes due -- most of them, most of the
+time -- keeps its stack at whatever depth a busy spell left it, and updates the
+top of it forever after.
+
 ## Flattening
 
 The stack grows by one directory per refresh. Lookup cost grows with it, and

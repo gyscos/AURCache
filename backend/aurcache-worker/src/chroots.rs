@@ -596,39 +596,42 @@ impl Chroots {
             return Ok(root);
         }
 
-        // Nothing reading the base, and nothing stacked on it: update it where
-        // it lies. The layer machinery exists for the case where something *is*
-        // reading it, and a worker that happens to be idle when a refresh comes
-        // due -- most of them, most of the time -- then never stacks anything,
-        // never flattens, and keeps a base that is simply current.
-        //
-        // Only with an empty stack, and that is the correctness constraint
-        // rather than an optimisation: a layer shadows the base, so a layer
-        // published last week would hide a package this refresh just upgraded,
-        // and the build would see the older one. With layers present the
-        // refresh has to go on top of them, where the newest copy wins.
+        // Nothing is reading the stack: update what is on top of it, in place.
+        // A new layer is only ever needed because the current top might be in
+        // use -- when it is not, writing into it is correct and costs nothing.
+        // How deep the stack already is does not come into it: the top is the
+        // layer that wins, so updating it is what a build ends up seeing.
         //
         // The lock is what makes it safe, and what makes it bounded. A build
-        // starting here waits for the update (~13s) instead of mounting a base
+        // starting here waits for the update instead of mounting something
         // being written; a build already running holds the lock shared, so this
-        // finds it busy and stacks a layer instead.
-        if self.layers().is_empty()
-            && self.mounted_copies().is_empty()
+        // finds it busy and adds a layer instead.
+        let published = self.layers();
+        if self.mounted_copies().is_empty()
             && let chroot::BaseLock::Held(lock) = chroot::try_lock_base(&root).await
         {
-            let refreshed = chroot::ensure_base_chroot(&self.dir, pacman_conf).await;
+            let updated = if published.is_empty() {
+                chroot::ensure_base_chroot(&self.dir, pacman_conf)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.update_top_layer(&root, &published).await
+            };
             drop(lock);
-            match refreshed {
-                Ok(root) => {
-                    tracing::debug!("refreshed the base chroot in place");
+            match updated {
+                Ok(()) => {
+                    tracing::debug!(
+                        "updated the chroot in place ({} layer(s) deep)",
+                        published.len()
+                    );
                     *last = Some(Instant::now());
                     return Ok(root);
                 }
-                Err(e) => tracing::warn!("could not refresh the base chroot in place: {e:#}"),
+                Err(e) => tracing::warn!("could not update the chroot in place: {e:#}"),
             }
         }
 
-        let published = self.layers().len();
+        let published = published.len();
         if published >= HARD_MAX_LAYERS {
             tracing::warn!(
                 "{published} chroot layers and flattening them keeps failing; \
@@ -653,16 +656,64 @@ impl Chroots {
         let name = next_layer_name(&published);
         let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
         let pending = updates.join(format!("{name}{PENDING_SUFFIX}"));
+        let lower = lower_stack(root, &published).context("chroot paths cannot be stacked")?;
+
+        if let Err(e) = self.upgrade_into(&lower, &pending, &name).await {
+            let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
+            return Err(e);
+        }
+
+        // Publication is the rename: until it lands, `layers` does not see a
+        // layer that is still being written.
+        let layer = updates.join(&name);
+        sudo(&["mv".as_ref(), pending.as_os_str(), layer.as_os_str()]).await?;
+        tracing::info!("published chroot update layer {name}");
+        Ok(())
+    }
+
+    /// Update the layer already on top of the stack, rather than adding
+    /// another.
+    ///
+    /// The reason a refresh ever needs a *new* layer is that the old one may be
+    /// in use; when it is not, writing into it is both correct and free. What
+    /// makes it correct is that it is the layer that wins -- overlayfs reads
+    /// lower layers newest-first, so the topmost copy of a file is the one a
+    /// build sees. Updating anything below it, the base included, would leave
+    /// an older file shadowing a newer one, which is why this follows the top
+    /// of the stack rather than the bottom of it.
+    ///
+    /// Same precondition as updating the base: nothing may be reading the stack
+    /// while any part of it is written, which the caller holds the base's lock
+    /// to guarantee.
+    async fn update_top_layer(&self, root: &Path, published: &[PathBuf]) -> Result<()> {
+        let Some((top, rest)) = published.split_last() else {
+            return Ok(());
+        };
+        let name = top
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("top")
+            .to_string();
+        let lower = lower_stack(root, rest).context("chroot paths cannot be stacked")?;
+        self.upgrade_into(&lower, top, &name).await
+    }
+
+    /// Run `pacman -Syu` with `upper` as the writable layer over `lower`.
+    ///
+    /// The scratch directories are named after the layer so two of these can
+    /// never collide, though the base chroot's lock means two never run at
+    /// once.
+    async fn upgrade_into(&self, lower: &str, upper: &Path, name: &str) -> Result<()> {
+        let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
         let work = updates.join(format!(".work-{name}"));
         let merged = updates.join(format!(".merged-{name}"));
-        let lower = lower_stack(root, &published).context("chroot paths cannot be stacked")?;
-        let options = overlay_options(&lower, &pending, &work)
+        let options = overlay_options(lower, upper, &work)
             .context("chroot paths cannot be expressed as overlay options")?;
 
         sudo(&[
             "mkdir".as_ref(),
             "-p".as_ref(),
-            pending.as_os_str(),
+            upper.as_os_str(),
             work.as_os_str(),
             merged.as_os_str(),
         ])
@@ -691,23 +742,10 @@ impl Chroots {
         .await;
 
         match updated {
-            Ok((_, status)) if status.success() => {}
-            Ok((log, _)) => {
-                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
-                bail!("updating the chroot returned non-zero:\n{log}");
-            }
-            Err(e) => {
-                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
-                return Err(e);
-            }
+            Ok((_, status)) if status.success() => Ok(()),
+            Ok((log, _)) => bail!("updating the chroot returned non-zero:\n{log}"),
+            Err(e) => Err(e),
         }
-
-        // Publication is the rename: until it lands, `layers` does not see a
-        // layer that is still being written.
-        let layer = updates.join(&name);
-        sudo(&["mv".as_ref(), pending.as_os_str(), layer.as_os_str()]).await?;
-        tracing::info!("published chroot update layer {name}");
-        Ok(())
     }
 
     /// [`Chroots::flatten_if_deep`], with its failure reported rather than
