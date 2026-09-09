@@ -31,16 +31,19 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 /// `SUDO_USER` inference, so it is `builder` and never `aurcache` -- see
 /// `build::build_command`.
 ///
-/// Only `GNUPGHOME` is preserved: it names this build's keyring replica (see
-/// [`prepare_job_keyring`]). `SRCDEST`/`PKGDEST` are passed to
-/// `makechrootpkg`/`makepkg.conf` by other means, never via the environment,
-/// so preserving them here would be a no-op.
+/// Three variables are preserved, because sudo would otherwise drop all of
+/// them: `GNUPGHOME` names this build's keyring replica (see
+/// [`prepare_job_keyring`]), `SRCDEST` the source cache `makechrootpkg` binds
+/// itself, and `AURCACHE_DROPIN` the makepkg overrides it installs into this
+/// build's chroot copy. `PKGDEST` reaches the build through `makepkg.conf`
+/// instead, so preserving it here would be a no-op.
 pub fn devtools(program: &str) -> Command {
     let mut cmd = Command::new("sudo");
     // `SRCDEST` is how `makechrootpkg` is told where to keep downloaded
     // sources; sudo would otherwise strip it and devtools would silently fall
     // back to the PKGBUILD directory, losing the cache.
-    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST").arg(program);
+    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN")
+        .arg(program);
     cmd
 }
 
@@ -316,28 +319,24 @@ fn without_chroot_owned(overrides: &str) -> String {
         .collect()
 }
 
-pub async fn install_makepkg_dropin(root: &Path, staged: &Path) -> Result<()> {
-    let dest = root.join("etc/makepkg.conf.d/aurcache.conf");
+/// Write this build's makepkg overrides to a file of its own, and return it.
+///
+/// `makechrootpkg` installs it into the job's chroot copy (see
+/// `packaging/patch-makechrootpkg.py`), which is why nothing here touches the
+/// base chroot. It used to: the drop-in went into the shared template before
+/// every build, and `sync_chroot` carried it into the copy -- so two builds
+/// starting together raced, and one could run with the other's `MAKEFLAGS`,
+/// `PACKAGER` and ssh-agent socket. The copy is per build by construction,
+/// and the worker cannot see when `makechrootpkg` makes it, so there is no
+/// lock that would have fixed this.
+pub fn stage_makepkg_dropin(staged: &Path) -> Result<PathBuf> {
     let filtered = without_chroot_owned(
         &std::fs::read_to_string(staged)
             .with_context(|| format!("reading {}", staged.display()))?,
     );
-    let staged = &staged.with_extension("dropin");
-    std::fs::write(staged, filtered).with_context(|| format!("writing {}", staged.display()))?;
-    // Through `sudo`, because the chroot belongs to root and this worker
-    // deliberately does not. The file is staged in the job's own directory
-    // first, so nothing writes into the chroot except this one copy -- which is
-    // the same division `mkarchroot -M` used to provide.
-    let mut cmd = Command::new("sudo");
-    cmd.arg("install").arg("-Dm644").arg(staged).arg(&dest);
-    let (log, status) = run_capture(cmd).await?;
-    if !status.success() {
-        bail!(
-            "installing makepkg overrides into {}:\n{log}",
-            dest.display()
-        );
-    }
-    Ok(())
+    let dropin = staged.with_extension("dropin");
+    std::fs::write(&dropin, filtered).with_context(|| format!("writing {}", dropin.display()))?;
+    Ok(dropin)
 }
 
 /// Append the worker's cache layout to a server-rendered `pacman.conf`.
@@ -566,6 +565,42 @@ mod tests {
         assert!(!is_stale_copy("job-604-2844759.lock"));
         assert!(!is_stale_copy("root"));
         assert!(!is_stale_copy("root.lock"));
+    }
+
+    /// One build's overrides go to a file of that build's own, which
+    /// `makechrootpkg` then installs into the chroot copy it makes. Nothing is
+    /// written to the shared base chroot, where two builds starting together
+    /// used to overwrite each other's.
+    #[test]
+    fn a_dropin_is_staged_per_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("makepkg.conf");
+        std::fs::write(&staged, "MAKEFLAGS=-j4\nPKGDEST=/output\nPACKAGER='a'\n").unwrap();
+
+        let dropin = stage_makepkg_dropin(&staged).unwrap();
+
+        assert_ne!(dropin, staged, "the drop-in is its own file");
+        let text = std::fs::read_to_string(&dropin).unwrap();
+        assert_eq!(text, "MAKEFLAGS=-j4\nPACKAGER='a'\n");
+    }
+
+    /// The variable has to be spelled the same here and in
+    /// `packaging/patch-makechrootpkg.py`, which reads `$AURCACHE_DROPIN`:
+    /// sudo drops everything not named, and a dropped drop-in is a build that
+    /// silently runs on the chroot's own defaults.
+    #[test]
+    fn the_build_environment_survives_sudo() {
+        let cmd = devtools("makechrootpkg");
+        let preserve = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .find(|a| a.starts_with("--preserve-env="))
+            .expect("devtools commands must preserve an environment through sudo");
+
+        for var in ["GNUPGHOME", "SRCDEST", "AURCACHE_DROPIN"] {
+            assert!(preserve.contains(var), "{preserve} must carry {var}");
+        }
     }
 
     /// `makechrootpkg` picks the build directories, and a drop-in must not

@@ -64,6 +64,50 @@ PATCHES = [
         '\t\tenv SRCDEST="$SRCDEST" BUILDDIR="$WORKDIR" TMPDIR="$WORKDIR" \\',
     ),
     (
+        # The worker used to install this into the *base* chroot before each
+        # build and let `sync_chroot` carry it into the copy. Two builds
+        # starting at once then raced: the second overwrote the drop-in while
+        # the first was still being copied, and a build ran with another
+        # package's MAKEFLAGS, PACKAGER and ssh-agent socket. Installing into
+        # `$copydir` instead makes it per-build by construction -- there is no
+        # shared file left to overwrite, and no lock to hold across a copy the
+        # worker cannot observe.
+        #
+        # It must land in the copy rather than be bind-mounted in, because
+        # `download_sources` runs `makepkg --config="$copydir/etc/makepkg.conf"`
+        # on the *host*, and makepkg reads `"$MAKEPKG_CONF.d"/*.conf` relative
+        # to that path -- so a drop-in visible only inside the container would
+        # be missed by the step that fetches sources, losing `GIT_SSH_COMMAND`
+        # for authenticated fetches.
+        #
+        # Before `download_sources`, which is the first thing to read it, and
+        # after the copy exists. Unset `AURCACHE_DROPIN` (anyone running this
+        # copy by hand) leaves the chroot's own configuration untouched.
+        "per-build makepkg drop-in installed into the chroot copy",
+        "\ndownload_sources\n\nprepare_chroot\n",
+        """
+if [[ -n ${AURCACHE_DROPIN:-} ]]; then
+\tinstall -Dm644 "$AURCACHE_DROPIN" "$copydir/etc/makepkg.conf.d/aurcache.conf" ||
+\t\tdie "Unable to install %s" "$AURCACHE_DROPIN"
+fi
+
+download_sources
+
+prepare_chroot
+""",
+    ),
+    (
+        # `check_root` re-execs through `sudo --preserve-env=<list>`, which
+        # drops everything else. A no-op for the worker, which is already root
+        # by then, but without this the drop-in silently vanishes for anyone
+        # invoking the script unprivileged.
+        "AURCACHE_DROPIN kept across the root re-exec",
+        "check_root SOURCE_DATE_EPOCH,BUILDTOOL,BUILDTOOLVER,GNUPGHOME,SRCDEST,"
+        "SRCPKGDEST,PKGDEST,LOGDEST,NPROC,MAKEFLAGS,PACKAGER",
+        "check_root SOURCE_DATE_EPOCH,BUILDTOOL,BUILDTOOLVER,GNUPGHOME,SRCDEST,"
+        "SRCPKGDEST,PKGDEST,LOGDEST,NPROC,MAKEFLAGS,PACKAGER,AURCACHE_DROPIN",
+    ),
+    (
         "direct `source PKGBUILD` for pkgbase/pkgname",
         '} < <(sudo -u "$makepkg_user" bash -c \'',
         '} < <(sudo -u "$makepkg_user" aurcache-sandbox --allow-build-env -- bash -c \'',

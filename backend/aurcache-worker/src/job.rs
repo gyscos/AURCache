@@ -155,18 +155,17 @@ async fn run_job_inner(
     .context("writing job configs")?;
 
     log(client, build_id, "[worker] preparing chroot\n").await;
-    let root = chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf)
+    chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf)
         .await
         .context("preparing base chroot")?;
 
-    // After the chroot exists, and before every build: makechrootpkg copies the
-    // base into this job's chroot when it runs, so the drop-in goes with it.
-    // Writing it per build is also what makes a per-package `makepkg_conf`
-    // setting apply at all -- installing it once at creation froze whatever the
-    // first build happened to use.
-    chroot::install_makepkg_dropin(&root, &makepkg_overrides)
-        .await
-        .context("installing makepkg overrides")?;
+    // Staged for this build alone; `makechrootpkg` installs it into the chroot
+    // copy it makes, which is what keeps a per-package `makepkg_conf` from
+    // reaching another build. Writing it into the shared base chroot -- which
+    // is where it went until concurrent builds started overwriting each
+    // other's -- is what that replaced.
+    let dropin =
+        chroot::stage_makepkg_dropin(&makepkg_overrides).context("staging makepkg overrides")?;
 
     // 3. Stage this job's trusted PGP keys into a keyring of its own, copied
     //    from the shared one so a key is fetched from the keyserver once and
@@ -254,7 +253,11 @@ async fn run_job_inner(
         binds.push((dir.to_path_buf(), dir.to_path_buf()));
     }
 
-    let ctx = WorkerContext { cfg, cgroups };
+    let ctx = WorkerContext {
+        cfg,
+        cgroups,
+        dropin: &dropin,
+    };
     let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
 
     // 5. Fold this job's downloads into the shared cache, then bound it. Only
@@ -366,6 +369,9 @@ fn agent_socket() -> Option<PathBuf> {
 struct WorkerContext<'a> {
     cfg: &'a Config,
     cgroups: Option<&'a Hierarchy>,
+    /// This build's makepkg overrides, which `makechrootpkg` installs into the
+    /// chroot copy it makes for it.
+    dropin: &'a Path,
 }
 
 async fn run_build(
@@ -431,6 +437,11 @@ async fn run_build(
         if let Some(dir) = gnupg.as_deref() {
             cmd.env("GNUPGHOME", dir);
         }
+        // This build's makepkg overrides. `makechrootpkg` installs the file
+        // named here into the chroot copy it makes for this build, so no two
+        // builds share one -- and the host-side source download reads the same
+        // copy, which a bind mount inside the container would not reach.
+        cmd.env("AURCACHE_DROPIN", ctx.dropin);
         cmd.spawn()
     };
 
