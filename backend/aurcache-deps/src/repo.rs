@@ -12,16 +12,6 @@ use crate::satisfy::SatisfyIndex;
 
 const OFFICIAL_REPO_NAMES: &[&str] = &["core", "extra", "multilib"];
 const OFFICIAL_REPO_CACHE_TTL_SECS: u64 = 60 * 60;
-/// Every pacman repository directory holds its database under this name --
-/// AURCache's own (written by `repo_ingest`) and the cached official ones
-/// alike.
-const REPO_DB_FILE: &str = "repo.db.tar.gz";
-
-pub(crate) fn default_repo_root() -> PathBuf {
-    std::env::var("AURCACHE_REPO_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./repo"))
-}
 
 /// Mirrorlist used to locate official repo databases.
 ///
@@ -46,38 +36,6 @@ pub(crate) fn default_official_repo_cache_dir() -> PathBuf {
 }
 
 impl AurClient {
-    /// Index AURCache's own repository for `wanted`.
-    ///
-    /// Restricted to `platforms`, because the repository is laid out one
-    /// directory per platform (see `repo_ingest`) and a package built only for
-    /// `aarch64` cannot satisfy an `x86_64` build. An empty list means every
-    /// platform present, which is what a backfill with no per-package platform
-    /// list wants.
-    pub(crate) fn local_repo_index(
-        &self,
-        wanted: &HashSet<&str>,
-        platforms: &[String],
-    ) -> Result<SatisfyIndex, Error> {
-        if !self.repo_root.exists() {
-            return Ok(SatisfyIndex::new());
-        }
-
-        let archives: Vec<PathBuf> = if platforms.is_empty() {
-            fs::read_dir(&self.repo_root)?
-                .map(|entry| entry.map(|entry| entry.path().join(REPO_DB_FILE)))
-                .collect::<Result<_, _>>()?
-        } else {
-            platforms
-                .iter()
-                .map(|platform| self.repo_root.join(platform).join(REPO_DB_FILE))
-                .collect()
-        };
-
-        index_archives(archives, wanted)
-    }
-
-    /// Index `core`, `extra` and `multilib` for `wanted`, refreshing the
-    /// cached databases first if they have aged out.
     pub(crate) async fn official_repo_index(
         &self,
         wanted: &HashSet<&str>,
@@ -438,7 +396,6 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let client = AurClient::with_urls_and_paths(
             "http://unused.invalid/rpc/v5",
-            tempfile::tempdir().unwrap().path().to_path_buf(),
             mirrorlist_path,
             cache_dir.path().to_path_buf(),
         );
@@ -486,7 +443,6 @@ mod tests {
 
         let client = AurClient::with_urls_and_paths(
             "http://unused.invalid/rpc/v5",
-            tempfile::tempdir().unwrap().path().to_path_buf(),
             PathBuf::from("/nonexistent/mirrorlist"),
             cache_dir.path().to_path_buf(),
         );

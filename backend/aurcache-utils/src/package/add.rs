@@ -482,10 +482,7 @@ async fn plan_package_with_deps(
     plan: &mut AddPlan,
 ) -> anyhow::Result<()> {
     let &PlanContext {
-        client,
-        tracked,
-        context,
-        ..
+        client, tracked, ..
     } = plan_context;
     let pairs = package_spec.deps.to_pairs();
     let resolved_deps = if pairs.is_empty() {
@@ -498,7 +495,6 @@ async fn plan_package_with_deps(
             tracked,
             &crate::pkg::as_dependencies(&pairs),
             &plan.candidates(),
-            &crate::pkg::platform_names(&context.platforms_str),
         )
         .await
         .map_err(|e| {

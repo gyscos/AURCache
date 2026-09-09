@@ -33,12 +33,8 @@ fn client_with_empty_official_cache(rpc_url: String) -> (tempfile::TempDir, AurC
             .unwrap();
     }
 
-    let client = AurClient::with_urls_and_paths(
-        rpc_url,
-        tmp.path().join("repo"),
-        tmp.path().join("no-such-mirrorlist"),
-        cache_dir,
-    );
+    let client =
+        AurClient::with_urls_and_paths(rpc_url, tmp.path().join("no-such-mirrorlist"), cache_dir);
     (tmp, client)
 }
 

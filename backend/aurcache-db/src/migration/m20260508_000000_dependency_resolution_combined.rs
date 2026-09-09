@@ -699,14 +699,13 @@ async fn ensure_deps(
     // stale and a package added earlier in the backfill would be resolved
     // against the AUR and inserted a second time.
     let tracked = TrackedPackages::load(db).await?;
-    let resolved_deps =
-        match resolve_dependencies(client, &tracked, &deps_to_resolve, &[], &[]).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("dependency resolution failed for {pkgbase}: {e}");
-                return Ok(());
-            }
-        };
+    let resolved_deps = match resolve_dependencies(client, &tracked, &deps_to_resolve, &[]).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("dependency resolution failed for {pkgbase}: {e}");
+            return Ok(());
+        }
+    };
     if !resolved_deps.unresolved.is_empty() {
         tracing::warn!(
             "{pkgbase}: no package provides {}",

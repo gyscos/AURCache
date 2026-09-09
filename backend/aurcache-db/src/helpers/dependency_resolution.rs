@@ -128,18 +128,15 @@ impl TrackedPackages {
 /// against the AUR and planned a second time. Callers with nothing in flight
 /// pass `&[]`.
 ///
-/// `platforms` scopes AURCache's own repository, which is stored one directory
-/// per platform; empty means every platform present.
 pub async fn resolve_dependencies(
     client: &AurClient,
     tracked: &TrackedPackages,
     deps: &[Dependency<'_>],
     planned: &[PackageCandidate],
-    platforms: &[String],
 ) -> Result<Resolutions, aurcache_deps::Error> {
     let wanted = deps.iter().map(|dep| dep.name).collect();
     client
-        .resolve_dependencies(deps, &tracked.index(planned, &wanted), platforms)
+        .resolve_dependencies(deps, &tracked.index(planned, &wanted))
         .await
 }
 

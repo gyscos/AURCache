@@ -63,7 +63,6 @@ async fn setup_env() -> TestEnv {
 
     let client = AurClient::with_urls_and_paths(
         format!("{base_url}/rpc/v5"),
-        repo_root.clone(),
         mirrorlist_path,
         official_cache_dir.clone(),
     );
