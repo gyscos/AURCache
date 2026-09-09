@@ -595,6 +595,39 @@ impl Chroots {
             tracing::debug!("base chroot is current; not adding a layer");
             return Ok(root);
         }
+
+        // Nothing reading the base, and nothing stacked on it: update it where
+        // it lies. The layer machinery exists for the case where something *is*
+        // reading it, and a worker that happens to be idle when a refresh comes
+        // due -- most of them, most of the time -- then never stacks anything,
+        // never flattens, and keeps a base that is simply current.
+        //
+        // Only with an empty stack, and that is the correctness constraint
+        // rather than an optimisation: a layer shadows the base, so a layer
+        // published last week would hide a package this refresh just upgraded,
+        // and the build would see the older one. With layers present the
+        // refresh has to go on top of them, where the newest copy wins.
+        //
+        // The lock is what makes it safe, and what makes it bounded. A build
+        // starting here waits for the update (~13s) instead of mounting a base
+        // being written; a build already running holds the lock shared, so this
+        // finds it busy and stacks a layer instead.
+        if self.layers().is_empty()
+            && self.mounted_copies().is_empty()
+            && let chroot::BaseLock::Held(lock) = chroot::try_lock_base(&root).await
+        {
+            let refreshed = chroot::ensure_base_chroot(&self.dir, pacman_conf).await;
+            drop(lock);
+            match refreshed {
+                Ok(root) => {
+                    tracing::debug!("refreshed the base chroot in place");
+                    *last = Some(Instant::now());
+                    return Ok(root);
+                }
+                Err(e) => tracing::warn!("could not refresh the base chroot in place: {e:#}"),
+            }
+        }
+
         let published = self.layers().len();
         if published >= HARD_MAX_LAYERS {
             tracing::warn!(
