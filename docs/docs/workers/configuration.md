@@ -161,18 +161,15 @@ Set it to `1` or `0` to decide yourself. An unrecognised value means `auto`, so
 a typo cannot quietly disable something you were trying to enable.
 
 Refreshes accumulate as layers, and layers are merged back into the base once
-there are enough of them. Merging can only happen when no build is mounted, so
-a worker with a full queue may not get the chance -- at which point it stops
-claiming new builds, lets the ones in flight finish, merges, and starts
-claiming again. Jobs wait on the server rather than being claimed and stalled,
-so they stay visible in the queue and hold no lease.
+there are enough of them. Merging runs alongside builds: it reads what they
+read, writes the new base somewhere nothing is reading, and publishes it with a
+rename, which a mounted chroot does not notice. The base and layers it replaces
+are retained -- almost free, since the new base is hardlinked from the old --
+and deleted once no build is reading them.
 
-One consequence is worth knowing: a live overlay's lower layer must not change,
-so the base chroot cannot be refreshed while an overlay build is using it. The
-refresh does not wait -- waiting would hold up every job start behind it for as
-long as the longest build runs -- it simply happens at the next build that
-finds the chroot free. A worker that is never idle will therefore go longer
-between refreshes than `WORKER_CHROOT_REFRESH_INTERVAL` suggests.
+A live overlay's lower layer must not change, which is why a refresh publishes
+a layer rather than rewriting the base: nothing a running build reads is ever
+modified, so refreshes keep to their interval however busy the worker is.
 
 ### Putting the chroot on other storage
 

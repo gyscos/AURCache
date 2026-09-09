@@ -109,17 +109,37 @@ they mounted; the next build gets the longer one.
 
 ## Flattening
 
-The stack grows by one directory per refresh -- three a day, measured. Lookup
-cost grows with it, and `lowerdir` lists are not unbounded (Docker caps its
-equivalent at 128 layers).
+The stack grows by one directory per refresh. Lookup cost grows with it, and
+`lowerdir` lists are not unbounded (Docker caps its equivalent at 128).
 
-Flattening replaces `root` with the merged view and drops the layers. It is a
-full write, so it happens rarely -- once the stack passes a threshold, at the
-first moment no overlay is mounted. That "no overlay is mounted" test is not a
-nicety: the layers being merged are the lower layers of any live build, and
-removing them under one is the same undefined behaviour the whole design exists
-to avoid. If the worker is never idle, the stack keeps growing and the flatten
-keeps deferring; that is a warning, not a failure.
+Flattening builds a new base from the merged view and publishes it. None of it
+needs the worker to be idle, which the first implementation assumed and paid
+for with a drain:
+
+* **Building** the new base reads the base and the layers -- which running
+  builds are also reading -- and writes `root.new`, which is nobody's lower
+  layer. Seeded by hardlinking the old base and rsynced from the merged view,
+  so only what the layers changed is written: two seconds and two megabytes,
+  measured, against seventeen seconds and 1.3 GB for a plain copy.
+* **Publishing** is three renames under an in-process lock held against
+  *starting* builds, not running ones. A rename is invisible to a live mount,
+  which holds the directory it was given rather than its name -- verified: after
+  the rename, and even after a new directory takes the old name, the mount still
+  reads the tree it started with.
+* **Deleting** what was replaced is the only part that needs idleness, so it is
+  deferred. Removing a tree a build is reading takes out precisely the paths it
+  has not looked at yet -- what it has already read keeps working, so the
+  failure surfaces later and elsewhere:
+
+```
+delete the lower of a live mount:
+   file already read  → still fine          (cached dentry)
+   file never read    → No such file or directory
+```
+
+  Retaining it is nearly free, because the new base was hardlinked from the old
+  one and the two share every file neither changed. It is discarded at the next
+  moment no chroot copy is mounted, which startup guarantees.
 
 ## Crash recovery
 

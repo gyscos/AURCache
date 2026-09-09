@@ -77,6 +77,9 @@ const MAX_LAYERS: usize = 40;
 /// further leaves the chroot stale, which is the better failure.
 const HARD_MAX_LAYERS: usize = 96;
 
+/// Bases and layers a flatten has replaced, kept until nothing is reading them.
+const RETIRED_DIR: &str = "retired";
+
 /// Run one privileged command, failing with its output.
 ///
 /// The chroot directory belongs to root and this worker deliberately does not,
@@ -217,6 +220,14 @@ pub struct Chroots {
     /// Whether the worker is currently refusing jobs to drain for a flatten.
     /// Only so the transition is logged once rather than at every poll.
     draining: AtomicBool,
+    /// Guards *deciding* what to mount against *publishing* something new.
+    ///
+    /// In-process, unlike the base chroot's file lock, and correctly so: both
+    /// sides are ours. Held shared only while a build reads the layer list and
+    /// mounts (milliseconds), and exclusively only while a flatten renames its
+    /// result into place -- never across a build, which is what made the file
+    /// lock mean "wait for every build to finish".
+    layout: tokio::sync::RwLock<()>,
 }
 
 impl Chroots {
@@ -229,16 +240,20 @@ impl Chroots {
             last_refresh: Mutex::new(None),
             interval,
             draining: AtomicBool::new(false),
+            layout: tokio::sync::RwLock::new(()),
         }
     }
 
     /// Whether a build can start, or the worker should drain first.
     ///
-    /// Layers can only be flattened when nothing is mounted, and a worker with
-    /// a full queue never reaches that on its own -- so at the hard cap it
-    /// stops taking work until the builds in flight finish. Refusing to claim
-    /// is what makes that safe: a *claimed* job holds a lease the server
-    /// expects progress on, so stalling one that had already been accepted
+    /// A last resort, and one that should never fire: flattening no longer
+    /// needs an idle worker, so the stack only reaches the hard cap if
+    /// flattening has been failing for some other reason. When it does, the
+    /// worker stops taking work so the builds in flight can finish and the
+    /// retired trees be discarded, which *does* need idleness.
+    ///
+    /// Refusing to claim is what makes waiting safe: a *claimed* job holds a
+    /// lease the server expects progress on, so stalling one already accepted
     /// would risk it being taken for a dead worker, while a job left queued
     /// simply waits where everyone can see it.
     ///
@@ -506,6 +521,9 @@ impl Chroots {
     /// answer to that is a new base per refresh, which is a larger change than
     /// this one.
     async fn mount_overlay(&self, label: &str) -> Result<Option<std::fs::File>> {
+        // Held until the mount is made, so a flatten cannot retire the layers
+        // between reading them and using them.
+        let _layout = self.layout.read().await;
         let root = self.dir.join("root");
         let merged = self.dir.join(label);
         let layers = self.dir.join(OVERLAY_DIR).join(label);
@@ -580,8 +598,8 @@ impl Chroots {
         let published = self.layers().len();
         if published >= HARD_MAX_LAYERS {
             tracing::warn!(
-                "{published} chroot layers and no idle moment to flatten them; \
-                 not updating the chroot until there is one"
+                "{published} chroot layers and flattening them keeps failing; \
+                 not updating the chroot further"
             );
             return Ok(root);
         }
@@ -670,44 +688,23 @@ impl Chroots {
 
     /// Merge the layers back into the base once there are enough of them.
     ///
-    /// Only while nothing is mounted, and that is not a nicety: the layers
-    /// being merged are the lower layers of any live build, and removing them
-    /// under one is the undefined behaviour this whole design exists to avoid.
-    /// A worker that is never idle keeps stacking, which is a warning rather
-    /// than a failure.
+    /// Runs whenever it is due, including with builds in flight: it reads what
+    /// they read, writes somewhere nothing is reading, and publishes with
+    /// renames a live mount does not notice. Only *discarding* what it retires
+    /// waits for the builds to finish.
     async fn flatten_if_deep(&self, root: &Path) -> Result<()> {
         let published = self.layers();
         if published.len() < MAX_LAYERS {
+            // Still worth clearing anything an earlier flatten retired.
+            self.discard_retired().await;
             return Ok(());
         }
-        // Take the base exclusively for the whole swap. Checking that nothing
-        // is mounted is not enough on its own: a build starting a moment later
-        // would mount the stack this is about to delete, and the copy alone
-        // takes long enough for that to be likely rather than theoretical.
-        // `mount_overlay` takes the same lock shared, so a build that starts
-        // here waits, and one already running keeps this waiting instead.
-        let root_lock = match chroot::try_lock_base(root).await {
-            chroot::BaseLock::Held(lock) => lock,
-            chroot::BaseLock::Busy => {
-                tracing::warn!(
-                    "{} chroot layers and builds in flight; flattening when the worker is idle",
-                    published.len()
-                );
-                return Ok(());
-            }
-            // Without a lock there is no way to keep a build out of the swap,
-            // and stale layers are better than a build reading half of one.
-            chroot::BaseLock::Unavailable => {
-                tracing::warn!("cannot lock the base chroot; not flattening its layers");
-                return Ok(());
-            }
-        };
-        // Belt and braces: a leftover mount from a killed worker holds no lock.
-        if !self.mounted_copies().is_empty() {
-            tracing::warn!("chroot copies are still mounted; flattening later");
-            return Ok(());
-        }
-
+        let name = published
+            .last()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("0000")
+            .to_string();
         let staging = self.dir.join(OVERLAY_DIR).join(".flatten");
         let merged = staging.join("merged");
         let work = staging.join("work");
@@ -717,6 +714,9 @@ impl Chroots {
         let options =
             overlay_options(&lower, &empty, &work).context("cannot express the merged view")?;
 
+        // Unlocked, and it is the slow part. It reads the base and the layers,
+        // which every running build is also reading, and writes `root.new`,
+        // which is nobody's lower layer.
         let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), fresh.as_os_str()]).await;
         sudo(&[
             "mkdir".as_ref(),
@@ -736,26 +736,42 @@ impl Chroots {
             merged.as_os_str(),
         ])
         .await?;
-
         let built = self.build_flattened(root, &merged, &fresh).await;
         let _ = sudo(&["umount".as_ref(), merged.as_os_str()]).await;
         let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), staging.as_os_str()]).await;
         built?;
 
-        // Two renames, and a crash between them leaves no `root` -- which the
-        // next start treats as "no chroot yet" and rebuilds, slow but correct.
-        let previous = self.dir.join("root.old");
-        sudo(&["mv".as_ref(), root.as_os_str(), previous.as_os_str()]).await?;
-        sudo(&["mv".as_ref(), fresh.as_os_str(), root.as_os_str()]).await?;
+        // Publishing is three renames, and only they need exclusivity -- from
+        // *starting* builds, not from running ones. A rename is invisible to a
+        // live mount, which holds the directory it was given rather than the
+        // name: after one, and even after a new directory takes the old name,
+        // the mount still reads the tree it started with.
+        let retired = self.dir.join(OVERLAY_DIR).join(RETIRED_DIR).join(&name);
         let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
-        let _ = sudo(&[
-            "rm".as_ref(),
-            "-rf".as_ref(),
-            previous.as_os_str(),
-            updates.as_os_str(),
-        ])
-        .await;
-        drop(root_lock);
+        {
+            let _layout = self.layout.write().await;
+            sudo(&["mkdir".as_ref(), "-p".as_ref(), retired.as_os_str()]).await?;
+            sudo(&[
+                "mv".as_ref(),
+                updates.as_os_str(),
+                retired.join("updates").as_os_str(),
+            ])
+            .await?;
+            sudo(&[
+                "mv".as_ref(),
+                root.as_os_str(),
+                retired.join("root").as_os_str(),
+            ])
+            .await?;
+            sudo(&["mv".as_ref(), fresh.as_os_str(), root.as_os_str()]).await?;
+        }
+
+        // Retired, not deleted. Deleting a tree a build is still reading takes
+        // out exactly the paths it has not looked at yet -- what it has already
+        // read keeps working, so the failure arrives later and elsewhere. And
+        // keeping it costs almost nothing: the new base was seeded by
+        // hardlinking this one, so the two share every file neither changed.
+        self.discard_retired().await;
         tracing::info!("flattened {} chroot layers into the base", published.len());
         Ok(())
     }
@@ -814,6 +830,27 @@ impl Chroots {
             format!("{}/", fresh.display()).as_ref(),
         ])
         .await
+    }
+
+    /// Delete what previous flattens retired, once nothing is reading it.
+    ///
+    /// The check is "no chroot copy is mounted", which is what a build holds:
+    /// its stack names a retired base and its layers, and the paths it has not
+    /// touched yet vanish with them. Startup is the reliable moment -- the
+    /// sweep has just unmounted whatever a previous run left.
+    async fn discard_retired(&self) {
+        let retired = self.dir.join(OVERLAY_DIR).join(RETIRED_DIR);
+        if !retired.exists() {
+            return;
+        }
+        if !self.mounted_copies().is_empty() {
+            tracing::debug!("builds are still reading retired chroot layers; keeping them");
+            return;
+        }
+        match sudo(&["rm".as_ref(), "-rf".as_ref(), retired.as_os_str()]).await {
+            Ok(()) => tracing::info!("discarded retired chroot layers"),
+            Err(e) => tracing::warn!("could not discard retired chroot layers: {e:#}"),
+        }
     }
 
     /// Chroot copies currently mounted, from `/proc/self/mountinfo`.
