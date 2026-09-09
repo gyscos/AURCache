@@ -168,9 +168,13 @@ async fn run_job_inner(
         .await
         .context("installing makepkg overrides")?;
 
-    // 3. Import trusted PGP keys into the shared keyring.
-    if let Some(gnupg) = cache.gnupg_home() {
-        chroot::import_pgp_keys(&gnupg, &cfg.keyserver, &job.pgp_keys)
+    // 3. Stage this job's trusted PGP keys into a keyring of its own, copied
+    //    from the shared one so a key is fetched from the keyserver once and
+    //    then reused, without the build reading a keybox that a sibling job's
+    //    import may rewrite underneath it.
+    let job_label = format!("job-{build_id}");
+    if let (Some(shared), Some(replica)) = (cache.gnupg_home(), cache.gnupg_job(&job_label)) {
+        chroot::prepare_job_keyring(&shared, &replica, &cfg.keyserver, &job.pgp_keys)
             .await
             .ok();
     }
@@ -184,7 +188,6 @@ async fn run_job_inner(
     // Private writable pacman cache for this job. Concurrent builds otherwise
     // share one writable cache directory and race on the same partial
     // download; the shared cache remains available read-only for hits.
-    let job_label = format!("job-{build_id}");
     let pkg_cache_bind = cache
         .pacman_pkg_job(&job_label)
         .map(|dir| (dir, PathBuf::from(chroot::PER_JOB_CACHE_MOUNT)));
@@ -263,6 +266,7 @@ async fn run_job_inner(
         let _ = tokio::task::spawn_blocking(move || {
             let promoted = cache.promote_job_pkgs(&label);
             cache.wipe_pacman_pkg_job(&label);
+            cache.wipe_gnupg_job(&label);
             let evicted = cache.evict_pkgs();
             if promoted > 0 || !evicted.is_empty() {
                 tracing::info!(
@@ -375,6 +379,7 @@ async fn run_build(
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
     let srcdest = cache.srcdest(&job.pkgbase);
+    let gnupg = cache.gnupg_job(&format!("job-{build_id}"));
     let argv = build::build_command(
         &ctx.cfg.chroot_dir,
         &format!("job-{build_id}"),
@@ -415,6 +420,16 @@ async fn run_build(
         // falls back to the PKGBUILD directory and nothing is cached.
         if let Some(dir) = srcdest.as_deref() {
             cmd.env("SRCDEST", dir);
+        }
+        // `makechrootpkg` verifies source signatures on the worker, before the
+        // chroot is entered, and reaches that step through
+        // `sudo --preserve-env=GNUPGHOME` -- which forwards nothing unless the
+        // variable is in this command's environment. Unset, gpg falls back to
+        // `~builder/.gnupg`, a directory the build user cannot create, and dies
+        // before it reports anything; makepkg turns that silence into
+        // "SIGNATURE NOT FOUND", which names neither gpg nor the real cause.
+        if let Some(dir) = gnupg.as_deref() {
+            cmd.env("GNUPGHOME", dir);
         }
         cmd.spawn()
     };

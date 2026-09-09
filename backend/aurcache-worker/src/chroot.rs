@@ -31,8 +31,8 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 /// `SUDO_USER` inference, so it is `builder` and never `aurcache` -- see
 /// `build::build_command`.
 ///
-/// Only `GNUPGHOME` is preserved: it is the one variable the worker actually
-/// exports (see [`import_pgp_keys`]). `SRCDEST`/`PKGDEST` are passed to
+/// Only `GNUPGHOME` is preserved: it names this build's keyring replica (see
+/// [`prepare_job_keyring`]). `SRCDEST`/`PKGDEST` are passed to
 /// `makechrootpkg`/`makepkg.conf` by other means, never via the environment,
 /// so preserving them here would be a no-op.
 pub fn devtools(program: &str) -> Command {
@@ -141,18 +141,60 @@ async fn ensure_multilib(root: &Path) {
     }
 }
 
-/// Import the job's trusted PGP keys into a keyring inside the chroot copy's
-/// build user. Best-effort: a key server hiccup should not abort the build if
-/// the key turns out unnecessary (PKGBUILD `validpgpkeys` still gates trust).
-pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]) -> Result<()> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(gnupg_home)
-        .with_context(|| format!("creating gnupg home {}", gnupg_home.display()))?;
+/// Serializes every write to the shared keyring, and every copy taken from it.
+///
+/// The worker is that keyring's only writer, but it runs jobs concurrently, so
+/// two `--recv-keys` children would otherwise race — and worse, a replica could
+/// be copied out of a keybox mid-rewrite. Held across the fetch as well as the
+/// copy: a key already present is not fetched again, so once warm this is a
+/// file copy's worth of contention at the start of a build.
+static KEYRING_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// What a read-only GnuPG home needs to be usable.
+///
+/// gpg takes a dotlock in its home even to *read* a keybox, and rewrites the
+/// trustdb it is handed; the build user can write neither, here or anywhere
+/// else outside `SRCDEST`/`BUILDDIR` (`aurcache-sandbox` enforces that with
+/// Landlock). Locking is safe to drop precisely because the replica has no
+/// writer for the life of the build -- which is the whole reason it is a
+/// replica.
+const REPLICA_GPG_CONF: &str = "lock-never\nno-auto-check-trustdb\n";
+
+/// Files that make up the replica. `trustdb.gpg` is not optional: gpg aborts
+/// with `Fatal: can't create trustdb.gpg` on a read-only home that has a
+/// keyring but no trustdb, before it reports anything about the signature.
+const REPLICA_FILES: [&str; 2] = ["pubring.kbx", "trustdb.gpg"];
+
+/// Stage the job's trusted PGP keys into a keyring of this build's own.
+///
+/// Keys are fetched once into `shared` and kept there, so a key some earlier
+/// build already needed costs no keyserver round trip. What the build reads is
+/// `replica`, a copy of that keyring: `makechrootpkg` verifies source
+/// signatures *on the worker*, as the build user, while sibling jobs may be
+/// importing keys — and a keybox rewritten under a reader fails the
+/// verification. gpg's own dotlock does not prevent that; a reader still lands
+/// between the writer's rename steps and reports `keydb_search failed: No such
+/// file or directory`, measured at roughly one read in fifty during an import,
+/// with locking on or off. A replica has no writer at all.
+///
+/// Best-effort: a key server hiccup should not abort the build if the key turns
+/// out unnecessary (PKGBUILD `validpgpkeys` still gates trust).
+pub async fn prepare_job_keyring(
+    shared: &Path,
+    replica: &Path,
+    keyserver: &str,
+    keys: &[String],
+) -> Result<()> {
+    let _guard = KEYRING_LOCK.lock().await;
+    std::fs::create_dir_all(shared)
+        .with_context(|| format!("creating gnupg home {}", shared.display()))?;
     for key in keys {
+        if has_key(shared, key).await {
+            tracing::debug!("pgp key {key} already in the shared keyring");
+            continue;
+        }
         let mut cmd = Command::new("gpg");
-        cmd.env("GNUPGHOME", gnupg_home).args([
+        cmd.env("GNUPGHOME", shared).args([
             "--batch",
             "--keyserver",
             keyserver,
@@ -167,7 +209,68 @@ pub async fn import_pgp_keys(gnupg_home: &Path, keyserver: &str, keys: &[String]
             Err(e) => tracing::warn!("gpg failed for key {key}: {e}"),
         }
     }
+    // Ensure the trustdb exists before it is copied, rather than leaving the
+    // build to discover it cannot create one. Idempotent and near-instant on a
+    // keyring this size ("no need for a trustdb check" once current).
+    let mut cmd = Command::new("gpg");
+    cmd.env("GNUPGHOME", shared)
+        .args(["--batch", "--check-trustdb"]);
+    if let Ok((log, status)) = run_capture(cmd).await
+        && !status.success()
+    {
+        tracing::warn!("could not prepare the shared trustdb:\n{log}");
+    }
+    // Always staged, even for a package that declares no keys: a PKGBUILD with
+    // signed sources and no `validpgpkeys` then fails with "unknown public
+    // key", which says what is wrong, instead of gpg dying on a home it cannot
+    // write and makepkg reporting "SIGNATURE NOT FOUND".
+    copy_keyring(shared, replica)
+}
+
+/// Whether the shared keyring already holds a key, so it is not fetched twice.
+async fn has_key(gnupg_home: &Path, key: &str) -> bool {
+    let mut cmd = Command::new("gpg");
+    cmd.env("GNUPGHOME", gnupg_home)
+        .args(["--batch", "--list-keys", key]);
+    matches!(run_capture(cmd).await, Ok((_, status)) if status.success())
+}
+
+/// Copy the shared keyring into a home the build user can read and nothing can
+/// write.
+///
+/// The modes are set explicitly because `copy` carries the source's across:
+/// gpg creates `trustdb.gpg` `0600`, and a replica the build cannot read fails
+/// exactly like no replica at all.
+fn copy_keyring(shared: &Path, replica: &Path) -> Result<()> {
+    std::fs::create_dir_all(replica)
+        .with_context(|| format!("creating job keyring {}", replica.display()))?;
+    for name in REPLICA_FILES {
+        let from = shared.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = replica.join(name);
+        std::fs::copy(&from, &to)
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        set_readable(&to);
+    }
+    let conf = replica.join("gpg.conf");
+    std::fs::write(&conf, REPLICA_GPG_CONF)
+        .with_context(|| format!("writing {}", conf.display()))?;
+    set_readable(&conf);
     Ok(())
+}
+
+/// Make a replica file readable by the build user, which is not the user that
+/// wrote it.
+fn set_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)) {
+            tracing::warn!("could not make {} readable: {e}", path.display());
+        }
+    }
 }
 
 /// Install the job's makepkg overrides into the chroot's `makepkg.conf.d/`.
@@ -387,6 +490,72 @@ async fn remove_copy(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The replica has to carry a trustdb, not just a keyring. On a home it
+    /// cannot write, gpg dies with `Fatal: can't create trustdb.gpg` before it
+    /// says anything about the signature -- and makepkg reports that silence
+    /// as "SIGNATURE NOT FOUND".
+    #[test]
+    fn the_replica_carries_a_trustdb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let replica = tmp.path().join("job");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("pubring.kbx"), b"keys").unwrap();
+        std::fs::write(shared.join("trustdb.gpg"), b"trust").unwrap();
+
+        copy_keyring(&shared, &replica).unwrap();
+
+        for name in REPLICA_FILES {
+            assert!(replica.join(name).exists(), "{name} must reach the replica");
+        }
+    }
+
+    /// gpg creates `trustdb.gpg` `0600`, and `copy` carries the source's mode
+    /// across -- so an unadjusted replica is unreadable by the build user,
+    /// which fails exactly like having no replica at all.
+    #[test]
+    fn the_replica_is_readable_by_another_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let replica = tmp.path().join("job");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("trustdb.gpg"), b"trust").unwrap();
+        std::fs::set_permissions(
+            shared.join("trustdb.gpg"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        copy_keyring(&shared, &replica).unwrap();
+
+        for name in ["trustdb.gpg", "gpg.conf"] {
+            let mode = std::fs::metadata(replica.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o044, 0o044, "{name} must be readable by the build");
+        }
+    }
+
+    /// Without `lock-never` gpg takes a dotlock in its home to *read* the
+    /// keybox, which a read-only replica cannot grant; without
+    /// `no-auto-check-trustdb` it wants to rewrite the trustdb it was handed.
+    #[test]
+    fn the_replica_tells_gpg_not_to_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        let replica = tmp.path().join("job");
+        std::fs::create_dir_all(&shared).unwrap();
+
+        copy_keyring(&shared, &replica).unwrap();
+
+        let conf = std::fs::read_to_string(replica.join("gpg.conf")).unwrap();
+        assert!(conf.contains("lock-never"), "{conf}");
+        assert!(conf.contains("no-auto-check-trustdb"), "{conf}");
+    }
 
     /// The lock beside a copy is removed with it, so matching it separately
     /// double-counts what was reclaimed. The base chroot must never match.

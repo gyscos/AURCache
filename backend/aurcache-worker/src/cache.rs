@@ -198,6 +198,32 @@ impl Cache {
         Self::ensured(self.root.join("gnupg"))
     }
 
+    /// One build's private replica of that keyring, staged by the worker and
+    /// written by nothing once the build starts.
+    ///
+    /// The build cannot read the shared keyring directly. Source signatures are
+    /// verified on the worker, as the build user, while sibling jobs may be
+    /// importing keys into it — and a keybox rewritten under a reader fails the
+    /// verification whether or not gpg takes its dotlock. A replica has no
+    /// writer for the life of the build, which no shared keyring can offer.
+    ///
+    /// Deliberately not group-writable, unlike every other directory here: the
+    /// build only reads it, so leaving it read-only keeps a PKGBUILD out of the
+    /// trust store its own sources are checked against.
+    pub fn gnupg_job(&self, label: &str) -> Option<PathBuf> {
+        Self::ensured_readable(self.root.join(format!("gnupg-{label}")))
+    }
+
+    /// Discard a job's keyring replica when its build ends.
+    pub fn wipe_gnupg_job(&self, label: &str) {
+        let path = self.root.join(format!("gnupg-{label}"));
+        if let Err(e) = std::fs::remove_dir_all(&path)
+            && path.exists()
+        {
+            tracing::warn!("could not wipe job keyring {}: {e}", path.display());
+        }
+    }
+
     /// Shared pacman package cache, bound **read-only** into every chroot as
     /// the second `CacheDir`, so builds get hits without being able to write.
     pub fn pacman_pkg(&self) -> Option<PathBuf> {
@@ -301,6 +327,29 @@ impl Cache {
     /// umask the new directory would be `rwxr-xr-x` and owned by the worker,
     /// and devtools would fail with "You do not have write permission for the
     /// directory $SRCDEST". Group write is what bridges the two users.
+    /// Like [`Self::ensured`], but for a directory the build user reads rather
+    /// than writes: `0755` instead of group-writable.
+    fn ensured_readable(path: PathBuf) -> Option<PathBuf> {
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    {
+                        tracing::debug!("could not set mode on {}: {e}", path.display());
+                    }
+                }
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!("cache dir {} unavailable: {e}", path.display());
+                None
+            }
+        }
+    }
+
     fn ensured(path: PathBuf) -> Option<PathBuf> {
         match std::fs::create_dir_all(&path) {
             Ok(()) => {
@@ -573,6 +622,48 @@ mod pkgcache_tests {
 
     fn write(path: &Path, bytes: usize) {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    /// Every other cache directory is group-writable so the build user can
+    /// write it. This one must not be: the build reads its own trust store and
+    /// has no business rewriting it.
+    #[test]
+    fn a_keyring_replica_is_not_writable_by_the_build() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let replica = c.gnupg_job("job-7").unwrap();
+        let shared = c.gnupg_home().unwrap();
+
+        let mode = std::fs::metadata(&replica).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o022,
+            0,
+            "the replica must not be writable: {mode:o}"
+        );
+        assert_ne!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o020,
+            0,
+            "the shared keyring stays group-writable for the worker"
+        );
+    }
+
+    /// A replica belongs to one build and goes away with it.
+    #[test]
+    fn a_keyring_replica_is_wiped_with_its_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let replica = c.gnupg_job("job-7").unwrap();
+        std::fs::write(replica.join("pubring.kbx"), b"keys").unwrap();
+
+        c.wipe_gnupg_job("job-7");
+
+        assert!(!replica.exists());
+        assert!(
+            c.gnupg_home().unwrap().exists(),
+            "wiping a replica must not touch the shared keyring"
+        );
     }
 
     /// Least recently used goes first, and the tree the build is about to use
