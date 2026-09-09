@@ -66,11 +66,8 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     // build or `-Syu` the same shared root.
     let _guard = BASE_CHROOT_LOCK.lock().await;
 
-    std::fs::create_dir_all(chroot_dir)
-        .with_context(|| format!("creating chroot dir {}", chroot_dir.display()))?;
-    let root = chroot_dir.join("root");
-
-    if root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists()) {
+    let root = base_dir(chroot_dir)?;
+    if base_exists(&root) {
         // Refresh existing chroot; a failure here is non-fatal for the build.
         let mut cmd = devtools("arch-nspawn");
         cmd.arg(&root).args(["pacman", "-Syu", "--noconfirm"]);
@@ -84,7 +81,38 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
         ensure_multilib(&root).await;
         return Ok(root);
     }
+    create_base(&root, pacman_conf).await
+}
 
+/// Create the base chroot if it is missing, and leave it alone if it is not.
+///
+/// What an overlay worker calls instead of [`ensure_base_chroot`]: its base is
+/// frozen, and a refresh there is a new layer on top rather than a change to
+/// the thing every running build is reading. See `design/overlay-chroot.md`.
+pub async fn create_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
+    let _guard = BASE_CHROOT_LOCK.lock().await;
+
+    let root = base_dir(chroot_dir)?;
+    if base_exists(&root) {
+        return Ok(root);
+    }
+    create_base(&root, pacman_conf).await
+}
+
+/// The base chroot's path, with its directory made.
+fn base_dir(chroot_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(chroot_dir)
+        .with_context(|| format!("creating chroot dir {}", chroot_dir.display()))?;
+    Ok(chroot_dir.join("root"))
+}
+
+/// Whether there is a chroot here already, rather than an empty directory.
+fn base_exists(root: &Path) -> bool {
+    root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists())
+}
+
+/// `mkarchroot` a fresh base chroot.
+async fn create_base(root: &Path, pacman_conf: &Path) -> Result<PathBuf> {
     // No `-M`. `mkarchroot` would copy a makepkg.conf into the chroot, and its
     // default is the *host's* -- which is the operator's own build
     // configuration, not this service's. A developer machine with
@@ -100,7 +128,7 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     let mut cmd = devtools("mkarchroot");
     cmd.arg("-C")
         .arg(pacman_conf)
-        .arg(&root)
+        .arg(root)
         .arg("base-devel")
         // git+ssh sources are fetched by makepkg *inside* the chroot, and
         // base-devel carries neither git nor an ssh client.
@@ -110,8 +138,8 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
     if !status.success() {
         bail!("mkarchroot failed:\n{log}");
     }
-    ensure_multilib(&root).await;
-    Ok(root)
+    ensure_multilib(root).await;
+    Ok(root.to_path_buf())
 }
 
 /// Install the 32-bit toolchain, where the architecture has one.

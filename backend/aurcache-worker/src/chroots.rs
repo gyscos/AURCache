@@ -52,6 +52,30 @@ impl Strategy {
 /// never mistaken for a chroot to sweep.
 const OVERLAY_DIR: &str = ".overlay";
 
+/// Published update layers, one directory per refresh, under [`OVERLAY_DIR`].
+const UPDATES_DIR: &str = "updates";
+
+/// A layer still being written. Publication is the rename that drops this, so
+/// a refresh killed halfway leaves rubbish rather than a half-written layer in
+/// the stack.
+const PENDING_SUFFIX: &str = ".tmp";
+
+/// How many layers to stack before flattening them back into the base.
+///
+/// Lookup cost grows with the stack and `lowerdir` lists are not unbounded --
+/// Docker caps its equivalent at 128. Three refreshes a day was the measured
+/// rate, so this is a fortnight of them.
+const MAX_LAYERS: usize = 40;
+
+/// Where stacking stops altogether.
+///
+/// Flattening needs a moment with nothing mounted, and a worker that never
+/// idles never gets one -- so the soft cap alone bounds nothing. `lowerdir`
+/// lists are not unbounded (Docker caps its equivalent at 128), and running
+/// into that limit would fail a *build*, not a refresh. Refusing to stack
+/// further leaves the chroot stale, which is the better failure.
+const HARD_MAX_LAYERS: usize = 96;
+
 /// Run one privileged command, failing with its output.
 ///
 /// The chroot directory belongs to root and this worker deliberately does not,
@@ -74,21 +98,49 @@ async fn sudo(args: &[&OsStr]) -> Result<()> {
 /// chroot directory containing either is so far outside what this deployment
 /// looks like that falling back to copying is a better answer than getting the
 /// escaping subtly wrong.
-fn overlay_options(lower: &Path, upper: &Path, work: &Path) -> Option<String> {
-    let parts = [lower, upper, work]
-        .map(|p| p.to_str().map(str::to_string))
-        .into_iter()
-        .collect::<Option<Vec<_>>>()?;
-    if parts
+fn overlay_options(lower: &str, upper: &Path, work: &Path) -> Option<String> {
+    let upper = upper.to_str()?;
+    let work = work.to_str()?;
+    if [lower, upper, work]
         .iter()
-        .any(|p| p.contains(',') || p.contains(':') || p.contains('\\'))
+        .any(|p| p.contains(',') || p.contains('\\'))
+        || upper.contains(':')
+        || work.contains(':')
     {
         return None;
     }
-    Some(format!(
-        "lowerdir={},upperdir={},workdir={}",
-        parts[0], parts[1], parts[2]
-    ))
+    Some(format!("lowerdir={lower},upperdir={upper},workdir={work}"))
+}
+
+/// The name of the next layer, ordered so a plain directory listing sorts
+/// oldest-first for as long as anyone will run this.
+fn next_layer_name(published: &[PathBuf]) -> String {
+    let highest = published
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str()?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{:04}", highest + 1)
+}
+
+/// The `lowerdir` list for a stack: newest layer first, the base last.
+///
+/// overlayfs reads lower layers left to right with the leftmost winning, so an
+/// updated file in the newest layer shadows the one in the base.
+fn lower_stack(root: &Path, published: &[PathBuf]) -> Option<String> {
+    let mut parts = Vec::with_capacity(published.len() + 1);
+    for dir in published
+        .iter()
+        .rev()
+        .chain(std::iter::once(&root.to_path_buf()))
+    {
+        let text = dir.to_str()?;
+        if text.contains(',') || text.contains(':') || text.contains('\\') {
+            return None;
+        }
+        parts.push(text.to_string());
+    }
+    Some(parts.join(":"))
 }
 
 /// Mount points under `dir`, deepest first, from the contents of
@@ -175,6 +227,43 @@ impl Chroots {
         }
     }
 
+    /// The published update layers, oldest first.
+    ///
+    /// Read from the directory rather than remembered, because a worker that
+    /// restarts mid-life inherits whatever the last one published.
+    fn layers(&self) -> Vec<PathBuf> {
+        let dir = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Layers a refresh was killed partway through writing.
+    fn layers_pending(&self) -> Vec<PathBuf> {
+        let dir = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(PENDING_SUFFIX))
+            })
+            .collect()
+    }
+
     /// How chroots will be made. Copying until [`Chroots::detect`] says
     /// otherwise.
     fn strategy(&self) -> Strategy {
@@ -233,7 +322,9 @@ impl Chroots {
         let upper = layers.join("upper");
         let work = layers.join("work");
         let merged = layers.join("merged");
-        let options = overlay_options(&lower, &upper, &work)
+        let options = lower
+            .to_str()
+            .and_then(|lower| overlay_options(lower, &upper, &work))
             .context("chroot paths cannot be expressed as overlay options")?;
 
         let outcome = async {
@@ -279,6 +370,9 @@ impl Chroots {
     /// A chroot that does not exist yet is always made, whatever the interval
     /// says -- there is nothing to be stale.
     pub async fn refresh(&self, pacman_conf: &Path) -> Result<PathBuf> {
+        if matches!(self.strategy(), Strategy::Overlay) {
+            return self.refresh_by_layer(pacman_conf).await;
+        }
         let root = self.dir.join("root");
         let mut last = self.last_refresh.lock().await;
         if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval) {
@@ -364,7 +458,11 @@ impl Chroots {
         let layers = self.dir.join(OVERLAY_DIR).join(label);
         let upper = layers.join("upper");
         let work = layers.join("work");
-        let options = overlay_options(&root, &upper, &work)
+        // The stack as it stands *now*: a refresh that publishes a layer after
+        // this point belongs to the next build, not to one already mounted.
+        let lower = lower_stack(&root, &self.layers())
+            .context("chroot paths cannot be expressed as overlay options")?;
+        let options = overlay_options(&lower, &upper, &work)
             .context("chroot paths cannot be expressed as overlay options")?;
 
         let lock = chroot::share_base_chroot(&root).await;
@@ -403,6 +501,213 @@ impl Chroots {
         out
     }
 
+    /// Bring the chroot up to date by publishing a layer, not by rewriting the
+    /// base.
+    ///
+    /// Nothing a running build is reading is touched: its stack was fixed when
+    /// it mounted, and this only ever adds to the end. So unlike the in-place
+    /// refresh there is no lock to take and nothing to wait for -- a busy
+    /// worker refreshes on schedule rather than never. See
+    /// `design/overlay-chroot.md`.
+    async fn refresh_by_layer(&self, pacman_conf: &Path) -> Result<PathBuf> {
+        let root = chroot::create_base_chroot(&self.dir, pacman_conf).await?;
+        let mut last = self.last_refresh.lock().await;
+        if !refresh_due(last.map(|at| at.elapsed()), self.interval) {
+            tracing::debug!("base chroot is current; not adding a layer");
+            return Ok(root);
+        }
+        let published = self.layers().len();
+        if published >= HARD_MAX_LAYERS {
+            tracing::warn!(
+                "{published} chroot layers and no idle moment to flatten them; \
+                 not updating the chroot until there is one"
+            );
+            return Ok(root);
+        }
+        match self.add_update_layer(&root).await {
+            // Stamped only on success, so a failure is retried by the next
+            // build rather than waiting out the interval.
+            Ok(()) => *last = Some(Instant::now()),
+            Err(e) => tracing::warn!("could not update the chroot: {e:#}"),
+        }
+        drop(last);
+        if let Err(e) = self.flatten_if_deep(&root).await {
+            tracing::warn!("could not flatten the chroot layers: {e:#}");
+        }
+        Ok(root)
+    }
+
+    /// Run `pacman -Syu` into a new layer and publish it.
+    async fn add_update_layer(&self, root: &Path) -> Result<()> {
+        let published = self.layers();
+        let name = next_layer_name(&published);
+        let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
+        let pending = updates.join(format!("{name}{PENDING_SUFFIX}"));
+        let work = updates.join(format!(".work-{name}"));
+        let merged = updates.join(format!(".merged-{name}"));
+        let lower = lower_stack(root, &published).context("chroot paths cannot be stacked")?;
+        let options = overlay_options(&lower, &pending, &work)
+            .context("chroot paths cannot be expressed as overlay options")?;
+
+        sudo(&[
+            "mkdir".as_ref(),
+            "-p".as_ref(),
+            pending.as_os_str(),
+            work.as_os_str(),
+            merged.as_os_str(),
+        ])
+        .await?;
+        sudo(&[
+            "mount".as_ref(),
+            "-t".as_ref(),
+            "overlay".as_ref(),
+            "overlay".as_ref(),
+            "-o".as_ref(),
+            options.as_ref(),
+            merged.as_os_str(),
+        ])
+        .await?;
+
+        let mut cmd = chroot::devtools("arch-nspawn");
+        cmd.arg(&merged).args(["pacman", "-Syu", "--noconfirm"]);
+        let updated = chroot::run_capture(cmd).await;
+        let _ = sudo(&["umount".as_ref(), merged.as_os_str()]).await;
+        let _ = sudo(&[
+            "rm".as_ref(),
+            "-rf".as_ref(),
+            work.as_os_str(),
+            merged.as_os_str(),
+        ])
+        .await;
+
+        match updated {
+            Ok((_, status)) if status.success() => {}
+            Ok((log, _)) => {
+                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
+                bail!("updating the chroot returned non-zero:\n{log}");
+            }
+            Err(e) => {
+                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
+                return Err(e);
+            }
+        }
+
+        // Publication is the rename: until it lands, `layers` does not see a
+        // layer that is still being written.
+        let layer = updates.join(&name);
+        sudo(&["mv".as_ref(), pending.as_os_str(), layer.as_os_str()]).await?;
+        tracing::info!("published chroot update layer {name}");
+        Ok(())
+    }
+
+    /// Merge the layers back into the base once there are enough of them.
+    ///
+    /// Only while nothing is mounted, and that is not a nicety: the layers
+    /// being merged are the lower layers of any live build, and removing them
+    /// under one is the undefined behaviour this whole design exists to avoid.
+    /// A worker that is never idle keeps stacking, which is a warning rather
+    /// than a failure.
+    async fn flatten_if_deep(&self, root: &Path) -> Result<()> {
+        let published = self.layers();
+        if published.len() < MAX_LAYERS {
+            return Ok(());
+        }
+        // Take the base exclusively for the whole swap. Checking that nothing
+        // is mounted is not enough on its own: a build starting a moment later
+        // would mount the stack this is about to delete, and the copy alone
+        // takes long enough for that to be likely rather than theoretical.
+        // `mount_overlay` takes the same lock shared, so a build that starts
+        // here waits, and one already running keeps this waiting instead.
+        let root_lock = match chroot::try_lock_base(root).await {
+            chroot::BaseLock::Held(lock) => lock,
+            chroot::BaseLock::Busy => {
+                tracing::warn!(
+                    "{} chroot layers and builds in flight; flattening when the worker is idle",
+                    published.len()
+                );
+                return Ok(());
+            }
+            // Without a lock there is no way to keep a build out of the swap,
+            // and stale layers are better than a build reading half of one.
+            chroot::BaseLock::Unavailable => {
+                tracing::warn!("cannot lock the base chroot; not flattening its layers");
+                return Ok(());
+            }
+        };
+        // Belt and braces: a leftover mount from a killed worker holds no lock.
+        if !self.mounted_copies().is_empty() {
+            tracing::warn!("chroot copies are still mounted; flattening later");
+            return Ok(());
+        }
+
+        let staging = self.dir.join(OVERLAY_DIR).join(".flatten");
+        let merged = staging.join("merged");
+        let work = staging.join("work");
+        let empty = staging.join("empty");
+        let fresh = self.dir.join("root.new");
+        let lower = lower_stack(root, &published).context("chroot paths cannot be stacked")?;
+        let options =
+            overlay_options(&lower, &empty, &work).context("cannot express the merged view")?;
+
+        let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), fresh.as_os_str()]).await;
+        sudo(&[
+            "mkdir".as_ref(),
+            "-p".as_ref(),
+            merged.as_os_str(),
+            work.as_os_str(),
+            empty.as_os_str(),
+            fresh.as_os_str(),
+        ])
+        .await?;
+        sudo(&[
+            "mount".as_ref(),
+            "-t".as_ref(),
+            "overlay".as_ref(),
+            "overlay".as_ref(),
+            "-o".as_ref(),
+            options.as_ref(),
+            merged.as_os_str(),
+        ])
+        .await?;
+        // `--reflink=auto` so this costs metadata on a filesystem that can
+        // share extents, and a real copy only where it must.
+        let copied = sudo(&[
+            "cp".as_ref(),
+            "-a".as_ref(),
+            "--reflink=auto".as_ref(),
+            format!("{}/.", merged.display()).as_ref(),
+            fresh.as_os_str(),
+        ])
+        .await;
+        let _ = sudo(&["umount".as_ref(), merged.as_os_str()]).await;
+        let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), staging.as_os_str()]).await;
+        copied?;
+
+        // Two renames, and a crash between them leaves no `root` -- which the
+        // next start treats as "no chroot yet" and rebuilds, slow but correct.
+        let previous = self.dir.join("root.old");
+        sudo(&["mv".as_ref(), root.as_os_str(), previous.as_os_str()]).await?;
+        sudo(&["mv".as_ref(), fresh.as_os_str(), root.as_os_str()]).await?;
+        let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
+        let _ = sudo(&[
+            "rm".as_ref(),
+            "-rf".as_ref(),
+            previous.as_os_str(),
+            updates.as_os_str(),
+        ])
+        .await;
+        drop(root_lock);
+        tracing::info!("flattened {} chroot layers into the base", published.len());
+        Ok(())
+    }
+
+    /// Chroot copies currently mounted, from `/proc/self/mountinfo`.
+    fn mounted_copies(&self) -> Vec<PathBuf> {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|info| mounts_under(&info, &self.dir))
+            .unwrap_or_default()
+    }
+
     /// Reclaim copies a previous run left behind. This is the only real
     /// guarantee: `release` and `Drop` both lose to `SIGKILL`.
     pub async fn sweep(&self) -> u64 {
@@ -417,9 +722,27 @@ impl Chroots {
                 }
             }
         }
-        let layers = self.dir.join(OVERLAY_DIR);
-        if layers.exists() {
-            let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), layers.as_os_str()]).await;
+        // Per-build layers are rubbish now; published update layers are not,
+        // and neither is a base a flatten was halfway through swapping in.
+        let overlay = self.dir.join(OVERLAY_DIR);
+        if let Ok(entries) = std::fs::read_dir(&overlay) {
+            for path in entries.flatten().map(|e| e.path()) {
+                if path.file_name().is_some_and(|n| n == UPDATES_DIR) {
+                    continue;
+                }
+                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), path.as_os_str()]).await;
+            }
+        }
+        for path in [
+            self.dir.join("root.new"),
+            self.dir.join(OVERLAY_DIR).join(".flatten"),
+        ] {
+            if path.exists() {
+                let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), path.as_os_str()]).await;
+            }
+        }
+        for pending in self.layers_pending() {
+            let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), pending.as_os_str()]).await;
         }
         chroot::remove_stale_copies(&self.dir).await
     }
@@ -552,7 +875,7 @@ mod tests {
     #[test]
     fn overlay_options_name_the_three_layers() {
         let options = overlay_options(
-            Path::new("/chroot/root"),
+            "/chroot/root",
             Path::new("/chroot/.overlay/job-1/upper"),
             Path::new("/chroot/.overlay/job-1/work"),
         )
@@ -571,11 +894,47 @@ mod tests {
     fn a_path_needing_escapes_declines_the_overlay() {
         assert!(
             overlay_options(
-                Path::new("/chroot,odd/root"),
+                "/chroot,odd/root",
                 Path::new("/chroot/upper"),
                 Path::new("/chroot/work"),
             )
             .is_none()
+        );
+    }
+
+    /// Layers shadow the base and each other newest-first, which is how an
+    /// upgraded package in the newest layer wins over the one `mkarchroot`
+    /// installed.
+    #[test]
+    fn the_newest_layer_comes_first_and_the_base_last() {
+        let published = vec![
+            PathBuf::from("/chroot/.overlay/updates/0001"),
+            PathBuf::from("/chroot/.overlay/updates/0002"),
+        ];
+        assert_eq!(
+            lower_stack(Path::new("/chroot/root"), &published).unwrap(),
+            "/chroot/.overlay/updates/0002:/chroot/.overlay/updates/0001:/chroot/root"
+        );
+        assert_eq!(
+            lower_stack(Path::new("/chroot/root"), &[]).unwrap(),
+            "/chroot/root"
+        );
+    }
+
+    /// Names are numbered so a directory listing sorts oldest-first, and the
+    /// next one continues from the highest published rather than the count --
+    /// flattening removes layers, and reusing a name would put an old layer's
+    /// contents in a new layer's place.
+    #[test]
+    fn the_next_layer_continues_from_the_highest() {
+        assert_eq!(next_layer_name(&[]), "0001");
+        assert_eq!(
+            next_layer_name(&[
+                PathBuf::from("/x/0001"),
+                PathBuf::from("/x/0009"),
+                PathBuf::from("/x/0002"),
+            ]),
+            "0010"
         );
     }
 
