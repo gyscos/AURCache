@@ -99,12 +99,30 @@ fn overridden(source: SettingSource, scoped: bool) -> bool {
 /// rather than naming a specific fallback they cannot see from here.
 #[component]
 fn ConfigFileEditor(setting: String, name: String, pkgbase: Option<String>) -> Element {
-    // Held in a signal so the closures below stay `Copy`; two buttons share
-    // the save path, and a captured `String` would let only one of them have
-    // it.
+    // Held in signals so the closures below stay `Copy`; two buttons share the
+    // save path, and a captured `String` would let only one of them have it.
+    //
+    // Synced from the props rather than seeded once: this component stays
+    // mounted when the route moves from one package's config files to
+    // another's, and a signal initialised on the first mount would keep
+    // reading -- and `patch_setting` writing -- the package left behind.
+    let setting_prop = setting.clone();
     let setting = use_signal(|| setting);
+    use_effect(use_reactive(&setting_prop, move |setting_prop: String| {
+        let mut setting = setting;
+        setting.set(setting_prop);
+    }));
+
     let scoped = pkgbase.is_some();
+    let pkgbase_prop = pkgbase.clone();
     let pkgbase = use_signal(|| pkgbase);
+    use_effect(use_reactive(
+        &pkgbase_prop,
+        move |pkgbase_prop: Option<String>| {
+            let mut pkgbase = pkgbase;
+            pkgbase.set(pkgbase_prop);
+        },
+    ));
     let mut reload = use_signal(|| 0u32);
     let loaded = use_resource(move || async move {
         // Read so a save re-fetches: the server owns the value, and the source

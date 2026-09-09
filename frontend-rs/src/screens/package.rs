@@ -1245,13 +1245,17 @@ fn BuildFlagsField(pkgbase: String, flags: Vec<String>, on_changed: EventHandler
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
 
-    let pkgbase = use_signal(|| pkgbase);
     let current = use_signal(|| flags.clone());
-    // Follow the server after a save, or the chips show the list as it was
-    // before the change that was just made.
+    let current_pkgbase = use_signal(|| pkgbase.clone());
+    // Follow the props: this component stays mounted when the route moves
+    // between packages, so the signals need to track the current package.
     use_effect(use_reactive(&flags, move |flags| {
         let mut current = current;
         current.set(flags);
+    }));
+    use_effect(use_reactive(&pkgbase, move |pkgbase: String| {
+        let mut current_pkgbase = current_pkgbase;
+        current_pkgbase.set(pkgbase);
     }));
 
     let save = move |next: Vec<String>| async move {
@@ -1260,7 +1264,7 @@ fn BuildFlagsField(pkgbase: String, flags: Vec<String>, on_changed: EventHandler
         let outcome = match client() {
             Ok(client) => client
                 .patch_package(
-                    &pkgbase(),
+                    &current_pkgbase(),
                     &PatchPackageRequest {
                         build_flags: Some(next),
                         ..Default::default()
@@ -1376,30 +1380,35 @@ fn RemoveCard(pkgbase: String) -> Element {
     let mut confirming = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
-    let pkgbase = use_signal(|| pkgbase);
 
-    let remove = move |_| async move {
-        busy.set(true);
-        error.set(None);
-        let outcome = match client() {
-            Ok(client) => client
-                .delete_package(&pkgbase())
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        };
-        busy.set(false);
-        match outcome {
-            Ok(()) => {
-                confirming.set(false);
-                // The package may no longer exist, so going back to it would
-                // land on an error page.
-                navigator().push(Route::Packages {
-                    view: ViewParams::default(),
-                    q: String::new(),
-                });
+    let remove = {
+        let pkgbase = pkgbase.clone();
+        move |_| {
+            let pkgbase = pkgbase.clone();
+            async move {
+                busy.set(true);
+                error.set(None);
+                let outcome = match client() {
+                    Ok(client) => client
+                        .delete_package(&pkgbase)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                busy.set(false);
+                match outcome {
+                    Ok(()) => {
+                        confirming.set(false);
+                        // The package may no longer exist, so going back to it
+                        // would land on an error page.
+                        navigator().push(Route::Packages {
+                            view: ViewParams::default(),
+                            q: String::new(),
+                        });
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
             }
-            Err(e) => error.set(Some(e)),
         }
     };
 
