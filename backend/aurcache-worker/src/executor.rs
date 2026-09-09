@@ -13,16 +13,27 @@ use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 
 use crate::cgroup::Hierarchy;
+use crate::chroots::Chroots;
 use crate::config::Config;
 use crate::job;
+
+/// State that spans the concurrent builds on this worker.
+///
+/// Shared with every job rather than rebuilt per job, because both parts have
+/// to see all of them: the cache garbage-collector must know which `SRCDEST`
+/// directories are live, and the chroots must know which copies are.
+pub struct Shared {
+    /// Pkgbases of currently-running jobs, so the garbage-collector never
+    /// evicts a sibling job's in-progress `SRCDEST` when `concurrency > 1`.
+    pub active_pkgbases: Mutex<HashSet<String>>,
+    /// Where a build gets its chroot, and gives it back.
+    pub chroots: Chroots,
+}
 
 /// Builds each package in its own `devtools` chroot copy.
 pub struct ChrootExecutor {
     cfg: Arc<Config>,
-    /// Pkgbases of currently-running jobs. Shared with each job so the cache
-    /// garbage-collector never evicts a sibling job's in-progress `SRCDEST`
-    /// when `concurrency > 1`.
-    active_pkgbases: Arc<Mutex<HashSet<String>>>,
+    shared: Arc<Shared>,
     /// The prepared cgroup subtree each build's cgroup is created under, so
     /// `memory.peak` reports one build rather than the worker and its siblings.
     ///
@@ -45,9 +56,13 @@ impl ChrootExecutor {
                 None
             }
         };
+        let shared = Arc::new(Shared {
+            active_pkgbases: Mutex::new(HashSet::new()),
+            chroots: Chroots::new(cfg.chroot_dir.clone()),
+        });
         Self {
             cfg,
-            active_pkgbases: Arc::new(Mutex::new(HashSet::new())),
+            shared,
             cgroups,
         }
     }
@@ -66,7 +81,11 @@ impl Executor for ChrootExecutor {
         // Register before building so this job's own SRCDEST (and every
         // sibling's) is protected from the cache GC that runs at each job's
         // start.
-        self.active_pkgbases.lock().await.insert(pkgbase.clone());
+        self.shared
+            .active_pkgbases
+            .lock()
+            .await
+            .insert(pkgbase.clone());
 
         let report = job::run_job(
             &self.cfg,
@@ -74,11 +93,11 @@ impl Executor for ChrootExecutor {
             &client,
             job,
             cancel,
-            Arc::clone(&self.active_pkgbases),
+            Arc::clone(&self.shared),
         )
         .await;
 
-        self.active_pkgbases.lock().await.remove(&pkgbase);
+        self.shared.active_pkgbases.lock().await.remove(&pkgbase);
         report
     }
 

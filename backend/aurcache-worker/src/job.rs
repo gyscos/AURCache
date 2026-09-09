@@ -6,13 +6,11 @@
 
 use anyhow::{Context, Result};
 use aurcache_common::worker::{CompleteReport, JobDescriptor};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};
@@ -22,8 +20,10 @@ use crate::build;
 use crate::cache::Cache;
 use crate::cgroup::Hierarchy;
 use crate::chroot;
+use crate::chroots::Lease;
 use crate::config::Config;
 use crate::credentials;
+use crate::executor::Shared;
 
 /// Run one job to completion and return its terminal report.
 ///
@@ -38,7 +38,7 @@ pub async fn run_job(
     client: &Arc<WorkerClient>,
     job: JobDescriptor,
     cancel: Arc<AtomicBool>,
-    active_pkgbases: Arc<Mutex<HashSet<String>>>,
+    shared: Arc<Shared>,
 ) -> CompleteReport {
     let workdir = cfg
         .core
@@ -46,17 +46,7 @@ pub async fn run_job(
         .join("work")
         .join(job.build_id.to_string());
 
-    let report = match run_job_inner(
-        cfg,
-        cgroups,
-        client,
-        &job,
-        &cancel,
-        &active_pkgbases,
-        &workdir,
-    )
-    .await
-    {
+    let report = match run_job_inner(cfg, cgroups, client, &job, &cancel, &shared, &workdir).await {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("build setup failed: {e:#}");
@@ -82,7 +72,7 @@ async fn run_job_inner(
     client: &Arc<WorkerClient>,
     job: &JobDescriptor,
     cancel: &AtomicBool,
-    active_pkgbases: &Mutex<HashSet<String>>,
+    shared: &Shared,
     workdir: &Path,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
@@ -103,7 +93,7 @@ async fn run_job_inner(
     // `concurrency` jobs starting at once it would otherwise tie up that many
     // runtime worker threads and stall heartbeats, claims, and log streaming.
     let in_use: Vec<String> = {
-        let guard = active_pkgbases.lock().await;
+        let guard = shared.active_pkgbases.lock().await;
         guard.iter().cloned().collect()
     };
     {
@@ -155,7 +145,9 @@ async fn run_job_inner(
     .context("writing job configs")?;
 
     log(client, build_id, "[worker] preparing chroot\n").await;
-    chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf)
+    shared
+        .chroots
+        .refresh(&pacman_conf)
         .await
         .context("preparing base chroot")?;
 
@@ -253,12 +245,21 @@ async fn run_job_inner(
         binds.push((dir.to_path_buf(), dir.to_path_buf()));
     }
 
-    let ctx = WorkerContext {
-        cfg,
-        cgroups,
-        dropin: &dropin,
-    };
-    let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
+    // The lease is given back on the error path too, which is the half a
+    // caller forgets -- and it is given back *after* the build's child has been
+    // waited on, which a `Drop` could not promise.
+    let report = shared
+        .chroots
+        .with_lease(&job_label, async |lease| {
+            let ctx = WorkerContext {
+                cfg,
+                cgroups,
+                dropin: &dropin,
+                lease,
+            };
+            run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await
+        })
+        .await?;
 
     // 5. Fold this job's downloads into the shared cache, then bound it. Only
     //    after `makechrootpkg` has exited: promoting mid-build would move
@@ -369,6 +370,9 @@ fn agent_socket() -> Option<PathBuf> {
 struct WorkerContext<'a> {
     cfg: &'a Config,
     cgroups: Option<&'a Hierarchy>,
+    /// This build's chroot, which names itself to `makechrootpkg` and says who
+    /// is responsible for taking it down.
+    lease: &'a Lease,
     /// This build's makepkg overrides, which `makechrootpkg` installs into the
     /// chroot copy it makes for it.
     dropin: &'a Path,
@@ -387,8 +391,9 @@ async fn run_build(
     let srcdest = cache.srcdest(&job.pkgbase);
     let gnupg = cache.gnupg_job(&format!("job-{build_id}"));
     let argv = build::build_command(
-        &ctx.cfg.chroot_dir,
-        &format!("job-{build_id}"),
+        ctx.lease.chroot_dir(),
+        ctx.lease.label(),
+        ctx.lease.devtools_owns_copy(),
         binds,
         &job.build_flags,
         &ctx.cfg.build_user,

@@ -50,38 +50,44 @@ fn makechrootpkg_path() -> String {
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
+    devtools_owns_copy: bool,
     binds: &[(PathBuf, PathBuf)],
     build_flags: &[String],
     build_user: &str,
 ) -> Vec<String> {
-    let mut argv = vec![
-        makechrootpkg_path(),
-        "-c".to_string(),
+    let mut argv = vec![makechrootpkg_path()];
+    if devtools_owns_copy {
+        argv.push("-c".to_string());
+    }
+    argv.extend([
         "-r".to_string(),
         chroot_root.display().to_string(),
         "-l".to_string(),
         copy_label.to_string(),
-        // Name the build user explicitly. Without `-U`, makechrootpkg infers it
-        // from `SUDO_USER`, which is whoever invoked us — so the worker's own
-        // user would run the build, and a build could then read the worker's
-        // mTLS identity and credentials by ordinary file permissions.
-        // Delete the copy when the build ends, which devtools only does for a
-        // temporary chroot: `delete_chroot` is called under `(( temp_chroot ))`
-        // and nowhere else. Without it every build left a full chroot behind
-        // for good -- 26 of them, 362G, until the disk filled and took a
-        // four-hour build with it.
-        //
-        // Ordering matters: `-T` appends `-$$` to the copy name and `-l`
-        // *assigns* it, so a `-T` before the label would have its suffix
-        // overwritten and the copy would outlive the build after all.
-        //
-        // Letting devtools do the deleting rather than doing it ourselves is
-        // what keeps this correct on btrfs, where the copy is a subvolume
-        // snapshot that `rm -rf` cannot remove.
-        "-T".to_string(),
-        "-U".to_string(),
-        build_user.to_string(),
-    ];
+    ]);
+    // Delete the copy when the build ends, which devtools only does for a
+    // temporary chroot: `delete_chroot` is called under `(( temp_chroot ))`
+    // and nowhere else. Without it every build left a full chroot behind for
+    // good -- 26 of them, 362G, until the disk filled and took a four-hour
+    // build with it.
+    //
+    // Ordering matters: `-T` appends `-$$` to the copy name and `-l` *assigns*
+    // it, so a `-T` before the label would have its suffix overwritten and the
+    // copy would outlive the build after all.
+    //
+    // Letting devtools do the deleting rather than doing it ourselves is what
+    // keeps this correct on btrfs, where the copy is a subvolume snapshot that
+    // `rm -rf` cannot remove. It is conditional on devtools having made the
+    // copy in the first place: a strategy that makes its own must also take it
+    // down, and asking it to delete what it did not create fails the build.
+    if devtools_owns_copy {
+        argv.push("-T".to_string());
+    }
+    // Name the build user explicitly. Without `-U`, makechrootpkg infers it
+    // from `SUDO_USER`, which is whoever invoked us -- so the worker's own user
+    // would run the build, and a build could then read the worker's mTLS
+    // identity and credentials by ordinary file permissions.
+    argv.extend(["-U".to_string(), build_user.to_string()]);
     // `SRCDEST` is passed through the environment instead of a bind mount:
     // devtools reads it directly and binds it itself, which avoids competing
     // with its own `--bind=$SRCDEST:/srcdest`.
@@ -106,6 +112,7 @@ mod tests {
         let cmd = build_command(
             Path::new("/chroot"),
             "job-42",
+            true,
             &[],
             &["--nocheck".to_string()],
             "builder",
@@ -135,11 +142,25 @@ mod tests {
         assert!(joined.contains("-- --nocheck"));
     }
 
+    /// A strategy that makes the copy itself leaves devtools' half out: no
+    /// `-c` to copy the base over it, and no `-T` to delete what devtools did
+    /// not create. Everything else about the command is the same, which is the
+    /// point of asking the lease rather than branching at the call site.
+    #[test]
+    fn a_caller_owned_copy_drops_the_devtools_flags() {
+        let cmd = build_command(Path::new("/chroot"), "job-9", false, &[], &[], "builder");
+        let joined = cmd.join(" ");
+        assert!(!cmd.iter().any(|a| a == "-c"), "{joined}");
+        assert!(!cmd.iter().any(|a| a == "-T"), "{joined}");
+        assert!(joined.contains("-r /chroot -l job-9"), "{joined}");
+        assert!(joined.contains("-U builder"), "{joined}");
+    }
+
     /// `SRCDEST` travels in the environment, not as a bind: devtools binds it
     /// itself, so adding one here would compete with devtools' own bind.
     #[test]
     fn build_command_does_not_bind_srcdest() {
-        let cmd = build_command(Path::new("/chroot"), "job-1", &[], &[], "builder");
+        let cmd = build_command(Path::new("/chroot"), "job-1", true, &[], &[], "builder");
         assert!(!cmd.join(" ").contains("/srcdest"));
         assert!(!cmd.iter().any(|a| a == "-d"));
         assert!(!cmd.iter().any(|a| a == "--"));
@@ -155,7 +176,7 @@ mod tests {
             ),
             (PathBuf::from("/host/netrc"), PathBuf::from("/etc/netrc")),
         ];
-        let cmd = build_command(Path::new("/chroot"), "job-7", &binds, &[], "builder");
+        let cmd = build_command(Path::new("/chroot"), "job-7", true, &binds, &[], "builder");
         let joined = cmd.join(" ");
         assert!(joined.contains("/job/secrets:/build-secrets"));
         assert!(joined.contains("/host/netrc:/etc/netrc"));

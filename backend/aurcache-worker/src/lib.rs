@@ -12,6 +12,7 @@ pub mod build;
 pub mod cache;
 pub mod cgroup;
 pub mod chroot;
+pub mod chroots;
 pub mod config;
 pub mod credentials;
 pub mod executor;

@@ -10,6 +10,7 @@ use aurcache_worker_core::{artifacts, report};
 use crate::build;
 use crate::cache::Cache;
 use crate::chroot;
+use crate::chroots::Chroots;
 use crate::config::Config;
 
 /// Build the PKGBUILD in `path` locally and report where the artifacts landed.
@@ -27,9 +28,12 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     // repositories are the right ones. `makepkg.conf` is still left to the
     // chroot's own, matching what a served build gets.
     let pacman_conf = existing("/etc/pacman.conf")?;
-    chroot::ensure_base_chroot(&cfg.chroot_dir, &pacman_conf)
+    let chroots = Chroots::new(cfg.chroot_dir.clone());
+    chroots
+        .refresh(&pacman_conf)
         .await
         .context("preparing base chroot")?;
+    let lease = chroots.acquire("build-once").await?;
 
     let cache = Cache::new(
         &cfg.cache_dir,
@@ -45,8 +49,9 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     let srcdest = cache.srcdest(pkgbase);
 
     let argv = build::build_command(
-        &cfg.chroot_dir,
-        "build-once",
+        lease.chroot_dir(),
+        lease.label(),
+        lease.devtools_owns_copy(),
         &cfg.bind_mounts,
         flags,
         &cfg.build_user,
@@ -61,6 +66,8 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         cmd.env("SRCDEST", dir);
     }
     let status = cmd.status().await.context("running build")?;
+    // After the child has exited, never before.
+    lease.release().await;
 
     let report = report::classify_exit(status, false);
     if report.success {
