@@ -19,6 +19,7 @@ use crate::chroot;
 use anyhow::{Context, Result, bail};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -213,6 +214,9 @@ pub struct Chroots {
     last_refresh: Mutex<Option<Instant>>,
     /// How long a refresh counts as current.
     interval: Duration,
+    /// Whether the worker is currently refusing jobs to drain for a flatten.
+    /// Only so the transition is logged once rather than at every poll.
+    draining: AtomicBool,
 }
 
 impl Chroots {
@@ -224,7 +228,44 @@ impl Chroots {
             mode,
             last_refresh: Mutex::new(None),
             interval,
+            draining: AtomicBool::new(false),
         }
+    }
+
+    /// Whether a build can start, or the worker should drain first.
+    ///
+    /// Layers can only be flattened when nothing is mounted, and a worker with
+    /// a full queue never reaches that on its own -- so at the hard cap it
+    /// stops taking work until the builds in flight finish. Refusing to claim
+    /// is what makes that safe: a *claimed* job holds a lease the server
+    /// expects progress on, so stalling one that had already been accepted
+    /// would risk it being taken for a dead worker, while a job left queued
+    /// simply waits where everyone can see it.
+    ///
+    /// Cheap enough to ask before every claim: a `read_dir` of the layer
+    /// directory, and the flatten below only tries once the cap is reached.
+    pub async fn ready_for_work(&self) -> bool {
+        if !matches!(self.strategy(), Strategy::Overlay) {
+            return true;
+        }
+        let root = self.dir.join("root");
+        if !root.exists() || self.layers().len() < HARD_MAX_LAYERS {
+            if self.draining.swap(false, Ordering::Relaxed) {
+                tracing::info!("chroot layers flattened; accepting builds again");
+            }
+            return true;
+        }
+        if !self.draining.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "{} chroot layers: not claiming builds until the ones in flight \
+                 finish and the layers can be flattened",
+                self.layers().len()
+            );
+        }
+        // Every poll, because the moment worth catching is the one just after
+        // the last build ends.
+        self.flatten_when_deep(&root).await;
+        self.layers().len() < HARD_MAX_LAYERS
     }
 
     /// The published update layers, oldest first.
@@ -307,6 +348,18 @@ impl Chroots {
             }
         };
         let _ = self.strategy.set(chosen);
+
+        // Startup is the one moment a worker is reliably idle -- the sweep has
+        // just unmounted anything a previous run left -- so it is the most
+        // likely chance a busy worker ever gets to flatten. Restarts come with
+        // upgrades, which makes this the recovery path for a worker that
+        // stacked its way to the cap.
+        if matches!(chosen, Strategy::Overlay) {
+            let root = self.dir.join("root");
+            if root.exists() {
+                self.flatten_when_deep(&root).await;
+            }
+        }
     }
 
     /// Mount an overlay and take it straight down again, to find out whether
@@ -511,6 +564,14 @@ impl Chroots {
     /// `design/overlay-chroot.md`.
     async fn refresh_by_layer(&self, pacman_conf: &Path) -> Result<PathBuf> {
         let root = chroot::create_base_chroot(&self.dir, pacman_conf).await?;
+        // Before anything else, and whether or not a refresh is due. A worker
+        // at the hard cap has stopped stacking and needs this more than it
+        // needs anything else -- doing it after the early returns below meant a
+        // worker that reached the cap never flattened again, even once it went
+        // idle, and stayed stale for good. Costs a `read_dir` when there is
+        // nothing to do.
+        self.flatten_when_deep(&root).await;
+
         let mut last = self.last_refresh.lock().await;
         if !refresh_due(last.map(|at| at.elapsed()), self.interval) {
             tracing::debug!("base chroot is current; not adding a layer");
@@ -531,9 +592,7 @@ impl Chroots {
             Err(e) => tracing::warn!("could not update the chroot: {e:#}"),
         }
         drop(last);
-        if let Err(e) = self.flatten_if_deep(&root).await {
-            tracing::warn!("could not flatten the chroot layers: {e:#}");
-        }
+        self.flatten_when_deep(&root).await;
         Ok(root)
     }
 
@@ -598,6 +657,15 @@ impl Chroots {
         sudo(&["mv".as_ref(), pending.as_os_str(), layer.as_os_str()]).await?;
         tracing::info!("published chroot update layer {name}");
         Ok(())
+    }
+
+    /// [`Chroots::flatten_if_deep`], with its failure reported rather than
+    /// returned: flattening is maintenance, and a worker that cannot do it
+    /// should carry on building with a deeper stack.
+    async fn flatten_when_deep(&self, root: &Path) {
+        if let Err(e) = self.flatten_if_deep(root).await {
+            tracing::warn!("could not flatten the chroot layers: {e:#}");
+        }
     }
 
     /// Merge the layers back into the base once there are enough of them.
@@ -904,6 +972,47 @@ mod tests {
         assert_eq!(lease.chroot_dir(), Path::new("/var/lib/aurcache-chroot"));
         assert_eq!(lease.label(), "job-42");
         assert!(lease.devtools_owns_copy());
+    }
+
+    /// A worker that has stacked to the hard cap stops claiming, so the builds
+    /// in flight can finish and the layers be flattened. Claiming and then
+    /// stalling the build instead would put a lease at risk; a job left queued
+    /// on the server costs nothing and is visible.
+    #[tokio::test]
+    async fn a_worker_at_the_cap_stops_taking_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chroots = Chroots::new(
+            tmp.path().to_path_buf(),
+            Duration::ZERO,
+            ChrootMode::Overlay,
+        );
+        chroots.strategy.set(Strategy::Overlay).unwrap();
+        std::fs::create_dir_all(tmp.path().join("root")).unwrap();
+        let updates = tmp.path().join(OVERLAY_DIR).join(UPDATES_DIR);
+        std::fs::create_dir_all(&updates).unwrap();
+
+        for n in 1..HARD_MAX_LAYERS {
+            std::fs::create_dir(updates.join(format!("{n:04}"))).unwrap();
+        }
+        assert!(
+            chroots.ready_for_work().await,
+            "below the cap the worker keeps building"
+        );
+
+        std::fs::create_dir(updates.join(format!("{HARD_MAX_LAYERS:04}"))).unwrap();
+        assert!(
+            !chroots.ready_for_work().await,
+            "at the cap it drains instead: there is no idle moment to flatten in otherwise"
+        );
+    }
+
+    /// Copying workers never stack anything, so they never drain.
+    #[tokio::test]
+    async fn a_copying_worker_never_drains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chroots = Chroots::new(tmp.path().to_path_buf(), Duration::ZERO, ChrootMode::Copy);
+        chroots.strategy.set(Strategy::DevtoolsCopy).unwrap();
+        assert!(chroots.ready_for_work().await);
     }
 
     /// A typo should not quietly turn off something the operator was turning

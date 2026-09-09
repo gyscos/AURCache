@@ -160,6 +160,13 @@ property of the machine rather than a preference:
 Set it to `1` or `0` to decide yourself. An unrecognised value means `auto`, so
 a typo cannot quietly disable something you were trying to enable.
 
+Refreshes accumulate as layers, and layers are merged back into the base once
+there are enough of them. Merging can only happen when no build is mounted, so
+a worker with a full queue may not get the chance -- at which point it stops
+claiming new builds, lets the ones in flight finish, merges, and starts
+claiming again. Jobs wait on the server rather than being claimed and stalled,
+so they stay visible in the queue and hold no lease.
+
 One consequence is worth knowing: a live overlay's lower layer must not change,
 so the base chroot cannot be refreshed while an overlay build is using it. The
 refresh does not wait -- waiting would hold up every job start behind it for as

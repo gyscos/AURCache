@@ -120,6 +120,15 @@ impl<E: Executor> Runner<E> {
             // Acquire a permit before claiming so we never hold a job we can't run.
             let permit = Arc::clone(&self.permits).acquire_owned().await?;
 
+            // Ask before claiming rather than after: a job we cannot start yet
+            // is better left queued on the server, where it is visible and
+            // costs nothing, than held here against a lease.
+            if !self.executor.ready_for_work().await {
+                drop(permit);
+                tokio::time::sleep(Duration::from_secs(self.cfg.poll_interval)).await;
+                continue;
+            }
+
             let claim = ClaimRequest {
                 native_arches: self.cfg.native_arches.clone(),
                 emulated_arches: self.cfg.emulated_arches.clone(),

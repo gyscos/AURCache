@@ -109,6 +109,10 @@ impl Executor for ChrootExecutor {
         report
     }
 
+    async fn ready_for_work(&self) -> bool {
+        self.shared.chroots.ready_for_work().await
+    }
+
     fn describe_self(&self) -> String {
         format!("devtools chroot ({})", self.cfg.chroot_dir.display())
     }

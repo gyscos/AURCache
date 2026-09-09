@@ -45,6 +45,20 @@ pub trait Executor: Send + Sync + 'static {
         cancel: Arc<AtomicBool>,
     ) -> impl Future<Output = CompleteReport> + Send;
 
+    /// Whether this executor can take work right now.
+    ///
+    /// Always, unless an executor says otherwise. The chroot executor uses it
+    /// to drain: some maintenance cannot run while builds do, and refusing to
+    /// claim is the only way to reach a moment when none are. Claiming and
+    /// then stalling the build would be worse -- a claimed job holds a lease
+    /// the server expects progress on.
+    ///
+    /// Consulted before each claim, so an implementation should be cheap and
+    /// is a reasonable place to do the waiting-for work itself.
+    fn ready_for_work(&self) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+
     /// One-line summary of the executor, logged when the worker comes online,
     /// so a worker's logs say which build strategy produced its packages.
     fn describe_self(&self) -> String;
