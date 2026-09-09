@@ -4,6 +4,7 @@
 //! [`AurCacheClient`], a small async wrapper around the most common endpoints.
 
 use anyhow::{Context, Result};
+use reqwest::Url;
 // The API shapes are defined once, in aurcache-common, and used by the server,
 // this client, and the browser frontend alike. Types still declared below are
 // ones whose server-side counterpart has a different shape or name; converging
@@ -94,6 +95,23 @@ pub struct PatchPackageRequest {
 }
 
 /// Async HTTP client for the AURCache API.
+/// Where a request for the API actually landed.
+///
+/// Reaching *something* is not the same as reaching the API. Pointed at the
+/// web UI, the server answers `/health` with a redirect to its login page, and
+/// that page returns a perfectly good 200 -- so a bare status check calls the
+/// URL healthy and the mistake resurfaces as an unrelated complaint about the
+/// token at the next call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiReachability {
+    /// The API answered directly.
+    Api,
+    /// Something answered, but not the API, and `detail` says how that was
+    /// established: the request was redirected away, or the answer was a web
+    /// page where the API returns none.
+    NotApi { detail: String },
+}
+
 pub struct AurCacheClient {
     base_url: String,
     token: Option<String>,
@@ -133,8 +151,44 @@ impl AurCacheClient {
     }
 
     pub async fn health(&self) -> Result<()> {
-        self.request_empty::<Value>(Method::GET, "/health", &[], None)
+        match self.probe_api().await? {
+            ApiReachability::Api => Ok(()),
+            ApiReachability::NotApi { detail } => Err(anyhow::anyhow!(
+                "{} answered, but {detail}: that is the web UI, not the API",
+                endpoint_url(&self.base_url, "/health")
+            )),
+        }
+    }
+
+    /// Ask the health endpoint whether this URL is the API, and where the
+    /// request ended up if it is not.
+    pub async fn probe_api(&self) -> Result<ApiReachability> {
+        let requested = endpoint_url(&self.base_url, "/health");
+        let response = self
+            .send::<Value>(Method::GET, "/health", &[], None)
+            .await?;
+        let response = ensure_success(response).await?;
+        let landed_on = response.url().to_string();
+        if !same_endpoint(&requested, &landed_on) {
+            return Ok(ApiReachability::NotApi {
+                detail: format!("the request was redirected to {landed_on}"),
+            });
+        }
+        // Not every wrong URL redirects. The UI is a single-page app served by
+        // the same host, so with a token in hand `/health` comes back as a
+        // perfectly good 200 -- carrying `index.html`. The API answers it with
+        // an empty body, so the page itself is the tell.
+        let body = response
+            .text()
             .await
+            .with_context(|| format!("failed to read the response from {requested}"))?;
+        Ok(if looks_like_html(&body) {
+            ApiReachability::NotApi {
+                detail: "the answer was a web page".to_string(),
+            }
+        } else {
+            ApiReachability::Api
+        })
     }
 
     /// Fetches information about the currently authenticated user.
@@ -566,10 +620,14 @@ impl AurCacheClient {
     {
         let response = self.send(method, path, query, body).await?;
         let response = ensure_success(response).await?;
-        response
-            .json::<T>()
+        // Read the body first: `json()` consumes the response, leaving nothing
+        // to explain the failure with beyond serde's "expected value at line 1
+        // column 1", which describes the symptom and not the cause.
+        let body = response
+            .text()
             .await
-            .with_context(|| format!("failed to decode JSON response from {path}"))
+            .with_context(|| format!("failed to read the response from {path}"))?;
+        serde_json::from_str(&body).with_context(|| json_decode_context(path, &body))
     }
 
     /// Sends a request that is expected to return no meaningful response body.
@@ -723,6 +781,42 @@ impl AurCacheClient {
     }
 }
 
+/// Whether a response came back from the endpoint that was asked for.
+///
+/// Compared by scheme, host, port and path rather than as text: an empty query
+/// string is spelled with a trailing `?` in the response's URL and not in ours,
+/// and a trailing slash is not a different endpoint by any useful definition.
+/// Textual comparison calls both a redirect and reports a correct URL as the
+/// web UI.
+fn same_endpoint(requested: &str, landed_on: &str) -> bool {
+    match (Url::parse(requested), Url::parse(landed_on)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+                && a.path().trim_end_matches('/') == b.path().trim_end_matches('/')
+        }
+        _ => requested.trim_end_matches('/') == landed_on.trim_end_matches('/'),
+    }
+}
+
+/// Why a JSON decode failed, in terms the caller can act on.
+///
+/// A body opening with `<` is the web UI's HTML, which means the base URL names
+/// the site rather than the API. That is the common way to arrive here, and
+/// serde describes it as "expected value at line 1 column 1" -- an accurate
+/// account of the first byte and no help at all.
+fn json_decode_context(path: &str, body: &str) -> String {
+    if looks_like_html(body) {
+        format!(
+            "expected JSON from {path} but the server returned an HTML page: the URL looks \
+             like the web UI rather than the API (try adding `/api`)"
+        )
+    } else {
+        format!("failed to decode JSON response from {path}")
+    }
+}
+
 fn endpoint_url(base_url: &str, path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         path.to_string()
@@ -835,6 +929,49 @@ fn looks_like_html(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::endpoint_url;
+
+    /// The web UI answers with HTML and a 200, so the decode is where the
+    /// mistake first becomes visible -- and "expected value at line 1 column 1"
+    /// sends the reader looking at the wrong thing entirely.
+    #[test]
+    fn an_html_body_is_reported_as_the_wrong_url() {
+        let msg = super::json_decode_context("/userinfo", "<!doctype html><html>...");
+        assert!(msg.contains("HTML"), "{msg}");
+        assert!(msg.contains("/api"), "{msg}");
+
+        let msg = super::json_decode_context("/userinfo", "{\"unexpected\": true}");
+        assert!(!msg.contains("HTML"), "{msg}");
+    }
+
+    /// The UI is served by the same host as the API, so a wrong URL need not
+    /// redirect anywhere: `/health` answers 200 with `index.html`, where the
+    /// API answers with nothing at all.
+    #[test]
+    fn a_page_is_not_an_api_answer() {
+        assert!(super::looks_like_html("\n<!doctype html><html>"));
+        assert!(!super::looks_like_html(""));
+        assert!(!super::looks_like_html("{}"));
+    }
+
+    /// A redirect that only adds a trailing slash -- or the empty `?` reqwest
+    /// puts on a URL built with no query parameters -- has not gone anywhere.
+    /// Compared as text, that empty query reports every correct URL as the web
+    /// UI.
+    #[test]
+    fn a_trailing_slash_is_the_same_endpoint() {
+        assert!(super::same_endpoint(
+            "http://host:8080/api/health",
+            "http://host:8080/api/health/"
+        ));
+        assert!(super::same_endpoint(
+            "http://host:8080/api/health",
+            "http://host:8080/api/health?"
+        ));
+        assert!(!super::same_endpoint(
+            "http://host:8080/health",
+            "http://host:8080/api/login"
+        ));
+    }
 
     #[test]
     fn endpoint_url_trims_slashes() {

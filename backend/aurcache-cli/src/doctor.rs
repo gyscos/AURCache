@@ -18,7 +18,9 @@
 
 use crate::OutputFormat;
 use anyhow::{Result, bail};
-use aurcache_client::{ApprovalStatus, AurCacheClient, Build, WaitingReason, Worker};
+use aurcache_client::{
+    ApiReachability, ApprovalStatus, AurCacheClient, Build, WaitingReason, Worker,
+};
 use aurcache_common::build_state::BuildStates;
 use serde::Serialize;
 
@@ -220,6 +222,16 @@ fn hint_for_reason(reason: &WaitingReason) -> String {
     }
 }
 
+/// What to do about a URL that reached the site instead of the API.
+fn api_url_hint(api_url: &str) -> String {
+    let trimmed = api_url.trim_end_matches('/');
+    if trimmed.ends_with("/api") {
+        format!("`{trimmed}` already names the API, so something else is answering on that address")
+    } else {
+        format!("point the CLI at the API: `aurcache-cli config set-url {trimmed}/api`")
+    }
+}
+
 /// Walk the chain, stopping at the first fatal check.
 pub async fn run_doctor(
     client: &AurCacheClient,
@@ -228,8 +240,21 @@ pub async fn run_doctor(
 ) -> Result<()> {
     let mut checks = Vec::new();
 
-    match client.health().await {
-        Ok(()) => checks.push(Check::pass("server", format!("reachable at {api_url}"))),
+    match client.probe_api().await {
+        Ok(ApiReachability::Api) => {
+            checks.push(Check::pass("server", format!("reachable at {api_url}")));
+        }
+        // Answered, but not by the API. Left as a plain reachability pass, this
+        // walks on and fails at the token instead, which is the one thing that
+        // is not wrong.
+        Ok(ApiReachability::NotApi { detail }) => {
+            checks.push(Check::fail(
+                "server",
+                format!("{api_url} answered, but {detail}: that is the web UI, not the API"),
+                api_url_hint(api_url),
+            ));
+            return finish(format, Report::new(checks));
+        }
         Err(e) => {
             checks.push(Check::fail(
                 "server",
@@ -367,6 +392,22 @@ mod tests {
             worker_name: None,
             waiting_reason,
         }
+    }
+
+    /// The UI and the API sit on one address, one path apart, so the fix is a
+    /// suffix -- and naming it is the whole difference between a diagnosis and
+    /// a serde error about column 1.
+    #[test]
+    fn a_ui_url_is_answered_with_the_api_url() {
+        let hint = super::api_url_hint("http://truenas:30099");
+        assert!(
+            hint.contains("config set-url http://truenas:30099/api"),
+            "{hint}"
+        );
+
+        let hint = super::api_url_hint("http://truenas:30099/api/");
+        assert!(!hint.contains("set-url"), "{hint}");
+        assert!(hint.contains("already names the API"), "{hint}");
     }
 
     #[test]
