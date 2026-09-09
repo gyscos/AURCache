@@ -1,9 +1,9 @@
 ARG LATEST_COMMIT_SHA=dev
 # Must stay on the same Debian release as the runtime stage below: the default
-# `rust:1.96.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
+# `rust:1.98.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
 # runtime (glibc 2.36) cannot load - it dies at startup with
 # "GLIBC_2.38 not found".
-FROM --platform=linux/amd64 rust:1.96.1-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.98.1-bookworm AS builder
 ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # Install necessary tools and dependencies

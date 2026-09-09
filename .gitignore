@@ -23,3 +23,6 @@ frontend-rs/dist/
 # feature. Produced by the Docker build and by scripts/test-frontend.sh; never
 # a source file.
 backend/aurcache-api/web/
+
+# Compiler crash dumps, written into the working directory by rustc itself.
+rustc-ice-*.txt
