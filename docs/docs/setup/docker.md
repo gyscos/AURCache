@@ -43,6 +43,39 @@ to configure and no approval to click.
 See the [Quick Start](../overview/quick-start.md) for the same setup with
 PostgreSQL.
 
+## What to persist
+
+Everything the server keeps lives under `/app`, so one mount covers all of it:
+
+```yaml
+volumes:
+  - aurcache_data:/app
+```
+
+That is the database, the package repository, the internal worker CA, each
+build's log and the source cache. Mounting the pieces individually works and is
+the right thing when they belong on different storage — a large repository on
+bulk disks, the database on an SSD — but then **anything you do not mount lives
+in the container and is gone when the container is replaced**, which happens on
+every image update. Build logs were lost that way for a long time, because
+`/app/build_logs` was in nobody's volume list.
+
+Both shapes can be combined: a mount for `/app` and a more specific one for a
+subdirectory of it are applied parent-first regardless of the order you list
+them.
+
+```yaml
+volumes:
+  - aurcache_data:/app          # everything by default
+  - big_pool:/app/repo          # …except the packages, which live elsewhere
+```
+
+One catch when adding a specific mount to a deployment that has been running:
+the inner mount **shadows** whatever the outer volume holds at that path rather
+than adopting it. Packages already in `aurcache_data/repo` would still be there,
+but the server would no longer see them. Copy them into the new volume before
+switching, or it looks exactly like data loss.
+
 ## Why the worker needs `privileged`
 
 Each package is built in its own `systemd-nspawn` chroot, which needs mounts and

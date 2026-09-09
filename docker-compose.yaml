@@ -47,9 +47,23 @@ services:
       # `enroll` volume (mounted read-only here). No secret, no approval click.
       - AURCACHE_ENROLLMENT_DIR=/enroll
     volumes:
-      - aurcache_db:/app/db
-      - aurcache_repo:/app/repo
-      - aurcache_ca:/app/data/ca      # internal worker CA (persist across restarts)
+      # Everything the server keeps lives under /app, so one mount persists all
+      # of it: the database, the package repository, the internal worker CA,
+      # each build's log, and the source cache. Mounting the pieces separately
+      # works too (see below) but means every directory added later is a
+      # directory someone forgets -- which is how build logs came to be lost on
+      # every image update.
+      - aurcache_data:/app
+      # Add specific mounts alongside it if some parts belong on different
+      # pools -- a big repo on bulk storage, the database on an SSD. Overlapping
+      # mounts are applied parent-first whatever order they are listed in, and
+      # the inner one shadows what the outer volume holds at that path, so copy
+      # existing data across before adding one to a running deployment:
+      #   - aurcache_db:/app/db                # SQLite (unused with Postgres)
+      #   - aurcache_repo:/app/repo            # built packages
+      #   - aurcache_ca:/app/data/ca           # internal worker CA
+      #   - aurcache_logs:/app/build_logs      # per-build logs
+      #   - aurcache_srccache:/app/source_cache
       - enroll:/enroll:ro             # read the workers' enrollment CSRs
     networks:
       - aurcache
@@ -140,9 +154,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  aurcache_db:
-  aurcache_repo:
-  aurcache_ca:
+  aurcache_data:
   enroll:
   worker_data:
   worker_cache:
