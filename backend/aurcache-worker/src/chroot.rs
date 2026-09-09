@@ -454,16 +454,59 @@ fn is_stale_copy(name: &str) -> bool {
     name.starts_with("job-") && !name.ends_with(".lock")
 }
 
+/// The lock `makechrootpkg` takes for a copy, which sits beside it rather than
+/// inside it.
+fn lock_beside(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    Some(path.with_file_name(format!("{name}.lock")))
+}
+
+/// btrfs, from `statfs`.
+const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
+
+/// Every btrfs subvolume root has this inode number, and only a subvolume root
+/// has it -- on btrfs. Any other filesystem hands out 256 like any other
+/// number, which is why the filesystem type is half the test.
+const BTRFS_SUBVOLUME_INODE: u64 = 256;
+
+/// Whether a filesystem type and inode number describe a subvolume root.
+fn is_subvolume_ino(fs_type: i64, inode: u64) -> bool {
+    fs_type == BTRFS_SUPER_MAGIC && inode == BTRFS_SUBVOLUME_INODE
+}
+
+/// Whether a path is a btrfs subvolume, by the test devtools uses.
+///
+/// Deliberately not `btrfs subvolume show`: that searches the B-tree and needs
+/// root, so asking it as the worker's own user answers "not a subvolume" for
+/// every subvolume there is. The caller then reaches for `rm`, which cannot
+/// delete a subvolume -- and every copy this ever swept was left on disk, one
+/// per crashed build, forever. `statfs` and the inode number need no
+/// privileges.
+fn is_btrfs_subvolume(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated path and `buf` is a valid statfs.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    is_subvolume_ino(buf.f_type as i64, meta.ino())
+}
+
 /// Remove one chroot copy, whatever kind of thing it is.
 ///
 /// A copy on btrfs is a subvolume snapshot, and `rm -rf` cannot delete a
 /// subvolume -- it empties it and then fails on the directory itself. This is
 /// the same distinction `delete_chroot` makes inside devtools.
 async fn remove_copy(path: &Path) -> Result<()> {
-    let mut show = Command::new("btrfs");
-    show.arg("subvolume").arg("show").arg(path);
-    // A missing `btrfs` binary means this cannot be a subvolume.
-    let is_subvolume = matches!(run_capture(show).await, Ok((_, status)) if status.success());
+    let is_subvolume = is_btrfs_subvolume(path);
 
     let mut cmd = Command::new("sudo");
     if is_subvolume {
@@ -480,6 +523,18 @@ async fn remove_copy(path: &Path) -> Result<()> {
     let (log, status) = run_capture(cmd).await?;
     if !status.success() {
         bail!("removing {}:\n{log}", path.display());
+    }
+    // The lock lives beside the copy and is root's, like the copy. devtools
+    // removes it in `delete_chroot`; a sweep that does not leaves one empty
+    // file per crashed build behind for good.
+    if let Some(lock) = lock_beside(path) {
+        let mut cmd = Command::new("sudo");
+        cmd.arg("rm").arg("--force").arg(&lock);
+        if let Ok((log, status)) = run_capture(cmd).await
+            && !status.success()
+        {
+            tracing::warn!("could not remove {}:\n{log}", lock.display());
+        }
     }
     // devtools keeps the copy's lock beside it, not inside it.
     std::fs::remove_file(path.with_extension("lock")).ok();
@@ -554,6 +609,27 @@ mod tests {
         let conf = std::fs::read_to_string(replica.join("gpg.conf")).unwrap();
         assert!(conf.contains("lock-never"), "{conf}");
         assert!(conf.contains("no-auto-check-trustdb"), "{conf}");
+    }
+
+    /// The inode number alone means nothing off btrfs, where 256 is just a
+    /// number -- and the filesystem type alone means nothing either, since
+    /// every directory in a chroot copy sits on btrfs too.
+    #[test]
+    fn a_subvolume_is_a_filesystem_and_an_inode() {
+        assert!(is_subvolume_ino(BTRFS_SUPER_MAGIC, BTRFS_SUBVOLUME_INODE));
+        assert!(!is_subvolume_ino(BTRFS_SUPER_MAGIC, 257));
+        // ext4.
+        assert!(!is_subvolume_ino(0xEF53, BTRFS_SUBVOLUME_INODE));
+    }
+
+    /// The lock is a sibling, not a child: `job-604-2844759.lock` beside
+    /// `job-604-2844759`.
+    #[test]
+    fn the_lock_sits_beside_the_copy() {
+        assert_eq!(
+            lock_beside(Path::new("/chroot/job-604-2844759")),
+            Some(PathBuf::from("/chroot/job-604-2844759.lock"))
+        );
     }
 
     /// The lock beside a copy is removed with it, so matching it separately
