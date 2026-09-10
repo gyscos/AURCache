@@ -518,7 +518,22 @@ impl AurClient {
     /// meant a virtual dependency was built from a package chosen by nothing
     /// more than its initial.
     async fn aur_provider_pkgbase(&self, dep_name: &str) -> Result<Option<String>, Error> {
-        let packages = self
+        Ok(self
+            .aur_providers(dep_name)
+            .await?
+            .into_iter()
+            .next()
+            .map(|package| package.package_base))
+    }
+
+    /// Every AUR package answering to `dep_name`, best first.
+    ///
+    /// Resolution takes the head of this list; offering a dependency edge
+    /// somewhere else to point needs the rest of it, ranked the same way, so
+    /// that the option a person is shown first is the one resolution would
+    /// have picked on its own.
+    pub async fn aur_providers(&self, dep_name: &str) -> Result<Vec<Package>, Error> {
+        let mut packages = self
             .rpc_fetch(self.rpc_search_url(dep_name, "provides")?)
             .await?;
 
@@ -528,17 +543,17 @@ impl AurClient {
         // unlike `info` -- so re-deriving the claim from the response body
         // would find nothing and quietly resolve every virtual dependency to
         // nothing at all.
-        Ok(packages
-            .iter()
-            .min_by_key(|package| {
-                provider_rank(
-                    &package.name,
-                    &package.package_base,
-                    package.num_votes,
-                    dep_name,
-                )
-            })
-            .map(|package| package.package_base.clone()))
+        // `sort_by` rather than `sort_by_key`: the rank borrows the names it
+        // ranks, which a key function may not do.
+        packages.sort_by(|a, b| {
+            provider_rank(&a.name, &a.package_base, a.num_votes, dep_name).cmp(&provider_rank(
+                &b.name,
+                &b.package_base,
+                b.num_votes,
+                dep_name,
+            ))
+        });
+        Ok(packages)
     }
 }
 

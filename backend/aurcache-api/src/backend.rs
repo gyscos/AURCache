@@ -8,9 +8,10 @@ use crate::build::{
 use crate::health::health;
 use crate::package::{
     active_operations, bulk_add_progress, get_package, package_add_endpoint, package_del,
-    package_list, package_source_file, package_source_file_update, package_source_files,
-    package_source_preview_file, package_source_preview_files, package_update_endpoint,
-    package_update_entity_endpoint, packages_add_endpoint,
+    package_dependency_options, package_dependency_replace, package_list, package_source_file,
+    package_source_file_update, package_source_files, package_source_preview_file,
+    package_source_preview_files, package_update_endpoint, package_update_entity_endpoint,
+    packages_add_endpoint,
 };
 use crate::settings::{
     package_setting_get, package_setting_patch, package_setting_reset, package_settings,
@@ -33,6 +34,8 @@ pub fn build_api() -> Vec<Route> {
         active_operations,
         bulk_add_progress,
         package_del,
+        package_dependency_options,
+        package_dependency_replace,
         package_update_entity_endpoint,
         build_output,
         delete_build,

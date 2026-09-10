@@ -8,6 +8,9 @@ use crate::models::package::{
     AddPackages, AurNotFoundPackage, AurPackage, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, PackageSource, SimplePackage,
 };
+use crate::models::package::{
+    CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
+};
 use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
@@ -24,7 +27,7 @@ use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files, packages};
 use aurcache_utils::package::add::package_add;
-use aurcache_utils::package::live_check::package_remove;
+use aurcache_utils::package::live_check::{live_check, package_remove};
 use aurcache_utils::package::update::{package_resync_dependencies, package_update};
 use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::pkg::satisfies_constraint;
@@ -42,7 +45,8 @@ use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
 use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
+    ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    RelationTrait,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -88,6 +92,8 @@ async fn package_by_pkgbase(
     package_update_entity_endpoint,
     package_update_endpoint,
     package_del,
+    package_dependency_options,
+    package_dependency_replace,
     package_list,
     get_package,
     package_source_files,
@@ -1386,5 +1392,589 @@ mod file_tests {
 
         let listed = package_files(&db, 1).await.unwrap();
         assert_eq!(listed[0].size, None);
+    }
+}
+
+/// Every name a package answers to: its own, its split packages, and its
+/// `provides` with any `=version` dropped.
+///
+/// This is what a replacement is measured against. A dependent's edge records
+/// the constraint but not which of these names it declared, so covering all of
+/// them is the only way to know a replacement covers a given dependent.
+fn provided_names(pkg: &packages::Model) -> Vec<String> {
+    let mut names = vec![pkg.name.clone()];
+    names.extend(json_string_list(pkg.split_packages.as_deref()));
+    names.extend(
+        json_string_list(pkg.provides.as_deref())
+            .into_iter()
+            .map(|entry| match entry.split_once('=') {
+                Some((name, _version)) => name.to_string(),
+                None => entry,
+            }),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn json_string_list(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+async fn official_holds(services: &Services, name: &str) -> Result<bool, ApiError> {
+    services
+        .client
+        .official
+        .holds(name)
+        .await
+        .map_err(|e| err(Status::BadGateway, e))
+}
+
+/// Resolve one dependency edge by the two package names on its ends.
+async fn dependency_edge(
+    db: &DatabaseConnection,
+    dependent: &str,
+    dependency: &str,
+) -> Result<(packages::Model, packages::Model, dependencies::Model), ApiError> {
+    let dependent = package_by_pkgbase(db, dependent).await?;
+    let current = package_by_pkgbase(db, dependency).await?;
+    let edge = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(dependent.id))
+        .filter(dependencies::Column::DependeeId.eq(current.id))
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| {
+            err(
+                Status::NotFound,
+                format!("{} does not depend on {}", dependent.name, current.name),
+            )
+        })?;
+    Ok((dependent, current, edge))
+}
+
+/// The names `dependent` declares that `current` answers to.
+///
+/// The edge records the constraint but not the name behind it, so this reads
+/// the dependent's source to recover it -- one source, already cached, for the
+/// package whose page is asking. Empty means nothing the dependent declares
+/// matches any more, which is a stale edge: droppable, but with nothing to
+/// search for a replacement by.
+async fn declared_names_for_edge(
+    services: &Services,
+    dependent: &packages::Model,
+    current: &packages::Model,
+) -> Result<Vec<String>, ApiError> {
+    let sourceinfo = services
+        .store
+        .sourceinfo(&dependent.source_data, dependent.patch.as_deref())
+        .await
+        .map_err(|e| err(Status::BadGateway, e))?;
+    let deps = aurcache_deps::deps_from_srcinfo(
+        &sourceinfo,
+        &aurcache_utils::pkg::architectures_for_platforms(&dependent.platforms),
+    );
+    let declared = aurcache_utils::pkg::DependencySet::of(&deps)
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
+    let answers = provided_names(current);
+    Ok(declared
+        .names
+        .into_iter()
+        .filter(|name| answers.contains(name))
+        .collect())
+}
+
+fn candidate_verdict(version: Option<&str>, constraint: &str) -> ReplacementVerdict {
+    if constraint.is_empty() {
+        return ReplacementVerdict::Satisfied;
+    }
+    match version {
+        Some(version) if satisfies_constraint(version, constraint) => ReplacementVerdict::Satisfied,
+        Some(_) => ReplacementVerdict::Unsatisfied,
+        None => ReplacementVerdict::Unknown,
+    }
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "What could take over this dependency", body = DependencyOptions),
+    ),
+    params(
+            ("pkgbase", description = "pkgbase of the depending package"),
+            ("dependency", description = "pkgbase of the dependency to replace")
+    )
+)]
+#[get("/package/<pkgbase>/dependency/<dependency>/options")]
+pub async fn package_dependency_options(
+    services: &State<Services>,
+    pkgbase: &str,
+    dependency: &str,
+    _a: Authenticated,
+) -> Result<Json<DependencyOptions>, ApiError> {
+    let (dependent, current, edge) = dependency_edge(&services.db, pkgbase, dependency).await?;
+    let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
+
+    let mut official = Vec::new();
+    for name in &declared_names {
+        if official_holds(services, name).await? {
+            official.push(name.clone());
+        }
+    }
+
+    // Tracked first: they are already here, so choosing one builds nothing new.
+    // A package carrying a declared name outright leads one that merely
+    // provides it, on the same rule resolution ranks by.
+    let mut candidates = Vec::new();
+    let tracked = Packages::find()
+        .all(&services.db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+    let mut tracked_matches: Vec<&packages::Model> = tracked
+        .iter()
+        .filter(|package| package.id != current.id && package.id != dependent.id)
+        .filter(|package| {
+            provided_names(package)
+                .iter()
+                .any(|name| declared_names.contains(name))
+        })
+        .collect();
+    tracked_matches.sort_by(|a, b| {
+        let carries = |package: &packages::Model| !declared_names.contains(&package.name);
+        carries(a)
+            .cmp(&carries(b))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for package in tracked_matches {
+        let version = latest_successful_version_any_platform(&services.db, package.id)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+        candidates.push(DependencyCandidate {
+            pkgbase: package.name.clone(),
+            source: CandidateSource::Tracked,
+            verdict: candidate_verdict(version.as_deref(), &edge.version_constraint),
+            version,
+        });
+    }
+
+    // Then the AUR, in the order resolution itself would rank them, minus
+    // everything already offered above.
+    let tracked_names: std::collections::HashSet<&str> = tracked
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut aur_error = None;
+    for name in &declared_names {
+        let providers = match services.client.aur_providers(name).await {
+            Ok(providers) => providers,
+            // Best-effort: an unreachable AUR must not take the tracked
+            // candidates down with it, and the caller is told which half of
+            // the answer is missing rather than left to read an empty list as
+            // "nothing exists".
+            Err(e) => {
+                aur_error = Some(e.to_string());
+                break;
+            }
+        };
+        for package in providers {
+            if tracked_names.contains(package.package_base.as_str())
+                || !seen.insert(package.package_base.clone())
+            {
+                continue;
+            }
+            candidates.push(DependencyCandidate {
+                pkgbase: package.package_base,
+                source: CandidateSource::Aur,
+                verdict: candidate_verdict(Some(&package.version), &edge.version_constraint),
+                version: Some(package.version),
+            });
+        }
+    }
+
+    Ok(Json(DependencyOptions {
+        dependent: dependent.name,
+        current: current.name,
+        version_constraint: edge.version_constraint,
+        declared_names,
+        official,
+        candidates,
+        aur_error,
+    }))
+}
+
+#[utoipa::path(
+    responses(
+            (status = 200, description = "Point the dependency somewhere else, or drop it"),
+    ),
+    params(
+            ("pkgbase", description = "pkgbase of the depending package"),
+            ("dependency", description = "pkgbase of the dependency being replaced")
+    )
+)]
+#[put("/package/<pkgbase>/dependency/<dependency>", data = "<input>")]
+pub async fn package_dependency_replace(
+    services: &State<Services>,
+    pkgbase: &str,
+    dependency: &str,
+    input: Json<ReplaceDependency>,
+    _a: Authenticated,
+) -> Result<(), ApiError> {
+    let (dependent, current, edge) = dependency_edge(&services.db, pkgbase, dependency).await?;
+    let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
+
+    match input.into_inner().replacement {
+        None => {
+            // Dropping is only honest when nothing has to be built for the
+            // name any more. Otherwise the edge would come straight back the
+            // next time the dependent is resolved, and the button would look
+            // like it had failed.
+            for name in &declared_names {
+                if !official_holds(services, name).await? {
+                    return Err(err(
+                        Status::BadRequest,
+                        format!(
+                            "'{name}' is not published by the official repositories, so this dependency cannot be dropped"
+                        ),
+                    ));
+                }
+            }
+            edge.delete(&services.db)
+                .await
+                .map_err(|e| err(Status::InternalServerError, e))?;
+        }
+        Some(replacement) => {
+            if replacement == current.name {
+                return Err(err(
+                    Status::BadRequest,
+                    format!("{} already depends on {replacement}", dependent.name),
+                ));
+            }
+            if replacement == dependent.name {
+                return Err(err(
+                    Status::BadRequest,
+                    "a package cannot depend on itself".to_string(),
+                ));
+            }
+            if declared_names.is_empty() {
+                return Err(err(
+                    Status::BadRequest,
+                    format!(
+                        "{} no longer declares anything {} answers to, so there is nothing to replace -- drop the dependency instead",
+                        dependent.name, current.name
+                    ),
+                ));
+            }
+
+            let package = ensure_replacement_exists(services, &dependent, &replacement).await?;
+            let answers = provided_names(&package);
+            if !declared_names.iter().any(|name| answers.contains(name)) {
+                return Err(err(
+                    Status::BadRequest,
+                    format!(
+                        "{replacement} answers to none of {}, so the edge would be undone at the next update",
+                        declared_names.join(", ")
+                    ),
+                ));
+            }
+
+            repoint_edge(&services.db, edge, dependent.id, package.id)
+                .await
+                .map_err(|e| err(Status::InternalServerError, e))?;
+        }
+    }
+
+    // The usual collection, now that the old dependency may be holding nothing
+    // up. This is what makes emptying a package's dependents remove it: patch
+    // the last edge away and the package goes with it, without a second
+    // endpoint that knows how to remove packages.
+    live_check(&services.db, current.id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
+    Ok(())
+}
+
+/// Move `edge` onto `replacement_id`.
+///
+/// There is one row per (dependent, dependency) pair, and the dependent may
+/// already depend on the replacement under some other name, so an edge that
+/// would collide is merged into the one already there rather than duplicated.
+/// Neither constraint is merged into the other: both are recomputed from the
+/// dependent's declarations at its next resync, and guessing here would only
+/// disagree with that in the meantime.
+async fn repoint_edge(
+    db: &DatabaseConnection,
+    edge: dependencies::Model,
+    dependent_id: i32,
+    replacement_id: i32,
+) -> Result<(), sea_orm::DbErr> {
+    let collides = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(dependent_id))
+        .filter(dependencies::Column::DependeeId.eq(replacement_id))
+        .one(db)
+        .await?
+        .is_some();
+
+    if collides {
+        edge.delete(db).await?;
+    } else {
+        let mut active: dependencies::ActiveModel = edge.into();
+        active.dependee_id = Set(replacement_id);
+        active.save(db).await?;
+    }
+    Ok(())
+}
+
+/// The row to point an edge at, adding it from the AUR if it is not here yet.
+///
+/// Added the way resolution would have added it -- as a dependency, on the
+/// dependent's own platforms and build flags -- so a replacement chosen by
+/// hand is indistinguishable from one resolution picked itself.
+async fn ensure_replacement_exists(
+    services: &Services,
+    dependent: &packages::Model,
+    replacement: &str,
+) -> Result<packages::Model, ApiError> {
+    if let Some(package) = Packages::find()
+        .filter(packages::Column::Name.eq(replacement))
+        .one(&services.db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+    {
+        return Ok(package);
+    }
+
+    aurcache_utils::package::add::ensure_aur_package_exists_recursive(
+        &services.client,
+        &services.store,
+        &services.db,
+        replacement,
+        &dependent.platforms,
+        &dependent.build_flags,
+    )
+    .await
+    .map_err(|e| err(Status::BadGateway, e))?;
+
+    Packages::find()
+        .filter(packages::Column::Name.eq(replacement))
+        .one(&services.db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| {
+            err(
+                Status::NotFound,
+                format!("'{replacement}' could not be added from the AUR"),
+            )
+        })
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::{
+        ReplacementVerdict, candidate_verdict, dependency_edge, provided_names, repoint_edge,
+    };
+    use aurcache_db::migration::Migrator;
+    use aurcache_db::packages::SourceData;
+    use aurcache_db::prelude::{Dependencies, Packages};
+    use aurcache_db::{dependencies, packages};
+    use aurcache_utils::package::live_check::live_check;
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
+        QueryFilter, Set, TryIntoModel,
+    };
+    use sea_orm_migration::MigratorTrait;
+    use serde_json::json;
+
+    async fn memory_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    async fn package(
+        db: &DatabaseConnection,
+        name: &str,
+        directly_requested: bool,
+    ) -> packages::Model {
+        packages::ActiveModel {
+            name: Set(name.to_string()),
+            status: Set(1),
+            out_of_date: Set(0),
+            upstream_version: Set(None),
+            latest_build: Set(None),
+            build_flags: Set(String::new()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(packages::SourceType::Aur),
+            source_data: Set(SourceData::Aur { name: name.into() }),
+            directly_requested: Set(directly_requested),
+            split_packages: Set(None),
+            ..Default::default()
+        }
+        .save(db)
+        .await
+        .unwrap()
+        .try_into_model()
+        .unwrap()
+    }
+
+    async fn edge(db: &DatabaseConnection, dependent: i32, dependee: i32, constraint: &str) {
+        dependencies::ActiveModel {
+            dependent_id: Set(dependent),
+            dependee_id: Set(dependee),
+            version_constraint: Set(constraint.to_string()),
+            ..Default::default()
+        }
+        .save(db)
+        .await
+        .unwrap();
+    }
+
+    /// A replacement is judged against every name the package answers to, so
+    /// all three sources of them have to be here -- and a versioned `provides`
+    /// contributes the name, not the whole entry.
+    #[tokio::test]
+    async fn provided_names_covers_the_name_the_splits_and_the_provides() {
+        let db = memory_db().await;
+        let mut package = package(&db, "libfoo", true).await;
+        assert_eq!(provided_names(&package), vec!["libfoo"]);
+
+        package.split_packages = Some(json!(["libfoo-docs"]).to_string());
+        package.provides = Some(json!(["libfoo.so=1", "foo-compat"]).to_string());
+        assert_eq!(
+            provided_names(&package),
+            vec!["foo-compat", "libfoo", "libfoo-docs", "libfoo.so"],
+            "a versioned `provides` contributes the name, not the whole entry"
+        );
+    }
+
+    /// An unbuilt candidate is `Unknown`, not `Unsatisfied`: the queue checks
+    /// the constraint against each real build, so there is nothing to conclude
+    /// yet and saying "no" would hide a usable option.
+    #[test]
+    fn a_candidate_is_judged_on_the_version_it_is_known_to_be_at() {
+        assert_eq!(
+            candidate_verdict(None, ""),
+            ReplacementVerdict::Satisfied,
+            "an unconstrained edge is met by anything"
+        );
+        assert_eq!(
+            candidate_verdict(Some("2.0.0-1"), ">=2.0"),
+            ReplacementVerdict::Satisfied
+        );
+        assert_eq!(
+            candidate_verdict(Some("1.0.0-1"), ">=2.0"),
+            ReplacementVerdict::Unsatisfied
+        );
+        assert_eq!(
+            candidate_verdict(None, ">=2.0"),
+            ReplacementVerdict::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_that_does_not_exist_is_not_found() {
+        let db = memory_db().await;
+        package(&db, "dependent", true).await;
+        package(&db, "stranger", false).await;
+
+        assert!(dependency_edge(&db, "dependent", "stranger").await.is_err());
+        assert!(dependency_edge(&db, "dependent", "nonesuch").await.is_err());
+    }
+
+    /// Repointing the last edge onto something else leaves the old dependency
+    /// holding nothing up, and the collection that follows takes it. This is
+    /// what lets emptying a package's dependents remove it, with no second
+    /// endpoint that knows how to remove packages.
+    #[tokio::test]
+    async fn repointing_the_last_edge_collects_the_old_dependency() {
+        let db = memory_db().await;
+        let dependent = package(&db, "dependent", true).await;
+        let old = package(&db, "old-provider", false).await;
+        let new = package(&db, "new-provider", false).await;
+        edge(&db, dependent.id, old.id, ">=1.0").await;
+
+        let moving = Dependencies::find().one(&db).await.unwrap().unwrap();
+        repoint_edge(&db, moving, dependent.id, new.id)
+            .await
+            .unwrap();
+        live_check(&db, old.id).await.unwrap();
+
+        assert!(
+            Packages::find_by_id(old.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing needs the old dependency any more"
+        );
+        let remaining = Dependencies::find().all(&db).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].dependee_id, new.id);
+        assert_eq!(
+            remaining[0].version_constraint, ">=1.0",
+            "the constraint travels with the edge"
+        );
+    }
+
+    /// A dependent that already depends on the replacement under some other
+    /// name would collide, since there is one row per pair. The edge is merged
+    /// into the one already there rather than duplicated.
+    #[tokio::test]
+    async fn repointing_onto_an_edge_that_already_exists_merges() {
+        let db = memory_db().await;
+        let dependent = package(&db, "dependent", true).await;
+        let old = package(&db, "old-provider", false).await;
+        let new = package(&db, "new-provider", false).await;
+        edge(&db, dependent.id, old.id, ">=1.0").await;
+        edge(&db, dependent.id, new.id, ">=3.0").await;
+
+        let moving = Dependencies::find()
+            .filter(dependencies::Column::DependeeId.eq(old.id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        repoint_edge(&db, moving, dependent.id, new.id)
+            .await
+            .unwrap();
+
+        assert_eq!(Dependencies::find().count(&db).await.unwrap(), 1);
+        let remaining = Dependencies::find().one(&db).await.unwrap().unwrap();
+        assert_eq!(remaining.dependee_id, new.id);
+        assert_eq!(remaining.version_constraint, ">=3.0");
+    }
+
+    /// A dependency something else still needs survives the repoint: the
+    /// collection is reachability, not "did an edge just move".
+    #[tokio::test]
+    async fn a_dependency_another_package_still_needs_is_kept() {
+        let db = memory_db().await;
+        let dependent = package(&db, "dependent", true).await;
+        let other = package(&db, "other", true).await;
+        let old = package(&db, "old-provider", false).await;
+        let new = package(&db, "new-provider", false).await;
+        edge(&db, dependent.id, old.id, "").await;
+        edge(&db, other.id, old.id, "").await;
+
+        let moving = Dependencies::find()
+            .filter(dependencies::Column::DependentId.eq(dependent.id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        repoint_edge(&db, moving, dependent.id, new.id)
+            .await
+            .unwrap();
+        live_check(&db, old.id).await.unwrap();
+
+        assert!(
+            Packages::find_by_id(old.id)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

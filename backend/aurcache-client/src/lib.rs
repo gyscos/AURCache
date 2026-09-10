@@ -23,6 +23,9 @@ pub use aurcache_common::api::package::{
 pub use aurcache_common::api::package::{
     AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
 };
+pub use aurcache_common::api::package::{
+    CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
+};
 // The add and preview requests are the server's own shapes rather than copies:
 // they were duplicated here, so a field added to one was silently absent from
 // the other.
@@ -320,6 +323,43 @@ impl AurCacheClient {
             &format!("/package/{pkgbase}"),
             &[],
             Some(body),
+        )
+        .await
+    }
+
+    /// What could take over one of a package's dependencies.
+    pub async fn dependency_options(
+        &self,
+        pkgbase: &str,
+        dependency: &str,
+    ) -> Result<DependencyOptions> {
+        self.request_json::<DependencyOptions, Value>(
+            Method::GET,
+            &format!("/package/{pkgbase}/dependency/{dependency}/options"),
+            &[],
+            None,
+        )
+        .await
+    }
+
+    /// Points one of a package's dependencies at `replacement`, or drops the
+    /// dependency entirely when it is `None`.
+    ///
+    /// Dropping is accepted only where the official repositories publish the
+    /// name, since anything else would be undone at the next update.
+    pub async fn replace_dependency(
+        &self,
+        pkgbase: &str,
+        dependency: &str,
+        replacement: Option<&str>,
+    ) -> Result<()> {
+        self.request_empty(
+            Method::PUT,
+            &format!("/package/{pkgbase}/dependency/{dependency}"),
+            &[],
+            Some(&ReplaceDependency {
+                replacement: replacement.map(ToString::to_string),
+            }),
         )
         .await
     }

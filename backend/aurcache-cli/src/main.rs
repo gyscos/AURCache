@@ -9,9 +9,10 @@ mod url;
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
     AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BulkAddAccepted, BulkAddOutcome,
-    BulkAddProgress, ExtendedPackage, GitSourceSpec, GraphDataPoint, ListStats, Method,
-    PackageDependency, PackageSource, PatchPackageRequest, RestoreOutcome, SearchResult,
-    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
+    BulkAddProgress, CandidateSource, DependencyOptions, ExtendedPackage, GitSourceSpec,
+    GraphDataPoint, ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest,
+    ReplacementVerdict, RestoreOutcome, SearchResult, SimplePackage, SourceData,
+    UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
 use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
@@ -411,6 +412,11 @@ enum PackagesCommand {
     Update(UpdatePackageArgs),
     /// Partially update package metadata.
     Patch(PatchPackageArgs),
+    /// Inspect and repoint a package's dependencies.
+    Dep {
+        #[command(subcommand)]
+        command: DependencyCommand,
+    },
     /// Remove the direct-request flag from one or more packages.
     #[command(visible_alias = "delete")]
     Rm {
@@ -418,6 +424,37 @@ enum PackagesCommand {
         /// `pkg list -q` can be passed straight through.
         #[arg(required = true)]
         pkgbases: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum DependencyCommand {
+    /// List what could take over a dependency.
+    Options {
+        /// Package whose dependency this is.
+        pkgbase: String,
+        /// The dependency to replace, by pkgbase.
+        dependency: String,
+    },
+    /// Point a dependency at another package.
+    Replace {
+        /// Package whose dependency this is.
+        pkgbase: String,
+        /// The dependency to replace, by pkgbase.
+        dependency: String,
+        /// What to depend on instead. Added from the AUR if it is not tracked
+        /// yet.
+        replacement: String,
+    },
+    /// Drop a dependency the official repositories now publish.
+    ///
+    /// Refused for anything they do not, since resolution would put the edge
+    /// straight back at the next update.
+    Drop {
+        /// Package whose dependency this is.
+        pkgbase: String,
+        /// The dependency to drop, by pkgbase.
+        dependency: String,
     },
 }
 
@@ -1052,6 +1089,7 @@ async fn run_packages_command(
         PackagesCommand::Add(args) => add_package_command(client, format, args).await,
         PackagesCommand::Update(args) => update_package_command(client, format, args).await,
         PackagesCommand::Patch(args) => patch_package_command(client, format, args).await,
+        PackagesCommand::Dep { command } => run_dependency_command(client, format, command).await,
         PackagesCommand::Rm { pkgbases } => {
             remove_packages_command(client, format, &pkgbases).await
         }
@@ -1666,6 +1704,101 @@ fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
         bail!("no changes specified");
     }
     Ok(())
+}
+
+async fn run_dependency_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    command: DependencyCommand,
+) -> Result<()> {
+    match command {
+        DependencyCommand::Options {
+            pkgbase,
+            dependency,
+        } => {
+            let options = client.dependency_options(&pkgbase, &dependency).await?;
+            render(format, &options, print_dependency_options)
+        }
+        DependencyCommand::Replace {
+            pkgbase,
+            dependency,
+            replacement,
+        } => {
+            client
+                .replace_dependency(&pkgbase, &dependency, Some(&replacement))
+                .await?;
+            print_done_message(format, &format!("{pkgbase} now depends on {replacement}"));
+            Ok(())
+        }
+        DependencyCommand::Drop {
+            pkgbase,
+            dependency,
+        } => {
+            client
+                .replace_dependency(&pkgbase, &dependency, None)
+                .await?;
+            print_done_message(
+                format,
+                &format!("{pkgbase} no longer depends on {dependency}"),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn print_dependency_options(options: &DependencyOptions) {
+    println!("dependent: {}", options.dependent);
+    println!("current: {}", options.current);
+    println!(
+        "declared as: {}",
+        if options.declared_names.is_empty() {
+            "nothing (stale edge)".to_string()
+        } else {
+            options.declared_names.join(", ")
+        }
+    );
+    println!(
+        "constraint: {}",
+        option_text(Some(options.version_constraint.as_str()).filter(|c| !c.is_empty()))
+    );
+    if !options.official.is_empty() {
+        println!(
+            "official: {} -- `pkg dep drop` removes this dependency",
+            options.official.join(", ")
+        );
+    }
+    println!();
+
+    if let Some(error) = &options.aur_error {
+        println!("warning: the AUR could not be searched ({error});");
+        println!("         only packages already tracked are listed below.");
+        println!();
+    }
+    if options.candidates.is_empty() {
+        println!("no replacement found");
+        return;
+    }
+    let rows = options
+        .candidates
+        .iter()
+        .map(|candidate| {
+            vec![
+                candidate.pkgbase.clone(),
+                match candidate.source {
+                    CandidateSource::Tracked => "tracked".to_string(),
+                    CandidateSource::Aur => "aur".to_string(),
+                },
+                option_text(candidate.version.as_deref()),
+                match candidate.verdict {
+                    ReplacementVerdict::Satisfied => "yes",
+                    ReplacementVerdict::Unknown => "unknown",
+                    ReplacementVerdict::Unsatisfied => "no",
+                }
+                .to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["name", "source", "version", "satisfies"], &rows);
 }
 
 /// Removing several packages is one request per package, so one failure must

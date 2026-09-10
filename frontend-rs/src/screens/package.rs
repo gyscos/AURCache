@@ -182,7 +182,10 @@ pub fn Package(pkgbase: String) -> Element {
                                 builds: builds.clone(),
                                 on_changed: move |()| data.restart(),
                             }
-                            Relations { pkg: pkg.clone() }
+                            Relations {
+                                pkg: pkg.clone(),
+                                on_changed: move |()| data.restart(),
+                            }
                         }
                         div { class: "space-y-4 min-w-0",
                             SourceCard { pkg: pkg.clone() }
@@ -419,7 +422,8 @@ fn BuildRow(label: String, entry: Build, now: i64) -> Element {
 }
 
 #[component]
-fn Relations(pkg: ExtendedPackage) -> Element {
+fn Relations(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Element {
+    let name = pkg.name.clone();
     let ExtendedPackage {
         dependencies,
         dependents,
@@ -435,12 +439,19 @@ fn Relations(pkg: ExtendedPackage) -> Element {
             // unsatisfied is waiting on *this* package, which is its problem to
             // display, not a reason to flag anything here.
             show_blocking: true,
+            // Only this side is editable: an edge belongs to the package that
+            // declares it, so a dependent's dependency is changed from the
+            // dependent's own page.
+            replace_for: Some(name),
+            on_changed,
         }
         RelationList {
             title: "Dependents",
             empty: "Nothing depends on this package.",
             items: dependents,
             show_blocking: false,
+            replace_for: None,
+            on_changed,
         }
     }
 }
@@ -451,6 +462,8 @@ fn RelationList(
     empty: String,
     items: Vec<aurcache_client::PackageDependency>,
     show_blocking: bool,
+    replace_for: Option<String>,
+    on_changed: EventHandler<()>,
 ) -> Element {
     let blocking = items.iter().filter(|item| !item.satisfied).count();
 
@@ -473,7 +486,12 @@ fn RelationList(
                 } else {
                     ul { class: "divide-y divide-base-300",
                         for item in items.iter() {
-                            RelationRow { item: item.clone(), show_blocking }
+                            RelationRow {
+                                item: item.clone(),
+                                show_blocking,
+                                replace_for: replace_for.clone(),
+                                on_changed,
+                            }
                         }
                     }
                 }
@@ -484,11 +502,31 @@ fn RelationList(
 
 /// One dependency, and why it is or is not holding the build back.
 #[component]
-fn RelationRow(item: aurcache_client::PackageDependency, show_blocking: bool) -> Element {
+fn RelationRow(
+    item: aurcache_client::PackageDependency,
+    show_blocking: bool,
+    replace_for: Option<String>,
+    on_changed: EventHandler<()>,
+) -> Element {
     let blocking = show_blocking && !item.satisfied;
+    let mut replacing = use_signal(|| false);
 
     rsx! {
         li { key: "{item.id}", class: "py-2 flex items-center gap-2 flex-wrap",
+            // Inside the row rather than beside it: the key has to sit on the
+            // first node of the block for list diffing, and the modal is
+            // positioned against the viewport regardless of where it is
+            // mounted.
+            if let Some(dependent) = replace_for.clone() {
+                if replacing() {
+                    ReplaceDependencyDialog {
+                        dependent,
+                        dependency: item.name.clone(),
+                        on_close: move |()| replacing.set(false),
+                        on_changed,
+                    }
+                }
+            }
             Link {
                 class: "link link-primary font-mono text-sm break-all",
                 to: Route::Package { pkgbase: item.name.clone() },
@@ -516,6 +554,240 @@ fn RelationRow(item: aurcache_client::PackageDependency, show_blocking: bool) ->
                 span { class: "font-mono text-xs opacity-50", "{built}" }
             }
             BuildStatusBadge { status: item.status }
+            if replace_for.is_some() {
+                button {
+                    class: "btn btn-ghost btn-xs",
+                    onclick: move |_| replacing.set(true),
+                    "Replace"
+                }
+            }
+        }
+    }
+}
+
+/// Send one dependency somewhere else. `None` drops it.
+async fn apply_replacement(
+    dependent: String,
+    dependency: String,
+    replacement: Option<String>,
+) -> Result<(), String> {
+    match client() {
+        Ok(client) => client
+            .replace_dependency(&dependent, &dependency, replacement.as_deref())
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Point one dependency at something else, or drop it.
+///
+/// Which packages could stand in is a question only the server can answer --
+/// it weighs the official repositories, everything tracked here and an AUR
+/// `provides` search, in that order -- so this is a thin view over one
+/// endpoint rather than a picker filtering a list the page already had. It is
+/// mounted only while open, which is what makes that request happen on opening
+/// and not on every page load.
+#[component]
+fn ReplaceDependencyDialog(
+    dependent: String,
+    dependency: String,
+    on_close: EventHandler<()>,
+    on_changed: EventHandler<()>,
+) -> Element {
+    let options = use_resource({
+        let dependent = dependent.clone();
+        let dependency = dependency.clone();
+        move || {
+            let dependent = dependent.clone();
+            let dependency = dependency.clone();
+            async move {
+                match client() {
+                    Ok(client) => client
+                        .dependency_options(&dependent, &dependency)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    });
+
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    // Held as signals so the handler below captures nothing but `Copy` values
+    // and can therefore be used from more than one place in the tree.
+    let ends = use_signal(|| (dependent.clone(), dependency.clone()));
+    let apply = move |replacement: Option<String>| {
+        let (dependent, dependency) = ends();
+        spawn(async move {
+            busy.set(true);
+            error.set(None);
+            let outcome = apply_replacement(dependent, dependency, replacement).await;
+            busy.set(false);
+            match outcome {
+                Ok(()) => {
+                    on_changed.call(());
+                    on_close.call(());
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        });
+    };
+
+    rsx! {
+        div {
+            class: "modal modal-open",
+            role: "dialog",
+            aria_modal: "true",
+            aria_label: "Replace dependency",
+            div { class: "modal-box max-w-2xl",
+                h3 { class: "font-bold text-lg", "Replace {dependency}" }
+                p { class: "text-sm opacity-70 pt-1",
+                    "Changes what {dependent} is built against. "
+                    "The choice sticks: resolution prefers the dependency a package already has."
+                }
+
+                if let Some(message) = error() {
+                    div { class: "alert alert-error text-sm mt-3", span { "{message}" } }
+                }
+
+                match &*options.read_unchecked() {
+                    None => rsx! {
+                        div { class: "flex justify-center p-8",
+                            span { class: "loading loading-spinner" }
+                        }
+                    },
+                    Some(Err(e)) => rsx! {
+                        div { class: "alert alert-error text-sm mt-3", span { "{e}" } }
+                    },
+                    Some(Ok(options)) => {
+                        let dropped = !options.official.is_empty()
+                            && options.official.len() == options.declared_names.len();
+                        rsx! {
+                            div { class: "text-xs opacity-60 pt-3 font-mono",
+                                if options.declared_names.is_empty() {
+                                    "no longer declared by {dependent}"
+                                } else {
+                                    "declared as {options.declared_names.join(\", \")}"
+                                }
+                                if !options.version_constraint.is_empty() {
+                                    " {options.version_constraint}"
+                                }
+                            }
+
+                            // Rare, and worth its own action rather than a row
+                            // in the list: nothing is chosen, the edge simply
+                            // stops existing because pacman can satisfy it.
+                            if dropped {
+                                div { class: "alert alert-info text-sm mt-3 flex-wrap",
+                                    span {
+                                        "The official repositories now publish this. "
+                                        "AURCache does not have to build anything for it."
+                                    }
+                                    button {
+                                        class: "btn btn-sm",
+                                        disabled: busy(),
+                                        onclick: move |_| apply(None),
+                                        "Drop the dependency"
+                                    }
+                                }
+                            }
+
+                            if let Some(message) = options.aur_error.clone() {
+                                div { class: "alert alert-warning text-sm mt-3",
+                                    span {
+                                        "The AUR could not be searched ({message}), so only "
+                                        "packages already tracked here are listed."
+                                    }
+                                }
+                            }
+
+                            if options.candidates.is_empty() {
+                                p { class: "opacity-60 text-sm pt-4",
+                                    if options.aur_error.is_some() {
+                                        "Nothing tracked here provides it."
+                                    } else {
+                                        "Nothing else provides it, here or in the AUR."
+                                    }
+                                }
+                            } else {
+                                ul { class: "divide-y divide-base-300 pt-2 max-h-80 overflow-y-auto",
+                                    for candidate in options.candidates.iter() {
+                                        CandidateRow {
+                                            key: "{candidate.pkgbase}",
+                                            candidate: candidate.clone(),
+                                            busy: busy(),
+                                            on_pick: move |pkgbase: String| apply(Some(pkgbase)),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div { class: "modal-action",
+                    button {
+                        class: "btn btn-sm",
+                        disabled: busy(),
+                        onclick: move |_| on_close.call(()),
+                        "Cancel"
+                    }
+                }
+            }
+            button {
+                class: "modal-backdrop",
+                disabled: busy(),
+                onclick: move |_| on_close.call(()),
+                "Close"
+            }
+        }
+    }
+}
+
+/// One package that could take the edge over.
+#[component]
+fn CandidateRow(
+    candidate: aurcache_client::DependencyCandidate,
+    busy: bool,
+    on_pick: EventHandler<String>,
+) -> Element {
+    let pkgbase = candidate.pkgbase.clone();
+
+    rsx! {
+        li { class: "py-2 flex items-center gap-2 flex-wrap",
+            span { class: "font-mono text-sm break-all", "{candidate.pkgbase}" }
+            match candidate.source {
+                aurcache_client::CandidateSource::Tracked => rsx! {
+                    span { class: "badge badge-sm badge-neutral", "tracked" }
+                },
+                // Says what picking it costs: a package that is not here yet
+                // gets added and built before the dependent can use it.
+                aurcache_client::CandidateSource::Aur => rsx! {
+                    span { class: "badge badge-sm badge-outline", "AUR — would be added" }
+                },
+            }
+            if let Some(version) = candidate.version.clone() {
+                span { class: "font-mono text-xs opacity-60", "{version}" }
+            }
+            match candidate.verdict {
+                aurcache_client::ReplacementVerdict::Satisfied => rsx! {},
+                aurcache_client::ReplacementVerdict::Unknown => rsx! {
+                    span { class: "badge badge-sm badge-ghost", "not built yet" }
+                },
+                aurcache_client::ReplacementVerdict::Unsatisfied => rsx! {
+                    span { class: "badge badge-sm badge-warning", "too old" }
+                },
+            }
+            div { class: "flex-1" }
+            button {
+                class: "btn btn-sm btn-primary",
+                disabled: busy,
+                onclick: move |_| on_pick.call(pkgbase.clone()),
+                "Use"
+            }
         }
     }
 }

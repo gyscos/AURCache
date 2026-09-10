@@ -414,7 +414,7 @@ async fn plan_dependency_recursive(
     plan_package_with_deps(plan_context, package_spec, visited, plan).await
 }
 
-pub(crate) async fn ensure_aur_package_exists_recursive(
+pub async fn ensure_aur_package_exists_recursive(
     client: &aurcache_deps::AurClient,
     store: &SnapshotStore,
     db: &DatabaseConnection,

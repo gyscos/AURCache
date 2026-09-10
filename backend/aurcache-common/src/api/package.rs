@@ -291,3 +291,84 @@ pub struct AurPackage {
     pub aur_flagged_outdated: bool,
     pub aur_url: String,
 }
+
+/// Where a replacement candidate was found.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSource {
+    /// Already tracked by this instance.
+    Tracked,
+    /// Would be added from the AUR and built.
+    Aur,
+}
+
+/// Whether a candidate meets what the edge being replaced recorded.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementVerdict {
+    /// Its version meets the constraint, or there is no constraint.
+    Satisfied,
+    /// Not decidable here rather than negative: nothing has been built for it
+    /// yet, so there is no version to check. The build queue re-checks the
+    /// constraint against each real build, so this settles itself later.
+    Unknown,
+    /// The version it is known to be at fails the constraint.
+    Unsatisfied,
+}
+
+/// One dependency edge, and what could take its place.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct DependencyOptions {
+    /// The package whose dependency this is.
+    pub dependent: String,
+    /// The package it currently depends on.
+    pub current: String,
+    /// The names the dependent declares that `current` answers to. Normally
+    /// one; more where a single package covers several of them.
+    ///
+    /// The edge records the constraint but not the name it came from, so this
+    /// is recovered by reading the dependent's source. It is what the
+    /// candidates are searched for.
+    pub declared_names: Vec<String>,
+    /// What the edge requires, e.g. `>=1.3`. Empty when unconstrained.
+    pub version_constraint: String,
+    /// Declared names the official repositories publish.
+    ///
+    /// When they cover every one of them the edge can be dropped outright
+    /// rather than repointed: pacman resolves it at install time and AURCache
+    /// has nothing left to build. Rare, and it happens when a name moved into
+    /// an official repository after the dependent was last resolved.
+    pub official: Vec<String>,
+    /// What could stand in, best first, tracked packages before AUR ones.
+    /// Never includes the current dependency or the dependent itself.
+    pub candidates: Vec<DependencyCandidate>,
+    /// Why the AUR could not be searched, when it could not be.
+    ///
+    /// `candidates` then holds only what is already tracked, which is not the
+    /// same as the AUR having nothing to offer. Saying "nothing else provides
+    /// it" when the truth is "could not ask" is how someone ends up removing a
+    /// dependency they could have replaced, so the two are kept apart here as
+    /// they are everywhere else resolution asks a source a question.
+    pub aur_error: Option<String>,
+}
+
+/// One package that could take over a dependency edge.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct DependencyCandidate {
+    pub pkgbase: String,
+    pub source: CandidateSource,
+    /// The version it is known to be at: its newest successful build if it is
+    /// tracked, or what the AUR publishes. `None` when nothing has been built
+    /// for a tracked package yet.
+    pub version: Option<String>,
+    pub verdict: ReplacementVerdict,
+}
+
+/// Point a dependency edge at something else.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplaceDependency {
+    /// The package base to depend on instead. `None` drops the edge, which is
+    /// accepted only when the official repositories publish every declared
+    /// name behind it.
+    pub replacement: Option<String>,
+}
