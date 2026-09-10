@@ -50,6 +50,13 @@ pub struct Config {
     /// worker, 23 of 26 of them upgraded nothing at all: Arch's repositories
     /// move a few times a day, not a few times an hour. Every build paid for
     /// that, serially, before it could start.
+    ///
+    /// This bounds how stale the *shared* base may be, not what a build sees:
+    /// every build syncs its own chroot copy before it starts
+    /// (`makechrootpkg -u`, see [`crate::build::build_command`]), because
+    /// AURCache's own repository moves whenever a build finishes rather than a
+    /// few times a day. Keeping the base close to current is what leaves that
+    /// per-build sync with nothing to download.
     pub chroot_refresh_interval: u64,
     /// Whether each build's chroot is an overlay on the base or a copy of it.
     ///

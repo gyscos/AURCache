@@ -88,6 +88,23 @@ pub fn build_command(
     // would run the build, and a build could then read the worker's mTLS
     // identity and credentials by ordinary file permissions.
     argv.extend(["-U".to_string(), build_user.to_string()]);
+    // `pacman -Syuu` inside *this build's* copy, before the build starts.
+    //
+    // The shared base is only refreshed on an interval
+    // (`WORKER_CHROOT_REFRESH_INTERVAL`, 15 minutes by default), which is right
+    // for Arch's repositories -- they move a few times a day -- and wrong for
+    // AURCache's own, which moves whenever a build here finishes. A dependency
+    // this very server built two minutes ago is in the repository and absent
+    // from the base chroot's sync databases, so the build that was unblocked by
+    // it cannot see the thing that unblocked it. That is what failed
+    // lib32-leptonica twice.
+    //
+    // Doing it per copy rather than by refreshing the base is what keeps it
+    // cheap: the copy is this build's alone, so nothing is locked, nothing is
+    // serialised behind it, and concurrent builds each do their own. The
+    // interval refresh still earns its keep -- it is what leaves this one with
+    // nothing to download on the large majority of builds.
+    argv.push("-u".to_string());
     // `SRCDEST` is passed through the environment instead of a bind mount:
     // devtools reads it directly and binds it itself, which avoids competing
     // with its own `--bind=$SRCDEST:/srcdest`.
@@ -140,6 +157,22 @@ mod tests {
             "-T must come after -l: {joined}"
         );
         assert!(joined.contains("-- --nocheck"));
+    }
+
+    /// Every build syncs its own copy first, whichever strategy made it. The
+    /// shared base is refreshed on an interval, and a dependency AURCache built
+    /// since that interval last elapsed is in the repository but not in the
+    /// base's sync databases.
+    #[test]
+    fn every_build_refreshes_its_own_copy() {
+        for owns in [true, false] {
+            let cmd = build_command(Path::new("/chroot"), "job-1", owns, &[], &[], "builder");
+            assert!(
+                cmd.iter().any(|a| a == "-u"),
+                "copy owned by devtools={owns}: {}",
+                cmd.join(" ")
+            );
+        }
     }
 
     /// A strategy that makes the copy itself leaves devtools' half out: no
