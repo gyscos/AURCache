@@ -186,6 +186,30 @@ pub fn Package(pkgbase: String) -> Element {
                                 pkg: pkg.clone(),
                                 on_changed: move |()| data.restart(),
                             }
+                            // Last in this column rather than full width
+                            // under both: it is the one irreversible action
+                            // here, and it still has no business sitting
+                            // beside Rebuild where people click without
+                            // reading -- but spanning the page put it below a
+                            // sidebar that had already run out, leaving the
+                            // space beside it doing nothing.
+                            //
+                            // A package that is only here as a dependency
+                            // cannot be removed by clearing a flag that is
+                            // already clear -- its dependents have to stop
+                            // needing it first. One that was asked for keeps
+                            // the plain Remove, which clears the flag and
+                            // leaves it as a dependency; removing it then is
+                            // the second step, from this same card.
+                            if !pkg.directly_requested && !pkg.dependents.is_empty() {
+                                ReplaceAndRemoveCard {
+                                    pkgbase: pkg.name.clone(),
+                                    dependents: pkg.dependents.clone(),
+                                    on_changed: move |()| data.restart(),
+                                }
+                            } else {
+                                RemoveCard { pkgbase: pkg.name.clone() }
+                            }
                         }
                         div { class: "space-y-4 min-w-0",
                             SourceCard { pkg: pkg.clone() }
@@ -195,24 +219,6 @@ pub fn Package(pkgbase: String) -> Element {
                             }
                             ProducesCard { pkg: pkg.clone() }
                         }
-                    }
-                    // Below the fold of the page proper: it is the one
-                    // irreversible action here, and it has no business sitting
-                    // beside Rebuild where people click without reading.
-                    // A package that is only here as a dependency cannot be
-                    // removed by clearing a flag that is already clear -- its
-                    // dependents have to stop needing it first. One that was
-                    // asked for keeps the plain Remove, which clears the flag
-                    // and leaves it as a dependency; removing it then is the
-                    // second step, from this same card.
-                    if !pkg.directly_requested && !pkg.dependents.is_empty() {
-                        ReplaceAndRemoveCard {
-                            pkgbase: pkg.name.clone(),
-                            dependents: pkg.dependents.clone(),
-                            on_changed: move |()| data.restart(),
-                        }
-                    } else {
-                        RemoveCard { pkgbase: pkg.name.clone() }
                     }
                 }
             },
