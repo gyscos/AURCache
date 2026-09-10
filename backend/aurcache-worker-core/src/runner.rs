@@ -232,7 +232,12 @@ impl<E: Executor> Runner<E> {
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!("reporting completion for {build_id} failed: {e}");
+                    // `{e:#}` for the cause chain, not just the outermost
+                    // context: on its own "complete rejected" says nothing
+                    // about *why* the server refused, and the status code is
+                    // the whole difference between a lost lease and an ingest
+                    // that cannot publish.
+                    tracing::warn!("reporting completion for {build_id} failed: {e:#}");
                     tokio::time::sleep(Duration::from_secs(2 * (attempt + 1))).await;
                 }
             }

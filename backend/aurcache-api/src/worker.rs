@@ -620,9 +620,29 @@ pub async fn complete_job(
     build_id: i32,
     input: Json<CompleteReport>,
 ) -> Result<(), ApiError> {
-    let db = db.inner();
-    let report = input.into_inner();
+    // The worker only ever sees the status code -- `error_for_status` keeps
+    // nothing else -- and a refused completion is how a build that finished
+    // becomes a build that failed. So the reason is logged here, on the side
+    // that knows it. Refusing quietly is what made a stale `files` row take an
+    // afternoon to find.
+    let outcome = complete_job_inner(db.inner(), &auth, build_id, input.into_inner()).await;
+    if let Err(e) = &outcome {
+        tracing::warn!(
+            "rejected completion of build {build_id} from worker {}: {} -- {}",
+            auth.worker.id,
+            e.0,
+            e.1
+        );
+    }
+    outcome
+}
 
+async fn complete_job_inner(
+    db: &DatabaseConnection,
+    auth: &WorkerAuth,
+    build_id: i32,
+    report: CompleteReport,
+) -> Result<(), ApiError> {
     let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
