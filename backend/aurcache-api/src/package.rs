@@ -1702,6 +1702,15 @@ pub async fn package_dependency_replace(
         }
     }
 
+    // The dependent's queue entry was made against the edge that just changed,
+    // so it may now be wrong in either direction: free to start because what
+    // held it up is no longer its dependency, or obliged to wait because the
+    // replacement has not been built yet. Before `live_check`, which may delete
+    // the old dependency and everything that hung off it.
+    aurcache_utils::worker_complete::resync_pending_builds(&services.db, dependent.id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+
     // The usual collection, now that the old dependency may be holding nothing
     // up. This is what makes emptying a package's dependents remove it: patch
     // the last edge away and the package goes with it, without a second

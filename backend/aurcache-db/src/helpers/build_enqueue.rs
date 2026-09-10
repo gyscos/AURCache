@@ -146,6 +146,37 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     Ok(Some(updated))
 }
 
+/// Put an `ENQUEUED` build back to `WAITING_FOR_DEPS`, because something it
+/// needs is no longer ready.
+///
+/// The counterpart of [`promote_waiting_build`], and the reason a package's
+/// dependencies can be repointed while a build for it is already queued: the
+/// queue entry was made against the old dependency, and the new one may not be
+/// built yet.
+///
+/// A conditional `UPDATE` rather than the read-then-write `promote_waiting_build`
+/// does, because the race runs the other way here. A queued build is exactly
+/// what a worker is looking for, so one can be claimed (`ENQUEUED -> ACTIVE`)
+/// between a read and a write -- and demoting it then would take a build a
+/// worker is already running and put it back in the queue. Pinning the update to
+/// `status = ENQUEUED` makes that a no-op instead.
+///
+/// Returns whether a build was demoted.
+pub async fn demote_enqueued_build<C: ConnectionTrait>(
+    db: &C,
+    pkg_id: i32,
+    platform: Platform,
+) -> Result<bool, DbErr> {
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Status, Expr::value(STATUS_WAITING_FOR_DEPS))
+        .filter(builds::Column::PkgId.eq(pkg_id))
+        .filter(builds::Column::Platform.eq(platform.as_str()))
+        .filter(builds::Column::Status.eq(Some(STATUS_ENQUEUED)))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected > 0)
+}
+
 #[cfg(test)]
 mod build_number_tests {
     use super::next_build_number_expr;

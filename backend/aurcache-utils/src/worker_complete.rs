@@ -9,7 +9,7 @@
 use aurcache_common::builder::BuildStates;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
-use aurcache_db::helpers::build_enqueue::promote_waiting_build;
+use aurcache_db::helpers::build_enqueue::{demote_enqueued_build, promote_waiting_build};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use pacman_mirrors::platforms::Platform;
@@ -246,6 +246,68 @@ pub async fn trigger_dependents<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Re-decide whether one package's queued build can still start, after its
+/// dependencies changed.
+///
+/// Repointing or dropping a dependency edge changes the answer in *both*
+/// directions, which is why this is not just [`trigger_dependents`]:
+///
+/// * a build held at `WAITING_FOR_DEPS` may now be free to go, because the
+///   dependency that was holding it up is no longer one of this package's --
+///   this is what makes "replace the dependency" unblock a build rather than
+///   leave it waiting on a package it no longer needs;
+/// * a build already `ENQUEUED` may now have to wait, because the replacement
+///   it was pointed at has not been built yet. Leaving it queued sends it to a
+///   worker that cannot resolve its dependencies, and the build fails for a
+///   reason the queue already knew about.
+///
+/// Every platform the package has a pending build on, since a dependency may be
+/// satisfied on one and not another. `ACTIVE` builds are left alone: they are
+/// running, and the queue has nothing left to say about them.
+pub async fn resync_pending_builds<C: ConnectionTrait>(db: &C, pkg_id: i32) -> Result<(), DbErr> {
+    let pending: Vec<builds::Model> = Builds::find()
+        .filter(builds::Column::PkgId.eq(pkg_id))
+        .filter(builds::Column::Status.is_in([
+            Some(BuildStates::ENQUEUED_BUILD),
+            Some(BuildStates::WAITING_FOR_DEPS),
+        ]))
+        .all(db)
+        .await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let deps = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(pkg_id))
+        .all(db)
+        .await?;
+
+    for build in pending {
+        let platform = build.platform;
+        let ready = dependencies_ready(db, &deps, platform).await?;
+        match (build.status, ready) {
+            (Some(BuildStates::WAITING_FOR_DEPS), true) => {
+                if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {
+                    tracing::info!(
+                        "Build #{} on {platform} can start: its dependencies changed and are now satisfied",
+                        promoted.id
+                    );
+                }
+            }
+            (Some(BuildStates::ENQUEUED_BUILD), false)
+                if demote_enqueued_build(db, pkg_id, platform).await? =>
+            {
+                tracing::info!(
+                    "Build #{} on {platform} must wait: its dependencies changed and are not satisfied yet",
+                    build.id
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn load_dependencies_for_dependents_of<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
@@ -389,6 +451,116 @@ mod tests {
         );
         // The lease is a claim on a running build and does end here.
         assert_eq!(finished.lease_expires_at, None);
+    }
+
+    async fn dep(db: &DatabaseConnection, dependent: i32, dependee: i32) {
+        db.execute_unprepared(&format!(
+            "INSERT INTO dependencies (dependent_id, dependee_id, version_constraint) \
+             VALUES ({dependent}, {dependee}, '')"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn status_of(db: &DatabaseConnection, build_id: i32) -> Option<i32> {
+        Builds::find_by_id(build_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    /// The point of repointing a dependency: the build waiting on the old one
+    /// can go, because the old one is no longer what it needs.
+    #[tokio::test]
+    async fn a_waiting_build_starts_once_its_dependency_is_repointed() {
+        let db = setup().await;
+        pkg(&db, 1).await; // the dependent
+        pkg(&db, 2).await; // the replacement, already built
+        build(&db, 20, 2, BuildStates::SUCCESSFUL_BUILD, "1").await;
+        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+        dep(&db, 1, 2).await;
+
+        resync_pending_builds(&db, 1).await.unwrap();
+
+        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
+    }
+
+    /// A promotion is an all-of, not a check of the edge that just changed.
+    ///
+    /// Repointing one dependency says nothing about the others: the build is
+    /// only free to start when *every* dependency is satisfied, and promoting on
+    /// the strength of the one that was touched would send a build to a worker
+    /// that still cannot resolve the rest.
+    #[tokio::test]
+    async fn a_waiting_build_stays_waiting_while_another_dependency_is_unbuilt() {
+        let db = setup().await;
+        pkg(&db, 1).await; // the dependent
+        pkg(&db, 2).await; // the repointed dependency, built
+        pkg(&db, 3).await; // a second dependency, never built
+        build(&db, 20, 2, BuildStates::SUCCESSFUL_BUILD, "1").await;
+        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+        dep(&db, 1, 2).await;
+        dep(&db, 1, 3).await;
+
+        resync_pending_builds(&db, 1).await.unwrap();
+
+        assert_eq!(
+            status_of(&db, 10).await,
+            Some(BuildStates::WAITING_FOR_DEPS),
+            "promoted on one satisfied dependency while another is unbuilt"
+        );
+
+        // ... and it goes as soon as the last one lands.
+        build(&db, 30, 3, BuildStates::SUCCESSFUL_BUILD, "1").await;
+        resync_pending_builds(&db, 1).await.unwrap();
+        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
+    }
+
+    /// And the other direction, which is the one a promotion-only pass misses:
+    /// a build already queued against the old dependency has to wait when the
+    /// replacement has not been built.
+    #[tokio::test]
+    async fn a_queued_build_waits_when_its_new_dependency_is_not_built() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        pkg(&db, 2).await; // the replacement, never built
+        build(&db, 10, 1, BuildStates::ENQUEUED_BUILD, "NULL").await;
+        dep(&db, 1, 2).await;
+
+        resync_pending_builds(&db, 1).await.unwrap();
+
+        assert_eq!(
+            status_of(&db, 10).await,
+            Some(BuildStates::WAITING_FOR_DEPS)
+        );
+    }
+
+    /// A build a worker is already running is none of the queue's business.
+    #[tokio::test]
+    async fn a_running_build_is_left_alone() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        pkg(&db, 2).await;
+        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        dep(&db, 1, 2).await;
+
+        resync_pending_builds(&db, 1).await.unwrap();
+
+        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ACTIVE_BUILD));
+    }
+
+    /// Dropping the last dependency leaves nothing to wait for.
+    #[tokio::test]
+    async fn a_waiting_build_starts_when_its_last_dependency_is_dropped() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+
+        resync_pending_builds(&db, 1).await.unwrap();
+
+        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
     }
 
     #[tokio::test]
