@@ -8,12 +8,12 @@
 use crate::build_logger::BuildLogger;
 use crate::utils::remove_archive_file::forget_archive_file;
 use anyhow::{anyhow, bail};
-use aurcache_db::prelude::{Dependencies, Files};
+use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    Set, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -153,24 +153,51 @@ pub async fn ingest_pkgs_in(
             if let Some(ref ex) = existing
                 && ex.package_id != pkg_id
             {
-                let existing_owner_depends_on_new_owner = Dependencies::find()
-                    .filter(dependencies::Column::DependentId.eq(ex.package_id))
-                    .filter(dependencies::Column::DependeeId.eq(pkg_id))
-                    .one(&txn)
-                    .await?;
+                // "Another package" has to be a package that still exists. A
+                // row whose owner is gone is a leftover, not a claim, and
+                // refusing it is permanent: the build fails, retries, exhausts
+                // its attempt budget, and the package can never be published
+                // again.
+                //
+                // `files.package_id` is a foreign key now, so this should be
+                // unreachable -- except on a SQLite database opened without
+                // `foreign_keys` on, where the constraint is inert. Kept as the
+                // second line because the cost is one `count` and the failure it
+                // prevents is unrecoverable.
+                // Counted rather than read: all this needs is whether the row
+                // is there, and loading the model would also have to
+                // deserialize columns like `source_data` -- turning a
+                // half-written neighbouring row into a failure to publish
+                // this one.
+                let owner_exists = Packages::find_by_id(ex.package_id).count(&txn).await? > 0;
 
-                if existing_owner_depends_on_new_owner.is_none() {
-                    bail!(
-                        "File '{}' is already produced by another package",
-                        pkg.filename
-                    );
+                if !owner_exists {
+                    logger
+                        .append(format!(
+                            "Claiming file '{}' from package {}, which no longer exists\n",
+                            pkg.filename, ex.package_id
+                        ))
+                        .await;
+                } else {
+                    let existing_owner_depends_on_new_owner = Dependencies::find()
+                        .filter(dependencies::Column::DependentId.eq(ex.package_id))
+                        .filter(dependencies::Column::DependeeId.eq(pkg_id))
+                        .one(&txn)
+                        .await?;
+
+                    if existing_owner_depends_on_new_owner.is_none() {
+                        bail!(
+                            "File '{}' is already produced by another package",
+                            pkg.filename
+                        );
+                    }
+                    logger
+                        .append(format!(
+                            "Transferring file '{}' from package {} (depends on this package)\n",
+                            pkg.filename, ex.package_id
+                        ))
+                        .await;
                 }
-                logger
-                    .append(format!(
-                        "Transferring file '{}' from package {} (depends on this package)\n",
-                        pkg.filename, ex.package_id
-                    ))
-                    .await;
             }
 
             pkg.existing_id = existing.as_ref().map(|e| e.id);

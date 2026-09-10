@@ -107,3 +107,111 @@ async fn ingest_writes_repo_and_files_row_and_parses_version() {
         "exactly one file row expected"
     );
 }
+
+/// A `files` row left behind by a package that no longer exists must not block
+/// the artifact being published again.
+///
+/// This is the failure that took seven lib32 builds down at once: the orphan
+/// collector in `package::update` deleted packages without their `files` rows,
+/// and `files.package_id` had no foreign key to catch it. Every rebuild of the
+/// same package then uploaded fine and was refused at ingest with "already
+/// produced by another package" -- deterministically, so the build's attempt
+/// budget ran out and it failed for good.
+///
+/// `files.package_id` is a foreign key now, so the constraint has to be turned
+/// off to write the row at all. That is not the test cheating: it is the exact
+/// condition this branch covers, a database where the constraint is not being
+/// enforced.
+#[tokio::test]
+async fn ingest_claims_a_file_whose_owner_is_gone() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys = OFF;")
+        .await
+        .unwrap();
+
+    db.execute_unprepared("INSERT INTO packages (id, name) VALUES (2, 'hello');")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO builds (id, pkg_id, platform, status, version) VALUES (1, 2, 'x86_64', 0, '');",
+    )
+    .await
+    .unwrap();
+    // The leftover: owned by package 1, which was deleted without it.
+    db.execute_unprepared(
+        "INSERT INTO files (filename, platform, package_id) \
+         VALUES ('hello-2.12.1-1-x86_64.pkg.tar.zst', 'x86_64', 1);",
+    )
+    .await
+    .unwrap();
+
+    let logger = BuildLogger::new("pkg", 1);
+    let repo_root = tempfile::tempdir().unwrap();
+
+    ingest_pkgs_in(
+        &db,
+        &logger,
+        2,
+        &Platform::X86_64,
+        vec![(
+            "hello-2.12.1-1-x86_64.pkg.tar.zst".to_string(),
+            fake_pkg_zst("hello", "2.12.1-1"),
+        )],
+        repo_root.path(),
+        None,
+    )
+    .await
+    .expect("a row with no surviving owner is a leftover, not a claim");
+
+    // Claimed rather than duplicated: one row, now owned by the package that
+    // actually built the file.
+    let rows = Files::find().all(&db).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].package_id, 2);
+}
+
+/// A live package still owning the filename is a real conflict, and still
+/// refused. The relaxation above turns on the owner being *gone*, nothing else.
+#[tokio::test]
+async fn ingest_still_refuses_a_file_owned_by_a_live_package() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+
+    db.execute_unprepared("INSERT INTO packages (id, name) VALUES (1, 'other'), (2, 'hello');")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO builds (id, pkg_id, platform, status, version) VALUES (1, 2, 'x86_64', 0, '');",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO files (filename, platform, package_id) \
+         VALUES ('hello-2.12.1-1-x86_64.pkg.tar.zst', 'x86_64', 1);",
+    )
+    .await
+    .unwrap();
+
+    let logger = BuildLogger::new("pkg", 1);
+    let repo_root = tempfile::tempdir().unwrap();
+
+    let err = ingest_pkgs_in(
+        &db,
+        &logger,
+        2,
+        &Platform::X86_64,
+        vec![(
+            "hello-2.12.1-1-x86_64.pkg.tar.zst".to_string(),
+            fake_pkg_zst("hello", "2.12.1-1"),
+        )],
+        repo_root.path(),
+        None,
+    )
+    .await
+    .expect_err("a live package owns this filename");
+    assert!(
+        err.to_string().contains("already produced by another"),
+        "{err}"
+    );
+}
