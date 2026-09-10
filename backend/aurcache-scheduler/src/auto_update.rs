@@ -1,6 +1,7 @@
 use crate::sleep_until_next_fire;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::action::Action;
+use aurcache_deps::AurClient;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
@@ -19,6 +20,7 @@ pub fn start_auto_update_job(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
+    client: Arc<AurClient>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -39,7 +41,8 @@ pub fn start_auto_update_job(
 
                     if sleep_until_next_fire(&mut upcoming, "update").await {
                         info!("Executing scheduled job at: {}", Utc::now());
-                        if let Err(e) = package_update_all_outdated(&db, &store, &tx).await {
+                        if let Err(e) = package_update_all_outdated(&db, &client, &store, &tx).await
+                        {
                             warn!("Failed to trigger update of all outdated packages: {e}");
                         }
                     } else {

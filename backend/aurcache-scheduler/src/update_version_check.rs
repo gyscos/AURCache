@@ -24,11 +24,12 @@ pub fn start_update_version_checking(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
+    client: Arc<AurClient>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(&db, &store, &tx).await {
+            if let Err(e) = check_versions(&db, &client, &store, &tx).await {
                 error!("Failed to perform aur version check: {e}");
             }
 
@@ -41,11 +42,11 @@ pub fn start_update_version_checking(
 
 async fn check_versions(
     db: &DatabaseConnection,
+    client: &AurClient,
     store: &SnapshotStore,
     tx: &Sender<Action>,
 ) -> anyhow::Result<()> {
     let packages = Packages::find().all(db).await?;
-    let client = AurClient::new();
     let aur_query_names: Vec<String> = packages
         .iter()
         .filter(|x| x.source_type == SourceType::Aur)
@@ -223,7 +224,7 @@ async fn check_versions(
     let build_now: SettingsEntry<bool> =
         ApplicationSettings::get(Setting::BuildOnNewVersion, None, db).await;
     if build_now.value
-        && let Err(e) = package_update_all_outdated(db, store, tx).await
+        && let Err(e) = package_update_all_outdated(db, client, store, tx).await
     {
         warn!("Failed to queue builds for newly outdated packages: {e}");
     }

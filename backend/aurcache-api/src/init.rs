@@ -9,6 +9,7 @@ use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, oauth_config_from_e
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::downloads::DownloadCounter;
+use aurcache_deps::AurClient;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
@@ -99,6 +100,7 @@ pub fn init_api(
     db: DatabaseConnection,
     tx: Sender<Action>,
     store: Arc<SnapshotStore>,
+    client: Arc<AurClient>,
     downloads: Arc<DownloadCounter>,
     version: ServerVersion,
     ca_dir: CaDirectory,
@@ -203,6 +205,7 @@ pub fn init_api(
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(ActivityLog::new(db))
             .manage(store)
+            .manage(client)
             // Shared with the repository server, so a package's count includes
             // downloads not yet flushed rather than stalling until they are.
             .manage(downloads)

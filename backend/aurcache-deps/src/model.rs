@@ -24,6 +24,17 @@ pub enum Error {
     /// A cached repository database could not be read.
     #[error("malformed repository database")]
     RepoDb(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Nothing has managed to read the official repository databases yet.
+    ///
+    /// Its own variant so callers can say which of the sources is missing.
+    /// Resolution cannot proceed without it -- a name the repositories hold
+    /// would otherwise be sent to the AUR and built -- and the server serves
+    /// while it retries, so this reaches a user as the reason an add failed.
+    #[error(
+        "the official repository databases have not been read yet; \
+         check that a mirror is reachable"
+    )]
+    OfficialReposUnread,
 }
 
 /// Dependency lists extracted from a package's metadata.

@@ -5,10 +5,12 @@ use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::init::init_db;
+use aurcache_deps::AurClient;
 use aurcache_scheduler::auto_update::start_auto_update_job;
 use aurcache_scheduler::download_flush::start_download_flush;
 use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
+use aurcache_scheduler::official_repos::start_official_repo_refresh;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
 use aurcache_utils::snapshot::SnapshotStore;
 use dotenvy::dotenv;
@@ -53,13 +55,27 @@ async fn main() {
     // stores on the same checkout directories with no shared locking.
     let store = Arc::new(SnapshotStore::new());
 
+    // One AUR client for the whole server, for the same reason as the store
+    // above: it owns the cached official repository databases and the names
+    // read from them, and a second instance would fetch the same databases
+    // again and hold a second answer to the same question.
+    //
+    // It starts with nothing read. The refresh job below fills it in and keeps
+    // it current; until the first pass succeeds, dependency resolution says so
+    // rather than reporting an empty repository -- so the API and the UI come
+    // up either way and can report why an add failed.
+    let client = Arc::new(AurClient::new());
+    let official_repo_handle = start_official_repo_refresh(client.clone());
+
     // Before anything else can resolve a source: a prune cannot distinguish a
     // clone in flight from a stranded one.
     startup::prune_source_checkouts(&db, &store).await;
 
     let build_queue_handle = init_build_queue(db.clone(), tx.clone());
-    let version_check_handle = start_update_version_checking(db.clone(), tx.clone(), store.clone());
-    let auto_update_handle = start_auto_update_job(db.clone(), tx.clone(), store.clone());
+    let version_check_handle =
+        start_update_version_checking(db.clone(), tx.clone(), store.clone(), client.clone());
+    let auto_update_handle =
+        start_auto_update_job(db.clone(), tx.clone(), store.clone(), client.clone());
 
     let mirrorlist_override =
         env::var("MIRRORLIST_SERVERS_X86_64").is_ok_and(|s| !s.trim().is_empty());
@@ -82,6 +98,7 @@ async fn main() {
         db.clone(),
         tx,
         store.clone(),
+        client.clone(),
         downloads.clone(),
         ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
         CaDirectory(ca_dir.clone()),
@@ -101,6 +118,9 @@ async fn main() {
         }
         _ = lease_reaper_handle => {
             warn!("Lease reaper handle exited");
+        }
+        _ = official_repo_handle => {
+            warn!("Official repository refresh handle exited");
         }
         _ = download_flush_handle => {
             warn!("Download flush handle exited");

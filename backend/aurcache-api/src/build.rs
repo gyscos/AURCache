@@ -1,3 +1,4 @@
+use aurcache_deps::AurClient;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, post};
@@ -370,6 +371,7 @@ pub async fn retry_build(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     pkgbase: &str,
     number: i32,
     _a: Authenticated,
@@ -392,7 +394,7 @@ pub async fn retry_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let platform_results = package_update(store, db, package, true, tx)
+    let platform_results = package_update(client, store, db, package, true, tx)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 

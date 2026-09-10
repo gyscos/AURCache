@@ -22,7 +22,7 @@ use wiremock::{
 /// cache used to be indistinguishable from "not found there", which sent
 /// ordinary `core` names off to be built from the AUR — so a test that wants
 /// everything to fall through to the AUR has to say so explicitly.
-fn client_with_empty_official_cache(rpc_url: String) -> (tempfile::TempDir, AurClient) {
+async fn client_with_empty_official_cache(rpc_url: String) -> (tempfile::TempDir, AurClient) {
     let tmp = tempfile::tempdir().unwrap();
     let cache_dir = tmp.path().join("official-cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -35,6 +35,9 @@ fn client_with_empty_official_cache(rpc_url: String) -> (tempfile::TempDir, AurC
 
     let client =
         AurClient::with_urls_and_paths(rpc_url, tmp.path().join("no-such-mirrorlist"), cache_dir);
+    // Present and empty: "the official repositories hold nothing", as opposed
+    // to "they could not be read", which resolution refuses to answer.
+    client.official.refresh().await.unwrap();
     (tmp, client)
 }
 
@@ -115,7 +118,7 @@ async fn backfill_creates_dependency_links() {
     .unwrap();
 
     let (_cache, client) =
-        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri())).await;
     backfill_dependencies(&client, &db).await.unwrap();
 
     let child = packages::Entity::find()
@@ -260,7 +263,7 @@ async fn backfill_multi_dep_package() {
     .unwrap();
 
     let (_cache, client) =
-        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri())).await;
     backfill_dependencies(&client, &db).await.unwrap();
 
     // libaegis inserted as placeholder dep
@@ -416,7 +419,7 @@ async fn backfill_resolves_provider_dependencies() {
     .unwrap();
 
     let (_cache, client) =
-        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri())).await;
     backfill_dependencies(&client, &db).await.unwrap();
 
     let parent = packages::Entity::find()
@@ -562,7 +565,7 @@ async fn backfill_prefers_existing_local_provider() {
     .unwrap();
 
     let (_cache, client) =
-        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri()));
+        client_with_empty_official_cache(format!("{}/rpc/v5", mock_server.uri())).await;
     backfill_dependencies(&client, &db).await.unwrap();
 
     let parent = packages::Entity::find()

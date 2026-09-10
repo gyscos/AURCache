@@ -9,6 +9,7 @@ use aurcache_common::api::dump::{
 };
 use aurcache_db::action::Action;
 use aurcache_db::helpers::operations;
+use aurcache_deps::AurClient;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::data::Data;
 use rocket::http::{Header, Status};
@@ -142,6 +143,7 @@ mod tests {
 pub async fn restore(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     tx: &State<Sender<Action>>,
     ca_dir: &State<CaDirectory>,
     dry_run: Option<bool>,
@@ -209,6 +211,7 @@ pub async fn restore(
 
     let db_task = db.inner().clone();
     let store_task = Arc::clone(store.inner());
+    let client_task = Arc::clone(client.inner());
     let tx_task = tx.inner().clone();
     let ca_dir_task = ca_dir.inner().clone();
 
@@ -217,9 +220,11 @@ pub async fn restore(
         let worker = {
             let db = db_task.clone();
             let store = Arc::clone(&store_task);
+            let client = Arc::clone(&client_task);
             tokio::spawn(async move {
                 aurcache_utils::restore::apply(
                     &db,
+                    &client,
                     &store,
                     &tx_task,
                     &ca_dir_task.0,

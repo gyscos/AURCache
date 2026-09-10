@@ -66,6 +66,15 @@ async fn setup_env() -> TestEnv {
         mirrorlist_path,
         official_cache_dir.clone(),
     );
+    // What the server does at startup. The seeded cache is fresh, so this
+    // reads it rather than fetching: "the official repositories hold nothing"
+    // as opposed to "they could not be read", which resolution refuses to
+    // answer.
+    client
+        .official
+        .refresh()
+        .await
+        .expect("a seeded cache needs no mirror");
 
     let db = Database::connect("sqlite::memory:")
         .await
@@ -670,8 +679,12 @@ async fn scenario_f_system_deps_only() {
         .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
+    // Removed and re-served, then read back: the official repositories are
+    // refreshed on a schedule now, so a test that changes what they hold says
+    // when that lands rather than having the next resolution notice.
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
     mock_official_repo_db(&env.server, "core", vec![("glibc", "2.42-1", vec![])]).await;
+    env.client.official.refresh().await.unwrap();
 
     let result = add_pkg_via_rpc(&env, "my-pkg").await;
     assert!(
@@ -866,6 +879,9 @@ async fn scenario_i_official_provider_prevents_aur_dependency_addition() {
         .respond_with(ResponseTemplate::new(200).set_body_json(multiinfo_json(&[])))
         .mount(&env.server)
         .await;
+    // Removed and re-served, then read back: the official repositories are
+    // refreshed on a schedule now, so a test that changes what they hold says
+    // when that lands rather than having the next resolution notice.
     fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
     mock_official_repo_db(
         &env.server,
@@ -873,6 +889,7 @@ async fn scenario_i_official_provider_prevents_aur_dependency_addition() {
         vec![("libglvnd", "1.7.0-1", vec!["virtual-dep"])],
     )
     .await;
+    env.client.official.refresh().await.unwrap();
 
     let result = add_pkg_via_rpc(&env, "parent-pkg").await;
     assert!(result.is_ok(), "{result:?}");
@@ -1025,8 +1042,12 @@ async fn scenario_l_settled_states_still_link_as_dependencies() {
 
         // Its artifact is still in the repository, which is what used to
         // answer for it.
+        // Removed and re-served, then read back: the official repositories are
+        // refreshed on a schedule now, so a test that changes what they hold says
+        // when that lands rather than having the next resolution notice.
         fs::remove_file(env.official_cache_dir.join("core.db.tar.gz")).unwrap();
         mock_official_repo_db(&env.server, "core", vec![]).await;
+        env.client.official.refresh().await.unwrap();
         write_local_repo_db(&env, &[("local-dep", "1.0.0-1", vec![])]);
 
         mock_rpc_info(

@@ -139,6 +139,7 @@ pub async fn packages_add_endpoint(
     input: Json<AddPackages>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<status::Accepted<Json<BulkAddAccepted>>, ApiError> {
@@ -159,6 +160,7 @@ pub async fn packages_add_endpoint(
     let db_task = db.inner().clone();
     let tx_task = tx.inner().clone();
     let store_task = Arc::clone(store.inner());
+    let client_task = Arc::clone(client.inner());
     let al_task = al.inner().clone();
     let username = a.username.clone();
 
@@ -167,8 +169,10 @@ pub async fn packages_add_endpoint(
         let worker = {
             let db = db_task.clone();
             let store = Arc::clone(&store_task);
+            let client = Arc::clone(&client_task);
             tokio::spawn(async move {
                 aurcache_utils::package::bulk_add::bulk_add(
+                    &client,
                     &store,
                     &db,
                     &tx_task,
@@ -323,6 +327,7 @@ pub async fn package_add_endpoint(
     input: Json<AddPackage>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
@@ -330,6 +335,7 @@ pub async fn package_add_endpoint(
     let platforms = parse_platforms(input.platforms)?;
 
     let new_pkg_name = package_add(
+        client,
         store,
         db,
         tx,
@@ -370,6 +376,7 @@ pub async fn package_update_entity_endpoint(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     input: Json<PackagePatch>,
     pkgbase: &str,
     _a: Authenticated,
@@ -436,8 +443,7 @@ pub async fn package_update_entity_endpoint(
     // whole graph from source, which both adds newly-required dependencies and
     // drops ones no longer needed.
     if patch_changed || platforms_changed {
-        let client = AurClient::new();
-        package_resync_dependencies(&client, store, db, tx, &updated)
+        package_resync_dependencies(client, store, db, tx, &updated)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     }
@@ -519,6 +525,7 @@ pub async fn package_source_file_update(
     db: &State<DatabaseConnection>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     pkgbase: &str,
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
@@ -527,8 +534,6 @@ pub async fn package_source_file_update(
     let input = input.into_inner();
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
-
-    let client = AurClient::new();
 
     // Diff against the pristine (unpatched) file, not the currently effective
     // one, so re-saving the same edit twice is idempotent.
@@ -574,7 +579,7 @@ pub async fn package_source_file_update(
     // than waiting for the next explicit "update" trigger.
     let mut resynced_pkg = pkg;
     resynced_pkg.patch = new_patch;
-    package_resync_dependencies(&client, store, db, tx, &resynced_pkg)
+    package_resync_dependencies(client, store, db, tx, &resynced_pkg)
         .await
         .map_err(|e| {
             err(
@@ -639,12 +644,14 @@ pub async fn package_source_preview_file(
     )
 )]
 #[post("/package/<pkgbase>/update", data = "<input>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn package_update_endpoint(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     input: Json<UpdatePackage>,
     tx: &State<Sender<Action>>,
     store: &State<Arc<SnapshotStore>>,
+    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<Json<Vec<i32>>, ApiError> {
@@ -654,7 +661,7 @@ pub async fn package_update_endpoint(
     let package_name = pkg_model.name.clone();
     let forced = input.force;
 
-    let pkg_update = package_update(store, db, pkg_model, forced, tx)
+    let pkg_update = package_update(client, store, db, pkg_model, forced, tx)
         .await
         .map(|results| {
             Json(

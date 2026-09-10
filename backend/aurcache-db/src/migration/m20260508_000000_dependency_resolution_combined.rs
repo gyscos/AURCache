@@ -405,8 +405,22 @@ impl MigrationTrait for Migration {
         create_pending_build_unique_index(manager).await?;
 
         tracing::info!("Backfilling dependency entries for existing AUR packages...");
+        // The one place that builds its own client: this runs inside
+        // `init_db`, before the server has one, and a `sea-orm` migration is
+        // handed nothing but a connection. It is never concurrent with the
+        // server's, which does not exist yet.
+        //
+        // Reading the official repositories is part of resolving anything, so
+        // it is done here rather than left to fail per package -- and if it
+        // cannot be done, the backfill is skipped whole rather than resolving
+        // every `core` name against the AUR.
         let client = AurClient::new();
-        if let Err(e) = backfill_dependencies(&client, db).await {
+        if let Err(e) = client.official.refresh().await {
+            tracing::error!(
+                "Dependency backfill skipped: the official repositories could not be read ({e}). \
+                 Resync a package's dependencies once a mirror is reachable."
+            );
+        } else if let Err(e) = backfill_dependencies(&client, db).await {
             tracing::error!("Dependency backfill failed (non-fatal): {e}");
         }
 

@@ -16,6 +16,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "2"
+tokio = { workspace = true, features = ["sync"] }
 url = "2"
 
 [dev-dependencies]

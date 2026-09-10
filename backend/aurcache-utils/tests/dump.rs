@@ -52,6 +52,34 @@ async fn package(
 }
 
 /// The headline: authored state in, derived state out.
+/// An AUR client whose official repositories are read and hold nothing.
+///
+/// Restore resolves sources, and resolution asks the repositories first, so a
+/// client that has never read them refuses to answer. Present-and-empty is how
+/// a test says "the repositories hold nothing" -- absent would mean "could not
+/// ask", which is a different answer and deliberately fatal.
+async fn client_with_empty_official_repos() -> (aurcache_deps::AurClient, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    for repo in ["core", "extra", "multilib"] {
+        let mut archive = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut archive, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            builder.finish().unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        std::fs::write(dir.path().join(format!("{repo}.db.tar.gz")), &archive).unwrap();
+    }
+    let client = aurcache_deps::AurClient::with_urls_and_paths(
+        "http://unused.invalid/rpc/v5",
+        dir.path().join("no-mirrorlist"),
+        dir.path().to_path_buf(),
+    );
+    client.official.refresh().await.unwrap();
+    (client, dir)
+}
+
 #[tokio::test]
 async fn a_dump_carries_configuration_and_not_history() {
     let db = db().await;
@@ -564,8 +592,10 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &target,
+        &client,
         &store,
         &tx,
         &tempfile::tempdir().unwrap().keep(),
@@ -848,8 +878,10 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &target,
+        &client,
         &store,
         &tx,
         target_ca.path(),
@@ -907,8 +939,10 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &target,
+        &client,
         &store,
         &tx,
         target_ca.path(),

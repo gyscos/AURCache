@@ -82,7 +82,9 @@ pub(crate) async fn resolve_pkgbases(
 /// One package failing does not stop the rest either: a restore of a thousand
 /// packages should not be undone by one whose PKGBUILD no longer parses, and
 /// the entry says which it was.
+#[allow(clippy::too_many_arguments)]
 pub async fn bulk_add(
+    client: &aurcache_deps::AurClient,
     store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
@@ -91,9 +93,8 @@ pub async fn bulk_add(
     sources: Vec<SourceData>,
     progress: UnboundedSender<BulkAddEntry>,
 ) {
-    let client = aurcache_deps::AurClient::new();
     let context = build_add_context(platforms, build_flags);
-    let bases = resolve_pkgbases(&client, &sources).await;
+    let bases = resolve_pkgbases(client, &sources).await;
 
     info!(
         "bulk add: {} sources, {} pkgbases resolved in batch",
@@ -104,7 +105,7 @@ pub async fn bulk_add(
     for source in sources {
         let name = source_label(&source);
         let resolved = apply_resolved_base(source, &bases);
-        let outcome = add_one(&client, store, db, tx, &context, resolved).await;
+        let outcome = add_one(client, store, db, tx, &context, resolved).await;
         // Ignore a closed channel: the observer left, the work has not.
         let _ = progress.send(BulkAddEntry { name, outcome });
     }

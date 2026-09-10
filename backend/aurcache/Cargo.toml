@@ -16,6 +16,7 @@ pacman-repo-utils = {path = "../pacman-repo-utils"}
 pacman-mirrors = {path = "../pacman-mirrors"}
 aurcache-builder = {path = "../aurcache-builder"}
 aurcache-db = {path = "../aurcache-db"}
+aurcache-deps = {path = "../aurcache-deps"}
 aurcache-api = { path = "../aurcache-api" }
 aurcache-ca = { path = "../aurcache-ca" }
 aurcache-scheduler = {path = "../aurcache-scheduler"}

@@ -316,8 +316,10 @@ async fn package_row(
 /// package names, so a dependency naming one of those will not find it; the
 /// entry says so, because it is the difference between a restore that worked
 /// and one that looks like it did.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     db: &DatabaseConnection,
+    client: &aurcache_deps::AurClient,
     store: &SnapshotStore,
     tx: &Sender<Action>,
     ca_dir: &std::path::Path,
@@ -381,7 +383,6 @@ pub async fn apply(
     }
 
     // PASS 3: the graph, and the builds it makes possible.
-    let client = aurcache_deps::AurClient::new();
     for pkgbase in &applied.touched {
         // Its source could not be read, so its dependency list cannot be
         // either. Trying anyway would fail identically and report it twice.
@@ -392,7 +393,7 @@ pub async fn apply(
             continue;
         };
         if let Err(e) =
-            crate::package::update::package_resync_dependencies(&client, store, db, tx, &row).await
+            crate::package::update::package_resync_dependencies(client, store, db, tx, &row).await
         {
             warn!("restore: could not resolve dependencies for {pkgbase}: {e}");
             let _ = progress.send(RestoreEntry {

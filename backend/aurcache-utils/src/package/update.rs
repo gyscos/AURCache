@@ -65,6 +65,7 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 /// Returns the build IDs enqueued across all updated packages.
 pub async fn package_update_all_outdated(
     db: &DatabaseConnection,
+    client: &AurClient,
     store: &SnapshotStore,
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<i32>> {
@@ -73,13 +74,12 @@ pub async fn package_update_all_outdated(
         .all(db)
         .await?;
     let activity_log = ActivityLog::new(db.clone());
-    let client = AurClient::new();
 
     let mut ids_total = vec![];
     for pkg in pkg_models {
         if pkg.status == BuildStates::SUCCESSFUL_BUILD {
             let package_name = pkg.name.clone();
-            let results = package_update_with_client(&client, store, db, pkg, false, tx).await?;
+            let results = package_update_with_client(client, store, db, pkg, false, tx).await?;
             activity_log
                 .add(
                     PackageUpdateActivity {
@@ -127,14 +127,14 @@ pub async fn package_update_all_outdated(
 ///   that was enqueued/promoted or left waiting on dependencies.
 /// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
 pub async fn package_update(
+    client: &AurClient,
     store: &SnapshotStore,
     db: &DatabaseConnection,
     pkg_model: packages::Model,
     force: bool,
     tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
-    let client = AurClient::new();
-    package_update_with_client(&client, store, db, pkg_model, force, tx).await
+    package_update_with_client(client, store, db, pkg_model, force, tx).await
 }
 
 /// Update a single package using a caller-provided AUR client.
@@ -907,7 +907,7 @@ mod tests {
     /// what stops a mirror outage from sending `git` to the AUR. A test that
     /// wants the repositories to hold nothing therefore has to say so, by
     /// handing over a cache that is present, fresh and empty.
-    fn client_with_empty_official_repos(rpc_url: String) -> (AurClient, tempfile::TempDir) {
+    async fn client_with_empty_official_repos(rpc_url: String) -> (AurClient, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         for repo in ["core", "extra", "multilib"] {
             let mut archive = Vec::new();
@@ -927,6 +927,10 @@ mod tests {
             dir.path().join("no-mirrorlist"),
             dir.path().to_path_buf(),
         );
+        // Present and empty: "the official repositories hold nothing", as
+        // opposed to "they could not be read", which resolution refuses to
+        // answer.
+        client.official.refresh().await.unwrap();
         (client, dir)
     }
 
@@ -934,7 +938,7 @@ mod tests {
     async fn package_update_queues_dependency_builds_before_parent_when_constraints_tighten() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
@@ -1083,7 +1087,7 @@ mod tests {
     async fn package_update_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
@@ -1302,7 +1306,7 @@ mod tests {
     async fn force_rebuild_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
@@ -1513,7 +1517,7 @@ mod tests {
     async fn git_update_refreshes_dependency_rows() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
@@ -1679,7 +1683,7 @@ mod tests {
     async fn force_rebuild_after_failure_queues_new_build() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<Action>(100);
@@ -1769,7 +1773,7 @@ mod tests {
     async fn update_removes_orphaned_dependency_package() {
         let server = MockServer::start().await;
         let (client, _official) =
-            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri()));
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);

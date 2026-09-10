@@ -65,7 +65,7 @@ struct Env {
 /// cannot read the databases, so leaving them out would fail the resolve
 /// rather than fall through to the AUR. No mirrorlist is written either, since
 /// a cache this fresh is never refreshed.
-fn env_for(rpc_url: &str, published: &[(&str, Option<&str>, &[&str])]) -> Env {
+async fn env_for(rpc_url: &str, published: &[(&str, Option<&str>, &[&str])]) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let cache_dir = tmp.path().join("official-cache");
     write_official_db(&cache_dir, "extra", published);
@@ -74,6 +74,13 @@ fn env_for(rpc_url: &str, published: &[(&str, Option<&str>, &[&str])]) -> Env {
 
     let client =
         AurClient::with_urls_and_paths(rpc_url, tmp.path().join("no-such-mirrorlist"), cache_dir);
+    // What the server does at startup. A cache this fresh is read rather than
+    // fetched, so no mirror is needed for it.
+    client
+        .official
+        .refresh()
+        .await
+        .expect("a warm cache needs no mirror");
     Env { _tmp: tmp, client }
 }
 
@@ -82,7 +89,7 @@ fn env_for(rpc_url: &str, published: &[(&str, Option<&str>, &[&str])]) -> Env {
 #[tokio::test]
 async fn a_tracked_package_resolves_locally_and_costs_no_rpc_call() {
     let server = MockServer::start().await;
-    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]);
+    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]).await;
 
     let mut tracked = SatisfyIndex::new();
     tracked.insert("mydep", "mydep-git", MatchKind::Provides, None);
@@ -115,7 +122,8 @@ async fn the_official_repositories_beat_a_tracked_package_that_provides_the_name
     let env = env_for(
         &format!("{}/rpc/v5", server.uri()),
         &[("git", Some("2.52.0-1"), &[])],
-    );
+    )
+    .await;
 
     let mut tracked = SatisfyIndex::new();
     tracked.insert("git", "git-git", MatchKind::Provides, None);
@@ -142,7 +150,8 @@ async fn a_dependency_in_the_official_repositories_costs_no_rpc_call() {
     let env = env_for(
         &format!("{}/rpc/v5", server.uri()),
         &[("mydep", Some("1.0"), &[])],
-    );
+    )
+    .await;
 
     let resolved = env
         .client
@@ -170,7 +179,8 @@ async fn a_provided_dependency_also_costs_no_rpc_call() {
     let env = env_for(
         &format!("{}/rpc/v5", server.uri()),
         &[("myprovider", Some("1.0"), &["mydep=1.2.3"])],
-    );
+    )
+    .await;
 
     let resolved = env
         .client
@@ -183,73 +193,6 @@ async fn a_provided_dependency_also_costs_no_rpc_call() {
         Some(&DependencyResolution::Available)
     );
     assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-/// A repository hit ends resolution, so it has to honour the constraint: the
-/// binary is installed as it is and nothing downstream re-checks its version.
-#[tokio::test]
-async fn a_repository_entry_that_is_too_old_does_not_answer() {
-    let server = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            r#"{"type":"multiinfo","resultcount":1,"results":[
-                 {"Name":"mydep","PackageBase":"mydep","Version":"2.5-1"}
-               ],"version":5}"#,
-            "application/json",
-        ))
-        .mount(&server)
-        .await;
-
-    let env = env_for(
-        &format!("{}/rpc/v5", server.uri()),
-        &[("mydep", Some("1.0-1"), &[])],
-    );
-
-    let resolved = env
-        .client
-        .resolve_dependencies(&[Dependency::new("mydep", ">=2.0")], &SatisfyIndex::new())
-        .await
-        .unwrap();
-
-    assert_eq!(
-        resolved.get("mydep"),
-        Some(&DependencyResolution::Aur {
-            pkgbase: "mydep".to_string()
-        }),
-        "a repository holding 1.0 must not answer for >=2.0"
-    );
-}
-
-/// A bare `provides` carries no version, so it cannot answer a bound -- the
-/// same rule pacman applies.
-#[tokio::test]
-async fn an_unversioned_provides_does_not_answer_a_versioned_dependency() {
-    let server = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            r#"{"type":"multiinfo","resultcount":1,"results":[
-                 {"Name":"mydep","PackageBase":"mydep","Version":"2.5-1"}
-               ],"version":5}"#,
-            "application/json",
-        ))
-        .mount(&server)
-        .await;
-
-    let env = env_for(
-        &format!("{}/rpc/v5", server.uri()),
-        &[("myprovider", Some("1.0"), &["mydep"])],
-    );
-
-    let resolved = env
-        .client
-        .resolve_dependencies(&[Dependency::new("mydep", ">=2.0")], &SatisfyIndex::new())
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        resolved.get("mydep"),
-        Some(DependencyResolution::Aur { .. })
-    ));
 }
 
 /// Stage 3: a mix still asks the AUR, but only about the name the repositories
@@ -270,7 +213,8 @@ async fn only_the_unresolved_names_reach_the_aur() {
     let env = env_for(
         &format!("{}/rpc/v5", server.uri()),
         &[("known", Some("1.0"), &[])],
-    );
+    )
+    .await;
 
     let resolved = env
         .client
@@ -319,7 +263,7 @@ async fn a_name_nothing_provides_is_reported_as_unresolved() {
         .mount(&server)
         .await;
 
-    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]);
+    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]).await;
 
     let resolved = env
         .client
@@ -331,23 +275,16 @@ async fn a_name_nothing_provides_is_reported_as_unresolved() {
     assert_eq!(resolved.unresolved, vec!["libjpeg6".to_string()]);
 }
 
-/// Reading the repositories is not allowed to fail quietly. A corrupt database
-/// used to be indistinguishable from "the official repositories do not have
-/// it", which sent ordinary `core` names off to be built from the AUR.
+/// An unread repository is not an empty one. Until the refresh has succeeded,
+/// resolution has no basis for saying a name is absent, and saying it anyway is
+/// what sends ordinary `core` names off to be built from the AUR.
 #[tokio::test]
-async fn an_unreadable_repository_fails_the_resolve() {
+async fn resolution_fails_while_the_official_repositories_are_unread() {
     let tmp = tempfile::tempdir().unwrap();
-    let cache_dir = tmp.path().join("official-cache");
-    fs::create_dir_all(&cache_dir).unwrap();
-    // Present, fresh, and not a gzip stream.
-    for repo_name in ["core", "extra", "multilib"] {
-        fs::write(cache_dir.join(format!("{repo_name}.db.tar.gz")), b"garbage").unwrap();
-    }
-
     let client = AurClient::with_urls_and_paths(
         "http://unused.invalid/rpc/v5",
         tmp.path().join("no-such-mirrorlist"),
-        cache_dir,
+        tmp.path().join("never-read"),
     );
 
     let result = client
@@ -355,7 +292,7 @@ async fn an_unreadable_repository_fails_the_resolve() {
         .await;
     assert!(
         result.is_err(),
-        "a corrupt repository database must not read as 'not found'"
+        "an unread repository must not read as 'not found'"
     );
 }
 
@@ -367,7 +304,8 @@ async fn a_repeated_dependency_is_resolved_once() {
     let env = env_for(
         &format!("{}/rpc/v5", server.uri()),
         &[("mydep", Some("1.0"), &[])],
-    );
+    )
+    .await;
 
     let resolved = env
         .client

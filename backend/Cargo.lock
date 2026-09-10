@@ -616,6 +616,7 @@ dependencies = [
  "aurcache-ca",
  "aurcache-common",
  "aurcache-db",
+ "aurcache-deps",
  "aurcache-scheduler",
  "aurcache-utils",
  "dotenvy",

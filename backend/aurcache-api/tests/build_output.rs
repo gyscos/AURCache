@@ -44,6 +44,9 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
         .manage(Arc::new(DownloadCounter::new()))
         .manage(ActivityLog::new(db.clone()))
         .manage(broadcast::channel::<Action>(16).0)
+        // Routes that resolve dependencies take it as state; these tests never
+        // reach one, but Rocket refuses to launch with an unmanaged type.
+        .manage(Arc::new(aurcache_deps::AurClient::new()))
         .manage(Arc::new(SnapshotStore::with_checkout_root(
             checkouts.path().to_path_buf(),
         )))

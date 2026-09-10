@@ -3,8 +3,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use backon::{FibonacciBuilder, Retryable};
+
 use reqwest::Client;
 use url::Url;
+
+/// How an outbound request rides out a blip: three attempts, Fibonacci from
+/// 500 ms. Defined once so the AUR and the mirrors cannot drift apart.
+pub(crate) fn retry_policy() -> FibonacciBuilder {
+    FibonacciBuilder::default()
+        .with_min_delay(Duration::from_millis(500))
+        .with_max_times(3)
+}
 
 /// Ceiling for a generated RPC URL, under the server's 8 KiB request-line
 /// limit with room for the scheme, host and path already in the base.
@@ -14,7 +23,9 @@ use crate::deps::deps_from_packages;
 use crate::model::{
     Dependency, DependencyResolution, Error, Package, PackageResponse, PkgDeps, Resolutions,
 };
-use crate::repo::{default_official_mirrorlist_path, default_official_repo_cache_dir};
+use crate::repo::{
+    OfficialRepos, default_official_mirrorlist_path, default_official_repo_cache_dir,
+};
 use crate::satisfy::SatisfyIndex;
 
 /// Client for the AUR RPC and Arch Linux official package search APIs.
@@ -22,12 +33,15 @@ use crate::satisfy::SatisfyIndex;
 /// Handles dependency resolution against AUR packages, official Arch
 /// repositories (via a cached local copy of the repo DBs), and packages
 /// already present in the local AURCache repository.
-#[derive(Debug, Clone)]
+/// Neither `Clone` nor `Copy`: one instance per server, shared as an `Arc`.
+/// [`OfficialRepos`] owns downloads and the names read from them, and two of
+/// those on one cache directory would fetch the same databases twice and hold
+/// two answers to the same question.
+#[derive(Debug)]
 pub struct AurClient {
     pub(crate) http: Client,
     pub(crate) rpc_url: String,
-    pub(crate) official_mirrorlist_path: PathBuf,
-    pub(crate) official_repo_cache_dir: PathBuf,
+    pub official: OfficialRepos,
 }
 
 impl Default for AurClient {
@@ -109,12 +123,11 @@ impl AurClient {
     pub fn new() -> Self {
         let rpc_url = std::env::var("AUR_RPC_URL")
             .unwrap_or_else(|_| "https://aur.archlinux.org/rpc/v5".to_string());
-        Self {
-            http: Client::new(),
-            official_mirrorlist_path: default_official_mirrorlist_path(),
-            official_repo_cache_dir: default_official_repo_cache_dir(),
+        Self::with_urls_and_paths(
             rpc_url,
-        }
+            default_official_mirrorlist_path(),
+            default_official_repo_cache_dir(),
+        )
     }
 
     /// Construct a client with an explicit AUR RPC URL and default filesystem paths.
@@ -132,11 +145,18 @@ impl AurClient {
         official_mirrorlist_path: impl Into<PathBuf>,
         official_repo_cache_dir: impl Into<PathBuf>,
     ) -> Self {
+        // One `reqwest::Client` for the AUR and the mirrors alike: it is a
+        // handle to a connection pool, so cloning shares the pool rather than
+        // opening a second one.
+        let http = Client::new();
         Self {
-            http: Client::new(),
+            official: OfficialRepos::new(
+                http.clone(),
+                official_mirrorlist_path.into(),
+                official_repo_cache_dir.into(),
+            ),
+            http,
             rpc_url: aur_url.into(),
-            official_mirrorlist_path: official_mirrorlist_path.into(),
-            official_repo_cache_dir: official_repo_cache_dir.into(),
         }
     }
 
@@ -360,21 +380,10 @@ impl AurClient {
             }
         }
 
-        // Column 1: what the official repositories publish. From disk, and
-        // over the network when the cached databases have aged out.
-        //
-        // Not gated on anything, because nothing outranks it -- which does
-        // mean a resolution cannot proceed while the official databases are
-        // unreadable. That is deliberate: answering "not in the official
-        // repositories" when the truth is "could not ask" is what sent
-        // ordinary `core`/`extra` names to the AUR and had AURCache build
-        // `git-git` for `git`.
-        let all: HashSet<&str> = evidence.iter().map(|(dep, _)| dep.name).collect();
-        let official = self.official_repo_index(&all).await?;
+        // Column 1: what the official repositories publish. From memory --
+        // and an error, rather than a "no", while they have never been read.
         for (dep, found) in &mut evidence {
-            found.official = official
-                .best_match(dep.name, |candidate| candidate.satisfies(dep.constraint))
-                .is_some();
+            found.official = self.official.holds(dep.name).await?;
         }
 
         // Column 2: what AURCache already tracks. In memory; costs nothing.
@@ -456,7 +465,7 @@ impl AurClient {
         Ok(packages)
     }
 
-    /// Perform an HTTP GET with the shared Fibonacci retry policy, returning the
+    /// Perform an HTTP GET with the shared retry policy, returning the
     /// response only if it has a success status.
     pub(crate) async fn retry_get<U: reqwest::IntoUrl + Clone>(
         &self,
@@ -469,11 +478,7 @@ impl AurClient {
             async move { http.get(url).send().await }
         };
         fetch
-            .retry(
-                FibonacciBuilder::default()
-                    .with_min_delay(Duration::from_millis(500))
-                    .with_max_times(3),
-            )
+            .retry(retry_policy())
             .await
             .map_err(Error::Http)?
             .error_for_status()

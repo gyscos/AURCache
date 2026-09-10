@@ -315,6 +315,7 @@ pub async fn package_add_with_client(
 // source, patches); bundling them into a struct would only move the same list.
 #[allow(clippy::too_many_arguments)]
 pub async fn package_add(
+    client: &aurcache_deps::AurClient,
     store: &SnapshotStore,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
@@ -323,9 +324,8 @@ pub async fn package_add(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
-    let client = aurcache_deps::AurClient::new();
     package_add_with_client(
-        &client,
+        client,
         store,
         db,
         tx,
