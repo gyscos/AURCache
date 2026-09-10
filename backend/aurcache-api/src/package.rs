@@ -1261,8 +1261,28 @@ mod file_tests {
     use aurcache_db::files;
     use aurcache_db::migration::Migrator;
     use pacman_mirrors::platforms::Platform;
-    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, Set};
     use sea_orm_migration::MigratorTrait;
+
+    /// A migrated database with the packages these tests hang files off.
+    ///
+    /// The packages have to exist: `files.package_id` references them, and
+    /// SQLite enforces that here because sqlx opens connections with
+    /// `foreign_keys` on.
+    async fn db_with_packages(ids: &[i32]) -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        for id in ids {
+            db.execute_unprepared(&format!(
+                "INSERT INTO packages \
+                 (id, name, status, out_of_date, build_flags, platforms, source_type, source_data, directly_requested) \
+                 VALUES ({id}, 'p{id}', 0, 0, '', 'x86_64', 'aur', '{{\"type\":\"aur\",\"name\":\"p{id}\"}}', 1)"
+            ))
+            .await
+            .unwrap();
+        }
+        db
+    }
 
     async fn file(db: &DatabaseConnection, name: &str, pkg_id: i32, size: Option<i64>) {
         files::ActiveModel {
@@ -1281,8 +1301,7 @@ mod file_tests {
     /// scoped to the package that owns them.
     #[tokio::test]
     async fn lists_only_this_package_s_artifacts() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
+        let db = db_with_packages(&[1, 2]).await;
 
         file(&db, "hello-1.0-1-x86_64.pkg.tar.zst", 1, Some(1000)).await;
         file(&db, "hello-docs-1.0-1-x86_64.pkg.tar.zst", 1, Some(24)).await;
@@ -1301,8 +1320,7 @@ mod file_tests {
     /// between two loads of the same page.
     #[tokio::test]
     async fn artifacts_come_back_in_a_stable_order() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
+        let db = db_with_packages(&[1]).await;
 
         file(&db, "zzz-1.0-1-x86_64.pkg.tar.zst", 1, Some(1)).await;
         file(&db, "aaa-1.0-1-x86_64.pkg.tar.zst", 1, Some(2)).await;
@@ -1385,8 +1403,7 @@ mod file_tests {
     /// to the response rather than being flattened to a zero-byte file.
     #[tokio::test]
     async fn an_unrecorded_size_stays_unknown() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
+        let db = db_with_packages(&[1]).await;
 
         file(&db, "hello-1.0-1-x86_64.pkg.tar.zst", 1, None).await;
 

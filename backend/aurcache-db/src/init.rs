@@ -27,6 +27,7 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
                 .sqlx_logging_level(LevelFilter::Trace);
             let db = Database::connect(conn_opts).await?;
             db.execute_unprepared("
+                PRAGMA foreign_keys = ON;           -- SQLite ignores every FK in the schema without this
                 PRAGMA journal_mode = WAL;          -- read/write concurrency; persistent on the db file
                 PRAGMA synchronous = NORMAL;        -- fsync at WAL checkpoint, not every write
                 PRAGMA busy_timeout = 5000;         -- wait up to 5s for the write lock before SQLITE_BUSY
