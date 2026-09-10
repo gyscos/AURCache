@@ -98,9 +98,13 @@ pub async fn bulk_add(
     for source in sources {
         let name = source_label(&source);
         let resolved = apply_resolved_base(source, &bases);
-        let outcome = add_one(services, &context, resolved).await;
+        let (outcome, pkgbase) = add_one(services, &context, resolved).await;
         // Ignore a closed channel: the observer left, the work has not.
-        let _ = progress.send(BulkAddEntry { name, outcome });
+        let _ = progress.send(BulkAddEntry {
+            name,
+            pkgbase,
+            outcome,
+        });
     }
 }
 
@@ -117,7 +121,16 @@ fn apply_resolved_base(source: SourceData, bases: &HashMap<String, String>) -> S
 
 /// One package's add, with its result turned into an outcome rather than an
 /// error, so the caller can record it and carry on.
-async fn add_one(services: &Services, context: &AddContext, source: SourceData) -> BulkAddOutcome {
+///
+/// Returns the pkgbase alongside the outcome. It is only known once the add has
+/// resolved the source -- a git URL does not carry it, and an AUR name need not
+/// match it -- and it is what a caller needs to link to the package it just
+/// made.
+async fn add_one(
+    services: &Services,
+    context: &AddContext,
+    source: SourceData,
+) -> (BulkAddOutcome, Option<String>) {
     let existed = match &source {
         SourceData::Aur { name } => crate::package::add::package_exists(&services.db, name)
             .await
@@ -126,11 +139,14 @@ async fn add_one(services: &Services, context: &AddContext, source: SourceData) 
     };
 
     match add_resolved_source(services, context, source, None).await {
-        Ok(_) if existed => BulkAddOutcome::Existed,
-        Ok(_) => BulkAddOutcome::Added,
-        Err(e) => BulkAddOutcome::Failed {
-            error: e.to_string(),
-        },
+        Ok(pkgbase) if existed => (BulkAddOutcome::Existed, Some(pkgbase)),
+        Ok(pkgbase) => (BulkAddOutcome::Added, Some(pkgbase)),
+        Err(e) => (
+            BulkAddOutcome::Failed {
+                error: e.to_string(),
+            },
+            None,
+        ),
     }
 }
 

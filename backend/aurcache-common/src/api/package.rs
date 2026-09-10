@@ -208,6 +208,15 @@ pub struct BulkAddEntry {
     /// The source as the caller named it, so a failure can be matched back to
     /// the request even when the name never resolved to a pkgbase.
     pub name: String,
+    /// The pkgbase the source turned out to be, once it is known.
+    ///
+    /// Separate from `name` because they are not the same thing and only one of
+    /// them can be linked to: `name` is whatever was typed -- an AUR package
+    /// name that may differ from its base, or a git URL -- while this is the row
+    /// the package now has. `None` for anything that never got that far, which
+    /// is every failure that happened during resolution.
+    #[serde(default)]
+    pub pkgbase: Option<String>,
     #[serde(flatten)]
     pub outcome: BulkAddOutcome,
 }

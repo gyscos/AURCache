@@ -53,6 +53,21 @@ pub enum Work {
     FollowRestore { operation: i32, label: String },
 }
 
+/// One source that landed, and what happened to it.
+#[derive(Clone, PartialEq)]
+pub struct Succeeded {
+    /// The source as it was named in the request, which is what a failure or a
+    /// summary is reported against.
+    pub label: String,
+    /// The word for what happened: "added", "already here", "imported", ...
+    pub outcome: String,
+    /// The package this turned out to be, when the server said. Only an add
+    /// against a resolved source has one -- which is what the card needs to
+    /// offer a link to the package it just made, since `label` may be a git URL
+    /// or an AUR name that is not its own pkgbase.
+    pub pkgbase: Option<String>,
+}
+
 /// One add being watched.
 #[derive(Clone, PartialEq)]
 pub struct Job {
@@ -63,7 +78,7 @@ pub struct Job {
     /// "added" or "existed" for an add, "imported", "skipped", "overwritten" or
     /// "patch adopted" for a restore. Kept per item rather than as counters so
     /// the card can summarise in the kind's own vocabulary.
-    pub succeeded: Vec<(String, String)>,
+    pub succeeded: Vec<Succeeded>,
     pub failed: Vec<(String, String)>,
     /// The source being worked on, when the job reports one.
     pub current: Option<String>,
@@ -89,7 +104,8 @@ impl Job {
     #[must_use]
     pub fn summary(&self) -> String {
         let mut counts: Vec<(String, usize)> = Vec::new();
-        for (_, outcome) in &self.succeeded {
+        for entry in &self.succeeded {
+            let outcome = &entry.outcome;
             match counts.iter_mut().find(|(word, _)| word == outcome) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((outcome.clone(), 1)),
@@ -113,6 +129,24 @@ impl Job {
                 (n, _) => format!("Adding {n} packages"),
             },
             Work::FollowAdd { label, .. } | Work::FollowRestore { label, .. } => label.clone(),
+        }
+    }
+
+    /// The package this card can send you to, once it is finished.
+    ///
+    /// Only when the job produced exactly one, and the server said which
+    /// package it turned out to be. A job that added five has no single answer,
+    /// and one whose source never resolved has no answer at all -- both keep the
+    /// plain "View packages" link instead of an invented one. `already here`
+    /// counts: the package is there to look at, which is what the link offers.
+    #[must_use]
+    pub fn landed_package(&self) -> Option<String> {
+        if !self.finished || !self.failed.is_empty() {
+            return None;
+        }
+        match self.succeeded.as_slice() {
+            [only] => only.pkgbase.clone(),
+            _ => None,
         }
     }
 
@@ -307,13 +341,20 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
         seen += progress.entries.len();
         for entry in progress.entries {
             let landed = !matches!(entry.outcome, BulkAddOutcome::Failed { .. });
+            let pkgbase = entry.pkgbase.clone();
             update_job(jobs, id, |job| match entry.outcome {
-                BulkAddOutcome::Added => job.succeeded.push((entry.name, "added".to_string())),
+                BulkAddOutcome::Added => job.succeeded.push(Succeeded {
+                    label: entry.name,
+                    outcome: "added".to_string(),
+                    pkgbase,
+                }),
                 // Distinguished from added: nothing changed, which is a
                 // different answer to "did that work" than a fresh add.
-                BulkAddOutcome::Existed => {
-                    job.succeeded.push((entry.name, "already here".to_string()));
-                }
+                BulkAddOutcome::Existed => job.succeeded.push(Succeeded {
+                    label: entry.name,
+                    outcome: "already here".to_string(),
+                    pkgbase,
+                }),
                 BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
             });
             if landed {
@@ -378,13 +419,20 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
         seen += progress.entries.len();
         for entry in progress.entries {
             let landed = !matches!(entry.outcome, BulkAddOutcome::Failed { .. });
+            let pkgbase = entry.pkgbase.clone();
             update_job(jobs, id, |job| match entry.outcome {
-                BulkAddOutcome::Added => job.succeeded.push((entry.name, "added".to_string())),
+                BulkAddOutcome::Added => job.succeeded.push(Succeeded {
+                    label: entry.name,
+                    outcome: "added".to_string(),
+                    pkgbase,
+                }),
                 // Distinguished from added: nothing changed, which is a
                 // different answer to "did that work" than a fresh add.
-                BulkAddOutcome::Existed => {
-                    job.succeeded.push((entry.name, "already here".to_string()));
-                }
+                BulkAddOutcome::Existed => job.succeeded.push(Succeeded {
+                    label: entry.name,
+                    outcome: "already here".to_string(),
+                    pkgbase,
+                }),
                 BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
             });
             if landed {
@@ -452,21 +500,18 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
             // "skipped" changed nothing, but the others did; a spare re-fetch
             // for a skip is cheaper than branching four ways here.
             let landed = !matches!(entry.outcome, RestoreOutcome::Failed { .. });
+            // A restore reports the pkgbase as its label, so it is both.
+            let pkgbase = entry.pkgbase.clone();
+            let landed_as = move |outcome: &str| Succeeded {
+                label: pkgbase.clone(),
+                outcome: outcome.to_string(),
+                pkgbase: Some(pkgbase.clone()),
+            };
             update_job(jobs, id, |job| match entry.outcome {
-                RestoreOutcome::Imported => {
-                    job.succeeded.push((entry.pkgbase, "imported".to_string()));
-                }
-                RestoreOutcome::Skipped => {
-                    job.succeeded.push((entry.pkgbase, "skipped".to_string()));
-                }
-                RestoreOutcome::Overwritten => {
-                    job.succeeded
-                        .push((entry.pkgbase, "overwritten".to_string()));
-                }
-                RestoreOutcome::PatchAdopted => {
-                    job.succeeded
-                        .push((entry.pkgbase, "patch adopted".to_string()));
-                }
+                RestoreOutcome::Imported => job.succeeded.push(landed_as("imported")),
+                RestoreOutcome::Skipped => job.succeeded.push(landed_as("skipped")),
+                RestoreOutcome::Overwritten => job.succeeded.push(landed_as("overwritten")),
+                RestoreOutcome::PatchAdopted => job.succeeded.push(landed_as("patch adopted")),
                 RestoreOutcome::Failed { error } => job.failed.push((entry.pkgbase, error)),
             });
             if landed {
@@ -522,7 +567,14 @@ async fn add_patched_sources(jobs: Signal<Vec<Job>>, id: u64, request: AddReques
 
         let landed = result.is_ok();
         update_job(jobs, id, |job| match result {
-            Ok(()) => job.succeeded.push((label, "added".to_string())),
+            // The single-add endpoint answers with nothing, so there is no
+            // resolved pkgbase to link to -- only what was typed, which need
+            // not be one.
+            Ok(()) => job.succeeded.push(Succeeded {
+                label,
+                outcome: "added".to_string(),
+                pkgbase: None,
+            }),
             Err(e) => job.failed.push((label, e.to_string())),
         });
         if landed {
@@ -601,6 +653,7 @@ fn JobCard(id: u64) -> Element {
     let done = job.resolved_count();
     let title = job.title();
     let failed = !job.failed.is_empty();
+    let landed = job.landed_package();
 
     rsx! {
         div { class: "card bg-base-100 shadow-lg border border-base-300",
@@ -615,7 +668,19 @@ fn JobCard(id: u64) -> Element {
                     }
 
                     div { class: "flex-1 min-w-0",
-                        div { class: "font-medium text-sm truncate", "{title}" }
+                        // Once there is a package to go to, the title is the
+                        // way there: it already names the thing that was just
+                        // added, and reading "Adding hello" and then hunting
+                        // for hello in the list is a step nobody wanted.
+                        if let Some(pkgbase) = landed.clone() {
+                            Link {
+                                class: "font-medium text-sm truncate link link-hover block",
+                                to: crate::routes::Route::Package { pkgbase },
+                                "{title}"
+                            }
+                        } else {
+                            div { class: "font-medium text-sm truncate", "{title}" }
+                        }
                         div { class: "text-xs opacity-70",
                             if job.finished {
                                 {job.summary()}
@@ -668,10 +733,18 @@ fn JobCard(id: u64) -> Element {
                 }
 
                 if job.finished && !failed {
-                    Link {
-                        class: "btn btn-ghost btn-xs self-start",
-                        to: crate::routes::Route::Packages { view: ViewParams::default(), q: String::new() },
-                        "View packages"
+                    if let Some(pkgbase) = landed {
+                        Link {
+                            class: "btn btn-ghost btn-xs self-start",
+                            to: crate::routes::Route::Package { pkgbase: pkgbase.clone() },
+                            "View {pkgbase}"
+                        }
+                    } else {
+                        Link {
+                            class: "btn btn-ghost btn-xs self-start",
+                            to: crate::routes::Route::Packages { view: ViewParams::default(), q: String::new() },
+                            "View packages"
+                        }
                     }
                 }
             }
@@ -763,15 +836,32 @@ mod tests {
         assert_eq!(job(vec![aur("hello")]).operation_id(), None);
     }
 
+    /// A landed source, named and with its outcome, and no package to link to.
+    fn landed(label: &str, outcome: &str) -> Succeeded {
+        Succeeded {
+            label: label.to_string(),
+            outcome: outcome.to_string(),
+            pkgbase: None,
+        }
+    }
+
+    /// The same, having resolved to a package.
+    fn landed_as(label: &str, outcome: &str, pkgbase: &str) -> Succeeded {
+        Succeeded {
+            pkgbase: Some(pkgbase.to_string()),
+            ..landed(label, outcome)
+        }
+    }
+
     /// A restore reports in its own words, which is why outcomes are carried
     /// per item rather than as one "done" counter: "12 imported, 3 skipped"
     /// answers a question that "15 done" does not.
     #[test]
     fn the_summary_counts_each_outcome_separately() {
         let mut j = job(vec![aur("a")]);
-        j.succeeded.push(("one".into(), "imported".into()));
-        j.succeeded.push(("two".into(), "imported".into()));
-        j.succeeded.push(("three".into(), "skipped".into()));
+        j.succeeded.push(landed("one", "imported"));
+        j.succeeded.push(landed("two", "imported"));
+        j.succeeded.push(landed("three", "skipped"));
         j.failed.push(("four".into(), "bad patch".into()));
 
         assert_eq!(j.summary(), "2 imported, 1 skipped, 1 failed");
@@ -782,9 +872,58 @@ mod tests {
     #[test]
     fn an_add_distinguishes_added_from_already_here() {
         let mut j = job(vec![aur("a"), aur("b")]);
-        j.succeeded.push(("a".into(), "added".into()));
-        j.succeeded.push(("b".into(), "already here".into()));
+        j.succeeded.push(landed("a", "added"));
+        j.succeeded.push(landed("b", "already here"));
         assert_eq!(j.summary(), "1 added, 1 already here");
+    }
+
+    /// The card offers a link to the package it just added, which is the whole
+    /// point of it saying which package that was.
+    #[test]
+    fn a_finished_single_add_links_to_the_package_it_made() {
+        let mut j = job(vec![aur("hello")]);
+        j.succeeded.push(landed_as("hello", "added", "hello-git"));
+        j.finished = true;
+        // The pkgbase the server resolved, not the name that was typed.
+        assert_eq!(j.landed_package().as_deref(), Some("hello-git"));
+    }
+
+    /// Not while it is still running: there is nothing to look at yet, and a
+    /// link that appears mid-add invites clicking away from the progress.
+    #[test]
+    fn an_unfinished_add_offers_no_link() {
+        let mut j = job(vec![aur("hello")]);
+        j.succeeded.push(landed_as("hello", "added", "hello"));
+        assert_eq!(j.landed_package(), None);
+    }
+
+    /// Several packages have no single answer, and one that failed has none
+    /// worth offering. Both keep the plain "View packages" link.
+    #[test]
+    fn only_a_single_clean_add_names_a_package() {
+        let mut many = job(vec![aur("a"), aur("b")]);
+        many.succeeded.push(landed_as("a", "added", "a"));
+        many.succeeded.push(landed_as("b", "added", "b"));
+        many.finished = true;
+        assert_eq!(many.landed_package(), None);
+
+        let mut with_failure = job(vec![aur("a"), aur("b")]);
+        with_failure.succeeded.push(landed_as("a", "added", "a"));
+        with_failure
+            .failed
+            .push(("b".to_string(), "no such package".to_string()));
+        with_failure.finished = true;
+        assert_eq!(with_failure.landed_package(), None);
+    }
+
+    /// A source the server never resolved has no package to point at, so the
+    /// card says nothing rather than guessing that the name typed is a pkgbase.
+    #[test]
+    fn an_unresolved_source_names_no_package() {
+        let mut j = job(vec![aur("hello")]);
+        j.succeeded.push(landed("hello", "added"));
+        j.finished = true;
+        assert_eq!(j.landed_package(), None);
     }
 
     /// Progress counts what has been resolved either way. A failure is as
@@ -794,7 +933,7 @@ mod tests {
     fn progress_counts_failures_as_resolved() {
         let mut j = job(vec![aur("a"), aur("b"), aur("c")]);
         assert_eq!(j.resolved_count(), 0);
-        j.succeeded.push(("a".to_string(), "added".to_string()));
+        j.succeeded.push(landed("a", "added"));
         j.failed
             .push(("b".to_string(), "no such package".to_string()));
         assert_eq!(j.resolved_count(), 2);
