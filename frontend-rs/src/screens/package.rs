@@ -2173,6 +2173,11 @@ fn ReplaceAndRemoveDialog(
     let mut selected = use_signal(Vec::<Choice>::new);
     let mut removing = use_signal(Vec::<String>::new);
     let mut busy = use_signal(|| false);
+    // What is happening right now, step by step. Applying is one request per
+    // dependent and one per package being removed, each of which reads a
+    // source or sweeps the graph on the server -- long enough that a bare
+    // spinner leaves someone wondering whether it is working or hung.
+    let mut progress = use_signal(|| Option::<String>::None);
     let mut errors = use_signal(Vec::<String>::new);
 
     // What removing the ticked dependents actually takes with it. Reruns as
@@ -2195,11 +2200,14 @@ fn ReplaceAndRemoveDialog(
             busy.set(true);
             errors.set(Vec::new());
             let mut failed = Vec::new();
+            let steps = assignments.len() + doomed.len();
+            let mut step = 0;
 
             let client = match client() {
                 Ok(client) => client,
                 Err(e) => {
                     busy.set(false);
+                    progress.set(None);
                     errors.set(vec![e]);
                     return;
                 }
@@ -2209,6 +2217,10 @@ fn ReplaceAndRemoveDialog(
             // of those racing would each be deciding what is still reachable
             // while the other changed it.
             for (dependent, choice) in &assignments {
+                step += 1;
+                progress.set(Some(format!(
+                    "{step}/{steps} — pointing {dependent} elsewhere"
+                )));
                 let replacement = match choice {
                     Choice::Official => None,
                     Choice::Package(pkgbase) => Some(pkgbase.as_str()),
@@ -2224,12 +2236,15 @@ fn ReplaceAndRemoveDialog(
             // things above it are gone, and only then does clearing it free
             // what is underneath.
             for dependent in doomed.iter().rev() {
+                step += 1;
+                progress.set(Some(format!("{step}/{steps} — removing {dependent}")));
                 if let Err(e) = client.delete_package(dependent).await {
                     failed.push(format!("{dependent}: {e}"));
                 }
             }
 
             busy.set(false);
+            progress.set(None);
             if failed.is_empty() {
                 // Nothing needs it any more, so the collection after the last
                 // edit took it. Its page would now be a 404.
@@ -2320,6 +2335,7 @@ fn ReplaceAndRemoveDialog(
                                                     key: "{offer_key(&offer.choice)}",
                                                     offer: offer.clone(),
                                                     total,
+                                                    busy: busy(),
                                                     picked: selected().contains(&offer.choice),
                                                     on_toggle: {
                                                         let choice = offer.choice.clone();
@@ -2346,6 +2362,7 @@ fn ReplaceAndRemoveDialog(
                                                 key: "{dependent}",
                                                 dependent: dependent.clone(),
                                                 choice: choice.clone(),
+                                                busy: busy(),
                                                 marked: removing().contains(dependent),
                                                 on_remove: {
                                                     let dependent = dependent.clone();
@@ -2400,7 +2417,11 @@ fn ReplaceAndRemoveDialog(
                             }
 
                             div { class: "modal-action",
-                                if !ready {
+                                if let Some(step) = progress() {
+                                    span { class: "text-xs opacity-70 self-center font-mono",
+                                        "{step}"
+                                    }
+                                } else if !ready {
                                     span { class: "text-xs opacity-60 self-center",
                                         "{unaccounted} dependent(s) still need {pkgbase}"
                                     }
@@ -2445,7 +2466,13 @@ fn offer_key(choice: &Choice) -> String {
 
 /// One thing that could stand in, and how much of the job it does.
 #[component]
-fn OfferRow(offer: Offer, total: usize, picked: bool, on_toggle: EventHandler<bool>) -> Element {
+fn OfferRow(
+    offer: Offer,
+    total: usize,
+    picked: bool,
+    busy: bool,
+    on_toggle: EventHandler<bool>,
+) -> Element {
     rsx! {
         li { class: "py-2",
             label { class: "label cursor-pointer justify-start gap-3",
@@ -2453,6 +2480,7 @@ fn OfferRow(offer: Offer, total: usize, picked: bool, on_toggle: EventHandler<bo
                     r#type: "checkbox",
                     class: "checkbox checkbox-sm",
                     checked: picked,
+                    disabled: busy,
                     onchange: move |event| on_toggle.call(event.checked()),
                 }
                 match &offer.choice {
@@ -2490,6 +2518,7 @@ fn DependentRow(
     dependent: String,
     choice: Option<Choice>,
     marked: bool,
+    busy: bool,
     on_remove: EventHandler<bool>,
 ) -> Element {
     rsx! {
@@ -2521,6 +2550,7 @@ fn DependentRow(
                             r#type: "checkbox",
                             class: "checkbox checkbox-sm checkbox-warning",
                             checked: marked,
+                            disabled: busy,
                             onchange: move |event| on_remove.call(event.checked()),
                         }
                         span { class: "font-mono text-sm break-all", "{dependent}" }
