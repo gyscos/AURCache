@@ -8,6 +8,20 @@ ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # Install necessary tools and dependencies
 
+# The CLI's version has to match the `wasm-bindgen` crate the frontend links
+# against exactly, so it is read from the frontend's lockfile. `--locked` pins
+# only the CLI's own dependencies and will still install whatever release is
+# newest -- see hybrid.Dockerfile for the schema mismatch that produces.
+#
+# The lockfile alone, ahead of the source, so that this expensive `cargo
+# install` is invalidated when the pinned version changes and not by a code
+# edit -- the same ordering, and for the same reason, as hybrid.Dockerfile.
+COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
+RUN rustup target add wasm32-unknown-unknown \
+    && wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
+    && test -n "$wb_version" \
+    && cargo install wasm-bindgen-cli --locked --version "$wb_version"
+
 # The two trees keep the layout they have in the repository: the frontend
 # reaches the shared crates as `../backend/...`, and `aurcache-api`'s build
 # script reaches the frontend as `../../frontend-rs`. Flattening either breaks
@@ -20,15 +34,6 @@ ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 COPY backend/ /app/backend/
 COPY frontend-rs /app/frontend-rs/
 WORKDIR /app/backend
-# The CLI's version has to match the `wasm-bindgen` crate the frontend links
-# against exactly, so it is read from the frontend's lockfile, which is already
-# in the image by this point. `--locked` pins only the CLI's own dependencies
-# and will still install whatever release is newest -- see hybrid.Dockerfile for
-# the schema mismatch that produces.
-RUN rustup target add wasm32-unknown-unknown \
-    && wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /app/frontend-rs/Cargo.lock)" \
-    && test -n "$wb_version" \
-    && cargo install wasm-bindgen-cli --locked --version "$wb_version"
 
 # Which architecture to cross-compile for. `TARGETPLATFORM` is what buildx sets
 # per target in a multi-platform build, so it is the default; `TARGET_ARCH`
