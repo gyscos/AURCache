@@ -80,14 +80,14 @@ pub(crate) async fn resolve_pkgbases(
 /// packages should not be undone by one whose PKGBUILD no longer parses, and
 /// the entry says which it was.
 pub async fn bulk_add(
-    services: &Services<'_>,
+    services: &Services,
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     sources: Vec<SourceData>,
     progress: UnboundedSender<BulkAddEntry>,
 ) {
     let context = build_add_context(platforms, build_flags);
-    let bases = resolve_pkgbases(services.client, &sources).await;
+    let bases = resolve_pkgbases(&services.client, &sources).await;
 
     info!(
         "bulk add: {} sources, {} pkgbases resolved in batch",
@@ -117,13 +117,9 @@ fn apply_resolved_base(source: SourceData, bases: &HashMap<String, String>) -> S
 
 /// One package's add, with its result turned into an outcome rather than an
 /// error, so the caller can record it and carry on.
-async fn add_one(
-    services: &Services<'_>,
-    context: &AddContext,
-    source: SourceData,
-) -> BulkAddOutcome {
+async fn add_one(services: &Services, context: &AddContext, source: SourceData) -> BulkAddOutcome {
     let existed = match &source {
-        SourceData::Aur { name } => crate::package::add::package_exists(services.db, name)
+        SourceData::Aur { name } => crate::package::add::package_exists(&services.db, name)
             .await
             .unwrap_or(false),
         _ => false,

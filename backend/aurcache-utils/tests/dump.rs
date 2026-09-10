@@ -7,11 +7,13 @@ use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings, workers};
 use aurcache_utils::dump::{build_dump, write_archive};
+use aurcache_utils::services::Services;
 use flate2::read::GzDecoder;
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, Set};
 use sea_orm_migration::MigratorTrait;
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 
 async fn db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -593,7 +595,7 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
+        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
         &tempfile::tempdir().unwrap().keep(),
         loaded,
         RestoreOptions::default(),
@@ -876,7 +878,7 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
+        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions::default(),
@@ -934,7 +936,7 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
+        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions {

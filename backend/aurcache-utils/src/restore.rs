@@ -316,7 +316,7 @@ async fn package_row(
 /// entry says so, because it is the difference between a restore that worked
 /// and one that looks like it did.
 pub async fn apply(
-    services: &Services<'_>,
+    services: &Services,
     ca_dir: &std::path::Path,
     dump: LoadedDump,
     options: RestoreOptions,
@@ -327,7 +327,7 @@ pub async fn apply(
         store,
         db,
         tx: _,
-    } = *services;
+    } = services;
     // PASS 1: rows. One transaction, because a half-applied dump is neither
     // what the instance was nor what the dump describes.
     let applied = match write_rows(db, &dump, &options).await {

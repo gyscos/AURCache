@@ -1,52 +1,43 @@
 use anyhow::anyhow;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
-use aurcache_db::action::Action;
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
-use aurcache_deps::AurClient;
 use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::services::Services;
 use aurcache_utils::settings::general::SettingsTraits;
-use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::vcs_check::sync_vcs_sources;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 #[must_use]
-pub fn start_update_version_checking(
-    db: DatabaseConnection,
-    tx: Sender<Action>,
-    store: Arc<SnapshotStore>,
-    client: Arc<AurClient>,
-) -> JoinHandle<()> {
+pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(&db, &client, &store, &tx).await {
+            if let Err(e) = check_versions(&services).await {
                 error!("Failed to perform aur version check: {e}");
             }
 
             let check_interval: SettingsEntry<u64> =
-                ApplicationSettings::get(Setting::VersionCheckInterval, None, &db).await;
+                ApplicationSettings::get(Setting::VersionCheckInterval, None, &services.db).await;
             tokio::time::sleep(Duration::from_secs(check_interval.value.max(1))).await;
         }
     })
 }
 
-async fn check_versions(
-    db: &DatabaseConnection,
-    client: &AurClient,
-    store: &SnapshotStore,
-    tx: &Sender<Action>,
-) -> anyhow::Result<()> {
+async fn check_versions(services: &Services) -> anyhow::Result<()> {
+    let Services {
+        db,
+        tx: _,
+        store,
+        client,
+    } = services;
     let packages = Packages::find().all(db).await?;
     let aur_query_names: Vec<String> = packages
         .iter()
@@ -225,7 +216,7 @@ async fn check_versions(
     let build_now: SettingsEntry<bool> =
         ApplicationSettings::get(Setting::BuildOnNewVersion, None, db).await;
     if build_now.value
-        && let Err(e) = package_update_all_outdated(&Services::new(client, store, db, tx)).await
+        && let Err(e) = package_update_all_outdated(services).await
     {
         warn!("Failed to queue builds for newly outdated packages: {e}");
     }

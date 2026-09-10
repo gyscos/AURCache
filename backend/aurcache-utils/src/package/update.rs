@@ -63,8 +63,8 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 ///
 /// Only packages whose latest build completed successfully are retriggered.
 /// Returns the build IDs enqueued across all updated packages.
-pub async fn package_update_all_outdated(services: &Services<'_>) -> anyhow::Result<Vec<i32>> {
-    let db = services.db;
+pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<Vec<i32>> {
+    let db = &services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
         .filter(packages::Column::OutOfDate.eq(1))
         .all(db)
@@ -123,7 +123,7 @@ pub async fn package_update_all_outdated(services: &Services<'_>) -> anyhow::Res
 ///   that was enqueued/promoted or left waiting on dependencies.
 /// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
 pub async fn package_update(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: packages::Model,
     force: bool,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
@@ -140,7 +140,7 @@ pub async fn package_update(
 /// intentionally lighter-weight than [`package_update`]: it does
 /// not enqueue or promote any builds.
 pub async fn package_resync_dependencies(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: &packages::Model,
 ) -> anyhow::Result<()> {
     let sourceinfo = services
@@ -157,7 +157,7 @@ pub async fn package_resync_dependencies(
 
     // The dependency change may have made some previously-required
     // dependency-only packages no longer needed.
-    remove_orphaned_packages(services.db, pkg_model.id).await?;
+    remove_orphaned_packages(&services.db, pkg_model.id).await?;
 
     Ok(())
 }
@@ -166,7 +166,7 @@ pub async fn package_resync_dependencies(
 #[allow(clippy::double_must_use)]
 #[async_recursion]
 async fn package_update_inner(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: packages::Model,
     force: bool,
     visited: &mut HashSet<i32>,
@@ -189,7 +189,7 @@ async fn package_update_inner(
     let graph = sync_dependency_graph(services, &pkg_model, &deps).await?;
 
     // With the update, it's possible some dependencies are no longer needed.
-    remove_orphaned_packages(services.db, pkg_model.id).await?;
+    remove_orphaned_packages(&services.db, pkg_model.id).await?;
 
     // Only a *successful* build makes a version "already built". This used to
     // ask for the latest build of any outcome, which meant a failed attempt at
@@ -198,7 +198,7 @@ async fn package_update_inner(
     // answers "already up to date (version 1.4.1-1)" about a version that is
     // nowhere in the repository. Nothing could shift it but a forced build.
     let built_version = aurcache_db::helpers::builds::latest_successful_version_any_platform(
-        services.db,
+        &services.db,
         pkg_model.id,
     )
     .await?;
@@ -255,7 +255,7 @@ struct DependencyGraph {
 ///
 /// Does not care about builds at this point.
 async fn sync_dependency_graph(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<DependencyGraph> {
@@ -265,7 +265,7 @@ async fn sync_dependency_graph(
 
     if dep_constraints_by_pkgbase.is_empty() {
         sync_dependency_rows(
-            services.db,
+            &services.db,
             pkg_model.id,
             &dep_constraints_by_pkgbase,
             &HashMap::new(),
@@ -276,10 +276,10 @@ async fn sync_dependency_graph(
         });
     }
 
-    let dep_packages = fetch_dep_packages_map(services.db, &dep_constraints_by_pkgbase).await?;
+    let dep_packages = fetch_dep_packages_map(&services.db, &dep_constraints_by_pkgbase).await?;
 
     sync_dependency_rows(
-        services.db,
+        &services.db,
         pkg_model.id,
         &dep_constraints_by_pkgbase,
         &dep_packages,
@@ -314,7 +314,7 @@ async fn sync_dependency_graph(
 /// pkgbase onto one edge. The difference is only what happens afterwards —
 /// an add plans rows, a resync reconciles the ones already there.
 async fn resolve_dependency_edges(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
@@ -327,9 +327,9 @@ async fn resolve_dependency_edges(
     // One package, one resolution, so the snapshot lives no longer than this
     // call.
     let tracked =
-        aurcache_db::helpers::dependency_resolution::TrackedPackages::load(services.db).await?;
+        aurcache_db::helpers::dependency_resolution::TrackedPackages::load(&services.db).await?;
     let resolved_deps = aurcache_db::helpers::dependency_resolution::resolve_dependencies(
-        services.client,
+        &services.client,
         &tracked,
         &crate::pkg::as_dependencies(&pairs),
         &[],
@@ -371,21 +371,21 @@ async fn resolve_dependency_edges(
 /// Ensure all resolved dependency packages exist in the database,
 /// adding them via the AUR if missing.
 async fn ensure_missing_dependency_packages(
-    services: &Services<'_>,
+    services: &Services,
     pkg_model: &packages::Model,
     dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
 ) -> anyhow::Result<()> {
     for dep_pkgbase in dep_constraints_by_pkgbase.keys() {
         if Packages::find()
             .filter(packages::Column::Name.eq(dep_pkgbase.as_str()))
-            .one(services.db)
+            .one(&services.db)
             .await?
             .is_none()
         {
             ensure_aur_package_exists_recursive(
-                services.client,
-                services.store,
-                services.db,
+                &services.client,
+                &services.store,
+                &services.db,
                 dep_pkgbase,
                 &pkg_model.platforms,
                 &pkg_model.build_flags,
@@ -495,14 +495,14 @@ async fn dependency_satisfies_constraint(
 /// starts. Packages whose last build failed are never auto-retriggered — the
 /// user has to retry those explicitly.
 async fn dependencies_ready_for_platform(
-    services: &Services<'_>,
+    services: &Services,
     platform: &Platform,
     graph: &DependencyGraph,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<bool> {
     for dep_info in graph.deps.values() {
         if dependency_satisfies_constraint(
-            services.db,
+            &services.db,
             dep_info.package.id,
             platform,
             dep_info.constraint.as_ref(),
@@ -520,7 +520,7 @@ async fn dependencies_ready_for_platform(
                 Some(BuildStates::ACTIVE_BUILD),
                 Some(BuildStates::WAITING_FOR_DEPS),
             ]))
-            .count(services.db)
+            .count(&services.db)
             .await?
             > 0;
 
@@ -561,7 +561,7 @@ pub struct PlatformUpdateResult {
 
 /// For each configured platform, check dep readiness and enqueue builds.
 async fn enqueue_platform_builds(
-    services: &Services<'_>,
+    services: &Services,
     request: BuildRequest<'_>,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
@@ -579,8 +579,8 @@ async fn enqueue_platform_builds(
                 *platform,
                 request.pkg_model.clone(),
                 request.version.to_string(),
-                services.db,
-                services.tx,
+                &services.db,
+                &services.tx,
             )
             .await?;
             results.push(PlatformUpdateResult {
@@ -679,6 +679,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -986,7 +987,7 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(&client, &store, &db, &tx),
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
             parent.clone(),
             false,
         )
@@ -1200,7 +1201,7 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(&client, &store, &db, &tx),
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
             parent.clone(),
             false,
         )
@@ -1423,7 +1424,7 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(&client, &store, &db, &tx),
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
             parent.clone(),
             true,
         )
@@ -1619,7 +1620,7 @@ mod tests {
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
         let build_ids = package_update(
-            &Services::new(&client, &store, &db, &tx),
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
             parent.clone(),
             false,
         )
@@ -1702,10 +1703,13 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let build_ids =
-            package_update(&Services::new(&client, &store, &db, &tx), pkg.clone(), true)
-                .await
-                .unwrap();
+        let build_ids = package_update(
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            pkg.clone(),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             build_ids.len(),
@@ -1826,7 +1830,7 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         package_update(
-            &Services::new(&client, &store, &db, &tx),
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
             parent.clone(),
             false,
         )

@@ -12,6 +12,7 @@ use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
 use aurcache_scheduler::official_repos::start_official_repo_refresh;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
+use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
 use dotenvy::dotenv;
 use std::env;
@@ -67,15 +68,18 @@ async fn main() {
     let client = Arc::new(AurClient::new());
     let official_repo_handle = start_official_repo_refresh(client.clone());
 
+    // The four things a package operation acts through, from here on passed as
+    // one. Cloning is four refcount bumps, so a job or a request handler takes
+    // its own handle on the same instances.
+    let services = Services::new(db.clone(), tx.clone(), store.clone(), client);
+
     // Before anything else can resolve a source: a prune cannot distinguish a
     // clone in flight from a stranded one.
     startup::prune_source_checkouts(&db, &store).await;
 
     let build_queue_handle = init_build_queue(db.clone(), tx.clone());
-    let version_check_handle =
-        start_update_version_checking(db.clone(), tx.clone(), store.clone(), client.clone());
-    let auto_update_handle =
-        start_auto_update_job(db.clone(), tx.clone(), store.clone(), client.clone());
+    let version_check_handle = start_update_version_checking(services.clone());
+    let auto_update_handle = start_auto_update_job(services.clone());
 
     let mirrorlist_override =
         env::var("MIRRORLIST_SERVERS_X86_64").is_ok_and(|s| !s.trim().is_empty());
@@ -95,10 +99,7 @@ async fn main() {
     let download_flush_handle = start_download_flush(db.clone(), downloads.clone());
 
     let api_handle = init_api(
-        db.clone(),
-        tx,
-        store.clone(),
-        client.clone(),
+        services.clone(),
         downloads.clone(),
         ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
         CaDirectory(ca_dir.clone()),

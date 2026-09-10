@@ -1,4 +1,3 @@
-use aurcache_deps::AurClient;
 use aurcache_utils::services::Services;
 use rocket::http::Status;
 use rocket::serde::json::Json;
@@ -15,13 +14,11 @@ use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
 use aurcache_utils::build_logger::read_build_output;
 use aurcache_utils::package::update::package_update;
-use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::FromQueryResult;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait, Select,
 };
-use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
@@ -369,15 +366,12 @@ pub async fn cancel_build(
 )]
 #[post("/package/<pkgbase>/build/<number>/retry")]
 pub async fn retry_build(
-    db: &State<DatabaseConnection>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
+    services: &State<Services>,
     pkgbase: &str,
     number: i32,
     _a: Authenticated,
 ) -> Result<Json<i32>, ApiError> {
-    let db = db.inner();
+    let db = &services.db;
 
     // The build being retried tells us which platform and package to rebuild.
     let old_build = build_by_number(db, pkgbase, number).await?;
@@ -395,7 +389,7 @@ pub async fn retry_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let platform_results = package_update(&Services::new(client, store, db, tx), package, true)
+    let platform_results = package_update(services, package, true)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 

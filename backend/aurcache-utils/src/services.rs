@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aurcache_db::action::Action;
 use aurcache_deps::AurClient;
 use sea_orm::DatabaseConnection;
@@ -5,40 +7,42 @@ use tokio::sync::broadcast::Sender;
 
 use crate::snapshot::SnapshotStore;
 
-/// The four things every package operation needs, passed as one.
+/// What a package operation acts through: the database it writes, the build
+/// queue it enqueues onto, the source cache it resolves through, and the AUR
+/// client it resolves dependencies with.
 ///
-/// Add, update, bulk add and restore all reach for the same set: the database
-/// to write, the build queue to enqueue onto, the snapshot store to resolve
-/// sources with, and the AUR client to resolve dependencies with. Threading
-/// them one by one put four of the same parameters on every signature in the
-/// chain, which is how those signatures grew past what anyone reads.
+/// This is where those four live, rather than four values threaded separately
+/// from `main` and reassembled at every layer. A function that needs more than
+/// one of them takes this; a function that needs exactly one takes that one, so
+/// its signature still says what it touches.
 ///
-/// Borrowed rather than owned, and `Copy`, so passing it costs what passing
-/// the four references cost.
-#[derive(Clone, Copy)]
-pub struct Services<'a> {
-    /// Resolves dependency names against the official repositories and the AUR.
-    pub client: &'a AurClient,
-    /// Resolves and caches package sources.
-    pub store: &'a SnapshotStore,
-    pub db: &'a DatabaseConnection,
+/// Cloning is four refcount bumps -- `DatabaseConnection` and `Sender` are
+/// handles and the other two are behind `Arc` -- so a spawned task takes a
+/// clone rather than borrowing, and no separate owned form is needed.
+#[derive(Clone)]
+pub struct Services {
+    pub db: DatabaseConnection,
     /// The build queue.
-    pub tx: &'a Sender<Action>,
+    pub tx: Sender<Action>,
+    /// Resolves and caches package sources.
+    pub store: Arc<SnapshotStore>,
+    /// Resolves dependency names against the official repositories and the AUR.
+    pub client: Arc<AurClient>,
 }
 
-impl<'a> Services<'a> {
+impl Services {
     #[must_use]
     pub fn new(
-        client: &'a AurClient,
-        store: &'a SnapshotStore,
-        db: &'a DatabaseConnection,
-        tx: &'a Sender<Action>,
+        db: DatabaseConnection,
+        tx: Sender<Action>,
+        store: Arc<SnapshotStore>,
+        client: Arc<AurClient>,
     ) -> Self {
         Self {
-            client,
-            store,
             db,
             tx,
+            store,
+            client,
         }
     }
 }

@@ -8,13 +8,11 @@ use crate::models::package::{
     AddPackages, AurNotFoundPackage, AurPackage, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, PackageSource, SimplePackage,
 };
-use crate::services::ApiServices;
 use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
-use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
@@ -25,7 +23,6 @@ use aurcache_db::helpers::operations;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files, packages};
-use aurcache_deps::AurClient;
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
 use aurcache_utils::package::update::{package_resync_dependencies, package_update};
@@ -49,7 +46,6 @@ use sea_orm::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
 /// Resolve an optional pkgbase to its row id, for endpoints whose per-package
@@ -137,11 +133,8 @@ fn parse_platforms(platforms: Option<Vec<String>>) -> Result<Option<Vec<Platform
 /// watching -- is read back from [`bulk_add_progress`].
 #[post("/packages", data = "<input>")]
 pub async fn packages_add_endpoint(
-    db: &State<DatabaseConnection>,
+    services: &State<Services>,
     input: Json<AddPackages>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<status::Accepted<Json<BulkAddAccepted>>, ApiError> {
@@ -153,28 +146,23 @@ pub async fn packages_add_endpoint(
     let build_flags = input.build_flags.as_deref().map(normalize_build_flags);
     let total = i32::try_from(input.sources.len()).unwrap_or(i32::MAX);
 
-    let job_id = operations::create(db.inner(), operations::KIND_BULK_ADD, total)
+    let job_id = operations::create(&services.db, operations::KIND_BULK_ADD, total)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     // Everything the task needs is cloned in: it outlives this request by
     // design, so it cannot borrow from it.
-    let db_task = db.inner().clone();
-    let tx_task = tx.inner().clone();
-    let store_task = Arc::clone(store.inner());
-    let client_task = Arc::clone(client.inner());
+    let services_task = services.inner().clone();
+    let db_task = services_task.db.clone();
     let al_task = al.inner().clone();
     let username = a.username.clone();
 
     tokio::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let worker = {
-            let db = db_task.clone();
-            let store = Arc::clone(&store_task);
-            let client = Arc::clone(&client_task);
             tokio::spawn(async move {
                 aurcache_utils::package::bulk_add::bulk_add(
-                    &Services::new(&client, &store, &db, &tx_task),
+                    &services_task,
                     platforms,
                     build_flags,
                     input.sources,
@@ -322,11 +310,8 @@ pub async fn bulk_add_progress(
 )]
 #[post("/package", data = "<input>")]
 pub async fn package_add_endpoint(
-    db: &State<DatabaseConnection>,
+    services: &State<Services>,
     input: Json<AddPackage>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
@@ -334,7 +319,7 @@ pub async fn package_add_endpoint(
     let platforms = parse_platforms(input.platforms)?;
 
     let new_pkg_name = package_add(
-        &Services::new(client, store, db, tx),
+        services,
         platforms,
         input.build_flags.as_deref().map(normalize_build_flags),
         input.source,
@@ -369,15 +354,12 @@ pub async fn package_add_endpoint(
 )]
 #[patch("/package/<pkgbase>", data = "<input>")]
 pub async fn package_update_entity_endpoint(
-    db: &State<DatabaseConnection>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
+    services: &State<Services>,
     input: Json<PackagePatch>,
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    let db = db.inner();
+    let db = &services.db;
 
     // We cannot move things out of Json<T>, but we can move it out of T.
     let input = input.into_inner();
@@ -439,7 +421,7 @@ pub async fn package_update_entity_endpoint(
     // whole graph from source, which both adds newly-required dependencies and
     // drops ones no longer needed.
     if patch_changed || platforms_changed {
-        package_resync_dependencies(&Services::new(client, store, db, tx), &updated)
+        package_resync_dependencies(services, &updated)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     }
@@ -518,22 +500,20 @@ pub async fn package_source_file(
 )]
 #[put("/package/<pkgbase>/source/file", data = "<input>")]
 pub async fn package_source_file_update(
-    db: &State<DatabaseConnection>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
+    services: &State<Services>,
     pkgbase: &str,
     input: Json<SourceFileUpdate>,
     _a: Authenticated,
 ) -> Result<(), ApiError> {
-    let db = db.inner();
+    let db = &services.db;
     let input = input.into_inner();
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     // Diff against the pristine (unpatched) file, not the currently effective
     // one, so re-saving the same edit twice is idempotent.
-    let original = store
+    let original = services
+        .store
         .read_file(&pkg.source_data, None, &input.path)
         .await
         .map_err(|e| err(Status::NotFound, e))?;
@@ -575,7 +555,7 @@ pub async fn package_source_file_update(
     // than waiting for the next explicit "update" trigger.
     let mut resynced_pkg = pkg;
     resynced_pkg.patch = new_patch;
-    package_resync_dependencies(&Services::new(client, store, db, tx), &resynced_pkg)
+    package_resync_dependencies(services, &resynced_pkg)
         .await
         .map_err(|e| {
             err(
@@ -641,19 +621,19 @@ pub async fn package_source_preview_file(
 )]
 #[post("/package/<pkgbase>/update", data = "<input>")]
 pub async fn package_update_endpoint(
-    services: ApiServices<'_>,
+    services: &State<Services>,
     pkgbase: &str,
     input: Json<UpdatePackage>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<Json<Vec<i32>>, ApiError> {
-    let db = services.db;
+    let db = &services.db;
 
     let pkg_model: packages::Model = package_by_pkgbase(db, pkgbase).await?;
     let package_name = pkg_model.name.clone();
     let forced = input.force;
 
-    let pkg_update = package_update(&services, pkg_model, forced)
+    let pkg_update = package_update(services, pkg_model, forced)
         .await
         .map(|results| {
             Json(

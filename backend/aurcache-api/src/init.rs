@@ -7,9 +7,8 @@ use crate::embed::CustomHandler;
 use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, oauth_config_from_env};
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::action::Action;
 use aurcache_db::helpers::downloads::DownloadCounter;
-use aurcache_deps::AurClient;
+use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
@@ -21,7 +20,6 @@ use sea_orm::DatabaseConnection;
 use std::env;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use utoipa::openapi::security::{AuthorizationCode, Flow, OAuth2, Scopes};
@@ -97,10 +95,7 @@ pub struct CaDirectory(pub std::path::PathBuf);
 pub struct ServerVersion(pub String);
 
 pub fn init_api(
-    db: DatabaseConnection,
-    tx: Sender<Action>,
-    store: Arc<SnapshotStore>,
-    client: Arc<AurClient>,
+    services: Services,
     downloads: Arc<DownloadCounter>,
     version: ServerVersion,
     ca_dir: CaDirectory,
@@ -200,14 +195,14 @@ pub fn init_api(
             // and must never be re-compressed. The fairing's own defaults also
             // skip images, video, archives and `text/event-stream`.
             .attach(Compression::with_level(Level::Precise(4)))
-            .manage(db.clone())
-            .manage(tx)
+            .manage(services.db.clone())
+            .manage(services.tx.clone())
             .manage(OauthEnabled(oauth_config.is_ok()))
-            .manage(ActivityLog::new(db))
-            .manage(store)
-            .manage(client)
-            // Shared with the repository server, so a package's count includes
-            // downloads not yet flushed rather than stalling until they are.
+            .manage(ActivityLog::new(services.db.clone()))
+            // Also managed on their own: a route that needs one of them says
+            // so, rather than asking for the bundle and using a field.
+            .manage(Arc::clone(&services.store))
+            .manage(services)
             .manage(downloads)
             .manage(version)
             .manage(ca_dir)

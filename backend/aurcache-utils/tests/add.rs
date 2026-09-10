@@ -27,6 +27,7 @@ use wiremock::{
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
+use std::sync::Arc;
 
 // -----------------------------------------------------------------------
 // Test helpers
@@ -36,7 +37,7 @@ struct TestEnv {
     db: DatabaseConnection,
     _rx: tokio::sync::broadcast::Receiver<Action>,
     server: MockServer,
-    client: AurClient,
+    client: Arc<AurClient>,
     _repo_dir: TempDir,
     _official_dir: TempDir,
     repo_root: std::path::PathBuf,
@@ -62,11 +63,11 @@ async fn setup_env() -> TestEnv {
     fs::create_dir_all(&official_cache_dir).expect("failed to create official cache dir");
     seed_official_repo_cache_empty(&official_cache_dir);
 
-    let client = AurClient::with_urls_and_paths(
+    let client = Arc::new(AurClient::with_urls_and_paths(
         format!("{base_url}/rpc/v5"),
         mirrorlist_path,
         official_cache_dir.clone(),
-    );
+    ));
     // What the server does at startup. The seeded cache is fresh, so this
     // reads it rather than fetching: "the official repositories hold nothing"
     // as opposed to "they could not be read", which resolution refuses to
@@ -326,7 +327,12 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
         env.aur_root.path().to_string_lossy().to_string(),
     );
     package_add(
-        &Services::new(&env.client, &store, &env.db, &tx),
+        &Services::new(
+            env.db.clone(),
+            tx.clone(),
+            Arc::new(store),
+            env.client.clone(),
+        ),
         None,
         None,
         SourceData::Aur {

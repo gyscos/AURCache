@@ -102,12 +102,19 @@ async fn test_client() -> (Client, DatabaseConnection) {
         .manage(Arc::new(DownloadCounter::new()))
         .manage(ActivityLog::new(db.clone()))
         .manage(broadcast::channel::<Action>(16).0)
-        // Routes that resolve dependencies take it as state; these tests never
-        // reach one, but Rocket refuses to launch with an unmanaged type.
-        .manage(Arc::new(aurcache_deps::AurClient::new()))
+        // Routes that act on packages take the bundle; these tests never reach
+        // one, but Rocket refuses to launch with an unmanaged type.
         .manage(Arc::new(SnapshotStore::with_checkout_root(
             checkouts.path().to_path_buf(),
         )))
+        .manage(aurcache_utils::services::Services::new(
+            db.clone(),
+            broadcast::channel::<Action>(16).0,
+            Arc::new(SnapshotStore::with_checkout_root(
+                checkouts.path().to_path_buf(),
+            )),
+            Arc::new(aurcache_deps::AurClient::new()),
+        ))
         // The dump route reports which AURCache wrote a dump. Rocket's
         // sentinels refuse to launch without it, which is the point: a route
         // needing unmanaged state would otherwise 500 in production.

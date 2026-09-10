@@ -2,13 +2,13 @@
 
 use crate::init::{CaDirectory, ServerVersion};
 use crate::models::authenticated::Authenticated;
-use crate::services::ApiServices;
 use crate::utils::error::{ApiError, err};
 use aurcache_common::api::dump::{
     ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOptions, RestoreOutcome,
     RestoreProgress, SecretsPolicy,
 };
 use aurcache_db::helpers::operations;
+use aurcache_utils::services::Services;
 use rocket::FromForm;
 use rocket::data::Data;
 use rocket::http::{Header, Status};
@@ -147,7 +147,7 @@ pub struct RestoreQuery {
 
 #[post("/restore?<query..>", data = "<archive>")]
 pub async fn restore(
-    services: ApiServices<'_>,
+    services: &State<Services>,
     ca_dir: &State<CaDirectory>,
     query: RestoreQuery,
     archive: Data<'_>,
@@ -201,7 +201,7 @@ pub async fn restore(
     let total = i32::try_from(loaded.packages.len()).unwrap_or(i32::MAX);
 
     if options.dry_run {
-        let preview = aurcache_utils::restore::preview(services.db, &loaded, &options)
+        let preview = aurcache_utils::restore::preview(&services.db, &loaded, &options)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
         return Ok(status::Accepted(Json(RestoreAccepted {
@@ -211,11 +211,11 @@ pub async fn restore(
         })));
     }
 
-    let job_id = operations::create(services.db, operations::KIND_RESTORE, total)
+    let job_id = operations::create(&services.db, operations::KIND_RESTORE, total)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    let services_task = services.owned();
+    let services_task = services.inner().clone();
     let db_task = services_task.db.clone();
     let ca_dir_task = ca_dir.inner().clone();
 
@@ -224,7 +224,7 @@ pub async fn restore(
         let worker = {
             tokio::spawn(async move {
                 aurcache_utils::restore::apply(
-                    &services_task.services(),
+                    &services_task,
                     &ca_dir_task.0,
                     loaded,
                     options,

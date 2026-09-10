@@ -228,7 +228,7 @@ async fn resolve_srcinfo_to_spec(
 }
 
 async fn finalize_package_add(
-    services: &Services<'_>,
+    services: &Services,
     context: &AddContext,
     package_spec: PackageInsertSpec,
 ) -> anyhow::Result<String> {
@@ -237,7 +237,7 @@ async fn finalize_package_add(
         store,
         db,
         tx,
-    } = *services;
+    } = services;
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
         // It may have been a dependency row that no version check has reached
@@ -299,7 +299,7 @@ async fn finalize_package_add(
 // Each argument is an independent input to the add flow (services, targeting,
 // source, patches); bundling them into a struct would only move the same list.
 pub async fn package_add(
-    services: &Services<'_>,
+    services: &Services,
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
@@ -319,7 +319,7 @@ async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyho
 }
 
 async fn add_package_with_source(
-    services: &Services<'_>,
+    services: &Services,
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
@@ -329,7 +329,7 @@ async fn add_package_with_source(
         store: _,
         db: _,
         tx: _,
-    } = *services;
+    } = services;
     let source_data = resolve_source_pkgbase(client, source_data).await?;
     add_resolved_source(services, context, source_data, patched_files).await
 }
@@ -359,7 +359,7 @@ pub(crate) async fn resolve_source_pkgbase(
 /// The half of the add that stays per-package: a checkout, a dependency plan,
 /// and the rows. Only the resolution in front of it batches.
 pub(crate) async fn add_resolved_source(
-    services: &Services<'_>,
+    services: &Services,
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
@@ -369,7 +369,7 @@ pub(crate) async fn add_resolved_source(
         store,
         db: _,
         tx: _,
-    } = *services;
+    } = services;
     let package_spec = resolve_srcinfo_to_spec(
         store,
         &source_data,
