@@ -411,10 +411,13 @@ enum PackagesCommand {
     Update(UpdatePackageArgs),
     /// Partially update package metadata.
     Patch(PatchPackageArgs),
-    /// Remove the direct-request flag from a package.
-    Delete {
-        /// Package name (pkgbase).
-        pkgbase: String,
+    /// Remove the direct-request flag from one or more packages.
+    #[command(visible_alias = "delete")]
+    Rm {
+        /// Package names (pkgbase). Accepts several, so the names printed by
+        /// `pkg list -q` can be passed straight through.
+        #[arg(required = true)]
+        pkgbases: Vec<String>,
     },
 }
 
@@ -431,6 +434,11 @@ struct ListPackagesArgs {
     /// Include packages that are only present as dependencies.
     #[arg(long)]
     all: bool,
+
+    /// Print only the package names, one per line, so the list can be fed to
+    /// another command such as `pkg rm`.
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1044,8 +1052,8 @@ async fn run_packages_command(
         PackagesCommand::Add(args) => add_package_command(client, format, args).await,
         PackagesCommand::Update(args) => update_package_command(client, format, args).await,
         PackagesCommand::Patch(args) => patch_package_command(client, format, args).await,
-        PackagesCommand::Delete { pkgbase } => {
-            delete_package_command(client, format, &pkgbase).await
+        PackagesCommand::Rm { pkgbases } => {
+            remove_packages_command(client, format, &pkgbases).await
         }
     }
 }
@@ -1136,6 +1144,17 @@ async fn render_packages_list(
     let packages = client
         .list_packages(args.limit, args.page, args.all)
         .await?;
+    if args.quiet {
+        let names = packages
+            .into_iter()
+            .map(|package| package.name)
+            .collect::<Vec<_>>();
+        return render(format, &names, |names| {
+            for name in names {
+                println!("{name}");
+            }
+        });
+    }
     render(format, &packages, |packages| print_package_list(packages))
 }
 
@@ -1649,13 +1668,50 @@ fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
     Ok(())
 }
 
-async fn delete_package_command(
+/// Removing several packages is one request per package, so one failure must
+/// not hide the rest: every name is attempted, and what failed is reported
+/// together at the end.
+async fn remove_packages_command(
     client: &AurCacheClient,
     format: OutputFormat,
-    pkgbase: &str,
+    pkgbases: &[String],
 ) -> Result<()> {
-    client.delete_package(pkgbase).await?;
-    print_done_message(format, "package removed");
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for pkgbase in pkgbases {
+        match client.delete_package(pkgbase).await {
+            Ok(()) => removed.push(pkgbase.clone()),
+            Err(error) => failed.push((pkgbase.clone(), format!("{error:#}"))),
+        }
+    }
+
+    match format {
+        OutputFormat::Json => print_json(&json!({
+            "removed": removed,
+            "failed": failed
+                .iter()
+                .map(|(pkgbase, error)| json!({ "package": pkgbase, "error": error }))
+                .collect::<Vec<_>>(),
+        }))?,
+        OutputFormat::Text => {
+            for pkgbase in &removed {
+                println!("removed {pkgbase}");
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        let details = failed
+            .iter()
+            .map(|(pkgbase, error)| format!("  {pkgbase}: {error}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "failed to remove {} of {} package(s):\n{details}",
+            failed.len(),
+            pkgbases.len()
+        );
+    }
     Ok(())
 }
 
@@ -2285,8 +2341,8 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddPackageArgs, Cli, Command, RepoCommand, SetupCommand, build_status_label, compose,
-        parse_key_val, repo,
+        AddPackageArgs, Cli, Command, PackagesCommand, RepoCommand, SetupCommand,
+        build_status_label, compose, parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
@@ -2364,6 +2420,48 @@ mod tests {
         }
 
         assert!(Wrapper::try_parse_from(["test"]).is_err());
+    }
+
+    /// `pkg rm $(pkg list -q)` is the reason both sides exist: the list prints
+    /// bare names and the removal takes as many as it is given.
+    #[test]
+    fn rm_takes_the_names_list_prints() {
+        let cli = Cli::parse_from(["aurcache-cli", "pkg", "list", "-q"]);
+        let Command::Pkg {
+            command: PackagesCommand::List(args),
+        } = cli.command
+        else {
+            panic!("expected pkg list");
+        };
+        assert!(args.quiet);
+
+        let cli = Cli::parse_from(["aurcache-cli", "pkg", "rm", "paru", "yay"]);
+        let Command::Pkg {
+            command: PackagesCommand::Rm { pkgbases },
+        } = cli.command
+        else {
+            panic!("expected pkg rm");
+        };
+        assert_eq!(pkgbases, vec!["paru", "yay"]);
+    }
+
+    /// Naming nothing is a usage error, not a silent no-op.
+    #[test]
+    fn rm_still_requires_a_package() {
+        assert!(Cli::try_parse_from(["aurcache-cli", "pkg", "rm"]).is_err());
+    }
+
+    /// The old name keeps working for anything already scripted against it.
+    #[test]
+    fn delete_stays_an_alias_for_rm() {
+        let cli = Cli::parse_from(["aurcache-cli", "pkg", "delete", "paru"]);
+        let Command::Pkg {
+            command: PackagesCommand::Rm { pkgbases },
+        } = cli.command
+        else {
+            panic!("expected pkg rm");
+        };
+        assert_eq!(pkgbases, vec!["paru"]);
     }
 
     #[test]
