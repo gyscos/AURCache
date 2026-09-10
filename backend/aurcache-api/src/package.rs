@@ -8,6 +8,7 @@ use crate::models::package::{
     AddPackages, AurNotFoundPackage, AurPackage, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, PackageSource, SimplePackage,
 };
+use crate::services::ApiServices;
 use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
@@ -30,6 +31,7 @@ use aurcache_utils::package::live_check::package_remove;
 use aurcache_utils::package::update::{package_resync_dependencies, package_update};
 use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::pkg::satisfies_constraint;
+use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
@@ -172,10 +174,7 @@ pub async fn packages_add_endpoint(
             let client = Arc::clone(&client_task);
             tokio::spawn(async move {
                 aurcache_utils::package::bulk_add::bulk_add(
-                    &client,
-                    &store,
-                    &db,
-                    &tx_task,
+                    &Services::new(&client, &store, &db, &tx_task),
                     platforms,
                     build_flags,
                     input.sources,
@@ -335,10 +334,7 @@ pub async fn package_add_endpoint(
     let platforms = parse_platforms(input.platforms)?;
 
     let new_pkg_name = package_add(
-        client,
-        store,
-        db,
-        tx,
+        &Services::new(client, store, db, tx),
         platforms,
         input.build_flags.as_deref().map(normalize_build_flags),
         input.source,
@@ -443,7 +439,7 @@ pub async fn package_update_entity_endpoint(
     // whole graph from source, which both adds newly-required dependencies and
     // drops ones no longer needed.
     if patch_changed || platforms_changed {
-        package_resync_dependencies(client, store, db, tx, &updated)
+        package_resync_dependencies(&Services::new(client, store, db, tx), &updated)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
     }
@@ -579,7 +575,7 @@ pub async fn package_source_file_update(
     // than waiting for the next explicit "update" trigger.
     let mut resynced_pkg = pkg;
     resynced_pkg.patch = new_patch;
-    package_resync_dependencies(client, store, db, tx, &resynced_pkg)
+    package_resync_dependencies(&Services::new(client, store, db, tx), &resynced_pkg)
         .await
         .map_err(|e| {
             err(
@@ -644,24 +640,20 @@ pub async fn package_source_preview_file(
     )
 )]
 #[post("/package/<pkgbase>/update", data = "<input>")]
-#[allow(clippy::too_many_arguments)]
 pub async fn package_update_endpoint(
-    db: &State<DatabaseConnection>,
+    services: ApiServices<'_>,
     pkgbase: &str,
     input: Json<UpdatePackage>,
-    tx: &State<Sender<Action>>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<Json<Vec<i32>>, ApiError> {
-    let db = db.inner();
+    let db = services.db;
 
     let pkg_model: packages::Model = package_by_pkgbase(db, pkgbase).await?;
     let package_name = pkg_model.name.clone();
     let forced = input.force;
 
-    let pkg_update = package_update(client, store, db, pkg_model, forced, tx)
+    let pkg_update = package_update(&services, pkg_model, forced)
         .await
         .map(|results| {
             Json(

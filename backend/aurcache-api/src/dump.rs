@@ -2,15 +2,14 @@
 
 use crate::init::{CaDirectory, ServerVersion};
 use crate::models::authenticated::Authenticated;
+use crate::services::ApiServices;
 use crate::utils::error::{ApiError, err};
 use aurcache_common::api::dump::{
     ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOptions, RestoreOutcome,
     RestoreProgress, SecretsPolicy,
 };
-use aurcache_db::action::Action;
 use aurcache_db::helpers::operations;
-use aurcache_deps::AurClient;
-use aurcache_utils::snapshot::SnapshotStore;
+use rocket::FromForm;
 use rocket::data::Data;
 use rocket::http::{Header, Status};
 use rocket::response::status;
@@ -18,8 +17,6 @@ use rocket::serde::json::Json;
 use rocket::{Responder, State, get, post};
 use sea_orm::DatabaseConnection;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc;
 use tracing::warn;
 use utoipa::OpenApi;
@@ -135,24 +132,33 @@ mod tests {
 /// progress recorded the way a bulk add's is.
 // Rocket's request guards, the three query parameters and the body are each an
 // independent input; bundling them into a struct would only move the same list.
-#[allow(clippy::too_many_arguments)]
-#[post(
-    "/restore?<dry_run>&<on_existing>&<clear>&<secrets>",
-    data = "<archive>"
-)]
-pub async fn restore(
-    db: &State<DatabaseConnection>,
-    store: &State<Arc<SnapshotStore>>,
-    client: &State<Arc<AurClient>>,
-    tx: &State<Sender<Action>>,
-    ca_dir: &State<CaDirectory>,
+/// The restore route's query string, taken as one parameter.
+///
+/// Four options that arrive together and are consumed together, as
+/// [`RestoreOptions`] -- a `FromForm` keeps them that way instead of spreading
+/// them across the signature.
+#[derive(FromForm)]
+pub struct RestoreQuery {
     dry_run: Option<bool>,
     on_existing: Option<String>,
     clear: Option<bool>,
     secrets: Option<String>,
+}
+
+#[post("/restore?<query..>", data = "<archive>")]
+pub async fn restore(
+    services: ApiServices<'_>,
+    ca_dir: &State<CaDirectory>,
+    query: RestoreQuery,
     archive: Data<'_>,
     _a: Authenticated,
 ) -> Result<status::Accepted<Json<RestoreAccepted>>, ApiError> {
+    let RestoreQuery {
+        dry_run,
+        on_existing,
+        clear,
+        secrets,
+    } = query;
     let bytes = archive
         .open(MAX_DUMP_SIZE)
         .into_bytes()
@@ -195,7 +201,7 @@ pub async fn restore(
     let total = i32::try_from(loaded.packages.len()).unwrap_or(i32::MAX);
 
     if options.dry_run {
-        let preview = aurcache_utils::restore::preview(db.inner(), &loaded, &options)
+        let preview = aurcache_utils::restore::preview(services.db, &loaded, &options)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
         return Ok(status::Accepted(Json(RestoreAccepted {
@@ -205,28 +211,20 @@ pub async fn restore(
         })));
     }
 
-    let job_id = operations::create(db.inner(), operations::KIND_RESTORE, total)
+    let job_id = operations::create(services.db, operations::KIND_RESTORE, total)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    let db_task = db.inner().clone();
-    let store_task = Arc::clone(store.inner());
-    let client_task = Arc::clone(client.inner());
-    let tx_task = tx.inner().clone();
+    let services_task = services.owned();
+    let db_task = services_task.db.clone();
     let ca_dir_task = ca_dir.inner().clone();
 
     tokio::spawn(async move {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let worker = {
-            let db = db_task.clone();
-            let store = Arc::clone(&store_task);
-            let client = Arc::clone(&client_task);
             tokio::spawn(async move {
                 aurcache_utils::restore::apply(
-                    &db,
-                    &client,
-                    &store,
-                    &tx_task,
+                    &services_task.services(),
                     &ca_dir_task.0,
                     loaded,
                     options,

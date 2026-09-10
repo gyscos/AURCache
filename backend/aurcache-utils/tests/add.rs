@@ -24,7 +24,8 @@ use wiremock::{
     matchers::{method, path, query_param},
 };
 
-use aurcache_utils::package::add::package_add_with_client;
+use aurcache_utils::package::add::package_add;
+use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
 
 // -----------------------------------------------------------------------
@@ -324,11 +325,8 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
         env.checkout_dir.path().to_path_buf(),
         env.aur_root.path().to_string_lossy().to_string(),
     );
-    package_add_with_client(
-        &env.client,
-        &store,
-        &env.db,
-        &tx,
+    package_add(
+        &Services::new(&env.client, &store, &env.db, &tx),
         None,
         None,
         SourceData::Aur {

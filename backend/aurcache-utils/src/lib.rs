@@ -9,6 +9,7 @@ pub mod pkg;
 pub mod pkgbuild;
 pub mod repo_ingest;
 pub mod restore;
+pub mod services;
 pub mod settings;
 pub mod snapshot;
 pub mod utils;

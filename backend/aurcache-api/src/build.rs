@@ -1,4 +1,5 @@
 use aurcache_deps::AurClient;
+use aurcache_utils::services::Services;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, post};
@@ -394,7 +395,7 @@ pub async fn retry_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let platform_results = package_update(client, store, db, package, true, tx)
+    let platform_results = package_update(&Services::new(client, store, db, tx), package, true)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 

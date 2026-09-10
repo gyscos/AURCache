@@ -16,6 +16,7 @@ pub mod init;
 pub mod models;
 mod package;
 mod repo;
+pub mod services;
 mod settings;
 pub mod spa;
 mod stats;

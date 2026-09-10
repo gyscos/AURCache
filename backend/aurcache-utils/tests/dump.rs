@@ -19,7 +19,6 @@ async fn db() -> DatabaseConnection {
     db
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn package(
     db: &DatabaseConnection,
     name: &str,
@@ -594,10 +593,7 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &target,
-        &client,
-        &store,
-        &tx,
+        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
         &tempfile::tempdir().unwrap().keep(),
         loaded,
         RestoreOptions::default(),
@@ -880,10 +876,7 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &target,
-        &client,
-        &store,
-        &tx,
+        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions::default(),
@@ -941,10 +934,7 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &target,
-        &client,
-        &store,
-        &tx,
+        &aurcache_utils::services::Services::new(&client, &store, &target, &tx),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions {

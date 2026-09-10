@@ -32,7 +32,6 @@ use aurcache_common::api::dump::{
     SecretsPolicy, TOKENS_FILE, WORKERS_FILE,
 };
 use aurcache_common::builder::BuildStates;
-use aurcache_db::action::Action;
 use aurcache_db::packages::{SourceData, SourceType};
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings};
@@ -41,11 +40,11 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
-use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::package::add::{provides_json, split_packages_json};
+use crate::services::Services;
 use crate::snapshot::SnapshotStore;
 
 /// A dump that has been read and checked, ready to apply.
@@ -316,17 +315,19 @@ async fn package_row(
 /// package names, so a dependency naming one of those will not find it; the
 /// entry says so, because it is the difference between a restore that worked
 /// and one that looks like it did.
-#[allow(clippy::too_many_arguments)]
 pub async fn apply(
-    db: &DatabaseConnection,
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     ca_dir: &std::path::Path,
     dump: LoadedDump,
     options: RestoreOptions,
     progress: UnboundedSender<RestoreEntry>,
 ) {
+    let Services {
+        client: _,
+        store,
+        db,
+        tx: _,
+    } = *services;
     // PASS 1: rows. One transaction, because a half-applied dump is neither
     // what the instance was nor what the dump describes.
     let applied = match write_rows(db, &dump, &options).await {
@@ -392,9 +393,7 @@ pub async fn apply(
         let Ok(Some(row)) = package_row(db, pkgbase).await else {
             continue;
         };
-        if let Err(e) =
-            crate::package::update::package_resync_dependencies(client, store, db, tx, &row).await
-        {
+        if let Err(e) = crate::package::update::package_resync_dependencies(services, &row).await {
             warn!("restore: could not resolve dependencies for {pkgbase}: {e}");
             let _ = progress.send(RestoreEntry {
                 pkgbase: pkgbase.clone(),

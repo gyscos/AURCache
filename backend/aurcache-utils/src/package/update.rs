@@ -1,7 +1,7 @@
 use crate::package::add::{
     ensure_aur_package_exists_recursive, provides_json, split_packages_json,
 };
-use crate::snapshot::SnapshotStore;
+use crate::services::Services;
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
@@ -13,7 +13,7 @@ use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, dependencies, packages};
-use aurcache_deps::{AurClient, DependencyResolution, PkgDeps};
+use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
@@ -63,12 +63,8 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 ///
 /// Only packages whose latest build completed successfully are retriggered.
 /// Returns the build IDs enqueued across all updated packages.
-pub async fn package_update_all_outdated(
-    db: &DatabaseConnection,
-    client: &AurClient,
-    store: &SnapshotStore,
-    tx: &Sender<Action>,
-) -> anyhow::Result<Vec<i32>> {
+pub async fn package_update_all_outdated(services: &Services<'_>) -> anyhow::Result<Vec<i32>> {
+    let db = services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
         .filter(packages::Column::OutOfDate.eq(1))
         .all(db)
@@ -79,7 +75,7 @@ pub async fn package_update_all_outdated(
     for pkg in pkg_models {
         if pkg.status == BuildStates::SUCCESSFUL_BUILD {
             let package_name = pkg.name.clone();
-            let results = package_update_with_client(client, store, db, pkg, false, tx).await?;
+            let results = package_update(services, pkg, false).await?;
             activity_log
                 .add(
                     PackageUpdateActivity {
@@ -127,35 +123,12 @@ pub async fn package_update_all_outdated(
 ///   that was enqueued/promoted or left waiting on dependencies.
 /// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
 pub async fn package_update(
-    client: &AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
+    services: &Services<'_>,
     pkg_model: packages::Model,
     force: bool,
-    tx: &Sender<Action>,
-) -> anyhow::Result<Vec<PlatformUpdateResult>> {
-    package_update_with_client(client, store, db, pkg_model, force, tx).await
-}
-
-/// Update a single package using a caller-provided AUR client.
-///
-/// Returns one [`PlatformUpdateResult`] per configured platform.
-pub async fn package_update_with_client(
-    client: &AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    pkg_model: packages::Model,
-    force: bool,
-    tx: &Sender<Action>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let mut visited = HashSet::new();
-    let services = Services {
-        client,
-        store,
-        db,
-        tx,
-    };
-    package_update_with_client_inner(&services, pkg_model, force, &mut visited).await
+    package_update_inner(services, pkg_model, force, &mut visited).await
 }
 
 /// Recompute and persist a package's dependency graph from its current
@@ -164,22 +137,12 @@ pub async fn package_update_with_client(
 /// A patch edit can change `depends`/`makedepends` without necessarily
 /// bumping `pkgver`/`pkgrel`, so the dependency graph needs to be kept in
 /// sync independently of the regular version-triggered update flow. This is
-/// intentionally lighter-weight than [`package_update_with_client`]: it does
+/// intentionally lighter-weight than [`package_update`]: it does
 /// not enqueue or promote any builds.
 pub async fn package_resync_dependencies(
-    client: &AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     pkg_model: &packages::Model,
 ) -> anyhow::Result<()> {
-    let services = Services {
-        client,
-        store,
-        db,
-        tx,
-    };
-
     let sourceinfo = services
         .store
         .sourceinfo(&pkg_model.source_data, pkg_model.patch.as_deref())
@@ -190,7 +153,7 @@ pub async fn package_resync_dependencies(
         &crate::pkg::architectures_for_platforms(&pkg_model.platforms),
     );
 
-    sync_dependency_graph(&services, pkg_model, &deps).await?;
+    sync_dependency_graph(services, pkg_model, &deps).await?;
 
     // The dependency change may have made some previously-required
     // dependency-only packages no longer needed.
@@ -202,7 +165,7 @@ pub async fn package_resync_dependencies(
 /// Recursively update a package and its dependencies, enqueuing builds for ready platforms.
 #[allow(clippy::double_must_use)]
 #[async_recursion]
-async fn package_update_with_client_inner(
+async fn package_update_inner(
     services: &Services<'_>,
     pkg_model: packages::Model,
     force: bool,
@@ -563,22 +526,13 @@ async fn dependencies_ready_for_platform(
 
         // A dependency whose last build failed is not auto-retried.
         if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
-            package_update_with_client_inner(services, dep_info.package.clone(), true, visited)
-                .await?;
+            package_update_inner(services, dep_info.package.clone(), true, visited).await?;
         }
 
         return Ok(false);
     }
 
     Ok(true)
-}
-
-/// Shared service dependencies passed through the update pipeline.
-struct Services<'a> {
-    client: &'a AurClient,
-    store: &'a SnapshotStore,
-    db: &'a DatabaseConnection,
-    tx: &'a Sender<Action>,
 }
 
 /// What to build and its resolved dependency graph.
@@ -705,7 +659,8 @@ pub async fn update_platform(
 
 #[cfg(test)]
 mod tests {
-    use super::package_update_with_client;
+    use super::package_update;
+    use crate::services::Services;
     use crate::snapshot::SnapshotStore;
     use aurcache_common::builder::BuildStates;
     use aurcache_db::action::Action;
@@ -1030,9 +985,13 @@ mod tests {
         .unwrap();
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let results = package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
-            .await
-            .unwrap();
+        let results = package_update(
+            &Services::new(&client, &store, &db, &tx),
+            parent.clone(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -1240,9 +1199,13 @@ mod tests {
         .unwrap();
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let results = package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
-            .await
-            .unwrap();
+        let results = package_update(
+            &Services::new(&client, &store, &db, &tx),
+            parent.clone(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -1459,9 +1422,13 @@ mod tests {
         .unwrap();
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let results = package_update_with_client(&client, &store, &db, parent.clone(), true, &tx)
-            .await
-            .unwrap();
+        let results = package_update(
+            &Services::new(&client, &store, &db, &tx),
+            parent.clone(),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert!(
             results.iter().all(|r| !r.enqueued),
@@ -1651,10 +1618,13 @@ mod tests {
 
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
-        let build_ids =
-            package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
-                .await
-                .unwrap();
+        let build_ids = package_update(
+            &Services::new(&client, &store, &db, &tx),
+            parent.clone(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             build_ids.len(),
@@ -1732,9 +1702,10 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        let build_ids = package_update_with_client(&client, &store, &db, pkg.clone(), true, &tx)
-            .await
-            .unwrap();
+        let build_ids =
+            package_update(&Services::new(&client, &store, &db, &tx), pkg.clone(), true)
+                .await
+                .unwrap();
 
         assert_eq!(
             build_ids.len(),
@@ -1854,9 +1825,13 @@ mod tests {
         .unwrap();
 
         let (store, _checkout_dir) = test_store(aur_root.path());
-        package_update_with_client(&client, &store, &db, parent.clone(), false, &tx)
-            .await
-            .unwrap();
+        package_update(
+            &Services::new(&client, &store, &db, &tx),
+            parent.clone(),
+            false,
+        )
+        .await
+        .unwrap();
 
         // Dependency link should be removed
         let dep_count = dependencies::Entity::find()

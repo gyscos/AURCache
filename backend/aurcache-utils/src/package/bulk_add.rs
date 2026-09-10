@@ -15,16 +15,13 @@
 use std::collections::HashMap;
 
 use aurcache_common::api::package::{BulkAddEntry, BulkAddOutcome};
-use aurcache_db::action::Action;
 use aurcache_db::packages::SourceData;
 use pacman_mirrors::platforms::Platform;
-use sea_orm::DatabaseConnection;
-use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
 use crate::package::add::{AddContext, add_resolved_source, build_add_context};
-use crate::snapshot::SnapshotStore;
+use crate::services::Services;
 
 /// How a source was named in the request, for reporting it back.
 ///
@@ -82,19 +79,15 @@ pub(crate) async fn resolve_pkgbases(
 /// One package failing does not stop the rest either: a restore of a thousand
 /// packages should not be undone by one whose PKGBUILD no longer parses, and
 /// the entry says which it was.
-#[allow(clippy::too_many_arguments)]
 pub async fn bulk_add(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     sources: Vec<SourceData>,
     progress: UnboundedSender<BulkAddEntry>,
 ) {
     let context = build_add_context(platforms, build_flags);
-    let bases = resolve_pkgbases(client, &sources).await;
+    let bases = resolve_pkgbases(services.client, &sources).await;
 
     info!(
         "bulk add: {} sources, {} pkgbases resolved in batch",
@@ -105,7 +98,7 @@ pub async fn bulk_add(
     for source in sources {
         let name = source_label(&source);
         let resolved = apply_resolved_base(source, &bases);
-        let outcome = add_one(client, store, db, tx, &context, resolved).await;
+        let outcome = add_one(services, &context, resolved).await;
         // Ignore a closed channel: the observer left, the work has not.
         let _ = progress.send(BulkAddEntry { name, outcome });
     }
@@ -125,21 +118,18 @@ fn apply_resolved_base(source: SourceData, bases: &HashMap<String, String>) -> S
 /// One package's add, with its result turned into an outcome rather than an
 /// error, so the caller can record it and carry on.
 async fn add_one(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     context: &AddContext,
     source: SourceData,
 ) -> BulkAddOutcome {
     let existed = match &source {
-        SourceData::Aur { name } => crate::package::add::package_exists(db, name)
+        SourceData::Aur { name } => crate::package::add::package_exists(services.db, name)
             .await
             .unwrap_or(false),
         _ => false,
     };
 
-    match add_resolved_source(client, store, db, tx, context, source, None).await {
+    match add_resolved_source(services, context, source, None).await {
         Ok(_) if existed => BulkAddOutcome::Existed,
         Ok(_) => BulkAddOutcome::Added,
         Err(e) => BulkAddOutcome::Failed {

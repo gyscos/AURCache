@@ -2,11 +2,11 @@ use crate::package::enqueue::trigger_initial_builds;
 use crate::package::metadata::refresh_source_metadata;
 use crate::patch::SourcePatch;
 use crate::pkg::architectures_for_platforms;
+use crate::services::Services;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_common::builder::BuildStates;
-use aurcache_db::action::Action;
 use aurcache_db::helpers::dependency_resolution::{PackageCandidate, TrackedPackages};
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
@@ -20,7 +20,6 @@ use sea_orm::{
     TransactionTrait,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tokio::sync::broadcast::Sender;
 
 pub(crate) struct AddContext {
     platforms: Vec<Platform>,
@@ -229,13 +228,16 @@ async fn resolve_srcinfo_to_spec(
 }
 
 async fn finalize_package_add(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     context: &AddContext,
     package_spec: PackageInsertSpec,
 ) -> anyhow::Result<String> {
+    let Services {
+        client,
+        store,
+        db,
+        tx,
+    } = *services;
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
         // It may have been a dependency row that no version check has reached
@@ -296,45 +298,15 @@ async fn finalize_package_add(
 
 // Each argument is an independent input to the add flow (services, targeting,
 // source, patches); bundling them into a struct would only move the same list.
-#[allow(clippy::too_many_arguments)]
-pub async fn package_add_with_client(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+pub async fn package_add(
+    services: &Services<'_>,
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let context = build_add_context(platforms, build_flags);
-    add_package_with_source(client, store, db, tx, &context, source_data, patched_files).await
-}
-
-// Each argument is an independent input to the add flow (services, targeting,
-// source, patches); bundling them into a struct would only move the same list.
-#[allow(clippy::too_many_arguments)]
-pub async fn package_add(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
-    platforms: Option<Vec<Platform>>,
-    build_flags: Option<Vec<String>>,
-    source_data: SourceData,
-    patched_files: Option<BTreeMap<String, String>>,
-) -> anyhow::Result<String> {
-    package_add_with_client(
-        client,
-        store,
-        db,
-        tx,
-        platforms,
-        build_flags,
-        source_data,
-        patched_files,
-    )
-    .await
+    add_package_with_source(services, &context, source_data, patched_files).await
 }
 
 async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<()> {
@@ -347,16 +319,19 @@ async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyho
 }
 
 async fn add_package_with_source(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
+    let Services {
+        client,
+        store: _,
+        db: _,
+        tx: _,
+    } = *services;
     let source_data = resolve_source_pkgbase(client, source_data).await?;
-    add_resolved_source(client, store, db, tx, context, source_data, patched_files).await
+    add_resolved_source(services, context, source_data, patched_files).await
 }
 
 /// Turn a caller's source into one naming a pkgbase.
@@ -384,14 +359,17 @@ pub(crate) async fn resolve_source_pkgbase(
 /// The half of the add that stays per-package: a checkout, a dependency plan,
 /// and the rows. Only the resolution in front of it batches.
 pub(crate) async fn add_resolved_source(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
-    tx: &Sender<Action>,
+    services: &Services<'_>,
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
+    let Services {
+        client: _,
+        store,
+        db: _,
+        tx: _,
+    } = *services;
     let package_spec = resolve_srcinfo_to_spec(
         store,
         &source_data,
@@ -399,7 +377,7 @@ pub(crate) async fn add_resolved_source(
         &architectures_for_platforms(&context.platforms_str),
     )
     .await?;
-    finalize_package_add(client, store, db, tx, context, package_spec).await
+    finalize_package_add(services, context, package_spec).await
 }
 
 #[allow(clippy::double_must_use)]

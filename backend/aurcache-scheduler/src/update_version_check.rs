@@ -9,6 +9,7 @@ use aurcache_deps::AurClient;
 use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
+use aurcache_utils::services::Services;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::vcs_check::sync_vcs_sources;
@@ -224,7 +225,7 @@ async fn check_versions(
     let build_now: SettingsEntry<bool> =
         ApplicationSettings::get(Setting::BuildOnNewVersion, None, db).await;
     if build_now.value
-        && let Err(e) = package_update_all_outdated(db, client, store, tx).await
+        && let Err(e) = package_update_all_outdated(&Services::new(client, store, db, tx)).await
     {
         warn!("Failed to queue builds for newly outdated packages: {e}");
     }
