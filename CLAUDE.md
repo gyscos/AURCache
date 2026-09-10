@@ -77,6 +77,12 @@ cd docs && yarn install --frozen-lockfile && yarn build
 # build the Arch packages from this tree (and optionally install them)
 ./scripts/build-packages.sh --install
 ./scripts/build-packages.sh --packages aurcache-server
+
+# build (and push) the container images: server, worker, hybrid. Same thing the
+# publish workflow does. `--toolchain-repo` points armv7 at a pacman repository
+# that already has the cross toolchain, turning an hour into seconds.
+./scripts/build-images.sh <registry> --push --toolchain-repo 'http://host:8081/$arch'
+./scripts/build-images.sh --images server --platforms linux/amd64 <registry>
 ```
 
 ### Which end-to-end suite to run
@@ -166,6 +172,16 @@ defect this frontend has had was of that kind.
 - A size, a count or a total that is not known is `Option::None`, not `0`: "nothing recorded" and "zero
   bytes" are different answers, and the UI renders the first as a dash. Totals over several such values
   are all-or-nothing — a sum of only the known parts reads as a wrong number rather than as missing data.
+- Removing a package goes through `aurcache_utils::package::delete::package_delete`, never row by row.
+  It is the only thing that does the whole job: the `builds`, `files`, `settings`, VCS-source and
+  dependency rows, then the artifacts off disk and out of `repo.db`/`repo.files` and the build logs. It
+  deletes the children *before* the package row, because the artifacts are removed from Rust after the
+  commit and a cascade that took the `files` rows first would leave them with nothing to find them by.
+  An orphaned `files` row is not a harmless leak: ingest reads it as "already produced by another
+  package" and the artifact can never be published again.
+- The schema's foreign keys are enforced, on SQLite too — sqlx opens connections with `foreign_keys` on
+  and `init.rs` sets it explicitly. `files.package_id` and both of `dependencies`' package columns
+  cascade. A test that inserts a child row has to insert its package first.
 - The repo includes multiple containerized workflows: `docker-compose.hostmode.dev.yaml` mounts the host
   Docker socket for builds, `docker-compose.dindmode.dev.yaml` is the simpler dev setup, and
   `scripts/test-e2e.sh` exercises `docker-compose.e2e.yaml` end to end.
