@@ -17,7 +17,7 @@ use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, Set, TransactionTrait,
+    QueryFilter, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -333,6 +333,7 @@ async fn resolve_dependency_edges(
         &tracked,
         &crate::pkg::as_dependencies(&pairs),
         &[],
+        &current_dependee_names(&services.db, pkg_model.id).await?,
     )
     .await?;
 
@@ -366,6 +367,41 @@ async fn resolve_dependency_edges(
     }
 
     Ok(by_pkgbase)
+}
+
+/// The package bases this package already depends on.
+///
+/// Handed back to resolution as a preference, which is what lets a dependency
+/// someone repointed by hand persist. Every edge is recomputed from the
+/// declared names on each update, so a provider that beat the ranking once
+/// would otherwise be replaced by the ranking's own pick the next time round.
+/// Being the existing edge is only a tie-break among the packages that
+/// genuinely satisfy the name: one that stops providing it is dropped like any
+/// other, and the official repositories are still asked first.
+async fn current_dependee_names(
+    db: &DatabaseConnection,
+    dependent_id: i32,
+) -> anyhow::Result<HashSet<String>> {
+    let dependee_ids: Vec<i32> = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(dependent_id))
+        .select_only()
+        .column(dependencies::Column::DependeeId)
+        .into_tuple()
+        .all(db)
+        .await?;
+    if dependee_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    Ok(Packages::find()
+        .filter(packages::Column::Id.is_in(dependee_ids))
+        .select_only()
+        .column(packages::Column::Name)
+        .into_tuple::<String>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect())
 }
 
 /// Ensure all resolved dependency packages exist in the database,
@@ -671,6 +707,7 @@ mod tests {
     use aurcache_deps::AurClient;
     use git2::{Repository, Signature};
     use pacman_mirrors::platforms::Platform;
+    use sea_orm::DatabaseConnection;
     use sea_orm::{
         ActiveModelTrait, ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
         TryIntoModel,
@@ -1648,6 +1685,158 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parent_after.upstream_version.as_deref(), Some("2.0.0-1"));
+    }
+
+    /// Set up a git package declaring `mydep`, with two tracked packages able
+    /// to satisfy it: `mydep`, which carries the name, and `mydep-git`, which
+    /// only provides it. Ranking prefers the first; the returned ids are
+    /// `(parent, mydep, mydep-git)`.
+    async fn two_providers_of_one_name(
+        db: &DatabaseConnection,
+        repo_path: &Path,
+    ) -> (packages::Model, i32, i32) {
+        let parent = packages::ActiveModel {
+            name: Set("git-parent".to_string()),
+            status: Set(BuildStates::SUCCESSFUL_BUILD),
+            out_of_date: Set(0),
+            upstream_version: Set(Some("1.0.0".to_string())),
+            latest_build: Set(None),
+            build_flags: Set(String::new()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(packages::SourceType::Git),
+            source_data: Set(packages::SourceData::Git {
+                spec: packages::GitSourceSpec {
+                    url: repo_path.to_string_lossy().to_string(),
+                    r#ref: "main".to_string(),
+                    subfolder: String::new(),
+                },
+            }),
+            directly_requested: Set(true),
+            split_packages: Set(None),
+            ..Default::default()
+        }
+        .save(db)
+        .await
+        .unwrap()
+        .try_into_model()
+        .unwrap();
+
+        let provider = async |name: &str, provides: Option<serde_json::Value>| {
+            packages::ActiveModel {
+                name: Set(name.to_string()),
+                status: Set(BuildStates::SUCCESSFUL_BUILD),
+                out_of_date: Set(0),
+                upstream_version: Set(Some("1.0.0".to_string())),
+                latest_build: Set(None),
+                build_flags: Set(String::new()),
+                platforms: Set("x86_64".to_string()),
+                source_type: Set(packages::SourceType::Aur),
+                source_data: Set(SourceData::Aur { name: name.into() }),
+                // Requested, so the loser is not swept as an orphan and the
+                // assertion is about the edge and nothing else.
+                directly_requested: Set(true),
+                split_packages: Set(None),
+                provides: Set(provides.map(|value| value.to_string())),
+                ..Default::default()
+            }
+            .save(db)
+            .await
+            .unwrap()
+            .id
+            .unwrap()
+        };
+
+        let by_name = provider("mydep", None).await;
+        let by_provides = provider("mydep-git", Some(json!(["mydep"]))).await;
+        (parent, by_name, by_provides)
+    }
+
+    /// A dependency someone repointed by hand survives re-resolution.
+    ///
+    /// Every edge is recomputed from the declared names, so the existing edge
+    /// has to be an input to that or the ranking takes the choice straight
+    /// back: `mydep` carries the name and `mydep-git` only provides it.
+    #[tokio::test]
+    async fn a_repointed_dependency_survives_a_resync() {
+        let server = MockServer::start().await;
+        let (client, _official) =
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        commit_pkgbuild(&repo, "initial", "1.0.0", &["mydep"]);
+
+        let (parent, _by_name, by_provides) = two_providers_of_one_name(&db, dir.path()).await;
+
+        // The hand-picked edge, as an "update this link" action would leave it.
+        dependencies::ActiveModel {
+            dependent_id: Set(parent.id),
+            dependee_id: Set(by_provides),
+            version_constraint: Set(String::new()),
+            ..Default::default()
+        }
+        .save(&db)
+        .await
+        .unwrap();
+
+        let checkout_dir = tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
+        super::package_resync_dependencies(
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &parent,
+        )
+        .await
+        .unwrap();
+
+        let deps = Dependencies::find()
+            .filter(dependencies::Column::DependentId.eq(parent.id))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            deps[0].dependee_id, by_provides,
+            "the existing edge should outrank the better-ranked candidate"
+        );
+    }
+
+    /// The control: with no edge to prefer, the same two candidates resolve
+    /// the other way round. Without this the test above would pass on a
+    /// resolver that simply never changed its mind.
+    #[tokio::test]
+    async fn ranking_picks_the_provider_when_there_is_no_edge_yet() {
+        let server = MockServer::start().await;
+        let (client, _official) =
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        commit_pkgbuild(&repo, "initial", "1.0.0", &["mydep"]);
+
+        let (parent, by_name, _by_provides) = two_providers_of_one_name(&db, dir.path()).await;
+
+        let checkout_dir = tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
+        super::package_resync_dependencies(
+            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &parent,
+        )
+        .await
+        .unwrap();
+
+        let deps = Dependencies::find()
+            .filter(dependencies::Column::DependentId.eq(parent.id))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].dependee_id, by_name);
     }
 
     #[tokio::test]

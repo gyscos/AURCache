@@ -713,7 +713,16 @@ async fn ensure_deps(
     // stale and a package added earlier in the backfill would be resolved
     // against the AUR and inserted a second time.
     let tracked = TrackedPackages::load(db).await?;
-    let resolved_deps = match resolve_dependencies(client, &tracked, &deps_to_resolve, &[]).await {
+    // The backfill is what creates the edges, so there are none to prefer.
+    let resolved_deps = match resolve_dependencies(
+        client,
+        &tracked,
+        &deps_to_resolve,
+        &[],
+        &HashSet::new(),
+    )
+    .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("dependency resolution failed for {pkgbase}: {e}");

@@ -128,15 +128,20 @@ impl TrackedPackages {
 /// against the AUR and planned a second time. Callers with nothing in flight
 /// pass `&[]`.
 ///
+/// `preferred` are package bases to favour among the tracked candidates; see
+/// [`AurClient::resolve_dependencies`]. A package being re-resolved passes the
+/// bases it already depends on, so an edge someone repointed by hand is not
+/// undone. An add has no previous edges and passes an empty set.
 pub async fn resolve_dependencies(
     client: &AurClient,
     tracked: &TrackedPackages,
     deps: &[Dependency<'_>],
     planned: &[PackageCandidate],
+    preferred: &HashSet<String>,
 ) -> Result<Resolutions, aurcache_deps::Error> {
     let wanted = deps.iter().map(|dep| dep.name).collect();
     client
-        .resolve_dependencies(deps, &tracked.index(planned, &wanted))
+        .resolve_dependencies(deps, &tracked.index(planned, &wanted), preferred)
         .await
 }
 

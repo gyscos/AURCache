@@ -365,10 +365,25 @@ impl AurClient {
     /// build, which is both later and better informed than anything decidable
     /// here. The AUR columns have nothing to check, since the version will be
     /// whatever the build produces.
+    ///
+    /// `preferred` are package bases the caller would rather have among the
+    /// tracked candidates -- in practice, the ones the package being resolved
+    /// already depends on. It only reorders column 2: the official
+    /// repositories are still asked first, and the AUR still last. Within the
+    /// preferred set the usual ranking applies.
+    ///
+    /// This is what makes a hand-picked provider survive. Re-resolution
+    /// recomputes every edge from the declared names, so without it a choice
+    /// that beat the ranking once would be undone the next time the package
+    /// was updated; with it, the existing edge is the first thing consulted
+    /// and only loses if it no longer satisfies the name at all. It also keeps
+    /// resolution stable for its own sake: two providers of equal rank stop
+    /// trading places between runs.
     pub async fn resolve_dependencies(
         &self,
         deps: &[Dependency<'_>],
         tracked: &SatisfyIndex,
+        preferred: &HashSet<String>,
     ) -> Result<Resolutions, Error> {
         // A pkgbase can name the same dependency in `depends` and
         // `makedepends`, and its split packages multiply that again.
@@ -386,7 +401,8 @@ impl AurClient {
             found.official = self.official.holds(dep.name).await?;
         }
 
-        // Column 2: what AURCache already tracks. In memory; costs nothing.
+        // Column 2: what AURCache already tracks, `preferred` first. In
+        // memory; costs nothing.
         // A row, not a built artifact: the two are kept in step -- deleting a
         // package removes its artifact -- and only a row can carry the
         // dependency edge that rebuilds dependents when it changes.
@@ -395,7 +411,8 @@ impl AurClient {
                 continue;
             }
             found.tracked = tracked
-                .best_match(dep.name, |_| true)
+                .best_match(dep.name, |matched| preferred.contains(&matched.pkgbase))
+                .or_else(|| tracked.best_match(dep.name, |_| true))
                 .map(|matched| matched.pkgbase.clone());
         }
 

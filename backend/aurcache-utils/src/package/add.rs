@@ -473,6 +473,8 @@ async fn plan_package_with_deps(
             tracked,
             &crate::pkg::as_dependencies(&pairs),
             &plan.candidates(),
+            // An add has no edges yet, so there is nothing to prefer.
+            &HashSet::new(),
         )
         .await
         .map_err(|e| {

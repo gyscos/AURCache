@@ -8,6 +8,7 @@
 //! live in `core`/`extra`/`multilib`, and resolving those over the network
 //! first spent a request per package on an answer already sitting in a file.
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::Path;
 
@@ -16,6 +17,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// No package base is favoured over another: what every caller but a
+/// re-resolve passes.
+fn no_preference() -> HashSet<String> {
+    HashSet::new()
+}
 
 /// Write one official repository database holding a `desc` entry per package.
 fn write_official_db(
@@ -96,7 +103,11 @@ async fn a_tracked_package_resolves_locally_and_costs_no_rpc_call() {
 
     let resolved = env
         .client
-        .resolve_dependencies(&[Dependency::unversioned("mydep")], &tracked)
+        .resolve_dependencies(
+            &[Dependency::unversioned("mydep")],
+            &tracked,
+            &no_preference(),
+        )
         .await
         .unwrap();
 
@@ -107,6 +118,118 @@ async fn a_tracked_package_resolves_locally_and_costs_no_rpc_call() {
         })
     );
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// An existing edge outranks a better-ranked newcomer.
+///
+/// Ranking alone would pick `mydep`, which carries the name, over `mydep-git`,
+/// which only provides it. Preferring what the package already depends on is
+/// what lets someone repoint an edge by hand and have it survive: every edge
+/// is recomputed from the declared names on each update, so without this the
+/// ranking would take the choice back at once.
+#[tokio::test]
+async fn a_preferred_package_beats_a_better_ranked_one() {
+    let server = MockServer::start().await;
+    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]).await;
+
+    let mut tracked = SatisfyIndex::new();
+    tracked.insert("mydep", "mydep", MatchKind::Name, None);
+    tracked.insert("mydep", "mydep-git", MatchKind::Provides, None);
+
+    let preferred = HashSet::from(["mydep-git".to_string()]);
+    let resolved = env
+        .client
+        .resolve_dependencies(&[Dependency::unversioned("mydep")], &tracked, &preferred)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolved.get("mydep"),
+        Some(&DependencyResolution::Local {
+            pkgbase: "mydep-git".to_string()
+        })
+    );
+}
+
+/// Without the preference the same index resolves the other way, which is what
+/// makes the test above about the preference and not about the index.
+#[tokio::test]
+async fn ranking_decides_when_nothing_is_preferred() {
+    let server = MockServer::start().await;
+    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]).await;
+
+    let mut tracked = SatisfyIndex::new();
+    tracked.insert("mydep", "mydep", MatchKind::Name, None);
+    tracked.insert("mydep", "mydep-git", MatchKind::Provides, None);
+
+    let resolved = env
+        .client
+        .resolve_dependencies(
+            &[Dependency::unversioned("mydep")],
+            &tracked,
+            &no_preference(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolved.get("mydep"),
+        Some(&DependencyResolution::Local {
+            pkgbase: "mydep".to_string()
+        })
+    );
+}
+
+/// A preference is a tie-break among the packages that answer to the name, not
+/// a way to keep one that no longer does. A package that stopped providing the
+/// name is dropped like any other, and resolution falls through to whatever
+/// still claims it.
+#[tokio::test]
+async fn a_preferred_package_that_no_longer_provides_the_name_is_dropped() {
+    let server = MockServer::start().await;
+    let env = env_for(&format!("{}/rpc/v5", server.uri()), &[]).await;
+
+    let mut tracked = SatisfyIndex::new();
+    tracked.insert("mydep", "mydep", MatchKind::Name, None);
+
+    let preferred = HashSet::from(["mydep-git".to_string()]);
+    let resolved = env
+        .client
+        .resolve_dependencies(&[Dependency::unversioned("mydep")], &tracked, &preferred)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resolved.get("mydep"),
+        Some(&DependencyResolution::Local {
+            pkgbase: "mydep".to_string()
+        })
+    );
+}
+
+/// The preference reorders stage 2 only. The official repositories are still
+/// asked first, so an edge cannot be pinned to a tracked package for a name
+/// the repositories carry.
+#[tokio::test]
+async fn a_preference_does_not_outrank_the_official_repositories() {
+    let server = MockServer::start().await;
+    let env = env_for(
+        &format!("{}/rpc/v5", server.uri()),
+        &[("git", Some("2.52.0-1"), &[])],
+    )
+    .await;
+
+    let mut tracked = SatisfyIndex::new();
+    tracked.insert("git", "git-git", MatchKind::Provides, None);
+
+    let preferred = HashSet::from(["git-git".to_string()]);
+    let resolved = env
+        .client
+        .resolve_dependencies(&[Dependency::unversioned("git")], &tracked, &preferred)
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.get("git"), Some(&DependencyResolution::Available));
 }
 
 /// Stage 1 wins over stage 2, and how a candidate claims the name does not
@@ -130,7 +253,11 @@ async fn the_official_repositories_beat_a_tracked_package_that_provides_the_name
 
     let resolved = env
         .client
-        .resolve_dependencies(&[Dependency::unversioned("git")], &tracked)
+        .resolve_dependencies(
+            &[Dependency::unversioned("git")],
+            &tracked,
+            &no_preference(),
+        )
         .await
         .unwrap();
 
@@ -155,7 +282,11 @@ async fn a_dependency_in_the_official_repositories_costs_no_rpc_call() {
 
     let resolved = env
         .client
-        .resolve_dependencies(&[Dependency::unversioned("mydep")], &SatisfyIndex::new())
+        .resolve_dependencies(
+            &[Dependency::unversioned("mydep")],
+            &SatisfyIndex::new(),
+            &no_preference(),
+        )
         .await
         .unwrap();
 
@@ -184,7 +315,11 @@ async fn a_provided_dependency_also_costs_no_rpc_call() {
 
     let resolved = env
         .client
-        .resolve_dependencies(&[Dependency::unversioned("mydep")], &SatisfyIndex::new())
+        .resolve_dependencies(
+            &[Dependency::unversioned("mydep")],
+            &SatisfyIndex::new(),
+            &no_preference(),
+        )
         .await
         .unwrap();
 
@@ -224,6 +359,7 @@ async fn only_the_unresolved_names_reach_the_aur() {
                 Dependency::unversioned("stranger"),
             ],
             &SatisfyIndex::new(),
+            &no_preference(),
         )
         .await
         .unwrap();
@@ -267,7 +403,11 @@ async fn a_name_nothing_provides_is_reported_as_unresolved() {
 
     let resolved = env
         .client
-        .resolve_dependencies(&[Dependency::unversioned("libjpeg6")], &SatisfyIndex::new())
+        .resolve_dependencies(
+            &[Dependency::unversioned("libjpeg6")],
+            &SatisfyIndex::new(),
+            &no_preference(),
+        )
         .await
         .unwrap();
 
@@ -288,7 +428,11 @@ async fn resolution_fails_while_the_official_repositories_are_unread() {
     );
 
     let result = client
-        .resolve_dependencies(&[Dependency::unversioned("glibc")], &SatisfyIndex::new())
+        .resolve_dependencies(
+            &[Dependency::unversioned("glibc")],
+            &SatisfyIndex::new(),
+            &no_preference(),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -315,6 +459,7 @@ async fn a_repeated_dependency_is_resolved_once() {
                 Dependency::unversioned("mydep"),
             ],
             &SatisfyIndex::new(),
+            &no_preference(),
         )
         .await
         .unwrap();
