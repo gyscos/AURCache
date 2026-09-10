@@ -25,6 +25,19 @@ use tokio::sync::broadcast::Sender;
 use tracing::info;
 
 /// Remove packages that have no remaining dependents and are not directly requested.
+///
+/// Deleting through [`package_delete`] rather than row by row here. The
+/// hand-written version this replaced took the builds, the dependency links and
+/// the VCS sources and left the `files` rows behind, pointing at a package id
+/// that no longer existed. Nothing notices until the same package is added
+/// again and rebuilt: ingest finds a `files` row for the artifact owned by
+/// somebody else, cannot find a dependency edge to justify a transfer -- there
+/// is no owner left to have one -- and refuses to publish with "already
+/// produced by another package". That is terminal, and it repeats on every
+/// retry until the build's attempt budget is spent, so the package can never be
+/// built again. `files.package_id` has a foreign key now, which would have made
+/// this loud rather than silent, but the rows still have to go so their
+/// artifacts leave the repository with them.
 async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> anyhow::Result<()> {
     let candidates = Packages::find()
         .filter(packages::Column::DirectlyRequested.eq(false))
@@ -40,21 +53,7 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
         if dep_count > 0 {
             continue;
         }
-        let txn = db.begin().await?;
-        builds::Entity::delete_many()
-            .filter(builds::Column::PkgId.eq(pkg.id))
-            .exec(&txn)
-            .await?;
-        dependencies::Entity::delete_many()
-            .filter(dependencies::Column::DependentId.eq(pkg.id))
-            .exec(&txn)
-            .await?;
-        aurcache_db::package_vcs_sources::Entity::delete_many()
-            .filter(aurcache_db::package_vcs_sources::Column::PackageId.eq(pkg.id))
-            .exec(&txn)
-            .await?;
-        packages::Entity::delete_by_id(pkg.id).exec(&txn).await?;
-        txn.commit().await?;
+        crate::package::delete::package_delete(db, pkg.id).await?;
     }
     Ok(())
 }
