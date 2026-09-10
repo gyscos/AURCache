@@ -48,10 +48,13 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 # Wall clock, for "3h ago" on the builds list.
 js-sys = "0.3"
-# Joining the two requests the package page makes, so they overlap rather than
-# queue. `default-features = false` keeps the executor out: the browser is the
+# Joining requests so they overlap rather than queue: the two the package page
+# makes, and one per dependent when working out where a package's dependents
+# could go instead. `alloc` is what `join_all` needs -- the fixed-arity `join`
+# cannot take a list whose length is the number of dependents.
+# `default-features = false` keeps the executor out: the browser is the
 # executor here.
-futures-util = { version = "0.3", default-features = false, features = ["async-await"] }
+futures-util = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }
 # Timers: the build log polls, so it needs a sleep that works in the browser.
 gloo-timers = { version = "0.4", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Clipboard", "Document", "Element", "EventTarget", "History", "Location", "MediaQueryList", "Navigator", "Storage", "Window"] }

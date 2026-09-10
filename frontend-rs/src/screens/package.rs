@@ -634,13 +634,103 @@ fn shared_candidates(
     merged.into_iter().map(|(shared, _)| shared).collect()
 }
 
-/// Whether the official repositories have taken over every dependent's need
-/// for this package, in which case the edges are dropped rather than moved.
-fn official_everywhere(per_dependent: &[(String, aurcache_client::DependencyOptions)]) -> bool {
-    !per_dependent.is_empty()
-        && per_dependent.iter().all(|(_, options)| {
+/// What one dependent ends up depending on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Choice {
+    /// Drop the edge. The official repositories publish every name this
+    /// dependent declares, so nothing has to be built for it at all.
+    Official,
+    /// Depend on this package base instead.
+    Package(String),
+}
+
+/// One thing that can be offered as a replacement, and who it can serve.
+#[derive(Clone, Debug, PartialEq)]
+struct Offer {
+    choice: Choice,
+    /// `None` for the official repositories, which are not a package.
+    source: Option<aurcache_client::CandidateSource>,
+    serves: Vec<String>,
+}
+
+/// Everything that could take over from this package, best first.
+///
+/// The official repositories lead where they can take a dependent at all, even
+/// if that is only one of several. Coverage does not rank them against the
+/// packages below: dropping an edge builds nothing, so for a dependent they
+/// can serve there is no better answer, and a package serving four others does
+/// not make it a worse one for the fifth.
+///
+/// They are judged per dependent, not for the removal as a whole. One package
+/// can declare `git`, which `extra` publishes, while another declares this
+/// package's own name, which it does not -- the first is dropped and the
+/// second still needs somewhere to go.
+fn offers_for(loaded: &[(String, aurcache_client::DependencyOptions)]) -> Vec<Offer> {
+    let mut offers = Vec::new();
+
+    let official: Vec<String> = loaded
+        .iter()
+        .filter(|(_, options)| {
+            // Every declared name, not merely one of them: a dependent whose
+            // other name is unpublished would be left with a dependency
+            // nothing satisfies.
             !options.official.is_empty() && options.official.len() == options.declared_names.len()
         })
+        .map(|(dependent, _)| dependent.clone())
+        .collect();
+    if !official.is_empty() {
+        offers.push(Offer {
+            choice: Choice::Official,
+            source: None,
+            serves: official,
+        });
+    }
+
+    offers.extend(
+        shared_candidates(
+            &loaded
+                .iter()
+                .map(|(dependent, options)| (dependent.clone(), options.candidates.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|candidate| Offer {
+            choice: Choice::Package(candidate.pkgbase),
+            source: Some(candidate.source),
+            serves: candidate.serves,
+        }),
+    );
+
+    offers
+}
+
+/// Work out what each dependent ends up with, given what is selected.
+///
+/// More than one replacement can be picked, because one need not serve
+/// everybody -- `git-git` may cover the dependents asking for `git` while the
+/// one asking for `git-git` itself needs something else entirely. Each
+/// dependent takes the first selected offer that can serve it, in the order
+/// the offers are listed, so the answer is the one the list already put
+/// highest and selecting a further option never changes what an earlier one
+/// was doing.
+///
+/// `None` for a dependent means nothing selected can serve it: it has to be
+/// removed, or the package it needs stays.
+fn assign(
+    offers: &[Offer],
+    selected: &[Choice],
+    dependents: &[String],
+) -> Vec<(String, Option<Choice>)> {
+    dependents
+        .iter()
+        .map(|dependent| {
+            let choice = offers
+                .iter()
+                .find(|offer| selected.contains(&offer.choice) && offer.serves.contains(dependent))
+                .map(|offer| offer.choice.clone());
+            (dependent.clone(), choice)
+        })
+        .collect()
 }
 
 /// Send one dependency somewhere else. `None` drops it.
@@ -1540,7 +1630,7 @@ mod tests {
 
 #[cfg(test)]
 mod shared_candidate_tests {
-    use super::{official_everywhere, shared_candidates};
+    use super::{Choice, Offer, assign, offers_for, shared_candidates};
     use aurcache_client::{
         CandidateSource, DependencyCandidate, DependencyOptions, ReplacementVerdict,
     };
@@ -1627,30 +1717,147 @@ mod shared_candidate_tests {
         assert!(shared_candidates(&[]).is_empty());
     }
 
-    /// Dropping the edges is only offered when the repositories cover every
-    /// name every dependent declares -- one that they only half cover would
-    /// leave that dependent with an unsatisfied dependency.
+    /// The repositories are offered for a dependent they fully cover, and only
+    /// that one. A package declaring this package's own name is not served by
+    /// them however many of its neighbours are -- which is the difference
+    /// between `git` moving into `extra` and something that really does need
+    /// `git-git`.
     #[test]
-    fn dropping_needs_the_repositories_to_cover_everyone() {
-        assert!(official_everywhere(&[
-            ("one".to_string(), options(&["libfoo"], &["libfoo"])),
-            ("two".to_string(), options(&["libfoo"], &["libfoo"])),
-        ]));
+    fn the_repositories_are_offered_per_dependent() {
+        let offers = offers_for(&[
+            ("wants-git".to_string(), options(&["git"], &["git"])),
+            ("wants-git-git".to_string(), options(&["git-git"], &[])),
+        ]);
 
-        assert!(!official_everywhere(&[
-            ("one".to_string(), options(&["libfoo"], &["libfoo"])),
-            ("two".to_string(), options(&["libfoo"], &[])),
-        ]));
+        assert_eq!(offers[0].choice, Choice::Official);
+        assert_eq!(
+            offers[0].serves,
+            vec!["wants-git"],
+            "only the dependent they cover"
+        );
+    }
 
-        assert!(
-            !official_everywhere(&[(
-                "one".to_string(),
-                options(&["libfoo", "libfoo-compat"], &["libfoo"]),
-            )]),
-            "a partly covered dependent is not covered"
+    /// A dependent they cover only half of is not covered: the other name
+    /// would be left with nothing satisfying it.
+    #[test]
+    fn a_partly_published_dependent_is_not_offered_the_repositories() {
+        let offers = offers_for(&[(
+            "one".to_string(),
+            options(&["libfoo", "libfoo-compat"], &["libfoo"]),
+        )]);
+
+        assert!(offers.iter().all(|offer| offer.choice != Choice::Official));
+    }
+
+    /// The repositories lead where they can take a dependent at all. Dropping
+    /// an edge builds nothing, so for a dependent they serve there is no
+    /// better answer -- a package covering four others is not a better one for
+    /// the fifth.
+    #[test]
+    fn the_repositories_lead_even_when_they_cover_less() {
+        let mut wide = options(&["libfoo"], &[]);
+        wide.candidates = vec![candidate("wide")];
+        let mut published = options(&["libfoo"], &["libfoo"]);
+        published.candidates = vec![candidate("wide")];
+
+        let offers = offers_for(&[
+            ("one".to_string(), published),
+            ("two".to_string(), wide.clone()),
+            ("three".to_string(), wide),
+        ]);
+
+        assert_eq!(offers[0].choice, Choice::Official);
+        assert_eq!(offers[0].serves.len(), 1);
+        assert_eq!(offers[1].choice, Choice::Package("wide".to_string()));
+        assert_eq!(offers[1].serves.len(), 3);
+    }
+
+    fn offer(choice: Choice, serves: &[&str]) -> Offer {
+        Offer {
+            choice,
+            source: None,
+            serves: serves.iter().copied().map(String::from).collect(),
+        }
+    }
+
+    /// More than one replacement can be picked, because one need not serve
+    /// everybody. Each dependent then takes whichever selected option covers
+    /// it.
+    #[test]
+    fn several_replacements_can_share_the_dependents() {
+        let offers = vec![
+            offer(Choice::Package("left".to_string()), &["one"]),
+            offer(Choice::Package("right".to_string()), &["two"]),
+        ];
+        let selected = vec![
+            Choice::Package("left".to_string()),
+            Choice::Package("right".to_string()),
+        ];
+
+        let assigned = assign(&offers, &selected, &["one".to_string(), "two".to_string()]);
+
+        assert_eq!(
+            assigned,
+            vec![
+                ("one".to_string(), Some(Choice::Package("left".to_string()))),
+                (
+                    "two".to_string(),
+                    Some(Choice::Package("right".to_string()))
+                ),
+            ]
+        );
+    }
+
+    /// Where two selected options both serve a dependent, the one the list put
+    /// first wins -- so selecting a further option never moves a dependent
+    /// that an earlier one was already covering.
+    #[test]
+    fn the_first_offer_that_serves_a_dependent_takes_it() {
+        let offers = vec![
+            offer(Choice::Official, &["one"]),
+            offer(Choice::Package("also".to_string()), &["one"]),
+        ];
+
+        let assigned = assign(
+            &offers,
+            &[Choice::Official, Choice::Package("also".to_string())],
+            &["one".to_string()],
+        );
+        assert_eq!(assigned[0].1, Some(Choice::Official));
+
+        let without = assign(
+            &offers,
+            &[Choice::Package("also".to_string())],
+            &["one".to_string()],
+        );
+        assert_eq!(
+            without[0].1,
+            Some(Choice::Package("also".to_string())),
+            "and the later one takes it when the first is not selected"
+        );
+    }
+
+    /// A dependent nothing selected can serve has no assignment: it still
+    /// needs this package, and has to be removed or the removal does nothing.
+    #[test]
+    fn an_unserved_dependent_gets_nothing() {
+        let offers = vec![offer(Choice::Package("some".to_string()), &["one"])];
+
+        let assigned = assign(
+            &offers,
+            &[Choice::Package("some".to_string())],
+            &["one".to_string(), "two".to_string()],
         );
 
-        assert!(!official_everywhere(&[]), "nothing to cover is not cover");
+        assert_eq!(assigned[1], ("two".to_string(), None));
+    }
+
+    /// An offer that could serve a dependent does nothing until it is picked.
+    #[test]
+    fn an_unselected_offer_serves_nobody() {
+        let offers = vec![offer(Choice::Package("some".to_string()), &["one"])];
+        let assigned = assign(&offers, &[], &["one".to_string()]);
+        assert_eq!(assigned[0].1, None);
     }
 }
 
@@ -1885,6 +2092,44 @@ fn ReplaceAndRemoveCard(
     }
 }
 
+/// Every package that would go with `roots`, the roots included.
+///
+/// Removing a package is not a local act: everything that needs it stops
+/// existing too, and everything that needs those. Walking the dependents
+/// transitively is the only way to say what a removal costs before it happens
+/// -- and without it a cascade that stops one level down leaves the package it
+/// was meant to free still needed, so nothing is removed at all.
+async fn cascade_closure(
+    client: &aurcache_client::AurCacheClient,
+    roots: &[String],
+) -> Result<Vec<String>, String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = roots.to_vec();
+
+    while !frontier.is_empty() {
+        let fetched =
+            futures_util::future::join_all(frontier.iter().map(|name| client.get_package(name)))
+                .await;
+
+        let mut next = Vec::new();
+        for (name, result) in frontier.iter().zip(fetched) {
+            if seen.contains(name) {
+                continue;
+            }
+            seen.push(name.clone());
+            let package = result.map_err(|e| format!("{name}: {e}"))?;
+            for dependent in package.dependents {
+                if !seen.contains(&dependent.name) && !next.contains(&dependent.name) {
+                    next.push(dependent.name);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    Ok(seen)
+}
+
 /// Point every dependent somewhere else, then let the package fall away.
 #[component]
 fn ReplaceAndRemoveDialog(
@@ -1893,38 +2138,58 @@ fn ReplaceAndRemoveDialog(
     on_close: EventHandler<()>,
     on_changed: EventHandler<()>,
 ) -> Element {
-    // One request per dependent, in sequence. They are asked separately
-    // because they are answered separately: two packages needing this one can
-    // declare different names for it and hold different constraints, so a
-    // replacement that serves one need not serve the other.
-    let plan = use_resource({
-        let pkgbase = pkgbase.clone();
-        move || {
-            let pkgbase = pkgbase.clone();
-            let dependents = dependents.clone();
-            async move {
-                let client = client()?;
-                let mut loaded = Vec::new();
-                for dependent in &dependents {
-                    let options = client
-                        .dependency_options(&dependent.name, &pkgbase)
-                        .await
-                        .map_err(|e| format!("{}: {e}", dependent.name))?;
-                    loaded.push((dependent.name.clone(), options));
-                }
-                Ok::<_, String>(loaded)
-            }
+    let name = use_signal(|| pkgbase.clone());
+    let names: Vec<String> = dependents.iter().map(|d| d.name.clone()).collect();
+    let dependent_names = use_signal(|| names.clone());
+
+    // One request per dependent, all in flight together. They are asked
+    // separately because they are answered separately -- two packages needing
+    // this one can declare different names for it and hold different
+    // constraints -- but nothing about them is sequential.
+    let plan = use_resource(move || {
+        let pkgbase = name();
+        let dependents = dependent_names();
+        async move {
+            let client = client()?;
+            let answers = futures_util::future::join_all(
+                dependents
+                    .iter()
+                    .map(|dependent| client.dependency_options(dependent, &pkgbase)),
+            )
+            .await;
+
+            dependents
+                .into_iter()
+                .zip(answers)
+                .map(|(dependent, answer)| {
+                    answer
+                        .map(|options| (dependent.clone(), options))
+                        .map_err(|e| format!("{dependent}: {e}"))
+                })
+                .collect::<Result<Vec<_>, String>>()
         }
     });
 
-    let mut chosen = use_signal(|| Option::<String>::None);
-    let mut drop_everywhere = use_signal(|| false);
-    let mut remove_others = use_signal(|| false);
+    let mut selected = use_signal(Vec::<Choice>::new);
+    let mut removing = use_signal(Vec::<String>::new);
     let mut busy = use_signal(|| false);
     let mut errors = use_signal(Vec::<String>::new);
-    let name = use_signal(|| pkgbase.clone());
 
-    let apply = move |assignments: Vec<(String, Option<String>)>, leftover: Vec<String>| {
+    // What removing the ticked dependents actually takes with it. Reruns as
+    // they are ticked, because the answer is a walk of the dependent graph
+    // rather than anything this page already knows.
+    let cascade = use_resource(move || {
+        let roots = removing();
+        async move {
+            if roots.is_empty() {
+                return Ok(Vec::new());
+            }
+            let client = client()?;
+            cascade_closure(&client, &roots).await
+        }
+    });
+
+    let apply = move |assignments: Vec<(String, Choice)>, doomed: Vec<String>| {
         let pkgbase = name();
         spawn(async move {
             busy.set(true);
@@ -1940,15 +2205,25 @@ fn ReplaceAndRemoveDialog(
                 }
             };
 
-            for (dependent, replacement) in &assignments {
+            // In sequence: each one runs a collection on the way out, and two
+            // of those racing would each be deciding what is still reachable
+            // while the other changed it.
+            for (dependent, choice) in &assignments {
+                let replacement = match choice {
+                    Choice::Official => None,
+                    Choice::Package(pkgbase) => Some(pkgbase.as_str()),
+                };
                 if let Err(e) = client
-                    .replace_dependency(dependent, &pkgbase, replacement.as_deref())
+                    .replace_dependency(dependent, &pkgbase, replacement)
                     .await
                 {
                     failed.push(format!("{dependent}: {e}"));
                 }
             }
-            for dependent in &leftover {
+            // Furthest-out first: a package still has dependents until the
+            // things above it are gone, and only then does clearing it free
+            // what is underneath.
+            for dependent in doomed.iter().rev() {
                 if let Err(e) = client.delete_package(dependent).await {
                     failed.push(format!("{dependent}: {e}"));
                 }
@@ -1956,9 +2231,8 @@ fn ReplaceAndRemoveDialog(
 
             busy.set(false);
             if failed.is_empty() {
-                // Every dependent was dealt with, so the package went with the
-                // collection that follows the last edit. Going back to its page
-                // would land on a 404.
+                // Nothing needs it any more, so the collection after the last
+                // edit took it. Its page would now be a 404.
                 navigator().push(Route::Packages {
                     view: ViewParams::default(),
                     q: String::new(),
@@ -1976,7 +2250,7 @@ fn ReplaceAndRemoveDialog(
             role: "dialog",
             aria_modal: "true",
             aria_label: "Replace and remove",
-            div { class: "modal-box max-w-2xl",
+            div { class: "modal-box max-w-4xl",
                 h3 { class: "font-bold text-lg", "Remove {pkgbase}" }
 
                 for message in errors() {
@@ -1987,131 +2261,136 @@ fn ReplaceAndRemoveDialog(
                     None => rsx! {
                         div { class: "flex flex-col items-center gap-2 p-8",
                             span { class: "loading loading-spinner" }
-                            span { class: "text-xs opacity-60",
-                                "Looking for replacements…"
-                            }
+                            span { class: "text-xs opacity-60", "Looking for replacements…" }
                         }
                     },
                     Some(Err(e)) => rsx! {
                         div { class: "alert alert-error text-sm mt-3", span { "{e}" } }
                     },
                     Some(Ok(loaded)) => {
-                        let candidates = shared_candidates(
-                            &loaded
-                                .iter()
-                                .map(|(dependent, options)| {
-                                    (dependent.clone(), options.candidates.clone())
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        let all_official = official_everywhere(loaded);
-                        let total = loaded.len();
-                        let picked = chosen();
-                        let served: Vec<String> = if drop_everywhere() {
-                            loaded.iter().map(|(name, _)| name.clone()).collect()
-                        } else {
-                            candidates
-                                .iter()
-                                .find(|candidate| Some(&candidate.pkgbase) == picked.as_ref())
-                                .map(|candidate| candidate.serves.clone())
-                                .unwrap_or_default()
-                        };
-                        let leftover: Vec<String> = loaded
-                            .iter()
-                            .map(|(name, _)| name.clone())
-                            .filter(|name| !served.contains(name))
-                            .collect();
-                        let ready = !served.is_empty() && (leftover.is_empty() || remove_others());
+                        let offers = offers_for(loaded);
+                        let dependents: Vec<String> =
+                            loaded.iter().map(|(name, _)| name.clone()).collect();
+                        let total = dependents.len();
+                        let assignments = assign(&offers, &selected(), &dependents);
 
-                        let assignments: Vec<(String, Option<String>)> = served
+                        let doomed = match &*cascade.read_unchecked() {
+                            Some(Ok(closure)) => closure.clone(),
+                            _ => removing(),
+                        };
+                        // Every dependent has to be accounted for. One left
+                        // neither pointed elsewhere nor removed still needs
+                        // this package, and then removing it does nothing --
+                        // which is the button this card exists to replace.
+                        let unaccounted = assignments
                             .iter()
-                            .map(|dependent| {
-                                (
-                                    dependent.clone(),
-                                    if drop_everywhere() { None } else { picked.clone() },
-                                )
+                            .filter(|(dependent, choice)| {
+                                choice.is_none() && !removing().contains(dependent)
+                            })
+                            .count();
+                        let ready = unaccounted == 0;
+
+                        let to_apply: Vec<(String, Choice)> = assignments
+                            .iter()
+                            .filter(|(dependent, _)| !removing().contains(dependent))
+                            .filter_map(|(dependent, choice)| {
+                                choice.clone().map(|choice| (dependent.clone(), choice))
                             })
                             .collect();
-                        let to_remove = if remove_others() {
-                            leftover.clone()
-                        } else {
-                            Vec::new()
-                        };
 
                         rsx! {
                             p { class: "text-sm opacity-70 pt-1",
                                 "Needed by {total} "
                                 if total == 1 { "package" } else { "packages" }
-                                ". Pick what "
-                                if total == 1 { "it should" } else { "they should" }
-                                " depend on instead."
+                                ". Choose what can stand in for it; anything left over "
+                                "has to go with it."
                             }
 
-                            if all_official {
-                                label { class: "label cursor-pointer justify-start gap-3 mt-3 alert alert-info",
-                                    input {
-                                        r#type: "radio",
-                                        class: "radio radio-sm",
-                                        name: "replacement",
-                                        checked: drop_everywhere(),
-                                        onchange: move |_| {
-                                            drop_everywhere.set(true);
-                                            chosen.set(None);
-                                        },
-                                    }
-                                    span { class: "text-sm",
-                                        "The official repositories publish this now — drop the "
-                                        "dependency instead of replacing it. Nothing gets built for it."
-                                    }
-                                }
-                            }
-
-                            if candidates.is_empty() {
-                                p { class: "opacity-60 text-sm pt-4",
-                                    "Nothing else provides what these packages need."
-                                }
-                            } else {
-                                ul { class: "divide-y divide-base-300 pt-2 max-h-72 overflow-y-auto",
-                                    for candidate in candidates.iter() {
-                                        li {
-                                            key: "{candidate.pkgbase}",
-                                            class: "py-2",
-                                            label { class: "label cursor-pointer justify-start gap-3",
-                                                input {
-                                                    r#type: "radio",
-                                                    class: "radio radio-sm",
-                                                    name: "replacement",
-                                                    checked: picked.as_deref() == Some(candidate.pkgbase.as_str()),
-                                                    onchange: {
-                                                        let pkgbase = candidate.pkgbase.clone();
-                                                        move |_| {
-                                                            chosen.set(Some(pkgbase.clone()));
-                                                            drop_everywhere.set(false);
+                            div { class: "grid grid-cols-1 md:grid-cols-2 gap-4 pt-3",
+                                div {
+                                    h4 { class: "font-semibold text-sm pb-1", "Replace with" }
+                                    if offers.is_empty() {
+                                        p { class: "opacity-60 text-sm",
+                                            "Nothing else provides what these packages need."
+                                        }
+                                    } else {
+                                        ul { class: "divide-y divide-base-300 max-h-72 overflow-y-auto",
+                                            for offer in offers.iter() {
+                                                OfferRow {
+                                                    key: "{offer_key(&offer.choice)}",
+                                                    offer: offer.clone(),
+                                                    total,
+                                                    picked: selected().contains(&offer.choice),
+                                                    on_toggle: {
+                                                        let choice = offer.choice.clone();
+                                                        move |on: bool| {
+                                                            let mut current = selected();
+                                                            current.retain(|c| c != &choice);
+                                                            if on {
+                                                                current.push(choice.clone());
+                                                            }
+                                                            selected.set(current);
                                                         }
                                                     },
                                                 }
-                                                span { class: "font-mono text-sm break-all",
-                                                    "{candidate.pkgbase}"
-                                                }
-                                                match candidate.source {
-                                                    aurcache_client::CandidateSource::Tracked => rsx! {
-                                                        span { class: "badge badge-sm badge-neutral", "tracked" }
-                                                    },
-                                                    aurcache_client::CandidateSource::Aur => rsx! {
-                                                        span { class: "badge badge-sm badge-outline",
-                                                            "AUR — would be added"
+                                            }
+                                        }
+                                    }
+                                }
+
+                                div {
+                                    h4 { class: "font-semibold text-sm pb-1", "Dependents" }
+                                    ul { class: "divide-y divide-base-300 max-h-72 overflow-y-auto",
+                                        for (dependent, choice) in assignments.iter() {
+                                            DependentRow {
+                                                key: "{dependent}",
+                                                dependent: dependent.clone(),
+                                                choice: choice.clone(),
+                                                marked: removing().contains(dependent),
+                                                on_remove: {
+                                                    let dependent = dependent.clone();
+                                                    move |on: bool| {
+                                                        let mut current = removing();
+                                                        current.retain(|d| d != &dependent);
+                                                        if on {
+                                                            current.push(dependent.clone());
                                                         }
-                                                    },
-                                                }
-                                                // The number that decides the choice: anything
-                                                // short of all of them leaves packages behind.
-                                                if candidate.serves.len() == total {
-                                                    span { class: "badge badge-sm badge-success",
-                                                        "serves all {total}"
+                                                        removing.set(current);
                                                     }
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // What the ticked removals really cost. A dependent
+                            // has dependents of its own, and they cannot be left
+                            // needing something that is going away.
+                            if !removing().is_empty() {
+                                match &*cascade.read_unchecked() {
+                                    None => rsx! {
+                                        div { class: "text-xs opacity-60 pt-3",
+                                            "Working out what else that removes…"
+                                        }
+                                    },
+                                    Some(Err(e)) => rsx! {
+                                        div { class: "alert alert-error text-sm mt-3", span { "{e}" } }
+                                    },
+                                    Some(Ok(closure)) => {
+                                        let extra: Vec<String> = closure
+                                            .iter()
+                                            .filter(|name| !removing().contains(name))
+                                            .cloned()
+                                            .collect();
+                                        rsx! {
+                                            div { class: "alert alert-warning text-sm mt-3",
+                                                if extra.is_empty() {
+                                                    span { "Removes {removing().len()} package(s)." }
                                                 } else {
-                                                    span { class: "badge badge-sm badge-warning",
-                                                        "serves {candidate.serves.len()} of {total}"
+                                                    span {
+                                                        "Also removes {extra.join(\", \")}, which "
+                                                        "cannot survive without them."
                                                     }
                                                 }
                                             }
@@ -2120,22 +2399,12 @@ fn ReplaceAndRemoveDialog(
                                 }
                             }
 
-                            if !leftover.is_empty() && (picked.is_some() || drop_everywhere()) {
-                                label { class: "label cursor-pointer justify-start gap-3 mt-3 alert alert-warning",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox checkbox-sm",
-                                        checked: remove_others(),
-                                        onchange: move |event| remove_others.set(event.checked()),
-                                    }
-                                    span { class: "text-sm",
-                                        "Also remove {leftover.join(\", \")}, which this cannot serve. "
-                                        "Without that they keep needing {pkgbase} and it stays."
+                            div { class: "modal-action",
+                                if !ready {
+                                    span { class: "text-xs opacity-60 self-center",
+                                        "{unaccounted} dependent(s) still need {pkgbase}"
                                     }
                                 }
-                            }
-
-                            div { class: "modal-action",
                                 button {
                                     class: "btn btn-sm",
                                     disabled: busy(),
@@ -2145,7 +2414,7 @@ fn ReplaceAndRemoveDialog(
                                 button {
                                     class: "btn btn-error btn-sm",
                                     disabled: busy() || !ready,
-                                    onclick: move |_| apply(assignments.clone(), to_remove.clone()),
+                                    onclick: move |_| apply(to_apply.clone(), doomed.clone()),
                                     if busy() {
                                         span { class: "loading loading-spinner loading-xs" }
                                     }
@@ -2161,6 +2430,103 @@ fn ReplaceAndRemoveDialog(
                 disabled: busy(),
                 onclick: move |_| on_close.call(()),
                 "Close"
+            }
+        }
+    }
+}
+
+/// A stable identity for a choice, for keying its row.
+fn offer_key(choice: &Choice) -> String {
+    match choice {
+        Choice::Official => "::official".to_string(),
+        Choice::Package(pkgbase) => pkgbase.clone(),
+    }
+}
+
+/// One thing that could stand in, and how much of the job it does.
+#[component]
+fn OfferRow(offer: Offer, total: usize, picked: bool, on_toggle: EventHandler<bool>) -> Element {
+    rsx! {
+        li { class: "py-2",
+            label { class: "label cursor-pointer justify-start gap-3",
+                input {
+                    r#type: "checkbox",
+                    class: "checkbox checkbox-sm",
+                    checked: picked,
+                    onchange: move |event| on_toggle.call(event.checked()),
+                }
+                match &offer.choice {
+                    Choice::Official => rsx! {
+                        span { class: "text-sm", "Official repositories" }
+                        span { class: "badge badge-sm badge-info", "nothing to build" }
+                    },
+                    Choice::Package(pkgbase) => rsx! {
+                        span { class: "font-mono text-sm break-all", "{pkgbase}" }
+                        match offer.source {
+                            Some(aurcache_client::CandidateSource::Aur) => rsx! {
+                                span { class: "badge badge-sm badge-outline", "AUR" }
+                            },
+                            _ => rsx! {
+                                span { class: "badge badge-sm badge-neutral", "tracked" }
+                            },
+                        }
+                    },
+                }
+                if offer.serves.len() == total {
+                    span { class: "badge badge-sm badge-success", "covers all {total}" }
+                } else {
+                    span { class: "badge badge-sm badge-ghost",
+                        "covers {offer.serves.len()} of {total}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One dependent, and what it ends up with.
+#[component]
+fn DependentRow(
+    dependent: String,
+    choice: Option<Choice>,
+    marked: bool,
+    on_remove: EventHandler<bool>,
+) -> Element {
+    rsx! {
+        li { class: "py-2",
+            match choice {
+                // Ticked by what is selected on the left rather than by hand:
+                // a dependent does not get a say in which replacement covers
+                // it, only in whether it survives at all.
+                Some(choice) => rsx! {
+                    div { class: "flex items-center gap-3 px-1",
+                        input {
+                            r#type: "checkbox",
+                            class: "checkbox checkbox-sm checkbox-success",
+                            checked: true,
+                            disabled: true,
+                        }
+                        span { class: "font-mono text-sm break-all", "{dependent}" }
+                        span { class: "text-xs opacity-60",
+                            match &choice {
+                                Choice::Official => "→ official repositories".to_string(),
+                                Choice::Package(pkgbase) => format!("→ {pkgbase}"),
+                            }
+                        }
+                    }
+                },
+                None => rsx! {
+                    label { class: "label cursor-pointer justify-start gap-3",
+                        input {
+                            r#type: "checkbox",
+                            class: "checkbox checkbox-sm checkbox-warning",
+                            checked: marked,
+                            onchange: move |event| on_remove.call(event.checked()),
+                        }
+                        span { class: "font-mono text-sm break-all", "{dependent}" }
+                        span { class: "text-xs opacity-60", "remove" }
+                    }
+                },
             }
         }
     }
