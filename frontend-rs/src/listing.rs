@@ -19,6 +19,10 @@ pub enum SortKey {
     Size,
     /// The worker that ran a build. Builds only; packages have no worker.
     Worker,
+    /// How long a build ran, from the timestamps it records.
+    Duration,
+    /// A build's peak memory, from its cgroup. Builds only.
+    Memory,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,10 +72,12 @@ impl Sort {
             Self {
                 key,
                 dir: match key {
-                    // Newest build and largest package first: for these two the
-                    // interesting end is the top, where A-Z is the natural
-                    // reading for everything else.
-                    SortKey::Time | SortKey::Size => SortDir::Desc,
+                    // Newest build, largest package, longest build, highest
+                    // peak first: for these the interesting end is the top,
+                    // where A-Z is the natural reading for everything else.
+                    SortKey::Time | SortKey::Size | SortKey::Duration | SortKey::Memory => {
+                        SortDir::Desc
+                    }
                     _ => SortDir::Asc,
                 },
             }
@@ -183,9 +189,12 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
             // A package row carries no timestamp, so the package list does
             // not offer this column; falling back to name would present an
             // ordering that has nothing to do with time.
-            // Packages have no worker or time of their own; both fall back to
-            // the name so the column headers stay interchangeable.
-            SortKey::Time | SortKey::Worker => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            // Packages have no worker, duration or peak memory of their own;
+            // all of them fall back to the name so the column headers stay
+            // interchangeable.
+            SortKey::Time | SortKey::Worker | SortKey::Duration | SortKey::Memory => {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            }
             // `Option`'s own ordering is what this wants: `None` sorts below
             // every `Some`, so unrecorded sizes group at one end rather than
             // among the small ones, and land last under the descending order a
@@ -224,6 +233,18 @@ fn build_id(build: &Build) -> String {
     }
 }
 
+/// How long a build ran, in the same units as its timestamps.
+///
+/// `None` for a build that has not ended: it has no duration to speak of, and
+/// sorting treats that the way it treats an unrecorded size or peak -- grouped
+/// at one end rather than among the finished builds.
+fn duration(build: &Build) -> Option<i64> {
+    build
+        .start_time
+        .zip(build.end_time)
+        .map(|(start, end)| end - start)
+}
+
 pub fn sort_builds(builds: &mut [Build], sort: Sort) {
     builds.sort_by(|a, b| {
         let ordering = match sort.key {
@@ -246,6 +267,21 @@ pub fn sort_builds(builds: &mut [Build], sort: Sort) {
                 .map(str::to_lowercase)
                 .cmp(&b.worker_name.as_deref().map(str::to_lowercase))
                 // Within one worker, newest first, as the name grouping does.
+                .then(b.number.cmp(&a.number)),
+            // A build still running has no end yet, so no duration. `None`
+            // sorts before `Some`, which under the descending order a Duration
+            // column opens in puts the unfinished builds last, after the
+            // longest — the interesting end first.
+            SortKey::Duration => duration(a)
+                .cmp(&duration(b))
+                // Ties are ordered newest first for a stable readout.
+                .then(b.number.cmp(&a.number)),
+            // As with size, unrecorded peaks group at one end: `None` under
+            // every `Some`, and last under the descending order a Memory
+            // column opens in.
+            SortKey::Memory => a
+                .peak_memory
+                .cmp(&b.peak_memory)
                 .then(b.number.cmp(&a.number)),
         };
         match sort.dir {
@@ -640,6 +676,58 @@ mod tests {
         );
     }
 
+    /// A build still running has no duration, so it sorts last under the
+    /// descending order a Duration column opens in, after the longest.
+    #[test]
+    fn sorting_builds_by_duration_puts_the_longest_first() {
+        let mut builds = vec![
+            build(1, "a", BuildState::Successful, Some(100)),
+            build(2, "b", BuildState::Successful, Some(100)),
+            build(3, "c", BuildState::Successful, Some(100)),
+        ];
+        // #1 runs 100s, #2 runs 300s, #3 is still running (end not recorded).
+        builds[0].end_time = Some(200);
+        builds[1].end_time = Some(400);
+        sort_builds(
+            &mut builds,
+            Sort {
+                key: SortKey::Duration,
+                dir: SortDir::Desc,
+            },
+        );
+        assert_eq!(
+            builds.iter().map(|b| b.number).collect::<Vec<_>>(),
+            [2, 1, 3],
+            "longest first, still-running last"
+        );
+    }
+
+    /// An unrecorded peak groups at the end — it is missing data, not a build
+    /// that used no memory — so it lands last under the descending order a
+    /// Memory column opens in.
+    #[test]
+    fn sorting_builds_by_peak_memory_puts_the_highest_first() {
+        let mut builds = vec![
+            build(1, "a", BuildState::Successful, Some(100)),
+            build(2, "b", BuildState::Successful, Some(100)),
+            build(3, "c", BuildState::Successful, Some(100)),
+        ];
+        builds[0].peak_memory = Some(300);
+        builds[1].peak_memory = Some(100);
+        sort_builds(
+            &mut builds,
+            Sort {
+                key: SortKey::Memory,
+                dir: SortDir::Desc,
+            },
+        );
+        assert_eq!(
+            builds.iter().map(|b| b.number).collect::<Vec<_>>(),
+            [1, 2, 3],
+            "highest first, unrecorded last"
+        );
+    }
+
     /// Clicking the active column reverses it; clicking a new one starts from
     /// the direction that column is usually read in.
     #[test]
@@ -651,6 +739,10 @@ mod tests {
         assert_eq!(by_name.toggled(SortKey::Name).dir, SortDir::Desc);
         // Time starts newest-first, which is what a log is read as.
         assert_eq!(by_name.toggled(SortKey::Time).dir, SortDir::Desc);
+        // So do the other measurements whose interesting end is the top: the
+        // longest build and the highest peak first.
+        assert_eq!(by_name.toggled(SortKey::Duration).dir, SortDir::Desc);
+        assert_eq!(by_name.toggled(SortKey::Memory).dir, SortDir::Desc);
         // Everything else starts A-Z.
         assert_eq!(by_name.toggled(SortKey::Status).dir, SortDir::Asc);
     }
@@ -956,6 +1048,8 @@ impl SortKey {
             Self::Time => "time",
             Self::Size => "size",
             Self::Worker => "worker",
+            Self::Duration => "duration",
+            Self::Memory => "memory",
         }
     }
 
@@ -966,6 +1060,8 @@ impl SortKey {
             "time" => Some(Self::Time),
             "size" => Some(Self::Size),
             "worker" => Some(Self::Worker),
+            "duration" => Some(Self::Duration),
+            "memory" => Some(Self::Memory),
             _ => None,
         }
     }

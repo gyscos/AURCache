@@ -16,7 +16,9 @@ use crate::listing::ViewParams;
 use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
-use aurcache_client::{Build, ExtendedPackage, PackageFile, PackageSource, PatchPackageRequest};
+use aurcache_client::{
+    Build, ExtendedPackage, PackageFile, PackageSource, PatchPackageRequest, Setting, SettingSource,
+};
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
@@ -1067,6 +1069,7 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                         .collect(),
                     on_changed,
                 }
+                PersistBuildDirField { pkgbase: pkg.name.clone() }
                 Field { label: "Patch",
                     if pkg.has_patch {
                         span { class: "badge badge-warning badge-sm", "applied" }
@@ -1088,6 +1091,145 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                     class: "btn btn-sm btn-block mt-2",
                     to: Route::PackageConfigFiles { pkgbase: pkg.name },
                     "Config files"
+                }
+            }
+        }
+    }
+}
+
+/// Whether this package keeps its build tree between builds.
+///
+/// A boolean with no Save step: toggling applies immediately, which is all the
+/// setting warrants. The checkbox flips on click and a re-read after the write
+/// keeps the row showing what the server actually holds, and where it now comes
+/// from — a package override, or a value inherited from elsewhere.
+///
+/// Read through the settings sub-resource rather than the package object:
+/// settings are fetched separately, and folding one of them into the package
+/// payload would make every package request carry it.
+#[component]
+fn PersistBuildDirField(pkgbase: String) -> Element {
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+
+    // Held separately from the loaded entry so the checkbox can flip on click
+    // rather than after the round-trip; the entry's re-read on save re-syncs it.
+    let mut value = use_signal(|| false);
+
+    let mut entry = use_resource(use_reactive(&pkgbase, move |pkgbase| async move {
+        client()?
+            .settings(Some(&pkgbase))
+            .await
+            .map_err(|e| e.to_string())
+    }));
+
+    use_effect(move || {
+        if let Some(Ok(settings)) = entry.read().as_ref() {
+            value.set(settings.persistent_builddir.value);
+        }
+    });
+
+    // One pkgbase clone per handler: both are `move` closures, and each needs
+    // its own copy to hand the async block.
+    let set_pkgbase = pkgbase.clone();
+
+    let set = move |enabled: bool| {
+        let pkgbase = set_pkgbase.clone();
+        async move {
+            if busy() {
+                return;
+            }
+            busy.set(true);
+            error.set(None);
+            let outcome = match client() {
+                Ok(client) => client
+                    .patch_setting(
+                        Some(&pkgbase),
+                        Setting::PersistentBuilddir.meta().key,
+                        if enabled { "true" } else { "false" },
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            busy.set(false);
+            match outcome {
+                Ok(()) => {
+                    value.set(enabled);
+                    // Re-read so the row shows the value's new *source* as well
+                    // as its value.
+                    entry.restart();
+                }
+                Err(e) => error.set(Some(e)),
+            }
+        }
+    };
+
+    let reset = move |_| {
+        let pkgbase = pkgbase.clone();
+        async move {
+            if busy() {
+                return;
+            }
+            busy.set(true);
+            error.set(None);
+            let outcome = match client() {
+                Ok(client) => client
+                    .reset_setting(Some(&pkgbase), Setting::PersistentBuilddir.meta().key)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            busy.set(false);
+            match outcome {
+                Ok(()) => entry.restart(),
+                Err(e) => error.set(Some(e)),
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "flex gap-2 py-1 text-sm items-center",
+            span { class: "opacity-60 w-32 shrink-0", "Persist build dir" }
+            div { class: "min-w-0 flex-1",
+                match &*entry.read_unchecked() {
+                    None => rsx! {
+                        span { class: "loading loading-spinner loading-xs" }
+                    },
+                    Some(Err(e)) => rsx! {
+                        span { class: "text-xs text-error", "Could not load the setting: {e}" }
+                    },
+                    Some(Ok(settings)) => {
+                        let source = settings.persistent_builddir.source;
+                        let locked = source == SettingSource::Env;
+                        rsx! {
+                            div { class: "flex items-center gap-2 flex-wrap",
+                                input {
+                                    r#type: "checkbox",
+                                    class: "toggle toggle-primary",
+                                    disabled: locked || busy(),
+                                    checked: value(),
+                                    onchange: move |e: FormEvent| set(e.checked()),
+                                }
+                                if source == SettingSource::Package && !locked && !busy() {
+                                    button {
+                                        class: "btn btn-ghost btn-xs",
+                                        title: "Discard this package's override and inherit the default again",
+                                        onclick: reset,
+                                        "Reset"
+                                    }
+                                }
+                                if let Some(message) = error() {
+                                    span { class: "text-xs text-error", "{message}" }
+                                }
+                            }
+                            if locked
+                                && let Some(name) = Setting::PersistentBuilddir.meta().env_name
+                            {
+                                p { class: "text-xs text-warning", "unset ${name} to allow control here" }
+                            }
+                        }
+                    }
                 }
             }
         }

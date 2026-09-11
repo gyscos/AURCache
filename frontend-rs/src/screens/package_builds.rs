@@ -6,13 +6,22 @@
 use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::format_duration;
-use crate::listing::{ListHeader, Pager, paginate};
+use crate::listing::{
+    ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, paginate, sort_builds,
+};
 use crate::routes::Route;
+use crate::screens::builds::{build_peak_memory, build_size};
 use crate::status::BuildStatusBadge;
 use aurcache_client::Build;
 use dioxus::prelude::*;
 
 const WIDE_ONLY: &str = "hidden md:table-cell";
+
+/// Newest first, as elsewhere: a build history is read as a log.
+const DEFAULT_SORT: Sort = Sort {
+    key: SortKey::Time,
+    dir: SortDir::Desc,
+};
 
 async fn load(pkgbase: String) -> Result<Vec<Build>, String> {
     client()?
@@ -40,7 +49,11 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
     }));
 
     let builds = use_resource(use_reactive(&pkgbase, load));
-    let page = use_signal(|| 0usize);
+    let mut page = use_signal(|| 0usize);
+    let sort = use_signal(|| DEFAULT_SORT);
+
+    // A different order is a different statement, not a new page.
+    use_effect(use_reactive(&sort(), move |_| page.set(0)));
 
     rsx! {
         div { class: "space-y-4",
@@ -70,18 +83,27 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                         div { class: "alert", span { "This package has never been built." } }
                     },
                     Some(Ok(list)) => {
-                        let current = paginate(list, page());
+                        let mut sorted = list.clone();
+                        // What `after` a package's own builds would put at the
+                        // top: sorting happens before paging, exactly as on the
+                        // main builds screen, so the order the header promises
+                        // is the order the whole list is read in.
+                        sort_builds(&mut sorted, sort());
+                        let current = paginate(&sorted, page());
                         rsx! {
                         div { class: "overflow-x-auto",
                             table { class: "table table-zebra",
                                 thead {
                                     tr {
-                                        th { "Build" }
+                                        SortableHeader { label: "Build", column: SortKey::Name, sort, class: "" }
                                         th { class: "{WIDE_ONLY}", "Version" }
-                                        th { class: "{WIDE_ONLY}", "Started" }
-                                        th { class: "{WIDE_ONLY}", "Duration" }
+                                        SortableHeader { label: "Started", column: SortKey::Time, sort, class: "{WIDE_ONLY}" }
+                                        SortableHeader { label: "Duration", column: SortKey::Duration, sort, class: "{WIDE_ONLY}" }
                                         th { class: "{WIDE_ONLY}", "Platform" }
-                                        th { "Status" }
+                                        SortableHeader { label: "Worker", column: SortKey::Worker, sort, class: "{WIDE_ONLY}" }
+                                        SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
+                                        SortableHeader { label: "Peak RAM", column: SortKey::Memory, sort, class: "{WIDE_ONLY} text-right" }
+                                        SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                     }
                                 }
                                 tbody {
@@ -133,6 +155,27 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                                                 {format_duration(build.start_time, build.end_time)}
                                             }
                                             td { class: "{WIDE_ONLY} text-sm opacity-70", "{build.platform}" }
+                                            td { class: "{WIDE_ONLY} text-sm opacity-70",
+                                                if let Some(worker) = build.worker_name.as_deref() {
+                                                    "{worker}"
+                                                } else {
+                                                    // Not "no worker": nobody
+                                                    // has claimed it yet.
+                                                    span {
+                                                        class: "opacity-40",
+                                                        title: "Not claimed by a worker yet.",
+                                                        "—"
+                                                    }
+                                                }
+                                            }
+                                            td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
+                                                {build_size(build)}
+                                            }
+                                            td {
+                                                class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
+                                                title: "Peak memory of the build's whole process tree, from its cgroup.",
+                                                {build_peak_memory(build)}
+                                            }
                                             td { BuildStatusBadge { status: build.status } }
                                         }
                                     }

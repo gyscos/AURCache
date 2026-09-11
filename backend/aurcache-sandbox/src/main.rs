@@ -308,9 +308,13 @@ fn read_grants_excluding(
 
 /// Apply the Landlock policy to this process (inherited by the exec'd child).
 fn restrict(allow: &[PathBuf], read: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
-    // V1 is the floor every Landlock kernel supports; asking for more would
-    // refuse to run on kernels that can still enforce what we actually need.
-    let abi = ABI::V1;
+    // Writing implies being able to move things around inside a writable tree,
+    // and makepkg renames across directories as a matter of course (tar
+    // extraction, breezy staging a pack into `packs/`, ...). Landlock only
+    // permits such renames when it explicitly grants `Refer`, a right added in
+    // ABI V2 (kernel 5.19); a V1 ruleset makes every one of them fail with
+    // EXDEV. V2 is therefore the floor, not V1.
+    let abi = ABI::V2;
     let write = AccessFs::from_write(abi);
     let read_only = AccessFs::from_read(abi);
 
@@ -380,6 +384,15 @@ mod tests {
                 PathBuf::from("/work/42/demo"),
             ]
         );
+    }
+
+    /// The write set must carry `Refer` (ABI V2+): without it every
+    /// cross-directory rename inside a writable tree fails with EXDEV, and
+    /// builds rename constantly. This keeps the ABI from being downgraded back
+    /// to V1 as a "compatibility" measure.
+    #[test]
+    fn the_write_set_carries_refer() {
+        assert!(AccessFs::from_write(ABI::V2).contains(AccessFs::Refer));
     }
 
     /// An unset or blank variable must not become a rule. `PathBeneath` on ""

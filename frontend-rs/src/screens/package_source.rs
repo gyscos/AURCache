@@ -186,11 +186,29 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                         .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
                                         .await
                                     {
-                                        // Back to the package, which is where
-                                        // the build just queued will appear.
-                                        Ok(_) => {
-                                            navigator().push(Route::Package { pkgbase: pkgbase.clone() });
-                                        }
+                                        // To the build just queued, not back to
+                                        // the package: the build page polls
+                                        // while the build runs, so this is the
+                                        // edit being watched rather than the
+                                        // edit disappearing behind a package
+                                        // header. An update queues one build
+                                        // per platform, and the page for the
+                                        // first of them is where the action
+                                        // sits.
+                                        Ok(numbers) => match numbers.first() {
+                                            Some(&number) => {
+                                                navigator().push(Route::Build {
+                                                    pkgbase: pkgbase.clone(),
+                                                    number,
+                                                });
+                                            }
+                                            // A forced update queues something,
+                                            // but not dying to a blank build
+                                            // page if it ever queues nothing.
+                                            None => {
+                                                navigator().push(Route::Package { pkgbase: pkgbase.clone() });
+                                            }
+                                        },
                                         // Stay put on a partial failure: the
                                         // edit is saved but the build is not
                                         // queued, and leaving would hide that.

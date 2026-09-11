@@ -108,11 +108,11 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
                                         SortableHeader { label: "Build", column: SortKey::Name, sort, class: "" }
                                         th { class: "{WIDE_ONLY}", "Version" }
                                         SortableHeader { label: "Started", column: SortKey::Time, sort, class: "{WIDE_ONLY}" }
-                                        th { class: "{WIDE_ONLY}", "Duration" }
+                                        SortableHeader { label: "Duration", column: SortKey::Duration, sort, class: "{WIDE_ONLY}" }
                                         th { class: "{WIDE_ONLY}", "Platform" }
                                         SortableHeader { label: "Worker", column: SortKey::Worker, sort, class: "{WIDE_ONLY}" }
                                         SortableHeader { label: "Size", column: SortKey::Size, sort, class: "{WIDE_ONLY} text-right" }
-                                        th { class: "{WIDE_ONLY} text-right", "Peak RAM" }
+                                        SortableHeader { label: "Peak RAM", column: SortKey::Memory, sort, class: "{WIDE_ONLY} text-right" }
                                         SortableHeader { label: "Status", column: SortKey::Status, sort, class: "" }
                                     }
                                 }
@@ -211,7 +211,9 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
 /// A dash for every build that produced nothing to measure -- failed, running,
 /// or queued -- and for a successful build that predates the recording. The
 /// status column beside it already says which.
-fn build_size(build: &Build) -> String {
+///
+/// Shared with the package builds list, which shows the same columns.
+pub(crate) fn build_size(build: &Build) -> String {
     build
         .size
         .and_then(|size| u64::try_from(size).ok())
@@ -224,7 +226,9 @@ fn build_size(build: &Build) -> String {
 /// container builder, or a worker without a cgroup subtree to measure in. That
 /// is a different statement from a build that used no memory, which cannot
 /// happen -- so it is never rendered as `0 B`.
-fn build_peak_memory(build: &Build) -> String {
+///
+/// Shared with the package builds list, which shows the same columns.
+pub(crate) fn build_peak_memory(build: &Build) -> String {
     build
         .peak_memory
         .and_then(|bytes| u64::try_from(bytes).ok())

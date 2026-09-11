@@ -64,6 +64,68 @@ PATCHES = [
         '\t\tenv SRCDEST="$SRCDEST" BUILDDIR="$WORKDIR" TMPDIR="$WORKDIR" \\',
     ),
     (
+        # A fetch that died mid-way (a worker killed mid-download, a full
+        # disk, ...) leaves a partial, unusable VCS checkout behind -- say a
+        # .bzr tree staged past cloning but before finishing. makepkg reuses
+        # any existing directory, so the next run tries to *update* the wreck
+        # instead of fetching afresh and fails forever ("Not a branch" and the
+        # like). Wipe the per-package source cache and retry exactly once from
+        # a clean slate, and only when the cache already held something: a
+        # deterministic failure (bad URL, checksum mismatch) should not
+        # discard sources that were fine. Both attempts run the same
+        # sandboxed makepkg, so the retry is Landlocked identically.
+        #
+        # `$SRCDEST` falls back to `$PWD` for unprivileged use, where the
+        # PKGBUILD itself lives; that is never wiped.
+        "download_sources: clear a poisoned source cache and retry once",
+        "download_sources() {\n"
+        "\tsetup_workdir\n"
+        "\tchown \"$makepkg_user:\" \"$WORKDIR\"\n"
+        "\n"
+        "\t# Ensure sources are downloaded\n"
+        "\tsudo -u \"$makepkg_user\" --preserve-env=GNUPGHOME,SSH_AUTH_SOCK \\\n"
+        "\t\tenv SRCDEST=\"$SRCDEST\" BUILDDIR=\"$WORKDIR\" TMPDIR=\"$WORKDIR\" \\\n"
+        "\t\taurcache-sandbox --allow-build-env -- makepkg --config=\"$copydir/etc/makepkg.conf\" --verifysource -o \"${verifysource_args[@]}\" ||\n"
+        "\t\tdie \"Could not download sources.\"\n"
+        "}",
+        "download_sources() {\n"
+        "\tsetup_workdir\n"
+        "\tchown \"$makepkg_user:\" \"$WORKDIR\"\n"
+        "\n"
+        "\t# Ensure sources are downloaded\n"
+        "\tif sudo -u \"$makepkg_user\" --preserve-env=GNUPGHOME,SSH_AUTH_SOCK \\\n"
+        "\t\tenv SRCDEST=\"$SRCDEST\" BUILDDIR=\"$WORKDIR\" TMPDIR=\"$WORKDIR\" \\\n"
+        "\t\taurcache-sandbox --allow-build-env -- makepkg --config=\"$copydir/etc/makepkg.conf\" --verifysource -o \"${verifysource_args[@]}\"; then\n"
+        "\t\treturn\n"
+        "\tfi\n"
+        "\n"
+        "\t# VCS fetches that die mid-way leave a broken checkout behind. makepkg\n"
+        "\t# sees that directory next time and updates it instead of fetching\n"
+        "\t# afresh, which is how a repository that is really a repository fails\n"
+        "\t# forever as \"Not a branch\". Give a failed download exactly one\n"
+        "\t# clean-slate retry -- but only when the cache already held something,\n"
+        "\t# so a deterministic failure (bad URL, wrong checksum) does not throw\n"
+        "\t# away sources that were fine. The working directory is never wiped:\n"
+        "\t# `SRCDEST` falls back to `$PWD` for unprivileged use, where the\n"
+        "\t# PKGBUILD itself lives.\n"
+        "\tif [[ -d $SRCDEST && $SRCDEST != \"$PWD\" && -n $(ls -A \"$SRCDEST\" 2>/dev/null) ]]; then\n"
+        "\t\twarning \"Clearing incomplete source cache and re-downloading\"\n"
+        "\t\t# `rm -rf \"$SRCDEST\"/*` alone would miss dotfiles and `.*` would\n"
+        "\t\t# reach `.`/`..`; find with -mindepth 1 covers both kinds and never\n"
+        "\t\t# the directory itself (prepare_chroot bind-mounts it, so it must\n"
+        "\t\t# survive), without following symlinks out of the cache.\n"
+        "\t\tfind \"$SRCDEST\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || die \"Could not clear %s\" \"$SRCDEST\"\n"
+        "\t\tif sudo -u \"$makepkg_user\" --preserve-env=GNUPGHOME,SSH_AUTH_SOCK \\\n"
+        "\t\t\tenv SRCDEST=\"$SRCDEST\" BUILDDIR=\"$WORKDIR\" TMPDIR=\"$WORKDIR\" \\\n"
+        "\t\t\taurcache-sandbox --allow-build-env -- makepkg --config=\"$copydir/etc/makepkg.conf\" --verifysource -o \"${verifysource_args[@]}\"; then\n"
+        "\t\t\treturn\n"
+        "\t\tfi\n"
+        "\tfi\n"
+        "\n"
+        "\tdie \"Could not download sources.\"\n"
+        "}",
+    ),
+    (
         # The worker used to install this into the *base* chroot before each
         # build and let `sync_chroot` carry it into the copy. Two builds
         # starting at once then raced: the second overwrote the drop-in while
