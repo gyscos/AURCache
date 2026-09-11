@@ -326,6 +326,73 @@ impl WorkerClient {
             .context("job status rejected")?;
         resp.json().await.context("decoding job status")
     }
+
+    /// Conditional GET of a resource outside the `/api/worker` mount — the
+    /// repository DB, which lives on the same server but on the repo port.
+    ///
+    /// A `304 Not Modified` returns a `None` body meaning "your copy is
+    /// current"; a `200` returns the new bytes together with the `ETag` and
+    /// `Last-Modified` they came with, so a caller can replay them next time.
+    /// Anything else is an error: the caller must treat that as "nothing
+    /// authoritative known", never as "reuse what you had".
+    pub async fn get_conditional(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<ConditionalGet> {
+        let mut req = self.http.get(url);
+        if let Some(etag) = etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("conditional GET request")?
+            .error_for_status()
+            .context("conditional GET rejected")?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(ConditionalGet {
+                body: None,
+                etag: None,
+                last_modified: None,
+            });
+        }
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let last_modified = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = resp
+            .bytes()
+            .await
+            .context("reading conditional GET body")?
+            .to_vec();
+        Ok(ConditionalGet {
+            body: Some(body),
+            etag,
+            last_modified,
+        })
+    }
+}
+
+/// Result of a conditional GET: a `None` body means the server sent `304`, so
+/// the caller's stored copy is still authoritative.
+pub struct ConditionalGet {
+    /// The bytes of a `200` response; `None` for `304`.
+    pub body: Option<Vec<u8>>,
+    /// The `ETag` the bytes came back with, for the next conditional request.
+    pub etag: Option<String>,
+    /// The `Last-Modified` the bytes came back with, ditto.
+    pub last_modified: Option<String>,
 }
 
 #[cfg(test)]

@@ -8,8 +8,14 @@
 //! Every accessor is graceful: a missing directory is simply created, and any
 //! I/O error is logged and never propagated into the build.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
+
+/// The part of a `repo.db` that tells us whether a cached archive is current:
+/// `filename -> (compressed size, sha256)`.
+pub type RepoDb = HashMap<String, (u64, String)>;
 
 /// Handle to the on-disk cache layout.
 #[derive(Clone, Debug)]
@@ -263,7 +269,23 @@ impl Cache {
     /// Runs only after `makechrootpkg` has exited. Promoting mid-build would
     /// move a package out from under the running pacman; a hard link would be
     /// needed instead, and there is no reason to promote early.
-    pub fn promote_job_pkgs(&self, label: &str) -> usize {
+    ///
+    /// A `repo_db` means the caller has fetched the repository this worker
+    /// serves, and every job artifact that the DB names is checked against what
+    /// the repository publishes *right now* before it enters the shared cache.
+    /// That check is not a formality: the whole point of this change is that a
+    /// build can start while the repository still carries the *old* bytes of a
+    /// same-version rebuild of a dependency, download those old bytes, and then
+    /// finish after the new ones are live. Without re-validating at promote
+    /// time, this job would restore the exact stale bytes the start-of-job
+    /// reconcile removed.
+    ///
+    /// `None` means the check could not be performed (the DB fetch failed, which
+    /// this method does not know about), so the promoted names are recorded as
+    /// *unverified* and the next reconcile hashes them rather than trusting a
+    /// stale cached value. A file is never silently blocked from promotion —
+    /// the shared cache just stops assuming it is correct until proved.
+    pub fn promote_job_pkgs(&self, label: &str, repo_db: Option<&RepoDb>) -> usize {
         let (Some(shared), Some(job)) = (self.pacman_pkg(), self.pacman_pkg_job(label)) else {
             return 0;
         };
@@ -271,6 +293,7 @@ impl Cache {
             return 0;
         };
         let mut promoted = 0;
+        let mut promoted_names = Vec::new();
         for entry in read.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -278,12 +301,126 @@ impl Cache {
             if !is_package_artifact(name) {
                 continue;
             }
-            match std::fs::rename(entry.path(), shared.join(name)) {
+            let path = entry.path();
+            // Official-repository files are trusted as they are: they are not
+            // in the aurcache DB to compare against, and nothing here can have
+            // gone stale through the rename cycle.
+            if let Some(want) = repo_db
+                && let Some(&(csize, ref sha)) = want.get(name)
+            {
+                let matches = match std::fs::metadata(&path) {
+                    Ok(meta) if meta.len() != csize => false,
+                    Ok(_) => sha256_file(&path).is_ok_and(|got| &got == sha),
+                    Err(_) => false,
+                };
+                if !matches {
+                    tracing::info!(
+                        "not promoting {name}: the repository no longer publishes these bytes"
+                    );
+                    continue;
+                }
+            }
+            match std::fs::rename(&path, shared.join(name)) {
                 Ok(()) => promoted += 1,
-                Err(e) => tracing::warn!("could not promote {name} to the shared cache: {e}"),
+                Err(e) => {
+                    tracing::warn!("could not promote {name} to the shared cache: {e}");
+                    continue;
+                }
+            }
+            promoted_names.push(name.to_string());
+        }
+        // What the DB vouches for is recorded as verified; whatever had to be
+        // promoted without a DB to name it is recorded as *not* verified, so a
+        // later reconcile of the same name hashes it from scratch.
+        {
+            let mut known = verified_lock();
+            match repo_db {
+                Some(want) => {
+                    for name in &promoted_names {
+                        if let Some((_, sha)) = want.get(name) {
+                            known.insert((shared.clone(), name.clone()), sha.clone());
+                        }
+                    }
+                }
+                None => {
+                    for name in &promoted_names {
+                        known.remove(&(shared.clone(), name.clone()));
+                    }
+                }
             }
         }
         promoted
+    }
+
+    /// Reconcile the shared package cache against what the served repository
+    /// publishes, removing cache entries that no longer match.
+    ///
+    /// A cached AURCache archive and the `repo.db` entry that names it can only
+    /// diverge inside this process: the chroots that use the cache mount it
+    /// read-only, so every write goes through promote/evict/reconcile here. The
+    /// one mode of divergence is a package deleted and re-added at the same
+    /// version, whose rebuilt bytes differ from the still-cached bytes. pacman
+    /// then finds the old file in a cache, skips its download, fails the
+    /// integrity check at install because the file is stale, and cannot delete
+    /// it from the read-only mount — the dependency install aborts.
+    ///
+    /// The pass is *event-driven*: a per-file record of the `repo.db` sha we
+    /// last verified makes a no-op job cost a directory read and a hash-map
+    /// lookup per package, with no stat and no hashing. A file is suspicious
+    /// only when its record is missing or its entry changed, and even then a
+    /// size mismatch removes it without reading a byte. Only files whose size
+    /// still matches get hashed, in parallel once there are enough of them.
+    ///
+    /// Files the DB does not name (official core/extra/multilib packages) are
+    /// left alone entirely: absence from the aurcache repo is not staleness.
+    /// Returns how many stale archives were removed.
+    pub fn reconcile_pkgs(&self, repo_db: &RepoDb) -> usize {
+        let Some(shared) = self.pacman_pkg() else {
+            return 0;
+        };
+        let mut removed = 0;
+        let mut suspects: Vec<(String, String)> = Vec::new();
+        {
+            let mut known = verified_lock();
+            for (name, (csize, sha)) in repo_db {
+                let key = (shared.clone(), name.clone());
+                if known.get(&key).is_some_and(|seen| seen == sha) {
+                    continue;
+                }
+                let path = shared.join(name);
+                match std::fs::metadata(&path) {
+                    Err(_) => {
+                        // Nothing cached; nothing to verify until some promote
+                        // actually lands the file.
+                        known.insert(key, sha.clone());
+                    }
+                    Ok(meta) if meta.len() != *csize => {
+                        if remove_cached(&shared, name) {
+                            removed += 1;
+                        }
+                        known.remove(&key);
+                    }
+                    Ok(_) => suspects.push((name.clone(), sha.clone())),
+                }
+            }
+            // Files no longer published are not consulted anymore; drop their
+            // records so the map tracks the repository instead of growing.
+            known.retain(|key, _| repo_db.contains_key(&key.1));
+        }
+        let verdicts = hash_suspects(&shared, &suspects);
+        {
+            let mut known = verified_lock();
+            for ((name, sha), matches) in suspects.iter().zip(verdicts) {
+                let key = (shared.clone(), name.clone());
+                if matches {
+                    known.insert(key, sha.clone());
+                } else if remove_cached(&shared, name) {
+                    removed += 1;
+                    known.remove(&key);
+                }
+            }
+        }
+        removed
     }
 
     /// Evict shared-cache packages over the package budget.
@@ -440,6 +577,152 @@ impl Cache {
 /// and not a detached signature, which is evicted with its package).
 fn is_package_artifact(name: &str) -> bool {
     name.contains(".pkg.tar") && !name.ends_with(".part") && !name.ends_with(".sig")
+}
+
+/// Repository DB entries verified against the shared package cache:
+/// `(cache dir, filename) -> last-verified `repo.db` sha256`.
+///
+/// Keyed on the cache dir as well as the name so the tests, which stack many
+/// caches in one process, never see each other's records. The wrinkle this
+/// records is narrow: the shared cache is written only by this worker
+/// (chroots mount it read-only), so a cached AURCache file can only go stale
+/// when its `repo.db` entry changes, and that a straightforward comparison
+/// catches — no stat and no hashing for an unchanged file.
+static VERIFIED: OnceLock<Mutex<HashMap<(PathBuf, String), String>>> = OnceLock::new();
+
+fn verified_lock() -> MutexGuard<'static, HashMap<(PathBuf, String), String>> {
+    VERIFIED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Many files by fiat; hashing this many without threads is the one case where
+/// the added threads are plainly worth it.
+const PARALLEL_HASH_THRESHOLD: usize = 8;
+
+/// Hash each suspect archive and report whether it matches the `repo.db` sha.
+///
+/// The steady state is zero; a restart's first pass or a mass-`--from-installed`
+/// rebuild re-verifies the whole repository at most once, and that is the only
+/// case with enough files to pay for threads, so the work stays serial below
+/// [`PARALLEL_HASH_THRESHOLD`] and fans out with `std::thread::scope` past it —
+/// no channeling and no new dependency. Each file is, and remains, a single
+/// answer, so the results keep positional order.
+fn hash_suspects(shared: &Path, suspects: &[(String, String)]) -> Vec<bool> {
+    if suspects.len() < PARALLEL_HASH_THRESHOLD {
+        return suspects
+            .iter()
+            .map(|(name, sha)| sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha))
+            .collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(suspects.len());
+    #[allow(clippy::needless_collect)]
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = suspects
+            .chunks(suspects.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(move || -> Vec<bool> {
+                    chunk
+                        .iter()
+                        .map(|(name, sha)| {
+                            sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha)
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// A package archive whose stored bytes no longer match its `repo.db` entry.
+/// Removed, along with its detached signature. A file already gone counts as
+/// removed; a genuine permission trouble surfaces as a warning and leaves the
+/// file — and the manifest record that would have been cleared — in place, so
+/// the next reconcile tries again.
+fn remove_cached(shared: &Path, name: &str) -> bool {
+    let gone = match std::fs::remove_file(shared.join(name)) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!("could not remove stale cached package {name}: {e}");
+            false
+        }
+    };
+    let _ = std::fs::remove_file(shared.join(format!("{name}.sig")));
+    gone
+}
+
+/// Hex sha256 of a file, streamed through 64 KiB so multi-hundred-MB packages
+/// are hashed without ever being in memory whole.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Parse `repo.db` (or `<name>.db`) — gzip'd tar of one `desc` per package, as
+/// `repo-add` writes it — into `filename -> (compressed size, sha256)`.
+///
+/// Each package's entry is a `<name>-<version>/desc` file holding
+/// `%FILENAME%`, `%CSIZE%` and `%SHA256SUM%` fields. An entry missing any of
+/// them is skipped rather than fatal; so is a tar member that is not a
+/// two-level `desc`.
+pub fn parse_repo_db(db: &[u8]) -> anyhow::Result<RepoDb> {
+    use std::io::Read;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(db));
+    let mut out = RepoDb::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let Ok(path) = entry.path() else { continue };
+        if path.components().count() != 2
+            || path.file_name().and_then(|n| n.to_str()) != Some("desc")
+        {
+            continue;
+        }
+        let mut text = String::new();
+        entry.read_to_string(&mut text)?;
+        if let Some(triple) = parse_desc(&text) {
+            out.insert(triple.0, (triple.1, triple.2));
+        }
+    }
+    Ok(out)
+}
+
+/// `%FILENAME%`, `%CSIZE%` and `%SHA256SUM%` of one `desc` file. A field is
+/// one line plus one following value line, so values use the same `i+1` shape
+/// as every other field parser in this repository.
+fn parse_desc(desc: &str) -> Option<(String, u64, String)> {
+    let lines: Vec<&str> = desc.lines().collect();
+    let mut filename = None;
+    let mut size = None;
+    let mut sha = None;
+    for (i, line) in lines.iter().enumerate() {
+        let value = lines.get(i + 1).map(|l| l.trim());
+        match *line {
+            "%FILENAME%" => filename = value.filter(|v| !v.is_empty()).map(str::to_string),
+            "%CSIZE%" => size = value.and_then(|v| v.trim().parse().ok()),
+            "%SHA256SUM%" => sha = value.filter(|v| !v.is_empty()).map(str::to_string),
+            _ => {}
+        }
+    }
+    Some((filename?, size?, sha?))
 }
 
 /// One cache entry per package file. `last_used` is the file's mtime, which for
@@ -756,7 +1039,7 @@ mod pkgcache_tests {
         // An interrupted download must not be published as a real package.
         write(&job.join("bar-2.0-1-x86_64.pkg.tar.zst.part"), 10);
 
-        assert_eq!(c.promote_job_pkgs("job-1"), 1);
+        assert_eq!(c.promote_job_pkgs("job-1", None), 1);
         let shared = c.pacman_pkg().unwrap();
         assert!(shared.join("foo-1.0-1-x86_64.pkg.tar.zst").exists());
         assert!(!shared.join("bar-2.0-1-x86_64.pkg.tar.zst.part").exists());
@@ -774,7 +1057,7 @@ mod pkgcache_tests {
         for label in ["job-1", "job-2"] {
             let job = c.pacman_pkg_job(label).unwrap();
             write(&job.join("cmake-1.0-1-x86_64.pkg.tar.zst"), 10);
-            assert_eq!(c.promote_job_pkgs(label), 1);
+            assert_eq!(c.promote_job_pkgs(label, None), 1);
         }
         assert!(
             c.pacman_pkg()
@@ -821,6 +1104,173 @@ mod pkgcache_tests {
         c.evict_pkgs();
         assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst").exists());
         assert!(!shared.join("a-1.0-1-x86_64.pkg.tar.zst.sig").exists());
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    fn make_db(entries: &[(&str, u64, &str)]) -> RepoDb {
+        entries
+            .iter()
+            .map(|&(name, size, sha)| (name.to_string(), (size, sha.to_string())))
+            .collect()
+    }
+
+    /// A real `repo-add`-shaped `repo.db`: gzip'd tar of one `desc` per package.
+    fn repo_db_bytes(entries: &[(&str, u64, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, size, sha) in entries {
+            let mut header = tar::Header::new_gnu();
+            let data = format!("%FILENAME%\n{name}\n%CSIZE%\n{size}\n%SHA256SUM%\n{sha}\n");
+            header.set_size(data.len() as u64);
+            tar.append_data(&mut header, format!("{name}-1-any/desc"), data.as_bytes())
+                .unwrap();
+        }
+        let raw = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn parses_a_repo_db_into_names_sizes_and_shas() {
+        let name_a = "a-1.0-1-x86_64.pkg.tar.zst";
+        let bytes = repo_db_bytes(&[
+            (name_a, 100, &sha_of(&[b'x'; 100])),
+            ("b-2.0-1-x86_64.pkg.tar.zst", 42, &"f".repeat(64)),
+        ]);
+        let repo = parse_repo_db(&bytes).unwrap();
+        assert_eq!(repo.len(), 2);
+        assert_eq!(repo.get(name_a), Some(&(100, sha_of(&[b'x'; 100]))));
+        assert_eq!(
+            repo.get("b-2.0-1-x86_64.pkg.tar.zst"),
+            Some(&(42, "f".repeat(64)))
+        );
+    }
+
+    /// The canonical failure this all exists for: a cache entry between two
+    /// runs of the same-version rebuild, whose size already betrays it. The
+    /// size check removes it without hashing a byte.
+    #[test]
+    fn reconcile_removes_a_file_whose_entry_grew_in_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&shared.join(name), 100);
+        write(&shared.join(format!("{name}.sig")), 10);
+
+        let repo = make_db(&[(name, 120, &"f".repeat(64))]);
+        assert_eq!(c.reconcile_pkgs(&repo), 1);
+        assert!(!shared.join(name).exists());
+        assert!(!shared.join(format!("{name}.sig")).exists());
+    }
+
+    /// Same size, new bytes — the sizing trick cannot see it, so the file is
+    /// hashed before it is trusted again.
+    #[test]
+    fn reconcile_hashes_and_removes_a_file_whose_bytes_changed_at_the_same_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&shared.join(name), 100);
+
+        let repo = make_db(&[(name, 100, &sha_of(&[b'y'; 100]))]);
+        assert_eq!(c.reconcile_pkgs(&repo), 1);
+        assert!(!shared.join(name).exists());
+    }
+
+    /// A matching file costs a directory read and a map lookup, not a hash, and
+    /// a repeat pass is a no-op.
+    #[test]
+    fn reconcile_leaves_matching_files_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&shared.join(name), 100);
+
+        let repo = make_db(&[(name, 100, &sha_of(&[b'x'; 100]))]);
+        assert_eq!(c.reconcile_pkgs(&repo), 0);
+        assert!(shared.join(name).exists());
+        assert_eq!(c.reconcile_pkgs(&repo), 0);
+    }
+
+    /// Official core/extra/multilib archives are absent from the aurcache DB
+    /// *by construction*; absence is not staleness, so they are left alone.
+    #[test]
+    fn reconcile_leaves_files_the_db_does_not_name_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let shared = c.pacman_pkg().unwrap();
+        let official = "gcc-13.2.1-3-x86_64.pkg.tar.zst";
+        write(&shared.join(official), 50);
+
+        assert_eq!(c.reconcile_pkgs(&RepoDb::new()), 0);
+        assert!(shared.join(official).exists());
+    }
+
+    /// A job that fetched the *old* bytes of a same-version rebuild must not be
+    /// able to restore them over the read-only cache: the DB names them, the
+    /// size prefilter catches them, and the stale bytes never reach the shared
+    /// side at all.
+    #[test]
+    fn promote_refuses_old_bytes_of_a_rebuilt_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let job = c.pacman_pkg_job("job-1").unwrap();
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&job.join(name), 100);
+
+        let repo = make_db(&[(name, 100, &sha_of(&[b'y'; 100]))]);
+        assert_eq!(c.promote_job_pkgs("job-1", Some(&repo)), 0);
+        assert!(job.join(name).exists(), "the artifact must stay put");
+        assert!(!shared.join(name).exists());
+    }
+
+    /// An artifact that passes the check (size and hash) is promoted and
+    /// recorded as verified, so the very next reconcile costs nothing.
+    #[test]
+    fn promote_with_a_matching_db_records_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let job = c.pacman_pkg_job("job-1").unwrap();
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&job.join(name), 100);
+
+        let repo = make_db(&[(name, 100, &sha_of(&[b'x'; 100]))]);
+        assert_eq!(c.promote_job_pkgs("job-1", Some(&repo)), 1);
+        assert!(shared.join(name).exists());
+        assert_eq!(c.reconcile_pkgs(&repo), 0);
+    }
+
+    /// The end-to-end story: the DB fetch failed, so a job's stale old bytes
+    /// were promoted unvalidated; the manifest records that, and the reconcile
+    /// that sees the rebuilt DB re-hashes and removes them before pacman can
+    /// pick them up from the read-only mount.
+    #[test]
+    fn an_unvalidated_promote_is_rechecked_by_the_next_reconcile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let job = c.pacman_pkg_job("job-1").unwrap();
+        let shared = c.pacman_pkg().unwrap();
+        let name = "a-1.0-1-x86_64.pkg.tar.zst";
+        write(&job.join(name), 100);
+
+        // No DB (the fetch failed): the promote cannot tell old from new bytes.
+        assert_eq!(c.promote_job_pkgs("job-1", None), 1);
+        assert!(shared.join(name).exists());
+
+        // The rebuilt DB says these bytes are no longer what it publishes.
+        let repo = make_db(&[(name, 100, &sha_of(&[b'y'; 100]))]);
+        assert_eq!(c.reconcile_pkgs(&repo), 1);
+        assert!(!shared.join(name).exists());
     }
 }
 

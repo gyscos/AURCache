@@ -99,6 +99,45 @@ fn with_base_url(template: &str, base: &str) -> String {
     out
 }
 
+/// URL of the repository database for one arch, given a rendered `[repo]`
+/// section.
+///
+/// pacman fetches `<Server>/<section-name>.db`, so the DB filename comes from
+/// the section header (`[repo]` behaves as `repo.db`) rather than being
+/// hardcoded — a section renamed elsewhere keeps working. `$arch` is
+/// substituted wherever it appears before appending `<name>.db`.
+///
+/// Parsed as a proper URL rather than patched by string: only an `http(s)`
+/// URL with a host is accepted, and a query string or fragment is rejected
+/// because the `<name>.db` suffix would have to be guessed past it. A `None`
+/// result means "no reconciliation", never a URL nobody wrote.
+#[must_use]
+pub fn repo_db_url(section: &str, arch: &str) -> Option<String> {
+    let name = section
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix('[')
+                .and_then(|rest| rest.split(']').next())
+        })
+        .filter(|n| !n.is_empty())?;
+    let server = section
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("Server =").map(str::trim))
+        .filter(|s| !s.is_empty())?;
+    let mut url = url::Url::parse(server).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let base = url.path().replace("$arch", arch);
+    let base = base.trim_end_matches('/');
+    url.set_path(&format!("{base}/{name}.db"));
+    Some(url.to_string())
+}
+
 /// Append a rendered `[repo]` section to a job's `pacman.conf`.
 ///
 /// An empty section is appended as nothing.
@@ -286,5 +325,80 @@ mod tests {
         let with = append_to_pacman_conf("[options]", "[repo]\n");
         assert!(with.starts_with("[options]\n"));
         assert!(with.ends_with("[repo]\n"));
+    }
+
+    /// The DB URL is the `Server` line with `$arch` substituted and the
+    /// section-derived `<name>.db` appended.
+    #[test]
+    fn db_url_substitutes_arch_and_appends_the_section_db() {
+        let section =
+            "[repo]\nSigLevel = Never\nServer = https://aur.example.com:9000/repo/$arch\n";
+        assert_eq!(
+            repo_db_url(section, "x86_64").as_deref(),
+            Some("https://aur.example.com:9000/repo/x86_64/repo.db")
+        );
+    }
+
+    /// A renamed section names its own DB, since pacman derives the DB
+    /// filename from the section this way.
+    #[test]
+    fn db_url_uses_the_section_name_not_a_hardcoded_repo() {
+        let section = "[myrepo]\nServer = http://host:8081/$arch\n";
+        assert_eq!(
+            repo_db_url(section, "aarch64").as_deref(),
+            Some("http://host:8081/aarch64/myrepo.db")
+        );
+    }
+
+    /// pacman does not care which of `/$arch` and `/$arch/` a template ends
+    /// in; the DB URL must not gain a double slash either way.
+    #[test]
+    fn db_url_without_double_slashes() {
+        let trailing = "[repo]\nServer = http://host:8081/$arch/\n";
+        assert_eq!(
+            repo_db_url(trailing, "x86_64").as_deref(),
+            Some("http://host:8081/x86_64/repo.db")
+        );
+    }
+
+    /// A `Server` line that spells the arch out already (someone's copy-paste)
+    /// is left alone rather than gaining a second one.
+    #[test]
+    fn db_url_leaves_a_literal_arch_alone() {
+        let section = "[repo]\nServer = http://h/r/i486\n";
+        assert_eq!(
+            repo_db_url(section, "i486").as_deref(),
+            Some("http://h/r/i486/repo.db")
+        );
+    }
+
+    /// A query string or fragment would make the `<name>.db` suffix ambiguous;
+    /// refusing beats fetching a URL nobody wrote.
+    #[test]
+    fn db_url_rejects_query_and_fragment() {
+        let query = "[repo]\nServer = http://h/$arch?token=1\n";
+        assert_eq!(repo_db_url(query, "x86_64"), None);
+        let fragment = "[repo]\nServer = http://h/$arch#frag\n";
+        assert_eq!(repo_db_url(fragment, "x86_64"), None);
+    }
+
+    /// A non-http server or a bare-hostless string is not something we can
+    /// fetch a DB from.
+    #[test]
+    fn db_url_rejects_non_http_and_hostless() {
+        assert_eq!(
+            repo_db_url("[repo]\nServer = ftp://h/$arch\n", "x86_64"),
+            None
+        );
+        assert_eq!(repo_db_url("[repo]\nServer = $arch\n", "x86_64"), None);
+        assert_eq!(repo_db_url("[repo]\nServer =\n", "x86_64"), None);
+    }
+
+    /// A section that does not name itself or its server yields nothing; a
+    /// blank section is an unset one.
+    #[test]
+    fn db_url_requires_a_named_section_and_server() {
+        assert_eq!(repo_db_url("[options]\n", "x86_64"), None);
+        assert_eq!(repo_db_url("", "x86_64"), None);
     }
 }

@@ -18,3 +18,4 @@ pub mod credentials;
 pub mod executor;
 pub mod job;
 pub mod oneshot;
+pub mod repo_db;

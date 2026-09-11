@@ -24,6 +24,7 @@ use crate::chroots::Lease;
 use crate::config::Config;
 use crate::credentials;
 use crate::executor::Shared;
+use crate::repo_db;
 
 /// Run one job to completion and return its terminal report.
 ///
@@ -110,6 +111,34 @@ async fn run_job_inner(
     // Defensive: a crash mid-job could have left a tree behind under this id.
     let _ = std::fs::remove_dir_all(workdir);
     let pkgdir = artifacts::extract_source(&source, workdir).context("extracting source")?;
+
+    // 1.5. Reconcile the shared package cache against what the served
+    // repository publishes *now* (see design/stale-shared-pacman-cache.md).
+    // The stale bytes live in the shared cache, the second, read-only
+    // `CacheDir`: pacman finds them there, fails the integrity check at
+    // install, and — being on a read-only mount — cannot delete them, so the
+    // dependency install aborts. Removed here, before the chroot is even
+    // prepared. The only writes that cache ever sees are this worker's, so
+    // nothing else can race the reconcile.
+    //
+    // A fetch/parse failure is a warning, not an error: the build proceeds
+    // without a reconcile, and the promote step's own re-fetch stands in for it
+    // when it can. The one thing the code must never do is reconcile against a
+    // previous fetch's stale copy.
+    match repo_db::fetch_repo_db(client, client.repo_section(), &job.arch).await {
+        Ok(db) => {
+            let cache = cache.clone();
+            let removed = tokio::task::spawn_blocking(move || cache.reconcile_pkgs(&db))
+                .await
+                .unwrap_or(0);
+            if removed > 0 {
+                tracing::info!("reconciled shared package cache: removed {removed} stale file(s)");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "skipping shared-cache reconcile");
+        }
+    }
 
     // 2. Stage build credentials, then write per-package configs + ensure base
     //    chroot. The key is read now rather than at worker start, so replacing
@@ -264,11 +293,26 @@ async fn run_job_inner(
     // 5. Fold this job's downloads into the shared cache, then bound it. Only
     //    after `makechrootpkg` has exited: promoting mid-build would move
     //    packages out from under the running pacman.
+    //
+    //    Re-fetched fresh, not the reconcile's copy: the build may have taken
+    //    minutes, and a dependency rebuilt mid-build is exactly the case the
+    //    promote-time check exists for. The fetch is conditional, so an
+    //    unchanged DB costs one cheap round-trip.
+    let repo_db = match repo_db::fetch_repo_db(client, client.repo_section(), &job.arch).await {
+        Ok(db) => Some(db),
+        Err(e) => {
+            // No DB to validate against: promote anyway (never silently drop
+            // artifacts), but record the promotions as unverified so the next
+            // reconcile re-hashes them instead of trusting them.
+            tracing::warn!(error = %e, "promoting without a repository DB to validate against");
+            None
+        }
+    };
     {
         let cache = cache.clone();
         let label = job_label.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let promoted = cache.promote_job_pkgs(&label);
+            let promoted = cache.promote_job_pkgs(&label, repo_db.as_ref());
             cache.wipe_pacman_pkg_job(&label);
             cache.wipe_gnupg_job(&label);
             let evicted = cache.evict_pkgs();
