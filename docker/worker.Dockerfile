@@ -93,7 +93,18 @@ USER packager
 # `--skipinteg` because the tarball is this tree rather than a release, and
 # `--nodeps` because the *build* needs nothing from the target architecture:
 # dependencies are recorded in the package and resolved where it is installed.
-RUN set -eux; \
+#
+# Cargo and rustup home dirs are cache mounts, sharing a single backing store
+# with the hybrid image's identically named packager stage (both are Arch,
+# rustup toolchain, linked against the same glibc, so their cached `bin/` and
+# `.crates.toml` are interchangeable). `prepare()`'s `cargo fetch --locked` and
+# the `rustup target add` therefore stop downloading on the second image. The
+# `uid`/`gid` are the whole point: buildkit would otherwise create the mount
+# as root and cargo could not write `~/.cargo/.crates.toml`, which is precisely
+# why the hybrid image used to avoid the mount for the wasm-bindgen install.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    set -eux; \
     case "${TARGETARCH}${TARGETVARIANT:-}" in \
       amd64) CARCH=x86_64 ;; \
       arm64) CARCH=aarch64 ;; \

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ARG LATEST_COMMIT_SHA=dev
 # Must stay on the same Debian release as the runtime stage below: the default
 # `rust:1.98.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
@@ -8,6 +9,12 @@ ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # Install necessary tools and dependencies
 
+# The official rust image keeps cargo and the toolchain under /usr/local/cargo,
+# which a cache mount would *hide* on the first, cold build -- so the cache home
+# lives here instead, and only the crates.io-visible bits of $CARGO_HOME (the
+# registry, and command binaries for `cargo install`) are redirected to it. The
+# `cargo` binary itself still resolves from /usr/local/cargo/bin on the layer.
+#
 # The CLI's version has to match the `wasm-bindgen` crate the frontend links
 # against exactly, so it is read from the frontend's lockfile. `--locked` pins
 # only the CLI's own dependencies and will still install whatever release is
@@ -17,7 +24,20 @@ ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # install` is invalidated when the pinned version changes and not by a code
 # edit -- the same ordering, and for the same reason, as hybrid.Dockerfile.
 COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
-RUN rustup target add wasm32-unknown-unknown \
+# The cargo cache is mounted: crates and the installed wasm-bindgen-cli are
+# immutable per version, so they are reused between builds and across the three
+# target architectures instead of being fetched once each. The `-root` cache id
+# stays private to this Debian builder stage -- the Arch packager stages keep
+# their own (`-packager`), because a compiled tool like wasm-bindgen-cli that
+# landed in the shared `bin/` from the other family would be linked against the
+# other's libc and could refuse to load. The downloads themselves are
+# toolchain-independent; the separation is about the binaries that share this
+# home, not the crates. (rustup stays on the shipped layer, as today: its std
+# downloads are already layer-cached per architecture.)
+ENV CARGO_HOME=/opt/cargo-cache \
+    PATH="/opt/cargo-cache/bin:${PATH}"
+RUN --mount=type=cache,target=/opt/cargo-cache,id=cargo-downloads-root \
+    rustup target add wasm32-unknown-unknown \
     && wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
     && test -n "$wb_version" \
     && cargo install wasm-bindgen-cli --locked --version "$wb_version"
@@ -43,7 +63,8 @@ WORKDIR /app/backend
 ARG TARGETPLATFORM
 ARG TARGET_ARCH=
 ADD docker/build-rust.sh /root
-RUN bash /root/build-rust.sh "${TARGET_ARCH:-$TARGETPLATFORM}"
+RUN --mount=type=cache,target=/opt/cargo-cache,id=cargo-downloads-root \
+    bash /root/build-rust.sh "${TARGET_ARCH:-$TARGETPLATFORM}"
 
 # No `--platform` here: buildx already builds this stage for the target, and
 # pinning it to a build arg meant the runtime base and the binary above could

@@ -95,13 +95,29 @@ USER packager
 # and every build began failing with "rust Wasm file schema version: 0.2.127 /
 # this binary schema version: 0.2.128".
 ENV PATH="/home/packager/.cargo/bin:${PATH}"
-RUN rustup default stable && rustup target add wasm32-unknown-unknown
+# rustup and cargo both write their homes here; the mounted caches make the
+# per-image downloads a one-time cost shared with the worker image's packager
+# (see worker.Dockerfile for why `-packager` ids are distinct from the Debian
+# builder's `-root` ones). `rustup target add wasm32` is before the lockfile
+# because the toolchain is independent of the crate set. The cargo mount is
+# needed here too: `rustup default stable` places the `cargo`/`rustc` shims in
+# $CARGO_HOME/bin, and without the mount those shims would live on the layer,
+# hidden by the mount in every subsequent RUN.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    rustup default stable && rustup target add wasm32-unknown-unknown
 # The lockfile alone, ahead of the source, so that the expensive `cargo install`
 # below is invalidated when the pinned version changes and not by a code edit.
 COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
-# No cache mount here: buildkit creates the mount's parent as root, leaving
-# cargo unable to write ~/.cargo/.crates.toml. The layer caches on its own.
-RUN wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
+# The cache mount carries the registry and the installed wasm-bindgen-cli, so
+# the install is skipped rather than recompiled once the worker or a previous
+# hybrid build has run. `uid`/`gid` solve the reason this used to be impossible:
+# buildkit creates the mount as root, leaving cargo -- running as `packager` --
+# unable to write `~/.cargo/.crates.toml`; naming the owner makes the home
+# writable and the layer caches on its own again.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
     && test -n "$wb_version" \
     && cargo install wasm-bindgen-cli --locked --version "$wb_version"
 
@@ -109,7 +125,11 @@ COPY --chown=packager . /src
 # `--skipinteg` because the tarball is this tree rather than a release, and
 # `--nodeps` because the build needs nothing from the target architecture:
 # dependencies are recorded in the package and resolved where it is installed.
-RUN set -eux; \
+# The cache mounts stop `prepare()`'s `cargo fetch` and the `rustup target add`
+# from redownloading what the worker image already fetched.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
+    set -eux; \
     case "${TARGETARCH}${TARGETVARIANT:-}" in \
       amd64) CARCH=x86_64 ;; \
       arm64) CARCH=aarch64 ;; \
