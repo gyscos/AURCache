@@ -150,7 +150,7 @@ SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER
 -- set for the fixture server), stored, and never set. Stored is the state a
 -- user is in the moment after they save one, and the only one that offers a
 -- Reset. `-1` is the global scope; a real package id would make it per-package.
-INSERT INTO settings (key, value, pkg_id) VALUES ('max_concurrent_builds', '4', -1);
+INSERT INTO settings (key, value, pkg_id) VALUES ('auto_update_interval', '4', -1);
 
 -- A few lines of activity log. The text is not stored: the server renders it
 -- from `typ` and the JSON in `data`, so these have to be shapes the serializers
@@ -252,9 +252,10 @@ VALUES
   -- others, so both of those columns have something to show.
   ('builder-01', 'approved', 'sha256:1111111111111111aaaa', 'x86_64', '',
    CAST(strftime('%s','now') AS INTEGER) - 5, '0.1.0', 'visual-studio-code-bin', 10),
-  -- Approved, but only reaches aarch64 through emulation.
+  -- Approved, but only reaches aarch64 through emulation. Its reservation
+  -- names no known package, so the column has to leave it as plain text.
   ('builder-arm', 'approved', 'sha256:2222222222222222bbbb', 'aarch64', 'armv7h',
-   CAST(strftime('%s','now') AS INTEGER) - 200000, '0.1.0', '', 0),
+   CAST(strftime('%s','now') AS INTEGER) - 200000, '0.1.0', 'not-a-package', 0),
   -- Enrolled and waiting. Has never checked in, so "last seen" is never rather
   -- than a long time ago.
   ('new-machine', 'pending', 'sha256:3333333333333333cccc', 'x86_64', '',

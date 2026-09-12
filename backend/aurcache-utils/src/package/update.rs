@@ -17,12 +17,12 @@ use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, QuerySelect, Set, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tokio::sync::broadcast::Sender;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Remove packages that have no remaining dependents and are not directly requested.
 ///
@@ -62,40 +62,63 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 ///
 /// Only packages whose latest build completed successfully are retriggered.
 /// Returns the build IDs enqueued across all updated packages.
+///
+/// Updates run forced: `out_of_date` is only ever set when a real upstream
+/// change was detected (a newer version, or for a VCS package a moved commit),
+/// and the unforced path would then refuse to build the VCS case -- that is the
+/// exact "newer source, same version string" situation this setting exists for.
 pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<Vec<i32>> {
     let db = &services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
         .filter(packages::Column::OutOfDate.eq(1))
+        .order_by_asc(packages::Column::Name)
         .all(db)
         .await?;
     let activity_log = ActivityLog::new(db.clone());
 
     let mut ids_total = vec![];
+    // One package's failure must not starve the rest. A sourceinfo that no
+    // longer applies after an upstream bump, a dependency that cannot be
+    // fetched, or a resolution that comes apart mid-way all fail this update,
+    // and with `?` the whole pass stopped at the first of them -- silently
+    // skipping every package after it, every round, while the offender stayed
+    // out of date. Each package is handled on its own and moves on.
     for pkg in pkg_models {
-        if pkg.status == BuildStates::SUCCESSFUL_BUILD {
-            let package_name = pkg.name.clone();
-            let results = package_update(services, pkg, false).await?;
-            activity_log
-                .add(
-                    PackageUpdateActivity {
-                        package: package_name,
-                        forced: false,
-                    },
-                    ActivityType::UpdatePackage,
-                    Some("Server".to_string()),
-                )
-                .await?;
-            ids_total.extend(
-                results
-                    .into_iter()
-                    .filter(|r| r.enqueued)
-                    .map(|r| r.build_id),
-            );
-        } else {
+        if pkg.status != BuildStates::SUCCESSFUL_BUILD {
             info!(
                 "Package auto update was not triggered for package {} because of prev. build status: {}",
                 pkg.name, pkg.status
             );
+            continue;
+        }
+        let package_name = pkg.name.clone();
+        let log_error = match package_update(services, pkg, true).await {
+            Ok(results) => {
+                if let Err(e) = activity_log
+                    .add(
+                        PackageUpdateActivity {
+                            package: package_name.clone(),
+                            forced: true,
+                        },
+                        ActivityType::UpdatePackage,
+                        Some("Server".to_string()),
+                    )
+                    .await
+                {
+                    warn!("Failed to log update of {package_name}: {e}");
+                }
+                ids_total.extend(
+                    results
+                        .into_iter()
+                        .filter(|r| r.enqueued)
+                        .map(|r| r.build_id),
+                );
+                None
+            }
+            Err(e) => Some(e),
+        };
+        if let Some(e) = log_error {
+            warn!("Auto update skipped {package_name}: {e}");
         }
     }
     Ok(ids_total)

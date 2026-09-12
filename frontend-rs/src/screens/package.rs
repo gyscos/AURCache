@@ -210,7 +210,11 @@ pub fn Package(pkgbase: String) -> Element {
                                     on_changed: move |()| data.restart(),
                                 }
                             } else {
-                                RemoveCard { pkgbase: pkg.name.clone() }
+                                RemoveCard {
+                                    pkgbase: pkg.name.clone(),
+                                    dependents: pkg.dependents.len(),
+                                    on_changed: move |()| data.restart(),
+                                }
                             }
                         }
                         div { class: "space-y-4 min-w-0",
@@ -219,7 +223,7 @@ pub fn Package(pkgbase: String) -> Element {
                                 pkg: pkg.clone(),
                                 on_changed: move |()| data.restart(),
                             }
-                            ProducesCard { pkg: pkg.clone() }
+                            ArtifactsCard { pkg: pkg.clone() }
                         }
                     }
                 }
@@ -1251,7 +1255,7 @@ fn downloads_label(downloads: i64) -> String {
 
 /// What lands in the repository when this package builds.
 #[component]
-fn ProducesCard(pkg: ExtendedPackage) -> Element {
+fn ArtifactsCard(pkg: ExtendedPackage) -> Element {
     let names = produced_names(&pkg);
     let split = pkg
         .split_packages
@@ -1269,7 +1273,7 @@ fn ProducesCard(pkg: ExtendedPackage) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 h2 { class: "card-title text-base",
-                    "Produces"
+                    "Artifacts"
                     if built {
                         span { class: "badge badge-sm badge-neutral", "{pkg.files.len()}" }
                     } else if split {
@@ -1354,11 +1358,12 @@ fn browsable_url(raw: &str) -> Option<String> {
     (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
-/// Queue a rebuild of this package.
+/// Queue a rebuild of this package and land on the new build's page.
 ///
 /// Disabled while in flight so a double click does not queue twice, and it
-/// reports what happened rather than silently doing nothing — a rebuild is
-/// otherwise invisible until the build list refreshes.
+/// reports what happened rather than silently doing nothing. `update_package`
+/// returns the build numbers it queued — one per platform — so the result is
+/// shown rather than waited for: the destination build's page is the update.
 #[component]
 fn RebuildButton(pkgbase: String, on_changed: EventHandler<()>) -> Element {
     let mut busy = use_signal(|| false);
@@ -1386,10 +1391,14 @@ fn RebuildButton(pkgbase: String, on_changed: EventHandler<()>) -> Element {
                                 .map_err(|e| e.to_string()),
                             Err(e) => Err(e),
                         };
-                        if let Err(e) = outcome {
-                            error.set(Some(e));
-                        } else {
-                            on_changed.call(());
+                        match outcome {
+                            Err(e) => error.set(Some(e)),
+                            Ok(ids) => {
+                                on_changed.call(());
+                                if let Some(number) = ids.into_iter().next() {
+                                    navigator().push(Route::Build { pkgbase, number });
+                                }
+                            }
                         }
                         busy.set(false);
                     }
@@ -2710,14 +2719,19 @@ fn DependentRow(
     }
 }
 
-/// "Remove" rather than "delete" because that is what the server does: it
-/// clears the direct-request flag and then live-checks. A package nothing
-/// depends on is deleted along with any dependency that was only there for it;
-/// one that something still needs stays, demoted to a dependency. Saying
-/// "delete" would promise the first case in a UI that cannot tell which applies
-/// until it has happened.
+/// "Remove" rather than "delete" because that is what the server does when
+/// something still needs the package: it clears the direct-request flag and the
+/// card then becomes this package's replacement-and-removal.
+///
+/// How deep the remove goes is decided here, not by the server: the page
+/// already knows whether anything depends on the package.
+///
+/// With no dependents the delete is total — the package, its builds and the
+/// dependencies only it used are all dropped, so the page leaves for the list.
+/// With dependents the package cannot go: removing only unflags it, and the
+/// refresh this card triggers makes it the replacement-and-removal card.
 #[component]
-fn RemoveCard(pkgbase: String) -> Element {
+fn RemoveCard(pkgbase: String, dependents: usize, on_changed: EventHandler<()>) -> Element {
     let mut confirming = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
@@ -2740,12 +2754,19 @@ fn RemoveCard(pkgbase: String) -> Element {
                 match outcome {
                     Ok(()) => {
                         confirming.set(false);
-                        // The package may no longer exist, so going back to it
-                        // would land on an error page.
-                        navigator().push(Route::Packages {
-                            view: ViewParams::default(),
-                            q: String::new(),
-                        });
+                        if dependents > 0 {
+                            // The package stayed on as a dependency, so going
+                            // to the list would say nothing about it. Refresh
+                            // in place: the card becomes the replacement one.
+                            on_changed.call(());
+                        } else {
+                            // The package may no longer exist, so going back to
+                            // it would land on an error page.
+                            navigator().push(Route::Packages {
+                                view: ViewParams::default(),
+                                q: String::new(),
+                            });
+                        }
                     }
                     Err(e) => error.set(Some(e)),
                 }
@@ -2758,10 +2779,13 @@ fn RemoveCard(pkgbase: String) -> Element {
             div { class: "card-body",
                 h2 { class: "card-title text-base text-error", "Remove" }
                 p { class: "text-xs opacity-60 max-w-prose",
-                    "Marks this package as no longer requested. If nothing depends on it, "
-                    "it and its builds are deleted, along with any dependency that was only "
-                    "installed for it. If something still depends on it, it stays as a "
-                    "dependency."
+                    if dependents > 0 {
+                        "This package has dependents, so removing only marks it as no longer explicitly required. \
+                         It stays as a dependency, and this card then becomes its replacement and removal."
+                    } else {
+                        "Nothing depends on it, so removing deletes the package — its builds go too, \
+                         and any dependency that was only installed for it."
+                    }
                 }
                 if let Some(message) = error() {
                     div { class: "alert alert-error text-sm", span { "{message}" } }
@@ -2784,9 +2808,13 @@ fn RemoveCard(pkgbase: String) -> Element {
             div { class: "modal-box",
                 h3 { class: "font-bold text-lg", "Remove {pkgbase}?" }
                 p { class: "text-sm opacity-70 pt-2",
-                    "It stops being a requested package. Unless something depends on it, "
-                    "it and its build history are deleted, and so is anything that was only "
-                    "here as its dependency. This cannot be undone."
+                    if dependents > 0 {
+                        "It stops being a requested package and stays as a dependency for the packages that \
+                         need it. Nothing is deleted; replacing and removing it is still open to you from this card."
+                    } else {
+                        "Nothing depends on it. It and its build history are deleted, and so is anything that \
+                         was only here as its dependency. This cannot be undone."
+                    }
                 }
                 div { class: "modal-action",
                     button {

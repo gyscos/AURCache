@@ -182,6 +182,10 @@ ROUTES=(
     "/builds|Showing 1|the pager says which rows are on screen"
     "/package/paru/builds|Page 1 of|a long history is paged too"
     "/package/hello/build/1|hello|build log (depth 4)"
+    # A finished build reports its recorded total; a running one (the fixture
+    # gives visual-studio-code-bin a start but no end) measures to now.
+    "/package/hello/build/1|took 43s|a finished build reports its total duration"
+    "/package/visual-studio-code-bin/build/1|so far|a running build's duration is measured to now"
     "/packages|Upstream|packages list"
     "/builds|Add package|the sidebar offers adding a package from any page"
     "/packages|Size|the packages list has a size column"
@@ -242,6 +246,10 @@ ROUTES=(
     "/package/hello|href=\"/package/hello/config-files\"|the package links to its config files"
     # The one irreversible action, in its own card rather than in the header.
     "/package/hello|Remove package|a package can be removed from its own page"
+    # The remove card knows which way the delete will go: `yay` needs hello, so
+    # it says removing only unflags it, while nothing depends on `paru`.
+    "/package/hello|This package has dependents|a package with dependents is told removing only unflags it"
+    "/package/paru|Nothing depends on it|a package with no dependents is told removing deletes it"
     # Summed over every version and architecture the package has produced
     # (1200 + 34 + 99), and not over `hello-world`, which a prefix match on the
     # name would have swallowed.
@@ -256,7 +264,7 @@ ROUTES=(
     # Named on every row, set or not, so the page documents what a deployment
     # can pin rather than only reporting what it already pinned.
     "/settings|\$JOB_TIMEOUT|settings document their environment variables"
-    "/settings|Builder image|settings covers every section"
+    "/settings|Builds|settings covers every section"
     "/settings|Backup|the settings page offers backup and restore"
     "/settings|Drop a dump here|a dump can be dropped as well as chosen"
     # Seeded as a stored global value, which is the only state offering a Reset.
@@ -268,6 +276,10 @@ ROUTES=(
     # Stored and unset render differently; only the stored one offers a Reset.
     "/config-files|>stored<|a stored file says so"
     "/workers|builder-01|workers"
+    # The affinity column resolves its entries: a reservation naming a package
+    # becomes a link to it, one naming nothing stays plain text.
+    "/workers|href=\"/package/visual-studio-code-bin\"|a reservation naming a package links to it"
+    "/workers|not-a-package|a reservation naming no package stays plain text"
     # The gate the page exists for: a machine waiting on an operator is called
     # out, not left to be spotted in a status column.
     "/workers|1 worker is waiting for approval|a pending worker is surfaced"

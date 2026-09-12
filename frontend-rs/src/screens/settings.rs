@@ -140,7 +140,7 @@ fn SettingsSections(
             }
         }
 
-        Section { title: "Builder",
+        Section { title: "Builds",
             div { class: "py-2",
                 Link { class: "link link-primary text-sm", to: Route::ConfigFiles {},
                     "Config files"
@@ -150,51 +150,12 @@ fn SettingsSections(
                 }
             }
             SettingRow {
-                setting: Setting::CpuLimit,
-                label: "CPU limit",
-                description: "µCPUs available to each build. 0 is unlimited.",
-                value: settings.cpu_limit.value.to_string(),
-                source: settings.cpu_limit.source,
-                editor: Editor::Number,
-                save,
-            }
-            SettingRow {
-                setting: Setting::MemoryLimit,
-                label: "Memory limit",
-                description: "Bytes of memory each build may use. -1 is unlimited.",
-                value: settings.memory_limit.value.to_string(),
-                source: settings.memory_limit.source,
-                editor: Editor::Number,
-                save,
-            }
-            SettingRow {
-                setting: Setting::MaxConcurrentBuilds,
-                label: "Job concurrency",
-                description: "How many builds may run at once.",
-                value: settings.max_concurrent_builds.value.to_string(),
-                source: settings.max_concurrent_builds.source,
-                editor: Editor::Number,
-                save,
-            }
-            SettingRow {
                 setting: Setting::JobTimeout,
                 label: "Job timeout",
-                description: "How long a single build may run before it is abandoned, in seconds.",
+                description: "How long a single build may run before the server abandons it, in seconds.",
                 value: settings.job_timeout.value.to_string(),
                 source: settings.job_timeout.source,
                 editor: Editor::Number,
-                save,
-            }
-        }
-
-        Section { title: "Advanced",
-            SettingRow {
-                setting: Setting::BuilderImage,
-                label: "Builder image",
-                description: "Container image builds run in.",
-                value: settings.builder_image.value.clone(),
-                source: settings.builder_image.source,
-                editor: Editor::Text { placeholder: String::new(), wide: true },
                 save,
             }
         }

@@ -18,6 +18,7 @@ use crate::routes::Route;
 use aurcache_client::{ApprovalStatus, Worker, WorkerJoinInfo};
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
+use std::collections::HashSet;
 
 /// Columns that only appear once there is room for them.
 const WIDE_ONLY: &str = "hidden lg:table-cell";
@@ -40,6 +41,20 @@ pub fn Workers() -> Element {
     let poll_fast = matches!(&*workers.read_unchecked(), Some(Ok(list))
         if list.iter().any(|w| w.active_builds > 0 || w.status == ApprovalStatus::Pending));
     crate::poll::use_poll(workers, poll_fast);
+
+    // The names the "reserved for" column resolves against: an entry that names
+    // a package here is a link to it, one that does not is plain text. The set
+    // refreshes with the list (so approve/revoke refetch it) and when a package
+    // lands (so a reservation made for it links right away).
+    let known_packages = use_resource(move || async move {
+        let _ = reload();
+        crate::api::client()?
+            .list_packages(None, None, true)
+            .await
+            .map(|pkgs| pkgs.into_iter().map(|p| p.name).collect::<HashSet<_>>())
+            .map_err(|e| e.to_string())
+    });
+    crate::poll::use_refetch_on_package_change(known_packages);
 
     let mut show_retired = use_signal(|| false);
     let mut busy = use_signal(|| Option::<i32>::None);
@@ -112,6 +127,13 @@ pub fn Workers() -> Element {
                             .filter(|w| show_retired() || !w.status.is_retired())
                             .cloned()
                             .collect();
+                        // The package names in `known` are what a reservation
+                        // can be resolved to. Missing or erroring leaves the
+                        // column as plain text, which is the fallback anyway.
+                        let known: HashSet<String> = match known_packages().as_ref() {
+                            Some(Ok(pkgs)) => pkgs.clone(),
+                            _ => HashSet::new(),
+                        };
 
                         rsx! {
                             div { class: "flex items-center gap-3 flex-wrap",
@@ -135,7 +157,7 @@ pub fn Workers() -> Element {
                                     }
                                 }
                             }
-                            WorkersTable { workers: shown, busy: busy(), act }
+                            WorkersTable { workers: shown, busy: busy(), act, known }
                         }
                     },
                 }
@@ -257,6 +279,9 @@ fn WorkersTable(
     busy: Option<i32>,
     /// `(id, approve)` — true approves, false revokes.
     act: EventHandler<(i32, bool)>,
+    /// Package names that resolve to a real package. A reservation naming one
+    /// is a link; any other reservation stays plain text.
+    known: HashSet<String>,
 ) -> Element {
     // Read once for the whole table rather than per row, so every "3m ago" on
     // screen is measured from the same instant.
@@ -311,7 +336,17 @@ fn WorkersTable(
                                 } else {
                                     div { class: "flex flex-wrap gap-1",
                                         for package in worker.package_affinity.iter() {
-                                            span { key: "{package}", class: "badge badge-outline badge-sm font-mono", "{package}" }
+                                            if known.contains(package) {
+                                                Link {
+                                                    key: "{package}",
+                                                    title: "Open package page",
+                                                    class: "badge badge-outline badge-sm font-mono link-hover",
+                                                    to: Route::Package { pkgbase: package.clone() },
+                                                    "{package}"
+                                                }
+                                            } else {
+                                                span { key: "{package}", class: "badge badge-outline badge-sm font-mono", "{package}" }
+                                            }
                                         }
                                     }
                                 }

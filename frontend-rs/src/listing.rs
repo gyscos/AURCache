@@ -85,20 +85,40 @@ impl Sort {
     }
 }
 
-/// How a status filter is expressed: everything, or one particular state.
+/// How a status filter is expressed: everything, one particular state, or the
+/// packages with something newer available upstream. The last is not a build
+/// state -- a package's last build is still `Successful` when it is out of
+/// date -- so it is a pseudo-status of its own, backed by `SimplePackage`
+/// `outofdate` rather than by the `status` column. The builds list has no such
+/// flag, so the dropdown only offers it where it means something.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StatusFilter(pub Option<BuildState>);
+pub enum StatusFilter {
+    Any,
+    OutOfDate,
+    State(BuildState),
+}
 
 impl StatusFilter {
-    pub const ANY: Self = Self(None);
-
     pub fn id(self) -> String {
-        self.0
-            .map_or_else(|| "any".to_string(), |s| s.as_i32().to_string())
+        match self {
+            Self::Any => "any".to_string(),
+            // A word rather than a number: the build states have the numeric
+            // namespace to themselves, and an "out of date" option does not.
+            Self::OutOfDate => "outdated".to_string(),
+            Self::State(state) => state.as_i32().to_string(),
+        }
     }
 
     pub fn from_id(id: &str) -> Self {
-        Self(id.parse::<i32>().ok().and_then(BuildState::from_i32))
+        match id {
+            "any" => Self::Any,
+            "outdated" => Self::OutOfDate,
+            _ => id
+                .parse::<i32>()
+                .ok()
+                .and_then(BuildState::from_i32)
+                .map_or(Self::Any, Self::State),
+        }
     }
 
     /// How this filter is spelled in a URL.
@@ -110,13 +130,14 @@ impl StatusFilter {
     /// the UI uses for it, including the Workers page link that lands here.
     #[must_use]
     pub fn slug(self) -> &'static str {
-        match self.0 {
-            None => "any",
-            Some(BuildState::Active) => "building",
-            Some(BuildState::Successful) => "successful",
-            Some(BuildState::Failed) => "failed",
-            Some(BuildState::Enqueued) => "enqueued",
-            Some(BuildState::WaitingForDeps) => "waiting",
+        match self {
+            Self::Any => "any",
+            Self::OutOfDate => "outdated",
+            Self::State(BuildState::Active) => "building",
+            Self::State(BuildState::Successful) => "successful",
+            Self::State(BuildState::Failed) => "failed",
+            Self::State(BuildState::Enqueued) => "enqueued",
+            Self::State(BuildState::WaitingForDeps) => "waiting",
         }
     }
 
@@ -125,19 +146,30 @@ impl StatusFilter {
     /// error page.
     #[must_use]
     pub fn from_slug(slug: &str) -> Self {
-        Self(match slug {
-            "building" => Some(BuildState::Active),
-            "successful" => Some(BuildState::Successful),
-            "failed" => Some(BuildState::Failed),
-            "enqueued" => Some(BuildState::Enqueued),
-            "waiting" => Some(BuildState::WaitingForDeps),
-            _ => None,
-        })
+        match slug {
+            "building" => Self::State(BuildState::Active),
+            "successful" => Self::State(BuildState::Successful),
+            "failed" => Self::State(BuildState::Failed),
+            "enqueued" => Self::State(BuildState::Enqueued),
+            "waiting" => Self::State(BuildState::WaitingForDeps),
+            "outdated" => Self::OutOfDate,
+            _ => Self::Any,
+        }
     }
 
-    fn matches(self, status: i32) -> bool {
-        self.0
-            .is_none_or(|wanted| BuildState::from_i32(status) == Some(wanted))
+    /// Whether the underlying state and out-of-date flag answer to this filter.
+    fn matches(self, status: i32, outofdate: i32) -> bool {
+        match self {
+            Self::Any => true,
+            // The same condition the badge calls "out of date": a successful
+            // build that newer sources are ahead of. The flag is only ever
+            // meaningful for such a package in practice, but matching the badge
+            // keeps a filter result and a row's label from disagreeing.
+            Self::OutOfDate => {
+                BuildState::from_i32(status) == Some(BuildState::Successful) && outofdate != 0
+            }
+            Self::State(wanted) => BuildState::from_i32(status) == Some(wanted),
+        }
     }
 }
 
@@ -173,7 +205,7 @@ pub fn filter_packages(
 ) -> Vec<SimplePackage> {
     packages
         .iter()
-        .filter(|pkg| name_matches(&pkg.name, query) && status.matches(pkg.status))
+        .filter(|pkg| name_matches(&pkg.name, query) && status.matches(pkg.status, pkg.outofdate))
         .cloned()
         .collect()
 }
@@ -211,7 +243,7 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
 pub fn filter_builds(builds: &[Build], query: &str, status: StatusFilter) -> Vec<Build> {
     builds
         .iter()
-        .filter(|build| name_matches(&build_id(build), query) && status.matches(build.status))
+        .filter(|build| name_matches(&build_id(build), query) && status.matches(build.status, 0))
         .cloned()
         .collect()
 }
@@ -310,11 +342,11 @@ mod tests {
             dir: SortDir::Asc,
         };
         let untouched =
-            ViewParams::from_state(StatusFilter::ANY, default_sort, default_sort, false);
+            ViewParams::from_state(StatusFilter::Any, default_sort, default_sort, false);
         assert_eq!(untouched.to_string(), "");
 
         let changed = ViewParams::from_state(
-            StatusFilter(Some(BuildState::Failed)),
+            StatusFilter::State(BuildState::Failed),
             Sort {
                 key: SortKey::Worker,
                 dir: SortDir::Desc,
@@ -333,7 +365,12 @@ mod tests {
             ViewParams::default(),
             ViewParams::with_status(BuildState::Active),
             ViewParams {
-                status: Some(BuildState::Failed),
+                status: Some(StatusFilter::OutOfDate),
+                sort: None,
+                dependencies: false,
+            },
+            ViewParams {
+                status: Some(StatusFilter::State(BuildState::Failed)),
                 sort: Some(Sort {
                     key: SortKey::Size,
                     dir: SortDir::Desc,
@@ -356,7 +393,7 @@ mod tests {
         // A key we do not know is ignored, and the rest still applies.
         assert_eq!(
             ViewParams::from("zz=1&s=failed").status,
-            Some(BuildState::Failed)
+            Some(StatusFilter::State(BuildState::Failed))
         );
     }
     use super::*;
@@ -496,20 +533,20 @@ mod tests {
         ];
 
         // The package alone still finds all of its builds.
-        let by_package = filter_builds(&builds, "hello", StatusFilter::ANY);
+        let by_package = filter_builds(&builds, "hello", StatusFilter::Any);
         assert_eq!(by_package.len(), 2);
 
         // And the identity finds the one.
-        let by_id = filter_builds(&builds, "hello/4", StatusFilter::ANY);
+        let by_id = filter_builds(&builds, "hello/4", StatusFilter::Any);
         assert_eq!(by_id.len(), 1);
         assert_eq!(by_id[0].number, 4);
 
         // A build of another package with the same number is not it.
-        let other = filter_builds(&builds, "neofetch/3", StatusFilter::ANY);
+        let other = filter_builds(&builds, "neofetch/3", StatusFilter::Any);
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].pkg_name, "neofetch");
 
-        assert!(filter_builds(&builds, "hello/9", StatusFilter::ANY).is_empty());
+        assert!(filter_builds(&builds, "hello/9", StatusFilter::Any).is_empty());
     }
 
     fn build(number: i32, pkg: &str, status: BuildState, start: Option<i64>) -> Build {
@@ -537,7 +574,7 @@ mod tests {
             package("lib32-gtk3", BuildState::Successful, 0),
             package("firefox", BuildState::Successful, 0),
         ];
-        let found = filter_packages(&packages, "gtk", StatusFilter::ANY);
+        let found = filter_packages(&packages, "gtk", StatusFilter::Any);
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|p| p.name.contains("gtk")));
     }
@@ -547,7 +584,7 @@ mod tests {
         let packages = vec![package("Firefox", BuildState::Successful, 0)];
         for query in ["firefox", "FIREFOX", "  fire  "] {
             assert_eq!(
-                filter_packages(&packages, query, StatusFilter::ANY).len(),
+                filter_packages(&packages, query, StatusFilter::Any).len(),
                 1,
                 "{query:?}"
             );
@@ -561,9 +598,9 @@ mod tests {
             package("a", BuildState::Successful, 0),
             package("b", BuildState::Failed, 0),
         ];
-        assert_eq!(filter_packages(&packages, "", StatusFilter::ANY).len(), 2);
+        assert_eq!(filter_packages(&packages, "", StatusFilter::Any).len(), 2);
         assert_eq!(
-            filter_packages(&packages, "   ", StatusFilter::ANY).len(),
+            filter_packages(&packages, "   ", StatusFilter::Any).len(),
             2
         );
     }
@@ -575,9 +612,31 @@ mod tests {
             package("b", BuildState::Failed, 0),
             package("c", BuildState::Failed, 0),
         ];
-        let failed = filter_packages(&packages, "", StatusFilter(Some(BuildState::Failed)));
+        let failed = filter_packages(&packages, "", StatusFilter::State(BuildState::Failed));
         assert_eq!(failed.len(), 2);
-        assert_eq!(filter_packages(&packages, "", StatusFilter::ANY).len(), 3);
+        assert_eq!(filter_packages(&packages, "", StatusFilter::Any).len(), 3);
+    }
+
+    /// "Out of date" is a pseudo-status of its own, not a build state: only
+    /// the packages whose successful build newer sources are ahead of answer
+    /// to it.
+    #[test]
+    fn the_out_of_date_filter_selects_packages_behind_upstream() {
+        let packages = vec![
+            package("stale", BuildState::Successful, 1),
+            package("current", BuildState::Successful, 0),
+            package("broken", BuildState::Failed, 1),
+        ];
+        let filtered = filter_packages(&packages, "", StatusFilter::OutOfDate);
+        assert_eq!(
+            filtered.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["stale"],
+            "a failure is a failed package, not an out-of-date one"
+        );
+        assert_eq!(
+            filter_packages(&packages, "", StatusFilter::State(BuildState::Successful)).len(),
+            2
+        );
     }
 
     /// Sorting by status is asking "what needs me", so failures lead and
@@ -749,13 +808,18 @@ mod tests {
 
     #[test]
     fn a_status_filter_round_trips_through_its_id() {
-        assert_eq!(StatusFilter::from_id("any"), StatusFilter::ANY);
+        assert_eq!(StatusFilter::from_id("any"), StatusFilter::Any);
+        assert_eq!(StatusFilter::from_id("outdated"), StatusFilter::OutOfDate);
         for state in [BuildState::Failed, BuildState::Successful] {
-            let filter = StatusFilter(Some(state));
+            let filter = StatusFilter::State(state);
             assert_eq!(StatusFilter::from_id(&filter.id()), filter);
+            assert_eq!(StatusFilter::from_slug(filter.slug()), filter);
         }
         // An unrecognised value shows everything rather than nothing.
-        assert_eq!(StatusFilter::from_id("999"), StatusFilter::ANY);
+        assert_eq!(StatusFilter::from_id("999"), StatusFilter::Any);
+        // "outdated" spells the pseudo-status in a URL too.
+        assert_eq!(StatusFilter::OutOfDate.slug(), "outdated");
+        assert_eq!(StatusFilter::from_slug("outdated"), StatusFilter::OutOfDate);
     }
 }
 
@@ -847,6 +911,9 @@ pub fn ListControls(
     placeholder: String,
     shown: usize,
     total: usize,
+    /// Whether the "Out of date" pseudo-status is offered. Packages have the
+    /// backing flag; builds do not.
+    show_outdated: bool,
     children: Element,
 ) -> Element {
     let mut query = query;
@@ -867,9 +934,16 @@ pub fn ListControls(
                 aria_label: "Filter by status",
                 onchange: move |e| status.set(StatusFilter::from_id(&e.value())),
                 option {
-                    value: StatusFilter::ANY.id(),
-                    selected: status() == StatusFilter::ANY,
+                    value: StatusFilter::Any.id(),
+                    selected: status() == StatusFilter::Any,
                     "Any status"
+                }
+                if show_outdated {
+                    option {
+                        value: StatusFilter::OutOfDate.id(),
+                        selected: status() == StatusFilter::OutOfDate,
+                        "Out of date"
+                    }
                 }
                 for state in [
                     State::Failed,
@@ -880,8 +954,8 @@ pub fn ListControls(
                 ] {
                     option {
                         key: "{state.as_i32()}",
-                        value: StatusFilter(Some(state)).id(),
-                        selected: status() == StatusFilter(Some(state)),
+                        value: StatusFilter::State(state).id(),
+                        selected: status() == StatusFilter::State(state),
                         "{state_label(state)}"
                     }
                 }
@@ -1106,7 +1180,7 @@ impl SortDir {
 /// unescaped and the query stays legible.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ViewParams {
-    pub status: Option<BuildState>,
+    pub status: Option<StatusFilter>,
     /// `None` means "the list's own default order", so the common view carries
     /// no `o=` at all rather than spelling out what it would have done anyway.
     pub sort: Option<Sort>,
@@ -1124,7 +1198,7 @@ impl ViewParams {
         dependencies: bool,
     ) -> Self {
         Self {
-            status: status.0,
+            status: (status != StatusFilter::Any).then_some(status),
             sort: (sort != default_sort).then_some(sort),
             dependencies,
         }
@@ -1138,14 +1212,14 @@ impl ViewParams {
 
     #[must_use]
     pub fn status_filter(&self) -> StatusFilter {
-        StatusFilter(self.status)
+        self.status.unwrap_or(StatusFilter::Any)
     }
 
     /// A view filtered to one status and nothing else, for links into a list.
     #[must_use]
     pub fn with_status(status: BuildState) -> Self {
         Self {
-            status: Some(status),
+            status: Some(StatusFilter::State(status)),
             ..Self::default()
         }
     }
@@ -1154,8 +1228,8 @@ impl ViewParams {
 impl std::fmt::Display for ViewParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut sep = "";
-        if self.status.is_some() {
-            write!(f, "s={}", StatusFilter(self.status).slug())?;
+        if let Some(status) = self.status {
+            write!(f, "s={}", status.slug())?;
             sep = "&";
         }
         if let Some(sort) = self.sort {
@@ -1177,7 +1251,10 @@ impl From<&str> for ViewParams {
         let mut view = Self::default();
         for (key, value) in query.split('&').filter_map(|p| p.split_once('=')) {
             match key {
-                "s" => view.status = StatusFilter::from_slug(value).0,
+                "s" => {
+                    let filter = StatusFilter::from_slug(value);
+                    view.status = (filter != StatusFilter::Any).then_some(filter);
+                }
                 "o" => {
                     if let Some((key, dir)) = value.split_once('-')
                         && let (Some(key), Some(dir)) =

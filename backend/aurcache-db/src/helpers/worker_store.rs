@@ -176,10 +176,16 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     Ok(worker)
 }
 
-/// List all workers, most recently seen first.
+/// List all workers in name order.
+///
+/// Not by `last_seen`: that is rewritten on every heartbeat, so a "most
+/// recently seen" order shuffles the list every few seconds. Name order keeps
+/// the fleet in the same place between polls; liveness is a column, not the
+/// sort.
 pub async fn list_workers<C: ConnectionTrait>(db: &C) -> Result<Vec<workers::Model>, DbErr> {
     Workers::find()
-        .order_by_desc(workers::Column::LastSeen)
+        .order_by_asc(workers::Column::Name)
+        .order_by_asc(workers::Column::Id)
         .all(db)
         .await
 }

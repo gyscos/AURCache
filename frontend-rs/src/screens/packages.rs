@@ -140,6 +140,7 @@ pub fn Packages(
                             placeholder: "Filter packages…",
                             shown: found,
                             total,
+                            show_outdated: true,
                             // Sits beside the status filter. Only when there
                             // are dependencies to reveal — a checkbox that
                             // changes nothing invites the reader to wonder

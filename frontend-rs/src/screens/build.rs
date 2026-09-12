@@ -1,6 +1,8 @@
 //! A build's log output.
 
 use crate::api::api_base;
+use crate::dates::AbsoluteDate;
+use crate::format::{format_duration, now_secs};
 use crate::listing::ViewParams;
 use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon};
@@ -221,6 +223,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // Filled from the same poll that decides when the log stops, so a build
     // claimed while this page is open names its worker without a reload.
     let mut worker_name = use_signal(|| None::<String>);
+    // When it started and, once it has, when it stopped. A build that is not
+    // even queued has no start, and an ended build always has an end.
+    let mut start_time = use_signal(|| None::<i64>);
+    let mut end_time = use_signal(|| None::<i64>);
     let mut error = use_signal(|| Option::<String>::None);
     // True for a couple of seconds after a successful copy, so the button
     // swaps its icon and label to say the log is now on the clipboard.
@@ -282,6 +288,8 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 if let Ok(build) = client.get_build(&pkgbase, number).await {
                     worker_name.set(build.worker_name.clone());
                     status.set(Some(build.status));
+                    start_time.set(build.start_time);
+                    end_time.set(build.end_time);
                     // Only a *settled* build stops the loop. `is_in_progress`
                     // answers exactly this and keeps the queued states on the
                     // right side of it; testing for `Active` alone treated an
@@ -345,6 +353,20 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
                             title: "Show this worker's builds",
                             "{worker}"
+                        }
+                    }
+                    if let Some(start) = start_time() {
+                        // When it started and what it has used since. A running
+                        // build's duration grows as this page watches, so it is
+                        // measured to now; an ended one reports its total.
+                        span { class: "flex items-center gap-2 text-sm opacity-70",
+                            span { class: "whitespace-nowrap", "Started " }
+                            AbsoluteDate { ts: Some(start) }
+                            if end_time().is_none() {
+                                {format!("· {} so far", format_duration(Some(start), Some(now_secs())))}
+                            } else {
+                                {format!("· took {}", format_duration(Some(start), end_time()))}
+                            }
                         }
                     }
                     div { class: "flex-1" }

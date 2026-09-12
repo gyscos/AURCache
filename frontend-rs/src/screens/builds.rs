@@ -92,6 +92,7 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
                             placeholder: "Filter by package or build…",
                             shown: found,
                             total,
+                            show_outdated: false,
                         }
                         if shown.is_empty() {
                             div { class: "alert mt-2", span { "Nothing matches that filter." } }
