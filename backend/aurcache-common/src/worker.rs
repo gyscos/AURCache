@@ -179,6 +179,19 @@ pub struct Heartbeat {
     pub version: String,
 }
 
+/// The server's answer to a heartbeat.
+///
+/// Carried by the same request the worker already sends every few seconds, so
+/// it is the one channel back the pull-only worker has. A non-empty `cancel` is
+/// the server saying "these builds are no longer ACTIVE under you — stop
+/// them"; the worker aborts them on its next 5 s tick.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct HeartbeatResponse {
+    /// Build ids this worker should stop running.
+    #[serde(default)]
+    pub cancel: Vec<i32>,
+}
+
 /// Terminal report for a single build.
 ///
 /// A report with `success == false` (including OOM / non-zero exit) is a
@@ -304,6 +317,17 @@ mod tests {
             version: "0.1.0".into(),
         };
         assert_eq!(round_trip(&hb).active_build_ids, hb.active_build_ids);
+    }
+
+    /// An empty cancel list must deserialize — a server that has nothing to
+    /// stop says so in full, and the field has to be optional for callers that
+    /// predate it.
+    #[test]
+    fn an_empty_cancel_list_deserializes() {
+        let parsed: HeartbeatResponse = serde_json::from_str(r#"{"cancel":[]}"#).expect("parse");
+        assert!(parsed.cancel.is_empty());
+        let bare: HeartbeatResponse = serde_json::from_str(r#"{}"#).expect("parse");
+        assert!(bare.cancel.is_empty());
     }
 
     #[test]

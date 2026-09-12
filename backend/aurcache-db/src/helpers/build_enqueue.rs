@@ -1,6 +1,7 @@
 use crate::builds;
 use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
+use aurcache_common::build_state::BuildTriggers;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{
@@ -11,6 +12,16 @@ use sea_orm::{
 pub struct EnqueueBuildResult {
     pub build: builds::Model,
     pub inserted: bool,
+}
+
+/// What each caller wanted the row to mean: `user`, `auto_update`, or the
+/// reaper's `timeout_retry` (`BuildTriggers::*`). The retry budget for
+/// abandoned builds reads this column, so every creation path has to say.
+fn valid_trigger(trigger: i32) -> bool {
+    matches!(
+        trigger,
+        BuildTriggers::USER | BuildTriggers::AUTO_UPDATE | BuildTriggers::TIMEOUT_RETRY
+    )
 }
 
 // See the race explanation in `enqueue_build_if_missing`.
@@ -51,7 +62,12 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     version: &str,
     start_time: i64,
     initial_status: i32,
+    trigger: i32,
 ) -> Result<EnqueueBuildResult, DbErr> {
+    assert!(
+        valid_trigger(trigger),
+        "enqueue with unknown trigger {trigger}: a row whose purpose the budget walk cannot read"
+    );
     let platform_str = platform.as_str();
 
     // Two conflicts can stop this insert, and they mean opposite things.
@@ -79,6 +95,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
                 builds::Column::Platform,
                 builds::Column::Version,
                 builds::Column::Number,
+                builds::Column::Trigger,
             ])
             .values([
                 pkg_id.into(),
@@ -87,6 +104,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
                 platform_str.to_owned().into(),
                 version.to_owned().into(),
                 next_number,
+                trigger.into(),
             ])
             .map_err(|e| DbErr::Custom(e.to_string()))?
             .on_conflict(OnConflict::new().do_nothing().to_owned())

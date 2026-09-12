@@ -41,6 +41,17 @@ pub struct Model {
     pub lease_expires_at: Option<i64>,
     /// Number of times this build has been re-enqueued after a silent worker.
     pub attempt_count: i32,
+    /// Why this build row was created: `user`, `auto_update`, or `timeout_retry`
+    /// (see `aurcache_common::build_state::BuildTrigger`). The retry budget for
+    /// abandoned builds is derived from the consecutive `timeout_retry` run in
+    /// this column rather than counted anywhere.
+    pub trigger: i32,
+    /// Why the server stopped this build, when it did the stopping (`canceled`,
+    /// `lease_expired`, `max_duration` — see
+    /// `aurcache_common::build_state::EndReason`). `None` for a build whose
+    /// terminal outcome the worker reported, whose `CompleteReport.reason` text
+    /// is the record.
+    pub end_reason: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -14,8 +14,8 @@ use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary
 use aurcache_common::builder::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, MirrorlistPreference,
-    RegisterRequest, RegisterStatus,
+    ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
+    MirrorlistPreference, RegisterRequest, RegisterStatus,
 };
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
@@ -643,6 +643,28 @@ async fn complete_job_inner(
     build_id: i32,
     report: CompleteReport,
 ) -> Result<(), ApiError> {
+    // A canceled report is the worker's acknowledgement of an abort the server
+    // already carried out (operator Stop, or the reaper abandoning the build):
+    // the row is terminal FAILED and the retained `worker_id` still names the
+    // reporter. Accept it — 200, no mutation, staging already cleaned — and
+    // never ingest. This is a real ownership check: without it, any
+    // authenticated worker that guessed an id could remove another worker's
+    // staging directory (design §4). Everything else falls through to the
+    // refusal path below.
+    if report.canceled && !report.success {
+        let build = Builds::find_by_id(build_id)
+            .one(db)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+        let acked = build.is_some_and(|b| {
+            b.status == Some(worker_jobs::STATUS_FAILED) && b.worker_id == Some(auth.worker.id)
+        });
+        if acked {
+            let _ = tokio::fs::remove_dir_all(&staging_dir(build_id)).await;
+            return Ok(());
+        }
+    }
+
     let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
@@ -779,20 +801,23 @@ async fn read_staging(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     Ok(files)
 }
 
-/// Liveness heartbeat: renews leases for reported builds and requeues any this
-/// worker silently dropped.
+/// Liveness heartbeat: renews leases for reported builds, requeues any this
+/// worker silently dropped, and returns the builds the server wants it to stop
+/// (abandoned, or cancelled by an operator). The abort list rides this same
+/// answer rather than a second poll, so a cancelled or lost build is usually
+/// stopped on the next 5 s tick.
 #[post("/worker/heartbeat", data = "<input>")]
 pub async fn heartbeat(
     db: &State<DatabaseConnection>,
     auth: WorkerAuth,
     input: Json<Heartbeat>,
-) -> Result<(), ApiError> {
+) -> Result<Json<HeartbeatResponse>, ApiError> {
     let db = db.inner();
     let hb = input.into_inner();
     worker_store::touch_last_seen(db, auth.worker.id, Some(&hb.version))
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    worker_jobs::heartbeat(
+    let outcome = worker_jobs::heartbeat(
         db,
         auth.worker.id,
         &hb.active_build_ids,
@@ -801,10 +826,21 @@ pub async fn heartbeat(
     )
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
-    Ok(())
+    Ok(Json(HeartbeatResponse {
+        cancel: outcome.cancel_requested,
+    }))
 }
 
 /// Poll whether a cancel was requested for a specific job.
+///
+/// A build the worker still owns is cancelled when the server moved it out of
+/// `ACTIVE` (an operator Stop, or the reaper abandoning it). A build that left
+/// this worker's hands entirely — retried, reclaimed by someone else, or
+/// already terminal — reads as cancelled too: the worker must stop touching it.
+/// Only an `ACTIVE` row owned by *another* worker is refused, because that is
+/// the one case where answering would leak a job descriptor the reporter never
+/// had. Without row reuse that refusal is unreachable in practice, and 404 does
+/// the rest of the withholding.
 #[get("/worker/jobs/<build_id>/status")]
 pub async fn job_status(
     db: &State<DatabaseConnection>,
@@ -817,11 +853,13 @@ pub async fn job_status(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "build not found"))?;
-    if build.worker_id != Some(auth.worker.id) {
+    let mine = build.worker_id == Some(auth.worker.id);
+    if build.status == Some(worker_jobs::STATUS_ACTIVE) && !mine {
         return Err(err(Status::Forbidden, "not owner"));
     }
-    // Cancel is signalled by moving the build out of ACTIVE while owned.
-    let cancel_requested = build.status != Some(worker_jobs::STATUS_ACTIVE);
+    // Cancel is signalled by leaving ACTIVE while owned, or by no longer being
+    // this worker's to run.
+    let cancel_requested = build.status != Some(worker_jobs::STATUS_ACTIVE) || !mine;
     Ok(Json(JobStatus { cancel_requested }))
 }
 

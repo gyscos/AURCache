@@ -259,6 +259,7 @@ async fn trigger_build_for_package(
             &version,
             aurcache_db::helpers::time::now_secs(),
             initial_status,
+            aurcache_common::build_state::BuildTriggers::USER,
         )
         .await?;
 

@@ -235,8 +235,14 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // is what lets someone read back through a long log while it is still
     // being written.
     let mut following = use_signal(|| true);
+    // A Stop in flight, so the button shows "Stop…" and cannot double-fire.
+    let canceling = use_signal(|| false);
+    // The stop handler moves these; taken before the poll loop below moves the
+    // originals, so the button does not borrow what the loop owns.
+    let (pkgbase_for_stop, number_for_stop) = (pkgbase.clone(), number);
     use_future(move || {
         let pkgbase = pkgbase.clone();
+        let number = number;
         async move {
             let client = match AurCacheClient::new(api_base(), None) {
                 Ok(c) => c,
@@ -370,6 +376,37 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         }
                     }
                     div { class: "flex-1" }
+                    // Stop a build that is not over yet: running, enqueued, or
+                    // waiting for deps. Same `settled` gate as the poll loop,
+                    // so a build that just started is stoppable the moment this
+                    // page opens and a state from a newer server is too.
+                    if status().is_some_and(|s| !settled(s)) {
+                        button {
+                            disabled: canceling(),
+                            class: "btn btn-xs btn-error btn-outline",
+                            onclick: move |_| {
+                                // Signals are Copy; both are rebound `mut`
+                                // for the async body below.
+                                let (mut canceling, mut error) = (canceling, error);
+                                let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
+                                spawn(async move {
+                                    canceling.set(true);
+                                    let result = match crate::api::client() {
+                                        Ok(client) => match client.cancel_build(&pkgbase, number).await {
+                                            Ok(()) => Ok(()),
+                                            Err(e) => Err(e.to_string()),
+                                        },
+                                        Err(e) => Err(e),
+                                    };
+                                    if let Err(e) = result {
+                                        error.set(Some(e));
+                                        canceling.set(false);
+                                    }
+                                });
+                            },
+                            if canceling() { "Stopping…" } else { "Stop" }
+                        }
+                    }
                     LogCopyButton { log, copied, error }
                     label { class: "label cursor-pointer gap-2",
                         span { class: "label-text text-sm", "Follow" }

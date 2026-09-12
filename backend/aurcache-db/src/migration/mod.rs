@@ -25,6 +25,7 @@ mod m20260902_000000_build_logs_to_files;
 mod m20260906_000000_worker_kind;
 mod m20260907_000000_build_peak_memory;
 mod m20260910_000000_files_package_fk;
+mod m20260911_000000_build_trigger_end_reason;
 
 pub struct Migrator;
 
@@ -64,6 +65,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000000_worker_kind::Migration),
             Box::new(m20260907_000000_build_peak_memory::Migration),
             Box::new(m20260910_000000_files_package_fk::Migration),
+            Box::new(m20260911_000000_build_trigger_end_reason::Migration),
         ]
     }
 }

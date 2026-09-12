@@ -261,7 +261,21 @@ impl<E: Executor> Runner<E> {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             };
             match self.client.heartbeat(&hb).await {
-                Ok(()) => self.mark_contact(),
+                Ok(resp) => {
+                    self.mark_contact();
+                    // The server's abort list: any of our builds that were
+                    // abandoned (lease lost) or cancelled by an operator. Set
+                    // each flag; the build's next 5 s tick then aborts it.
+                    if !resp.cancel.is_empty() {
+                        let guard = self.active.lock().await;
+                        for id in &resp.cancel {
+                            if let Some(flag) = guard.get(id) {
+                                flag.store(true, Ordering::SeqCst);
+                                tracing::warn!("server asked to stop build #{id}; aborting");
+                            }
+                        }
+                    }
+                }
                 Err(e) => tracing::warn!("heartbeat failed: {e}"),
             }
 

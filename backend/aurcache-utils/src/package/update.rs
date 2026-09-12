@@ -657,6 +657,7 @@ async fn enqueue_platform_builds(
                 request.version,
                 start_time,
                 BuildStates::WAITING_FOR_DEPS,
+                aurcache_common::build_state::BuildTriggers::AUTO_UPDATE,
             )
             .await?;
             txn.commit().await?;
@@ -702,6 +703,7 @@ pub async fn update_platform(
         &new_version,
         start_time,
         BuildStates::ENQUEUED_BUILD,
+        aurcache_common::build_state::BuildTriggers::AUTO_UPDATE,
     )
     .await?;
     txn.commit().await?;

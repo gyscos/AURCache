@@ -454,6 +454,10 @@ async fn run_build(
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
+        // The build's own process group: alone it enables the process-group
+        // SIGKILL fallback below, which takes makechrootpkg's whole tree even
+        // where no cgroup was prepared.
+        cmd.process_group(0);
         if let Some(cg) = &build_cgroup {
             // Opened per spawn: the retry below runs this closure again, and a
             // descriptor consumed by the first attempt is gone by then.
@@ -552,7 +556,33 @@ async fn run_build(
                     }
                 }
                 if canceled || hit_timeout {
-                    let _ = child.start_kill();
+                    // Kill the whole build tree, not just makechrootpkg:
+                    // cgroup.kill (recursive over descendants) when the cgroup
+                    // is available, else the process-group SIGKILL the
+                    // `process_group(0)` spawn made possible. `start_kill`
+                    // alone would orphan the compilers and whatever the chroot
+                    // spawned into a systemd-managed scope.
+                    let killed = if let Some(cg) = &build_cgroup {
+                        match cg.kill() {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "cgroup.kill failed for build {build_id}: {e:#}; \
+                                     falling back to the process group"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if !killed && let Err(e) = kill_process_group(&mut child).await {
+                        tracing::warn!(
+                            "process-group kill failed for build {build_id}: {e}; \
+                             falling back to start_kill"
+                        );
+                        let _ = child.start_kill();
+                    }
                     let status = child.wait().await.context("awaiting killed build")?;
                     break status;
                 }
@@ -586,4 +616,25 @@ async fn run_build(
     };
     report.peak_memory_bytes = peak_memory_bytes;
     Ok(report)
+}
+
+/// SIGKILL the child's whole process group.
+///
+/// The build is spawned with `process_group(0)`, so the child is the leader of
+/// a fresh group (pgid = pid) and killing the negative pid reaches every
+/// descendant that inherited the group — sudo, makechrootpkg, nspawn, the
+/// compilers. This is the fallback when no per-build cgroup was prepared; on a
+/// systemd host the container may have been handed to a managed scope, which
+/// escapes the group, and that is a documented boundary of the kill.
+async fn kill_process_group(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    let Some(pid) = child.id() else {
+        return Ok(()); // Already reaped.
+    };
+    // SAFETY: a plain kill(2); every argument is a value, nothing borrowed.
+    let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }

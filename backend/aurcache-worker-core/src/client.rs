@@ -10,8 +10,8 @@
 
 use anyhow::{Context, Result, bail};
 use aurcache_common::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, JobStatus, RegisterRequest,
-    RegisterStatus,
+    ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
+    RegisterRequest, RegisterStatus,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -301,9 +301,12 @@ impl WorkerClient {
         Ok(())
     }
 
-    /// Send a liveness heartbeat listing the builds still running.
-    pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<()> {
-        self.http
+    /// Send a liveness heartbeat listing the builds still running, and return
+    /// the server's answer: the builds it wants this worker to stop (abandoned,
+    /// or cancelled by an operator).
+    pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatResponse> {
+        let resp = self
+            .http
             .post(self.url("/heartbeat"))
             .json(hb)
             .send()
@@ -311,7 +314,9 @@ impl WorkerClient {
             .context("heartbeat request")?
             .error_for_status()
             .context("heartbeat rejected")?;
-        Ok(())
+        resp.json()
+            .await
+            .context("decoding heartbeat response")
     }
 
     /// Poll whether a build has been asked to cancel.

@@ -141,6 +141,22 @@ impl BuildCgroup {
         let raw = fs::read_to_string(self.dir.join("memory.peak")).ok()?;
         parse_peak(&raw)
     }
+
+    /// Kill every process in this cgroup, including descendants.
+    ///
+    /// `cgroup.kill` is v2's recursive kill: it signals the whole tree — the
+    /// nspawn child, `makechrootpkg`, each compiler — in one write, which is
+    /// exactly the tree a build is. Only the leaf's processes are listed by
+    /// `cgroup.procs`; `cgroup.kill` walks the descendants for us.
+    ///
+    /// This is the primary kill path for an aborted (cancelled) or timed-out
+    /// build: `child.start_kill()` would only take `makechrootpkg`, and the
+    /// processes it spawned (possibly in a systemd-managed scope that escapes
+    /// the process group) would linger. Falls back to the outside caller.
+    pub fn kill(&self) -> Result<()> {
+        fs::write(self.dir.join("cgroup.kill"), "1")
+            .with_context(|| format!("writing cgroup.kill in {}", self.dir.display()))
+    }
 }
 
 impl Drop for BuildCgroup {
