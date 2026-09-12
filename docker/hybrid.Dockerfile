@@ -126,6 +126,17 @@ RUN set -eux; \
       cp ./*.pkg.tar.zst /pkg/; \
     done
 
+########## Stage 1c: export the built packages to the host ##########
+# The image installs the packages and discards them (`rm -rf /tmp/pkg` below),
+# but the build *made* the packages, and a host that wants them for a native
+# install should not re-make them with build-packages.sh. This stage gives the
+# finished archives back: nothing in the image flow references it, so it costs
+# the normal build nothing, and `scripts/build-images.sh --packages-dir` runs one
+# extra `buildx build --target export-pkgs` that replays the now-cached
+# (host-arch) packager stage and copies /pkg out with `type=local` output.
+FROM scratch AS export-pkgs
+COPY --from=packager /pkg/*.pkg.tar.zst /
+
 ########## Stage 2: per-arch Arch Linux runtime ##########
 # Official Arch is x86_64-only; Arch Linux ARM covers arm64.
 FROM --platform=linux/amd64 archlinux/archlinux:latest AS runtime-amd64

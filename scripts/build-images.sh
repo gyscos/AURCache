@@ -20,6 +20,12 @@
 # the better part of an hour to build from the AUR. Point `--toolchain-repo` at
 # a pacman repository that already has it -- an AURCache instance, for
 # example -- and that becomes a few seconds. See packaging/build-cross-toolchain.sh.
+#
+# The worker and hybrid images *build* the AURCache packages as a stage of their
+# own and then install them. `--packages-dir` keeps that work for the host too:
+# the packager stage is replayed from the build cache into the directory, so a
+# local `pacman -U` gets the same artifacts the image just installed, without
+# `build-packages.sh` building them a second time.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,6 +52,11 @@ Options:
                             database file pacman fetches (default: repo)
       --builder NAME        buildx builder to use (default: aurcache-multiarch,
                             created on demand)
+      --packages-dir DIR    Also write the AURCache packages the worker/hybrid
+                            images built into DIR, for a native install. The
+                            packager stage is replayed from the build cache, so
+                            this is an output, not a second build. Host arch
+                            (x86_64) only.
   -h, --help                This message
 
 Without --push, what happens to the result depends on the daemon's image
@@ -82,6 +93,7 @@ push=0
 toolchain_repo=
 toolchain_repo_name=
 builder=$DEFAULT_BUILDER
+packages_dir=
 registry=
 
 while (($#)); do
@@ -93,6 +105,7 @@ while (($#)); do
         --toolchain-repo) toolchain_repo=$2; shift 2 ;;
         --toolchain-repo-name) toolchain_repo_name=$2; shift 2 ;;
         --builder) builder=$2; shift 2 ;;
+        --packages-dir) packages_dir=$2; shift 2 ;;
         -h | --help) usage; exit 0 ;;
         -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
         *)
@@ -109,15 +122,31 @@ if [[ -z $registry ]]; then
     exit 2
 fi
 
+# --packages-dir exports the packages the worker/hybrid packager stages built,
+# via `type=local` output. Local output needs the docker-container driver too,
+# so both cases pull in the container builder.
+export_targets=()
+if [[ -n $packages_dir ]]; then
+    IFS=',' read -r -a _sel <<<"$images"
+    for _img in "${_sel[@]}"; do
+        case $_img in worker | hybrid) export_targets+=("$_img") ;; esac
+    done
+fi
+need_local_output=0
+((${#export_targets[@]})) && need_local_output=1
+
 # A multi-platform build needs the docker-container driver; the default `docker`
 # driver builds for one architecture only and fails with a message that does not
 # say so. Created rather than demanded, since one builder is as good as another.
-if [[ $platforms == *,* ]] && ! docker buildx inspect "$builder" >/dev/null 2>&1; then
+if [[ ($platforms == *,* || $need_local_output == 1) ]] &&
+    ! docker buildx inspect "$builder" >/dev/null 2>&1; then
     echo "==> creating buildx builder '$builder'"
     docker buildx create --name "$builder" --driver docker-container --bootstrap >/dev/null
 fi
 builder_args=()
-[[ $platforms == *,* ]] && builder_args=(--builder "$builder")
+if [[ $platforms == *,* || $need_local_output == 1 ]]; then
+    builder_args=(--builder "$builder")
+fi
 
 # Foreign runtime stages run under qemu-user through binfmt. Checked rather than
 # assumed: without it the build fails partway with "exec format error", which
@@ -218,6 +247,35 @@ for image in "${selected[@]}"; do
         "$REPO_ROOT"
 done
 
+# The packager stages just built the AURCache packages and the image build
+# discarded them (`rm -rf /tmp/pkg`). Give the host its own copy: a second
+# build targeting the export-pkgs stage replays those stages from the build
+# cache the image build just populated and copies the archives out with
+# `type=local` output. One run per Dockerfile, since worker and hybrid both
+# build the worker packages (overwriting is fine, the bytes are identical).
+if [[ -n $packages_dir ]]; then
+    echo
+    if ((${#export_targets[@]})); then
+        echo "==> exporting built packages to $packages_dir (x86_64, host arch)"
+        mkdir -p "$packages_dir"
+        declare -A exported_dockerfiles=()
+        for image in "${export_targets[@]}"; do
+            dockerfile=${DOCKERFILES[$image]}
+            [[ -n ${exported_dockerfiles[$dockerfile]:-} ]] && continue
+            docker buildx build "${builder_args[@]}" \
+                --platform linux/amd64 \
+                --file "$REPO_ROOT/$dockerfile" \
+                --target export-pkgs \
+                --output "type=local,dest=$packages_dir" \
+                "$REPO_ROOT"
+            exported_dockerfiles[$dockerfile]=1
+        done
+    else
+        echo "note: --packages-dir given but no worker or hybrid image selected;" >&2
+        echo "      the server image installs no packages to export." >&2
+    fi
+fi
+
 echo
 if ((push)); then
     echo "==> pushed $images as :$tag to $registry"
@@ -225,4 +283,7 @@ elif ((containerd_store)) || [[ $platforms != *,* ]]; then
     echo "==> built and loaded $images for $platforms"
 else
     echo "==> built $images for $platforms (discarded; --push to publish)"
+fi
+if [[ -n $packages_dir ]] && ((${#export_targets[@]})); then
+    echo "==> packages written to $packages_dir (install with: sudo pacman -U $packages_dir/*.pkg.tar.zst)"
 fi

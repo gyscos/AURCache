@@ -83,6 +83,7 @@ cd docs && yarn install --frozen-lockfile && yarn build
 # that already has the cross toolchain, turning an hour into seconds.
 ./scripts/build-images.sh <registry> --push --toolchain-repo 'http://host:8081/$arch'
 ./scripts/build-images.sh --images server --platforms linux/amd64 <registry>
+./scripts/build-images.sh --packages-dir /tmp/pkgs <registry>   # also keep a host copy of the AURCache packages the images built (host arch; replayed from the build cache, not rebuilt)
 ```
 
 ### Which end-to-end suite to run
