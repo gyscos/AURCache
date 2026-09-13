@@ -206,7 +206,7 @@ fi
 # `aurcache-hybrid` because that is the name deployments predating the split
 # already pull.
 declare -A DOCKERFILES=(
-    [server]=docker/Dockerfile
+    [server]=docker/server.Dockerfile
     [worker]=docker/worker.Dockerfile
     [hybrid]=docker/hybrid.Dockerfile
 )

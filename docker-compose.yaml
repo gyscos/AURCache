@@ -29,7 +29,7 @@ services:
     # Prefer a published image; uncomment to build locally instead:
     # build:
     #   context: .
-    #   dockerfile: docker/Dockerfile
+    #   dockerfile: docker/server.Dockerfile
     ports:
       - "8080:8080"   # Web UI + API (plain HTTP; front with a reverse proxy for TLS)
       - "8081:8081"   # Pacman repository (plain HTTP, for `pacman -Sy`)

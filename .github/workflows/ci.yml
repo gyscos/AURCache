@@ -33,7 +33,7 @@ jobs:
       # bundled in the crate, which resolves it from $PATH at runtime. Without
       # it, every test that parses a *patched* PKGBUILD fails (unpatched sources
       # read the shipped .SRCINFO instead and pass either way). The runtime
-      # image installs it the same way - see docker/Dockerfile.
+      # image installs it the same way - see docker/server.Dockerfile.
       - name: Install alpm-pkgbuild-bridge
         run: |
           curl -sSLf -o "$RUNNER_TEMP/alpm-pkgbuild-bridge" \

@@ -58,7 +58,7 @@ applying a patch invalidates that `.SRCINFO` and forces a PKGBUILD re-parse
 through the bridge. So most of the suite passes and a handful of patch-related
 tests fail.
 
-The Docker image installs it the same way (see `docker/Dockerfile`), so this
+The Docker image installs it the same way (see `docker/server.Dockerfile`), so this
 only affects running the backend or its tests directly on your machine.
 
 [`alpm-pkgbuild-bridge`]: https://gitlab.archlinux.org/archlinux/alpm/alpm-pkgbuild-bridge
