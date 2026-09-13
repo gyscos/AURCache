@@ -112,6 +112,17 @@ async fn run_job_inner(
     let _ = std::fs::remove_dir_all(workdir);
     let pkgdir = artifacts::extract_source(&source, workdir).context("extracting source")?;
 
+    // The archive unpacks owned by this worker's user, with the modes baked
+    // into it (0644/0755); the build then runs as a *different* user
+    // (`build_user`). makepkg rewrites the PKGBUILD in place for VCS packages
+    // (`pkgver()` at build time), and its `update_pkgver` prints a warning and
+    // proceeds with the stale version whenever the file is not writable — the
+    // `ttf-google-fonts-git` symptom of a pkgver that never advances. The
+    // docker builder needs the same and solves it with `chmod -R a+w .`.
+    make_source_writable(&pkgdir)
+        .await
+        .context("making source writable")?;
+
     // 1.5. Reconcile the shared package cache against what the served
     // repository publishes *now* (see design/stale-shared-pacman-cache.md).
     // The stale bytes live in the shared cache, the second, read-only
@@ -339,6 +350,29 @@ async fn run_job_inner(
 enum Either {
     Out(tokio::process::ChildStdout),
     Err(tokio::process::ChildStderr),
+}
+
+/// Recursively open up the extracted source tree so the build user can write
+/// to it. `makechrootpkg` bind-mounts the package directory into the chroot
+/// and runs `makepkg` as `build_user`, which is not the user that unpacked
+/// the archive: makepkg rewrites the PKGBUILD in place when a `pkgver()`
+/// function is present, and it only does so where the file is writable (see
+/// `update_pkgver` in `makepkg.sh.in`) — otherwise it warns and builds with
+/// the stale version. The directory lives in the per-job `workdir`, which
+/// `run_job` removes on every exit path, so the loosened permissions do not
+/// outlive the build.
+async fn make_source_writable(pkgdir: &Path) -> Result<()> {
+    let status = tokio::process::Command::new("chmod")
+        .arg("-R")
+        .arg("a+w")
+        .arg(pkgdir)
+        .status()
+        .await
+        .context("running chmod -R a+w")?;
+    if !status.success() {
+        anyhow::bail!("chmod -R a+w {} failed: {status}", pkgdir.display());
+    }
+    Ok(())
 }
 
 /// How much output to accumulate before sending, and how long to hold a
@@ -636,5 +670,42 @@ async fn kill_process_group(child: &mut tokio::process::Child) -> std::io::Resul
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The build user is not the worker's user; makepkg can only rewrite the
+    /// PKGBUILD for a `pkgver()` check where the extracted tree is writable.
+    #[tokio::test]
+    async fn make_source_writable_opens_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pkgdir = tmp.path().join("pkg");
+        std::fs::create_dir_all(pkgdir.join("sub")).unwrap();
+        std::fs::write(pkgdir.join("PKGBUILD"), b"pkgname=x").unwrap();
+        std::fs::write(pkgdir.join("sub/data"), b"x").unwrap();
+        // As tar::unpack leaves them: 0755 dirs, 0644 files.
+        std::fs::set_permissions(&pkgdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            pkgdir.join("PKGBUILD"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        make_source_writable(&pkgdir).await.unwrap();
+
+        for path in [&pkgdir, &pkgdir.join("sub"), &pkgdir.join("PKGBUILD")] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o222,
+                0o222,
+                "{} must be writable by all",
+                path.display()
+            );
+        }
     }
 }
