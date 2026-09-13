@@ -81,7 +81,7 @@ ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 
 USER packager
-ENV PATH="/home/packager/.cargo/bin:${PATH}"
+ENV PATH="/home/packager/bin:/home/packager/.cargo/bin:${PATH}"
 # The toolchain needs no source, so its COPY glue stays ahead of the tree: a
 # code change then invalidates the wasm-bindgen and makepkg RUNs below without
 # re-running the locked rustup install.
@@ -108,10 +108,15 @@ COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
 # run. `uid`/`gid` solve the reason this used to be impossible: buildkit
 # creates the mount as root, leaving cargo -- running as `packager` -- unable to
 # write `~/.cargo/.crates.toml`; naming the owner makes the home writable and
-# the layer caches on its own again.
+# the layer caches on its own again. The binary itself is copied out of the
+# mount into the layer (`~/.cargo` is a cache mount, which buildkit may evict
+# independently of the layer cache -- the same trap server.Dockerfile copies
+# itself out of); `~/.cargo/bin` stays on PATH for the compiles that run under
+# `cargo`, and `~/bin` is where the durable copy lives.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    install-wasm-bindgen.sh /tmp/frontend-Cargo.lock
+    install-wasm-bindgen.sh /tmp/frontend-Cargo.lock \
+    && install -Dm755 /home/packager/.cargo/bin/wasm-bindgen /home/packager/bin/wasm-bindgen
 
 COPY --chown=packager . /src
 # Build all four packages: the worker-docker package is a wrapper image of its

@@ -2,12 +2,14 @@
 
 use crate::api::api_base;
 use crate::dates::AbsoluteDate;
-use crate::format::{format_duration, now_secs};
+use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
+use crate::log_tail::{append_capped, coarse_pointer, drop_leading_partial_line, log_tail_cap};
 use crate::routes::Route;
-use crate::shell::{CheckIcon, CopyIcon};
+use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
 use aurcache_client::AurCacheClient;
+use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 use wasm_bindgen::JsValue;
@@ -50,8 +52,19 @@ mod tests {
     fn CopyButtonHarness(log: String, copied: bool) -> Element {
         let log_signal = use_signal(move || log);
         let copied_signal = use_signal(move || copied);
+        let tail = use_signal(|| false);
         let error = use_signal(|| None::<String>);
-        rsx! { LogCopyButton { log: log_signal, copied: copied_signal, error } }
+        rsx! {
+            LogCopyButton {
+                pkgbase: "hello".to_string(),
+                number: 3,
+                log: log_signal,
+                tail,
+                cap: 4 << 20,
+                copied: copied_signal,
+                error,
+            }
+        }
     }
 
     fn render_copy_button(log: &str, copied: bool) -> String {
@@ -79,8 +92,19 @@ mod tests {
         let log = use_signal(String::new);
         LATE_LOG.with(|cell| *cell.borrow_mut() = Some(log));
         let copied = use_signal(|| false);
+        let tail = use_signal(|| false);
         let error = use_signal(|| None::<String>);
-        rsx! { LogCopyButton { log, copied, error } }
+        rsx! {
+            LogCopyButton {
+                pkgbase: "hello".to_string(),
+                number: 3,
+                log,
+                tail,
+                cap: 4 << 20,
+                copied,
+                error,
+            }
+        }
     }
 
     /// A log arrives after the first render — always, since the page fetches
@@ -127,6 +151,53 @@ mod tests {
         assert!(
             !html.contains(">Copy<"),
             "the label should flip to Copied: {html}"
+        );
+    }
+
+    /// Once the window is a true tail, Copy stops pretending —
+    /// it labels itself, warns, and the Download link is offered beside it.
+    #[component]
+    fn TailButtonHarness() -> Element {
+        let log = use_signal(|| "line one\nline two\nline three\n".to_string());
+        let tail = use_signal(|| true);
+        let copied = use_signal(|| false);
+        let error = use_signal(|| None::<String>);
+        rsx! {
+            LogCopyButton {
+                pkgbase: "hello".to_string(),
+                number: 3,
+                log,
+                tail,
+                cap: 4 << 20,
+                copied,
+                error,
+            }
+        }
+    }
+
+    #[test]
+    fn the_copy_button_says_when_it_is_a_tail_and_offers_download() {
+        let mut dom = VirtualDom::new(TailButtonHarness);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Copy tail"), "{html}");
+        assert!(
+            html.contains("Copying the shown ~4.0 MiB tail, not the full log"),
+            "the tooltip should send whole-log users to Download: {html}"
+        );
+        // The Download anchor reaches the streaming route and names the file
+        // it will save.
+        assert!(
+            html.contains("/package/hello/build/3/output/download"),
+            "the anchor should point at the download route: {html}"
+        );
+        assert!(html.contains("download=\"hello-3.log\""), "{html}");
+        // Warning marker on the tail's copy button.
+        assert!(
+            html.contains(
+                "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"
+            ),
+            "a tail should carry the `!` warning: {html}"
         );
     }
 }
@@ -191,10 +262,12 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
 // Build log
 //
 // The interesting screen: output arrives while the build runs. The API is
-// incremental rather than streaming — `?startline=N` returns everything from
-// line N on — so this polls, appends, and stops once the build reaches a
-// terminal state. That is the same contract the Dart component uses; the
-// point here is to see what it costs to express in Dioxus.
+// incremental rather than streaming — `?offset=N&limit=M` returns a bounded
+// page of raw bytes from byte N on — so this polls aligned pages, appends
+// them to a cap-sized window, and stops once the build reaches a terminal
+// state. That is the same contract the Dart component used, with the raw
+// bytes decoded (and the cap kept) client-side. The point here is to see what
+// it costs to express that in Dioxus.
 // ---------------------------------------------------------------------------
 
 /// How often to ask for more output while a build is running.
@@ -206,28 +279,28 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // for per-line features — ANSI colour, line numbers, deep links — and a
     // build emits thousands of lines, so the browser would lay out thousands
     // of elements and the VirtualDom would walk them on every poll.
-    let mut log = use_signal(String::new);
-    // Two counters, because they answer different questions. `byte_offset` is
-    // what the API takes: the server seeks to it in the log file, so a poll
-    // costs what it reads rather than the size of the whole log. `line_count`
-    // is only for display, counted from the chunks as they arrive so the server
-    // never has to think in lines -- which is what let the transport switch to
-    // bytes without losing the "N lines" readout.
-    let mut byte_offset = use_signal(|| 0u64);
-    let mut line_count = use_signal(|| 0i32);
-    let mut finished = use_signal(|| false);
+    let log = use_signal(String::new);
+    // How large the log is, from the detail route. As with any "not known" the
+    // answer is `None`, not zero: no log file and a zero-byte log are different.
+    let log_size = use_signal(|| None::<i64>);
+    // Whether the window is a true tail — the initial frame was placed near the
+    // end or a leading line was drained to stay in budget. A tail restates what
+    // Copy does and how the footer reads; an untrimmed head view is the whole
+    // log.
+    let tail = use_signal(|| false);
+    let finished = use_signal(|| false);
     // The build's real state, not just "is it over". "Not building" also covers
     // *enqueued* and *waiting for deps*, and collapsing those into a boolean is
     // what told someone their freshly queued build had already finished.
-    let mut status = use_signal(|| None::<i32>);
+    let status = use_signal(|| None::<i32>);
     // Filled from the same poll that decides when the log stops, so a build
     // claimed while this page is open names its worker without a reload.
-    let mut worker_name = use_signal(|| None::<String>);
+    let worker_name = use_signal(|| None::<String>);
     // When it started and, once it has, when it stopped. A build that is not
     // even queued has no start, and an ended build always has an end.
-    let mut start_time = use_signal(|| None::<i64>);
-    let mut end_time = use_signal(|| None::<i64>);
-    let mut error = use_signal(|| Option::<String>::None);
+    let start_time = use_signal(|| None::<i64>);
+    let end_time = use_signal(|| None::<i64>);
+    let error = use_signal(|| Option::<String>::None);
     // True for a couple of seconds after a successful copy, so the button
     // swaps its icon and label to say the log is now on the clipboard.
     let copied = use_signal(|| false);
@@ -237,11 +310,30 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     let mut following = use_signal(|| true);
     // A Stop in flight, so the button shows "Stop…" and cannot double-fire.
     let canceling = use_signal(|| false);
+    // The tail budget, read once on mount: `window.inner_width()` and
+    // `(pointer: coarse)` decide phone (4 MiB) versus desktop (16 MiB).
+    let cap = use_memo(|| {
+        log_tail_cap(
+            web_sys::window()
+                .and_then(|w| w.inner_width().ok())
+                .and_then(|w| w.as_f64()),
+            coarse_pointer(),
+        )
+    });
     // The stop handler moves these; taken before the poll loop below moves the
     // originals, so the button does not borrow what the loop owns.
     let (pkgbase_for_stop, number_for_stop) = (pkgbase.clone(), number);
+    // The poll loop is the component's only other `pkgbase` consumer, and it
+    // runs for the life of the screen, so it takes its own copy and the rsx
+    // below keeps the original for the header and the copy/download buttons.
+    let pkgbase_for_poll = pkgbase.clone();
     use_future(move || {
-        let pkgbase = pkgbase.clone();
+        let (mut log, mut log_size, mut tail) = (log, log_size, tail);
+        let (mut worker_name, mut status, mut start_time, mut end_time) =
+            (worker_name, status, start_time, end_time);
+        let (mut finished, mut error, following) = (finished, error, following);
+        let cap = cap();
+        let pkgbase = pkgbase_for_poll.clone();
         let number = number;
         async move {
             let client = match AurCacheClient::new(api_base(), None) {
@@ -252,64 +344,125 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 }
             };
 
+            // The fetch position is private to the poll loop: nothing outside
+            // it reads or writes it, and the loop is its only owner. `align`'s
+            // back_drop makes it byte-precise — it advances by raw bytes read,
+            // never by the length of the decoded text.
+            let mut next_offset: u64 = 0;
+
             loop {
-                // Ask only for what we do not already have.
-                let have = byte_offset();
-                match client.build_output(&pkgbase, number, Some(have)).await {
-                    Ok(chunk) if !chunk.is_empty() => {
-                        let added = chunk.lines().count() as i32;
-                        byte_offset += chunk.len() as u64;
-                        log.with_mut(|text| {
-                            if !text.is_empty() && !text.ends_with('\n') {
-                                text.push('\n');
-                            }
-                            text.push_str(&chunk);
-                        });
-                        line_count += added;
-                        if error.peek().is_some() {
-                            error.set(None);
-                        }
-                    }
-                    Ok(_) => {
+                // The build's state first, each cycle: status, worker, start
+                // and end times, and — from the detail route only — the log's
+                // size. The output fetch is gated on this, so a hiccup on the
+                // header route never fetches without bounds.
+                let build = match client.get_build(&pkgbase, number).await {
+                    Ok(build) => {
+                        worker_name.set(build.worker_name.clone());
+                        status.set(Some(build.status));
+                        start_time.set(build.start_time);
+                        end_time.set(build.end_time);
+                        log_size.set(build.log_size);
                         // A successful poll clears a previous failure: the
                         // banner should describe now, not the worst moment so
                         // far.
                         if error.peek().is_some() {
                             error.set(None);
                         }
+                        Some(build)
                     }
                     Err(e) => {
-                        // Report and keep polling. Returning here abandoned the
-                        // log for the life of the page, so one timeout on a
-                        // slow connection meant a running build stopped
-                        // updating until it was reloaded by hand -- and the
-                        // first fetch is the most likely to time out, being the
-                        // whole log at once.
                         error.set(Some(e.to_string()));
+                        None
+                    }
+                };
+
+                // Terminal check after the output fetch below (this cycle's
+                // page arrives before the loop returns), so the last lines are
+                // never missed. Only a *settled* build stops the loop.
+                // `is_in_progress` answers exactly this and keeps the queued
+                // states on the right side of it; testing for `Active` alone
+                // treated an enqueued build as over, so the page announced
+                // "finished" and never updated again when the build started.
+                // An unrecognised state from a newer server counts as in
+                // progress: being wrong that way costs one poll per interval,
+                // while being wrong the other way is this bug.
+                let settled_now = build.as_ref().is_some_and(|b| settled(b.status));
+                if settled_now {
+                    finished.set(true);
+                }
+
+                // Output, gated on the header above. Frozen while not following
+                // so the view cannot jump under a scroll position — the header
+                // still polls, keeping status and times live. A build that
+                // settles this cycle gets its final page regardless, then the
+                // loop returns, so the last lines are never missed.
+                if let Some(build) = build.filter(|_| following() || settled_now) {
+                    // Initial placement, once: a log already bigger than
+                    // the window opens at its *end*, not at 0 — the first
+                    // frame is what a finished log should show, not the
+                    // first 4 MiB of a multi-GiB file. The leading partial
+                    // line that `size − cap` can land on is stripped once,
+                    // below, after `align`.
+                    if next_offset == 0 && build.log_size.is_some_and(|s| s as u64 > cap as u64) {
+                        next_offset = build.log_size.unwrap_or(0) as u64 - cap as u64;
+                        tail.set(true);
+                    }
+
+                    // One bounded page per poll: the window never holds
+                    // more than the cap, and the server never reads more
+                    // than the cap's worth either.
+                    let requested = next_offset;
+                    match client
+                        .build_output_page(&pkgbase, number, Some(requested), Some(cap as u64))
+                        .await
+                    {
+                        Ok(page) => {
+                            if error.peek().is_some() {
+                                error.set(None);
+                            }
+                            if !page.is_empty() {
+                                let (front_skip, back_drop) = align(&page);
+                                // A page that aligns to nothing — the log
+                                // ended mid-codepoint and it is all tail —
+                                // cannot advance `next_offset`, so it is
+                                // EOF; nothing is appended.
+                                let slice = &page[front_skip..page.len() - back_drop];
+                                if !slice.is_empty() {
+                                    let chunk = String::from_utf8_lossy(slice);
+                                    // First real frame at a tail offset:
+                                    // the view opens mid-line, so the
+                                    // partial leading line is dropped once
+                                    // to start at a line boundary.
+                                    let first_tail_frame = requested > 0 && log.read().is_empty();
+                                    let trimmed =
+                                        log.with_mut(|text| append_capped(text, &chunk, cap));
+                                    if trimmed || first_tail_frame {
+                                        tail.set(true);
+                                    }
+                                    if first_tail_frame {
+                                        log.with_mut(drop_leading_partial_line);
+                                    }
+                                }
+                                // Advance by what was actually read — raw
+                                // bytes minus the incomplete trailing
+                                // codepoint — never by the length of the
+                                // decoded text.
+                                next_offset = requested + (page.len() - back_drop) as u64;
+                            }
+                        }
+                        Err(e) => {
+                            // Report and keep polling. Returning here
+                            // abandoned the log for the life of the page,
+                            // so one timeout on a slow connection meant a
+                            // running build stopped updating until it was
+                            // reloaded by hand.
+                            error.set(Some(e.to_string()));
+                        }
                     }
                 }
 
-                // Stop polling once the build reaches a terminal state, but only
-                // after the fetch above, so the last lines are never missed.
-                if let Ok(build) = client.get_build(&pkgbase, number).await {
-                    worker_name.set(build.worker_name.clone());
-                    status.set(Some(build.status));
-                    start_time.set(build.start_time);
-                    end_time.set(build.end_time);
-                    // Only a *settled* build stops the loop. `is_in_progress`
-                    // answers exactly this and keeps the queued states on the
-                    // right side of it; testing for `Active` alone treated an
-                    // enqueued build as over, so the page announced "finished"
-                    // and -- because this returns -- never updated again when
-                    // the build actually started.
-                    //
-                    // An unrecognised state from a newer server counts as in
-                    // progress: being wrong that way costs one poll per
-                    // interval, while being wrong the other way is this bug.
-                    if settled(build.status) {
-                        finished.set(true);
-                        return;
-                    }
+                if settled_now {
+                    return;
                 }
 
                 gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
@@ -325,135 +478,166 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // the height of text that was not on screen yet and stopped short of the
     // bottom -- which is exactly the "jumps down once, then never again" the poll
     // loop produced. An effect runs after the DOM is patched, so `scrollHeight`
-    // is finally correct. It re-runs when `line_count` grows (a new chunk landed)
-    // or when `following` flips back on (re-pin immediately).
+    // is finally correct. It re-runs when `log` grows (a new page landed) or
+    // when `following` flips back on (re-pin immediately).
     use_effect(move || {
-        line_count();
+        let _ = log.read().lines().count();
         if following() {
             scroll_log_to_bottom();
         }
     });
 
     rsx! {
-        div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
-            div { class: "card-body flex flex-col min-h-0",
-                div { class: "flex items-center gap-3",
-                    // The same badge the lists use, so a state means the same
-                    // thing everywhere and a new one added server-side breaks
-                    // the exhaustive match instead of rendering as a guess.
-                    if let Some(state) = status() {
-                        span { class: "flex items-center gap-2",
-                            BuildStatusBadge { status: state }
-                            if !finished() {
-                                span { class: "loading loading-spinner loading-xs opacity-60" }
+            div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
+                div { class: "card-body flex flex-col min-h-0",
+                    div { class: "flex items-center gap-3",
+                        // The same badge the lists use, so a state means the same
+                        // thing everywhere and a new one added server-side breaks
+                        // the exhaustive match instead of rendering as a guess.
+                        if let Some(state) = status() {
+                            span { class: "flex items-center gap-2",
+                                BuildStatusBadge { status: state }
+                                if !finished() {
+                                    span { class: "loading loading-spinner loading-xs opacity-60" }
+                                }
                             }
-                        }
-                    } else {
-                        span { class: "badge badge-ghost badge-sm", "…" }
-                    }
-                    if let Some(worker) = worker_name() {
-                        // Beside the state, because "what is it doing" and
-                        // "where" are one question when a build misbehaves.
-                        Link {
-                            class: "font-mono text-sm opacity-70 hover:underline",
-                            to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
-                            title: "Show this worker's builds",
-                            "{worker}"
-                        }
-                    }
-                    if let Some(start) = start_time() {
-                        // When it started and what it has used since. A running
-                        // build's duration grows as this page watches, so it is
-                        // measured to now; an ended one reports its total.
-                        span { class: "flex items-center gap-2 text-sm opacity-70",
-                            span { class: "whitespace-nowrap", "Started " }
-                            AbsoluteDate { ts: Some(start) }
-                            if end_time().is_none() {
-                                {format!("· {} so far", format_duration(Some(start), Some(now_secs())))}
-                            } else {
-                                {format!("· took {}", format_duration(Some(start), end_time()))}
-                            }
-                        }
-                    }
-                    div { class: "flex-1" }
-                    // Stop a build that is not over yet: running, enqueued, or
-                    // waiting for deps. Same `settled` gate as the poll loop,
-                    // so a build that just started is stoppable the moment this
-                    // page opens and a state from a newer server is too.
-                    if status().is_some_and(|s| !settled(s)) {
-                        button {
-                            disabled: canceling(),
-                            class: "btn btn-xs btn-error btn-outline",
-                            onclick: move |_| {
-                                // Signals are Copy; both are rebound `mut`
-                                // for the async body below.
-                                let (mut canceling, mut error) = (canceling, error);
-                                let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
-                                spawn(async move {
-                                    canceling.set(true);
-                                    let result = match crate::api::client() {
-                                        Ok(client) => match client.cancel_build(&pkgbase, number).await {
-                                            Ok(()) => Ok(()),
-                                            Err(e) => Err(e.to_string()),
-                                        },
-                                        Err(e) => Err(e),
-                                    };
-                                    if let Err(e) = result {
-                                        error.set(Some(e));
-                                        canceling.set(false);
-                                    }
-                                });
-                            },
-                            if canceling() { "Stopping…" } else { "Stop" }
-                        }
-                    }
-                    LogCopyButton { log, copied, error }
-                    label { class: "label cursor-pointer gap-2",
-                        span { class: "label-text text-sm", "Follow" }
-                        input {
-                            r#type: "checkbox",
-                            class: "toggle toggle-sm toggle-primary",
-                            checked: following(),
-                            // The effect below does the scrolling: it reads
-                            // `following`, so turning this on re-pins to the
-                            // bottom on the next render.
-                            oninput: move |e| following.set(e.value() == "true"),
-                        }
-                    }
-                }
-
-                if let Some(e) = error() {
-                    div { class: "alert alert-error", span { "{e}" } }
-                }
-
-                pre {
-                    id: "build-log",
-                    // `flex-1 min-h-0` rather than a share of the viewport:
-                    // the log takes whatever is left after the header and the
-                    // footer, so the card fills the window exactly and this is
-                    // the only thing that scrolls. `min-h-0` because a flex
-                    // child will not shrink below its content without it, which
-                    // is what pushed the page past the window before.
-                    class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
-                            flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
-                    if line_count() == 0 {
-                        // A finished build with nothing to show has no log at
-                        // all -- it never wrote one, or it has been removed --
-                        // which is a different statement from a running build
-                        // that has not written its first line yet.
-                        if finished() {
-                            span { class: "opacity-60", "no log for this build" }
                         } else {
-                            span { class: "opacity-60", "waiting for output…" }
+                            span { class: "badge badge-ghost badge-sm", "…" }
+                        }
+                        if let Some(worker) = worker_name() {
+                            // Beside the state, because "what is it doing" and
+                            // "where" are one question when a build misbehaves.
+                            Link {
+                                class: "font-mono text-sm opacity-70 hover:underline",
+                                to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
+                                title: "Show this worker's builds",
+                                "{worker}"
+                            }
+                        }
+                        if let Some(start) = start_time() {
+                            // When it started and what it has used since. A running
+                            // build's duration grows as this page watches, so it is
+                            // measured to now; an ended one reports its total.
+                            span { class: "flex items-center gap-2 text-sm opacity-70",
+                                span { class: "whitespace-nowrap", "Started " }
+                                AbsoluteDate { ts: Some(start) }
+                                if end_time().is_none() {
+                                    {format!("· {} so far", format_duration(Some(start), Some(now_secs())))}
+                                } else {
+                                    {format!("· took {}", format_duration(Some(start), end_time()))}
+                                }
+                            }
+                        }
+                        div { class: "flex-1" }
+                        // Stop a build that is not over yet: running, enqueued, or
+                        // waiting for deps. Same `settled` gate as the poll loop,
+                        // so a build that just started is stoppable the moment this
+                        // page opens and a state from a newer server is too.
+                        if status().is_some_and(|s| !settled(s)) {
+                            button {
+                                disabled: canceling(),
+                                class: "btn btn-xs btn-error btn-outline",
+                                onclick: move |_| {
+                                    // Signals are Copy; both are rebound `mut`
+                                    // for the async body below.
+                                    let (mut canceling, mut error) = (canceling, error);
+                                    let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
+                                    spawn(async move {
+                                        canceling.set(true);
+                                        let result = match crate::api::client() {
+                                            Ok(client) => match client.cancel_build(&pkgbase, number).await {
+                                                Ok(()) => Ok(()),
+                                                Err(e) => Err(e.to_string()),
+                                            },
+                                            Err(e) => Err(e),
+                                        };
+                                        if let Err(e) = result {
+                                            error.set(Some(e));
+                                            canceling.set(false);
+                                        }
+                                    });
+                                },
+                                if canceling() { "Stopping…" } else { "Stop" }
+                            }
+                        }
+    LogCopyButton {
+                            pkgbase,
+                            number,
+                            log,
+                            tail: tail,
+                            cap: cap(),
+                            copied,
+                            error,
+                        }
+                        label { class: "label cursor-pointer gap-2",
+                            span { class: "label-text text-sm", "Follow" }
+                            input {
+                                r#type: "checkbox",
+                                class: "toggle toggle-sm toggle-primary",
+                                checked: following(),
+                                // The effect below does the scrolling: it reads
+                                // `following`, so turning this on re-pins to the
+                                // bottom on the next render.
+                                oninput: move |e| following.set(e.value() == "true"),
+                            }
+                        }
+                    }
+
+                    if let Some(e) = error() {
+                        div { class: "alert alert-error", span { "{e}" } }
+                    }
+
+                    pre {
+                        id: "build-log",
+                        // `flex-1 min-h-0` rather than a share of the viewport:
+                        // the log takes whatever is left after the header and the
+                        // footer, so the card fills the window exactly and this is
+                        // the only thing that scrolls. `min-h-0` because a flex
+                        // child will not shrink below its content without it, which
+                        // is what pushed the page past the window before.
+                        class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
+                                flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
+                        if log.read().is_empty() {
+                            // A finished build with nothing to show has no log at
+                            // all -- it never wrote one, or it has been removed --
+                            // which is a different statement from a running build
+                            // that has not written its first line yet.
+                            if finished() {
+                                span { class: "opacity-60", "no log for this build" }
+                            } else {
+                                span { class: "opacity-60", "waiting for output…" }
+                            }
+                        } else {
+                            "{log}"
+                        }
+                    }
+                    // The footer answers "how much of it is here". An untrimmed
+                    // window is the whole log, so it counts lines in the window.
+                    // A trimmed one is a tail, so it says how much of the total it
+                    // covers -- the size is what is actually missing.
+                    if tail() {
+                        div {
+                            class: "text-sm opacity-60",
+                            {
+                                // The total comes from the header route's
+                                // `log_size`: a build may have created its log
+                                // after the last poll, in which case "not known"
+                                // reads as a dash, one of the several answers
+                                // `None` has here.
+                                let total = log_size()
+                                    .map(|s| format_bytes(s as u64))
+                                    .unwrap_or_else(|| "—".to_string());
+                                let shown = format_bytes(cap() as u64);
+                                let lines = log.read().lines().count();
+                                format!("showing the last ~{shown} of {total} (~{lines} lines in view)")
+                            }
                         }
                     } else {
-                        "{log}"
+                        div { class: "text-sm opacity-60", "{log.read().lines().count()} lines" }
                     }
                 }
-                div { class: "text-sm opacity-60", "{line_count} lines" }
             }
         }
-    }
 }
 
 /// Pin the log view to the newest output.
@@ -476,9 +660,19 @@ fn scroll_log_to_bottom() {
 /// clipboard — cannot be, and lives in the onclick. The button only appears
 /// once there is something to copy, and flips to a checkmark for a couple of
 /// seconds after a successful copy so someone pasting knows it landed.
+///
+/// Once the window is a true tail — placed at `offset > 0` on first frame, or
+/// a leading line drained since — the button stops pretending it copies the
+/// whole log: a `!` marker goes on, the label flips to "Copy tail", and the
+/// title says to use the Download link for everything. Both stay ≤ cap + one
+/// line, so the clipboard path is never unsafe.
 #[component]
 fn LogCopyButton(
+    pkgbase: String,
+    number: i32,
     log: Signal<String>,
+    tail: Signal<bool>,
+    cap: usize,
     mut copied: Signal<bool>,
     mut error: Signal<Option<String>>,
 ) -> Element {
@@ -489,51 +683,82 @@ fn LogCopyButton(
     if log.read().is_empty() {
         return rsx! {};
     }
+    // A relative URL: same origin as the page, so the browser attaches the
+    // session cookie itself (same rule as `api_base`), and nothing is touched
+    // at render time for the host-side render tests to trip over.
+    let download_url = format!("/api/package/{pkgbase}/build/{number}/output/download");
+    let download_name = format!("{pkgbase}-{number}.log");
+    let copy_title = if tail() {
+        format!(
+            "Copying the shown ~{} tail, not the full log — use Download for the whole log",
+            format_bytes(cap as u64)
+        )
+    } else {
+        "Copy the whole build log to the clipboard".to_string()
+    };
     rsx! {
-        button {
-            class: "btn btn-ghost btn-xs gap-1.5",
-            title: "Copy the whole build log to the clipboard",
-            disabled: copied(),
-            onclick: move |_| async move {
-                // The whole log is one string in memory, so nothing extra is
-                // fetched — the button copies everything written so far.
-                let text = log();
-                let Some(clipboard) = web_sys::window()
-                    .map(|w| w.navigator().clipboard())
-                    // Outside a secure context `navigator.clipboard` is
-                    // undefined, and web-sys hands that straight back as a
-                    // `Clipboard` rather than `None`. Calling `write_text` on
-                    // it throws through the wasm boundary, which takes the page
-                    // down instead of showing the message below — and http on a
-                    // LAN address is an ordinary way to reach this UI.
-                    .filter(|c| !AsRef::<JsValue>::as_ref(c).is_undefined())
-                else {
-                    error.set(Some(
-                        "Clipboard is unavailable on this connection \
-                         (it needs a secure context, like https or localhost)."
-                            .to_string(),
-                    ));
-                    return;
-                };
-                match JsFuture::from(clipboard.write_text(&text)).await {
-                    Ok(_) => {
-                        copied.set(true);
-                        // Let the checkmark say its piece, then give the button
-                        // back its job.
-                        gloo_timers::future::TimeoutFuture::new(2000).await;
-                        copied.set(false);
+        div { class: "flex items-center gap-1.5",
+            a {
+                class: "btn btn-ghost btn-xs gap-1.5",
+                // The page is session-cookie authenticated, so a bare anchor
+                // carries the session and the browser streams the response to
+                // its download manager with nothing landing in the JS heap —
+                // important, since a multi-GiB log must never materialise
+                // client-side (`fetch` + `response.blob()` would).
+                href: download_url,
+                download: download_name,
+                title: "Download the whole build log",
+                DownloadIcon {}
+                span { "Download" }
+            }
+            button {
+                class: "btn btn-ghost btn-xs gap-1.5",
+                title: copy_title,
+                disabled: copied(),
+                onclick: move |_| async move {
+                    // The window is one string in memory, so nothing extra is
+                    // fetched — the button copies everything written so far.
+                    // For a tail the marker says "and no more": the rest of
+                    // the file is only reachable through the Download link.
+                    let text = log();
+                    let Some(clipboard) = web_sys::window()
+                        .map(|w| w.navigator().clipboard())
+                        // Outside a secure context `navigator.clipboard` is
+                        // undefined, and web-sys hands that straight back as a
+                        // `Clipboard` rather than `None`. Calling `write_text` on
+                        // it throws through the wasm boundary, which takes the page
+                        // down instead of showing the message below — and http on a
+                        // LAN address is an ordinary way to reach this UI.
+                        .filter(|c| !AsRef::<JsValue>::as_ref(c).is_undefined())
+                    else {
+                        error.set(Some(
+                            "Clipboard is unavailable on this connection \
+                             (it needs a secure context, like https or localhost)."
+                                .to_string(),
+                        ));
+                        return;
+                    };
+                    match JsFuture::from(clipboard.write_text(&text)).await {
+                        Ok(_) => {
+                            copied.set(true);
+                            // Let the checkmark say its piece, then give the button
+                            // back its job.
+                            gloo_timers::future::TimeoutFuture::new(2000).await;
+                            copied.set(false);
+                        }
+                        Err(_) => error.set(Some(
+                            "Could not copy the build log to the clipboard.".to_string(),
+                        )),
                     }
-                    Err(_) => error.set(Some(
-                        "Could not copy the build log to the clipboard.".to_string(),
-                    )),
+                },
+                if copied() {
+                    CheckIcon {}
+                    span { "Copied" }
+                } else {
+                    if tail() { WarnIcon {} }
+                    CopyIcon {}
+                    span { if tail() { "Copy tail" } else { "Copy" } }
                 }
-            },
-            if copied() {
-                CheckIcon {}
-                span { "Copied" }
-            } else {
-                CopyIcon {}
-                span { "Copy" }
             }
         }
     }

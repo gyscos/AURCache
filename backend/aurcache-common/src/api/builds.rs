@@ -42,6 +42,16 @@ pub struct BuildSummary {
     /// operator searches for; a renamed worker relabels its history, which is
     /// the same thing the Workers page does.
     pub worker_name: Option<String>,
+    /// Size of this build's stored log, in bytes.
+    ///
+    /// `None` for a build whose log file does not exist -- one that produced no
+    /// output, or whose log has been removed. Only the single-build detail
+    /// route fills it; list endpoints would pay a metadata stat per row for a
+    /// field the lists do not show. `0` is a real answer (an empty log file)
+    /// and is never conflated with "no log".
+    #[cfg_attr(feature = "db", sea_orm(skip))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_size: Option<i64>,
     /// Why this build is stuck, when it is `ENQUEUED` and *no* approved worker
     /// can currently take it. `None` for everything else, including a build
     /// merely waiting behind a busy worker — see

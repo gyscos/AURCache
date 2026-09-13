@@ -36,8 +36,16 @@ ADD --chmod=0755 docker/install-wasm-bindgen.sh /root/
 # downloads are already layer-cached per architecture.)
 ENV CARGO_HOME=/opt/cargo-cache \
     PATH="/opt/cargo-cache/bin:${PATH}"
+# `cargo install` puts the binary in that cache mount, and a cache mount is
+# buildkit scratch space: `docker builder prune` or buildkit GC can evict it
+# without touching the layer cache, leaving a cached install step with no
+# binary behind it. Copy it into the image layer so the `cargo build` below
+# does not depend on what the cache store happens to still hold. `/usr/local/bin`
+# is on the image's default PATH, which is where build-rust.sh's nested cargo
+# looks for it.
 RUN --mount=type=cache,target=/opt/cargo-cache,id=cargo-downloads-root \
-    bash /root/install-wasm-bindgen.sh /tmp/frontend-Cargo.lock
+    bash /root/install-wasm-bindgen.sh /tmp/frontend-Cargo.lock \
+    && install -Dm755 /opt/cargo-cache/bin/wasm-bindgen /usr/local/bin/wasm-bindgen
 
 # The two trees keep the layout they have in the repository: the frontend
 # reaches the shared crates as `../backend/...`, and `aurcache-api`'s build

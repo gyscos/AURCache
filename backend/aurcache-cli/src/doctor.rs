@@ -390,6 +390,7 @@ mod tests {
             size: None,
             peak_memory: None,
             worker_name: None,
+            log_size: None,
             waiting_reason,
         }
     }

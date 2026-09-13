@@ -31,6 +31,17 @@ use tracing::{debug, error, warn};
 /// writing, so a burst of lines collapses into a single write.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Maximum bytes a single [`read_build_output`] call may return, whatever
+/// limit is asked for: the bound of an absent limit, and the clamp of any
+/// limit. Structural — no code path fetches a whole log at once, so the size
+/// of one request never grows with the log.
+pub const MAX_OUTPUT_BYTES: u64 = 32 << 20;
+
+/// Clamp a caller's `limit` to [`MAX_OUTPUT_BYTES`].
+fn resolved_limit(limit: Option<u64>) -> u64 {
+    limit.map_or(MAX_OUTPUT_BYTES, |l| l.min(MAX_OUTPUT_BYTES))
+}
+
 pub use aurcache_common::fs::{build_log_dir, build_log_path, build_log_root};
 
 /// Append `text` to a build's log, creating the file on first write.
@@ -48,17 +59,25 @@ pub async fn append_build_output(pkgbase: &str, number: i32, text: &str) -> anyh
     Ok(())
 }
 
-/// Read a build's log from `offset` bytes onwards.
+/// Read up to `limit` bytes of a build's log from `offset` onwards. The result
+/// is raw file bytes, not decoded text: alignment to a UTF-8 boundary is the
+/// caller's job, because only the caller knows how much of a trailing character
+/// it can afford to re-read next time.
+///
+/// `limit` defaults to, and is clamped to, [`MAX_OUTPUT_BYTES`], so a request
+/// never pays in proportion to the log's size.
 ///
 /// `Ok(None)` means there is no log file: a build that never produced output,
 /// or one whose file has been removed. That is a normal answer rather than an
 /// error, because the alternative is a 500 on a page whose entire job is to
-/// display whatever there is.
+/// display whatever there is. An empty `Some` is likewise normal: `offset`
+/// past the end of the log and at or before `limit` bytes from it.
 pub async fn read_build_output(
     pkgbase: &str,
     number: i32,
     offset: u64,
-) -> anyhow::Result<Option<String>> {
+    limit: Option<u64>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let path = build_log_path(pkgbase, number);
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
@@ -70,18 +89,11 @@ pub async fn read_build_output(
         file.seek(SeekFrom::Start(offset)).await?;
     }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await?;
+    file.take(resolved_limit(limit))
+        .read_to_end(&mut buf)
+        .await?;
 
-    // Offsets we hand out are byte lengths of what we already sent, so they
-    // always land on a character boundary. A caller is free to pass any number
-    // though, so skip any leading continuation bytes rather than returning a
-    // slice that is not valid UTF-8.
-    let start = buf
-        .iter()
-        .position(|b| (b & 0xC0) != 0x80)
-        .unwrap_or(buf.len());
-
-    Ok(Some(String::from_utf8_lossy(&buf[start..]).into_owned()))
+    Ok(Some(buf))
 }
 
 /// Size of a build's log in bytes, or `None` if it has none.
@@ -271,8 +283,11 @@ mod tests {
         append_build_output("hello", 1, "world\n").await.unwrap();
 
         assert_eq!(
-            read_build_output("hello", 1, 0).await.unwrap().as_deref(),
-            Some("hello\nworld\n")
+            read_build_output("hello", 1, 0, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"hello\nworld\n".as_slice())
         );
         // Named after the build's public identity, not its row id.
         assert!(root.dir.path().join("hello/1.log").exists());
@@ -290,12 +305,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            read_build_output("hello", 1, 0).await.unwrap().as_deref(),
-            Some("first build\n")
+            read_build_output("hello", 1, 0, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"first build\n".as_slice())
         );
         assert_eq!(
-            read_build_output("hello", 2, 0).await.unwrap().as_deref(),
-            Some("second build\n")
+            read_build_output("hello", 2, 0, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"second build\n".as_slice())
         );
     }
 
@@ -308,31 +329,96 @@ mod tests {
 
         let offset = u64::try_from("first\n".len()).unwrap();
         assert_eq!(
-            read_build_output("p", 1, offset).await.unwrap().as_deref(),
-            Some("second\n")
+            read_build_output("p", 1, offset, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"second\n".as_slice())
         );
     }
 
-    /// The whole point of byte offsets: a log containing multi-byte characters
-    /// (gcc quotes its diagnostics with them) must survive an offset that lands
-    /// mid-character without producing invalid UTF-8.
+    /// An offset that lands mid-character now returns exactly the raw bytes at
+    /// that offset: the server no longer decodes, so it has no opinion on
+    /// character boundaries. Re-aligning is the client's job.
     #[tokio::test]
-    async fn an_offset_inside_a_character_does_not_yield_invalid_utf8() {
+    async fn an_offset_inside_a_character_returns_exact_bytes() {
         let _root = temp_root();
         append_build_output("p", 1, "unrecognized option \u{2018}-fno_char8_t\u{2019}\n")
             .await
             .unwrap();
 
-        // 'unrecognized option ' is 20 bytes; the next character is 3.
-        let tail = read_build_output("p", 1, 21).await.unwrap().unwrap();
-        assert!(!tail.contains('\u{FFFD}'), "tail was mangled: {tail:?}");
-        assert!(tail.ends_with("-fno_char8_t\u{2019}\n"));
+        // 'unrecognized option ' is 20 bytes; the next character is a 3-byte
+        // U+2018. Offset 21 is its second byte.
+        let tail = read_build_output("p", 1, 21, None).await.unwrap().unwrap();
+        assert_eq!(tail, b"\x80\x98-fno_char8_t\xE2\x80\x99\n");
+    }
+
+    /// A paged read returns exactly `limit` bytes, and the next page continues
+    /// from the last byte returned.
+    #[tokio::test]
+    async fn a_paged_read_returns_at_most_the_requested_limit() {
+        let _root = temp_root();
+        append_build_output("p", 1, "first\nsecond\nthird\n")
+            .await
+            .unwrap();
+
+        let first = read_build_output("p", 1, 0, Some(6))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, b"first\n");
+
+        let rest = read_build_output("p", 1, 6, Some(100))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest, b"second\nthird\n");
+    }
+
+    /// A limit past the end just returns the remainder; an offset at or past
+    /// the end is an empty page, which is how a client knows it has caught up.
+    #[tokio::test]
+    async fn an_offset_at_or_after_the_end_is_an_empty_page() {
+        let _root = temp_root();
+        append_build_output("p", 1, "abc").await.unwrap();
+
+        assert_eq!(
+            read_build_output("p", 1, 2, None).await.unwrap().unwrap(),
+            b"c"
+        );
+        assert!(
+            read_build_output("p", 1, 3, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            read_build_output("p", 1, 99, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_limit_is_clamped_to_the_maximum() {
+        assert_eq!(resolved_limit(None), MAX_OUTPUT_BYTES);
+        assert_eq!(resolved_limit(Some(10)), 10);
+        assert_eq!(resolved_limit(Some(MAX_OUTPUT_BYTES)), MAX_OUTPUT_BYTES);
+        assert_eq!(resolved_limit(Some(MAX_OUTPUT_BYTES + 1)), MAX_OUTPUT_BYTES);
     }
 
     #[tokio::test]
     async fn a_missing_log_is_none_rather_than_an_error() {
         let _root = temp_root();
-        assert!(read_build_output("nope", 9, 0).await.unwrap().is_none());
+        assert!(
+            read_build_output("nope", 9, 0, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(build_log_size("nope", 9).await.is_none());
     }
 
@@ -372,9 +458,24 @@ mod tests {
         // Tolerates a package that never logged anything.
         remove_package_logs("never-built").await;
 
-        assert!(read_build_output("doomed", 1, 0).await.unwrap().is_none());
-        assert!(read_build_output("doomed", 2, 0).await.unwrap().is_none());
-        assert!(read_build_output("kept", 1, 0).await.unwrap().is_some());
+        assert!(
+            read_build_output("doomed", 1, 0, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_build_output("doomed", 2, 0, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_build_output("kept", 1, 0, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -385,8 +486,8 @@ mod tests {
 
         remove_all_logs().await;
 
-        assert!(read_build_output("a", 1, 0).await.unwrap().is_none());
-        assert!(read_build_output("b", 1, 0).await.unwrap().is_none());
+        assert!(read_build_output("a", 1, 0, None).await.unwrap().is_none());
+        assert!(read_build_output("b", 1, 0, None).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -396,13 +497,19 @@ mod tests {
         logger.append("hello\n".to_string()).await;
         logger.append("world\n".to_string()).await;
 
-        eventually(async || read_build_output("buffered", 1, 0).await.unwrap().is_some()).await;
+        eventually(async || {
+            read_build_output("buffered", 1, 0, None)
+                .await
+                .unwrap()
+                .is_some()
+        })
+        .await;
         assert_eq!(
-            read_build_output("buffered", 1, 0)
+            read_build_output("buffered", 1, 0, None)
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("hello\nworld\n")
+            Some(b"hello\nworld\n".as_slice())
         );
     }
 
@@ -414,10 +521,19 @@ mod tests {
             let clone = logger.clone();
             clone.append("from the clone\n".to_string()).await;
         }
-        eventually(async || read_build_output("drained", 1, 0).await.unwrap().is_some()).await;
+        eventually(async || {
+            read_build_output("drained", 1, 0, None)
+                .await
+                .unwrap()
+                .is_some()
+        })
+        .await;
         assert_eq!(
-            read_build_output("drained", 1, 0).await.unwrap().as_deref(),
-            Some("from the clone\n")
+            read_build_output("drained", 1, 0, None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"from the clone\n".as_slice())
         );
     }
 }

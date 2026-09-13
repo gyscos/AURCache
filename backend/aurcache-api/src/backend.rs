@@ -2,8 +2,8 @@ use crate::activity::activity;
 use crate::aur::search;
 use crate::auth::regenerate_api_token_endpoint;
 use crate::build::{
-    build_output, cancel_build, delete_build, get_build, list_builds, list_package_builds,
-    retry_build,
+    build_output, cancel_build, delete_build, download_build_output, get_build, list_builds,
+    list_package_builds, retry_build,
 };
 use crate::health::health;
 use crate::package::{
@@ -38,6 +38,7 @@ pub fn build_api() -> Vec<Route> {
         package_dependency_replace,
         package_update_entity_endpoint,
         build_output,
+        download_build_output,
         delete_build,
         list_builds,
         list_package_builds,

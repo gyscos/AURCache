@@ -395,6 +395,24 @@ pub(crate) fn CheckIcon() -> Element {
     rsx! { ButtonIcon { path: "M20 6 9 17l-5-5" } }
 }
 
+/// Warning, shown on the copy button once the window is a trimmed tail — what
+/// it copies is not the whole log any more.
+#[component]
+pub(crate) fn WarnIcon() -> Element {
+    rsx! {
+        ButtonIcon { path: "m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Zm-9.73-6v-4m0 4h.01" }
+    }
+}
+
+/// Download, on the link that fetches the whole log from the server and streams
+/// it to the browser's download manager.
+#[component]
+pub(crate) fn DownloadIcon() -> Element {
+    rsx! {
+        ButtonIcon { path: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" }
+    }
+}
+
 #[component]
 fn ActivitiesIcon() -> Element {
     rsx! { Icon { path: "M4 6h16M4 12h16M4 18h10" } }

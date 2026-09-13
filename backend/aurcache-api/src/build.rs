@@ -1,7 +1,7 @@
 use aurcache_utils::services::Services;
 use rocket::http::Status;
 use rocket::serde::json::Json;
-use rocket::{State, delete, get, post};
+use rocket::{Request, State, delete, get, post};
 
 use crate::models::authenticated::Authenticated;
 use crate::models::builds::BuildSummary;
@@ -12,8 +12,11 @@ use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
-use aurcache_utils::build_logger::read_build_output;
+use aurcache_utils::build_logger::{build_log_path, build_log_size, read_build_output};
 use aurcache_utils::package::update::package_update;
+use rocket::fs::NamedFile;
+use rocket::http::{ContentType, Header};
+use rocket::response::Responder;
 use sea_orm::FromQueryResult;
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
@@ -25,6 +28,7 @@ use utoipa::OpenApi;
 #[derive(OpenApi)]
 #[openapi(paths(
     build_output,
+    download_build_output,
     list_builds,
     list_package_builds,
     get_build,
@@ -36,33 +40,40 @@ pub struct BuildApi;
 
 /// Slice a build's stored output for the caller.
 ///
-/// `startline` is how many lines the caller already holds, so the response
-/// carries only what is new; an out-of-range or negative offset simply skips
-/// nothing or everything rather than erroring.
+/// `offset` is how many bytes of log the caller already holds, so the response
+/// carries only what is new; an out-of-range offset simply skips nothing or
+/// everything rather than erroring. `limit` bounds the response, defaulting to
+/// and clamped to `MAX_OUTPUT_BYTES` server-side, so one request's size never
+/// scales with the log.
 ///
-/// A build that exists but has not written anything yet yields an empty string.
+/// The body is raw file bytes, not decoded text: a slice may end mid-character,
+/// and re-aligning on the next offset is the caller's job.
+///
+/// A build that exists but has not written anything yet yields an empty body.
 /// "No output yet" is the normal state of a freshly started build, and the log
 /// view polls this endpoint from the moment it opens — reporting that as an
 /// error would make every new build's first poll fail.
 #[utoipa::path(
     responses(
-            (status = 200, description = "Build output from `startline` onwards; empty if the build has not logged anything yet"),
+            (status = 200, description = "Up to `limit` bytes of build output from `offset` onwards, raw; empty if the build has not logged anything yet"),
             (status = 404, description = "No such build"),
     ),
     params(
             ("pkgbase", description = "pkgbase of the package"),
             ("number", description = "Build number within that package"),
-            ("offset", description = "Bytes of log the caller already has; the response starts there")
+            ("offset", description = "Bytes of log the caller already has; the response starts there"),
+            ("limit", description = "Maximum bytes to return; defaults to and is clamped to the server bound")
     )
 )]
-#[get("/package/<pkgbase>/build/<number>/output?<offset>")]
+#[get("/package/<pkgbase>/build/<number>/output?<offset>&<limit>")]
 pub async fn build_output(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     number: i32,
     offset: Option<u64>,
+    limit: Option<u64>,
     _a: Authenticated,
-) -> Result<String, ApiError> {
+) -> Result<(ContentType, Vec<u8>), ApiError> {
     let db = db.inner();
 
     // Resolved even though the log path needs neither: an unknown
@@ -72,10 +83,77 @@ pub async fn build_output(
 
     // A build with no log file is not an error: it may have produced nothing
     // yet, or its log may have been removed. Callers render the difference.
-    Ok(read_build_output(pkgbase, number, offset.unwrap_or(0))
+    let bytes = read_build_output(pkgbase, number, offset.unwrap_or(0), limit)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
-        .unwrap_or_default())
+        .unwrap_or_default();
+
+    Ok((ContentType::Plain, bytes))
+}
+
+/// A [`NamedFile`] served as a `Content-Disposition: attachment` download.
+///
+/// `NamedFile`'s responder streams the file in chunks, which is why this is a
+/// wrapper rather than a `Vec<u8>`: a large log is never buffered whole just
+/// because someone asked for the full log. (`NamedFile` alone would set the
+/// Content-Type from the `.log` extension and stream too, but there is no way
+/// to attach the download header through it.)
+pub struct LogDownload(NamedFile, String);
+
+impl<'r> Responder<'r, 'static> for LogDownload {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = self.0.respond_to(req)?;
+        response.set_header(Header::new("Content-Disposition", self.1));
+        Ok(response)
+    }
+}
+
+/// Download a build's whole log as an attachment.
+///
+/// The entire file, with none of the caps that bound [`build_output`]: this is
+/// the escape hatch for the rare occasions the full log is genuinely wanted.
+/// The log view stays within its window and copies from that; it links here for
+/// "give me the whole thing". The file is streamed from disk, so the response
+/// does not hold the log in memory, and the attachment name is the build's
+/// public identity, `<pkgbase>-<number>.log`.
+///
+/// A build whose log file does not exist -- never wrote output, or the log was
+/// removed -- is a 404 here, deliberately different from [`build_output`],
+/// where an empty body means "nothing new yet". Downloading a log that is not
+/// there is a mistake, not a poll.
+#[utoipa::path(
+    responses(
+            (status = 200, description = "The build's log, as an attachment named `<pkgbase>-<number>.log`"),
+            (status = 404, description = "No such build, or no log for it"),
+    ),
+    params(
+            ("pkgbase", description = "pkgbase of the package"),
+            ("number", description = "Build number within that package")
+    )
+)]
+#[get("/package/<pkgbase>/build/<number>/output/download")]
+pub async fn download_build_output(
+    db: &State<DatabaseConnection>,
+    pkgbase: &str,
+    number: i32,
+    _a: Authenticated,
+) -> Result<LogDownload, ApiError> {
+    // Resolved even though the open could fail on the log path: an unknown
+    // pkgbase/number must be a 404 with the build's name, not a generic error.
+    build_by_number(db.inner(), pkgbase, number).await?;
+
+    let file = NamedFile::open(build_log_path(pkgbase, number))
+        .await
+        .map_err(|e| {
+            err(
+                Status::NotFound,
+                format!("no log for build {pkgbase}/{number}: {e}"),
+            )
+        })?;
+    Ok(LogDownload(
+        file,
+        format!("attachment; filename=\"{pkgbase}-{number}.log\""),
+    ))
 }
 
 #[utoipa::path(
@@ -201,6 +279,10 @@ impl BuildRow {
             size: self.size,
             peak_memory: self.peak_memory,
             worker_name: self.worker_name,
+            // Filled only by the detail route, which knows it is rendering one
+            // build; the lists would pay a stat per row for fields they do not
+            // show. See the field's docs for how `None` differs from `0`.
+            log_size: None,
             waiting_reason,
         }
     }
@@ -288,7 +370,7 @@ pub async fn get_build(
     // `annotate_waiting` maps rows 1:1, so this always yields the one row —
     // but an HTTP handler should not panic on an invariant it cannot enforce
     // locally, so the impossible case is an error rather than an `expect`.
-    let summary = annotate_waiting(db, vec![row])
+    let mut summary = annotate_waiting(db, vec![row])
         .await
         .into_iter()
         .next()
@@ -298,6 +380,10 @@ pub async fn get_build(
                 "build vanished while annotating",
             )
         })?;
+    // The one field only the detail route fills: a metadata stat, not a read.
+    summary.log_size = build_log_size(pkgbase, number)
+        .await
+        .and_then(|s| i64::try_from(s).ok());
     Ok(Json(summary))
 }
 

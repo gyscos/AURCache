@@ -450,21 +450,47 @@ impl AurCacheClient {
             .await
     }
 
-    /// Fetches raw build output text.
+    /// Fetches one page of a build's raw log output, decoded lossily to text.
     ///
-    /// `offset` is how many *bytes* of the log the caller already has; the
-    /// response starts there. Bytes rather than lines because the server seeks
-    /// to the offset in a file, which is proportional to what is being read
-    /// rather than to the size of the whole log. An offset returned by a
-    /// previous call always lands on a character boundary.
+    /// A single-request convenience over [`Self::build_output_page`]: the log
+    /// is stored and transferred as raw bytes, and alignment is the caller's
+    /// job, so a page that starts or ends inside a multi-byte character comes
+    /// back with a replacement character at that boundary. Callers that walk
+    /// the log in pages should use [`Self::build_output_page`] and own the
+    /// offsets, so trailing characters re-read whole.
     pub async fn build_output(
         &self,
         pkgbase: &str,
         number: i32,
         offset: Option<u64>,
     ) -> Result<String> {
-        let query = Query::default().opt("offset", offset);
-        self.request_text::<Value>(
+        Ok(String::from_utf8_lossy(
+            &self
+                .build_output_page(pkgbase, number, offset, None)
+                .await?,
+        )
+        .into_owned())
+    }
+
+    /// Fetch one bounded page of a build's log as raw bytes.
+    ///
+    /// `offset` and `limit` are byte counts, both optional: the server starts
+    /// at `offset` and returns at most `limit` bytes, defaulting `limit` to —
+    /// and clamping it to — its own bound. The body is the raw file bytes, so
+    /// a page may start or end mid-character; the caller owns alignment by
+    /// passing `next_offset = offset + page.len() - back_drop` where
+    /// `back_drop` is how much of a trailing character the page dropped, which
+    /// re-reads that character whole on the next call. An empty `Ok(vec![])`
+    /// page means the log has nothing new at that offset.
+    pub async fn build_output_page(
+        &self,
+        pkgbase: &str,
+        number: i32,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let query = Query::default().opt("offset", offset).opt("limit", limit);
+        self.request_bytes::<Value>(
             Method::GET,
             &format!("/package/{pkgbase}/build/{number}/output"),
             query.pairs(),

@@ -14,6 +14,7 @@ use aurcache_client::{
     ReplacementVerdict, RestoreOutcome, SearchResult, SimplePackage, SourceData,
     UpdatePackageRequest, UserInfo, Worker, looks_like_git_url,
 };
+use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::{BuildState, BuildStates};
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -619,16 +620,26 @@ struct ListBuildsArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+/// Fetch one build's log output, bounded to server-sized pages.
 struct BuildOutputArgs {
     /// Build reference, e.g. `hello/3`.
     build: BuildRef,
 
     /// Skip this many bytes of log before printing.
     ///
-    /// Bytes rather than lines: the server seeks to the offset, so the cost is
-    /// proportional to what is read rather than to the whole log.
+    /// Bytes rather than lines: the server seeks to the offset, so the cost
+    /// is proportional to what is read rather than to the whole log. An
+    /// offset in the middle of a multi-byte character drops that character.
     #[arg(long = "offset")]
     offset: Option<u64>,
+
+    /// Maximum number of bytes of log to print.
+    ///
+    /// The log is fetched in bounded pages whatever the value, so the
+    /// server never holds more than one page; this only caps what reaches
+    /// stdout (or the JSON `output` string).
+    #[arg(long = "limit")]
+    limit: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1873,16 +1884,64 @@ async fn render_build_output(
     format: OutputFormat,
     args: BuildOutputArgs,
 ) -> Result<()> {
-    let output = client
-        .build_output(&args.build.pkgbase, args.build.number, args.offset)
-        .await?;
-    match format {
-        OutputFormat::Json => print_json(&json!({ "output": output })),
-        OutputFormat::Text => {
-            print!("{output}");
-            Ok(())
+    // The log is walked in bounded pages with byte offsets, so one fetch never
+    // costs in proportion to the whole log. Each page is re-aligned to UTF-8
+    // and a character split across two pages is re-read whole on the next one;
+    // the offset arithmetic is the same `align` the frontend uses, so both ends
+    // of the API walk identical bytes.
+    let mut offset = args.offset.unwrap_or(0);
+    // `--limit` caps the total bytes *printed*; without it the whole log is
+    // printed, one bounded page at a time.
+    let mut remaining = args.limit;
+    // JSON accumulates one output string, matching the shape of the plain view.
+    let mut accumulated = String::new();
+
+    loop {
+        let page = client
+            .build_output_page(&args.build.pkgbase, args.build.number, Some(offset), None)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        let (front_skip, back_drop) = align(&page);
+        // When the whole page is a split character, `back_drop` covers it and
+        // the offset cannot advance. That is EOF mid-character — stop, rather
+        // than re-read the same tail forever (the empty-page rule alone would
+        // never fire, because the re-read is non-empty).
+        let advanced = page.len().saturating_sub(back_drop) as u64;
+        if advanced == 0 {
+            break;
+        }
+
+        let aligned = &page[front_skip..page.len() - back_drop];
+        // Trim to the byte cap before decoding, honoring the "--limit is bytes"
+        // promise. A cut character becomes a replacement char in the last page.
+        let (slice, capped) = match remaining {
+            Some(r) if r < aligned.len() as u64 => (&aligned[..r as usize], true),
+            _ => (aligned, false),
+        };
+        let decoded = String::from_utf8_lossy(slice);
+        match format {
+            OutputFormat::Text => {
+                print!("{decoded}");
+                std::io::stdout().flush()?;
+            }
+            OutputFormat::Json => accumulated.push_str(&decoded),
+        }
+
+        if let Some(r) = remaining.as_mut() {
+            *r -= slice.len() as u64;
+        }
+        offset += advanced;
+        if capped || remaining == Some(0) {
+            break;
         }
     }
+
+    if format == OutputFormat::Json {
+        return print_json(&json!({ "output": accumulated }));
+    }
+    Ok(())
 }
 
 async fn retry_build_command(

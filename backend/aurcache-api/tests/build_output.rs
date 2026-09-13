@@ -101,6 +101,14 @@ async fn get(client: &Client, url: &str) -> (Status, String) {
     (status, response.into_string().await.unwrap_or_default())
 }
 
+/// The raw-body variant: the `/output` route answers in bytes, and a test that
+/// swims mid-character needs to see them, not a lossy, possibly empty, String.
+async fn get_bytes(client: &Client, url: &str) -> (Status, Vec<u8>) {
+    let response = client.get(url).dispatch().await;
+    let status = response.status();
+    (status, response.into_bytes().await.unwrap_or_default())
+}
+
 #[rocket::async_test]
 async fn reads_the_log_from_a_byte_offset() {
     let _guard = ENV_LOCK.lock().await;
@@ -156,9 +164,11 @@ async fn an_unknown_build_is_not_found() {
 }
 
 /// gcc quotes its diagnostics with multi-byte characters, so an offset landing
-/// inside one is reachable in practice. It must not yield mangled text.
+/// inside one is reachable in practice. The server answers with the exact raw
+/// bytes from the offset — a mid-character cut is a client-side alignment
+/// problem, handled by the shared `align` helper, never a server-side guess.
 #[rocket::async_test]
-async fn an_offset_inside_a_character_does_not_mangle_the_tail() {
+async fn an_offset_inside_a_character_returns_raw_bytes() {
     let _guard = ENV_LOCK.lock().await;
     let root = tempfile::tempdir().unwrap();
     let (client, db) = test_client(root.path()).await;
@@ -168,9 +178,32 @@ async fn an_offset_inside_a_character_does_not_mangle_the_tail() {
 
     std::fs::write(root.path().join("hello/1.log"), "option ‘-fno_char8_t’\n").unwrap();
 
-    // "option " is 7 bytes; the quote that follows is 3.
-    let (status, body) = get(&client, "/api/package/hello/build/1/output?offset=8").await;
+    // "option " is 7 bytes; the quote that follows is 3 (U+2018: e2 80 98).
+    // Offset 8 lands on the quote's second byte, which will decode to
+    // nothing by itself — but the server does not decode.
+    let (status, body) = get_bytes(&client, "/api/package/hello/build/1/output?offset=8").await;
     assert_eq!(status, Status::Ok);
-    assert!(!body.contains('\u{FFFD}'), "mangled: {body:?}");
-    assert!(body.ends_with("-fno_char8_t’\n"));
+    assert_eq!(body, b"\x80\x98-fno_char8_t\xE2\x80\x99\n");
+    assert_eq!(body.len(), 18, "one page, byte-exact");
+}
+
+/// The raw byte slice a mid-character offset produces still aligns cleanly:
+/// the shared `align` helper is the API consumer's way back to text, and it
+/// must eat exactly the two continuation bytes this test wrote.
+#[rocket::async_test]
+async fn the_output_aligns_after_a_mid_character_offset() {
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let (client, db) = test_client(root.path()).await;
+    seed(&db).await;
+
+    std::fs::create_dir_all(root.path().join("hello")).unwrap();
+
+    std::fs::write(root.path().join("hello/1.log"), "option ‘-fno_char8_t’\n").unwrap();
+
+    let (_, body) = get_bytes(&client, "/api/package/hello/build/1/output?offset=8").await;
+    let (front_skip, back_drop) = aurcache_common::api::build_log::align(&body);
+    assert_eq!((front_skip, back_drop), (2, 0));
+    let text = String::from_utf8_lossy(&body[front_skip..]);
+    assert_eq!(text, "-fno_char8_t’\n");
 }

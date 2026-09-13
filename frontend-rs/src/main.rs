@@ -17,6 +17,7 @@ mod api;
 mod dates;
 mod format;
 mod listing;
+mod log_tail;
 mod platforms;
 mod poll;
 mod progress;
