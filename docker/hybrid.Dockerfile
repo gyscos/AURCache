@@ -81,70 +81,51 @@ ARG LATEST_COMMIT_SHA
 ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 
 USER packager
-# wasm-bindgen emits the frontend's JS glue and is not in Arch's repositories,
-# so it is built rather than installed. Its schema version has to match the
-# `wasm-bindgen` crate the frontend links against *exactly* -- the CLI refuses
-# a wasm file emitted by any other version -- so the version to install is read
-# out of frontend-rs/Cargo.lock rather than taken as whatever crates.io serves
-# as latest.
-#
-# `--locked` does not do that, which is worth being explicit about because it
-# reads as though it might: it pins the versions the CLI's *own* build resolves,
-# from the lockfile published alongside it, and says nothing about which release
-# is selected. Unpinned, this worked until wasm-bindgen 0.2.128 was published
-# and every build began failing with "rust Wasm file schema version: 0.2.127 /
-# this binary schema version: 0.2.128".
 ENV PATH="/home/packager/.cargo/bin:${PATH}"
-# rustup and cargo both write their homes here; the mounted caches make the
-# per-image downloads a one-time cost shared with the worker image's packager
-# (see worker.Dockerfile for why `-packager` ids are distinct from the Debian
-# builder's `-root` ones). `rustup target add wasm32` is before the lockfile
-# because the toolchain is independent of the crate set. The cargo mount is
-# needed here too: `rustup default stable` places the `cargo`/`rustc` shims in
-# $CARGO_HOME/bin, and without the mount those shims would live on the layer,
-# hidden by the mount in every subsequent RUN.
-RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    rustup default stable && rustup target add wasm32-unknown-unknown
+# The toolchain needs no source, so its COPY glue stays ahead of the tree: a
+# code change then invalidates the wasm-bindgen and makepkg RUNs below without
+# re-running the locked rustup install.
+COPY --chmod=0755 docker/install-rust-toolchain.sh docker/build-aurcache-packages.sh docker/install-wasm-bindgen.sh /usr/local/bin/
+# The packager always runs on amd64 (this stage is pinned to it), so whatever
+# architecture the build targets, `rustup default stable` installs the same
+# x86_64 toolchain -- and the racing architectures clobber adjacent files of
+# that shared install (see install-rust-toolchain.sh). The cargo home is
+# locked alongside: the toolchain's `bin/` shims land in it. The wasm32 std is
+# here too because it is one component no matter which host fetches it; only
+# the per-architecture std, added later, is downloaded under the shared mounts.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
+    install-rust-toolchain.sh wasm32-unknown-unknown
+
 # The lockfile alone, ahead of the source, so that the expensive `cargo install`
 # below is invalidated when the pinned version changes and not by a code edit.
 COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
-# The cache mount carries the registry and the installed wasm-bindgen-cli, so
-# the install is skipped rather than recompiled once the worker or a previous
-# hybrid build has run. `uid`/`gid` solve the reason this used to be impossible:
-# buildkit creates the mount as root, leaving cargo -- running as `packager` --
-# unable to write `~/.cargo/.crates.toml`; naming the owner makes the home
-# writable and the layer caches on its own again.
+# wasm-bindgen emits the frontend's JS glue and is not in Arch's repositories,
+# so it is built rather than installed. See install-wasm-bindgen.sh for why its
+# version comes from the lockfile rather than crates.io. The cache mount
+# carries the registry and the installed wasm-bindgen-cli, so the install is
+# skipped rather than recompiled once the worker or a previous hybrid build has
+# run. `uid`/`gid` solve the reason this used to be impossible: buildkit
+# creates the mount as root, leaving cargo -- running as `packager` -- unable to
+# write `~/.cargo/.crates.toml`; naming the owner makes the home writable and
+# the layer caches on its own again.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
-    && test -n "$wb_version" \
-    && cargo install wasm-bindgen-cli --locked --version "$wb_version"
+    install-wasm-bindgen.sh /tmp/frontend-Cargo.lock
 
 COPY --chown=packager . /src
-# `--skipinteg` because the tarball is this tree rather than a release, and
-# `--nodeps` because the build needs nothing from the target architecture:
-# dependencies are recorded in the package and resolved where it is installed.
-# The cache mounts stop `prepare()`'s `cargo fetch` and the `rustup target add`
-# from redownloading what the worker image already fetched.
+# Build all four packages: the worker-docker package is a wrapper image of its
+# own, and the server needs the same sandbox binary whose paths pacman refuses
+# to double-check across two packages. See build-aurcache-packages.sh for the
+# build itself.
+#
+# The cache mounts stop `prepare()`'s `cargo fetch` and the per-architecture
+# `rustup target add` from redownloading what the worker image already fetched;
+# both are safe under shared mounts because every architecture fetches
+# differently-named files (cargo additionally flocks its own cache).
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT:-}" in \
-      amd64) CARCH=x86_64 ;; \
-      arm64) CARCH=aarch64 ;; \
-      armv7) CARCH=armv7h ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}${TARGETVARIANT:-}"; exit 1 ;; \
-    esac; \
-    export CARCH; \
-    # From common.sh, so it cannot drift from the triple cargo is asked for.
-    rustup target add "$(. /src/packaging/common.sh && _aurcache_rust_target)"; \
-    for p in aurcache-sandbox aurcache-server aurcache-worker aurcache-worker-docker; do \
-      cd "/src/packaging/$p"; \
-      /src/packaging/make-source-tarball.sh /src "$p" 0.5.0 .; \
-      makepkg --nodeps --skipinteg --noconfirm --nocheck; \
-      cp ./*.pkg.tar.zst /pkg/; \
-    done
+    build-aurcache-packages.sh aurcache-sandbox aurcache-server aurcache-worker aurcache-worker-docker
 
 ########## Stage 1c: export the built packages to the host ##########
 # The image installs the packages and discards them (`rm -rf /tmp/pkg` below),

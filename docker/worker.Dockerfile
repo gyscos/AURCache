@@ -88,43 +88,40 @@ FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-COPY --chown=packager . /src
+# The toolchain needs no source, so its COPY glue stays ahead of the tree: a
+# code change then invalidates the makepkg RUNs below without re-running the
+# locked rustup install.
 USER packager
-# `--skipinteg` because the tarball is this tree rather than a release, and
-# `--nodeps` because the *build* needs nothing from the target architecture:
-# dependencies are recorded in the package and resolved where it is installed.
+COPY --chmod=0755 docker/install-rust-toolchain.sh docker/build-aurcache-packages.sh /usr/local/bin/
+# The packager always runs on amd64 (this stage is pinned to it), so whatever
+# architecture the build targets, `rustup default stable` installs the same
+# x86_64 toolchain -- and the racing architectures clobber adjacent files of
+# that shared install (see install-rust-toolchain.sh). The cargo home is
+# locked alongside: the toolchain's `bin/` shims land in it.
+RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
+    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
+    install-rust-toolchain.sh
+
+COPY --chown=packager . /src
+# Cross-compile both packages: aurcache-worker depends on aurcache-sandbox,
+# which is its own package because the server needs the same binary and pacman
+# refuses two packages shipping one path. See
+# build-aurcache-packages.sh for the build itself.
 #
 # Cargo and rustup home dirs are cache mounts, sharing a single backing store
 # with the hybrid image's identically named packager stage (both are Arch,
 # rustup toolchain, linked against the same glibc, so their cached `bin/` and
-# `.crates.toml` are interchangeable). `prepare()`'s `cargo fetch --locked` and
-# the `rustup target add` therefore stop downloading on the second image. The
-# `uid`/`gid` are the whole point: buildkit would otherwise create the mount
-# as root and cargo could not write `~/.cargo/.crates.toml`, which is precisely
-# why the hybrid image used to avoid the mount for the wasm-bindgen install.
+# `.crates.toml` are interchangeable); `prepare()`'s `cargo fetch --locked` and
+# the per-architecture `rustup target add` therefore stop downloading on the
+# second image. These mounts are *shared* -- the target std each architecture
+# adds is named after it, so there is nothing to clobber -- unlike the
+# toolchain install above. The `uid`/`gid` are the whole point: buildkit would
+# otherwise create the mount as root and cargo could not write
+# `~/.cargo/.crates.toml`, which is precisely why the hybrid image used to
+# avoid the mount for the wasm-bindgen install.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    set -eux; \
-    case "${TARGETARCH}${TARGETVARIANT:-}" in \
-      amd64) CARCH=x86_64 ;; \
-      arm64) CARCH=aarch64 ;; \
-      armv7) CARCH=armv7h ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}${TARGETVARIANT:-}"; exit 1 ;; \
-    esac; \
-    export CARCH; \
-    # The triple comes from common.sh, which the PKGBUILD uses too, so the
-    # target rustup installs cannot drift from the one cargo is asked for.
-    rustup default stable; \
-    rustup target add "$(. /src/packaging/common.sh && _aurcache_rust_target)"; \
-    # Both packages: aurcache-worker depends on aurcache-sandbox, which is its
-    # own package because the server needs the same binary and pacman refuses
-    # two packages shipping one path.
-    for p in aurcache-sandbox aurcache-worker; do \
-      cd "/src/packaging/$p"; \
-      /src/packaging/make-source-tarball.sh /src "$p" 0.5.0 .; \
-      makepkg --nodeps --skipinteg --noconfirm --nocheck; \
-      cp ./*.pkg.tar.zst /pkg/; \
-    done
+    build-aurcache-packages.sh aurcache-sandbox aurcache-worker
 
 ########## Stage 1c: export the built packages to the host ##########
 # The image installs the packages and discards them (`rm -rf /tmp/pkg` below),

@@ -16,14 +16,14 @@ ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 # `cargo` binary itself still resolves from /usr/local/cargo/bin on the layer.
 #
 # The CLI's version has to match the `wasm-bindgen` crate the frontend links
-# against exactly, so it is read from the frontend's lockfile. `--locked` pins
-# only the CLI's own dependencies and will still install whatever release is
-# newest -- see hybrid.Dockerfile for the schema mismatch that produces.
+# against exactly, so it is read from the frontend's lockfile -- see
+# install-wasm-bindgen.sh for the whole rationale, shared with the hybrid image.
 #
 # The lockfile alone, ahead of the source, so that this expensive `cargo
 # install` is invalidated when the pinned version changes and not by a code
 # edit -- the same ordering, and for the same reason, as hybrid.Dockerfile.
 COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
+ADD --chmod=0755 docker/install-wasm-bindgen.sh /root/
 # The cargo cache is mounted: crates and the installed wasm-bindgen-cli are
 # immutable per version, so they are reused between builds and across the three
 # target architectures instead of being fetched once each. The `-root` cache id
@@ -37,10 +37,7 @@ COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
 ENV CARGO_HOME=/opt/cargo-cache \
     PATH="/opt/cargo-cache/bin:${PATH}"
 RUN --mount=type=cache,target=/opt/cargo-cache,id=cargo-downloads-root \
-    rustup target add wasm32-unknown-unknown \
-    && wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[",]/, "", $3); print $3; exit }' /tmp/frontend-Cargo.lock)" \
-    && test -n "$wb_version" \
-    && cargo install wasm-bindgen-cli --locked --version "$wb_version"
+    bash /root/install-wasm-bindgen.sh /tmp/frontend-Cargo.lock
 
 # The two trees keep the layout they have in the repository: the frontend
 # reaches the shared crates as `../backend/...`, and `aurcache-api`'s build
