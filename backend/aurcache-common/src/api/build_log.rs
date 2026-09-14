@@ -21,32 +21,46 @@
 ///   `offset + raw.len() - back_drop`, and that re-reads the character whole
 ///   instead of printing two mangled halves.
 ///
-/// The slice `&raw[front_skip..raw.len() - back_drop]` is valid UTF-8 at both
-/// edges (interior bytes are the log's problem, and are lossy-decoded by the
-/// caller). The two values sum to at most `raw.len()`, and to all of it when
-/// the page is nothing but a split character — which is why callers also stop
-/// when `raw.len() - back_drop == 0`: no forward progress, so EOF mid-character
+/// The slice `&raw[front_skip..raw.len() - back_drop]` does not split a
+/// character at either edge. Invalid bytes anywhere else are the log's
+/// problem, left for the caller's lossy decode: only a character the page cut
+/// short is held back, never everything after a bad byte. The two values sum
+/// to at most `raw.len()`, and to all of it when the page is nothing but a
+/// split character — which is why callers also stop when
+/// `raw.len() - back_drop == 0`: no forward progress, so EOF mid-character
 /// terminates rather than re-reading the same tail forever.
 pub fn align(raw: &[u8]) -> (usize, usize) {
-    if raw.is_empty() {
-        return (0, 0);
-    }
-
     // Leading continuation bytes continue a character started before the
     // page. Full stop — that character cannot be recovered from what we have
     // been given, so it is dropped from the display.
-    let front_skip = raw.iter().take_while(|b| (**b & 0xC0) == 0x80).count();
+    let front_skip = raw.iter().take_while(|b| is_continuation(**b)).count();
+    (front_skip, unfinished_suffix(&raw[front_skip..]))
+}
 
-    // Everything from the page's last valid UTF-8 prefix is either a cut-off
-    // character or garbage; neither is printable. `valid_up_to` is where
-    // decoding failed, which for a page that ends mid-character is the start
-    // of that character's remaining bytes.
-    let valid = match std::str::from_utf8(&raw[front_skip..]) {
-        Ok(_) => raw.len(),
-        Err(e) => front_skip + e.valid_up_to(),
-    };
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
 
-    (front_skip, raw.len() - valid)
+/// How many trailing bytes are the start of a character the page cut short.
+///
+/// A character is at most four bytes, so only the last three can hold a lead
+/// byte still waiting for the rest. Whatever else is at the end -- a complete
+/// character, or garbage -- is kept.
+fn unfinished_suffix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if is_continuation(byte) {
+            continue;
+        }
+        let length = match byte {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if length > back { back } else { 0 };
+    }
+    0
 }
 
 #[cfg(test)]
@@ -114,13 +128,20 @@ mod tests {
         assert_eq!(align(b""), (0, 0));
     }
 
-    /// Interior garbage is left for the caller's lossy decode: the edges stay
-    /// clean, but only a page ending at the garbage shows a clean boundary.
+    /// Garbage is left for the caller's lossy decode, wherever it is. Holding
+    /// back everything after a bad byte would stall a walker for good: the
+    /// next page would start at the same bad byte and advance nothing.
     #[test]
-    fn interior_garbage_extends_to_the_ends_only_when_there() {
+    fn garbage_is_kept_and_only_a_cut_character_is_held_back() {
         let raw = b"before\xFFafter";
-        assert_eq!(align(&raw[..6]), (0, 0));
-        // A page that *includes* the garbage ends inside the invalid region.
-        assert_eq!(align(&raw[..9]), (0, 3));
+        assert_eq!(align(&raw[..9]), (0, 0));
+        assert_eq!(align(b"\xFF"), (0, 0));
+        // Garbage earlier in the page does not hide a character cut at its end.
+        let cut = [b"before\xFFafter ".as_slice(), &"\u{2018}".as_bytes()[..2]].concat();
+        assert_eq!(align(&cut), (0, 2));
+        // A four-byte character is complete once all four bytes are there.
+        let emoji = "\u{1F600}".as_bytes();
+        assert_eq!(align(&emoji[..3]), (0, 3));
+        assert_eq!(align(emoji), (0, 0));
     }
 }
