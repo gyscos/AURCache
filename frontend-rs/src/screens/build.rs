@@ -3,7 +3,9 @@
 use crate::dates::AbsoluteDate;
 use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
-use crate::log_tail::{append_capped, coarse_pointer, drop_leading_partial_line, log_tail_cap};
+use crate::log_tail::{
+    append_capped, catch_up_offset, coarse_pointer, drop_leading_partial_line, log_tail_cap,
+};
 use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
@@ -325,6 +327,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // runs for the life of the screen, so it takes its own copy and the rsx
     // below keeps the original for the header and the copy/download buttons.
     let pkgbase_for_poll = pkgbase.clone();
+    // Counted once per page that lands, not on every render: the window can be
+    // 16 MiB of text, and the header re-renders on every status poll.
+    let line_count = use_memo(move || log.read().lines().count());
     use_future(move || {
         let (mut log, mut log_size, mut tail) = (log, log_size, tail);
         let (mut worker_name, mut status, mut start_time, mut end_time) =
@@ -395,14 +400,18 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 // settles this cycle gets its final page regardless, then the
                 // loop returns, so the last lines are never missed.
                 if let Some(build) = build.filter(|_| following() || settled_now) {
-                    // Initial placement, once: a log already bigger than
-                    // the window opens at its *end*, not at 0 — the first
-                    // frame is what a finished log should show, not the
-                    // first 4 MiB of a multi-GiB file. The leading partial
-                    // line that `size − cap` can land on is stripped once,
-                    // below, after `align`.
-                    if next_offset == 0 && build.log_size.is_some_and(|s| s as u64 > cap as u64) {
-                        next_offset = build.log_size.unwrap_or(0) as u64 - cap as u64;
+                    // A log more than a window ahead of where this got to opens
+                    // at its *end*, not at the next page: on the first frame,
+                    // so a finished log shows its last lines rather than the
+                    // first 4 MiB of a multi-GiB file, and after Follow was off
+                    // while the build kept writing, so a build that settles
+                    // then still shows how it ended. The window starts over,
+                    // and the leading partial line that `size − cap` can land
+                    // on is stripped below, after `align`.
+                    let size = build.log_size.and_then(|s| u64::try_from(s).ok());
+                    if let Some(offset) = catch_up_offset(next_offset, size, cap as u64) {
+                        next_offset = offset;
+                        log.set(String::new());
                         tail.set(true);
                     }
 
@@ -479,163 +488,167 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // is finally correct. It re-runs when `log` grows (a new page landed) or
     // when `following` flips back on (re-pin immediately).
     use_effect(move || {
-        let _ = log.read().lines().count();
+        // Read only to subscribe to it.
+        let _ = log.read();
         if following() {
             scroll_log_to_bottom();
         }
     });
 
     rsx! {
-            div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
-                div { class: "card-body flex flex-col min-h-0",
-                    div { class: "flex items-center gap-3",
-                        // The same badge the lists use, so a state means the same
-                        // thing everywhere and a new one added server-side breaks
-                        // the exhaustive match instead of rendering as a guess.
-                        if let Some(state) = status() {
-                            span { class: "flex items-center gap-2",
-                                BuildStatusBadge { status: state }
-                                if !finished() {
-                                    span { class: "loading loading-spinner loading-xs opacity-60" }
-                                }
-                            }
-                        } else {
-                            span { class: "badge badge-ghost badge-sm", "…" }
-                        }
-                        if let Some(worker) = worker_name() {
-                            // Beside the state, because "what is it doing" and
-                            // "where" are one question when a build misbehaves.
-                            Link {
-                                class: "font-mono text-sm opacity-70 hover:underline",
-                                to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
-                                title: "Show this worker's builds",
-                                "{worker}"
-                            }
-                        }
-                        if let Some(start) = start_time() {
-                            // When it started and what it has used since. A running
-                            // build's duration grows as this page watches, so it is
-                            // measured to now; an ended one reports its total.
-                            span { class: "flex items-center gap-2 text-sm opacity-70",
-                                span { class: "whitespace-nowrap", "Started " }
-                                AbsoluteDate { ts: Some(start) }
-                                if end_time().is_none() {
-                                    {format!("· {} so far", format_duration(Some(start), Some(now_secs())))}
-                                } else {
-                                    {format!("· took {}", format_duration(Some(start), end_time()))}
-                                }
-                            }
-                        }
-                        div { class: "flex-1" }
-                        // Stop a build that is not over yet: running, enqueued, or
-                        // waiting for deps. Same `settled` gate as the poll loop,
-                        // so a build that just started is stoppable the moment this
-                        // page opens and a state from a newer server is too.
-                        if status().is_some_and(|s| !settled(s)) {
-                            button {
-                                disabled: canceling(),
-                                class: "btn btn-xs btn-error btn-outline",
-                                onclick: move |_| {
-                                    // Signals are Copy; both are rebound `mut`
-                                    // for the async body below.
-                                    let (mut canceling, mut error) = (canceling, error);
-                                    let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
-                                    spawn(async move {
-                                        canceling.set(true);
-                                        let result = match crate::api::client() {
-                                            Ok(client) => match client.cancel_build(&pkgbase, number).await {
-                                                Ok(()) => Ok(()),
-                                                Err(e) => Err(e.to_string()),
-                                            },
-                                            Err(e) => Err(e),
-                                        };
-                                        if let Err(e) = result {
-                                            error.set(Some(e));
-                                            canceling.set(false);
-                                        }
-                                    });
-                                },
-                                if canceling() { "Stopping…" } else { "Stop" }
-                            }
-                        }
-    LogCopyButton {
-                            pkgbase,
-                            number,
-                            log,
-                            tail: tail,
-                            cap: cap(),
-                            copied,
-                            error,
-                        }
-                        label { class: "label cursor-pointer gap-2",
-                            span { class: "label-text text-sm", "Follow" }
-                            input {
-                                r#type: "checkbox",
-                                class: "toggle toggle-sm toggle-primary",
-                                checked: following(),
-                                // The effect below does the scrolling: it reads
-                                // `following`, so turning this on re-pins to the
-                                // bottom on the next render.
-                                oninput: move |e| following.set(e.value() == "true"),
-                            }
-                        }
-                    }
-
-                    if let Some(e) = error() {
-                        div { class: "alert alert-error", span { "{e}" } }
-                    }
-
-                    pre {
-                        id: "build-log",
-                        // `flex-1 min-h-0` rather than a share of the viewport:
-                        // the log takes whatever is left after the header and the
-                        // footer, so the card fills the window exactly and this is
-                        // the only thing that scrolls. `min-h-0` because a flex
-                        // child will not shrink below its content without it, which
-                        // is what pushed the page past the window before.
-                        class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
-                                flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
-                        if log.read().is_empty() {
-                            // A finished build with nothing to show has no log at
-                            // all -- it never wrote one, or it has been removed --
-                            // which is a different statement from a running build
-                            // that has not written its first line yet.
-                            if finished() {
-                                span { class: "opacity-60", "no log for this build" }
-                            } else {
-                                span { class: "opacity-60", "waiting for output…" }
-                            }
-                        } else {
-                            "{log}"
-                        }
-                    }
-                    // The footer answers "how much of it is here". An untrimmed
-                    // window is the whole log, so it counts lines in the window.
-                    // A trimmed one is a tail, so it says how much of the total it
-                    // covers -- the size is what is actually missing.
-                    if tail() {
-                        div {
-                            class: "text-sm opacity-60",
-                            {
-                                // The total comes from the header route's
-                                // `log_size`: a build may have created its log
-                                // after the last poll, in which case "not known"
-                                // reads as a dash, one of the several answers
-                                // `None` has here.
-                                let total = log_size()
-                                    .map(|s| format_bytes(s as u64))
-                                    .unwrap_or_else(|| "—".to_string());
-                                let shown = format_bytes(cap() as u64);
-                                let lines = log.read().lines().count();
-                                format!("showing the last ~{shown} of {total} (~{lines} lines in view)")
+        div { class: "card bg-base-100 shadow-xl flex-1 min-h-0",
+            div { class: "card-body flex flex-col min-h-0",
+                div { class: "flex items-center gap-3",
+                    // The same badge the lists use, so a state means the same
+                    // thing everywhere and a new one added server-side breaks
+                    // the exhaustive match instead of rendering as a guess.
+                    if let Some(state) = status() {
+                        span { class: "flex items-center gap-2",
+                            BuildStatusBadge { status: state }
+                            if !finished() {
+                                span { class: "loading loading-spinner loading-xs opacity-60" }
                             }
                         }
                     } else {
-                        div { class: "text-sm opacity-60", "{log.read().lines().count()} lines" }
+                        span { class: "badge badge-ghost badge-sm", "…" }
                     }
+                    if let Some(worker) = worker_name() {
+                        // Beside the state, because "what is it doing" and
+                        // "where" are one question when a build misbehaves.
+                        Link {
+                            class: "font-mono text-sm opacity-70 hover:underline",
+                            to: Route::Builds { view: ViewParams::default(), q: worker.clone() },
+                            title: "Show this worker's builds",
+                            "{worker}"
+                        }
+                    }
+                    if let Some(start) = start_time() {
+                        // When it started and what it has used since. A running
+                        // build's duration grows as this page watches, so it is
+                        // measured to now; an ended one reports its total.
+                        span { class: "flex items-center gap-2 text-sm opacity-70",
+                            span { class: "whitespace-nowrap", "Started " }
+                            AbsoluteDate { ts: Some(start) }
+                            if end_time().is_none() {
+                                {format!("· {} so far", format_duration(Some(start), Some(now_secs())))}
+                            } else {
+                                {format!("· took {}", format_duration(Some(start), end_time()))}
+                            }
+                        }
+                    }
+                    div { class: "flex-1" }
+                    // Stop a build that is not over yet: running, enqueued, or
+                    // waiting for deps. Same `settled` gate as the poll loop,
+                    // so a build that just started is stoppable the moment this
+                    // page opens and a state from a newer server is too. Not
+                    // one being published: it has already been built, and the
+                    // server would refuse.
+                    if status().is_some_and(|s| {
+                        !settled(s) && BuildState::from_i32(s) != Some(BuildState::Publishing)
+                    }) {
+                        button {
+                            disabled: canceling(),
+                            class: "btn btn-xs btn-error btn-outline",
+                            onclick: move |_| {
+                                // Signals are Copy; both are rebound `mut`
+                                // for the async body below.
+                                let (mut canceling, mut error) = (canceling, error);
+                                let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
+                                spawn(async move {
+                                    canceling.set(true);
+                                    let result = match crate::api::client() {
+                                        Ok(client) => match client.cancel_build(&pkgbase, number).await {
+                                            Ok(()) => Ok(()),
+                                            Err(e) => Err(e.to_string()),
+                                        },
+                                        Err(e) => Err(e),
+                                    };
+                                    if let Err(e) = result {
+                                        error.set(Some(e));
+                                        canceling.set(false);
+                                    }
+                                });
+                            },
+                            if canceling() { "Stopping…" } else { "Stop" }
+                        }
+                    }
+                    LogCopyButton {
+                        pkgbase,
+                        number,
+                        log,
+                        tail,
+                        cap: cap(),
+                        copied,
+                        error,
+                    }
+                    label { class: "label cursor-pointer gap-2",
+                        span { class: "label-text text-sm", "Follow" }
+                        input {
+                            r#type: "checkbox",
+                            class: "toggle toggle-sm toggle-primary",
+                            checked: following(),
+                            // The effect below does the scrolling: it reads
+                            // `following`, so turning this on re-pins to the
+                            // bottom on the next render.
+                            oninput: move |e| following.set(e.value() == "true"),
+                        }
+                    }
+                }
+
+                if let Some(e) = error() {
+                    div { class: "alert alert-error", span { "{e}" } }
+                }
+
+                pre {
+                    id: "build-log",
+                    // `flex-1 min-h-0` rather than a share of the viewport:
+                    // the log takes whatever is left after the header and the
+                    // footer, so the card fills the window exactly and this is
+                    // the only thing that scrolls. `min-h-0` because a flex
+                    // child will not shrink below its content without it, which
+                    // is what pushed the page past the window before.
+                    class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
+                            flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
+                    if log.read().is_empty() {
+                        // A finished build with nothing to show has no log at
+                        // all -- it never wrote one, or it has been removed --
+                        // which is a different statement from a running build
+                        // that has not written its first line yet.
+                        if finished() {
+                            span { class: "opacity-60", "no log for this build" }
+                        } else {
+                            span { class: "opacity-60", "waiting for output…" }
+                        }
+                    } else {
+                        "{log}"
+                    }
+                }
+                // The footer answers "how much of it is here". An untrimmed
+                // window is the whole log, so it counts lines in the window.
+                // A trimmed one is a tail, so it says how much of the total it
+                // covers -- the size is what is actually missing.
+                if tail() {
+                    div {
+                        class: "text-sm opacity-60",
+                        {
+                            // The total comes from the header route's
+                            // `log_size`: a build may have created its log
+                            // after the last poll, in which case "not known"
+                            // reads as a dash, one of the several answers
+                            // `None` has here.
+                            let total = log_size()
+                                .map(|s| format_bytes(s as u64))
+                                .unwrap_or_else(|| "—".to_string());
+                            let shown = format_bytes(cap() as u64);
+                            format!("showing the last ~{shown} of {total} (~{line_count} lines in view)")
+                        }
+                    }
+                } else {
+                    div { class: "text-sm opacity-60", "{line_count} lines" }
                 }
             }
         }
+    }
 }
 
 /// Pin the log view to the newest output.

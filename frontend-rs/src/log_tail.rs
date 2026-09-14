@@ -87,6 +87,18 @@ pub fn coarse_pointer() -> bool {
         .is_some_and(|m| m.matches())
 }
 
+/// Where to fetch from instead of `next_offset`, when the log is more than a
+/// window ahead of it.
+///
+/// Walking a backlog page by page would take a poll per window, and a build that
+/// settles meanwhile gets only one more page -- so its last lines would never be
+/// shown. Jumping to `log_size - cap` shows the end in one fetch. `None` means
+/// carry on from `next_offset`, which includes a log whose size is not known.
+pub fn catch_up_offset(next_offset: u64, log_size: Option<u64>, cap: u64) -> Option<u64> {
+    let size = log_size?;
+    (size.saturating_sub(next_offset) > cap).then(|| size - cap)
+}
+
 /// Drop everything through the first newline, so the window starts at a line
 /// boundary.
 ///
@@ -102,9 +114,23 @@ pub fn drop_leading_partial_line(window: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DESKTOP_LOG_TAIL_BYTES, MOBILE_LOG_TAIL_BYTES, append_capped, drop_leading_partial_line,
-        log_tail_cap,
+        DESKTOP_LOG_TAIL_BYTES, MOBILE_LOG_TAIL_BYTES, append_capped, catch_up_offset,
+        drop_leading_partial_line, log_tail_cap,
     };
+
+    #[test]
+    fn a_log_more_than_a_window_ahead_is_jumped_to_its_end() {
+        // First frame of a log bigger than the window: open at its end.
+        assert_eq!(catch_up_offset(0, Some(100), 30), Some(70));
+        // Within a window of where the view got to: walk on from there.
+        assert_eq!(catch_up_offset(80, Some(100), 30), None);
+        assert_eq!(catch_up_offset(0, Some(30), 30), None);
+        // Follow was off while the build wrote far past the view.
+        assert_eq!(catch_up_offset(10, Some(1000), 30), Some(970));
+        // Not known, or a log that shrank (removed and rewritten): carry on.
+        assert_eq!(catch_up_offset(0, None, 30), None);
+        assert_eq!(catch_up_offset(500, Some(100), 30), None);
+    }
 
     #[test]
     fn phone_sizes_are_smaller() {
