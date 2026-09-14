@@ -16,8 +16,9 @@ use aurcache_common::worker::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, CONTROLS};
-use reqwest::{Certificate, Client, Identity, StatusCode};
+use reqwest::{Body, Certificate, Client, Identity, StatusCode};
 use std::time::Duration;
+use tokio_util::io::ReaderStream;
 
 /// Characters that must not appear raw in a URL path segment. Everything legal
 /// in a real makepkg artifact name (`.`, `-`, `_`, `+`, `:`, `~`) is left as-is
@@ -265,21 +266,21 @@ impl WorkerClient {
         Ok(())
     }
 
-    /// Upload a single artifact file.
+    /// Upload a single artifact file, streaming its contents from `reader` so
+    /// multi-gigabyte packages are never held in memory on the worker.
     ///
     /// `filename` is percent-encoded: it originates from whatever the PKGBUILD
     /// dropped in the build directory, and an unescaped `?` or `#` would be
     /// parsed as a query/fragment separator and silently truncate the path.
-    pub async fn upload_artifact(
-        &self,
-        build_id: i32,
-        filename: &str,
-        bytes: Vec<u8>,
-    ) -> Result<()> {
+    pub async fn upload_artifact<R>(&self, build_id: i32, filename: &str, reader: R) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+    {
         let encoded = percent_encoding::utf8_percent_encode(filename, PATH_SEGMENT);
+        let body = Body::wrap_stream(ReaderStream::new(reader));
         self.http
             .post(self.url(&format!("/jobs/{build_id}/artifacts/{encoded}")))
-            .body(bytes)
+            .body(body)
             .send()
             .await
             .context("artifact request")?

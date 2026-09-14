@@ -40,6 +40,10 @@ pub fn SourcePane(
     /// Whether the open file already carried a change before this edit.
     #[props(default = false)]
     patched: bool,
+    /// Whether the open file's stored patch no longer applies to the current
+    /// upstream, leaving only the pristine content in the editor.
+    #[props(default = false)]
+    patch_failed: bool,
     /// Buttons belonging to the surrounding flow: Save here, Done there.
     actions: Element,
     /// Warnings and results the caller wants above the text.
@@ -92,6 +96,7 @@ pub fn SourcePane(
                             div { class: "flex items-center gap-2 flex-wrap",
                                 h3 { class: "font-mono font-medium break-all", "{path}" }
                                 if patched { span { class: "badge badge-warning badge-sm", "patched" } }
+                                if patch_failed { span { class: "badge badge-error badge-sm", "patch failed" } }
                                 if dirty { span { class: "badge badge-info badge-sm", "unsaved" } }
                                 div { class: "flex-1" }
                                 {actions}

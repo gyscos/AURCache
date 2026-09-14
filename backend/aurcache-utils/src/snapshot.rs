@@ -222,16 +222,17 @@ impl SnapshotStore {
     /// stored patch no longer applies cleanly to the current pristine
     /// content: returns the pristine content unconditionally, plus the
     /// patched content if this file is part of `patch` and it still applies,
-    /// plus an error message if it's part of `patch` but no longer applies.
-    /// Intended for UI consumption, where the user should always be able to
-    /// see (and revert to) the original content even when their patch is
-    /// stale.
+    /// plus an error message if it's part of `patch` but no longer applies,
+    /// plus the stored unified diff text for the file when it is part of the
+    /// patch. Intended for UI consumption, where the user should always be
+    /// able to see (and revert to) the original content even when their patch
+    /// is stale, and inspect the diff itself to understand what it does.
     pub async fn read_file_with_patch_status(
         &self,
         source_data: &SourceData,
         patch: Option<&str>,
         rel_path: &str,
-    ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
+    ) -> anyhow::Result<(String, Option<String>, Option<String>, Option<String>)> {
         let entry = self.get_or_fetch_any(source_data).await?;
         let original_snapshot = entry.original();
         let original = read_file_from_archive(
@@ -242,12 +243,13 @@ impl SnapshotStore {
 
         let patch = match patch.map(SourcePatch::parse).transpose()? {
             Some(patch) if patch.diff_for(rel_path).is_some() => patch,
-            _ => return Ok((original, None, None)),
+            _ => return Ok((original, None, None, None)),
         };
 
+        let stored = patch.diff_for(rel_path).map(str::to_string);
         match patch.apply_to_content(rel_path, &original) {
-            Ok(patched) => Ok((original, Some(patched), None)),
-            Err(e) => Ok((original, None, Some(e.to_string()))),
+            Ok(patched) => Ok((original, Some(patched), None, stored)),
+            Err(e) => Ok((original, None, Some(e.to_string()), stored)),
         }
     }
 

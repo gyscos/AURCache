@@ -180,7 +180,10 @@ async fn fake_worker_protocol_roundtrip() {
     client.append_log(1, "fake build starting\n").await.unwrap();
 
     let (fname, bytes) = make_pkg("p1", "1.0-1");
-    client.upload_artifact(1, &fname, bytes).await.unwrap();
+    client
+        .upload_artifact(1, &fname, std::io::Cursor::new(bytes))
+        .await
+        .unwrap();
     client
         .complete(
             1,
@@ -215,7 +218,7 @@ async fn fake_worker_protocol_roundtrip() {
 
     let (bad_name, bad_bytes) = make_pkg("evil", "9.9-1");
     client
-        .upload_artifact(2, &bad_name, bad_bytes)
+        .upload_artifact(2, &bad_name, std::io::Cursor::new(bad_bytes))
         .await
         .unwrap();
     let rejected = client

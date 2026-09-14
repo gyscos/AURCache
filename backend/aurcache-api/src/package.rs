@@ -483,7 +483,7 @@ pub async fn package_source_file(
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
-    let (original_content, patched_content, patch_error) = store
+    let (original_content, patched_content, patch_error, stored_patch) = store
         .read_file_with_patch_status(&pkg.source_data, pkg.patch.as_deref(), &path)
         .await
         .map_err(|e| err(Status::NotFound, e))?;
@@ -493,6 +493,7 @@ pub async fn package_source_file(
         original_content,
         patched_content,
         patch_error,
+        stored_patch,
     }))
 }
 
@@ -614,6 +615,7 @@ pub async fn package_source_preview_file(
         original_content,
         patched_content: None,
         patch_error: None,
+        stored_patch: None,
     }))
 }
 

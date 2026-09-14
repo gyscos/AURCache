@@ -27,6 +27,11 @@ pub async fn remote_cancel(client: &WorkerClient, build_id: i32) -> bool {
 }
 
 /// Upload every built artifact to the server's staging area.
+///
+/// Artifacts are streamed from disk rather than read into memory: package
+/// files can be multi-gigabyte, and buffering them fully would triple the
+/// worker's peak memory (one copy in the filesystem cache, one in the read,
+/// one in the request body).
 pub async fn upload_artifacts(client: &WorkerClient, build_id: i32, pkgdir: &Path) -> Result<()> {
     let found = artifacts::discover_artifacts(pkgdir);
     if found.is_empty() {
@@ -38,12 +43,12 @@ pub async fn upload_artifacts(client: &WorkerClient, build_id: i32, pkgdir: &Pat
             .and_then(|s| s.to_str())
             .context("artifact has no filename")?
             .to_string();
-        let bytes = tokio::fs::read(&path)
+        let reader = tokio::fs::File::open(&path)
             .await
-            .with_context(|| format!("reading {}", path.display()))?;
+            .with_context(|| format!("opening {}", path.display()))?;
         log(client, build_id, &format!("[worker] uploading {name}\n")).await;
         client
-            .upload_artifact(build_id, &name, bytes)
+            .upload_artifact(build_id, &name, reader)
             .await
             .with_context(|| format!("uploading {name}"))?;
     }

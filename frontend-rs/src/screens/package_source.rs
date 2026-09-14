@@ -52,6 +52,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     // are both expressible.
     let mut draft = use_signal(String::new);
     let mut status = use_signal(|| Option::<(String, bool)>::None);
+    let mut show_patch = use_signal(|| false);
 
     let open_file = move |pkgbase: String, path: String| async move {
         let Ok(client) = crate::api::client() else {
@@ -71,6 +72,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                 loaded.set(Some(content));
                 selected.set(Some(path));
                 status.set(None);
+                show_patch.set(false);
             }
             Err(e) => status.set(Some((e.to_string(), false))),
         }
@@ -89,7 +91,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         }
     });
 
-    let dirty = loaded.read().as_ref().is_some_and(|c| {
+    let edited = loaded.read().as_ref().is_some_and(|c| {
         let shown = c
             .patched_content
             .clone()
@@ -100,6 +102,12 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         .read()
         .as_ref()
         .is_some_and(|c| c.patched_content.is_some());
+    let broken = loaded
+        .read()
+        .as_ref()
+        .is_some_and(|c| c.patch_error.is_some());
+    let can_save = edited || broken;
+    let can_revert = loaded.read().is_some() && (edited || patched || broken);
 
     rsx! {
         div { class: "space-y-4",
@@ -130,12 +138,13 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                 }
             },
             draft,
-            dirty,
+            dirty: edited,
             patched,
+            patch_failed: broken,
             actions: rsx! {
                 button {
                     class: "btn btn-ghost btn-sm",
-                    disabled: !dirty,
+                    disabled: !can_revert,
                     onclick: move |_| {
                         if let Some(c) = loaded.read().as_ref() {
                             draft.set(c.original_content.clone());
@@ -143,9 +152,16 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     },
                     "Revert to upstream"
                 }
+                if broken {
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        onclick: move |_| show_patch.set(true),
+                        "View patch"
+                    }
+                }
                 button {
                     class: "btn btn-sm",
-                    disabled: !dirty,
+                    disabled: !can_save,
                     onclick: {
                         let pkgbase = pkgbase.clone();
                         move |_| {
@@ -166,7 +182,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                 }
                 button {
                     class: "btn btn-primary btn-sm",
-                    disabled: !dirty,
+                    disabled: !can_save,
                     // Editing a PKGBUILD is nearly always a prelude to building
                     // it; without this the next step is a save, a navigation
                     // back, and a second button.
@@ -240,6 +256,92 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                 }
             },
         }
+        if show_patch() {
+            if let Some(c) = loaded.read().as_ref()
+                && let Some(patch) = c.stored_patch.clone()
+            {
+                div {
+                    class: "modal modal-open",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "Stored patch",
+                    div { class: "modal-box max-w-3xl",
+                        h3 { class: "font-bold text-lg", "Stored patch" }
+                        p { class: "text-xs opacity-60 font-mono break-all", "{c.path}" }
+                        pre { class: "max-h-[60vh] overflow-auto text-xs font-mono mt-3",
+                            for (index, line) in patch.lines().enumerate() {
+                                div {
+                                    key: "{index}",
+                                    class: "whitespace-pre-wrap {DiffLineKind::of(line).classes()}",
+                                    "{line}"
+                                }
+                            }
+                        }
+                        div { class: "modal-action",
+                            button {
+                                class: "btn btn-sm",
+                                onclick: move |_| show_patch.set(false),
+                                "Close"
+                            }
+                        }
+                    }
+                    button {
+                        class: "modal-backdrop",
+                        onclick: move |_| show_patch.set(false),
+                        aria_label: "Close stored patch",
+                        "Close"
+                    }
+                }
+            }
         }
+        }
+    }
+}
+
+/// How to classify a line of a unified diff for display, git-style.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+    Hunk,
+}
+
+impl DiffLineKind {
+    fn of(line: &str) -> Self {
+        if line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++") {
+            Self::Hunk
+        } else if line.starts_with('+') {
+            Self::Added
+        } else if line.starts_with('-') {
+            Self::Removed
+        } else {
+            Self::Context
+        }
+    }
+
+    fn classes(self) -> &'static str {
+        match self {
+            Self::Context => "",
+            Self::Added => "text-success",
+            Self::Removed => "text-error",
+            Self::Hunk => "text-info",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DiffLineKind;
+
+    #[test]
+    fn classifies_unified_diff_lines() {
+        assert_eq!(DiffLineKind::of("@@ -1,3 +1,4 @@"), DiffLineKind::Hunk);
+        assert_eq!(DiffLineKind::of("--- a/PKGBUILD"), DiffLineKind::Hunk);
+        assert_eq!(DiffLineKind::of("+++ b/PKGBUILD"), DiffLineKind::Hunk);
+        assert_eq!(DiffLineKind::of("+pkgrel=2"), DiffLineKind::Added);
+        assert_eq!(DiffLineKind::of("-pkgrel=1"), DiffLineKind::Removed);
+        assert_eq!(DiffLineKind::of(" context"), DiffLineKind::Context);
+        assert_eq!(DiffLineKind::of(""), DiffLineKind::Context);
     }
 }

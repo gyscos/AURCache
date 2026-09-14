@@ -46,6 +46,10 @@ pub struct SourceFileContent {
     /// (e.g. upstream changed enough that the diff's context no longer
     /// matches).
     pub patch_error: Option<String>,
+    /// The stored unified diff for this file as it was authored, so the UI can
+    /// show what the patch does even when it can no longer be applied. `None`
+    /// if this file isn't part of the patch.
+    pub stored_patch: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, ToSchema)]

@@ -571,7 +571,12 @@ pub async fn job_logs(
     Ok(())
 }
 
-/// Upload one built artifact into the job's staging area.
+/// Stream one built artifact into the job's staging area.
+///
+/// The body is copied to disk in chunks rather than buffered in memory: a
+/// package file can be multi-gigabyte, and `into_bytes` would hold it all in
+/// RAM, which is what made the previous upload path stall and time out under
+/// memory pressure.
 #[post("/worker/jobs/<build_id>/artifacts/<filename>", data = "<data>")]
 pub async fn job_artifact(
     db: &State<DatabaseConnection>,
@@ -580,6 +585,8 @@ pub async fn job_artifact(
     filename: &str,
     data: Data<'_>,
 ) -> Result<(), ApiError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
@@ -597,17 +604,35 @@ pub async fn job_artifact(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    let bytes = data
-        .open(2.gibibytes())
-        .into_bytes()
-        .await
-        .map_err(|e| err(Status::BadRequest, e))?;
-    if !bytes.is_complete() {
-        return Err(err(Status::PayloadTooLarge, "artifact exceeds size limit"));
-    }
-    tokio::fs::write(dir.join(name), bytes.value)
+    let dest = dir.join(name);
+    let mut reader = data.open(2.gibibytes());
+    let mut file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| err(Status::BadRequest, e))?;
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > 2 * 1024 * 1024 * 1024 {
+            // Leave no partial file behind for the later ingest to trip over.
+            let _ = tokio::fs::remove_file(&dest).await;
+            return Err(err(Status::PayloadTooLarge, "artifact exceeds size limit"));
+        }
+        file.write_all(&buf[..n])
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+    }
+    if written == 0 {
+        return Err(err(Status::BadRequest, "empty artifact"));
+    }
     Ok(())
 }
 
