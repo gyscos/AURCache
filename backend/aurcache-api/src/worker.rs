@@ -21,11 +21,10 @@ use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, workers};
-use aurcache_utils::build_logger::{BuildLogger, append_build_output};
+use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
-use aurcache_utils::repo_ingest::{
-    LeaseGuard, ingest_pkgs, is_debug_artifact, validate_artifact_names,
-};
+use aurcache_utils::publish::publish_build;
+use aurcache_utils::repository::Repository;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::worker_complete;
@@ -163,12 +162,6 @@ fn resolve_mirrorlist(
 /// Conventional PKGDEST inside a worker's build environment. Workers may patch
 /// this in their local `makepkg.conf`; it is only a default.
 const WORKER_PKGDEST: &str = "/output";
-
-/// Staging root where uploaded artifacts are buffered until the worker reports
-/// the build complete, at which point they are ingested atomically.
-fn staging_dir(build_id: i32) -> PathBuf {
-    PathBuf::from("./worker-staging").join(build_id.to_string())
-}
 
 /// Request guard: a verified, CA-signed client certificate mapped to an
 /// **approved** worker row. Pending/revoked/unknown workers are refused.
@@ -571,6 +564,13 @@ pub async fn job_logs(
     Ok(())
 }
 
+/// The largest single artifact a worker may upload.
+///
+/// A backstop against a runaway or hostile PKGBUILD filling the server's disk,
+/// not a statement about what a package should weigh: `unreal-engine` is past
+/// 2 GiB already, so the bound sits well above any package anyone builds.
+const MAX_ARTIFACT_SIZE: u64 = 20 << 30;
+
 /// Stream one built artifact into the job's staging area.
 ///
 /// The body is copied to disk in chunks rather than buffered in memory: a
@@ -580,13 +580,12 @@ pub async fn job_logs(
 #[post("/worker/jobs/<build_id>/artifacts/<filename>", data = "<data>")]
 pub async fn job_artifact(
     db: &State<DatabaseConnection>,
+    repo: &State<Arc<Repository>>,
     auth: WorkerAuth,
     build_id: i32,
     filename: &str,
     data: Data<'_>,
 ) -> Result<(), ApiError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let db = db.inner();
     worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
@@ -599,48 +598,45 @@ pub async fn job_artifact(
         .filter(|s| *s == filename)
         .ok_or_else(|| err(Status::BadRequest, "invalid filename"))?;
 
-    let dir = staging_dir(build_id);
+    let dir = repo.staging_dir(build_id);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     let dest = dir.join(name);
-    let mut reader = data.open(2.gibibytes());
-    let mut file = tokio::fs::File::create(&dest)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut written: u64 = 0;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| err(Status::BadRequest, e))?;
-        if n == 0 {
-            break;
-        }
-        written += n as u64;
-        if written > 2 * 1024 * 1024 * 1024 {
-            // Leave no partial file behind for the later ingest to trip over.
-            let _ = tokio::fs::remove_file(&dest).await;
-            return Err(err(Status::PayloadTooLarge, "artifact exceeds size limit"));
-        }
-        file.write_all(&buf[..n])
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-    }
-    if written == 0 {
-        return Err(err(Status::BadRequest, "empty artifact"));
+    // `open` stops reading at the limit without saying so; `is_complete` is the
+    // only thing that tells a whole artifact from one cut off there. `into_file`
+    // also flushes, so the file is fully written by the time ingest reads it.
+    let stored = data.open(MAX_ARTIFACT_SIZE.bytes()).into_file(&dest).await;
+    let problem = match &stored {
+        Err(e) => Some(err(Status::BadRequest, e)),
+        Ok(file) if !file.is_complete() => Some(err(
+            Status::PayloadTooLarge,
+            format!("artifact exceeds {MAX_ARTIFACT_SIZE} bytes"),
+        )),
+        Ok(file) if file.n.written == 0 => Some(err(Status::BadRequest, "empty artifact")),
+        Ok(_) => None,
+    };
+    if let Some(problem) = problem {
+        // Leave no partial file behind for the later ingest to trip over.
+        drop(stored);
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(problem);
     }
     Ok(())
 }
 
-/// Report a build as complete. Success ingests the staged artifacts into the
-/// repo and promotes dependents; failure is terminal.
+/// Report a build as complete.
+///
+/// A success is accepted and answered at once: the artifacts are all uploaded,
+/// so the worker's part is done, and the build moves to `PUBLISHING` while the
+/// server puts it in the repository in the background (see
+/// [`publish_build`]). Nothing that can go wrong from there is the worker's to
+/// fix. A failure is terminal.
 #[post("/worker/jobs/<build_id>/complete", data = "<input>")]
 pub async fn complete_job(
     db: &State<DatabaseConnection>,
+    repo: &State<Arc<Repository>>,
     auth: WorkerAuth,
     build_id: i32,
     input: Json<CompleteReport>,
@@ -650,7 +646,14 @@ pub async fn complete_job(
     // becomes a build that failed. So the reason is logged here, on the side
     // that knows it. Refusing quietly is what made a stale `files` row take an
     // afternoon to find.
-    let outcome = complete_job_inner(db.inner(), &auth, build_id, input.into_inner()).await;
+    let outcome = complete_job_inner(
+        db.inner(),
+        repo.inner(),
+        &auth,
+        build_id,
+        input.into_inner(),
+    )
+    .await;
     if let Err(e) = &outcome {
         tracing::warn!(
             "rejected completion of build {build_id} from worker {}: {} -- {}",
@@ -664,28 +667,42 @@ pub async fn complete_job(
 
 async fn complete_job_inner(
     db: &DatabaseConnection,
+    repo: &Arc<Repository>,
     auth: &WorkerAuth,
     build_id: i32,
     report: CompleteReport,
 ) -> Result<(), ApiError> {
-    // A canceled report is the worker's acknowledgement of an abort the server
-    // already carried out (operator Stop, or the reaper abandoning the build):
-    // the row is terminal FAILED and the retained `worker_id` still names the
-    // reporter. Accept it — 200, no mutation, staging already cleaned — and
-    // never ingest. This is a real ownership check: without it, any
-    // authenticated worker that guessed an id could remove another worker's
-    // staging directory (design §4). Everything else falls through to the
-    // refusal path below.
-    if report.canceled && !report.success {
-        let build = Builds::find_by_id(build_id)
-            .one(db)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-        let acked = build.is_some_and(|b| {
-            b.status == Some(worker_jobs::STATUS_FAILED) && b.worker_id == Some(auth.worker.id)
-        });
-        if acked {
-            let _ = tokio::fs::remove_dir_all(&staging_dir(build_id)).await;
+    let build = Builds::find_by_id(build_id)
+        .one(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "build not found"))?;
+
+    // A report about a build this worker ran that has already moved on is a
+    // repeat, and is answered 200 without changing anything: the worker's
+    // earlier request got through and only its answer was lost.
+    //
+    // * A cancelled report acknowledges an abort the server carried out
+    //   (operator Stop, or the reaper abandoning the build).
+    // * A success repeats a completion that was accepted: the build is being
+    //   published, was published, or failed to publish -- which fails with no
+    //   end reason, unlike a cancel or an abandonment.
+    //
+    // A real ownership check: without it, any authenticated worker that
+    // guessed an id could remove another worker's staging directory.
+    if build.worker_id == Some(auth.worker.id) {
+        let failed = build.status == Some(worker_jobs::STATUS_FAILED);
+        let acknowledged_abort = report.canceled && !report.success && failed;
+        let repeated_success = report.success
+            && (matches!(
+                build.status,
+                Some(BuildStates::PUBLISHING | BuildStates::SUCCESSFUL_BUILD)
+            ) || (failed && build.end_reason.is_none()));
+        if acknowledged_abort {
+            let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
+            return Ok(());
+        }
+        if repeated_success {
             return Ok(());
         }
     }
@@ -702,128 +719,31 @@ async fn complete_job_inner(
         tracing::warn!("Failed to record peak memory for build {build_id}: {e}");
     }
 
-    let dir = staging_dir(build_id);
     if report.success {
-        let files = read_staging(&dir)
+        worker_complete::accept_for_publishing(db, build_id, auth.worker.id)
             .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-        if files.is_empty() {
-            return Err(err(Status::BadRequest, "no artifacts uploaded"));
-        }
-
-        // Sanity-check filenames against the package names we expect. Blocks
-        // wrong-named uploads (not malicious contents — see design non-goals).
-        let pkg = Packages::find_by_id(build.pkg_id)
-            .one(db)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?
-            .ok_or_else(|| err(Status::NotFound, "package not found"))?;
-        let expected = expected_pkgnames(&pkg);
-
-        // Drop split debug packages before validating: they are not declared
-        // pkgnames, so they would fail validation and requeue the build forever.
-        // The server already sets OPTIONS=(!debug), so this only triggers for a
-        // worker whose user makepkg.conf re-enables it.
-        let logger = BuildLogger::new(&pkg.name, build.number);
-        let (files, debug_files): (Vec<_>, Vec<_>) = files
-            .into_iter()
-            .partition(|(name, _)| !is_debug_artifact(&expected, name));
-        for (name, _) in &debug_files {
-            logger
-                .append(format!("skipping debug package (not published): {name}\n"))
-                .await;
-        }
-        if files.is_empty() {
-            return Err(err(
-                Status::BadRequest,
-                "no publishable artifacts uploaded (only debug packages)",
-            ));
-        }
-
-        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
-        if let Err(e) = validate_artifact_names(&expected, &names) {
-            logger.append(format!("rejected artifacts: {e}\n")).await;
-            return Err(err(Status::BadRequest, e));
-        }
-
-        // Publishing is guarded by the lease itself: `assert_owned_active` above
-        // is a stale read by the time the (slow) ingest runs, so the ingest
-        // re-checks ownership under a row lock before committing anything.
-        let ingested = ingest_pkgs(
-            db,
-            &logger,
-            build.pkg_id,
-            &build.platform,
-            files,
-            Some(LeaseGuard {
-                build_id,
-                worker_id: auth.worker.id,
-            }),
-        )
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_complete::record_built_version(
-            db,
-            build_id,
-            auth.worker.id,
-            &ingested.version,
-            ingested.total_size,
-        )
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-        worker_complete::complete_success(db, build_id, auth.worker.id)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-    } else {
-        if let Some(reason) = &report.reason
-            && let Ok(pkgbase) = build_pkgbase(db, build.pkg_id).await
-            && let Err(e) = append_build_output(
-                &pkgbase,
-                build.number,
-                &format!("worker reported failure: {reason}\n"),
-            )
-            .await
-        {
-            tracing::warn!("Failed to record failure reason for build {build_id}: {e}");
-        }
-        worker_complete::complete_failure(db, build_id, auth.worker.id)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
+            .map_err(|e| err(Status::Forbidden, e))?;
+        let (db, repo) = (db.clone(), Arc::clone(repo));
+        tokio::spawn(async move { publish_build(&db, &repo, build_id).await });
+        return Ok(());
     }
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
 
-/// The package names the server expects a build to produce: the pkgbase plus any
-/// split-package names recorded on the package row.
-fn expected_pkgnames(pkg: &aurcache_db::packages::Model) -> Vec<String> {
-    let mut names = vec![pkg.name.clone()];
-    if let Some(json) = pkg.split_packages.as_deref()
-        && let Ok(split) = serde_json::from_str::<Vec<String>>(json)
+    if let Some(reason) = &report.reason
+        && let Ok(pkgbase) = build_pkgbase(db, build.pkg_id).await
+        && let Err(e) = append_build_output(
+            &pkgbase,
+            build.number,
+            &format!("worker reported failure: {reason}\n"),
+        )
+        .await
     {
-        for name in split {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
+        tracing::warn!("Failed to record failure reason for build {build_id}: {e}");
     }
-    names
-}
-
-async fn read_staging(dir: &Path) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
-    if !dir.exists() {
-        return Ok(files);
-    }
-    let mut rd = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = rd.next_entry().await? {
-        if entry.file_type().await?.is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let bytes = tokio::fs::read(entry.path()).await?;
-            files.push((name, bytes));
-        }
-    }
-    Ok(files)
+    worker_complete::complete_failure(db, build_id, auth.worker.id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+    let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
+    Ok(())
 }
 
 /// Liveness heartbeat: renews leases for reported builds, requeues any this

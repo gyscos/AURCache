@@ -189,6 +189,7 @@ async fn pending_build_for_platform(
             Some(BuildStates::ACTIVE_BUILD),
             Some(BuildStates::ENQUEUED_BUILD),
             Some(BuildStates::WAITING_FOR_DEPS),
+            Some(BuildStates::PUBLISHING),
         ]))
         .one(db)
         .await?)

@@ -3,9 +3,23 @@
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::{self, SourceData, SourceType};
 use aurcache_db::{dependencies, prelude::Dependencies};
+use aurcache_utils::package::delete::package_delete;
 use aurcache_utils::package::live_check::package_remove;
+use aurcache_utils::repository::Repository;
+use aurcache_utils::snapshot::SnapshotStore;
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait, Set};
 use sea_orm_migration::MigratorTrait;
+
+/// A store over a checkout root that holds nothing: these tests are about which
+/// rows go, and removing a checkout that was never made is a no-op.
+fn store() -> SnapshotStore {
+    SnapshotStore::with_checkout_root(std::env::temp_dir().join("aurcache-live-check-no-checkouts"))
+}
+
+/// A repository nothing was ever published to.
+fn repo() -> Repository {
+    Repository::new(tempfile::tempdir().unwrap().keep())
+}
 
 async fn memory_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -70,7 +84,7 @@ async fn removing_a_root_collects_the_chain_under_it() {
     needs(&db, root, middle).await;
     needs(&db, middle, leaf).await;
 
-    package_remove(&db, root).await.unwrap();
+    package_remove(&db, &store(), &repo(), root).await.unwrap();
 
     assert!(remaining(&db).await.is_empty());
     assert_eq!(Dependencies::find().count(&db).await.unwrap(), 0);
@@ -86,10 +100,12 @@ async fn a_shared_dependency_waits_for_its_last_dependent() {
     needs(&db, first, shared).await;
     needs(&db, second, shared).await;
 
-    package_remove(&db, first).await.unwrap();
+    package_remove(&db, &store(), &repo(), first).await.unwrap();
     assert_eq!(remaining(&db).await, ["second", "shared"]);
 
-    package_remove(&db, second).await.unwrap();
+    package_remove(&db, &store(), &repo(), second)
+        .await
+        .unwrap();
     assert!(remaining(&db).await.is_empty());
 }
 
@@ -106,7 +122,7 @@ async fn a_dependency_cycle_is_collected_with_its_root() {
     needs(&db, left, right).await;
     needs(&db, right, left).await;
 
-    package_remove(&db, root).await.unwrap();
+    package_remove(&db, &store(), &repo(), root).await.unwrap();
 
     assert!(remaining(&db).await.is_empty());
 }
@@ -125,7 +141,9 @@ async fn a_cycle_something_still_needs_is_kept() {
     needs(&db, left, right).await;
     needs(&db, right, left).await;
 
-    package_remove(&db, leaving).await.unwrap();
+    package_remove(&db, &store(), &repo(), leaving)
+        .await
+        .unwrap();
 
     assert_eq!(remaining(&db).await, ["left", "right", "staying"]);
 }
@@ -141,7 +159,76 @@ async fn an_unrelated_unlinked_package_is_left_alone() {
     needs(&db, root, dependency).await;
     package(&db, "in-flight", false).await;
 
-    package_remove(&db, root).await.unwrap();
+    package_remove(&db, &store(), &repo(), root).await.unwrap();
 
     assert_eq!(remaining(&db).await, ["in-flight"]);
+}
+
+/// The directory the store keeps an AUR source's checkout in.
+fn checkout_of(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    root.join(format!("aur_{name}"))
+}
+
+/// A removed package's checkout goes with its rows.
+#[tokio::test]
+async fn a_collected_package_takes_its_checkout() {
+    let db = memory_db().await;
+    let checkouts = tempfile::tempdir().unwrap();
+    let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
+    let root = package(&db, "root", true).await;
+    let dependency = package(&db, "dependency", false).await;
+    needs(&db, root, dependency).await;
+    for name in ["root", "dependency"] {
+        std::fs::create_dir_all(checkout_of(checkouts.path(), name)).unwrap();
+    }
+
+    package_remove(&db, &store, &repo(), root).await.unwrap();
+
+    assert!(remaining(&db).await.is_empty());
+    for name in ["root", "dependency"] {
+        assert!(
+            !checkout_of(checkouts.path(), name).exists(),
+            "{name}'s checkout outlived it"
+        );
+    }
+}
+
+/// Removing a package something still depends on only stops it being
+/// requested: its row, and its checkout, stay.
+#[tokio::test]
+async fn a_package_still_depended_on_keeps_its_checkout() {
+    let db = memory_db().await;
+    let checkouts = tempfile::tempdir().unwrap();
+    let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
+    let dependent = package(&db, "dependent", true).await;
+    let removed = package(&db, "removed", true).await;
+    needs(&db, dependent, removed).await;
+    std::fs::create_dir_all(checkout_of(checkouts.path(), "removed")).unwrap();
+
+    package_remove(&db, &store, &repo(), removed).await.unwrap();
+
+    assert_eq!(remaining(&db).await, ["dependent", "removed"]);
+    assert!(checkout_of(checkouts.path(), "removed").is_dir());
+}
+
+/// The delete itself refuses a package something outside the batch needs, so
+/// no caller can take rows, artifacts or checkout out from under a dependent.
+#[tokio::test]
+async fn deleting_a_package_something_needs_is_refused() {
+    let db = memory_db().await;
+    let dependent = package(&db, "dependent", true).await;
+    let needed = package(&db, "needed", false).await;
+    needs(&db, dependent, needed).await;
+
+    let refused = package_delete(&db, &store(), &repo(), &[needed]).await;
+
+    assert!(refused.is_err(), "deleted a package that is still needed");
+    assert_eq!(remaining(&db).await, ["dependent", "needed"]);
+    assert_eq!(Dependencies::find().count(&db).await.unwrap(), 1);
+
+    // Together with what needs it, it can go.
+    package_delete(&db, &store(), &repo(), &[dependent, needed])
+        .await
+        .unwrap();
+    assert!(remaining(&db).await.is_empty());
 }

@@ -1,4 +1,6 @@
 use crate::package::delete::package_delete;
+use crate::repository::Repository;
+use crate::snapshot::SnapshotStore;
 use aurcache_db::dependencies;
 use aurcache_db::packages;
 use aurcache_db::prelude::{Dependencies, Packages};
@@ -20,7 +22,16 @@ use std::collections::{HashMap, HashSet};
 /// The candidate set is still only what `pkg_id` reaches, so a removal collects
 /// what it orphaned and nothing else. Sweeping the whole graph would also pick
 /// up rows an unrelated concurrent add has inserted but not yet linked up.
-pub async fn live_check(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<()> {
+///
+/// Everything collected goes in one [`package_delete`], which is what lets a
+/// chain or a cycle go at once: each member is still depended on, but only by
+/// others going with it.
+pub async fn live_check(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    repo: &Repository,
+    pkg_id: i32,
+) -> anyhow::Result<()> {
     let dependees = dependency_edges(db).await?;
 
     // What this removal could possibly have orphaned.
@@ -36,11 +47,8 @@ pub async fn live_check(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<
         .await?;
     let needed = reachable_from(&dependees, roots);
 
-    for pkg_id in candidates.difference(&needed) {
-        package_delete(db, *pkg_id).await?;
-    }
-
-    Ok(())
+    let orphaned: Vec<i32> = candidates.difference(&needed).copied().collect();
+    package_delete(db, store, repo, &orphaned).await
 }
 
 /// Every dependency link, as dependent -> the packages it needs.
@@ -79,7 +87,15 @@ fn reachable_from(
 }
 
 /// "Remove" a package: clear its directly_requested flag, then live-check it.
-pub async fn package_remove(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<()> {
+///
+/// So a package something still depends on keeps everything -- rows,
+/// artifacts, checkout -- and only stops being requested.
+pub async fn package_remove(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    repo: &Repository,
+    pkg_id: i32,
+) -> anyhow::Result<()> {
     let pkg = Packages::find_by_id(pkg_id)
         .one(db)
         .await?
@@ -89,5 +105,5 @@ pub async fn package_remove(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Res
     active.directly_requested = Set(false);
     active.save(db).await?;
 
-    live_check(db, pkg_id).await
+    live_check(db, store, repo, pkg_id).await
 }

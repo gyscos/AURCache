@@ -37,6 +37,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
         tx: _,
         store,
         client,
+        repo: _,
     } = services;
     let packages = Packages::find().all(db).await?;
     let aur_query_names: Vec<String> = packages

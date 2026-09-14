@@ -332,6 +332,9 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
             tx.clone(),
             Arc::new(store),
             env.client.clone(),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
         ),
         None,
         None,

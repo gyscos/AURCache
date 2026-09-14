@@ -1,7 +1,7 @@
 use crate::builds;
 use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
-use aurcache_common::build_state::BuildTriggers;
+use aurcache_common::build_state::{BuildStates, BuildTriggers};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{
@@ -119,6 +119,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
                 Some(STATUS_ACTIVE),
                 Some(STATUS_ENQUEUED),
                 Some(STATUS_WAITING_FOR_DEPS),
+                Some(BuildStates::PUBLISHING),
             ]))
             .one(db)
             .await?;

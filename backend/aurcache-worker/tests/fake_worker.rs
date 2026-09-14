@@ -20,13 +20,13 @@
 //! (`scripts/test-e2e.sh`).
 
 use std::io::Write;
-use std::path::Path;
 use std::time::Duration;
 
+use aurcache_common::builder::BuildStates;
 use aurcache_common::worker::{ClaimRequest, CompleteReport};
 use aurcache_db::builds;
 use aurcache_db::files;
-use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_SUCCESS};
+use aurcache_db::helpers::worker_jobs::{STATUS_FAILED, STATUS_SUCCESS};
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
 use aurcache_worker_core::client::{WorkerClient, fetch_and_pin_ca};
@@ -89,6 +89,18 @@ async fn seed_build(db: &DatabaseConnection, id: i32, platform: &str, start: i64
     .unwrap();
 }
 
+/// The build's status once it is no longer being published.
+async fn settled_status(db: &DatabaseConnection, id: i32) -> i32 {
+    for _ in 0..100 {
+        let status = build_status(db, id).await;
+        if status != BuildStates::PUBLISHING {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("build {id} is still publishing");
+}
+
 async fn build_status(db: &DatabaseConnection, id: i32) -> i32 {
     builds::Entity::find_by_id(id)
         .one(db)
@@ -133,10 +145,12 @@ async fn fake_worker_protocol_roundtrip() {
 
     // Boot the real worker protocol listener (HTTPS + optional mTLS).
     let ca = aurcache_ca::Ca::load_or_create(&ca_dir).unwrap();
+    let repo_root = tmp.path().join("repo");
     let _server = aurcache_api::init::init_worker_api(
         db.clone(),
         ca,
         std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::new()),
+        std::sync::Arc::new(aurcache_utils::repository::Repository::new(&repo_root)),
     );
 
     // Wait for the TLS listener to accept and serve the CA.
@@ -196,10 +210,11 @@ async fn fake_worker_protocol_roundtrip() {
             },
         )
         .await
-        .expect("complete{success} should ingest the artifact");
+        .expect("complete{success} should be accepted");
 
-    assert_eq!(build_status(&db, 1).await, STATUS_SUCCESS);
-    let repo_db = Path::new("repo").join("x86_64").join("repo.db.tar.gz");
+    // Accepted, then published in the background.
+    assert_eq!(settled_status(&db, 1).await, STATUS_SUCCESS);
+    let repo_db = repo_root.join("x86_64").join("repo.db.tar.gz");
     assert!(repo_db.exists(), "repo db should be written at {repo_db:?}");
     let file_rows = files::Entity::find()
         .filter(files::Column::PackageId.eq(1))
@@ -207,8 +222,29 @@ async fn fake_worker_protocol_roundtrip() {
         .await
         .unwrap();
     assert!(!file_rows.is_empty(), "a files row should be recorded");
+    assert!(
+        !repo_root.join(".staging").join("1").exists(),
+        "the staging directory goes once the build is published"
+    );
 
-    // --- Safety rail: a wrong-named artifact is rejected at complete.
+    // A repeated completion -- its first answer lost -- is acknowledged, and
+    // changes nothing.
+    client
+        .complete(
+            1,
+            &CompleteReport {
+                success: true,
+                exit_code: Some(0),
+                reason: None,
+                canceled: false,
+                peak_memory_bytes: None,
+            },
+        )
+        .await
+        .expect("a repeated completion is acknowledged");
+    assert_eq!(build_status(&db, 1).await, STATUS_SUCCESS);
+
+    // --- Safety rail: a wrong-named artifact is never published.
     let job2 = client
         .claim(&claim_req)
         .await
@@ -221,7 +257,7 @@ async fn fake_worker_protocol_roundtrip() {
         .upload_artifact(2, &bad_name, std::io::Cursor::new(bad_bytes))
         .await
         .unwrap();
-    let rejected = client
+    client
         .complete(
             2,
             &CompleteReport {
@@ -232,10 +268,18 @@ async fn fake_worker_protocol_roundtrip() {
                 peak_memory_bytes: Some(512 * 1024 * 1024),
             },
         )
-        .await;
-    assert!(rejected.is_err(), "wrong pkgname must be rejected");
-    // Build 2 was not ingested and remains active (still owned, not completed).
-    assert_eq!(build_status(&db, 2).await, STATUS_ACTIVE);
+        .await
+        .expect("the worker's part is done either way");
+    // Refused at publishing, which is the server's: the build fails, and
+    // nothing of it reaches the repository.
+    assert_eq!(settled_status(&db, 2).await, STATUS_FAILED);
+    let evil_rows = files::Entity::find()
+        .filter(files::Column::PackageId.eq(2))
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(evil_rows.is_empty(), "a wrong-named artifact was published");
+    assert!(!repo_root.join("x86_64").join(&bad_name).exists());
 
     // --- Safety rail: a revoked worker is refused at the mTLS auth guard.
     let workers = worker_store::list_workers(&db).await.unwrap();

@@ -5,6 +5,7 @@ use aurcache_deps::AurClient;
 use sea_orm::DatabaseConnection;
 use tokio::sync::broadcast::Sender;
 
+use crate::repository::Repository;
 use crate::snapshot::SnapshotStore;
 
 /// What a package operation acts through: the database it writes, the build
@@ -28,6 +29,8 @@ pub struct Services {
     pub store: Arc<SnapshotStore>,
     /// Resolves dependency names against the official repositories and the AUR.
     pub client: Arc<AurClient>,
+    /// The pacman repository, which every change to goes through.
+    pub repo: Arc<Repository>,
 }
 
 impl Services {
@@ -37,12 +40,14 @@ impl Services {
         tx: Sender<Action>,
         store: Arc<SnapshotStore>,
         client: Arc<AurClient>,
+        repo: Arc<Repository>,
     ) -> Self {
         Self {
             db,
             tx,
             store,
             client,
+            repo,
         }
     }
 }

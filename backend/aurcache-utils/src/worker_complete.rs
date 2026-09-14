@@ -43,35 +43,6 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
     Ok(build)
 }
 
-/// Take a write lock on the build row while confirming the worker still owns an
-/// `ACTIVE` lease on it.
-///
-/// Unlike [`assert_owned_active`] — a plain read whose result is stale the
-/// instant it returns — this issues a no-op `UPDATE` pinned to
-/// `status = ACTIVE AND worker_id = ?`. That serializes against the reaper's
-/// requeue of the same row: called inside a transaction, the lock is held until
-/// commit, so a reaper cannot reclaim the build midway through the writes that
-/// follow. Returns [`lease_lost`] if the lease is already gone.
-pub async fn lock_lease<C: ConnectionTrait>(
-    db: &C,
-    build_id: i32,
-    worker_id: i32,
-) -> Result<(), DbErr> {
-    let res = Builds::update_many()
-        // Rewriting worker_id to itself keeps the row unchanged while still
-        // acquiring the row lock the guard depends on.
-        .col_expr(builds::Column::WorkerId, Some(worker_id).into())
-        .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
-        .filter(builds::Column::WorkerId.eq(worker_id))
-        .exec(db)
-        .await?;
-    if res.rows_affected == 0 {
-        return Err(lease_lost(build_id, worker_id));
-    }
-    Ok(())
-}
-
 /// Record the peak memory a worker reported for a build.
 ///
 /// Written before the success/failure branch, because a build that was
@@ -92,49 +63,6 @@ pub async fn record_peak_memory<C: ConnectionTrait>(
         .filter(builds::Column::Id.eq(build_id))
         .exec(db)
         .await?;
-    Ok(())
-}
-
-/// Record the authoritative built version (extracted from the uploaded package
-/// files) on the build and its package.
-///
-/// The build write is a compare-and-swap on `status = ACTIVE AND worker_id = ?`
-/// so a build the calling worker has already lost (reaper reclaim) is never
-/// silently mutated. If the lease was lost, this returns [`LeaseLostError`]-style
-/// `DbErr::Custom` and the caller should abort the completion.
-pub async fn record_built_version<C: ConnectionTrait>(
-    db: &C,
-    build_id: i32,
-    worker_id: i32,
-    version: &str,
-    total_size: i64,
-) -> Result<(), DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-    let pkg_id = build.pkg_id;
-
-    let res = Builds::update_many()
-        .col_expr(builds::Column::Version, version.to_string().into())
-        // Recorded here rather than in a statement of its own: this is the one
-        // update that runs exactly when a build has published artifacts, under
-        // the lease guard that says they were this worker's to publish.
-        .col_expr(builds::Column::Size, Some(total_size).into())
-        .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
-        .filter(builds::Column::WorkerId.eq(worker_id))
-        .exec(db)
-        .await?;
-    if res.rows_affected == 0 {
-        return Err(lease_lost(build_id, worker_id));
-    }
-
-    if let Some(pkg) = Packages::find_by_id(pkg_id).one(db).await? {
-        let mut pkg = pkg.into_active_model();
-        pkg.upstream_version = Set(Some(version.to_string()));
-        pkg.update(db).await?;
-    }
     Ok(())
 }
 
@@ -201,21 +129,46 @@ async fn finish_build<C: ConnectionTrait + TransactionTrait>(
     Ok(build)
 }
 
-/// Mark a build (and its package) as successfully built, then promote any
-/// dependents whose dependencies are now satisfied.
-pub async fn complete_success<C: ConnectionTrait + TransactionTrait>(
+/// Take a finished build over from the worker that built it, to publish.
+///
+/// The worker's artifacts are all uploaded and it has said so: from here on
+/// nothing it could do would change the outcome, so it is released. The build
+/// moves from `ACTIVE` to `PUBLISHING` and its lease ends -- which is also what
+/// takes it out of the reach of the heartbeat, the reaper and a revocation, all
+/// of which only look at `ACTIVE` builds. `worker_id` stays, as the record of
+/// who built it.
+///
+/// A compare-and-swap on `status = ACTIVE AND worker_id = ?`, like every other
+/// completion: a build this worker has already lost is not taken over.
+pub async fn accept_for_publishing<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    let build = finish_build(db, build_id, worker_id, BuildStates::SUCCESSFUL_BUILD).await?;
+    let build = Builds::find_by_id(build_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
 
-    if let Err(e) = trigger_dependents(db, build.pkg_id, build.platform).await {
-        tracing::error!(
-            "Failed to trigger dependents of package {}: {e}",
-            build.pkg_id
-        );
+    let txn = db.begin().await?;
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Status, BuildStates::PUBLISHING.into())
+        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .exec(&txn)
+        .await?;
+    if res.rows_affected == 0 {
+        txn.rollback().await?;
+        return Err(lease_lost(build_id, worker_id));
     }
+    if let Some(pkg) = Packages::find_by_id(build.pkg_id).one(&txn).await? {
+        let mut pkg = pkg.into_active_model();
+        pkg.status = Set(BuildStates::PUBLISHING);
+        pkg.update(&txn).await?;
+    }
+    txn.commit().await?;
     Ok(())
 }
 
@@ -440,10 +393,10 @@ mod tests {
         pkg(&db, 1).await;
         build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
 
-        complete_success(&db, 10, 5).await.unwrap();
+        accept_for_publishing(&db, 10, 5).await.unwrap();
 
         let finished = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(finished.status, Some(BuildStates::SUCCESSFUL_BUILD));
+        assert_eq!(finished.status, Some(BuildStates::PUBLISHING));
         assert_eq!(
             finished.worker_id,
             Some(5),
@@ -572,26 +525,30 @@ mod tests {
         assert!(assert_owned_active(&db, 6, 10).await.is_err());
     }
 
+    /// Accepting a completion releases the worker: the build is the server's to
+    /// publish, with no lease left for anything to police, and nothing recorded
+    /// as finished until it is published.
     #[tokio::test]
-    async fn success_marks_terminal_and_clears_lease() {
+    async fn an_accepted_build_is_published_without_its_worker() {
         let db = setup().await;
         pkg(&db, 1).await;
         build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
-        record_built_version(&db, 10, 5, "2.0-1", 4096)
+        db.execute_unprepared("UPDATE builds SET lease_expires_at = 999 WHERE id = 10")
             .await
             .unwrap();
-        complete_success(&db, 10, 5).await.unwrap();
+
+        accept_for_publishing(&db, 10, 5).await.unwrap();
+
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::SUCCESSFUL_BUILD));
-        // What the name of this test says, and what it did not actually check:
-        // the lease ends. The worker stays, as the record of who built it.
+        assert_eq!(b.status, Some(BuildStates::PUBLISHING));
         assert_eq!(b.lease_expires_at, None);
         assert_eq!(b.worker_id, Some(5));
-        assert_eq!(b.version, "2.0-1");
-        assert!(b.end_time.is_some());
-        // Recorded by the same guarded update that records the version, so a
-        // build that published artifacts always says how large they were.
-        assert_eq!(b.size, Some(4096));
+        assert_eq!(b.end_time, None, "not finished until published");
+        let p = Packages::find_by_id(1).one(&db).await.unwrap().unwrap();
+        assert_eq!(p.status, BuildStates::PUBLISHING);
+
+        // Accepted once: a repeat is no longer an ACTIVE build of this worker.
+        assert!(accept_for_publishing(&db, 10, 5).await.is_err());
     }
 
     #[tokio::test]
@@ -615,13 +572,8 @@ mod tests {
         // Build reclaimed and re-handed to worker 6.
         build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "6").await;
         // Late completion from the original owner (worker 5) must not clobber it.
-        assert!(complete_success(&db, 10, 5).await.is_err());
+        assert!(accept_for_publishing(&db, 10, 5).await.is_err());
         assert!(complete_failure(&db, 10, 5).await.is_err());
-        assert!(
-            record_built_version(&db, 10, 5, "9.9-9", 4096)
-                .await
-                .is_err()
-        );
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
         assert_eq!(b.worker_id, Some(6));

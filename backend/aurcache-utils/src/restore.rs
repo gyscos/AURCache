@@ -44,6 +44,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 use crate::package::add::{provides_json, split_packages_json};
+use crate::repository::Repository;
 use crate::services::Services;
 use crate::snapshot::SnapshotStore;
 
@@ -327,10 +328,11 @@ pub async fn apply(
         store,
         db,
         tx: _,
+        repo,
     } = services;
     // PASS 1: rows. One transaction, because a half-applied dump is neither
     // what the instance was nor what the dump describes.
-    let applied = match write_rows(db, &dump, &options).await {
+    let applied = match write_rows(db, repo, &dump, &options).await {
         Ok(applied) => applied,
         Err(e) => {
             // The transaction rolled back, so nothing was written; say so
@@ -472,6 +474,7 @@ pub struct Applied {
 /// whose effect on the database can be stated exactly and tested directly.
 pub async fn write_rows(
     db: &DatabaseConnection,
+    repo: &Repository,
     dump: &LoadedDump,
     options: &RestoreOptions,
 ) -> anyhow::Result<Applied> {
@@ -496,6 +499,29 @@ pub async fn write_rows(
         }
     }
 
+    // A clear takes every published artifact out of the repository with its
+    // rows, and only if the transaction below commits.
+    let mut update = repo.begin().await;
+    if options.clear {
+        for file in update.all_published_files(db).await? {
+            update.remove(&file)?;
+        }
+    }
+    let applied = update.commit(|| write_rows_txn(db, dump, options)).await?;
+
+    // `--clear` removes every package, so every build log goes with them.
+    if options.clear {
+        crate::build_logger::remove_all_logs().await;
+    }
+    Ok(applied)
+}
+
+/// The transaction [`write_rows`] commits: run again whole if it fails.
+async fn write_rows_txn(
+    db: &DatabaseConnection,
+    dump: &LoadedDump,
+    options: &RestoreOptions,
+) -> anyhow::Result<Applied> {
     let txn = db.begin().await?;
     let mut entries = Vec::new();
     let mut touched = Vec::new();
@@ -505,11 +531,9 @@ pub async fn write_rows(
     // replacement. If it did not, an import that failed after wiping would
     // leave an empty instance -- the one outcome worse than either keeping the
     // old state or taking the new one.
-    let orphaned = if options.clear {
-        clear_existing(&txn).await?
-    } else {
-        Vec::new()
-    };
+    if options.clear {
+        clear_existing(&txn).await?;
+    }
 
     for (pkgbase, package) in &dump.packages {
         let existing = Packages::find()
@@ -568,22 +592,11 @@ pub async fn write_rows(
     write_workers(&txn, dump, options).await?;
     write_tokens(&txn, dump, options).await?;
     txn.commit().await?;
-
-    // Only now: a rolled-back transaction can put a row back, and nothing can
-    // put back a deleted file.
-    for file in &orphaned {
-        crate::utils::remove_archive_file::forget_archive_file(file);
-    }
-    // `--clear` removes every package, so every build log goes with them.
-    if options.clear {
-        crate::build_logger::remove_all_logs().await;
-    }
-
     Ok(Applied { entries, touched })
 }
 
-/// Remove everything a dump replaces, returning the built artifacts whose files
-/// the caller must forget once the transaction commits.
+/// Remove the rows of everything a dump replaces. Their artifacts leave the
+/// repository through the update [`write_rows`] commits this in.
 ///
 /// What gets cleared is decided by what a dump *contains*, not by a list of
 /// tables: packages, settings and workers travel in every dump, so all three
@@ -593,11 +606,7 @@ pub async fn write_rows(
 /// Builds, files and VCS-source rows go with their packages. They are not in
 /// the dump because they are derived, but leaving them would orphan them
 /// against packages that no longer exist.
-async fn clear_existing<C: sea_orm::ConnectionTrait>(
-    txn: &C,
-) -> anyhow::Result<Vec<aurcache_db::files::Model>> {
-    let orphaned = aurcache_db::prelude::Files::find().all(txn).await?;
-
+async fn clear_existing<C: sea_orm::ConnectionTrait>(txn: &C) -> anyhow::Result<()> {
     aurcache_db::prelude::Dependencies::delete_many()
         .exec(txn)
         .await?;
@@ -615,8 +624,7 @@ async fn clear_existing<C: sea_orm::ConnectionTrait>(
         .exec(txn)
         .await?;
     Packages::delete_many().exec(txn).await?;
-
-    Ok(orphaned)
+    Ok(())
 }
 
 /// Restore the workers a dump trusts.

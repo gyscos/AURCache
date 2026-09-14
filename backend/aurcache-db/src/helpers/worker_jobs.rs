@@ -482,7 +482,7 @@ pub async fn requeue_or_fail<C: ConnectionTrait>(
 }
 
 /// What an [`abandon_build`] attempt actually did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AbandonOutcome {
     /// Whether the CAS won and the row is now terminal `FAILED`. `false`
     /// without changing anything means the row moved on (renewed, completed, or
@@ -494,19 +494,6 @@ pub struct AbandonOutcome {
     /// The package name, for a caller that wants to append to the build log.
     /// `None` when the package row is already gone.
     pub pkgbase: Option<String>,
-    /// The `EndReasons::*` code recorded on the failed row.
-    pub end_reason: i32,
-}
-
-impl Default for AbandonOutcome {
-    fn default() -> Self {
-        Self {
-            failed: false,
-            retry: None,
-            pkgbase: None,
-            end_reason: EndReasons::LEASE_EXPIRED,
-        }
-    }
 }
 
 /// Fail a build for good and queue a *fresh* build in its place, in one
@@ -534,12 +521,17 @@ impl Default for AbandonOutcome {
 ///    who ran the attempt — and only the lease is cleared.
 /// 2. **Mirror the package status** to `FAILED` (claiming set it to `ACTIVE`,
 ///    and only `worker_complete::finish_build` otherwise writes it back; left
-///    alone the package would be stuck "Building" forever). When a retry is
+///    alone the package would be stuck "Building" forever) -- but only while
+///    the package still points at this build, exactly like `cancel_build`. A
+///    package that has moved on to a newer build, on this platform or another,
+///    is describing that build, and this failure is not its news. When a retry is
 ///    queued, this same package row is then repointed at it, exactly like the
 ///    normal enqueue path (`trigger_build_for_package`).
-/// 3. **Decide the budget** by walking the package's most recent build rows:
-///    count the trailing consecutive `TimeoutRetry` rows whose `end_reason` is
-///    an abandonment. The just-failed row is part of the walk. A `user` or
+/// 3. **Decide the budget** by walking the package's most recent build rows
+///    *on the same platform*: count the trailing consecutive `TimeoutRetry`
+///    rows whose `end_reason` is an abandonment. Per platform because each
+///    platform has its own chain of retries, and interleaving two would spend
+///    one budget between them. The just-failed row is part of the walk. A `user` or
 ///    `auto_update` trigger, a success, or any other `end_reason` breaks the
 ///    chain and restores the budget.
 /// 4. **Insert the retry** (`ENQUEUED`, trigger `TimeoutRetry`, version from
@@ -592,6 +584,7 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
     let mut futile_run = 0i32;
     let recent: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::PkgId.eq(observed.pkg_id))
+        .filter(builds::Column::Platform.eq(observed.platform.as_str()))
         .order_by(builds::Column::Number, sea_orm::Order::Desc)
         .limit(max_attempts.max(1) as u64)
         .all(&txn)
@@ -624,21 +617,21 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
                 BuildTriggers::TIMEOUT_RETRY,
             )
             .await?;
+            // Pointed at the build either way. When the insert was skipped a
+            // pending build already exists (a concurrent auto-update queued one
+            // once this row stopped conflicting), and pointing the package at
+            // it is what keeps the just-failed mirror from sticking.
             let mut pkg_active: packages::ActiveModel = pkg.clone().into();
-            if enqueue.inserted {
-                pkg_active.latest_build = Set(Some(enqueue.build.id));
-                pkg_active.status = Set(STATUS_ENQUEUED);
-                retry = Some(enqueue.build.clone());
-            } else {
-                // A pending build already exists (a concurrent auto-update
-                // queued one once this row stopped conflicting). Point the
-                // package at it so the just-failed mirror never sticks.
-                pkg_active.latest_build = Set(Some(enqueue.build.id));
-                pkg_active.status = Set(enqueue.build.status.unwrap_or(STATUS_ENQUEUED));
-            }
+            pkg_active.latest_build = Set(Some(enqueue.build.id));
+            pkg_active.status = Set(enqueue.build.status.unwrap_or(STATUS_ENQUEUED));
             pkg_active.save(&txn).await?;
+            if enqueue.inserted {
+                retry = Some(enqueue.build);
+            }
         }
-    } else if let Some(pkg) = &pkg {
+    } else if let Some(pkg) = &pkg
+        && pkg.latest_build == Some(observed.id)
+    {
         // Budget spent: the mirror to FAILED stands.
         let mut pkg_active: packages::ActiveModel = pkg.clone().into();
         pkg_active.status = Set(STATUS_FAILED);
@@ -650,7 +643,6 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
         failed: true,
         retry,
         pkgbase: pkg.map(|p| p.name),
-        end_reason,
     })
 }
 
@@ -773,6 +765,21 @@ pub struct ReapOutcome {
     /// `(failed id, replacement build id)` for builds that were auto-retried
     /// with a fresh row.
     pub retried: Vec<(i32, i32)>,
+    /// Every build failed this pass, retried or not, with what locating and
+    /// explaining its log takes -- so the caller need not read it all back.
+    pub abandoned: Vec<Abandoned>,
+}
+
+/// One build a reaper pass failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abandoned {
+    pub build_id: i32,
+    /// The build's number within its package, which names its log.
+    pub number: i32,
+    /// `None` when the package row is already gone, and its logs with it.
+    pub pkgbase: Option<String>,
+    /// The `EndReasons::*` code recorded on the row.
+    pub end_reason: i32,
 }
 
 /// Reaper pass: reclaim `ACTIVE` builds whose owning worker went silent, and
@@ -833,6 +840,12 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
             Some(retry) => outcome.retried.push((build.id, retry.id)),
             None => outcome.failed.push(build.id),
         }
+        outcome.abandoned.push(Abandoned {
+            build_id: build.id,
+            number: build.number,
+            pkgbase: abandoned.pkgbase,
+            end_reason,
+        });
     }
     Ok(outcome)
 }
@@ -1619,6 +1632,48 @@ mod tests {
         assert_eq!(b31.attempt_count, 1);
     }
 
+    /// A build being published has no lease: its worker handed it over and no
+    /// longer reports it. Nothing that polices leases may touch it -- not the
+    /// heartbeat that no longer lists it, not the reaper, not a revocation --
+    /// or a finished build would be requeued or failed while the server puts
+    /// it in the repository.
+    #[tokio::test]
+    async fn a_build_being_published_is_out_of_reach_of_lease_policing() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 5,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 40, "x86_64", 100).await;
+        claim_job(&db, 5, 60, SPILL, LIVENESS).await.unwrap();
+        Builds::update_many()
+            .col_expr(builds::Column::Status, BuildStates::PUBLISHING.into())
+            .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
+            .filter(builds::Column::Id.eq(40))
+            .exec(&db)
+            .await
+            .unwrap();
+
+        let out = heartbeat(&db, 5, &[], 60, 3).await.unwrap();
+        assert!(out.dropped.is_empty(), "requeued by a heartbeat");
+        let reaped = reap_expired_builds(&db, now_secs() + 100_000, 3, 1)
+            .await
+            .unwrap();
+        assert!(reaped.abandoned.is_empty(), "abandoned by the reaper");
+        assert!(
+            requeue_worker_builds(&db, 5, 3).await.unwrap().is_empty(),
+            "requeued by a revocation"
+        );
+
+        let b = Builds::find_by_id(40).one(&db).await.unwrap().unwrap();
+        assert_eq!(b.status, Some(BuildStates::PUBLISHING));
+        assert_eq!(b.worker_id, Some(5));
+    }
+
     /// The abort list rides the same heartbeat: any id the worker reports that
     /// is missing, terminal, or owned by someone else must be flagged so the
     /// worker's next tick stops it. Owned-ACTIVE reported ids stay out.
@@ -1746,7 +1801,11 @@ mod tests {
             assert!(fresh.worker_id.is_none());
 
             // Package repointed at it, moving off "Building".
-            let pkg = Packages::find_by_id(old_id).one(&db).await.unwrap().unwrap();
+            let pkg = Packages::find_by_id(old_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pkg.status, STATUS_ENQUEUED);
             assert_eq!(pkg.latest_build, Some(fresh.id));
         }
@@ -1916,6 +1975,10 @@ mod tests {
         ))
         .await
         .unwrap();
+        // Claiming pointed the package at the attempt it is running.
+        db.execute_unprepared("UPDATE packages SET latest_build = 90 WHERE id = 90")
+            .await
+            .unwrap();
 
         let far = now_secs() + 10_000;
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
@@ -1969,10 +2032,7 @@ mod tests {
         let outcome = abandon_build(&db, &observed, EndReasons::LEASE_EXPIRED, 3)
             .await
             .unwrap();
-        assert!(
-            !outcome.failed,
-            "a renewed lease must make the CAS a no-op"
-        );
+        assert!(!outcome.failed, "a renewed lease must make the CAS a no-op");
 
         let b = Builds::find_by_id(91).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(STATUS_ACTIVE));
@@ -1988,5 +2048,102 @@ mod tests {
             1
         );
         assert_eq!(pkg_status(&db, 91).await, Some(STATUS_ACTIVE));
+    }
+
+    /// Seed package 95 with an abandoned `ACTIVE` build (#95, number 10,
+    /// `timeout_retry`) and the given earlier rows `(id, number, platform)`,
+    /// each a futile `timeout_retry` that ended in abandonment.
+    async fn seed_abandonment(db: &DatabaseConnection, earlier: &[(i32, i32, &str)]) {
+        worker(
+            db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        db.execute_unprepared(
+            "INSERT INTO packages (id, name, status, out_of_date, build_flags, platforms, \
+                source_type, source_data, directly_requested) \
+             VALUES (95, 'p95', 0, 0, '', 'x86_64;aarch64', 'aur', \
+                '{\"type\":\"aur\",\"name\":\"p95\"}', 1)",
+        )
+        .await
+        .unwrap();
+        for (id, number, platform) in earlier {
+            db.execute_unprepared(&format!(
+                "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, \
+                    number, trigger, end_reason, worker_id) \
+                 VALUES ({id}, 95, {STATUS_FAILED}, 0, '{platform}', '1.0', {number}, \
+                    {t}, {reason}, 2)",
+                t = BuildTriggers::TIMEOUT_RETRY,
+                reason = EndReasons::LEASE_EXPIRED
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute_unprepared(&format!(
+            "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, \
+                number, trigger, worker_id, lease_expires_at) \
+             VALUES (95, 95, {STATUS_ACTIVE}, {now}, 'x86_64', '1.0', 10, {t}, 2, 0)",
+            t = BuildTriggers::TIMEOUT_RETRY,
+            now = now_secs()
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared("UPDATE packages SET latest_build = 95 WHERE id = 95")
+            .await
+            .unwrap();
+    }
+
+    /// Each platform has its own chain of retries. Another platform's
+    /// abandonments interleaved in the history spend none of this one's budget.
+    #[tokio::test]
+    async fn another_platforms_abandonments_do_not_spend_the_budget() {
+        let db = setup().await;
+        seed_abandonment(
+            &db,
+            &[(91, 7, "aarch64"), (92, 8, "aarch64"), (93, 9, "aarch64")],
+        )
+        .await;
+
+        let far = now_secs() + 10_000;
+        let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
+
+        assert!(
+            out.failed.is_empty(),
+            "aarch64's retries spent x86_64's budget"
+        );
+        assert_eq!(out.retried.len(), 1);
+    }
+
+    /// A spent budget fails the package only while the package still points at
+    /// the abandoned build. One that has moved on to a newer build is reporting
+    /// on that build, and must not be overwritten with this old failure.
+    #[tokio::test]
+    async fn a_spent_budget_leaves_a_package_that_moved_on_alone() {
+        let db = setup().await;
+        seed_abandonment(&db, &[(93, 8, "x86_64"), (94, 9, "x86_64")]).await;
+        // Meanwhile a newer build of the package succeeded on aarch64.
+        db.execute_unprepared(&format!(
+            "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, number, trigger) \
+             VALUES (96, 95, {STATUS_SUCCESS}, 0, 'aarch64', '1.0', 11, {t})",
+            t = BuildTriggers::USER
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE packages SET latest_build = 96, status = {STATUS_SUCCESS} WHERE id = 95"
+        ))
+        .await
+        .unwrap();
+
+        let far = now_secs() + 10_000;
+        let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
+
+        assert_eq!(out.failed, vec![95], "the budget is spent");
+        let pkg = Packages::find_by_id(95).one(&db).await.unwrap().unwrap();
+        assert_eq!(pkg.status, STATUS_SUCCESS);
+        assert_eq!(pkg.latest_build, Some(96));
     }
 }

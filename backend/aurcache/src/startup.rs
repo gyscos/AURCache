@@ -7,14 +7,16 @@ use aurcache_common::builder::BuildStates;
 use aurcache_common::source::SourceData;
 use aurcache_db::helpers::operations;
 use aurcache_db::prelude::{Builds, Files, Packages};
-use aurcache_db::{builds, files, packages};
+use aurcache_db::{builds, files};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
+use aurcache_utils::publish;
+use aurcache_utils::repository::Repository;
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::{Platform, Platforms};
-use sea_orm::prelude::Expr;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
 use sea_orm::{QueryFilter, QueryOrder};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 const START_BANNER: &str = r"
@@ -142,34 +144,14 @@ async fn adopt_shared_mirrorlist() {
     }
 }
 
+/// Housekeeping once the database is up.
+///
+/// Builds in flight are left as they are. Builds run on workers, which carry on
+/// through a server restart: an `ACTIVE` build is still building, and the lease
+/// reaper deals with one whose worker really is gone; an `ENQUEUED` build is
+/// still waiting for one. Failing them here -- what this did when builds ran
+/// inside the server -- failed every build under way on every redeploy.
 pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
-    // set all pending package status to failed
-    Packages::update_many()
-        .col_expr(
-            packages::Column::Status,
-            Expr::value(BuildStates::FAILED_BUILD),
-        )
-        .filter(
-            packages::Column::Status
-                .is_in([BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
-        )
-        .exec(db)
-        .await?;
-
-    // Fail builds that were mid-flight when the server stopped. Waiting-for-deps
-    // builds are deliberately left alone: nothing was running, and the
-    // dependency that promotes them may still complete.
-    Builds::update_many()
-        .col_expr(
-            builds::Column::Status,
-            Expr::value(BuildStates::FAILED_BUILD),
-        )
-        .filter(
-            builds::Column::Status.is_in([BuildStates::ACTIVE_BUILD, BuildStates::ENQUEUED_BUILD]),
-        )
-        .exec(db)
-        .await?;
-
     backfill_file_sizes(db).await;
     backfill_build_sizes(db).await;
     close_orphaned_operations(db).await;
@@ -373,6 +355,24 @@ pub async fn prune_source_checkouts(db: &DatabaseConnection, store: &SnapshotSto
         Ok(0) => {}
         Ok(removed) => info!("removed {removed} orphaned source checkout(s)"),
         Err(e) => warn!("source checkout prune did not complete: {e}"),
+    }
+}
+
+/// Publish again the builds a restart interrupted while they were being
+/// published. Nothing about them was made public yet, and their uploads are
+/// still staged, so they simply start over.
+pub async fn resume_publishing(db: &DatabaseConnection, repo: &Arc<Repository>) {
+    let interrupted = match publish::interrupted(db).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("could not look for builds a restart interrupted while publishing: {e}");
+            return;
+        }
+    };
+    for build_id in interrupted {
+        info!("resuming publication of build #{build_id}");
+        let (db, repo) = (db.clone(), Arc::clone(repo));
+        tokio::spawn(async move { publish::publish_build(&db, &repo, build_id).await });
     }
 }
 

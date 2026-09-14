@@ -483,18 +483,11 @@ pub async fn package_source_file(
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
-    let (original_content, patched_content, patch_error, stored_patch) = store
+    store
         .read_file_with_patch_status(&pkg.source_data, pkg.patch.as_deref(), &path)
         .await
-        .map_err(|e| err(Status::NotFound, e))?;
-
-    Ok(Json(SourceFileContent {
-        path,
-        original_content,
-        patched_content,
-        patch_error,
-        stored_patch,
-    }))
+        .map(Json)
+        .map_err(|e| err(Status::NotFound, e))
 }
 
 #[utoipa::path(
@@ -679,28 +672,21 @@ pub async fn package_update_endpoint(
 )]
 #[delete("/package/<pkgbase>")]
 pub async fn package_del(
-    db: &State<DatabaseConnection>,
+    services: &State<Services>,
     pkgbase: &str,
     a: Authenticated,
     al: &State<ActivityLog>,
-    store: &State<Arc<SnapshotStore>>,
 ) -> Result<(), ApiError> {
-    let db = db.inner();
+    let db = &services.db;
 
     // query this before removing package ownership!
     let pkg = package_by_pkgbase(db, pkgbase).await?;
-    let source_data = pkg.source_data.clone();
 
-    package_remove(db, pkg.id)
+    // Deletes the package -- checkout included -- only if nothing depends on
+    // it; otherwise it merely stops being requested and keeps everything.
+    package_remove(db, &services.store, &services.repo, pkg.id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-
-    // The clone made for this package, now that nothing refers to it. Failing
-    // to remove it is not worth failing the delete over: the package is gone,
-    // and the boot-time prune sweeps whatever is left.
-    if let Err(e) = store.remove_checkout(&source_data).await {
-        warn!("could not remove source checkout for {pkgbase}: {e}");
-    }
 
     al.add(
         PackageDeleteActivity { package: pkg.name },
@@ -1717,7 +1703,7 @@ pub async fn package_dependency_replace(
     // up. This is what makes emptying a package's dependents remove it: patch
     // the last edge away and the package goes with it, without a second
     // endpoint that knows how to remove packages.
-    live_check(&services.db, current.id)
+    live_check(&services.db, &services.store, &services.repo, current.id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
@@ -1759,7 +1745,9 @@ async fn repoint_edge(
 ///
 /// Added the way resolution would have added it -- as a dependency, on the
 /// dependent's own platforms and build flags -- so a replacement chosen by
-/// hand is indistinguishable from one resolution picked itself.
+/// hand is indistinguishable from one resolution picked itself. That includes
+/// its builds: it is queued like any added package, and the dependent's own
+/// build then waits on it rather than on a package nothing will ever build.
 async fn ensure_replacement_exists(
     services: &Services,
     dependent: &packages::Model,
@@ -1774,10 +1762,8 @@ async fn ensure_replacement_exists(
         return Ok(package);
     }
 
-    aurcache_utils::package::add::ensure_aur_package_exists_recursive(
-        &services.client,
-        &services.store,
-        &services.db,
+    aurcache_utils::package::add::add_dependency_package(
+        services,
         replacement,
         &dependent.platforms,
         &dependent.build_flags,
@@ -1808,6 +1794,8 @@ mod dependency_tests {
     use aurcache_db::prelude::{Dependencies, Packages};
     use aurcache_db::{dependencies, packages};
     use aurcache_utils::package::live_check::live_check;
+    use aurcache_utils::repository::Repository;
+    use aurcache_utils::snapshot::SnapshotStore;
     use sea_orm::{
         ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
         QueryFilter, Set, TryIntoModel,
@@ -1927,7 +1915,10 @@ mod dependency_tests {
         repoint_edge(&db, moving, dependent.id, new.id)
             .await
             .unwrap();
-        live_check(&db, old.id).await.unwrap();
+        let checkouts = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
+        let repo = Repository::new(checkouts.path().join("repo"));
+        live_check(&db, &store, &repo, old.id).await.unwrap();
 
         assert!(
             Packages::find_by_id(old.id)
@@ -1995,7 +1986,10 @@ mod dependency_tests {
         repoint_edge(&db, moving, dependent.id, new.id)
             .await
             .unwrap();
-        live_check(&db, old.id).await.unwrap();
+        let checkouts = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
+        let repo = Repository::new(checkouts.path().join("repo"));
+        live_check(&db, &store, &repo, old.id).await.unwrap();
 
         assert!(
             Packages::find_by_id(old.id)

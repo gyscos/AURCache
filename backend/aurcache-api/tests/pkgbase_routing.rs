@@ -114,6 +114,9 @@ async fn test_client() -> (Client, DatabaseConnection) {
                 checkouts.path().to_path_buf(),
             )),
             Arc::new(aurcache_deps::AurClient::new()),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                checkouts.path().join("repo"),
+            )),
         ))
         // The dump route reports which AURCache wrote a dump. Rocket's
         // sentinels refuse to launch without it, which is the point: a route

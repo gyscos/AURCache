@@ -41,16 +41,30 @@ use crate::identity::spki_fingerprint;
 
 /// How long to wait for a TCP+TLS connection to establish before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Inactivity timeout while reading a response body. A silently stalled
-/// connection trips this well before the lease TTL (default 60s), so the
-/// worker's lease self-abort watchdog is never defeated by a hung socket.
-/// This is a per-read idle timeout, not a total-request deadline, so it does
-/// not break legitimately slow large source downloads / artifact uploads.
+/// How long a request may wait for its answer. A silently stalled connection
+/// trips this well before the lease TTL (default 60s), so the worker's lease
+/// self-abort watchdog is never defeated by a hung socket.
+///
+/// In reqwest this is not an idle timeout while a request is under way: it is
+/// a deadline from sending the request to receiving the response headers, and
+/// streaming the request body does not reset it (only reading a response body
+/// does, per read). Which is why artifact uploads do not use it -- see
+/// `WorkerClient::upload_http`.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an idle connection is probed. What notices a dead server during
+/// an artifact upload, which has no response deadline to do it.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 /// A configured protocol client bound to a base URL.
 pub struct WorkerClient {
     http: Client,
+    /// The same client with no response deadline, for artifact uploads.
+    ///
+    /// A multi-gigabyte package takes minutes to send, and the server answers
+    /// only once it has all of it, so [`READ_TIMEOUT`] would fail every upload
+    /// longer than thirty seconds while bytes were still flowing.
+    upload_http: Client,
     base: String,
     /// `[repo]` section rendered for this worker from the server's template,
     /// set once enrollment completes. Empty when this server publishes no
@@ -163,6 +177,8 @@ impl WorkerClient {
             .context("building enrollment client")?;
         Ok(Self {
             repo_section: String::new(),
+            // An enrolling worker has no job to upload for.
+            upload_http: http.clone(),
             http,
             base: base.to_string(),
         })
@@ -175,16 +191,24 @@ impl WorkerClient {
         identity_pem.extend_from_slice(key_pem.as_bytes());
         let identity =
             Identity::from_pem(&identity_pem).context("building client identity from PEM")?;
-        let http = Client::builder()
-            .use_rustls_tls()
-            .add_root_certificate(ca)
-            .identity(identity)
-            .connect_timeout(CONNECT_TIMEOUT)
+        let builder = || {
+            Client::builder()
+                .use_rustls_tls()
+                .add_root_certificate(ca.clone())
+                .identity(identity.clone())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .tcp_keepalive(TCP_KEEPALIVE)
+        };
+        let http = builder()
             .read_timeout(READ_TIMEOUT)
             .build()
             .context("building authenticated client")?;
+        let upload_http = builder()
+            .build()
+            .context("building authenticated upload client")?;
         Ok(Self {
             repo_section: String::new(),
+            upload_http,
             http,
             base: base.to_string(),
         })
@@ -278,7 +302,7 @@ impl WorkerClient {
     {
         let encoded = percent_encoding::utf8_percent_encode(filename, PATH_SEGMENT);
         let body = Body::wrap_stream(ReaderStream::new(reader));
-        self.http
+        self.upload_http
             .post(self.url(&format!("/jobs/{build_id}/artifacts/{encoded}")))
             .body(body)
             .send()
@@ -305,6 +329,11 @@ impl WorkerClient {
     /// Send a liveness heartbeat listing the builds still running, and return
     /// the server's answer: the builds it wants this worker to stop (abandoned,
     /// or cancelled by an operator).
+    ///
+    /// An accepted heartbeat is a success whatever its body says. The body is
+    /// advisory, and a server older than the abort list answers with an empty
+    /// one: failing on that would stop the worker counting the server as
+    /// reachable, and past the lease it would abort every build it holds.
     pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatResponse> {
         let resp = self
             .http
@@ -315,9 +344,8 @@ impl WorkerClient {
             .context("heartbeat request")?
             .error_for_status()
             .context("heartbeat rejected")?;
-        resp.json()
-            .await
-            .context("decoding heartbeat response")
+        let body = resp.bytes().await.unwrap_or_default();
+        Ok(parse_heartbeat_response(&body))
     }
 
     /// Poll whether a build has been asked to cancel.
@@ -401,9 +429,29 @@ pub struct ConditionalGet {
     pub last_modified: Option<String>,
 }
 
+/// Read a heartbeat answer, taking anything unreadable as "nothing to stop".
+fn parse_heartbeat_response(body: &[u8]) -> HeartbeatResponse {
+    if body.is_empty() {
+        return HeartbeatResponse::default();
+    }
+    serde_json::from_slice(body).unwrap_or_else(|e| {
+        tracing::warn!("ignoring an unreadable heartbeat response: {e}");
+        HeartbeatResponse::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that predates the abort list answers a heartbeat with nothing,
+    /// and that must still read as an accepted heartbeat.
+    #[test]
+    fn an_empty_heartbeat_answer_means_nothing_to_stop() {
+        assert!(parse_heartbeat_response(b"").cancel.is_empty());
+        assert!(parse_heartbeat_response(b"not json").cancel.is_empty());
+        assert_eq!(parse_heartbeat_response(br#"{"cancel":[3]}"#).cancel, [3]);
+    }
 
     #[test]
     fn base64_roundtrip_known_vectors() {

@@ -11,8 +11,8 @@ use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
-use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_db::{builds, dependencies, packages};
+use aurcache_db::prelude::{Builds, Dependencies, PackageVcsSources, Packages};
+use aurcache_db::{builds, dependencies, package_vcs_sources, packages};
 use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
@@ -38,24 +38,25 @@ use tracing::{info, warn};
 /// built again. `files.package_id` has a foreign key now, which would have made
 /// this loud rather than silent, but the rows still have to go so their
 /// artifacts leave the repository with them.
-async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> anyhow::Result<()> {
+async fn remove_orphaned_packages(services: &Services, exclude_id: i32) -> anyhow::Result<()> {
+    let db = &services.db;
     let candidates = Packages::find()
         .filter(packages::Column::DirectlyRequested.eq(false))
         .filter(packages::Column::Id.ne(exclude_id))
         .all(db)
         .await?;
 
+    let mut orphaned = Vec::new();
     for pkg in &candidates {
         let dep_count = Dependencies::find()
             .filter(dependencies::Column::DependeeId.eq(pkg.id))
             .count(db)
             .await?;
-        if dep_count > 0 {
-            continue;
+        if dep_count == 0 {
+            orphaned.push(pkg.id);
         }
-        crate::package::delete::package_delete(db, pkg.id).await?;
     }
-    Ok(())
+    crate::package::delete::package_delete(db, &services.store, &services.repo, &orphaned).await
 }
 
 /// Update every package currently marked as outdated.
@@ -63,10 +64,18 @@ async fn remove_orphaned_packages(db: &DatabaseConnection, exclude_id: i32) -> a
 /// Only packages whose latest build completed successfully are retriggered.
 /// Returns the build IDs enqueued across all updated packages.
 ///
-/// Updates run forced: `out_of_date` is only ever set when a real upstream
-/// change was detected (a newer version, or for a VCS package a moved commit),
-/// and the unforced path would then refuse to build the VCS case -- that is the
-/// exact "newer source, same version string" situation this setting exists for.
+/// Updates of packages with VCS sources run forced, and only those. A VCS
+/// package is flagged when an upstream commit moved without its PKGBUILD's
+/// version changing, and the unforced path would refuse exactly that case as
+/// "already up to date" -- the version is only computed by `pkgver()` at build
+/// time.
+///
+/// Anything else runs unforced, because for it the same version means nothing
+/// new to build. The flag says the AUR is ahead of what was built; if the
+/// source this server resolves has not caught up (a failed snapshot refresh),
+/// a forced update would rebuild the old version, the success would clear the
+/// flag, and the next version check would set it again -- a rebuild every
+/// pass. Unforced, it is skipped and stays flagged until the source catches up.
 pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<Vec<i32>> {
     let db = &services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
@@ -92,13 +101,24 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
             continue;
         }
         let package_name = pkg.name.clone();
-        let log_error = match package_update(services, pkg, true).await {
+        let force = match PackageVcsSources::find()
+            .filter(package_vcs_sources::Column::PackageId.eq(pkg.id))
+            .count(db)
+            .await
+        {
+            Ok(tracked) => tracked > 0,
+            Err(e) => {
+                warn!("Auto update skipped {package_name}: {e}");
+                continue;
+            }
+        };
+        match package_update(services, pkg, force).await {
             Ok(results) => {
                 if let Err(e) = activity_log
                     .add(
                         PackageUpdateActivity {
                             package: package_name.clone(),
-                            forced: true,
+                            forced: force,
                         },
                         ActivityType::UpdatePackage,
                         Some("Server".to_string()),
@@ -113,12 +133,8 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
                         .filter(|r| r.enqueued)
                         .map(|r| r.build_id),
                 );
-                None
             }
-            Err(e) => Some(e),
-        };
-        if let Some(e) = log_error {
-            warn!("Auto update skipped {package_name}: {e}");
+            Err(e) => warn!("Auto update skipped {package_name}: {e}"),
         }
     }
     Ok(ids_total)
@@ -179,7 +195,7 @@ pub async fn package_resync_dependencies(
 
     // The dependency change may have made some previously-required
     // dependency-only packages no longer needed.
-    remove_orphaned_packages(&services.db, pkg_model.id).await?;
+    remove_orphaned_packages(services, pkg_model.id).await?;
 
     Ok(())
 }
@@ -211,7 +227,7 @@ async fn package_update_inner(
     let graph = sync_dependency_graph(services, &pkg_model, &deps).await?;
 
     // With the update, it's possible some dependencies are no longer needed.
-    remove_orphaned_packages(&services.db, pkg_model.id).await?;
+    remove_orphaned_packages(services, pkg_model.id).await?;
 
     // Only a *successful* build makes a version "already built". This used to
     // ask for the latest build of any outcome, which meant a failed attempt at
@@ -577,6 +593,7 @@ async fn dependencies_ready_for_platform(
                 Some(BuildStates::ENQUEUED_BUILD),
                 Some(BuildStates::ACTIVE_BUILD),
                 Some(BuildStates::WAITING_FOR_DEPS),
+                Some(BuildStates::PUBLISHING),
             ]))
             .count(&services.db)
             .await?
@@ -720,6 +737,12 @@ pub async fn update_platform(
 #[cfg(test)]
 mod tests {
     use super::package_update;
+    /// A repository of its own for a test that never publishes to it.
+    fn test_repo() -> Arc<crate::repository::Repository> {
+        Arc::new(crate::repository::Repository::new(
+            tempdir().unwrap().keep(),
+        ))
+    }
     use crate::services::Services;
     use crate::snapshot::SnapshotStore;
     use aurcache_common::builder::BuildStates;
@@ -1048,7 +1071,13 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             parent.clone(),
             false,
         )
@@ -1262,7 +1291,13 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             parent.clone(),
             false,
         )
@@ -1485,7 +1520,13 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let results = package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             parent.clone(),
             true,
         )
@@ -1681,7 +1722,13 @@ mod tests {
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
         let build_ids = package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             parent.clone(),
             false,
         )
@@ -1809,7 +1856,13 @@ mod tests {
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
         super::package_resync_dependencies(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             &parent,
         )
         .await
@@ -1848,7 +1901,13 @@ mod tests {
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());
         super::package_resync_dependencies(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             &parent,
         )
         .await
@@ -1917,7 +1976,13 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         let build_ids = package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             pkg.clone(),
             true,
         )
@@ -1955,6 +2020,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total_builds, 2, "there should be 2 build records total");
+    }
+
+    /// Auto-update rebuilds an unchanged version only for a package that tracks
+    /// VCS sources. For anything else the flag with no newer source is a
+    /// snapshot that has not caught up, and forcing it would rebuild the same
+    /// version on every pass.
+    #[tokio::test]
+    async fn auto_update_forces_only_packages_with_vcs_sources() {
+        let server = MockServer::start().await;
+        let (client, _official) =
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<Action>(100);
+
+        let aur_root = tempdir().unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for name in ["plain", "tracks-git"] {
+            create_aur_git_repo(aur_root.path(), name, "1.0.0", &[]);
+            // Built at the version its source still reports, and flagged anyway.
+            let pkg = packages::ActiveModel {
+                name: Set(name.to_string()),
+                status: Set(BuildStates::SUCCESSFUL_BUILD),
+                out_of_date: Set(1),
+                upstream_version: Set(Some("1.0.0-1".to_string())),
+                latest_build: Set(None),
+                build_flags: Set(String::new()),
+                platforms: Set("x86_64".to_string()),
+                source_type: Set(packages::SourceType::Aur),
+                source_data: Set(SourceData::Aur { name: name.into() }),
+                directly_requested: Set(true),
+                split_packages: Set(None),
+                ..Default::default()
+            }
+            .save(&db)
+            .await
+            .unwrap()
+            .try_into_model()
+            .unwrap();
+            builds::ActiveModel {
+                pkg_id: Set(pkg.id),
+                status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+                start_time: Set(Some(1)),
+                end_time: Set(Some(2)),
+                platform: Set(Platform::X86_64),
+                version: Set("1.0.0-1".to_string()),
+                ..Default::default()
+            }
+            .save(&db)
+            .await
+            .unwrap();
+            ids.insert(name, pkg.id);
+        }
+        aurcache_db::package_vcs_sources::ActiveModel {
+            package_id: Set(ids["tracks-git"]),
+            source_url: Set("git+https://example.com/repo.git".to_string()),
+            last_commit: Set("abc".to_string()),
+            updated_at: Set(1),
+            ..Default::default()
+        }
+        .save(&db)
+        .await
+        .unwrap();
+
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let services = Services::new(
+            db.clone(),
+            tx,
+            Arc::new(store),
+            Arc::new(client),
+            test_repo(),
+        );
+        super::package_update_all_outdated(&services).await.unwrap();
+
+        let queued_for = |name: &'static str| {
+            let db = db.clone();
+            let id = ids[name];
+            async move {
+                builds::Entity::find()
+                    .filter(builds::Column::PkgId.eq(id))
+                    .count(&db)
+                    .await
+                    .unwrap()
+                    - 1
+            }
+        };
+        assert_eq!(
+            queued_for("tracks-git").await,
+            1,
+            "the VCS package rebuilds"
+        );
+        assert_eq!(
+            queued_for("plain").await,
+            0,
+            "an unchanged version with no VCS source is not rebuilt"
+        );
     }
 
     #[tokio::test]
@@ -2043,7 +2204,13 @@ mod tests {
 
         let (store, _checkout_dir) = test_store(aur_root.path());
         package_update(
-            &Services::new(db.clone(), tx.clone(), Arc::new(store), Arc::new(client)),
+            &Services::new(
+                db.clone(),
+                tx.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+            ),
             parent.clone(),
             false,
         )

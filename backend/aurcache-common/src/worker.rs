@@ -185,7 +185,7 @@ pub struct Heartbeat {
 /// it is the one channel back the pull-only worker has. A non-empty `cancel` is
 /// the server saying "these builds are no longer ACTIVE under you — stop
 /// them"; the worker aborts them on its next 5 s tick.
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct HeartbeatResponse {
     /// Build ids this worker should stop running.
     #[serde(default)]

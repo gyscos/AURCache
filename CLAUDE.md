@@ -173,13 +173,26 @@ defect this frontend has had was of that kind.
 - A size, a count or a total that is not known is `Option::None`, not `0`: "nothing recorded" and "zero
   bytes" are different answers, and the UI renders the first as a dash. Totals over several such values
   are all-or-nothing — a sum of only the known parts reads as a wrong number rather than as missing data.
+- Every change to the pacman repository goes through `aurcache_utils::repository::Repository` (one
+  instance, in `Services`): `repo.begin()` takes its lock, the caller records additions and removals,
+  and `commit(|| transaction)` writes the new `repo.db`/`repo.files` beside the old, runs the database
+  transaction (retried on failure), and only then moves staged files in and renames the databases
+  over. Private and risky first, the transaction next, renames last: a failure before the commit leaves
+  the repository untouched. Never write `repo.db` or a repository file any other way -- the lock is what
+  keeps two changes from each dropping the other's entry. Uploads are staged under the repository root
+  (`staging_dir`), so publishing is a rename on one filesystem.
+- A worker's successful completion is accepted at once: the build goes `ACTIVE` -> `PUBLISHING`, the
+  lease ends, and `aurcache_utils::publish::publish_build` puts it in the repository in the background.
+  Publishing failures fail the build; a restart resumes builds left `PUBLISHING`. Lease policing (the
+  heartbeat, the reaper, revoking a worker, claim capacity) only looks at `ACTIVE`, which is why
+  publishing is a state of its own.
 - Removing a package goes through `aurcache_utils::package::delete::package_delete`, never row by row.
   It is the only thing that does the whole job: the `builds`, `files`, `settings`, VCS-source and
-  dependency rows, then the artifacts off disk and out of `repo.db`/`repo.files` and the build logs. It
-  deletes the children *before* the package row, because the artifacts are removed from Rust after the
-  commit and a cascade that took the `files` rows first would leave them with nothing to find them by.
-  An orphaned `files` row is not a harmless leak: ingest reads it as "already produced by another
-  package" and the artifact can never be published again.
+  dependency rows, the artifacts and their `repo.db`/`repo.files` entries (through `Repository`), the
+  build logs and the source checkout. It refuses outright while any package outside the set it is given
+  still depends on one of them -- all of that goes together or none of it does -- so collecting a chain
+  or a cycle passes the whole set at once, as `live_check` does. An orphaned `files` row is not a
+  harmless leak: publishing reads it as "already produced by another package" unless its owner is gone.
 - The schema's foreign keys are enforced, on SQLite too — sqlx opens connections with `foreign_keys` on
   and `init.rs` sets it explicitly. `files.package_id` and both of `dependencies`' package columns
   cascade. A test that inserts a child row has to insert its package first.

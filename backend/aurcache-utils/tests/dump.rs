@@ -15,6 +15,11 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
+/// A repository of its own for a restore that publishes nothing new.
+fn test_repo() -> aurcache_utils::repository::Repository {
+    aurcache_utils::repository::Repository::new(tempfile::tempdir().unwrap().keep())
+}
+
 async fn db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
@@ -416,7 +421,7 @@ async fn an_imported_row_is_visible_to_dependency_resolution() {
 
     let target = db().await;
     let loaded = load_dump(&bytes).unwrap();
-    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
         .await
         .unwrap();
 
@@ -455,9 +460,14 @@ async fn skip_leaves_the_existing_configuration_alone() {
     existing.update(&target).await.unwrap();
 
     let loaded = load_dump(&bytes).unwrap();
-    let applied = aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
-        .await
-        .unwrap();
+    let applied = aurcache_utils::restore::write_rows(
+        &target,
+        &test_repo(),
+        &loaded,
+        &RestoreOptions::default(),
+    )
+    .await
+    .unwrap();
 
     let row = Packages::find_by_id(id)
         .one(&target)
@@ -492,6 +502,7 @@ async fn overwrite_replaces_the_configuration() {
     let loaded = load_dump(&bytes).unwrap();
     aurcache_utils::restore::write_rows(
         &target,
+        &test_repo(),
         &loaded,
         &RestoreOptions {
             dry_run: false,
@@ -533,7 +544,7 @@ async fn settings_are_restored_against_the_right_package() {
 
     let target = db().await;
     let loaded = load_dump(&bytes).unwrap();
-    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
         .await
         .unwrap();
 
@@ -595,7 +606,15 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
+        &Services::new(
+            target.clone(),
+            tx.clone(),
+            store.clone(),
+            Arc::new(client),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        ),
         &tempfile::tempdir().unwrap().keep(),
         loaded,
         RestoreOptions::default(),
@@ -655,6 +674,7 @@ async fn clear_replaces_what_was_here() {
     let loaded = load_dump(&bytes).unwrap();
     aurcache_utils::restore::write_rows(
         &target,
+        &test_repo(),
         &loaded,
         &RestoreOptions {
             clear: true,
@@ -698,7 +718,7 @@ async fn workers_are_restored_by_fingerprint() {
 
     let target = db().await;
     let loaded = load_dump(&bytes).unwrap();
-    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
         .await
         .unwrap();
 
@@ -751,7 +771,7 @@ async fn an_already_trusted_worker_keeps_its_routing() {
     .unwrap();
 
     let loaded = load_dump(&bytes).unwrap();
-    aurcache_utils::restore::write_rows(&target, &loaded, &RestoreOptions::default())
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
         .await
         .unwrap();
 
@@ -878,7 +898,15 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
+        &Services::new(
+            target.clone(),
+            tx.clone(),
+            store.clone(),
+            Arc::new(client),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        ),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions::default(),
@@ -936,7 +964,15 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
-        &Services::new(target.clone(), tx.clone(), store.clone(), Arc::new(client)),
+        &Services::new(
+            target.clone(),
+            tx.clone(),
+            store.clone(),
+            Arc::new(client),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+        ),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
         RestoreOptions {
@@ -987,6 +1023,7 @@ async fn merge_patches_adopts_a_patch_the_instance_lacks() {
     let loaded = load_dump(&bytes).unwrap();
     let applied = aurcache_utils::restore::write_rows(
         &target,
+        &test_repo(),
         &loaded,
         &RestoreOptions {
             on_existing: ExistingPackagePolicy::MergePatches,
@@ -1027,6 +1064,7 @@ async fn merge_patches_keeps_the_instances_own_patch() {
     let loaded = load_dump(&bytes).unwrap();
     let applied = aurcache_utils::restore::write_rows(
         &target,
+        &test_repo(),
         &loaded,
         &RestoreOptions {
             on_existing: ExistingPackagePolicy::MergePatches,
@@ -1065,6 +1103,7 @@ async fn two_patches_for_one_package_refuse_the_import() {
     let loaded = load_dump(&bytes).unwrap();
     let error = aurcache_utils::restore::write_rows(
         &target,
+        &test_repo(),
         &loaded,
         &RestoreOptions {
             on_existing: ExistingPackagePolicy::MergePatches,

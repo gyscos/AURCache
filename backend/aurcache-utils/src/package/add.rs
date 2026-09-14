@@ -237,6 +237,7 @@ async fn finalize_package_add(
         store,
         db,
         tx,
+        repo: _,
     } = services;
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
@@ -329,6 +330,7 @@ async fn add_package_with_source(
         store: _,
         db: _,
         tx: _,
+        repo: _,
     } = services;
     let source_data = resolve_source_pkgbase(client, source_data).await?;
     add_resolved_source(services, context, source_data, patched_files).await
@@ -369,6 +371,7 @@ pub(crate) async fn add_resolved_source(
         store,
         db: _,
         tx: _,
+        repo: _,
     } = services;
     let package_spec = resolve_srcinfo_to_spec(
         store,
@@ -414,6 +417,12 @@ async fn plan_dependency_recursive(
     plan_package_with_deps(plan_context, package_spec, visited, plan).await
 }
 
+/// Insert `pkgbase` and every AUR dependency it needs as dependency-only rows,
+/// returning the pkgbases actually inserted.
+///
+/// Rows only: nothing is queued. The update flow builds what it inserted
+/// through its own dependency readiness check; anything else wants
+/// [`add_dependency_package`].
 pub async fn ensure_aur_package_exists_recursive(
     client: &aurcache_deps::AurClient,
     store: &SnapshotStore,
@@ -421,7 +430,7 @@ pub async fn ensure_aur_package_exists_recursive(
     pkgbase: &str,
     platforms_str: &str,
     build_flags_str: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     // This helper inserts dependency-only rows and relies on the caller to
     // provide the platform/build flag strings that should be stored on them.
     let context = AddContext {
@@ -445,8 +454,36 @@ pub async fn ensure_aur_package_exists_recursive(
         &mut plan,
     )
     .await?;
-    persist_plan(db, &context, plan).await?;
-    Ok(())
+    persist_plan(db, &context, plan).await
+}
+
+/// Add an AUR package as a dependency, and do everything an add does with it:
+/// the rows for it and its own dependencies, their metadata, and their initial
+/// builds -- leaves queued, the rest waiting on them.
+///
+/// For a dependency chosen by hand, such as a replacement. Without the builds
+/// the package would sit "Enqueued" with no build row for any worker to claim,
+/// and whatever depends on it would wait on it for ever.
+pub async fn add_dependency_package(
+    services: &Services,
+    pkgbase: &str,
+    platforms_str: &str,
+    build_flags_str: &str,
+) -> anyhow::Result<()> {
+    let platforms = Platform::parse_many(platforms_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow!("invalid platforms '{platforms_str}': {e}"))?;
+    let added = ensure_aur_package_exists_recursive(
+        &services.client,
+        &services.store,
+        &services.db,
+        pkgbase,
+        platforms_str,
+        build_flags_str,
+    )
+    .await?;
+    refresh_source_metadata(&services.store, &services.db, &added).await;
+    trigger_initial_builds(&services.db, &services.tx, &platforms, &added).await
 }
 
 /// Plan a package and, recursively, every AUR dependency it needs.

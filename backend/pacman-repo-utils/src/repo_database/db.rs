@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, BufReader, Write};
 use std::path::Path;
 use tar::{Archive, Builder, Header};
 
@@ -7,115 +7,153 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
-/// Rewrite `db_archive` as a fresh tar.gz: copy across every existing entry
-/// except those `superseded` selects, then hand the new builder to `fill`, and
-/// write the result back. Used by every mutation so add/remove cannot drift on
-/// how a database archive is rewritten.
+use crate::describe::PackageEntry;
+
+/// The directory a package file's entry occupies in the databases.
 ///
-/// `superseded` takes a [`Path`], not a `&str`, so both callers match on whole
-/// path components rather than on bytes. Entry paths here are `{pkgname}-{ver}`
+/// `hello-2.12.1-1-x86_64.pkg.tar.zst` is `hello-2.12.1-1`: everything before
+/// the architecture, which is the last `-` field.
+fn entry_dir_for_filename(filename: &str) -> &str {
+    filename.rsplit_once('-').map_or(filename, |(dir, _)| dir)
+}
+
+/// Write `output` as a copy of the archive at `input` (or of an empty one, if
+/// there is none), without the entries `superseded` selects and with whatever
+/// `fill` appends. `input` is only read.
+///
+/// `superseded` takes a [`Path`], not a `&str`, so it matches whole path
+/// components rather than bytes. Entry paths here are `{pkgname}-{ver}`
 /// directories, where one name is routinely a byte prefix of another: with
 /// `str::starts_with`, removing `foo-1.0-1` also drops the `foo-1.0-10` a
 /// rebuild just added.
-fn rewrite_archive<F, G>(db_archive: &Path, superseded: F, fill: G) -> anyhow::Result<()>
+fn rewrite_archive<F, G>(input: &Path, output: &Path, superseded: F, fill: G) -> anyhow::Result<()>
 where
     F: Fn(&Path) -> bool,
-    G: FnOnce(&mut Builder<GzEncoder<&mut Vec<u8>>>) -> anyhow::Result<()>,
+    G: FnOnce(&mut Builder<GzEncoder<File>>) -> anyhow::Result<()>,
 {
-    let mut new_archive_data = Vec::new();
-    {
-        let mut builder = if db_archive.exists() {
-            let mut existing_archive_data = Vec::new();
+    let encoder = GzEncoder::new(File::create(output)?, Compression::default());
+    let mut builder = Builder::new(encoder);
 
-            // Decode the existing archive
-            File::open(db_archive)?.read_to_end(&mut existing_archive_data)?;
-            let mut archive = Archive::new(GzDecoder::new(Cursor::new(existing_archive_data)));
-
-            let enc = GzEncoder::new(&mut new_archive_data, Compression::default());
-            let mut tar_builder = Builder::new(enc);
-
-            for mut entry in archive.entries()?.flatten() {
-                if superseded(&entry.path()?) {
-                    continue;
-                }
-                tar_builder.append(&entry.header().clone(), &mut entry)?;
+    if input.exists() {
+        let mut archive = Archive::new(GzDecoder::new(BufReader::new(File::open(input)?)));
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if superseded(&entry.path()?) {
+                continue;
             }
-            tar_builder
-        } else {
-            // Create a new archive
-            let encoder = GzEncoder::new(&mut new_archive_data, Compression::default());
-
-            Builder::new(encoder)
-        };
-
-        fill(&mut builder)?;
-        builder.finish()?;
+            let header = entry.header().clone();
+            builder.append(&header, &mut entry)?;
+        }
     }
 
-    File::create(db_archive)?.write_all(&new_archive_data)?;
+    fill(&mut builder)?;
+    let file = builder.into_inner()?.finish()?;
+    // On disk before anyone renames it into place.
+    file.sync_all()?;
     Ok(())
 }
 
-pub fn remove_from_db_file(db_archive: &Path, dir_name: &str) -> anyhow::Result<()> {
-    if !db_archive.exists() {
-        return Ok(());
-    }
-
-    rewrite_archive(db_archive, |path| path.starts_with(dir_name), |_| Ok(()))
-}
-
-pub fn add_to_db_file(
-    content: &str,
+fn append_entry<W: Write>(
+    builder: &mut Builder<W>,
     dir_name: &str,
     file_name: &str,
-    db_archive: &Path,
+    content: &str,
 ) -> anyhow::Result<()> {
-    let target_file = format!("{dir_name}/{file_name}");
+    let mut header = Header::new_gnu();
+    header.set_path(dir_name)?;
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_mode(0o755);
+    header.set_size(0);
+    header.set_cksum();
+    builder.append(&header, io::empty())?;
 
-    rewrite_archive(
-        db_archive,
-        |path| path == Path::new(dir_name) || path == Path::new(&target_file),
-        |builder| {
-            // Add folder (replacing old one)
-            let mut header = Header::new_gnu();
-            header.set_path(dir_name)?;
-            header.set_entry_type(tar::EntryType::Directory);
-            header.set_mode(0o755);
-            header.set_size(0);
-            header.set_cksum();
-            builder.append(&header, io::empty())?;
+    let mut header = Header::new_gnu();
+    header.set_path(format!("{dir_name}/{file_name}"))?;
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, content.as_bytes())?;
+    Ok(())
+}
 
-            // Add file (replacing old one)
+/// Write the updated `repo.db` and `repo.files` beside the current ones: the
+/// entries of the package files named in `remove` dropped, and `add` added,
+/// replacing any entry already at the same `{pkgname}-{pkgver}`.
+///
+/// The current databases are only read. Nothing is visible to a client until
+/// the caller renames `db_out` and `files_out` over them, so a failure here, or
+/// a decision not to go ahead, costs nothing but the files it wrote.
+pub fn write_updated_databases(
+    db: &Path,
+    files: &Path,
+    remove: &[String],
+    add: &[PackageEntry],
+    db_out: &Path,
+    files_out: &Path,
+) -> anyhow::Result<()> {
+    let superseded = |path: &Path| {
+        remove
+            .iter()
+            .map(|filename| entry_dir_for_filename(filename))
+            .chain(add.iter().map(|entry| entry.dir_name.as_str()))
+            .any(|dir| path.starts_with(dir))
+    };
+
+    rewrite_archive(db, db_out, superseded, |builder| {
+        for entry in add {
+            append_entry(builder, &entry.dir_name, "desc", &entry.desc)?;
+        }
+        Ok(())
+    })?;
+    rewrite_archive(files, files_out, superseded, |builder| {
+        for entry in add {
+            append_entry(builder, &entry.dir_name, "desc", &entry.desc)?;
             let mut header = Header::new_gnu();
-            header.set_path(&target_file)?;
-            header.set_size(content.len() as u64);
+            header.set_path(format!("{}/files", entry.dir_name))?;
+            header.set_size(entry.files.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append(&header, content.as_bytes())?;
-
-            Ok(())
-        },
-    )
+            builder.append(&header, entry.files.as_bytes())?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
-    /// Every entry path in `db_archive`, for asserting what a rewrite kept.
-    fn entry_paths(db_archive: &Path) -> Vec<String> {
+    fn entry(filename: &str, dir_name: &str) -> PackageEntry {
+        PackageEntry {
+            filename: filename.to_string(),
+            dir_name: dir_name.to_string(),
+            desc: format!("%FILENAME%\n{filename}\n"),
+            files: "%FILES%\nusr/bin/x".to_string(),
+        }
+    }
+
+    /// Every entry path in the archive at `path`.
+    fn entry_paths(path: &Path) -> Vec<String> {
         let mut data = Vec::new();
-        File::open(db_archive)
-            .unwrap()
-            .read_to_end(&mut data)
-            .unwrap();
-        let mut archive = Archive::new(GzDecoder::new(Cursor::new(data)));
+        File::open(path).unwrap().read_to_end(&mut data).unwrap();
+        let mut archive = Archive::new(GzDecoder::new(io::Cursor::new(data)));
         archive
             .entries()
             .unwrap()
             .flatten()
             .map(|e| e.path().unwrap().to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Apply one update in place, the way a caller renames the result over.
+    fn update(dir: &Path, remove: &[&str], add: &[PackageEntry]) {
+        let (db, files) = (dir.join("repo.db.tar.gz"), dir.join("repo.files.tar.gz"));
+        let (db_out, files_out) = (dir.join(".db.next"), dir.join(".files.next"));
+        let remove: Vec<String> = remove.iter().map(ToString::to_string).collect();
+        write_updated_databases(&db, &files, &remove, add, &db_out, &files_out).unwrap();
+        std::fs::rename(db_out, db).unwrap();
+        std::fs::rename(files_out, files).unwrap();
     }
 
     /// Removing one package must not take its version-prefixed neighbours with
@@ -125,14 +163,18 @@ mod tests {
     #[test]
     fn removing_a_pkgrel_does_not_remove_its_longer_neighbour() {
         let tmp = tempfile::tempdir().unwrap();
-        let db_archive = tmp.path().join("repo.db.tar.gz");
+        update(
+            tmp.path(),
+            &[],
+            &[
+                entry("foo-1.0-1-x86_64.pkg.tar.zst", "foo-1.0-1"),
+                entry("foo-1.0-10-x86_64.pkg.tar.zst", "foo-1.0-10"),
+            ],
+        );
 
-        add_to_db_file("old", "foo-1.0-1", "desc", &db_archive).unwrap();
-        add_to_db_file("new", "foo-1.0-10", "desc", &db_archive).unwrap();
+        update(tmp.path(), &["foo-1.0-1-x86_64.pkg.tar.zst"], &[]);
 
-        remove_from_db_file(&db_archive, "foo-1.0-1").unwrap();
-
-        let paths = entry_paths(&db_archive);
+        let paths = entry_paths(&tmp.path().join("repo.db.tar.gz"));
         assert!(
             paths.iter().any(|p| p.starts_with("foo-1.0-10")),
             "the rebuilt package was removed along with the old pkgrel: {paths:?}"
@@ -144,20 +186,84 @@ mod tests {
     }
 
     /// Re-adding a package replaces its entries rather than stacking
-    /// duplicates, which is what the equality half of the predicate is for.
+    /// duplicates, which is what adding over the same directory is for.
     #[test]
     fn re_adding_replaces_rather_than_duplicates() {
         let tmp = tempfile::tempdir().unwrap();
-        let db_archive = tmp.path().join("repo.db.tar.gz");
+        let foo = entry("foo-1.0-1-x86_64.pkg.tar.zst", "foo-1.0-1");
+        update(tmp.path(), &[], std::slice::from_ref(&foo));
+        update(tmp.path(), &[], std::slice::from_ref(&foo));
 
-        add_to_db_file("first", "foo-1.0-1", "desc", &db_archive).unwrap();
-        add_to_db_file("second", "foo-1.0-1", "desc", &db_archive).unwrap();
+        let db = entry_paths(&tmp.path().join("repo.db.tar.gz"));
+        assert_eq!(db, ["foo-1.0-1", "foo-1.0-1/desc"]);
+        let files = entry_paths(&tmp.path().join("repo.files.tar.gz"));
+        assert_eq!(files, ["foo-1.0-1", "foo-1.0-1/desc", "foo-1.0-1/files"]);
+    }
 
-        let paths = entry_paths(&db_archive);
+    /// A new version in, the old one out, in one rewrite: what publishing a
+    /// build does, and what two separate rewrites could leave half-done.
+    #[test]
+    fn one_update_adds_and_removes_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        update(
+            tmp.path(),
+            &[],
+            &[
+                entry("foo-1.0-1-x86_64.pkg.tar.zst", "foo-1.0-1"),
+                entry("bar-2.0-1-x86_64.pkg.tar.zst", "bar-2.0-1"),
+            ],
+        );
+
+        update(
+            tmp.path(),
+            &["foo-1.0-1-x86_64.pkg.tar.zst"],
+            &[entry("foo-1.1-1-x86_64.pkg.tar.zst", "foo-1.1-1")],
+        );
+
+        let db = entry_paths(&tmp.path().join("repo.db.tar.gz"));
         assert_eq!(
-            paths.iter().filter(|p| p.starts_with("foo-1.0-1")).count(),
-            2,
-            "expected exactly one directory and one desc entry: {paths:?}"
+            db,
+            ["bar-2.0-1", "bar-2.0-1/desc", "foo-1.1-1", "foo-1.1-1/desc"]
+        );
+    }
+
+    /// The current databases are only read: writing an update that is never
+    /// renamed into place changes nothing.
+    #[test]
+    fn an_update_not_renamed_in_leaves_the_databases_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        update(
+            tmp.path(),
+            &[],
+            &[entry("foo-1.0-1-x86_64.pkg.tar.zst", "foo-1.0-1")],
+        );
+        let before = std::fs::read(tmp.path().join("repo.db.tar.gz")).unwrap();
+
+        write_updated_databases(
+            &tmp.path().join("repo.db.tar.gz"),
+            &tmp.path().join("repo.files.tar.gz"),
+            &["foo-1.0-1-x86_64.pkg.tar.zst".to_string()],
+            &[],
+            &tmp.path().join(".db.next"),
+            &tmp.path().join(".files.next"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("repo.db.tar.gz")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_package_filename_maps_to_its_entry_directory() {
+        assert_eq!(
+            entry_dir_for_filename("hello-2.12.1-1-x86_64.pkg.tar.zst"),
+            "hello-2.12.1-1"
+        );
+        assert_eq!(
+            entry_dir_for_filename("lib32-glibc-2.39-1-any.pkg.tar.zst"),
+            "lib32-glibc-2.39-1"
         );
     }
 }

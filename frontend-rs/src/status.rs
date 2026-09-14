@@ -18,6 +18,8 @@ fn badge_class(state: Option<BuildState>) -> &'static str {
         // `badge-ghost` has no background on this theme.
         Some(BuildState::Enqueued) => "badge-neutral",
         Some(BuildState::WaitingForDeps) => "badge-outline",
+        // Still under way, like building: the server is doing the last of it.
+        Some(BuildState::Publishing) => "badge-info",
         // Only reachable against a newer server that added a state.
         None => "badge-outline",
     }
@@ -33,6 +35,7 @@ pub fn BuildStatusBadge(status: i32) -> Element {
         Some(BuildState::Failed) => "failed",
         Some(BuildState::Enqueued) => "enqueued",
         Some(BuildState::WaitingForDeps) => "waiting for deps",
+        Some(BuildState::Publishing) => "publishing",
         None => "unknown",
     };
     let class = badge_class(state);
@@ -58,6 +61,7 @@ pub fn StatusBadge(status: i32, outofdate: i32) -> Element {
         Some(BuildState::Failed) => "failed",
         Some(BuildState::Enqueued) => "enqueued",
         Some(BuildState::WaitingForDeps) => "waiting for deps",
+        Some(BuildState::Publishing) => "publishing",
         None => "unknown",
     };
     let class = if outdated {
@@ -94,6 +98,7 @@ mod tests {
                 "waiting for deps",
                 "badge-outline",
             ),
+            (BuildState::Publishing, "publishing", "badge-info"),
         ] {
             let status = state.as_i32();
             let html = {

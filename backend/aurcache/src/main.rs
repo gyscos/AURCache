@@ -12,6 +12,7 @@ use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
 use aurcache_scheduler::official_repos::start_official_repo_refresh;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
+use aurcache_utils::repository::{REPO_ROOT, Repository};
 use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
 use dotenvy::dotenv;
@@ -66,12 +67,26 @@ async fn main() {
     // rather than reporting an empty repository -- so the API and the UI come
     // up either way and can report why an add failed.
     let client = Arc::new(AurClient::new());
-    let official_repo_handle = start_official_repo_refresh(client.clone());
+    let official_repo_handle = start_official_repo_refresh(Arc::clone(&client));
 
-    // The four things a package operation acts through, from here on passed as
-    // one. Cloning is four refcount bumps, so a job or a request handler takes
-    // its own handle on the same instances.
-    let services = Services::new(db.clone(), tx.clone(), store.clone(), client);
+    // The pacman repository. One instance, because its lock is what keeps two
+    // changes to it from interleaving: the worker protocol publishing builds,
+    // package removals and restores all go through this one.
+    let repo = Arc::new(Repository::new(REPO_ROOT));
+
+    // The things a package operation acts through, from here on passed as one.
+    // Cloning is a few refcount bumps, so a job or a request handler takes its
+    // own handle on the same instances.
+    let services = Services::new(
+        db.clone(),
+        tx.clone(),
+        Arc::clone(&store),
+        client,
+        Arc::clone(&repo),
+    );
+
+    // Builds a restart caught mid-publish pick up where they were.
+    startup::resume_publishing(&db, &repo).await;
 
     // Before anything else can resolve a source: a prune cannot distinguish a
     // clone in flight from a stranded one.
@@ -96,16 +111,16 @@ async fn main() {
     // sides share this one buffer; a second instance would count into a map
     // nothing flushes.
     let downloads = Arc::new(DownloadCounter::new());
-    let download_flush_handle = start_download_flush(db.clone(), downloads.clone());
+    let download_flush_handle = start_download_flush(db.clone(), Arc::clone(&downloads));
 
     let api_handle = init_api(
         services.clone(),
-        downloads.clone(),
+        Arc::clone(&downloads),
         ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
         CaDirectory(ca_dir.clone()),
     );
-    let worker_api_handle = init_worker_api(db, ca, store);
-    let repo_handle = init_repo(downloads);
+    let worker_api_handle = init_worker_api(db, ca, store, Arc::clone(&repo));
+    let repo_handle = init_repo(downloads, repo);
 
     tokio::select! {
         _ = version_check_handle => {

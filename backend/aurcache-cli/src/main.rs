@@ -2486,6 +2486,7 @@ fn build_status_label(status: i32) -> &'static str {
         Some(BuildState::Failed) => "failed",
         Some(BuildState::Enqueued) => "enqueued",
         Some(BuildState::WaitingForDeps) => "waiting for deps",
+        Some(BuildState::Publishing) => "publishing",
         None => "unknown",
     }
 }

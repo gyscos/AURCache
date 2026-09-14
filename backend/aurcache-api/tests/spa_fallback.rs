@@ -47,6 +47,9 @@ async fn test_client() -> (Client, DatabaseConnection) {
                 checkouts.path().to_path_buf(),
             )),
             Arc::new(aurcache_deps::AurClient::new()),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                checkouts.path().join("repo"),
+            )),
         ))
         .mount("/api", aurcache_api::backend::build_api())
         .mount("/", aurcache_api::embed::CustomHandler);

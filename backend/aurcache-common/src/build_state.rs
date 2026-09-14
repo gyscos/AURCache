@@ -28,6 +28,15 @@ pub enum BuildState {
     /// Queued, but cannot start yet: one or more dependency builds have not
     /// completed successfully.
     WaitingForDeps = 4,
+    /// Built: the worker handed its artifacts over and is done with it, and
+    /// the server is putting them in the repository.
+    ///
+    /// Its own state rather than more of `Active`, because what changes is who
+    /// is responsible. `Active` is a worker holding a lease, and everything that
+    /// polices leases -- the heartbeat, the reaper, revoking a worker, claim
+    /// capacity -- finds builds by that state. A build being published has no
+    /// lease and no worker left to lose it.
+    Publishing = 5,
 }
 
 impl BuildState {
@@ -50,6 +59,7 @@ impl BuildState {
             2 => Some(Self::Failed),
             3 => Some(Self::Enqueued),
             4 => Some(Self::WaitingForDeps),
+            5 => Some(Self::Publishing),
             _ => None,
         }
     }
@@ -61,7 +71,10 @@ impl BuildState {
     /// build in one of these states is a page worth refreshing briskly.
     #[must_use]
     pub const fn is_in_progress(self) -> bool {
-        matches!(self, Self::Active | Self::Enqueued | Self::WaitingForDeps)
+        matches!(
+            self,
+            Self::Active | Self::Enqueued | Self::WaitingForDeps | Self::Publishing
+        )
     }
 }
 
@@ -78,6 +91,8 @@ impl BuildStates {
     /// Build is queued but cannot start yet because one or more dependency
     /// builds have not completed successfully.
     pub const WAITING_FOR_DEPS: i32 = BuildState::WaitingForDeps.as_i32();
+    /// Built, and being put in the repository by the server.
+    pub const PUBLISHING: i32 = BuildState::Publishing.as_i32();
 }
 
 /// Why a build row was created.
@@ -189,6 +204,7 @@ mod tests {
             (BuildStates::FAILED_BUILD, BuildState::Failed),
             (BuildStates::ENQUEUED_BUILD, BuildState::Enqueued),
             (BuildStates::WAITING_FOR_DEPS, BuildState::WaitingForDeps),
+            (BuildStates::PUBLISHING, BuildState::Publishing),
         ] {
             assert_eq!(BuildState::from_i32(value), Some(state));
             assert_eq!(state.as_i32(), value);

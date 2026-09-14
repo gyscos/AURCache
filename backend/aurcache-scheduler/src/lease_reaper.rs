@@ -12,14 +12,10 @@
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::time::now_secs;
-use aurcache_db::helpers::worker_jobs::reap_expired_builds;
-use aurcache_db::prelude::{Builds, Packages};
-use aurcache_db::{builds, packages};
+use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::settings::general::SettingsTraits;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect,
-};
+use sea_orm::DatabaseConnection;
 use std::env;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -64,10 +60,8 @@ pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
 
                     // Explain each abandoned build in its own log. The row is
                     // terminal, so this is the last line it ever gets.
-                    let mut ids: Vec<i32> = out.retried.iter().map(|(old, _)| *old).collect();
-                    ids.extend(out.failed.iter().copied());
-                    for id in ids {
-                        explain_abandoned(&db, id).await;
+                    for abandoned in &out.abandoned {
+                        explain_abandoned(abandoned).await;
                     }
                 }
                 Err(e) => warn!("Lease reaper pass failed: {e}"),
@@ -76,45 +70,25 @@ pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
     })
 }
 
-/// Append why build `id` was abandoned to its log file. Best-effort by design:
+/// Append why a build was abandoned to its log file. Best-effort by design:
 /// the row is already terminal, so nothing downstream depends on this
 /// succeeding, and a deleted package simply yields no line.
-async fn explain_abandoned(db: &DatabaseConnection, id: i32) {
-    // The pkgbase and the build number together locate the log file; the row's
-    // own number is always the public identity of the attempt.
-    let pkgbase: Option<String> = Packages::find()
-        .select_only()
-        .column(packages::Column::Name)
-        .join(
-            sea_orm::JoinType::InnerJoin,
-            packages::Entity::belongs_to(builds::Entity)
-                .from(packages::Column::Id)
-                .to(builds::Column::PkgId)
-                .into(),
-        )
-        .filter(builds::Column::Id.eq(id))
-        .into_tuple::<String>()
-        .one(db)
-        .await
-        .ok()
-        .flatten();
-    let Some(pkgbase) = pkgbase else {
+async fn explain_abandoned(abandoned: &Abandoned) {
+    let Some(pkgbase) = &abandoned.pkgbase else {
         return;
     };
-
-    let Ok(Some(build)) = Builds::find_by_id(id).one(db).await else {
-        return;
-    };
-    let reason = match build.end_reason {
-        Some(EndReasons::MAX_DURATION) => "build exceeded its maximum duration",
-        Some(EndReasons::LEASE_EXPIRED) => "owner worker stopped heartbeating",
-        // Worker-reported terminal outcomes (OOM, timeout, nonzero exit) come
-        // through the `complete` path, never here; treat anything unexpected as
-        // an abandonment anyway so the log still says something truthful.
+    let reason = match abandoned.end_reason {
+        EndReasons::MAX_DURATION => "build exceeded its maximum duration",
+        EndReasons::LEASE_EXPIRED => "owner worker stopped heartbeating",
+        // The reaper records only the two above; anything else still reads as
+        // an abandonment, so the log says something truthful.
         _ => "abandoned by the lease reaper",
     };
     let text = format!("Timeout: {reason}.\n");
-    if let Err(e) = append_build_output(&pkgbase, build.number, &text).await {
-        warn!("could not append abandonment log for build {id}: {e}");
+    if let Err(e) = append_build_output(pkgbase, abandoned.number, &text).await {
+        warn!(
+            "could not append abandonment log for build {}: {e}",
+            abandoned.build_id
+        );
     }
 }

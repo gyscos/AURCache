@@ -1,101 +1,164 @@
-use crate::utils::remove_archive_file::forget_archive_file;
-use anyhow::anyhow;
+use crate::repository::Repository;
+use crate::snapshot::SnapshotStore;
+use anyhow::bail;
 use aurcache_db::prelude::{Builds, Dependencies, Files, PackageVcsSources, Packages, Settings};
-use aurcache_db::{builds, dependencies, files, package_vcs_sources, settings};
+use aurcache_db::{builds, dependencies, files, package_vcs_sources, packages, settings};
 use sea_orm::{
-    ColumnTrait, Condition, DatabaseConnection, EntityTrait, ModelTrait, QueryFilter,
-    TransactionTrait,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QuerySelect, TransactionTrait,
 };
+use tracing::warn;
 
-pub async fn package_delete(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<()> {
+/// Delete packages outright: their rows, their artifacts on disk and in
+/// `repo.db`, their build logs and their source checkouts -- all of it, or
+/// none of it.
+///
+/// **Refused while anything outside `pkg_ids` depends on one of them.** A
+/// package something still needs keeps everything; deciding that it is no
+/// longer needed is [`live_check`](crate::package::live_check::live_check)'s
+/// job, and this is the last line enforcing its answer. Several at once so a
+/// chain or a cycle that is being removed together can be: each member is
+/// depended on, but only from inside the set.
+///
+/// Ids that no longer exist are skipped, so a concurrent removal of the same
+/// package is not an error.
+pub async fn package_delete(
+    db: &DatabaseConnection,
+    store: &SnapshotStore,
+    repo: &Repository,
+    pkg_ids: &[i32],
+) -> anyhow::Result<()> {
+    if pkg_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut update = repo.begin().await;
+    let doomed: Vec<packages::Model> = Packages::find()
+        .filter(packages::Column::Id.is_in(pkg_ids.iter().copied()))
+        .all(db)
+        .await?;
+    let ids: Vec<i32> = doomed.iter().map(|pkg| pkg.id).collect();
+    // Checked here as well as in the transaction: a refusal is not worth the
+    // retries a failed commit gets.
+    refuse_if_needed(db, &doomed, &ids).await?;
+    for file in update.published_files_of(db, &ids).await? {
+        update.remove(&file)?;
+    }
+    let doomed = update.commit(|| delete_rows(db, &doomed)).await?;
+
+    // Stored outside the database and not part of the repository, so after the
+    // rows are gone: a stray directory is only wasted bytes.
+    //
+    // A checkout directory is not always one package's alone, so the remaining
+    // packages' sources say which ones must stay. Without them the removal is
+    // skipped rather than guessed at; the boot-time prune catches it later.
+    let remaining: Option<Vec<_>> = match Packages::find().all(db).await {
+        Ok(rows) => Some(rows.into_iter().map(|pkg| pkg.source_data).collect()),
+        Err(e) => {
+            warn!("could not list packages, leaving source checkouts in place: {e}");
+            None
+        }
+    };
+    for pkg in &doomed {
+        crate::build_logger::remove_package_logs(&pkg.name).await;
+        if let Some(remaining) = &remaining
+            && let Err(e) = store.remove_checkout(&pkg.source_data, remaining).await
+        {
+            warn!("could not remove source checkout for {}: {e:#}", pkg.name);
+        }
+    }
+    Ok(())
+}
+
+/// Fail if a package outside `ids` depends on one inside it.
+async fn refuse_if_needed<C: ConnectionTrait>(
+    db: &C,
+    doomed: &[packages::Model],
+    ids: &[i32],
+) -> anyhow::Result<()> {
+    let still_needed: Vec<i32> = Dependencies::find()
+        .filter(dependencies::Column::DependeeId.is_in(ids.iter().copied()))
+        .filter(dependencies::Column::DependentId.is_not_in(ids.iter().copied()))
+        .select_only()
+        .column(dependencies::Column::DependeeId)
+        .into_tuple()
+        .all(db)
+        .await?;
+    if !still_needed.is_empty() {
+        let names: Vec<&str> = doomed
+            .iter()
+            .filter(|pkg| still_needed.contains(&pkg.id))
+            .map(|pkg| pkg.name.as_str())
+            .collect();
+        bail!(
+            "not deleting {}: other packages still depend on it",
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The rows, in one transaction, children before the package rows.
+///
+/// `files.package_id` cascades, and nothing would notice the cascade taking
+/// those rows -- but every child is deleted explicitly anyway, so nothing here
+/// depends on the connection having `foreign_keys` on.
+async fn delete_rows(
+    db: &DatabaseConnection,
+    doomed: &[packages::Model],
+) -> anyhow::Result<Vec<packages::Model>> {
     let txn = db.begin().await?;
 
-    let pkg = Packages::find_by_id(pkg_id)
-        .one(&txn)
-        .await?
-        .ok_or_else(|| anyhow!("id not found"))?;
-
-    // Captured before the delete consumes the model: the logs are stored under
-    // this name and have to be removed after the transaction commits.
-    let pkgbase = pkg.name.clone();
-
-    // The children first, and the package row last.
-    //
-    // Order used to be the other way round, which stopped being safe the moment
-    // `files.package_id` became a real foreign key: `ON DELETE CASCADE` takes
-    // the `files` rows with the package, so a read afterwards returns nothing
-    // and every artifact stays on disk and in `repo.db` with no row left to
-    // find it by. Deleting the children explicitly, before the parent, means
-    // this function sees them whether or not the database would have removed
-    // them on its own.
-
-    // Read before the delete and removed from disk after the commit: a
-    // rolled-back transaction can put a row back, and nothing can put back a
-    // deleted file.
-    let package_files: Vec<files::Model> = Files::find()
-        .filter(files::Column::PackageId.eq(pkg_id))
+    // Locked before the dependents are counted: on Postgres a new dependency
+    // row referencing one of these then waits for this transaction and fails on
+    // the missing package, instead of being inserted after the check and
+    // silently cascaded away with it. (SQLite serialises writers anyway.)
+    let ids: Vec<i32> = Packages::find()
+        .filter(packages::Column::Id.is_in(doomed.iter().map(|pkg| pkg.id)))
+        .select_only()
+        .column(packages::Column::Id)
+        .lock_exclusive()
+        .into_tuple()
         .all(&txn)
         .await?;
 
+    refuse_if_needed(&txn, doomed, &ids).await?;
+
     Files::delete_many()
-        .filter(files::Column::PackageId.eq(pkg_id))
+        .filter(files::Column::PackageId.is_in(ids.iter().copied()))
         .exec(&txn)
         .await?;
-
-    // remove corresponding builds
     Builds::delete_many()
-        .filter(builds::Column::PkgId.eq(pkg_id))
+        .filter(builds::Column::PkgId.is_in(ids.iter().copied()))
         .exec(&txn)
         .await?;
-
-    // delete the dependency links this package sits on either end of.
-    //
-    // Both directions: an orphan has nothing depending on it *now*, but this is
-    // also how a directly-requested package is deleted, and that one can still
-    // be needed by something. Leaving either side behind strands a row
-    // referencing an id that no longer exists.
-    //
-    // Declared `ON DELETE CASCADE`, and done explicitly anyway, for the same
-    // reason as the VCS sources below: SQLite only enforces a foreign key when
-    // `foreign_keys` is on for the connection issuing the DELETE.
+    // Both ends: what these packages needed, and the links among themselves.
+    // Nothing outside the set points at them, as checked above.
     Dependencies::delete_many()
         .filter(
             Condition::any()
-                .add(dependencies::Column::DependentId.eq(pkg_id))
-                .add(dependencies::Column::DependeeId.eq(pkg_id)),
+                .add(dependencies::Column::DependentId.is_in(ids.iter().copied()))
+                .add(dependencies::Column::DependeeId.is_in(ids.iter().copied())),
         )
         .exec(&txn)
         .await?;
-
-    // delete corresponding settings entries
     Settings::delete_many()
-        .filter(settings::Column::PkgId.eq(pkg_id))
+        .filter(settings::Column::PkgId.is_in(ids.iter().copied()))
         .exec(&txn)
         .await?;
-
-    // delete tracked VCS source commits (not relied upon `ON DELETE CASCADE`
-    // alone, since SQLite only enforces it when foreign_keys is on for the
-    // connection actually issuing the DELETE)
     PackageVcsSources::delete_many()
-        .filter(package_vcs_sources::Column::PackageId.eq(pkg_id))
+        .filter(package_vcs_sources::Column::PackageId.is_in(ids.iter().copied()))
         .exec(&txn)
         .await?;
-
-    // remove package db entry
-    pkg.delete(&txn).await?;
+    Packages::delete_many()
+        .filter(packages::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
 
     txn.commit().await?;
-
-    for file in &package_files {
-        forget_archive_file(file);
-    }
-
-    // Build logs live on disk rather than in a column, so nothing removes them
-    // on our behalf. One directory, because they are stored under the package's
-    // name. After the commit deliberately: a rollback must not leave rows
-    // pointing at logs that are gone, while a stray directory after a commit is
-    // only wasted bytes.
-    crate::build_logger::remove_package_logs(&pkgbase).await;
-
-    Ok(())
+    Ok(doomed
+        .iter()
+        .filter(|pkg| ids.contains(&pkg.id))
+        .cloned()
+        .collect())
 }

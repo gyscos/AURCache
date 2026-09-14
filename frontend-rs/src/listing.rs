@@ -138,6 +138,7 @@ impl StatusFilter {
             Self::State(BuildState::Failed) => "failed",
             Self::State(BuildState::Enqueued) => "enqueued",
             Self::State(BuildState::WaitingForDeps) => "waiting",
+            Self::State(BuildState::Publishing) => "publishing",
         }
     }
 
@@ -152,6 +153,7 @@ impl StatusFilter {
             "failed" => Self::State(BuildState::Failed),
             "enqueued" => Self::State(BuildState::Enqueued),
             "waiting" => Self::State(BuildState::WaitingForDeps),
+            "publishing" => Self::State(BuildState::Publishing),
             "outdated" => Self::OutOfDate,
             _ => Self::Any,
         }
@@ -190,7 +192,7 @@ fn name_matches(name: &str, query: &str) -> bool {
 fn status_rank(status: i32) -> u8 {
     match BuildState::from_i32(status) {
         Some(BuildState::Failed) => 0,
-        Some(BuildState::Active) => 1,
+        Some(BuildState::Active | BuildState::Publishing) => 1,
         Some(BuildState::WaitingForDeps) => 2,
         Some(BuildState::Enqueued) => 3,
         Some(BuildState::Successful) => 4,
@@ -949,6 +951,7 @@ pub fn ListControls(
                 for state in [
                     State::Failed,
                     State::Active,
+                    State::Publishing,
                     State::WaitingForDeps,
                     State::Enqueued,
                     State::Successful,
@@ -978,6 +981,7 @@ fn state_label(state: State) -> &'static str {
         State::Failed => "Failed",
         State::Enqueued => "Enqueued",
         State::WaitingForDeps => "Waiting for deps",
+        State::Publishing => "Publishing",
     }
 }
 

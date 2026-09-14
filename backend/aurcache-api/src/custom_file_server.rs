@@ -52,7 +52,11 @@ impl Handler for CustomFileServer {
         let relative_path = req
             .segments::<Segments<'_, rocket::http::uri::fmt::Path>>(0..)
             .ok()
-            .and_then(|segments| segments.to_path_buf(true).ok());
+            // No dot segments: nothing pacman fetches is dot-named, and the
+            // repository root also holds uploads being staged for ingest
+            // (`.staging`) and artifacts mid-publish, neither of which is
+            // anyone's to download.
+            .and_then(|segments| segments.to_path_buf(false).ok());
 
         // Map uri to filepath
         let Some(relative_path) = relative_path else {

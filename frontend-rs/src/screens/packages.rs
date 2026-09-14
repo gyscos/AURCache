@@ -333,7 +333,12 @@ impl Action {
 #[must_use]
 pub fn row_action(status: i32, outofdate: i32) -> Option<Action> {
     match BuildState::from_i32(status) {
-        Some(BuildState::Active | BuildState::Enqueued | BuildState::WaitingForDeps) => None,
+        Some(
+            BuildState::Active
+            | BuildState::Enqueued
+            | BuildState::WaitingForDeps
+            | BuildState::Publishing,
+        ) => None,
         _ if outofdate != 0 => Some(Action::Update),
         Some(BuildState::Failed) => Some(Action::Retry),
         Some(BuildState::Successful) => Some(Action::Rebuild),
@@ -441,6 +446,7 @@ mod tests {
             BuildState::Active,
             BuildState::Enqueued,
             BuildState::WaitingForDeps,
+            BuildState::Publishing,
         ] {
             assert_eq!(row_action(state.as_i32(), FRESH), None, "{state:?}");
             // Even out of date: the build under way is what resolves it.

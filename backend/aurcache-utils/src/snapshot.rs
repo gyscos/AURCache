@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alpm_srcinfo::SourceInfoV1;
+use aurcache_common::api::package::SourceFileContent;
 use aurcache_db::packages::SourceData;
 use git2::Oid;
 use lru::LruCache;
@@ -220,37 +221,44 @@ impl SnapshotStore {
 
     /// Like [`SnapshotStore::read_file`], but never fails solely because the
     /// stored patch no longer applies cleanly to the current pristine
-    /// content: returns the pristine content unconditionally, plus the
-    /// patched content if this file is part of `patch` and it still applies,
-    /// plus an error message if it's part of `patch` but no longer applies,
-    /// plus the stored unified diff text for the file when it is part of the
-    /// patch. Intended for UI consumption, where the user should always be
-    /// able to see (and revert to) the original content even when their patch
-    /// is stale, and inspect the diff itself to understand what it does.
+    /// content. The pristine content is always there; for a file the patch
+    /// touches, so is the stored diff, along with either the patched content
+    /// or why it no longer applies. Intended for UI consumption, where the
+    /// user should always be able to see (and revert to) the original content
+    /// even when their patch is stale, and inspect the diff itself to
+    /// understand what it does.
     pub async fn read_file_with_patch_status(
         &self,
         source_data: &SourceData,
         patch: Option<&str>,
         rel_path: &str,
-    ) -> anyhow::Result<(String, Option<String>, Option<String>, Option<String>)> {
+    ) -> anyhow::Result<SourceFileContent> {
         let entry = self.get_or_fetch_any(source_data).await?;
         let original_snapshot = entry.original();
-        let original = read_file_from_archive(
-            &original_snapshot.archive_bytes,
-            &original_snapshot.pkgbase,
-            rel_path,
-        )?;
-
-        let patch = match patch.map(SourcePatch::parse).transpose()? {
-            Some(patch) if patch.diff_for(rel_path).is_some() => patch,
-            _ => return Ok((original, None, None, None)),
+        let mut content = SourceFileContent {
+            path: rel_path.to_string(),
+            original_content: read_file_from_archive(
+                &original_snapshot.archive_bytes,
+                &original_snapshot.pkgbase,
+                rel_path,
+            )?,
+            patched_content: None,
+            patch_error: None,
+            stored_patch: None,
         };
 
-        let stored = patch.diff_for(rel_path).map(str::to_string);
-        match patch.apply_to_content(rel_path, &original) {
-            Ok(patched) => Ok((original, Some(patched), None, stored)),
-            Err(e) => Ok((original, None, Some(e.to_string()), stored)),
+        let Some(patch) = patch.map(SourcePatch::parse).transpose()? else {
+            return Ok(content);
+        };
+        let Some(diff) = patch.diff_for(rel_path) else {
+            return Ok(content);
+        };
+        content.stored_patch = Some(diff.to_string());
+        match patch.apply_to_content(rel_path, &content.original_content) {
+            Ok(patched) => content.patched_content = Some(patched),
+            Err(e) => content.patch_error = Some(e.to_string()),
         }
+        Ok(content)
     }
 
     /// Proactively refresh the cache entry for `source_data`: fetch the
@@ -381,11 +389,28 @@ impl SnapshotStore {
     /// outlive it. Absent directories are not an error -- a package that was
     /// never resolved has no checkout, and neither does one whose checkout a
     /// previous prune already took.
-    pub async fn remove_checkout(&self, source_data: &SourceData) -> anyhow::Result<()> {
+    ///
+    /// `keep` is the sources of the packages that remain. A checkout one of
+    /// them maps to is left alone, by the same rule as
+    /// [`SnapshotStore::prune_orphaned_checkouts`]: cache keys are not unique
+    /// per package (every upload shares one) and sanitising them is
+    /// many-to-one, so the directory may still be another package's.
+    pub async fn remove_checkout(
+        &self,
+        source_data: &SourceData,
+        keep: &[SourceData],
+    ) -> anyhow::Result<()> {
         let cache_key = source_data.cache_key();
+        let dir_name = sanitize_cache_key(&cache_key);
+        if keep
+            .iter()
+            .any(|live| sanitize_cache_key(&live.cache_key()) == dir_name)
+        {
+            return Ok(());
+        }
         self.cache.lock().await.pop(&cache_key);
 
-        let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
+        let path = self.checkout_root.join(dir_name);
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1362,7 +1387,7 @@ license=('MIT')
         assert!(path.is_dir(), "the fetch should have left a checkout");
         assert!(store.cache.lock().await.contains(&source.cache_key()));
 
-        store.remove_checkout(&source).await.unwrap();
+        store.remove_checkout(&source, &[]).await.unwrap();
 
         assert!(!path.exists(), "the checkout outlived the package");
         assert!(
@@ -1379,11 +1404,37 @@ license=('MIT')
         let (store, _checkout_dir) = test_store(aur_root.path());
 
         store
-            .remove_checkout(&SourceData::Aur {
-                name: "never-fetched".to_string(),
-            })
+            .remove_checkout(
+                &SourceData::Aur {
+                    name: "never-fetched".to_string(),
+                },
+                &[],
+            )
             .await
             .unwrap();
+    }
+
+    /// Cache keys are not unique per package -- every upload shares one -- so
+    /// a checkout a remaining package maps to stays.
+    #[tokio::test]
+    async fn remove_checkout_keeps_a_directory_a_remaining_package_shares() {
+        let aur_root = tempfile::tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "foo", "1.0");
+        let (store, checkout_dir) = test_store(aur_root.path());
+        let source = SourceData::Aur {
+            name: "foo".to_string(),
+        };
+        store.sourceinfo(&source, None).await.unwrap();
+        let path = checkout_dir
+            .path()
+            .join(sanitize_cache_key(&source.cache_key()));
+
+        store
+            .remove_checkout(&source, std::slice::from_ref(&source))
+            .await
+            .unwrap();
+
+        assert!(path.is_dir(), "a checkout still claimed was removed");
     }
 
     /// The case no delete path can reach: a checkout whose package was never

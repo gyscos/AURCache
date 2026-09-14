@@ -56,6 +56,9 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
                 checkouts.path().to_path_buf(),
             )),
             Arc::new(aurcache_deps::AurClient::new()),
+            Arc::new(aurcache_utils::repository::Repository::new(
+                checkouts.path().join("repo"),
+            )),
         ))
         .manage(aurcache_api::init::ServerVersion("test".to_string()))
         .manage(aurcache_api::init::CaDirectory(std::path::PathBuf::from(
