@@ -82,20 +82,9 @@ ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
 
 USER packager
 ENV PATH="/home/packager/bin:/home/packager/.cargo/bin:${PATH}"
-# The toolchain needs no source, so its COPY glue stays ahead of the tree: a
-# code change then invalidates the wasm-bindgen and makepkg RUNs below without
-# re-running the locked rustup install.
+# The scripts need no source, so they are copied ahead of the tree and a code
+# change does not invalidate them.
 COPY --chmod=0755 docker/install-rust-toolchain.sh docker/build-aurcache-packages.sh docker/install-wasm-bindgen.sh /usr/local/bin/
-# The packager always runs on amd64 (this stage is pinned to it), so whatever
-# architecture the build targets, `rustup default stable` installs the same
-# x86_64 toolchain -- and the racing architectures clobber adjacent files of
-# that shared install (see install-rust-toolchain.sh). The cargo home is
-# locked alongside: the toolchain's `bin/` shims land in it. The wasm32 std is
-# here too because it is one component no matter which host fetches it; only
-# the per-architecture std, added later, is downloaded under the shared mounts.
-RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
-    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
-    install-rust-toolchain.sh wasm32-unknown-unknown
 
 # The lockfile alone, ahead of the source, so that the expensive `cargo install`
 # below is invalidated when the pinned version changes and not by a code edit.
@@ -108,14 +97,18 @@ COPY frontend-rs/Cargo.lock /tmp/frontend-Cargo.lock
 # run. `uid`/`gid` solve the reason this used to be impossible: buildkit
 # creates the mount as root, leaving cargo -- running as `packager` -- unable to
 # write `~/.cargo/.crates.toml`; naming the owner makes the home writable and
-# the layer caches on its own again. The binary itself is copied out of the
+# the layer caches on its own again. The toolchain comes from
+# install-rust-toolchain.sh, which serializes rustup across the architectures
+# building at once and reinstalls it if buildkit evicted the mount; the wasm32
+# std is added there too. The binary itself is copied out of the
 # mount into the layer (`~/.cargo` is a cache mount, which buildkit may evict
 # independently of the layer cache -- the same trap server.Dockerfile copies
 # itself out of); `~/.cargo/bin` stays on PATH for the compiles that run under
 # `cargo`, and `~/bin` is where the durable copy lives.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    install-wasm-bindgen.sh /tmp/frontend-Cargo.lock \
+    install-rust-toolchain.sh wasm32-unknown-unknown \
+    && install-wasm-bindgen.sh /tmp/frontend-Cargo.lock \
     && install -Dm755 /home/packager/.cargo/bin/wasm-bindgen /home/packager/bin/wasm-bindgen
 
 COPY --chown=packager . /src
@@ -125,9 +118,9 @@ COPY --chown=packager . /src
 # build itself.
 #
 # The cache mounts stop `prepare()`'s `cargo fetch` and the per-architecture
-# `rustup target add` from redownloading what the worker image already fetched;
-# both are safe under shared mounts because every architecture fetches
-# differently-named files (cargo additionally flocks its own cache).
+# `rustup target add` from redownloading what the worker image already fetched.
+# Sharing them between architectures is safe because rustup is only reached
+# through install-rust-toolchain.sh's lock, and cargo locks its own cache.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
     build-aurcache-packages.sh aurcache-sandbox aurcache-server aurcache-worker aurcache-worker-docker

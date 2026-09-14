@@ -10,10 +10,10 @@
 # labelled package from one PKGBUILD. That is a convention, not a supported
 # mode, which is why it is written down here rather than assumed.
 #
-# This runs with *shared* cache mounts even though it calls rustup: the target
-# std it adds is named after `CARCH`, so the racing architectures download
-# different files. The toolchain itself was installed under a lock by
-# install-rust-toolchain.sh for that reason.
+# Every architecture runs this at once over the same rustup home, so rustup is
+# only ever reached through install-rust-toolchain.sh, which serializes it and
+# restores a toolchain the cache mount lost. The compiles themselves share the
+# cargo home freely: cargo locks its own caches.
 set -euxo pipefail
 
 case "${TARGETARCH}${TARGETVARIANT:-}" in
@@ -30,7 +30,7 @@ export CARCH
 # The Rust target triple comes from common.sh, which the PKGBUILDs source
 # too, so this cannot drift from the one cargo is asked for.
 . /src/packaging/common.sh
-rustup target add "$(_aurcache_rust_target)"
+install-rust-toolchain.sh "$(_aurcache_rust_target)"
 
 for package in "$@"; do
     cd "/src/packaging/$package"

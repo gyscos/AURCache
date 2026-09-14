@@ -88,19 +88,10 @@ FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-# The toolchain needs no source, so its COPY glue stays ahead of the tree: a
-# code change then invalidates the makepkg RUNs below without re-running the
-# locked rustup install.
+# The scripts need no source, so they are copied ahead of the tree and a code
+# change does not invalidate them.
 USER packager
 COPY --chmod=0755 docker/install-rust-toolchain.sh docker/build-aurcache-packages.sh /usr/local/bin/
-# The packager always runs on amd64 (this stage is pinned to it), so whatever
-# architecture the build targets, `rustup default stable` installs the same
-# x86_64 toolchain -- and the racing architectures clobber adjacent files of
-# that shared install (see install-rust-toolchain.sh). The cargo home is
-# locked alongside: the toolchain's `bin/` shims land in it.
-RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
-    --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700,sharing=locked \
-    install-rust-toolchain.sh
 
 COPY --chown=packager . /src
 # Cross-compile both packages: aurcache-worker depends on aurcache-sandbox,
@@ -113,9 +104,10 @@ COPY --chown=packager . /src
 # rustup toolchain, linked against the same glibc, so their cached `bin/` and
 # `.crates.toml` are interchangeable); `prepare()`'s `cargo fetch --locked` and
 # the per-architecture `rustup target add` therefore stop downloading on the
-# second image. These mounts are *shared* -- the target std each architecture
-# adds is named after it, so there is nothing to clobber -- unlike the
-# toolchain install above. The `uid`/`gid` are the whole point: buildkit would
+# second image. The mounts are shared between the architectures building at
+# once; rustup is serialized inside them by install-rust-toolchain.sh, which
+# build-aurcache-packages.sh calls first, and which also reinstalls the
+# toolchain if buildkit evicted the mount. The `uid`/`gid` are the whole point: buildkit would
 # otherwise create the mount as root and cargo could not write
 # `~/.cargo/.crates.toml`, which is precisely why the hybrid image used to
 # avoid the mount for the wasm-bindgen install.
