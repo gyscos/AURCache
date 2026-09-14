@@ -100,7 +100,10 @@ impl Cache {
 
     /// Drop persistent build trees, least recently used first, until the cache
     /// is within `max_bytes` *and* the filesystem has `min_free` bytes spare.
-    /// Never touches `keep`.
+    /// Never touches the tree of a package in `in_use`: this build's own, and
+    /// every sibling's still running. Age cannot tell those apart -- a tree's
+    /// mtime only moves when an entry directly under it changes, so an
+    /// hours-long compile can leave its tree looking like the oldest here.
     ///
     /// **Nothing is evicted while the cache is within its limits.** Disk that
     /// nothing else needs is not worth reclaiming, and a tree kept is a rebuild
@@ -136,7 +139,13 @@ impl Cache {
     ///
     /// Best-effort. Failing to reclaim is worth reporting and carrying on;
     /// refusing to build over it would turn a full disk into an idle worker.
-    pub fn reclaim_builddirs(&self, platform: &str, keep: &str, max_bytes: u64, min_free: u64) {
+    pub fn reclaim_builddirs(
+        &self,
+        platform: &str,
+        in_use: &[String],
+        max_bytes: u64,
+        min_free: u64,
+    ) {
         let Some(root) = self.builddir(platform) else {
             return;
         };
@@ -166,9 +175,13 @@ impl Cache {
             if !over_budget && !short_of_free {
                 return;
             }
-            // The tree this build is about to use is the one thing worth
-            // keeping, even when it is itself what breaches the budget.
-            if path.file_name().is_some_and(|n| n == keep) {
+            // A tree a build is using is worth keeping even when it is itself
+            // what breaches the budget: deleting it fails that build.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| in_use.iter().any(|pkgbase| *pkgbase == n))
+            {
                 continue;
             }
             match std::fs::remove_dir_all(&path) {
@@ -410,7 +423,7 @@ impl Cache {
         let verdicts = hash_suspects(&shared, &suspects);
         {
             let mut known = verified_lock();
-            for ((name, sha), matches) in suspects.iter().zip(verdicts) {
+            for ((name, sha), matches) in verdicts {
                 let key = (shared.clone(), name.clone());
                 if matches {
                     known.insert(key, sha.clone());
@@ -607,14 +620,26 @@ const PARALLEL_HASH_THRESHOLD: usize = 8;
 /// rebuild re-verifies the whole repository at most once, and that is the only
 /// case with enough files to pay for threads, so the work stays serial below
 /// [`PARALLEL_HASH_THRESHOLD`] and fans out with `std::thread::scope` past it —
-/// no channeling and no new dependency. Each file is, and remains, a single
-/// answer, so the results keep positional order.
-fn hash_suspects(shared: &Path, suspects: &[(String, String)]) -> Vec<bool> {
+/// no channeling and no new dependency.
+///
+/// Each verdict comes back paired with the suspect it is about, rather than in
+/// the suspects' order. A thread that panics loses its chunk's verdicts, and a
+/// positional answer would then shift every later one onto the wrong file --
+/// removing a good archive, or vouching for a stale one. Paired, a lost verdict
+/// is only a file left unverified until the next pass.
+fn hash_suspects<'a>(
+    shared: &Path,
+    suspects: &'a [(String, String)],
+) -> Vec<(&'a (String, String), bool)> {
+    let verdict = |suspect: &'a (String, String)| {
+        let (name, sha) = suspect;
+        (
+            suspect,
+            sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha),
+        )
+    };
     if suspects.len() < PARALLEL_HASH_THRESHOLD {
-        return suspects
-            .iter()
-            .map(|(name, sha)| sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha))
-            .collect();
+        return suspects.iter().map(verdict).collect();
     }
     let workers = std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
@@ -623,16 +648,7 @@ fn hash_suspects(shared: &Path, suspects: &[(String, String)]) -> Vec<bool> {
     std::thread::scope(|scope| {
         let threads: Vec<_> = suspects
             .chunks(suspects.len().div_ceil(workers))
-            .map(|chunk| {
-                scope.spawn(move || -> Vec<bool> {
-                    chunk
-                        .iter()
-                        .map(|(name, sha)| {
-                            sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha)
-                        })
-                        .collect()
-                })
-            })
+            .map(|chunk| scope.spawn(move || chunk.iter().map(verdict).collect::<Vec<_>>()))
             .collect();
         threads
             .into_iter()
@@ -972,7 +988,7 @@ mod pkgcache_tests {
         }
 
         // Room for one tree, so two must go -- but "wanted" is in use.
-        c.reclaim_builddirs("x86_64", "wanted", 150, 0);
+        c.reclaim_builddirs("x86_64", &["wanted".to_string()], 150, 0);
 
         assert!(!root.join("old").exists(), "oldest goes first");
         assert!(!root.join("mid").exists(), "then the next oldest");
@@ -980,6 +996,40 @@ mod pkgcache_tests {
             root.join("wanted").exists(),
             "the tree this build needs must survive"
         );
+    }
+
+    /// A sibling build's tree is in use too, however old it looks: a long
+    /// compile does not touch its tree's root, and deleting it mid-build fails
+    /// that build.
+    #[test]
+    fn reclaim_spares_every_tree_a_running_build_uses() {
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+
+        for (name, age) in [("sibling", 300), ("idle", 200), ("mine", 100)] {
+            let tree = root.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+            let when = SystemTime::now() - Duration::from_secs(age);
+            std::fs::File::open(&tree)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+
+        c.reclaim_builddirs(
+            "x86_64",
+            &["mine".to_string(), "sibling".to_string()],
+            150,
+            0,
+        );
+
+        assert!(root.join("sibling").exists(), "a running build's tree went");
+        assert!(root.join("mine").exists());
+        assert!(!root.join("idle").exists(), "the idle tree pays instead");
     }
 
     /// Room to spare means nothing is touched, however old. Reclaiming disk
@@ -1004,7 +1054,7 @@ mod pkgcache_tests {
             .unwrap();
 
         // A cap nothing comes close to.
-        c.reclaim_builddirs("x86_64", "none", u64::MAX, 0);
+        c.reclaim_builddirs("x86_64", &[], u64::MAX, 0);
 
         assert!(
             tree.exists(),
@@ -1182,6 +1232,36 @@ mod pkgcache_tests {
         let repo = make_db(&[(name, 100, &sha_of(&[b'y'; 100]))]);
         assert_eq!(c.reconcile_pkgs(&repo), 1);
         assert!(!shared.join(name).exists());
+    }
+
+    /// Enough suspects to hash on threads, with good and stale files
+    /// interleaved: every verdict lands on its own file.
+    #[test]
+    fn a_parallel_reconcile_judges_each_file_by_its_own_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let shared = c.pacman_pkg().unwrap();
+        let mut entries = Vec::new();
+        for i in 0..(PARALLEL_HASH_THRESHOLD * 2) {
+            let name = format!("p{i}-1.0-1-x86_64.pkg.tar.zst");
+            write(&shared.join(&name), 100);
+            // Odd files were rebuilt: same size, different bytes.
+            let sha = if i % 2 == 0 {
+                sha_of(&[b'x'; 100])
+            } else {
+                sha_of(&[b'y'; 100])
+            };
+            entries.push((name, sha));
+        }
+        let repo: RepoDb = entries
+            .iter()
+            .map(|(name, sha)| (name.clone(), (100, sha.clone())))
+            .collect();
+
+        assert_eq!(c.reconcile_pkgs(&repo), PARALLEL_HASH_THRESHOLD);
+        for (i, (name, _)) in entries.iter().enumerate() {
+            assert_eq!(shared.join(name).exists(), i % 2 == 0, "{name}");
+        }
     }
 
     /// A matching file costs a directory read and a map lookup, not a hash, and

@@ -245,10 +245,18 @@ async fn run_job_inner(
     // build otherwise guarantees. See `design/persistent-build-directory.md`.
     if job.persistent_builddir {
         // Before the build, so the reserve is what bounds usage going in
-        // rather than a post-hoc tidy. Never drops this package's own tree.
+        // rather than a post-hoc tidy. Never drops a tree a build is using:
+        // this one's, or a sibling's still running (the set includes both).
+        let in_use: Vec<String> = shared
+            .active_pkgbases
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
         cache.reclaim_builddirs(
             &job.arch,
-            &job.pkgbase,
+            &in_use,
             cfg.core.builddir_max_bytes,
             cfg.core.builddir_min_free,
         );
