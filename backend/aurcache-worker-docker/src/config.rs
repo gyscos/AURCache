@@ -4,7 +4,7 @@
 //! names and with their original meanings, because the whole point of this
 //! executor is that an existing deployment keeps behaving as it did.
 
-use aurcache_worker_core::config::{CoreConfig, env_opt};
+use aurcache_worker_core::config::{CoreConfig, env_opt, env_parse};
 use std::path::PathBuf;
 
 /// Where a build directory lives, from two points of view.
@@ -61,12 +61,8 @@ impl Config {
             builder_image: env_opt("BUILDER_IMAGE")
                 .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.to_string()),
             dirs: BuildDirs { host, local },
-            cpu_limit: env_opt("CPU_LIMIT")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            memory_limit: env_opt("MEMORY_LIMIT")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(-1),
+            cpu_limit: env_parse("CPU_LIMIT").unwrap_or(0),
+            memory_limit: env_parse("MEMORY_LIMIT").unwrap_or(-1),
         })
     }
 

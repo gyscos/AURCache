@@ -226,14 +226,22 @@ pub enum ChrootMode {
 
 impl ChrootMode {
     /// Parse the `WORKER_CHROOT_OVERLAY` setting. Anything unrecognised is
-    /// `Auto`, which is also the default: a typo should not silently turn off
-    /// something the operator was trying to turn on.
+    /// `Auto`, which is also the default: a typo should not turn off something
+    /// the operator was trying to turn on. It is reported, though, so the typo
+    /// does not go unnoticed either.
     #[must_use]
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some("1" | "true" | "yes" | "on") => Self::Overlay,
             Some("0" | "false" | "no" | "off") => Self::Copy,
-            _ => Self::Auto,
+            None | Some("" | "auto") => Self::Auto,
+            Some(other) => {
+                tracing::warn!(
+                    "ignoring WORKER_CHROOT_OVERLAY={other:?} (expected auto, on or off); \
+                     deciding automatically"
+                );
+                Self::Auto
+            }
         }
     }
 }

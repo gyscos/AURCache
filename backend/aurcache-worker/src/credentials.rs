@@ -232,18 +232,26 @@ pub fn augment_makepkg_conf(
 ///
 /// Entries without exactly one `:` are dropped rather than guessed at: a
 /// half-parsed bind mount would silently expose the wrong path into a build.
+/// Each one dropped is reported, since a mount the operator asked for and
+/// the build never sees is otherwise only discovered as a failing build.
 #[must_use]
 pub fn parse_bind_mounts(raw: &str) -> Vec<(PathBuf, PathBuf)> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|entry| {
-            let (host, chroot) = entry.split_once(':')?;
-            let (host, chroot) = (host.trim(), chroot.trim());
-            if host.is_empty() || chroot.is_empty() || chroot.contains(':') {
-                return None;
+            let pair = entry
+                .split_once(':')
+                .map(|(host, chroot)| (host.trim(), chroot.trim()))
+                .filter(|(host, chroot)| {
+                    !host.is_empty() && !chroot.is_empty() && !chroot.contains(':')
+                });
+            if pair.is_none() {
+                tracing::warn!(
+                    "ignoring WORKER_BIND_MOUNTS entry {entry:?} (expected host:chroot)"
+                );
             }
-            Some((PathBuf::from(host), PathBuf::from(chroot)))
+            pair.map(|(host, chroot)| (PathBuf::from(host), PathBuf::from(chroot)))
         })
         .collect()
 }

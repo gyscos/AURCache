@@ -91,11 +91,20 @@ leaving each build to re-download its dependencies.
 | `WORKER_CACHE_MAX_SIZE` | Size | **Total** cache budget, split evenly between the two pools | `20G` |
 | `WORKER_SRCCACHE_MAX_SIZE` | Size | Source budget; overrides half the total | half of total |
 | `WORKER_PKGCACHE_MAX_SIZE` | Size | Package budget; overrides half the total | half of total |
-| `WORKER_CACHE_TTL` | Integer | Evict sources unused for this many seconds (`0` disables) | 30 days |
-| `WORKER_PKGCACHE_TTL` | Integer | Evict packages older than this (`0` disables) | `0` |
+| `WORKER_CACHE_TTL` | Duration | Evict sources unused for this long (`0` disables) | `30d` |
+| `WORKER_PKGCACHE_TTL` | Duration | Evict packages older than this (`0` disables) | `0` |
+| `WORKER_BUILDDIR_MAX_BYTES` | Size | Budget for kept build trees, for packages with a persistent build directory | `200G` |
+| `WORKER_BUILDDIR_MIN_FREE` | Size | Free space to keep on the filesystem holding kept build trees | `50G` |
 
-Sizes accept `20G`, `500M` or a plain byte count. Setting a budget to `0`
-disables size-based eviction for that pool.
+Sizes are read the way coreutils reads them: a plain number is bytes, a bare
+unit or an `iB` unit is binary, and a `B` unit is decimal -- `450G` and
+`450GiB` are both 450&nbsp;GiB, while `450GB` is 450&nbsp;×&nbsp;10⁹ bytes.
+Units run from `K` to `T`, in any case, with or without a space before them.
+Setting a budget to `0` disables size-based eviction for that pool.
+
+A value the worker cannot read, here or in any other setting, is logged as a
+warning at startup and replaced by the default -- check the log after
+changing one.
 
 Setting both per-pool budgets makes the split ratio configurable without a
 separate knob for it. A pinned pool always wins: the total is a default for
@@ -113,7 +122,7 @@ simply for being old. Size pressure is the honest bound for that pool.
 | `WORKER_DATA_DIR` | Path | Worker identity, credentials, chroots | `/var/lib/aurcache-worker` |
 | `WORKER_CHROOT_DIR` | Path | Base chroot and per-job copies | `<data dir>/chroot` |
 | `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
-| `WORKER_CHROOT_REFRESH_INTERVAL` | Integer | Seconds a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `900` |
+| `WORKER_CHROOT_REFRESH_INTERVAL` | Duration | How long a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `15m` |
 | `WORKER_CHROOT_OVERLAY` | `auto`/on/off | Mount each build's chroot as an overlay instead of copying the base | `auto` |
 
 The base chroot is brought up to date with `pacman -Syu` before a build, but
@@ -207,11 +216,16 @@ whatever the server's pool is made of.
 
 | Variable | Type | Description | Default |
 |---|---|---|---|
-| `WORKER_BUILD_TIMEOUT` | Integer | Kill a build after this many seconds (`0` disables) | 3 hours |
-| `WORKER_POLL_INTERVAL` | Integer | Seconds between job claims when idle | 10 |
-| `WORKER_HEARTBEAT_INTERVAL` | Integer | Seconds between heartbeats | 15 |
-| `LEASE_TTL` | Integer | Seconds before a silent worker's build is requeued | 60 |
+| `WORKER_BUILD_TIMEOUT` | Duration | Kill a build after this long (`0` disables) | `3h` |
+| `WORKER_POLL_INTERVAL` | Duration | Time between job claims when idle | `10s` |
+| `WORKER_HEARTBEAT_INTERVAL` | Duration | Time between heartbeats | `15s` |
+| `LEASE_TTL` | Duration | How long before a silent worker's build is requeued | `60s` |
 | `WORKER_KEYSERVER` | String | Keyserver for `validpgpkeys` | `hkps://keyserver.ubuntu.com` |
+
+Durations are a plain number of seconds, or terms with a unit that add up:
+`90s`, `15m`, `3h`, `1h30m`, `2h 30min`, `30d`, `2w`. Units are `s`, `m` (minutes),
+`h`, `d` and `w`, or spelled out (`min`, `hours`, `days`), in any case. Like
+sizes, a value that cannot be read is logged at startup and the default used.
 
 Very large packages need `WORKER_BUILD_TIMEOUT` raised — the three-hour default
 is generous for ordinary packages and nowhere near enough for something like a

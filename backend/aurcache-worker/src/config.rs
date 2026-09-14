@@ -5,7 +5,7 @@
 //! read from the same environment, so a worker is still configured as one flat
 //! set of variables.
 
-use aurcache_worker_core::config::{CoreConfig, env_opt, parse_size};
+use aurcache_worker_core::config::{CoreConfig, env_duration, env_opt, env_size};
 use std::path::PathBuf;
 
 /// Fully-resolved configuration for the chroot worker.
@@ -80,9 +80,9 @@ impl Config {
         let core = CoreConfig::from_env();
 
         let (src_budget, pkg_budget) = split_cache_budgets(
-            env_opt("WORKER_CACHE_MAX_SIZE").and_then(parse_size),
-            env_opt("WORKER_SRCCACHE_MAX_SIZE").and_then(parse_size),
-            env_opt("WORKER_PKGCACHE_MAX_SIZE").and_then(parse_size),
+            env_size("WORKER_CACHE_MAX_SIZE"),
+            env_size("WORKER_SRCCACHE_MAX_SIZE"),
+            env_size("WORKER_PKGCACHE_MAX_SIZE"),
         );
 
         // The chroot lives under the data dir by default so that persisting one
@@ -107,15 +107,10 @@ impl Config {
                 .unwrap_or_else(|| "hkps://keyserver.ubuntu.com".to_string()),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
             cache_max_size: src_budget,
-            cache_ttl: env_opt("WORKER_CACHE_TTL")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30 * 24 * 60 * 60),
+            cache_ttl: env_duration("WORKER_CACHE_TTL").unwrap_or(30 * 24 * 60 * 60),
             pkgcache_max_size: pkg_budget,
-            pkgcache_ttl: env_opt("WORKER_PKGCACHE_TTL")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            chroot_refresh_interval: env_opt("WORKER_CHROOT_REFRESH_INTERVAL")
-                .and_then(|s| s.parse().ok())
+            pkgcache_ttl: env_duration("WORKER_PKGCACHE_TTL").unwrap_or(0),
+            chroot_refresh_interval: env_duration("WORKER_CHROOT_REFRESH_INTERVAL")
                 .unwrap_or(15 * 60),
             chroot_mode: crate::chroots::ChrootMode::parse(
                 env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
