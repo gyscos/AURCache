@@ -264,6 +264,11 @@ pub struct Chroots {
     /// result into place -- never across a build, which is what made the file
     /// lock mean "wait for every build to finish".
     layout: tokio::sync::RwLock<()>,
+    /// One flatten at a time. Every refresh, every claim at the hard cap and
+    /// startup all ask for one, and two running together share `root.new` and
+    /// the staging mount: each deletes and unmounts what the other is building
+    /// from, and the survivor can publish an empty base.
+    flattening: Mutex<()>,
 }
 
 impl Chroots {
@@ -277,6 +282,7 @@ impl Chroots {
             interval,
             draining: AtomicBool::new(false),
             layout: tokio::sync::RwLock::new(()),
+            flattening: Mutex::new(()),
         }
     }
 
@@ -807,6 +813,12 @@ impl Chroots {
     /// renames a live mount does not notice. Only *discarding* what it retires
     /// waits for the builds to finish.
     async fn flatten_if_deep(&self, root: &Path) -> Result<()> {
+        // Whoever holds it is already doing this, so there is nothing to wait
+        // for: the next caller will find the stack shallow again.
+        let Ok(_flattening) = self.flattening.try_lock() else {
+            tracing::debug!("a flatten is already running");
+            return Ok(());
+        };
         let published = self.layers();
         if published.len() < MAX_LAYERS {
             // Still worth clearing anything an earlier flatten retired.
@@ -828,9 +840,12 @@ impl Chroots {
         let options =
             overlay_options(&lower, &empty, &work).context("cannot express the merged view")?;
 
-        // Unlocked, and it is the slow part. It reads the base and the layers,
-        // which every running build is also reading, and writes `root.new`,
-        // which is nobody's lower layer.
+        // The slow part. It reads the base and the layers, which every running
+        // build is also reading, and writes `root.new`, which is nobody's lower
+        // layer. So it holds the base lock shared, exactly as a build does:
+        // an in-place refresh, which writes the top layer, takes it
+        // exclusively, and must never run under a flatten reading that layer.
+        let _reading = chroot::share_base_chroot(root).await;
         let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), fresh.as_os_str()]).await;
         sudo(&[
             "mkdir".as_ref(),
@@ -855,22 +870,37 @@ impl Chroots {
         let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), staging.as_os_str()]).await;
         built?;
 
-        // Publishing is three renames, and only they need exclusivity -- from
+        // Publishing is a few renames, and only they need exclusivity -- from
         // *starting* builds, not from running ones. A rename is invisible to a
         // live mount, which holds the directory it was given rather than the
         // name: after one, and even after a new directory takes the old name,
         // the mount still reads the tree it started with.
-        let retired = self.dir.join(OVERLAY_DIR).join(RETIRED_DIR).join(&name);
-        let updates = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
+        //
+        // Only the layers merged here are retired, not the whole `updates`
+        // directory: a refresh may have published another one since `published`
+        // was read. That layer is a diff over the stack it was written on, and
+        // the new base *is* that stack flattened, so it stays valid on top of it
+        // -- whereas moving it out with the rest would lose the update.
+        //
+        // The retired directory is unique rather than named after the top
+        // layer: numbering restarts once `updates` empties, and a flatten while
+        // builds still hold an earlier retirement would otherwise move into it.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let retired = self
+            .dir
+            .join(OVERLAY_DIR)
+            .join(RETIRED_DIR)
+            .join(format!("{name}-{stamp}"));
+        let retired_layers = retired.join(UPDATES_DIR);
         {
             let _layout = self.layout.write().await;
-            sudo(&["mkdir".as_ref(), "-p".as_ref(), retired.as_os_str()]).await?;
-            sudo(&[
-                "mv".as_ref(),
-                updates.as_os_str(),
-                retired.join("updates").as_os_str(),
-            ])
-            .await?;
+            sudo(&["mkdir".as_ref(), "-p".as_ref(), retired_layers.as_os_str()]).await?;
+            let mut mv: Vec<&OsStr> =
+                vec!["mv".as_ref(), "-t".as_ref(), retired_layers.as_os_str()];
+            mv.extend(published.iter().map(|layer| layer.as_os_str()));
+            sudo(&mv).await?;
             sudo(&[
                 "mv".as_ref(),
                 root.as_os_str(),
