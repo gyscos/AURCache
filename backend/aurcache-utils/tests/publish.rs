@@ -150,7 +150,9 @@ async fn a_published_build_is_in_the_repository_and_recorded() {
     assert!(!repo.staging_dir(1).exists(), "staging is cleared");
 }
 
-/// A new version replaces the old one everywhere: file, entry and row.
+/// A new version replaces the old one in the database and the `files` rows at
+/// once; the old file stays downloadable until the sweep, for clients that
+/// synced before.
 #[tokio::test]
 async fn a_new_version_replaces_the_old_one() {
     let db = db().await;
@@ -167,15 +169,20 @@ async fn a_new_version_replaces_the_old_one() {
 
     assert_eq!(status(&db, 2).await, Some(BuildStates::SUCCESSFUL_BUILD));
     assert_eq!(listed(tmp.path()), ["hello-1.1-1"]);
-    assert!(
-        !tmp.path()
-            .join("x86_64")
-            .join(filename("hello", "1.0-1"))
-            .exists()
-    );
     let rows = Files::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].filename, filename("hello", "1.1-1"));
+
+    let old = tmp.path().join("x86_64").join(filename("hello", "1.0-1"));
+    assert!(old.exists(), "retired, not yet swept");
+    repo.sweep(std::time::Duration::ZERO).await.unwrap();
+    assert!(!old.exists());
+    assert!(
+        tmp.path()
+            .join("x86_64")
+            .join(filename("hello", "1.1-1"))
+            .exists()
+    );
 }
 
 /// A file another live package publishes is refused -- and a refusal fails the

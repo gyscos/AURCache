@@ -1,0 +1,74 @@
+//! Deleting package files the repository stopped listing, once no client can
+//! still be about to download them.
+//!
+//! Publishing a new version takes the old one out of `repo.db` straight away
+//! but leaves its file in place: a client that ran `pacman -Sy` just before
+//! still has the old `repo.db`, and asks for the old file. This job deletes
+//! such files once they have been unlisted for `RETIRED_PACKAGE_GRACE` seconds
+//! (see [`Repository::sweep`]).
+
+use aurcache_utils::repository::Repository;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+/// How long a retired package file stays downloadable, by default: a day,
+/// comfortably longer than any upgrade takes between syncing and downloading.
+const DEFAULT_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// The longest the job sleeps between sweeps. A file is deleted at most this
+/// long after its grace runs out.
+const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+fn grace() -> Duration {
+    Duration::from_secs(
+        env::var("RETIRED_PACKAGE_GRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_GRACE_SECS),
+    )
+}
+
+/// Sweep often enough that a short grace is honoured roughly, without
+/// reading every platform directory more than once a minute.
+fn interval(grace: Duration) -> Duration {
+    (grace / 2).clamp(Duration::from_secs(60), MAX_INTERVAL)
+}
+
+/// Spawn the sweep loop.
+pub fn start_retired_package_sweep(repo: Arc<Repository>) -> JoinHandle<()> {
+    let grace = grace();
+    let interval = interval(grace);
+    tokio::spawn(async move {
+        info!(
+            "Retired package sweep started (grace {}s, every {}s)",
+            grace.as_secs(),
+            interval.as_secs()
+        );
+        loop {
+            tokio::time::sleep(interval).await;
+            match repo.sweep(grace).await {
+                Ok(0) => {}
+                Ok(deleted) => info!("deleted {deleted} retired package file(s)"),
+                Err(e) => warn!("retired package sweep failed: {e:#}"),
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_interval_follows_the_grace_within_bounds() {
+        assert_eq!(interval(Duration::from_secs(10)), Duration::from_secs(60));
+        assert_eq!(interval(Duration::from_secs(600)), Duration::from_secs(300));
+        assert_eq!(
+            interval(Duration::from_secs(DEFAULT_GRACE_SECS)),
+            MAX_INTERVAL
+        );
+    }
+}

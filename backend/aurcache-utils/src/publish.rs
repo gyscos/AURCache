@@ -148,7 +148,7 @@ async fn publish(
     let mut update = repo.begin().await;
     let plan = plan(&update, db, &pkg, platform, &described, version).await?;
     for file in &plan.stale {
-        update.remove(file)?;
+        update.retire(file)?;
     }
     for staged in described {
         update.add(platform, staged.path, staged.entry);

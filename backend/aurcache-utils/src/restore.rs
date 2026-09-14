@@ -499,12 +499,12 @@ pub async fn write_rows(
         }
     }
 
-    // A clear takes every published artifact out of the repository with its
-    // rows, and only if the transaction below commits.
+    // A clear retires every published artifact with its rows, and only if the
+    // transaction below commits; the sweep deletes the files later.
     let mut update = repo.begin().await;
     if options.clear {
         for file in update.all_published_files(db).await? {
-            update.remove(&file)?;
+            update.retire(&file)?;
         }
     }
     let applied = update.commit(|| write_rows_txn(db, dump, options)).await?;

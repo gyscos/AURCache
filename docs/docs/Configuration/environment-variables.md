@@ -42,6 +42,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | AUTO_UPDATE_SCHEDULE   | String (CRON) | Auto update schedule in cronjob syntax with seconds (null to disable) | null    |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
 | JOB_TIMEOUT            | Integer       | Longest a build may run before the server reclaims it, in seconds     | 3600    |
+| RETIRED_PACKAGE_GRACE  | Integer       | How long a package file stays downloadable after a newer build or a removal takes it out of the repository database, in seconds, so clients that synced just before can still fetch it | 86400 |
 | SECRET_KEY             | String        | \>32Byte Random String for singing cookies                            | Random  |
 | AURCACHE_PUBLIC_URL    | String        | Base URL workers use for the pacman repo, baked into build configs. Example: `http://aurcache:8081` | `http://localhost:8081` |
 

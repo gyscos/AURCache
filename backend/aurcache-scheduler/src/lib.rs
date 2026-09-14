@@ -3,6 +3,7 @@ pub mod download_flush;
 pub mod lease_reaper;
 pub mod mirror_ranking;
 pub mod official_repos;
+pub mod retired_packages;
 pub mod update_version_check;
 
 use chrono::{DateTime, Utc};

@@ -8,11 +8,11 @@ use aurcache_db::prelude::Files;
 use pacman_mirrors::platforms::Platform;
 use pacman_repo_utils::PackageEntry;
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 /// Where the repository lives, relative to the server's working directory.
@@ -43,15 +43,20 @@ pub struct Repository {
     lock: tokio::sync::Mutex<()>,
     /// Numbers each update, so a [`PublishedFile`] can say which one read it.
     updates: AtomicU64,
+    /// When each retired file stopped being listed, as far as this process
+    /// knows: set by the update that retired it, or by the first sweep that
+    /// found it unlisted. Kept in memory only -- after a restart a retired
+    /// file's grace period starts again, which can only keep it longer.
+    retired: std::sync::Mutex<HashMap<PathBuf, Instant>>,
 }
 
 /// A package file the repository publishes, as its `files` row records it.
 ///
-/// Only an [`Update`] reads these, and [`Update::remove`] only takes these, from
-/// the same update: a file is only ever removed on the strength of a read made
-/// under the repository lock, by the change doing the removing. A read made
+/// Only an [`Update`] reads these, and [`Update::retire`] only takes these, from
+/// the same update: a file is only ever retired on the strength of a read made
+/// under the repository lock, by the change doing the retiring. A read made
 /// before the lock, or by an earlier change, could be out of date -- another
-/// package may have claimed the file since -- and acting on it would remove that
+/// package may have claimed the file since -- and acting on it would retire that
 /// package's file.
 #[derive(Debug)]
 pub struct PublishedFile {
@@ -83,11 +88,11 @@ impl PublishedFile {
     }
 }
 
-/// What one update adds and removes.
+/// What one update adds and retires.
 #[derive(Default)]
 struct Changes {
     add: Vec<Addition>,
-    remove: Vec<(Platform, String)>,
+    retire: Vec<(Platform, String)>,
 }
 
 struct Addition {
@@ -105,8 +110,8 @@ impl Changes {
         });
     }
 
-    fn remove(&mut self, platform: Platform, filename: impl Into<String>) {
-        self.remove.push((platform, filename.into()));
+    fn retire(&mut self, platform: Platform, filename: impl Into<String>) {
+        self.retire.push((platform, filename.into()));
     }
 
     fn platforms(&self) -> Vec<Platform> {
@@ -114,7 +119,7 @@ impl Changes {
             .add
             .iter()
             .map(|a| a.platform)
-            .chain(self.remove.iter().map(|(platform, _)| *platform))
+            .chain(self.retire.iter().map(|(platform, _)| *platform))
             .collect();
         platforms.sort_by_key(Platform::as_str);
         platforms.dedup();
@@ -128,7 +133,7 @@ impl Changes {
 /// Reading what the repository publishes, to decide what to change, goes
 /// through this too: the reads are only available while the lock is held.
 pub struct Update<'a> {
-    root: &'a Path,
+    repo: &'a Repository,
     /// Which update this is, so a [`PublishedFile`] read by another one is
     /// refused.
     id: u64,
@@ -156,17 +161,16 @@ pub struct Update<'a> {
     /// package file is renamed into place, and the `files` rows change in one
     /// transaction. A client or the web UI sees the repository before a change
     /// or after it. Order does the rest: new package files land before the
-    /// databases listing them, and removed ones go only after the databases no
-    /// longer do. A client may still hold a `repo.db` older than a removal, as
-    /// with any pacman mirror, and a rebuild at the same version replaces its
-    /// file a moment before the database lists the new checksum.
+    /// databases listing them, and a retired file stays downloadable for a
+    /// grace period after the databases stop listing it, for clients still
+    /// holding an older `repo.db` (see [`Repository::sweep`]).
     ///
     /// Not covered: the staging directories, which each belong to one build
     /// and are written by its uploads without the lock; every other table; and
     /// anything outside this process -- it is an in-process mutex, so a second
     /// server on the same repository, or a hand edit, is not serialized.
     _lock: tokio::sync::MutexGuard<'a, ()>,
-    /// What the change adds and removes, applied by [`Update::commit`].
+    /// What the change adds and retires, applied by [`Update::commit`].
     changes: Changes,
 }
 
@@ -226,19 +230,23 @@ impl Update<'_> {
         self.changes.add(platform, staged, entry);
     }
 
-    /// Take a published file out of the repository: its database entry, the
-    /// file, and its detached signature.
+    /// Take a published file out of the repository.
+    ///
+    /// Its database entry goes with this update. The file itself, and its
+    /// detached signature, stay downloadable until [`Repository::sweep`]
+    /// finds them unlisted for longer than the grace period: a client that
+    /// synced just before this update still asks for them.
     ///
     /// Refused for a file this update did not read itself; see
     /// [`PublishedFile`].
-    pub fn remove(&mut self, file: &PublishedFile) -> anyhow::Result<()> {
+    pub fn retire(&mut self, file: &PublishedFile) -> anyhow::Result<()> {
         if file.update != self.id {
             anyhow::bail!(
-                "{} was read by another repository update; only the update that read it may remove it",
+                "{} was read by another repository update; only the update that read it may retire it",
                 file.filename()
             );
         }
-        self.changes.remove(file.platform(), file.filename());
+        self.changes.retire(file.platform(), file.filename());
         Ok(())
     }
 
@@ -247,8 +255,8 @@ impl Update<'_> {
     ///
     /// 1. The new databases are written beside the current ones.
     /// 2. `commit` runs, and is tried again if it fails.
-    /// 3. Only once it has succeeded: staged files are moved in, the new
-    ///    databases renamed over the old, and removed files deleted.
+    /// 3. Only once it has succeeded: staged files are moved in and the new
+    ///    databases renamed over the old. Retired files stay for the sweep.
     ///
     /// What can fail and is private comes first, then the riskiest public step,
     /// and last the renames. A failure before step 3 leaves the repository
@@ -262,7 +270,7 @@ impl Update<'_> {
     {
         // `self`, and with it the lock, lives until this function returns:
         // every step below is part of the one serialized change.
-        let root = self.root;
+        let root = self.repo.root();
         let changes = self.take_changes();
 
         if let Some(addition) = changes.add.iter().find(|a| !a.staged.starts_with(root)) {
@@ -299,10 +307,9 @@ impl Update<'_> {
         };
 
         let root = root.to_path_buf();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || publish(&root, &changes, &prepared)).await
-        {
-            error!("publishing a committed repository update panicked: {e}");
+        match tokio::task::spawn_blocking(move || publish(&root, &changes, &prepared)).await {
+            Ok(retired) => self.repo.note_retired(retired, Instant::now()),
+            Err(e) => error!("publishing a committed repository update panicked: {e}"),
         }
         Ok(committed)
     }
@@ -330,6 +337,7 @@ impl Repository {
             root: root.into(),
             lock: tokio::sync::Mutex::new(()),
             updates: AtomicU64::new(0),
+            retired: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -365,11 +373,52 @@ impl Repository {
     pub async fn begin(&self) -> Update<'_> {
         let lock = self.lock.lock().await;
         Update {
-            root: &self.root,
+            repo: self,
             id: self.updates.fetch_add(1, Ordering::Relaxed),
             _lock: lock,
             changes: Changes::default(),
         }
+    }
+
+    /// Delete the retired package files -- present in a platform directory, not
+    /// listed by its `repo.db` -- that have been unlisted for at least
+    /// `grace`. Returns how many files it deleted.
+    ///
+    /// Unlisted by `repo.db` rather than missing from the `files` table: if the
+    /// database were ever wrong wholesale (restored from an old dump, or the
+    /// wrong one), every file would look unpublished and the whole repository
+    /// would go. `repo.db` lives beside the files and only ever changes through
+    /// an update, atomically. A platform directory without a readable
+    /// `repo.db` is skipped for the same reason.
+    ///
+    /// Takes the repository lock: deciding what to delete from what is listed
+    /// is a change like any other, and an update in flight may be about to list
+    /// a file this would otherwise see as unlisted.
+    pub async fn sweep(&self, grace: Duration) -> anyhow::Result<usize> {
+        self.sweep_at(Instant::now(), grace).await
+    }
+
+    async fn sweep_at(&self, now: Instant, grace: Duration) -> anyhow::Result<usize> {
+        let _lock = self.lock.lock().await;
+        let root = self.root.clone();
+        let known = std::mem::take(&mut *self.retired_times());
+        let (still_retired, deleted) =
+            tokio::task::spawn_blocking(move || sweep_retired(&root, known, now, grace)).await?;
+        *self.retired_times() = still_retired;
+        Ok(deleted)
+    }
+
+    fn note_retired(&self, paths: Vec<PathBuf>, when: Instant) {
+        let mut retired = self.retired_times();
+        for path in paths {
+            retired.insert(path, when);
+        }
+    }
+
+    fn retired_times(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, Instant>> {
+        self.retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn platform_dir(root: &Path, platform: Platform) -> PathBuf {
@@ -377,7 +426,7 @@ impl Repository {
     }
 }
 
-/// Step 2: the new databases of every platform the changes touch, beside the
+/// Step 1: the new databases of every platform the changes touch, beside the
 /// current ones. Dot-named, so never served; discarded if anything fails.
 fn prepare(root: &Path, changes: &Changes) -> anyhow::Result<Vec<Prepared>> {
     let mut prepared = Vec::new();
@@ -392,7 +441,7 @@ fn prepare(root: &Path, changes: &Changes) -> anyhow::Result<Vec<Prepared>> {
                 files_next: dir.join(format!(".{FILES_ARCHIVE}.next")),
             };
             let remove: Vec<String> = changes
-                .remove
+                .retire
                 .iter()
                 .filter(|(p, _)| *p == platform)
                 .map(|(_, filename)| filename.clone())
@@ -430,11 +479,11 @@ fn prepare(root: &Path, changes: &Changes) -> anyhow::Result<Vec<Prepared>> {
     Ok(prepared)
 }
 
-/// Step 4: make a committed update visible.
+/// Step 3: make a committed update visible, and return the files it retired.
 ///
 /// Package files first, so everything the new databases list exists before
-/// they do; the databases next; removed files last, once nothing lists them.
-fn publish(root: &Path, changes: &Changes, prepared: &[Prepared]) {
+/// they do; the databases next. Retired files are left where they are.
+fn publish(root: &Path, changes: &Changes, prepared: &[Prepared]) -> Vec<PathBuf> {
     let mut added: HashSet<(Platform, &str)> = HashSet::new();
     for addition in &changes.add {
         let dir = Repository::platform_dir(root, addition.platform);
@@ -450,16 +499,79 @@ fn publish(root: &Path, changes: &Changes, prepared: &[Prepared]) {
         rename_logged(&p.db_next, &p.db);
         rename_logged(&p.files_next, &p.files);
     }
-    for (platform, filename) in &changes.remove {
-        // A rebuild at the same version replaces the file it removes: the new
-        // one is already in place under that name.
+    let mut retired = Vec::new();
+    for (platform, filename) in &changes.retire {
+        // A rebuild at the same version replaces the file it retires: the new
+        // one is already in place, and listed, under that name.
         if added.contains(&(*platform, filename.as_str())) {
             continue;
         }
         let path = Repository::platform_dir(root, *platform).join(filename);
-        remove_logged(&path);
-        remove_logged(&with_suffix(&path, ".sig"));
+        retired.push(with_suffix(&path, ".sig"));
+        retired.push(path);
     }
+    retired
+}
+
+/// Whether a name in a platform directory is a package file or a package's
+/// detached signature -- the only things a sweep ever considers.
+fn is_package_file(name: &str) -> bool {
+    !name.starts_with('.') && name.contains(".pkg.tar.")
+}
+
+/// [`Repository::sweep`], given what is known of when files were retired.
+/// Returns the retirement times still worth keeping, and how many files it
+/// deleted.
+fn sweep_retired(
+    root: &Path,
+    mut known: HashMap<PathBuf, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> (HashMap<PathBuf, Instant>, usize) {
+    let mut still_retired = HashMap::new();
+    let mut deleted = 0;
+    let Ok(platforms) = std::fs::read_dir(root) else {
+        return (still_retired, deleted);
+    };
+    for platform in platforms.flatten() {
+        let dir = platform.path();
+        let hidden = platform.file_name().to_string_lossy().starts_with('.');
+        if hidden || !dir.is_dir() {
+            continue;
+        }
+        let listed = match pacman_repo_utils::listed_filenames(&dir.join(DB_ARCHIVE)) {
+            Ok(listed) => listed,
+            Err(e) => {
+                warn!(
+                    "not sweeping {}: its repo.db cannot be read ({e})",
+                    dir.display()
+                );
+                continue;
+            }
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_package_file(&name) {
+                continue;
+            }
+            let package = name.strip_suffix(".sig").unwrap_or(&name);
+            if listed.contains(package) {
+                continue;
+            }
+            let path = entry.path();
+            let since = known.remove(&path).unwrap_or(now);
+            if now.saturating_duration_since(since) >= grace {
+                remove_logged(&path);
+                deleted += 1;
+            } else {
+                still_retired.insert(path, since);
+            }
+        }
+    }
+    (still_retired, deleted)
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -476,7 +588,7 @@ fn rename_logged(from: &Path, to: &Path) {
 
 fn remove_logged(path: &Path) {
     match std::fs::remove_file(path) {
-        Ok(()) => {}
+        Ok(()) => tracing::info!("deleted retired {}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!("could not remove {}: {e}", path.display()),
     }
@@ -565,10 +677,10 @@ mod tests {
         })
     }
 
-    /// A file read by one update cannot be removed by another: by then it may
+    /// A file read by one update cannot be retired by another: by then it may
     /// belong to someone else.
     #[tokio::test]
-    async fn a_file_read_by_another_update_cannot_be_removed() {
+    async fn a_file_read_by_another_update_cannot_be_retired() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::new(tmp.path());
         let stale = {
@@ -577,9 +689,9 @@ mod tests {
         };
 
         let mut update = repo.begin().await;
-        assert!(update.remove(&stale).is_err());
+        assert!(update.retire(&stale).is_err());
         let fresh = published(&update, &filename("foo", "1.0-1"));
-        assert!(update.remove(&fresh).is_ok());
+        assert!(update.retire(&fresh).is_ok());
     }
 
     /// Commit a change that the database accepts.
@@ -594,13 +706,13 @@ mod tests {
         }
         for filename in remove {
             let file = published(&update, filename);
-            update.remove(&file).unwrap();
+            update.retire(&file).unwrap();
         }
         update.commit(|| async { Ok(()) }).await
     }
 
     #[tokio::test]
-    async fn an_update_publishes_its_additions_and_removals() {
+    async fn an_update_publishes_its_additions_and_retirements() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repository::new(tmp.path());
         let (staged, entry) = stage(&repo, 1, "foo", "1.0-1").await;
@@ -608,12 +720,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed(&repo), ["foo-1.0-1"]);
-        assert!(
-            repo.root()
-                .join("x86_64")
-                .join(filename("foo", "1.0-1"))
-                .exists()
-        );
+        assert!(platform_file(&repo, "foo", "1.0-1").exists());
         assert!(!staged.exists(), "the staged file is moved, not copied");
 
         let (staged, entry) = stage(&repo, 2, "foo", "1.1-1").await;
@@ -622,13 +729,118 @@ mod tests {
             .unwrap();
         assert_eq!(listed(&repo), ["foo-1.1-1"]);
         assert!(
-            !repo
-                .root()
-                .join("x86_64")
-                .join(filename("foo", "1.0-1"))
-                .exists()
+            platform_file(&repo, "foo", "1.0-1").exists(),
+            "a retired file stays downloadable until the sweep"
         );
         assert!(next_files_left(&repo).is_empty());
+    }
+
+    fn platform_file(repo: &Repository, pkgname: &str, pkgver: &str) -> PathBuf {
+        repo.root().join("x86_64").join(filename(pkgname, pkgver))
+    }
+
+    /// Publish foo 1.0 with a detached signature, then 1.1 over it: 1.0 and
+    /// its signature are retired.
+    async fn retire_one(repo: &Repository) {
+        let (staged, entry) = stage(repo, 1, "foo", "1.0-1").await;
+        apply(repo, vec![(staged, entry)], &[]).await.unwrap();
+        std::fs::write(
+            with_suffix(&platform_file(repo, "foo", "1.0-1"), ".sig"),
+            b"sig",
+        )
+        .unwrap();
+        let (staged, entry) = stage(repo, 2, "foo", "1.1-1").await;
+        apply(repo, vec![(staged, entry)], &[filename("foo", "1.0-1")])
+            .await
+            .unwrap();
+    }
+
+    /// A retired file, and its signature, go once unlisted for the grace
+    /// period -- not before, and the published version is never touched.
+    #[tokio::test]
+    async fn the_sweep_deletes_retired_files_once_their_grace_is_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::new(tmp.path());
+        retire_one(&repo).await;
+        let old = platform_file(&repo, "foo", "1.0-1");
+        let grace = Duration::from_secs(3600);
+
+        assert_eq!(repo.sweep(grace).await.unwrap(), 0);
+        assert!(old.exists() && with_suffix(&old, ".sig").exists());
+
+        let later = Instant::now() + grace;
+        assert_eq!(repo.sweep_at(later, grace).await.unwrap(), 2);
+        assert!(!old.exists());
+        assert!(!with_suffix(&old, ".sig").exists());
+        assert!(platform_file(&repo, "foo", "1.1-1").exists());
+        assert_eq!(listed(&repo), ["foo-1.1-1"]);
+    }
+
+    /// A restart forgets when files were retired. The first sweep after it
+    /// starts their grace then, so a restart can only keep a file longer.
+    #[tokio::test]
+    async fn after_a_restart_a_retired_file_gets_its_grace_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grace = Duration::from_secs(3600);
+        retire_one(&Repository::new(tmp.path())).await;
+
+        let restarted = Repository::new(tmp.path());
+        let old = platform_file(&restarted, "foo", "1.0-1");
+        // Long after the retirement, but the first this process has seen of it.
+        assert_eq!(restarted.sweep(grace).await.unwrap(), 0);
+        assert!(old.exists());
+
+        let later = Instant::now() + grace;
+        assert_eq!(restarted.sweep_at(later, grace).await.unwrap(), 2);
+        assert!(!old.exists());
+    }
+
+    /// A file published again under the same name before the sweep is listed
+    /// once more, and stays.
+    #[tokio::test]
+    async fn a_file_listed_again_is_not_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::new(tmp.path());
+        retire_one(&repo).await;
+        let (staged, entry) = stage(&repo, 3, "foo", "1.0-1").await;
+        apply(&repo, vec![(staged, entry)], &[]).await.unwrap();
+
+        let later = Instant::now() + Duration::from_secs(7200);
+        repo.sweep_at(later, Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert!(platform_file(&repo, "foo", "1.0-1").exists());
+        assert_eq!(listed(&repo), ["foo-1.0-1", "foo-1.1-1"]);
+    }
+
+    /// The sweep only ever deletes package files a readable `repo.db` does not
+    /// list: not the databases or anything else beside them, and nothing at
+    /// all in a directory whose `repo.db` is missing.
+    #[tokio::test]
+    async fn the_sweep_leaves_everything_but_unlisted_packages_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::new(tmp.path());
+        retire_one(&repo).await;
+        let x86 = repo.root().join("x86_64");
+        std::fs::write(x86.join("mirrorlist"), b"Server = x").unwrap();
+        let orphan_dir = repo.root().join("aarch64");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("bar-1.0-1-aarch64.pkg.tar.zst"), b"x").unwrap();
+
+        let later = Instant::now() + Duration::from_secs(7200);
+        assert_eq!(
+            repo.sweep_at(later, Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            2,
+            "only foo 1.0 and its signature"
+        );
+
+        assert!(x86.join(DB_ARCHIVE).exists());
+        assert!(x86.join(FILES_ARCHIVE).exists());
+        assert!(x86.join("mirrorlist").exists());
+        assert!(orphan_dir.join("bar-1.0-1-aarch64.pkg.tar.zst").exists());
     }
 
     /// A commit that fails for good leaves the repository exactly as it was:
@@ -646,7 +858,7 @@ mod tests {
         let mut update = repo.begin().await;
         update.add(Platform::X86_64, staged.clone(), entry);
         let foo = published(&update, &filename("foo", "1.0-1"));
-        update.remove(&foo).unwrap();
+        update.retire(&foo).unwrap();
         let failed: anyhow::Result<()> = update
             .commit(|| async {
                 attempts.fetch_add(1, Ordering::SeqCst);

@@ -9,9 +9,10 @@ use sea_orm::{
 };
 use tracing::warn;
 
-/// Delete packages outright: their rows, their artifacts on disk and in
-/// `repo.db`, their build logs and their source checkouts -- all of it, or
-/// none of it.
+/// Delete packages outright: their rows, their artifacts' `repo.db` entries,
+/// their build logs and their source checkouts -- all of it, or none of it.
+/// The artifact files themselves are retired, and deleted by the repository
+/// sweep once clients with an older `repo.db` have had time to fetch them.
 ///
 /// **Refused while anything outside `pkg_ids` depends on one of them.** A
 /// package something still needs keeps everything; deciding that it is no
@@ -42,7 +43,7 @@ pub async fn package_delete(
     // retries a failed commit gets.
     refuse_if_needed(db, &doomed, &ids).await?;
     for file in update.published_files_of(db, &ids).await? {
-        update.remove(&file)?;
+        update.retire(&file)?;
     }
     let doomed = update.commit(|| delete_rows(db, &doomed)).await?;
 

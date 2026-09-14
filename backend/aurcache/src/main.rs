@@ -11,6 +11,7 @@ use aurcache_scheduler::download_flush::start_download_flush;
 use aurcache_scheduler::lease_reaper::start_lease_reaper;
 use aurcache_scheduler::mirror_ranking::start_mirror_rank_job;
 use aurcache_scheduler::official_repos::start_official_repo_refresh;
+use aurcache_scheduler::retired_packages::start_retired_package_sweep;
 use aurcache_scheduler::update_version_check::start_update_version_checking;
 use aurcache_utils::repository::{REPO_ROOT, Repository};
 use aurcache_utils::services::Services;
@@ -106,6 +107,10 @@ async fn main() {
     // Reclaim build jobs whose remote worker went silent (lease liveness).
     let lease_reaper_handle = start_lease_reaper(db.clone());
 
+    // Delete package files the repository stopped listing, once clients with
+    // an older repo.db have had time to fetch them.
+    let retired_sweep_handle = start_retired_package_sweep(Arc::clone(&repo));
+
     // Repository downloads are counted in memory by the file server and folded
     // into the database from here, so serving a package costs no write. Both
     // sides share this one buffer; a second instance would count into a map
@@ -134,6 +139,9 @@ async fn main() {
         }
         _ = lease_reaper_handle => {
             warn!("Lease reaper handle exited");
+        }
+        _ = retired_sweep_handle => {
+            warn!("Retired package sweep handle exited");
         }
         _ = official_repo_handle => {
             warn!("Official repository refresh handle exited");

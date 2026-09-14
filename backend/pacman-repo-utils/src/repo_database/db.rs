@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use tar::{Archive, Builder, Header};
 
@@ -119,10 +120,32 @@ pub fn write_updated_databases(
     })
 }
 
+/// The package files a `repo.db` lists, by the `%FILENAME%` of each entry.
+pub fn listed_filenames(db_archive: &Path) -> anyhow::Result<HashSet<String>> {
+    let mut listed = HashSet::new();
+    let mut archive = Archive::new(GzDecoder::new(BufReader::new(File::open(db_archive)?)));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.file_name().and_then(|n| n.to_str()) != Some("desc") {
+            continue;
+        }
+        let mut desc = String::new();
+        entry.read_to_string(&mut desc)?;
+        let mut lines = desc.lines();
+        while let Some(line) = lines.next() {
+            if line == "%FILENAME%"
+                && let Some(filename) = lines.next()
+            {
+                listed.insert(filename.trim().to_string());
+            }
+        }
+    }
+    Ok(listed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn entry(filename: &str, dir_name: &str) -> PackageEntry {
         PackageEntry {
@@ -252,6 +275,27 @@ mod tests {
         assert_eq!(
             std::fs::read(tmp.path().join("repo.db.tar.gz")).unwrap(),
             before
+        );
+    }
+
+    /// What a database lists is what its entries name, after any update.
+    #[test]
+    fn a_database_lists_the_files_its_entries_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        update(
+            tmp.path(),
+            &[],
+            &[
+                entry("foo-1.0-1-x86_64.pkg.tar.zst", "foo-1.0-1"),
+                entry("bar-2.0-1-x86_64.pkg.tar.zst", "bar-2.0-1"),
+            ],
+        );
+        update(tmp.path(), &["bar-2.0-1-x86_64.pkg.tar.zst"], &[]);
+
+        let listed = listed_filenames(&tmp.path().join("repo.db.tar.gz")).unwrap();
+        assert_eq!(
+            listed,
+            HashSet::from(["foo-1.0-1-x86_64.pkg.tar.zst".to_string()])
         );
     }
 
