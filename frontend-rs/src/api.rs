@@ -19,6 +19,22 @@ pub fn api_base() -> String {
 ///
 /// No token: the session is a cookie the server set during OAuth, and the
 /// browser attaches it to same-origin requests on its own.
+///
+/// The client is wired to send the page to the login flow when the session is
+/// refused. A server restart turns every API call into a 401 — the cookie can
+/// no longer be decoded — and the only way back in is OAuth again, exactly the
+/// trip the server gives an unauthenticated full-page load. A plain page jump
+/// rather than a router navigate: `/api/login` is a server route, and a SPA
+/// navigation to it would render a frontend error screen instead of the login.
 pub fn client() -> Result<AurCacheClient, String> {
-    AurCacheClient::new(api_base(), None).map_err(|e| e.to_string())
+    let login_url = format!("{}/login", api_base());
+    AurCacheClient::new(api_base(), None)
+        .map(|client| {
+            client.on_unauthorized(move || {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.location().assign(&login_url);
+                }
+            })
+        })
+        .map_err(|e| e.to_string())
 }

@@ -46,6 +46,7 @@ use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
@@ -119,6 +120,7 @@ pub struct AurCacheClient {
     base_url: String,
     token: Option<String>,
     client: reqwest::Client,
+    on_unauthorized: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AurCacheClient {
@@ -133,7 +135,21 @@ impl AurCacheClient {
             client: reqwest::Client::builder()
                 .build()
                 .context("failed to build HTTP client")?,
+            on_unauthorized: None,
         })
+    }
+
+    /// Runs `handler` once each time a response comes back as a 401.
+    ///
+    /// A caller in a context where a 401 means "the session is gone" — the
+    /// browser frontend, whose session is a cookie the server can no longer
+    /// decode after a restart — can use this to send the user to the login flow
+    /// instead of leaving the failure to surface as a scattered error message.
+    /// Clients that handle 401s themselves, like the CLI, simply never set it.
+    #[must_use]
+    pub fn on_unauthorized(mut self, handler: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_unauthorized = Some(Arc::new(handler));
+        self
     }
 
     /// Calls the health endpoint and returns success when the instance is healthy.
@@ -170,7 +186,7 @@ impl AurCacheClient {
         let response = self
             .send::<Value>(Method::GET, "/health", &[], None)
             .await?;
-        let response = ensure_success(response).await?;
+        let response = self.success_or_notify(response).await?;
         let landed_on = response.url().to_string();
         if !same_endpoint(&requested, &landed_on) {
             return Ok(ApiReachability::NotApi {
@@ -685,7 +701,7 @@ impl AurCacheClient {
         B: Serialize + ?Sized,
     {
         let response = self.send(method, path, query, body).await?;
-        let response = ensure_success(response).await?;
+        let response = self.success_or_notify(response).await?;
         // Read the body first: `json()` consumes the response, leaving nothing
         // to explain the failure with beyond serde's "expected value at line 1
         // column 1", which describes the symptom and not the cause.
@@ -708,7 +724,7 @@ impl AurCacheClient {
         B: Serialize + ?Sized,
     {
         let response = self.send(method, path, query, body).await?;
-        ensure_success(response).await?;
+        self.success_or_notify(response).await?;
         Ok(())
     }
 
@@ -724,7 +740,7 @@ impl AurCacheClient {
         B: Serialize + ?Sized,
     {
         let response = self.send(method, path, query, body).await?;
-        let response = ensure_success(response).await?;
+        let response = self.success_or_notify(response).await?;
         response
             .text()
             .await
@@ -746,7 +762,7 @@ impl AurCacheClient {
         B: Serialize + ?Sized,
     {
         let response = self.send(method, path, query, body).await?;
-        let response = ensure_success(response).await?;
+        let response = self.success_or_notify(response).await?;
         Ok(response
             .bytes()
             .await
@@ -782,7 +798,9 @@ impl AurCacheClient {
             Some(token) => response.bearer_auth(token),
             None => response,
         };
-        let response = ensure_success(response.send().await.context("request failed")?).await?;
+        let response = self
+            .success_or_notify(response.send().await.context("request failed")?)
+            .await?;
         response
             .json()
             .await
@@ -845,6 +863,33 @@ impl AurCacheClient {
 
         request.send().await.context("request failed")
     }
+
+    /// Turns a response into an error where it is not a success, and runs the
+    /// `on_unauthorized` callback when the failure was the server refusing the
+    /// session.
+    ///
+    /// `probe_api` and friends build raw requests rather than going through
+    /// [`Self::send`], so this is what every call site of the free
+    /// [`ensure_success`] uses instead of it.
+    async fn success_or_notify(&self, response: Response) -> Result<Response> {
+        match ensure_success(response).await {
+            Ok(response) => Ok(response),
+            Err(error) if is_unauthorized_error(&error) => {
+                if let Some(on_unauthorized) = &self.on_unauthorized {
+                    on_unauthorized();
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether the error is the API answering 401 — i.e. the session or token it
+/// was presented with was refused.
+fn is_unauthorized_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiError>()
+        .is_some_and(ApiError::is_unauthorized)
 }
 
 /// Whether a response came back from the endpoint that was asked for.
@@ -994,7 +1039,7 @@ fn looks_like_html(body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_url;
+    use super::{ApiError, endpoint_url};
 
     /// The web UI answers with HTML and a 200, so the decode is where the
     /// mistake first becomes visible -- and "expected value at line 1 column 1"
@@ -1045,5 +1090,34 @@ mod tests {
             endpoint_url("http://localhost:8080/api/", "/packages/list"),
             "http://localhost:8080/api/packages/list"
         );
+    }
+
+    /// Only a 401 counts as a refused session: a 403 means the session was fine
+    /// and the request itself was out of bounds, which the on_unauthorized
+    /// callback must not misread as "the user needs to log in again".
+    #[test]
+    fn only_a_401_marks_the_session_refused() {
+        let unauthorized: anyhow::Error = ApiError {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            message: "session refused".to_string(),
+        }
+        .into();
+        assert!(super::is_unauthorized_error(&unauthorized));
+
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let error: anyhow::Error = ApiError {
+                status,
+                message: "something else".to_string(),
+            }
+            .into();
+            assert!(
+                !super::is_unauthorized_error(&error),
+                "{status} should not count as refused"
+            );
+        }
     }
 }

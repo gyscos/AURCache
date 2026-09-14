@@ -1,6 +1,5 @@
 //! A build's log output.
 
-use crate::api::api_base;
 use crate::dates::AbsoluteDate;
 use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
@@ -8,7 +7,6 @@ use crate::log_tail::{append_capped, coarse_pointer, drop_leading_partial_line, 
 use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
-use aurcache_client::AurCacheClient;
 use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
@@ -336,10 +334,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         let pkgbase = pkgbase_for_poll.clone();
         let number = number;
         async move {
-            let client = match AurCacheClient::new(api_base(), None) {
+            let client = match crate::api::client() {
                 Ok(c) => c,
                 Err(e) => {
-                    error.set(Some(e.to_string()));
+                    error.set(Some(e));
                     return;
                 }
             };

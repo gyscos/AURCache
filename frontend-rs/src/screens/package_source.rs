@@ -1,8 +1,7 @@
 //! Editing a package's source files.
 
-use crate::api::api_base;
 use crate::routes::Route;
-use aurcache_client::{AurCacheClient, SourceFileContent};
+use aurcache_client::SourceFileContent;
 use dioxus::prelude::*;
 
 /// The screen behind `/package/:pkgbase/source/:..path`.
@@ -39,7 +38,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     }));
 
     let files = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
-        let client = AurCacheClient::new(api_base(), None).map_err(|e| e.to_string())?;
+        let client = crate::api::client()?;
         client
             .list_source_files(&pkgbase)
             .await
@@ -55,7 +54,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     let mut status = use_signal(|| Option::<(String, bool)>::None);
 
     let open_file = move |pkgbase: String, path: String| async move {
-        let Ok(client) = AurCacheClient::new(api_base(), None) else {
+        let Ok(client) = crate::api::client() else {
             return;
         };
         match client.get_source_file(&pkgbase, &path).await {
@@ -153,7 +152,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                             let pkgbase = pkgbase.clone();
                             async move {
                                 let Some(path) = selected() else { return };
-                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
+                                let Ok(client) = crate::api::client() else { return };
                                 match client.put_source_file(&pkgbase, &path, &draft()).await {
                                     Ok(()) => {
                                         navigator().push(Route::Package { pkgbase: pkgbase.clone() });
@@ -176,7 +175,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                             let pkgbase = pkgbase.clone();
                             async move {
                                 let Some(path) = selected() else { return };
-                                let Ok(client) = AurCacheClient::new(api_base(), None) else { return };
+                                let Ok(client) = crate::api::client() else { return };
                                 // The rebuild is only queued if the save
                                 // worked: rebuilding the old source would
                                 // report success for a change never stored.
