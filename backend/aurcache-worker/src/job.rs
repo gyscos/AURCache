@@ -1,6 +1,6 @@
 //! End-to-end execution of a single claimed job: download the (server-patched)
-//! source, prepare a per-package chroot copy, import trusted keys, build under a
-//! resource-limited scope while streaming logs and honoring cancellation, then
+//! source, prepare a per-package chroot copy, import trusted keys, build in a
+//! cgroup of its own while streaming logs and honoring cancellation, then
 //! upload artifacts. Returns a terminal [`CompleteReport`]; never panics past
 //! the caller's wrapper.
 
@@ -214,7 +214,7 @@ async fn run_job_inner(
         return Ok(report::classify_exit_canceled());
     }
 
-    // 4. Build under a resource-limited scope, honoring cancel.
+    // 4. Build in the build's own cgroup, honoring cancel.
     log(client, build_id, "[worker] starting build\n").await;
     // Private writable pacman cache for this job. Concurrent builds otherwise
     // share one writable cache directory and race on the same partial
@@ -464,6 +464,11 @@ struct WorkerContext<'a> {
     dropin: &'a Path,
 }
 
+/// How long a killed build's output may stay open before the build is reported
+/// ended anyway. Generous: a killed tree closes its pipes within milliseconds,
+/// so reaching this means something escaped the kill, not that it was slow.
+const KILLED_OUTPUT_GRACE: Duration = Duration::from_secs(30);
+
 async fn run_build(
     ctx: &WorkerContext<'_>,
     client: &Arc<WorkerClient>,
@@ -510,6 +515,15 @@ async fn run_build(
             unsafe {
                 cmd.pre_exec(move || crate::cgroup::BuildCgroup::join_current_process(&handle));
             }
+            // Keep the container in that cgroup too. Left to itself,
+            // systemd-nspawn moves it into a scope of its own under
+            // devtools.slice, where neither `cgroup.kill` nor `memory.peak`
+            // reaches -- a stopped build kept compiling, and the figure was
+            // only the host-side download. The patched makechrootpkg turns this
+            // into `--keep-unit`; see `packaging/patch-makechrootpkg.py`.
+            // Only with a cgroup: without one, the unit nspawn would keep is
+            // the worker's own service.
+            cmd.env("AURCACHE_NSPAWN_KEEP_UNIT", "1");
         }
         // Capture the build's output instead of letting it inherit the
         // worker's stdio. Without this the log a user sees ends at
@@ -634,8 +648,30 @@ async fn run_build(
 
     // Drain the output before reporting: the pumps hold whatever the build
     // printed last, which is exactly what a failure report needs.
-    for pump in pumps {
-        let _ = pump.await;
+    //
+    // A pump ends at EOF, which only comes once *every* holder of the pipe has
+    // exited. After a normal exit that is at once. After a kill it may never
+    // be, if something outlived it -- a container that escaped the cgroup did
+    // exactly that, and the build stayed "active" with its lease held until the
+    // process was stopped by hand. So a killed build waits a bounded time.
+    let drain = async {
+        for pump in pumps {
+            let _ = pump.await;
+        }
+    };
+    if canceled || timed_out {
+        if tokio::time::timeout(KILLED_OUTPUT_GRACE, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "build {build_id} was killed but its output is still open after {}s; \
+                 something outlived the kill. Reporting it ended regardless",
+                KILLED_OUTPUT_GRACE.as_secs()
+            );
+        }
+    } else {
+        drain.await;
     }
 
     // Attached after the fact rather than threaded through every constructor:

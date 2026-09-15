@@ -161,13 +161,14 @@ prepare_chroot
     (
         # `check_root` re-execs through `sudo --preserve-env=<list>`, which
         # drops everything else. A no-op for the worker, which is already root
-        # by then, but without this the drop-in silently vanishes for anyone
-        # invoking the script unprivileged.
-        "AURCACHE_DROPIN kept across the root re-exec",
+        # by then, but without this the drop-in -- and the cgroup placement
+        # below -- silently vanish for anyone invoking the script unprivileged.
+        "AURCACHE_* kept across the root re-exec",
         "check_root SOURCE_DATE_EPOCH,BUILDTOOL,BUILDTOOLVER,GNUPGHOME,SRCDEST,"
         "SRCPKGDEST,PKGDEST,LOGDEST,NPROC,MAKEFLAGS,PACKAGER",
         "check_root SOURCE_DATE_EPOCH,BUILDTOOL,BUILDTOOLVER,GNUPGHOME,SRCDEST,"
-        "SRCPKGDEST,PKGDEST,LOGDEST,NPROC,MAKEFLAGS,PACKAGER,AURCACHE_DROPIN",
+        "SRCPKGDEST,PKGDEST,LOGDEST,NPROC,MAKEFLAGS,PACKAGER,AURCACHE_DROPIN,"
+        "AURCACHE_NSPAWN_KEEP_UNIT",
     ),
     (
         "direct `source PKGBUILD` for pkgbase/pkgname",
@@ -175,34 +176,60 @@ prepare_chroot
         '} < <(sudo -u "$makepkg_user" aurcache-sandbox --allow-build-env -- bash -c \'',
     ),
     (
-        # Not a confinement patch. systemd-nspawn currently permits every socket
-        # address family and warns, in every build log, that a future version
-        # will default to AF_INET, AF_INET6 and AF_UNIX only. Builds would lose
-        # AF_NETLINK -- which glibc uses for `getaddrinfo`'s AI_ADDRCONFIG, so
-        # name resolution is implicated -- along with AF_ALG and AF_PACKET.
-        # Whatever an arbitrary PKGBUILD needs, it is not for this to guess, so
-        # opt out explicitly: `--restrict-address-families=` with an empty
-        # argument is the documented way to keep today's behaviour, and it
-        # silences the notice as a side effect.
+        # Two nspawn options, neither a confinement patch, added by one wrapper.
+        #
+        # `--restrict-address-families=`: systemd-nspawn currently permits
+        # every socket address family and warns, in every build log, that a
+        # future version will default to AF_INET, AF_INET6 and AF_UNIX only.
+        # Builds would lose AF_NETLINK -- which glibc uses for `getaddrinfo`'s
+        # AI_ADDRCONFIG, so name resolution is implicated -- along with AF_ALG
+        # and AF_PACKET. Whatever an arbitrary PKGBUILD needs, it is not for
+        # this to guess, so opt out explicitly: an empty argument is the
+        # documented way to keep today's behaviour, and it silences the notice
+        # as a side effect. Guarded on the version because the option only
+        # exists from systemd 261; a worker mid-upgrade should build rather
+        # than fail on an unknown option.
+        #
+        # `--keep-unit`, when the worker asks for it: arch-nspawn passes
+        # `--slice=devtools-$SUDO_USER`, so by default nspawn runs the container
+        # in a transient scope of its own under devtools.slice -- *outside* the
+        # cgroup the worker created for the build. The worker kills a build
+        # with that cgroup's `cgroup.kill` and reads its `memory.peak`, so the
+        # container escaped both: Stop killed makechrootpkg and left makepkg
+        # and every compiler running, and the memory figure covered only the
+        # host-side download. `--keep-unit` (with the `--register=no` arch-nspawn
+        # already passes) keeps the container in the cgroup nspawn was started
+        # from, as `payload`/`supervisor` children of the build's cgroup; it
+        # also disables `--slice=`, which is the point. The container images
+        # have always forced it (docker/nspawn-wrapper.sh), for want of a
+        # systemd manager to allocate a scope.
+        #
+        # Opt-in through `AURCACHE_NSPAWN_KEEP_UNIT` rather than always on: the
+        # worker sets it only when it has created a cgroup for the build, and
+        # nspawn refuses `--keep-unit` from a user session, which is where
+        # someone running this copy by hand would be.
         #
         # A shell function rather than five edits: makechrootpkg calls
         # `arch-nspawn` unqualified in five places, and a function of that name
-        # takes precedence over the PATH lookup in all of them. The flag has to
-        # land straight after the working directory, since everything after it
-        # is the command to run inside the container.
-        #
-        # Guarded on the version because the option only exists from systemd
-        # 261. Both supported targets are Arch and roll forward, but a worker
-        # mid-upgrade should build rather than fail on an unknown option.
-        "arch-nspawn wrapper opting out of address-family filtering",
+        # takes precedence over the PATH lookup in all of them. The flags have
+        # to land straight after the working directory, since everything after
+        # it is the command to run inside the container.
+        "arch-nspawn wrapper: address families, and the build's own cgroup",
         "bindmounts_ro=()",
-        """_aurcache_nspawn_version=$(systemd-nspawn --version 2>/dev/null \\
+        """_aurcache_nspawn_args=()
+_aurcache_nspawn_version=$(systemd-nspawn --version 2>/dev/null \\
 \t| awk 'NR==1 {print $2 + 0; exit}')
 if [[ -n ${_aurcache_nspawn_version:-} ]] && (( _aurcache_nspawn_version >= 261 )); then
+\t_aurcache_nspawn_args+=(--restrict-address-families=)
+fi
+if [[ ${AURCACHE_NSPAWN_KEEP_UNIT:-} == 1 ]]; then
+\t_aurcache_nspawn_args+=(--keep-unit)
+fi
+if (( ${#_aurcache_nspawn_args[@]} )); then
 \tarch-nspawn() {
 \t\tlocal _aurcache_dir=$1
 \t\tshift
-\t\tcommand arch-nspawn "$_aurcache_dir" --restrict-address-families= "$@"
+\t\tcommand arch-nspawn "$_aurcache_dir" "${_aurcache_nspawn_args[@]}" "$@"
 \t}
 fi
 

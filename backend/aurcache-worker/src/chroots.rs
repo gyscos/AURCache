@@ -1092,6 +1092,9 @@ impl Lease {
     pub async fn release(mut self) {
         self.released = true;
         if !matches!(self.strategy, Strategy::Overlay) {
+            // devtools deletes its copy itself, unless the build was killed
+            // before its EXIT trap could.
+            chroot::remove_leftover_copy(&self.dir, &self.label).await;
             return;
         }
         let merged = self.dir.join(&self.label);

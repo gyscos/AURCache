@@ -86,7 +86,7 @@ impl Hierarchy {
         let dir = self.base.join(format!("build-{build_id}"));
         // A cgroup left by a previous attempt at the same build is empty by
         // now; removing it is what keeps `memory.peak` about this attempt.
-        let _ = fs::remove_dir(&dir);
+        let _ = remove_cgroup_tree(&dir);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(BuildCgroup { dir })
     }
@@ -165,10 +165,28 @@ impl Drop for BuildCgroup {
         // A cgroup that somehow still holds one cannot be removed, and leaving
         // it is better than blocking the worker: `for_build` clears it next
         // time the same build number comes round.
-        if let Err(e) = fs::remove_dir(&self.dir) {
+        if let Err(e) = remove_cgroup_tree(&self.dir) {
             tracing::debug!("could not remove {}: {e}", self.dir.display());
         }
     }
+}
+
+/// Remove a cgroup and every cgroup beneath it, deepest first.
+///
+/// cgroupfs refuses `rmdir` on a cgroup that still has child cgroups, and a
+/// build's has two: systemd-nspawn, kept in the build's cgroup with
+/// `--keep-unit`, creates `payload` and `supervisor` inside it. Removing only
+/// the top left every build's cgroup behind for good. The files in a cgroup
+/// are the kernel's and go with its directory, so only directories are
+/// removed -- which is also all `rmdir` can do, so nothing outside cgroupfs is
+/// at risk.
+fn remove_cgroup_tree(dir: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)?.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_cgroup_tree(&entry.path())?;
+        }
+    }
+    fs::remove_dir(dir)
 }
 
 /// This process's own cgroup directory.
@@ -202,6 +220,21 @@ fn parse_peak(raw: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape nspawn leaves under a build's cgroup. A plain directory tree
+    /// stands in for cgroupfs, where the kernel's files go with each directory.
+    #[test]
+    fn a_build_cgroup_is_removed_with_the_cgroups_nspawn_made_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build-997");
+        fs::create_dir_all(build.join("payload/nested")).unwrap();
+        fs::create_dir_all(build.join("supervisor")).unwrap();
+
+        remove_cgroup_tree(&build).unwrap();
+
+        assert!(!build.exists());
+        assert!(tmp.path().exists());
+    }
 
     /// The unified hierarchy is the `0::` line; v1 controller lines sit
     /// alongside it on a hybrid host and mean something else entirely.

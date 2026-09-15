@@ -31,18 +31,19 @@ pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::Exit
 /// `SUDO_USER` inference, so it is `builder` and never `aurcache` -- see
 /// `build::build_command`.
 ///
-/// Three variables are preserved, because sudo would otherwise drop all of
+/// Four variables are preserved, because sudo would otherwise drop all of
 /// them: `GNUPGHOME` names this build's keyring replica (see
 /// [`prepare_job_keyring`]), `SRCDEST` the source cache `makechrootpkg` binds
-/// itself, and `AURCACHE_DROPIN` the makepkg overrides it installs into this
-/// build's chroot copy. `PKGDEST` reaches the build through `makepkg.conf`
-/// instead, so preserving it here would be a no-op.
+/// itself, `AURCACHE_DROPIN` the makepkg overrides it installs into this
+/// build's chroot copy, and `AURCACHE_NSPAWN_KEEP_UNIT` whether the container
+/// stays in the build's cgroup. `PKGDEST` reaches the build through
+/// `makepkg.conf` instead, so preserving it here would be a no-op.
 pub fn devtools(program: &str) -> Command {
     let mut cmd = Command::new("sudo");
     // `SRCDEST` is how `makechrootpkg` is told where to keep downloaded
     // sources; sudo would otherwise strip it and devtools would silently fall
     // back to the PKGBUILD directory, losing the cache.
-    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN")
+    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN,AURCACHE_NSPAWN_KEEP_UNIT")
         .arg(program);
     cmd
 }
@@ -580,6 +581,43 @@ fn is_stale_copy(name: &str) -> bool {
     name.starts_with("job-") && !name.ends_with(".lock")
 }
 
+/// Whether `name` is the copy `makechrootpkg -l <label> -T` made: `-T` appends
+/// `-$$`, so `<label>-<pid>` and nothing else. Exact, because labels share
+/// prefixes -- `job-99`'s copy must never match `job-995-482762`.
+fn is_copy_of(name: &str, label: &str) -> bool {
+    name.strip_prefix(label)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Delete the copy one build's `makechrootpkg` left behind, if it left one.
+///
+/// It deletes its own copy on the way out -- from an EXIT trap, which a SIGKILL
+/// never runs. Stopping a build kills its whole cgroup, so every stopped build
+/// used to leave a full chroot copy (4.4G for unreal-engine) on disk until the
+/// worker next restarted and swept `job-*`. Called once the build's tree is
+/// dead, and matching only this build's label, so it cannot reach a copy
+/// another build is using. A build that ended normally has nothing here, and
+/// this costs one `read_dir`.
+pub async fn remove_leftover_copy(chroot_dir: &Path, label: &str) {
+    let Ok(entries) = std::fs::read_dir(chroot_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !is_copy_of(&entry.file_name().to_string_lossy(), label) {
+            continue;
+        }
+        let path = entry.path();
+        match remove_copy(&path).await {
+            Ok(()) => tracing::info!(
+                "removed chroot copy {} left by a killed build",
+                path.display()
+            ),
+            Err(e) => tracing::warn!("could not remove chroot copy {}: {e:#}", path.display()),
+        }
+    }
+}
+
 /// The lock `makechrootpkg` takes for a copy, which sits beside it rather than
 /// inside it.
 fn lock_beside(path: &Path) -> Option<PathBuf> {
@@ -781,6 +819,19 @@ mod tests {
         assert!(!is_stale_copy("job-604-2844759.lock"));
         assert!(!is_stale_copy("root"));
         assert!(!is_stale_copy("root.lock"));
+    }
+
+    /// A killed build's copy is found by its own label only. Labels share
+    /// prefixes, so a looser match would delete a copy a running build is in.
+    #[test]
+    fn a_leftover_copy_is_matched_by_its_own_label_only() {
+        assert!(is_copy_of("job-995-482762", "job-995"));
+        assert!(!is_copy_of("job-995-482762", "job-99"));
+        assert!(!is_copy_of("job-995-482762.lock", "job-995"));
+        assert!(!is_copy_of("job-995", "job-995"));
+        assert!(!is_copy_of("job-995-", "job-995"));
+        assert!(!is_copy_of("job-995-abc", "job-995"));
+        assert!(!is_copy_of("root", "job-995"));
     }
 
     /// One build's overrides go to a file of that build's own, which
