@@ -13,18 +13,15 @@
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
-use aurcache_db::helpers::time::now_secs;
-use aurcache_db::helpers::worker_jobs::{
-    STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS,
-};
-use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::builds;
+use aurcache_db::helpers::time::now_secs;
+use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
+use aurcache_db::prelude::{Builds, Packages};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
@@ -93,10 +90,7 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
     let cas = Builds::update_many()
         .col_expr(builds::Column::Status, BuildStates::FAILED_BUILD.into())
         .col_expr(builds::Column::EndTime, Some(now).into())
-        .col_expr(
-            builds::Column::EndReason,
-            Some(EndReasons::CANCELED).into(),
-        )
+        .col_expr(builds::Column::EndReason, Some(EndReasons::CANCELED).into())
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
         .filter(builds::Column::Id.eq(build_id))
         .filter(builds::Column::Status.is_in([
@@ -125,7 +119,8 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
 
     // The row is terminal now; appending the reason is best-effort and last.
     if let Some(pkg) = pkg
-        && let Err(e) = append_build_output(&pkg.name, build.number, "Cancelled by operator.\n").await
+        && let Err(e) =
+            append_build_output(&pkg.name, build.number, "Cancelled by operator.\n").await
     {
         warn!("could not append cancel note to build #{build_id}: {e}");
     }
