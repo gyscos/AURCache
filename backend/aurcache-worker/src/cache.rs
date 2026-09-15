@@ -74,9 +74,21 @@ impl Cache {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
     }
 
-    /// Name of the file caching a tree's measured size, written after each
-    /// build so reclaim never has to walk one.
-    const SIZE_STAMP: &'static str = ".aurcache-size";
+    /// The file caching a tree's measured size, written after each build so
+    /// reclaim never has to walk one.
+    ///
+    /// Beside the trees rather than inside them. A tree is the build user's --
+    /// makepkg creates it, mode 755 -- so the worker cannot write into it, and
+    /// a stamp kept there was never once written: every reclaim walked every
+    /// tree. `.sizes` is not a platform name, so it is never taken for a
+    /// platform's tree root.
+    fn size_stamp(&self, platform: &str, pkgbase: &str) -> PathBuf {
+        self.root
+            .join("builddir")
+            .join(".sizes")
+            .join(sanitize(platform))
+            .join(sanitize(pkgbase))
+    }
 
     /// Record how big a package's persistent tree is, so reclaim can total the
     /// cache without walking it.
@@ -84,7 +96,7 @@ impl Cache {
     /// Called once after a build, where the cost rides on top of something that
     /// already took minutes or hours. Measuring during reclaim instead would
     /// mean walking every candidate on every build, and these trees reach
-    /// 130 GB and millions of files.
+    /// 130 GB and millions of files. Blocking: run it off the async runtime.
     pub fn record_builddir_size(&self, platform: &str, pkgbase: &str) {
         let Some(tree) = self.builddir(platform).map(|r| r.join(sanitize(pkgbase))) else {
             return;
@@ -92,9 +104,21 @@ impl Cache {
         if !tree.is_dir() {
             return;
         }
-        let size = dir_size(&tree);
-        if let Err(e) = std::fs::write(tree.join(Self::SIZE_STAMP), size.to_string()) {
-            tracing::debug!("could not record size of {}: {e}", tree.display());
+        let size = measure_tree(&tree);
+        self.write_size_stamp(platform, pkgbase, size);
+    }
+
+    fn write_size_stamp(&self, platform: &str, pkgbase: &str, size: u64) {
+        let stamp = self.size_stamp(platform, pkgbase);
+        let written = stamp
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&stamp, size.to_string()));
+        if let Err(e) = written {
+            tracing::warn!(
+                "could not record build tree size in {}: {e}",
+                stamp.display()
+            );
         }
     }
 
@@ -139,6 +163,8 @@ impl Cache {
     ///
     /// Best-effort. Failing to reclaim is worth reporting and carrying on;
     /// refusing to build over it would turn a full disk into an idle worker.
+    /// Blocking, and a tree can take minutes to delete: run it off the async
+    /// runtime.
     pub fn reclaim_builddirs(
         &self,
         platform: &str,
@@ -149,6 +175,8 @@ impl Cache {
         let Some(root) = self.builddir(platform) else {
             return;
         };
+        // Finish any removal an earlier pass started and could not complete.
+        sweep_set_aside(&root);
 
         // Oldest first. `mtime` on the tree root moves whenever a build writes
         // into it, which makes it a serviceable "last used" -- and a tree whose
@@ -158,10 +186,11 @@ impl Cache {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| !is_set_aside(&e.file_name()))
             .filter_map(|e| {
                 let modified = e.metadata().ok()?.modified().ok()?;
                 let path = e.path();
-                let size = Self::stamped_size(&path);
+                let size = self.stamped_size(platform, &path);
                 Some((modified, path, size))
             })
             .collect();
@@ -184,9 +213,12 @@ impl Cache {
             {
                 continue;
             }
-            match std::fs::remove_dir_all(&path) {
+            match remove_tree(&path) {
                 Ok(()) => {
                     total = total.saturating_sub(size);
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        let _ = std::fs::remove_file(self.size_stamp(platform, name));
+                    }
                     tracing::info!(
                         "reclaimed persistent build tree {} ({size} bytes)",
                         path.display()
@@ -200,15 +232,17 @@ impl Cache {
     /// A tree's recorded size, measuring and stamping it if no stamp is there.
     /// Tolerates a stamp carrying more than one field, from the brief time a
     /// rebuild cost was recorded alongside.
-    fn stamped_size(tree: &Path) -> u64 {
-        let stamp = tree.join(Self::SIZE_STAMP);
-        if let Ok(text) = std::fs::read_to_string(&stamp)
+    fn stamped_size(&self, platform: &str, tree: &Path) -> u64 {
+        let Some(name) = tree.file_name().and_then(|n| n.to_str()) else {
+            return measure_tree(tree);
+        };
+        if let Ok(text) = std::fs::read_to_string(self.size_stamp(platform, name))
             && let Some(Ok(size)) = text.split_whitespace().next().map(str::parse)
         {
             return size;
         }
-        let size = dir_size(tree);
-        let _ = std::fs::write(&stamp, size.to_string());
+        let size = measure_tree(tree);
+        self.write_size_stamp(platform, name, size);
         size
     }
 
@@ -538,9 +572,7 @@ impl Cache {
     /// cold (self-heal). Best-effort.
     pub fn wipe_srcdest(&self, pkgbase: &str) {
         let path = self.root.join("srcdest").join(sanitize(pkgbase));
-        if let Err(e) = std::fs::remove_dir_all(&path)
-            && path.exists()
-        {
+        if let Err(e) = remove_tree(&path) {
             tracing::warn!("could not wipe cache {}: {e}", path.display());
         }
     }
@@ -548,6 +580,7 @@ impl Cache {
     /// Evict LRU source-cache entries above the size/TTL budget, skipping any
     /// pkgbase currently in use. Returns the pkgbases evicted.
     pub fn evict(&self, in_use: &[String]) -> Vec<String> {
+        sweep_set_aside(&self.root.join("srcdest"));
         let entries = self.scan_srcdest();
         let plan = plan_eviction(&entries, self.max_size, self.ttl, SystemTime::now(), in_use);
         for pkgbase in &plan {
@@ -566,7 +599,7 @@ impl Cache {
             return entries;
         };
         for ent in read.flatten() {
-            if !ent.file_type().is_ok_and(|t| t.is_dir()) {
+            if !ent.file_type().is_ok_and(|t| t.is_dir()) || is_set_aside(&ent.file_name()) {
                 continue;
             }
             let pkgbase = ent.file_name().to_string_lossy().into_owned();
@@ -979,7 +1012,7 @@ mod pkgcache_tests {
         for (name, age) in [("old", 300), ("mid", 200), ("wanted", 100)] {
             let tree = root.join(name);
             std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+            c.write_size_stamp("x86_64", name, 100);
             let when = SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&tree)
                 .unwrap()
@@ -1012,7 +1045,7 @@ mod pkgcache_tests {
         for (name, age) in [("sibling", 300), ("idle", 200), ("mine", 100)] {
             let tree = root.join(name);
             std::fs::create_dir_all(&tree).unwrap();
-            std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+            c.write_size_stamp("x86_64", name, 100);
             let when = SystemTime::now() - Duration::from_secs(age);
             std::fs::File::open(&tree)
                 .unwrap()
@@ -1046,7 +1079,7 @@ mod pkgcache_tests {
 
         let tree = root.join("ancient");
         std::fs::create_dir_all(&tree).unwrap();
-        std::fs::write(tree.join(Cache::SIZE_STAMP), "100").unwrap();
+        c.write_size_stamp("x86_64", "ancient", 100);
         let when = SystemTime::now() - Duration::from_secs(365 * 24 * 60 * 60);
         std::fs::File::open(&tree)
             .unwrap()
@@ -1072,12 +1105,99 @@ mod pkgcache_tests {
         std::fs::create_dir_all(tree.join("deep")).unwrap();
         write(&tree.join("deep").join("blob"), 4096);
 
-        assert_eq!(Cache::stamped_size(&tree), 4096);
-        // And it is stamped, so the walk happens once.
+        assert_eq!(c.stamped_size("x86_64", &tree), 4096);
+        // And it is stamped, so the walk happens once -- beside the tree, which
+        // the build user owns, not inside it.
         assert_eq!(
-            std::fs::read_to_string(tree.join(Cache::SIZE_STAMP)).unwrap(),
+            std::fs::read_to_string(c.size_stamp("x86_64", "unstamped")).unwrap(),
             "4096"
         );
+        assert!(!tree.join(".aurcache-size").exists());
+    }
+
+    /// A walk that cannot read part of a tree says so, rather than reporting
+    /// the readable part as the whole: makepkg leaves `pkg/` mode 111.
+    #[test]
+    fn a_walk_that_cannot_see_everything_is_not_complete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(tree.join("pkg")).unwrap();
+        write(&tree.join("pkg").join("blob"), 4096);
+        write(&tree.join("readable"), 100);
+        assert_eq!(dir_size(&tree), (4196, true));
+
+        std::fs::set_permissions(tree.join("pkg"), std::fs::Permissions::from_mode(0o111)).unwrap();
+        let unreadable = std::fs::read_dir(tree.join("pkg")).is_err();
+        let measured = dir_size(&tree);
+        std::fs::set_permissions(tree.join("pkg"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root reads everything, so the case only exists for a normal user.
+        if unreadable {
+            assert_eq!(measured, (100, false));
+        }
+    }
+
+    /// A reclaimed tree leaves nothing under its own name, and nothing set
+    /// aside once the removal succeeds; its stamp goes with it.
+    #[test]
+    fn a_reclaimed_tree_is_set_aside_then_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+        let tree = root.join("gone");
+        std::fs::create_dir_all(tree.join("src/deep")).unwrap();
+        write(&tree.join("src/deep/blob"), 10);
+        c.write_size_stamp("x86_64", "gone", 1000);
+
+        c.reclaim_builddirs("x86_64", &[], 1, 0);
+
+        assert!(!tree.exists());
+        assert!(!c.size_stamp("x86_64", "gone").exists());
+        let left: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// Something an earlier pass set aside and could not delete is neither a
+    /// tree to count nor a source cache entry, and the next pass finishes it.
+    #[test]
+    fn a_tree_left_set_aside_is_swept_and_never_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+
+        let root = c.builddir("x86_64").unwrap();
+        let aside = root.join(".old.aurcache-removing");
+        std::fs::create_dir_all(aside.join("src")).unwrap();
+        // Would breach any budget if it were counted as a tree.
+        c.reclaim_builddirs("x86_64", &[], 1, 0);
+        assert!(!aside.exists());
+
+        let srcdest = c.srcdest("pkg").unwrap();
+        let src_aside = srcdest.with_file_name(".pkg.aurcache-removing");
+        std::fs::create_dir_all(&src_aside).unwrap();
+        assert!(
+            c.scan_srcdest()
+                .iter()
+                .all(|e| !e.pkgbase.ends_with(SET_ASIDE_SUFFIX))
+        );
+        c.evict(&[]);
+        assert!(!src_aside.exists());
+    }
+
+    /// Removing a name whose earlier removal did not finish still works: the
+    /// leftover would otherwise block the rename.
+    #[test]
+    fn removal_is_not_blocked_by_an_unfinished_earlier_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("pkg");
+        std::fs::create_dir_all(tree.join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pkg.aurcache-removing/b")).unwrap();
+
+        remove_tree(&tree).unwrap();
+
+        assert!(!tree.exists());
+        assert!(!tmp.path().join(".pkg.aurcache-removing").exists());
+        remove_tree(&tree).unwrap();
     }
 
     #[test]
@@ -1366,22 +1486,155 @@ fn free_bytes(path: &Path) -> Option<u64> {
     (rc == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-/// Bytes occupied under `path`, following no symlinks.
+/// Bytes under `path`, measured as whoever can read all of it.
 ///
-/// Only ever called for a tree with no size stamp -- the first reclaim after
-/// one appears, or one left by an older version.
-fn dir_size(path: &Path) -> u64 {
+/// A build tree is the build user's, and not all of it is readable to the
+/// worker: makepkg leaves `pkg/` mode 111, and that is 128G of unreal-engine's
+/// 333G. Walked as the worker, such a tree silently measured as a fraction of
+/// itself and never counted against the budget. So a walk that could not see
+/// everything is redone with `sudo du`, as the chroot operations already use
+/// sudo; where that is not available either, the partial figure is the best
+/// there is.
+fn measure_tree(path: &Path) -> u64 {
+    let (size, complete) = dir_size(path);
+    if complete {
+        return size;
+    }
+    privileged_du(path).unwrap_or(size)
+}
+
+/// Bytes occupied under `path`, following no symlinks, and whether every
+/// directory and entry could be read.
+fn dir_size(path: &Path) -> (u64, bool) {
     let mut total = 0;
+    let mut complete = true;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            complete = false;
+            continue;
+        };
+        for entry in read {
+            let Ok(meta) = entry.and_then(|e| e.metadata().map(|m| (e.path(), m))) else {
+                complete = false;
+                continue;
+            };
+            let (path, meta) = meta;
             if meta.is_dir() {
-                stack.push(entry.path());
+                stack.push(path);
             } else if meta.is_file() {
                 total += meta.len();
             }
         }
     }
-    total
+    (total, complete)
+}
+
+/// `du` as root, for a tree the worker cannot read all of.
+///
+/// `-n` so a host without the sudoers grant fails at once instead of waiting on
+/// a password prompt no one will answer.
+fn privileged_du(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("sudo")
+        .args(["-n", "du", "-s", "--bytes", "--one-file-system", "--"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::debug!(
+            "sudo du {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// What a tree is renamed to while it is being removed.
+const SET_ASIDE_SUFFIX: &str = ".aurcache-removing";
+
+/// Whether a directory entry is a tree set aside for removal, rather than a
+/// cache entry of its own.
+fn is_set_aside(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().ends_with(SET_ASIDE_SUFFIX)
+}
+
+/// Remove a cache tree the build user may have written into.
+///
+/// Such a tree is not the worker's to delete: makepkg and the build write it
+/// as the build user, mode 755, and the worker can only unlink what sits
+/// directly in a directory it may write. `remove_dir_all` as the worker failed
+/// on every build tree ("Permission denied") -- none was ever reclaimed -- and
+/// on source caches it failed *partway*, taking the tarballs next to a git
+/// checkout it could not touch.
+///
+/// So the tree is renamed aside first, which needs only the parent directory
+/// the worker owns. Nothing is ever left half-deleted under the name makepkg
+/// looks for -- a partial build tree reads as resumable, a partial checkout as
+/// something to update. Then it is deleted: as the worker where that is enough,
+/// otherwise with `sudo rm`, as the chroot operations already are. A removal
+/// that fails even so stays set aside, never counted as an entry, and is
+/// finished by [`sweep_set_aside`] on a later pass.
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::other("no file name to set aside"));
+    };
+    let aside = path.with_file_name(format!(".{}{SET_ASIDE_SUFFIX}", name.to_string_lossy()));
+    // An earlier removal of the same name that did not finish would make the
+    // rename fail on a non-empty target.
+    if aside.exists() {
+        remove_set_aside(&aside)?;
+    }
+    match std::fs::rename(path, &aside) {
+        Ok(()) => remove_set_aside(&aside),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Delete a tree already renamed aside.
+fn remove_set_aside(aside: &Path) -> std::io::Result<()> {
+    let Err(e) = std::fs::remove_dir_all(aside) else {
+        return Ok(());
+    };
+    match e.kind() {
+        std::io::ErrorKind::NotFound => Ok(()),
+        std::io::ErrorKind::PermissionDenied => privileged_rm(aside).map_err(|with_sudo| {
+            std::io::Error::new(e.kind(), format!("{e}; and with sudo: {with_sudo}"))
+        }),
+        _ => Err(e),
+    }
+}
+
+/// `rm -rf` as root. `--one-file-system`, as devtools removes chroot copies: a
+/// bind mount left behind under a tree must not be walked into.
+fn privileged_rm(path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("sudo")
+        .args(["-n", "rm", "-rf", "--one-file-system", "--"])
+        .arg(path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() && !path.exists() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Finish removing whatever an earlier pass set aside and could not delete.
+fn sweep_set_aside(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if !is_set_aside(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(e) = remove_set_aside(&path) {
+            tracing::warn!("could not remove {}: {e}", path.display());
+        }
+    }
 }

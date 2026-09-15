@@ -254,12 +254,14 @@ async fn run_job_inner(
             .iter()
             .cloned()
             .collect();
-        cache.reclaim_builddirs(
-            &job.arch,
-            &in_use,
-            cfg.core.builddir_max_bytes,
-            cfg.core.builddir_min_free,
-        );
+        // On the blocking pool: deleting a tree of millions of files takes
+        // minutes, and this build waits for it anyway.
+        let (reclaim_cache, arch) = (cache.clone(), job.arch.clone());
+        let (max_bytes, min_free) = (cfg.core.builddir_max_bytes, cfg.core.builddir_min_free);
+        let _ = tokio::task::spawn_blocking(move || {
+            reclaim_cache.reclaim_builddirs(&arch, &in_use, max_bytes, min_free);
+        })
+        .await;
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
         } else {
@@ -684,7 +686,9 @@ async fn run_build(
     // on a build that already took minutes, instead of walking every candidate
     // on every future build.
     if job.persistent_builddir {
-        cache.record_builddir_size(&job.arch, &job.pkgbase);
+        let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
+        let _ =
+            tokio::task::spawn_blocking(move || cache.record_builddir_size(&arch, &pkgbase)).await;
     }
 
     let mut report = if timed_out {
