@@ -1074,19 +1074,14 @@ fn BuildConfigCard(pkg: ExtendedPackage, on_changed: EventHandler<()>) -> Elemen
                     on_changed,
                 }
                 PersistBuildDirField { pkgbase: pkg.name.clone() }
-                Field { label: "Patch",
-                    if pkg.has_patch {
-                        span { class: "badge badge-warning badge-sm", "applied" }
-                    } else {
-                        span { class: "opacity-60", "none" }
-                    }
-                }
-                // Editing the sources is what creates or clears that patch, so
-                // it sits with it rather than in the page header.
+                ArtifactSizeField { pkgbase: pkg.name.clone() }
+                // Editing the sources is what creates or clears the package's
+                // patch, so the button says whether there is one rather than a
+                // row of its own saying so beside it.
                 Link {
                     class: "btn btn-sm btn-block mt-2",
                     to: Route::PackageSource { pkgbase: pkg.name.clone(), path: vec![] },
-                    "Edit sources"
+                    if pkg.has_patch { "Edit sources (patch exists)" } else { "Edit sources" }
                 }
                 // The per-package makepkg.conf/pacman.conf overrides. They
                 // need a page of their own — two full-height editors — and
@@ -1231,6 +1226,145 @@ fn PersistBuildDirField(pkgbase: String) -> Element {
                                 && let Some(name) = Setting::PersistentBuilddir.meta().env_name
                             {
                                 p { class: "text-xs text-warning", "unset ${name} to allow control here" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The largest package file this package's builds may upload.
+///
+/// A server setting that resolves per package (see `Setting::MaxArtifactSize`),
+/// so one outsized package can be allowed more without raising the limit for
+/// all. Shown as the size it is written in (`20G`), with where the value comes
+/// from; typing a new one offers Save, and a package override offers Reset.
+#[component]
+fn ArtifactSizeField(pkgbase: String) -> Element {
+    let mut busy = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    // What is in the box. `None` until the setting has loaded, so a load does
+    // not overwrite something already typed.
+    let mut draft = use_signal(|| Option::<String>::None);
+
+    let mut entry = use_resource(use_reactive(&pkgbase, move |pkgbase| async move {
+        client()?
+            .settings(Some(&pkgbase))
+            .await
+            .map_err(|e| e.to_string())
+    }));
+
+    use_effect(move || {
+        if let Some(Ok(settings)) = entry.read().as_ref() {
+            draft.set(Some(aurcache_common::units::format_size(
+                settings.max_artifact_size.value,
+            )));
+        }
+    });
+
+    let save_pkgbase = pkgbase.clone();
+    let save = move |_| {
+        let pkgbase = save_pkgbase.clone();
+        async move {
+            let Some(value) = draft() else { return };
+            busy.set(true);
+            error.set(None);
+            let outcome = match client() {
+                Ok(client) => client
+                    .patch_setting(
+                        Some(&pkgbase),
+                        Setting::MaxArtifactSize.meta().key,
+                        value.trim(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            busy.set(false);
+            match outcome {
+                Ok(()) => entry.restart(),
+                Err(e) => error.set(Some(e)),
+            }
+        }
+    };
+
+    let reset = move |_| {
+        let pkgbase = pkgbase.clone();
+        async move {
+            busy.set(true);
+            error.set(None);
+            let outcome = match client() {
+                Ok(client) => client
+                    .reset_setting(Some(&pkgbase), Setting::MaxArtifactSize.meta().key)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            busy.set(false);
+            match outcome {
+                Ok(()) => entry.restart(),
+                Err(e) => error.set(Some(e)),
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "flex gap-2 py-1 text-sm items-center",
+            span { class: "opacity-60 w-32 shrink-0", "Max artifact size" }
+            div { class: "min-w-0 flex-1",
+                match &*entry.read_unchecked() {
+                    None => rsx! { span { class: "loading loading-spinner loading-xs" } },
+                    Some(Err(e)) => rsx! {
+                        span { class: "text-xs text-error", "Could not load the setting: {e}" }
+                    },
+                    Some(Ok(settings)) => {
+                        let current = aurcache_common::units::format_size(settings.max_artifact_size.value);
+                        let source = settings.max_artifact_size.source;
+                        // No lock for an environment variable: a package's own
+                        // value outranks it (Package -> Env -> Global -> Default),
+                        // so an override here still applies.
+                        let changed = draft().is_some_and(|d| d.trim() != current);
+                        rsx! {
+                            div { class: "flex items-center gap-2 flex-wrap",
+                                input {
+                                    r#type: "text",
+                                    class: "input input-bordered input-xs w-24 font-mono",
+                                    placeholder: "20G",
+                                    disabled: busy(),
+                                    value: draft().unwrap_or_default(),
+                                    oninput: move |e| draft.set(Some(e.value())),
+                                }
+                                span {
+                                    class: "badge badge-ghost badge-sm",
+                                    title: "Where this value comes from",
+                                    match source {
+                                        SettingSource::Package => "this package",
+                                        SettingSource::Global => "global",
+                                        SettingSource::Env => "environment",
+                                        SettingSource::Default => "default",
+                                    }
+                                }
+                                if changed {
+                                    button {
+                                        class: "btn btn-primary btn-xs",
+                                        disabled: busy(),
+                                        onclick: save,
+                                        "Save"
+                                    }
+                                }
+                                if source == SettingSource::Package && !busy() {
+                                    button {
+                                        class: "btn btn-ghost btn-xs",
+                                        title: "Discard this package's limit and use the global one again",
+                                        onclick: reset,
+                                        "Reset"
+                                    }
+                                }
+                            }
+                            if let Some(message) = error() {
+                                p { class: "text-xs text-error", "{message}" }
                             }
                         }
                     }

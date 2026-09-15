@@ -458,8 +458,16 @@ pub async fn package_source_files(
         .list_files(&pkg.source_data)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    // A patch that no longer parses marks nothing here; opening the file is
+    // where that is reported.
+    let patched = pkg
+        .patch
+        .as_deref()
+        .and_then(|raw| SourcePatch::parse(raw).ok())
+        .map(|patch| patch.paths().map(str::to_string).collect())
+        .unwrap_or_default();
 
-    Ok(Json(SourceFileList { files }))
+    Ok(Json(SourceFileList { files, patched }))
 }
 
 #[utoipa::path(
@@ -583,7 +591,10 @@ pub async fn package_source_preview_files(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    Ok(Json(SourceFileList { files }))
+    Ok(Json(SourceFileList {
+        files,
+        patched: Vec::new(),
+    }))
 }
 
 #[utoipa::path(

@@ -42,7 +42,6 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         client
             .list_source_files(&pkgbase)
             .await
-            .map(|l| l.files)
             .map_err(|e| e.to_string())
     }));
 
@@ -53,8 +52,14 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     let mut draft = use_signal(String::new);
     let mut status = use_signal(|| Option::<(String, bool)>::None);
     let mut show_patch = use_signal(|| false);
+    // The Reset menu is open. Closed again whenever another file is opened.
+    let mut reset_open = use_signal(|| false);
+    // A file asked for while the open one has unsaved edits: opening it would
+    // throw them away, so it waits here for "Discard and continue".
+    let mut pending_file = use_signal(|| Option::<String>::None);
 
     let open_file = move |pkgbase: String, path: String| async move {
+        reset_open.set(false);
         let Ok(client) = crate::api::client() else {
             return;
         };
@@ -107,7 +112,24 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         .as_ref()
         .is_some_and(|c| c.patch_error.is_some());
     let can_save = edited || broken;
-    let can_revert = loaded.read().is_some() && (edited || patched || broken);
+    // Two ways back, because there are two things an edit can be measured
+    // against. The saved version is what the editor opened with: the patched
+    // file, or upstream when there is no patch or it no longer applies. Upstream
+    // drops every local change, saved or not, and a save then removes the
+    // patch.
+    let can_revert_to_saved = edited;
+    let can_revert_to_upstream = loaded
+        .read()
+        .as_ref()
+        .is_some_and(|c| draft() != c.original_content);
+    let has_patch = loaded
+        .read()
+        .as_ref()
+        .is_some_and(|c| c.stored_patch.is_some());
+
+    // The Save & Rebuild handler takes `pkgbase` itself; the discard dialog,
+    // rendered after it, needs its own copy.
+    let pkgbase_for_discard = pkgbase.clone();
 
     rsx! {
         div { class: "space-y-4",
@@ -128,11 +150,31 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         }
         crate::source_editor::SourcePane {
             title: pkgbase.clone(),
-            files: files.read_unchecked().clone(),
+            files: match &*files.read_unchecked() {
+                None => None,
+                Some(Ok(list)) => Some(Ok(list.files.clone())),
+                Some(Err(e)) => Some(Err(e.clone())),
+            },
+            patched_files: match &*files.read_unchecked() {
+                Some(Ok(list)) => list.patched.clone(),
+                _ => Vec::new(),
+            },
             selected: selected(),
             onselect: {
                 let pkgbase = pkgbase.clone();
                 move |path: String| {
+                    if selected.peek().as_deref() == Some(path.as_str()) {
+                        return;
+                    }
+                    // Read at click time, not captured from the render: the
+                    // draft changes with every keystroke.
+                    let unsaved = loaded.peek().as_ref().is_some_and(|c| {
+                        *draft.peek() != c.patched_content.clone().unwrap_or_else(|| c.original_content.clone())
+                    });
+                    if unsaved {
+                        pending_file.set(Some(path));
+                        return;
+                    }
                     let pkgbase = pkgbase.clone();
                     spawn(async move { open_file(pkgbase, path).await });
                 }
@@ -142,21 +184,76 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
             patched,
             patch_failed: broken,
             actions: rsx! {
-                button {
-                    class: "btn btn-ghost btn-sm",
-                    disabled: !can_revert,
-                    onclick: move |_| {
-                        if let Some(c) = loaded.read().as_ref() {
-                            draft.set(c.original_content.clone());
-                        }
-                    },
-                    "Revert to upstream"
-                }
-                if broken {
+                // Whenever the file carries a patch, not only a broken one:
+                // reading the diff is the quickest way to see what a package
+                // changes about its upstream, and whether that is still wanted.
+                if has_patch {
                     button {
                         class: "btn btn-ghost btn-sm",
                         onclick: move |_| show_patch.set(true),
                         "View patch"
+                    }
+                }
+                div { class: "relative",
+                    button {
+                        class: "btn btn-ghost btn-sm",
+                        disabled: !(can_revert_to_saved || can_revert_to_upstream),
+                        aria_haspopup: "menu",
+                        aria_expanded: "{reset_open}",
+                        onclick: move |_| reset_open.toggle(),
+                        "Reset ▾"
+                    }
+                    if reset_open() {
+                        // Anywhere else on the page closes the menu without
+                        // choosing, as clicking away from a menu does.
+                        button {
+                            class: "fixed inset-0 z-10 cursor-default",
+                            tabindex: "-1",
+                            aria_label: "Close the reset menu",
+                            onclick: move |_| reset_open.set(false),
+                        }
+                        ul {
+                            class: "menu menu-sm absolute right-0 top-full mt-1 w-72 z-20 bg-base-200 rounded-box shadow-lg",
+                            role: "menu",
+                            li { class: if !can_revert_to_saved { "disabled" },
+                                button {
+                                    role: "menuitem",
+                                    disabled: !can_revert_to_saved,
+                                    onclick: move |_| {
+                                        reset_open.set(false);
+                                        if let Some(c) = loaded.read().as_ref() {
+                                            draft.set(
+                                                c.patched_content
+                                                    .clone()
+                                                    .unwrap_or_else(|| c.original_content.clone()),
+                                            );
+                                        }
+                                    },
+                                    span { class: "flex flex-col items-start",
+                                        span { "Revert to saved version" }
+                                        span { class: "text-xs opacity-60", "Discard the edits made since opening it" }
+                                    }
+                                }
+                            }
+                            li { class: if !can_revert_to_upstream { "disabled" },
+                                button {
+                                    role: "menuitem",
+                                    disabled: !can_revert_to_upstream,
+                                    onclick: move |_| {
+                                        reset_open.set(false);
+                                        if let Some(c) = loaded.read().as_ref() {
+                                            draft.set(c.original_content.clone());
+                                        }
+                                    },
+                                    span { class: "flex flex-col items-start",
+                                        span { "Revert to upstream" }
+                                        span { class: "text-xs opacity-60",
+                                            "Drop every local change; saving then removes the patch"
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 button {
@@ -255,6 +352,50 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     }
                 }
             },
+        }
+        // Opening another file replaces the draft, so unsaved edits ask first.
+        // "Stay" is the default and what clicking away means.
+        if let Some(next) = pending_file() {
+            div {
+                class: "modal modal-open",
+                role: "dialog",
+                aria_modal: "true",
+                aria_label: "Discard unsaved changes",
+                div { class: "modal-box",
+                    h3 { class: "font-bold text-lg", "Discard changes?" }
+                    p { class: "text-sm opacity-70 pt-2",
+                        {format!(
+                            "{} has edits that are not saved. Opening {next} discards them.",
+                            selected().unwrap_or_default()
+                        )}
+                    }
+                    div { class: "modal-action",
+                        button {
+                            class: "btn btn-sm",
+                            onclick: move |_| pending_file.set(None),
+                            "Stay"
+                        }
+                        button {
+                            class: "btn btn-warning btn-sm",
+                            onclick: {
+                                let pkgbase = pkgbase_for_discard;
+                                move |_| {
+                                    let Some(path) = pending_file.take() else { return };
+                                    let pkgbase = pkgbase.clone();
+                                    spawn(async move { open_file(pkgbase, path).await });
+                                }
+                            },
+                            "Discard and continue"
+                        }
+                    }
+                }
+                button {
+                    class: "modal-backdrop",
+                    onclick: move |_| pending_file.set(None),
+                    aria_label: "Stay",
+                    "Close"
+                }
+            }
         }
         if show_patch() {
             if let Some(c) = loaded.read().as_ref()

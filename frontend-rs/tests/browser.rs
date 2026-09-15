@@ -246,11 +246,166 @@ async fn interactions() {
     following_a_dependency_loads_that_package(&session).await;
     a_second_page_holds_different_builds(&session).await;
     a_build_can_be_found_by_the_name_the_list_shows(&session).await;
+    stopping_a_build_asks_first(&session).await;
+    // Fetches the PKGBUILD from the AUR, like the source editor's route checks.
+    if std::env::var("AURCACHE_ONLINE").as_deref() == Ok("1") {
+        a_source_edit_can_be_reset_either_way_and_its_patch_read(&session).await;
+    }
     every_row_has_a_cell_for_every_column(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
     removing_a_package_takes_it_out_of_the_list(&session).await;
 
     session.stop().await;
+}
+
+/// The Reset menu's two ways back, and the patch a save leaves behind.
+///
+/// "Revert to saved version" and "Revert to upstream" are the same textarea
+/// assignment with different sources, so only a change they undo tells them
+/// apart -- and a textarea's contents are a property, not markup. Saving a
+/// change is also the only way to reach a patch that applies, which is when
+/// "View patch" used to be hidden. Upstream is restored and saved at the end,
+/// so no patch is left behind for the scenarios after.
+async fn a_source_edit_can_be_reset_either_way_and_its_patch_read(session: &Session) {
+    const EDITOR: &str = "textarea";
+    const MARK: &str = "# edited by the interaction tests";
+    let open_editor = || async {
+        session.open("/package/hello/source/PKGBUILD").await;
+        session
+            .wait_for_script(
+                "the PKGBUILD to load",
+                "return (document.querySelector('textarea')?.value ?? '').includes('pkgname');"
+                    .to_string(),
+            )
+            .await;
+    };
+
+    open_editor().await;
+    let upstream = session.value_of(EDITOR).await;
+    assert_eq!(
+        session.count("[role=menu]").await,
+        0,
+        "the menu starts closed"
+    );
+
+    // Unsaved edit, then back to what was saved.
+    session
+        .type_into(EDITOR, &format!("{upstream}\n{MARK}\n"))
+        .await;
+    session.click_labelled("button", "Reset ▾").await;
+    session.wait_for("[role=menu]").await;
+    session
+        .click_labelled(
+            "[role=menu] button",
+            "Revert to saved versionDiscard the edits made since opening it",
+        )
+        .await;
+    assert_eq!(session.value_of(EDITOR).await, upstream, "revert to saved");
+    assert_eq!(
+        session.count("[role=menu]").await,
+        0,
+        "choosing closes the menu"
+    );
+
+    // Save a change, and it shows as a patch that can be read.
+    assert!(
+        !session.text().await.contains("View patch"),
+        "an unpatched file has no patch to view"
+    );
+    session
+        .type_into(EDITOR, &format!("{upstream}\n{MARK}\n"))
+        .await;
+    session.click_labelled("button", "Save").await;
+    session
+        .wait_until("the save to land on the package page", |t| {
+            // The patch is stored before the server re-resolves dependencies,
+            // and a test server without a working PKGBUILD parser fails only
+            // the latter; either way the patch is what the rest checks.
+            !t.contains("Reset ▾") || t.contains("Patch saved")
+        })
+        .await;
+    open_editor().await;
+    assert!(
+        session.value_of(EDITOR).await.contains(MARK),
+        "the saved edit reloads"
+    );
+    session.click_labelled("button", "View patch").await;
+    session
+        .wait_until("the stored patch to show", |t| {
+            t.contains(&format!("+{MARK}"))
+        })
+        .await;
+    session
+        .click_labelled(".modal-action button", "Close")
+        .await;
+
+    // Back to upstream, from the saved change, and save that to drop the patch.
+    session.click_labelled("button", "Reset ▾").await;
+    session
+        .click_labelled(
+            "[role=menu] button",
+            "Revert to upstreamDrop every local change; saving then removes the patch",
+        )
+        .await;
+    assert_eq!(
+        session.value_of(EDITOR).await,
+        upstream,
+        "revert to upstream"
+    );
+    session.click_labelled("button", "Save").await;
+    session
+        .wait_until("the revert to save", |t| {
+            !t.contains("Reset ▾") || t.contains("Patch saved")
+        })
+        .await;
+    open_editor().await;
+    assert!(
+        !session.text().await.contains("View patch"),
+        "saving upstream content removes the patch"
+    );
+}
+
+/// Stop opens a dialog instead of stopping, and backing out of it stops
+/// nothing.
+///
+/// A stopped build is hours of work gone, and the button sits beside Copy and
+/// Follow. The route check sees the dialog's markup; only a click shows that
+/// Stop opens it rather than firing, and that "Keep building" closes it without
+/// sending the cancel.
+async fn stopping_a_build_asks_first(session: &Session) {
+    session
+        .open("/package/visual-studio-code-bin/build/1")
+        .await;
+    session
+        .wait_until("the running build to load", |t| t.contains("so far"))
+        .await;
+    assert_eq!(session.count(".modal.modal-open").await, 0);
+
+    session.click_labelled("button", "Stop").await;
+    session.wait_for(".modal.modal-open").await;
+    session
+        .wait_until("the dialog to say what stopping does", |t| {
+            // Running or still queued, depending on what earlier scenarios did;
+            // both wordings end the same way.
+            t.contains("Stop visual-studio-code-bin build #1?") && t.contains("ends as canceled")
+        })
+        .await;
+
+    session
+        .click_labelled(".modal-open .modal-action button", "Keep building")
+        .await;
+    session
+        .wait_for_script(
+            "the dialog to close",
+            "return document.querySelector('.modal.modal-open') === null;".to_string(),
+        )
+        .await;
+    // Still running, and no cancel went out: the button would read "Stopping…".
+    let text = session.text().await;
+    assert!(
+        text.contains("so far") && !text.contains("Stopping…"),
+        "backing out of the dialog stopped the build. Page was:\n{text}"
+    );
 }
 
 /// Every body row must have exactly as many cells as the table has headers.

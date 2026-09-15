@@ -32,6 +32,10 @@ pub fn SourcePane(
     /// and navigated away from is still visible.
     #[props(default)]
     modified: Vec<String>,
+    /// Paths the package's stored patch already changes, marked so which files
+    /// carry a local change can be seen without opening each one.
+    #[props(default)]
+    patched_files: Vec<String>,
     /// The text being edited. A signal rather than a value and a callback,
     /// because the caller has to read it to save it.
     draft: Signal<String>,
@@ -68,11 +72,23 @@ pub fn SourcePane(
                                     li { key: "{path}",
                                         a {
                                             class: if selected.as_deref() == Some(path.as_str()) { "active font-mono" } else { "font-mono" },
+                                            // The list is narrow and a nested
+                                            // path is long; the name is cut off,
+                                            // so hovering says it in full.
+                                            title: "{path}",
                                             onclick: {
                                                 let path = path.clone();
                                                 move |_| onselect.call(path.clone())
                                             },
                                             span { class: "truncate", "{path}" }
+                                            if patched_files.iter().any(|p| p == path) {
+                                                span {
+                                                    class: "text-warning font-bold shrink-0",
+                                                    title: "This file has a stored patch",
+                                                    aria_label: "patched",
+                                                    "*"
+                                                }
+                                            }
                                             // A file changed and then left is
                                             // otherwise indistinguishable from
                                             // an untouched one.
@@ -113,5 +129,62 @@ pub fn SourcePane(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourcePane;
+    use dioxus::prelude::*;
+
+    /// A host component: `Signal` and `EventHandler` props need a runtime.
+    #[component]
+    fn Harness() -> Element {
+        let draft = use_signal(String::new);
+        rsx! {
+            SourcePane {
+                title: "pkg",
+                files: Some(Ok(vec![
+                    "PKGBUILD".to_string(),
+                    "patches/0001-a-long-name-the-list-cuts-short.patch".to_string(),
+                ])),
+                selected: None,
+                onselect: move |_| {},
+                patched_files: vec!["PKGBUILD".to_string()],
+                draft,
+                dirty: false,
+                actions: rsx! {},
+                notices: rsx! {},
+            }
+        }
+    }
+
+    fn render() -> String {
+        let mut dom = VirtualDom::new(Harness);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// A name the narrow list truncates is still readable, on hover.
+    #[test]
+    fn every_file_names_itself_in_full_on_hover() {
+        let html = render();
+        assert!(
+            html.contains(r#"title="patches/0001-a-long-name-the-list-cuts-short.patch""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"title="PKGBUILD""#), "{html}");
+    }
+
+    /// Only files the stored patch changes carry the marker.
+    #[test]
+    fn a_patched_file_is_marked_and_an_untouched_one_is_not() {
+        let html = render();
+        assert_eq!(
+            html.matches(r#"title="This file has a stored patch""#)
+                .count(),
+            1,
+            "{html}"
+        );
     }
 }

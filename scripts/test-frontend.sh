@@ -174,6 +174,7 @@ ROUTES=(
     # The chart is SVG, so a real element proves it drew rather than errored.
     "/|<svg|the build graph renders"
     "/builds|Duration|builds list"
+    "/settings|Max artifact size|the artifact size limit is a setting"
     "/builds|6.4 GiB|a build's peak memory is reported"
     # The fixture holds more builds than fit on a page. That the second page
     # holds different rows is an interaction test; this is only that the
@@ -186,6 +187,9 @@ ROUTES=(
     # gives visual-studio-code-bin a start but no end) measures to now.
     "/package/hello/build/1|took 43s|a finished build reports its total duration"
     "/package/visual-studio-code-bin/build/1|so far|a running build's duration is measured to now"
+    # Stop asks first. Whether the dialog opens on click is an interaction
+    # test; this is only that a running build renders one to open.
+    "/package/visual-studio-code-bin/build/1|Keep building|a running build's Stop asks for confirmation"
     "/packages|Upstream|packages list"
     "/builds|Add package|the sidebar offers adding a package from any page"
     "/packages|Size|the packages list has a size column"
@@ -246,6 +250,8 @@ ROUTES=(
     "/package/hello|href=\"/package/hello/config-files\"|the package links to its config files"
     # The one irreversible action, in its own card rather than in the header.
     "/package/hello|Remove package|a package can be removed from its own page"
+    "/package/hello|Max artifact size|a package can have its own artifact size limit"
+    "/package/hello|>Edit sources<|an unpatched package's sources button says nothing more"
     # The remove card knows which way the delete will go: `yay` needs hello, so
     # it says removing only unflags it, while nothing depends on `paru`.
     "/package/hello|This package has dependents|a package with dependents is told removing only unflags it"
@@ -307,8 +313,14 @@ ROUTES=(
     "/no/such/page|Not found|404 (depth 3)"
 )
 if [ "$ONLINE" = "1" ]; then
-    # Fetches the PKGBUILD from the AUR, so it needs network.
-    ROUTES+=("/package/hello/source/PKGBUILD|Revert to upstream|source editor (depth 4)")
+    # Fetches the PKGBUILD from the AUR, so it needs network. Fetched once here
+    # first: a cold fetch outlasts the page's render budget, so whichever check
+    # came first saw an editor with no file in it and failed, and only that one.
+    curl -sf "http://localhost:$API_PORT/api/package/hello/source/files" -o /dev/null \
+        || fail "could not fetch hello's source from the AUR"
+    # Both reverts live in the Reset menu, which renders its items only when
+    # opened; the interaction tests open it.
+    ROUTES+=("/package/hello/source/PKGBUILD|aria-haspopup=\"menu\"|source editor (depth 4)")
     ROUTES+=("/package/hello/source/PKGBUILD|Save &amp; Rebuild|save and queue in one step")
     # The way back is the breadcrumb's package link. It used to be a "← hello"
     # button; this marker went stale when the heading became the trail, and no
@@ -398,6 +410,6 @@ echo "==> all ${#ROUTES[@]} routes rendered"
 # stops both — so there is nothing to start or clean up here.
 echo "==> checking interactions"
 ( cd "$PROJECT_DIR/frontend-rs" \
-    && AURCACHE_UI="http://localhost:$API_PORT" \
+    && AURCACHE_UI="http://localhost:$API_PORT" AURCACHE_ONLINE="$ONLINE" \
        timeout 240 cargo test --quiet --test browser -- --ignored ) \
     || fail "interaction tests failed"

@@ -310,6 +310,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     let mut following = use_signal(|| true);
     // A Stop in flight, so the button shows "Stop…" and cannot double-fire.
     let canceling = use_signal(|| false);
+    // The Stop dialog is open. Stopping throws away a build that may be hours
+    // in, and the button sits beside Copy and Follow, so it asks first.
+    let mut confirming_stop = use_signal(|| false);
     // The tail budget, read once on mount: `window.inner_width()` and
     // `(pointer: coarse)` decide phone (4 MiB) versus desktop (16 MiB).
     let cap = use_memo(|| {
@@ -549,27 +552,73 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         button {
                             disabled: canceling(),
                             class: "btn btn-xs btn-error btn-outline",
-                            onclick: move |_| {
-                                // Signals are Copy; both are rebound `mut`
-                                // for the async body below.
-                                let (mut canceling, mut error) = (canceling, error);
-                                let (pkgbase, number) = (pkgbase_for_stop.clone(), number_for_stop);
-                                spawn(async move {
-                                    canceling.set(true);
-                                    let result = match crate::api::client() {
-                                        Ok(client) => match client.cancel_build(&pkgbase, number).await {
-                                            Ok(()) => Ok(()),
-                                            Err(e) => Err(e.to_string()),
-                                        },
-                                        Err(e) => Err(e),
-                                    };
-                                    if let Err(e) = result {
-                                        error.set(Some(e));
-                                        canceling.set(false);
-                                    }
-                                });
-                            },
+                            onclick: move |_| confirming_stop.set(true),
                             if canceling() { "Stopping…" } else { "Stop" }
+                        }
+                        // Inside the same condition as the button, so a build
+                        // that ends while the dialog is open takes the dialog
+                        // with it rather than offering to stop a finished build.
+                        div {
+                            class: if confirming_stop() { "modal modal-open" } else { "modal" },
+                            role: "dialog",
+                            aria_modal: "true",
+                            aria_label: "Confirm stopping the build",
+                            div { class: "modal-box",
+                                h3 { class: "font-bold text-lg",
+                                    "Stop {pkgbase_for_stop} build #{number_for_stop}?"
+                                }
+                                p { class: "text-sm opacity-70 pt-2",
+                                    if status() == Some(BuildState::Active as i32) {
+                                        "It is killed where it is and ends as canceled. Nothing it has built so \
+                                         far is published; retrying it starts the build again."
+                                    } else {
+                                        "It leaves the queue without starting and ends as canceled. Retrying it \
+                                         queues it again."
+                                    }
+                                }
+                                div { class: "modal-action",
+                                    button {
+                                        class: "btn btn-sm",
+                                        onclick: move |_| confirming_stop.set(false),
+                                        "Keep building"
+                                    }
+                                    button {
+                                        class: "btn btn-error btn-sm",
+                                        onclick: move |_| {
+                                            confirming_stop.set(false);
+                                            // Signals are Copy; both are rebound `mut`
+                                            // for the async body below.
+                                            let (mut canceling, mut error) = (canceling, error);
+                                            let (pkgbase, number) =
+                                                (pkgbase_for_stop.clone(), number_for_stop);
+                                            spawn(async move {
+                                                canceling.set(true);
+                                                let result = match crate::api::client() {
+                                                    Ok(client) => {
+                                                        match client.cancel_build(&pkgbase, number).await {
+                                                            Ok(()) => Ok(()),
+                                                            Err(e) => Err(e.to_string()),
+                                                        }
+                                                    }
+                                                    Err(e) => Err(e),
+                                                };
+                                                if let Err(e) = result {
+                                                    error.set(Some(e));
+                                                    canceling.set(false);
+                                                }
+                                            });
+                                        },
+                                        "Stop build"
+                                    }
+                                }
+                            }
+                            // Clicking away is "no", as it is for every dialog here.
+                            button {
+                                class: "modal-backdrop",
+                                onclick: move |_| confirming_stop.set(false),
+                                aria_label: "Keep building",
+                                "Close"
+                            }
                         }
                     }
                     LogCopyButton {
