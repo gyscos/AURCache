@@ -20,15 +20,22 @@ pub const WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worker:la
 
 /// The PostgreSQL major version a generated file runs.
 ///
-/// The image tag, the upgrade step's `TARGET_VERSION` and `PGDATA` all name
-/// it, and they only work together; a test holds them to this one number.
-pub const POSTGRES_MAJOR: u32 = 17;
+/// The image tag and the upgrade step's `TARGET_VERSION` both name it, and a
+/// test holds them to this one number. `PGDATA` names it too but is written
+/// nowhere: from 18 the image's default is `/var/lib/postgresql/<major>/docker`,
+/// the layout the upgrade step expects, and the upgrade step derives its own
+/// from `TARGET_VERSION`. So a version bump is two edits, not four.
+pub const POSTGRES_MAJOR: u32 = 18;
 
-/// Pinned to the major version *and* the Debian release. `postgres:17` moves
+// Before 18 the image's `PGDATA` is `/var/lib/postgresql/data`, which the
+// upgrade step would find nothing in; the file would need `PGDATA` written out.
+const _: () = assert!(POSTGRES_MAJOR >= 18);
+
+/// Pinned to the major version *and* the Debian release. `postgres:18` moves
 /// to a newer Debian from time to time, and a newer C library sorts text
 /// differently under indexes already built; `postgres:latest` can also jump a
 /// major version onto a data directory it refuses to start on.
-pub const POSTGRES_IMAGE: &str = "postgres:17-trixie";
+pub const POSTGRES_IMAGE: &str = "postgres:18-trixie";
 
 /// The one-shot container that brings the data directory up to
 /// [`POSTGRES_MAJOR`] before the database starts: `pg_upgrade` after a backup
@@ -388,29 +395,29 @@ fn server_service(params: &ComposeParams) -> String {
 /// rather than `PGDATA` itself: the data lives in `<major>/docker` below it,
 /// so an upgrade can build the new version's directory beside the old one.
 fn database_services(password: &str) -> String {
-    let pgdata = format!("/var/lib/postgresql/{POSTGRES_MAJOR}/docker");
     let env = format!(
         "\x20     - POSTGRES_USER={DATABASE_USER}\n\
          \x20     - POSTGRES_PASSWORD={password}\n\
-         \x20     - POSTGRES_DB={DATABASE_USER}\n\
-         \x20     - PGDATA={pgdata}\n"
+         \x20     - POSTGRES_DB={DATABASE_USER}\n"
     );
 
     format!(
         "  {DATABASE_SERVICE}_upgrade:\n\
          \x20   # Runs before the database, then exits. When the data is from an older major\n\
          \x20   # version it backs it up (under backups/ in the volume) and runs pg_upgrade;\n\
-         \x20   # otherwise it does nothing. It also moves data written by an older setup\n\
-         \x20   # straight into the volume (PG_VERSION at its root) into {POSTGRES_MAJOR}/docker.\n\
+         \x20   # otherwise it does nothing. Data an older setup wrote straight into the\n\
+         \x20   # volume (PG_VERSION at its root) is first moved into <its version>/docker.\n\
          \x20   #\n\
-         \x20   # To move to a new major version, change these three together: TARGET_VERSION\n\
-         \x20   # here, and the database's image tag and PGDATA below.\n\
+         \x20   # To move to a new major version, change TARGET_VERSION here and the\n\
+         \x20   # database's image tag below together.\n\
          \x20   #\n\
          \x20   # It runs as the postgres user and refuses a volume it does not own. A named\n\
          \x20   # volume already is; for a host directory, `chown -R 999:999` it first.\n\
          \x20   image: {POSTGRES_UPGRADE_IMAGE}\n\
-         \x20   # The image's own entrypoint starts a PostgreSQL server; the upgrade is this.\n\
-         \x20   entrypoint: [\"/bin/bash\", \"-c\", \"/upgrade.sh\"]\n\
+         \x20   # The image's own entrypoint starts a PostgreSQL server; the upgrade is\n\
+         \x20   # this. It insists on the PGDATA the database will use, which follows from\n\
+         \x20   # TARGET_VERSION (`$$` keeps compose from substituting it first).\n\
+         \x20   entrypoint: [\"/bin/bash\", \"-c\", \"export PGDATA=/var/lib/postgresql/$$TARGET_VERSION/docker && exec /upgrade.sh\"]\n\
          \x20   user: \"{POSTGRES_UID}\"\n\
          \x20   environment:\n\
          \x20     - TARGET_VERSION={POSTGRES_MAJOR}\n\
@@ -651,16 +658,15 @@ mod tests {
         }
     }
 
-    /// The image tag, the upgrade's target and both `PGDATA`s only work as a
-    /// set: an upgrade to 18 feeding a 17 server is a database that will not
-    /// start.
+    /// The image tag and the upgrade's target only work as a pair: an upgrade
+    /// to 18 feeding a 17 server is a database that will not start. `PGDATA`
+    /// is left to follow from them rather than written out to disagree.
     #[test]
     fn the_postgres_major_version_agrees_everywhere() {
         let doc = parsed(&ComposeParams {
             database: postgres(),
             ..params(ComposeRole::Bundle)
         });
-        let pgdata = format!("/var/lib/postgresql/{POSTGRES_MAJOR}/docker");
         let upgrade = environment(&doc, "aurcache_database_upgrade");
         let database = environment(&doc, "aurcache_database");
 
@@ -673,14 +679,18 @@ mod tests {
             value_of(&upgrade, "TARGET_VERSION"),
             Some(POSTGRES_MAJOR.to_string())
         );
-        assert_eq!(value_of(&upgrade, "PGDATA"), Some(pgdata.clone()));
         // Left to its own entrypoint the image is a server, which never exits
-        // and so never lets the database start.
+        // and so never lets the database start. `$$` is compose's escape for
+        // a `$` the shell is to expand.
+        let entrypoint = doc["services"]["aurcache_database_upgrade"]["entrypoint"][2]
+            .as_str()
+            .expect("an entrypoint script");
         assert_eq!(
-            doc["services"]["aurcache_database_upgrade"]["entrypoint"][2].as_str(),
-            Some("/upgrade.sh")
+            entrypoint,
+            "export PGDATA=/var/lib/postgresql/$$TARGET_VERSION/docker && exec /upgrade.sh"
         );
-        assert_eq!(value_of(&database, "PGDATA"), Some(pgdata));
+        assert_eq!(value_of(&upgrade, "PGDATA"), None);
+        assert_eq!(value_of(&database, "PGDATA"), None);
         // Everything else the upgrade is told is what the database is told.
         let upgrade_rest: Vec<_> = upgrade
             .iter()

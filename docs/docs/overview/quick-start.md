@@ -167,7 +167,7 @@ the parts worth reading before you deploy it.
 A file with a server asks which database it should use, or takes
 `--database postgres` or `--database sqlite` (required when there is no terminal
 to ask on). PostgreSQL adds two services: the database, pinned to
-`postgres:17-trixie`, and a step that runs before it and exits. That step is
+`postgres:18-trixie`, and a step that runs before it and exits. That step is
 `ixsystems/postgres-upgrade`, the one TrueNAS's own apps use. It does nothing
 while the data already matches the database's major version. When you raise the
 version, it backs the data up and runs `pg_upgrade`, and it moves data from the
