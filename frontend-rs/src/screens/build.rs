@@ -29,6 +29,25 @@ fn settled(status: i32) -> bool {
     BuildState::from_i32(status).is_some_and(|s| !s.is_in_progress())
 }
 
+/// What the log area says while it has no text, given whether the poll loop
+/// has finished (its final page is in) and the build's state.
+///
+/// Three different statements. A finished build with nothing to show has no
+/// log at all -- it never wrote one, or it has been removed. A settled build
+/// whose output is still being fetched has a log that has not arrived yet,
+/// which is the one to get right: saying "no log" there is false for as long
+/// as a large log takes to download. And a build still going may not have
+/// written its first line.
+fn empty_log_placeholder(finished: bool, status: Option<i32>) -> &'static str {
+    if finished {
+        "no log for this build"
+    } else if status.is_some_and(settled) {
+        "loading log…"
+    } else {
+        "waiting for output…"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +62,21 @@ mod tests {
         assert!(!settled(BuildState::WaitingForDeps.as_i32()));
         // A state this build of the UI has never heard of keeps it polling.
         assert!(!settled(99));
+    }
+
+    #[test]
+    fn empty_log_placeholder_tells_loading_from_missing() {
+        let failed = Some(BuildState::Failed.as_i32());
+        // The regression: an old build whose log is still downloading is not
+        // one without a log.
+        assert_eq!(empty_log_placeholder(false, failed), "loading log…");
+        assert_eq!(empty_log_placeholder(true, failed), "no log for this build");
+        assert_eq!(
+            empty_log_placeholder(false, Some(BuildState::Active.as_i32())),
+            "waiting for output…"
+        );
+        // Before the first status poll answers, nothing is known yet.
+        assert_eq!(empty_log_placeholder(false, None), "waiting for output…");
     }
 
     /// Signals only have a home inside a running component, so the button is
@@ -393,9 +427,6 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 // progress: being wrong that way costs one poll per interval,
                 // while being wrong the other way is this bug.
                 let settled_now = build.as_ref().is_some_and(|b| settled(b.status));
-                if settled_now {
-                    finished.set(true);
-                }
 
                 // Output, gated on the header above. Frozen while not following
                 // so the view cannot jump under a scroll position — the header
@@ -471,7 +502,11 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                     }
                 }
 
+                // Only now, with the final page in: setting this as soon as the
+                // header said settled announced "no log for this build" for as
+                // long as a large log took to arrive.
                 if settled_now {
+                    finished.set(true);
                     return;
                 }
 
@@ -659,15 +694,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                     class: "bg-neutral text-neutral-content rounded-box p-4 text-xs \
                             flex-1 min-h-0 overflow-auto whitespace-pre-wrap font-mono",
                     if log.read().is_empty() {
-                        // A finished build with nothing to show has no log at
-                        // all -- it never wrote one, or it has been removed --
-                        // which is a different statement from a running build
-                        // that has not written its first line yet.
-                        if finished() {
-                            span { class: "opacity-60", "no log for this build" }
-                        } else {
-                            span { class: "opacity-60", "waiting for output…" }
-                        }
+                        span { class: "opacity-60", {empty_log_placeholder(finished(), status())} }
                     } else {
                         "{log}"
                     }
