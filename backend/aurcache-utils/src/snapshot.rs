@@ -705,12 +705,17 @@ fn sanitize_cache_key(cache_key: &str) -> String {
 /// `subfolder` (or the repo root if empty) with `{pkgbase}/` as the
 /// top-level directory, matching the structure of AUR snapshots.
 ///
-/// Parsing the fetched `.SRCINFO`/PKGBUILD may fail for malformed real-world
-/// PKGBUILDs (e.g. `ogdf`) that `alpm-srcinfo` cannot handle. When that
-/// happens, `sourceinfo` is `None` rather than the whole fetch failing, so
-/// the raw source can still be browsed/edited (and a patch authored to fix
-/// the parse failure) before it's ever successfully added as a package. A
-/// best-effort `pkgbase` is derived from the repo URL/subfolder in that case.
+/// A shipped `.SRCINFO` that does not parse is not the end of it: the file is
+/// only derived from the PKGBUILD, and maintainers do edit it by hand --
+/// `ogdf`'s carries a `pkgtreename=foxglove` line `makepkg --printsrcinfo`
+/// would never write, which failed every package depending on it. So the
+/// PKGBUILD is parsed instead, as it is for a source that ships no `.SRCINFO`.
+///
+/// If that fails too, `sourceinfo` is `None` rather than the whole fetch
+/// failing, so the raw source can still be browsed/edited (and a patch
+/// authored to fix the parse failure) before it's ever successfully added as
+/// a package. A best-effort `pkgbase` is derived from the repo URL/subfolder
+/// in that case.
 async fn checkout_and_parse(
     repo_url: &str,
     git_ref: &str,
@@ -739,17 +744,28 @@ async fn checkout_and_parse(
     .await??;
 
     let srcinfo_path = package_dir.join(".SRCINFO");
+    let pkgbuild_path = package_dir.join("PKGBUILD");
     let parsed = if srcinfo_path.exists() {
         std::fs::read_to_string(&srcinfo_path)
             .map_err(anyhow::Error::from)
             .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
+            .or_else(|err| {
+                tracing::warn!(
+                    "{} does not parse, parsing the PKGBUILD instead: {err:#}",
+                    srcinfo_path.display()
+                );
+                parse_pkgbuild(&pkgbuild_path)
+            })
     } else {
-        parse_pkgbuild(package_dir.join("PKGBUILD").as_path())
+        parse_pkgbuild(&pkgbuild_path)
     };
 
     let (pkgbase, sourceinfo) = match parsed {
         Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
-        Err(_) => (fallback_pkgbase(&package_dir), None),
+        Err(err) => {
+            tracing::warn!("{} could not be parsed: {err:#}", pkgbuild_path.display());
+            (fallback_pkgbase(&package_dir), None)
+        }
     };
 
     let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
@@ -1129,6 +1145,50 @@ license=('MIT')
             .unwrap();
 
         repo_path
+    }
+
+    /// A hand-edited `.SRCINFO` that `alpm-srcinfo` rejects must not make the
+    /// source unparseable while its PKGBUILD is fine: `ogdf` shipped exactly
+    /// this line, and every package depending on it failed to add.
+    #[tokio::test]
+    async fn unparseable_srcinfo_falls_back_to_pkgbuild() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            return;
+        }
+
+        let aur_root = tempfile::tempdir().unwrap();
+        let repo_path = create_aur_git_repo(aur_root.path(), "bar", "1.0");
+        let repo = Repository::open(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join(".SRCINFO"),
+            "pkgbase = bar\n\tpkgtreename=foxglove\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = x86_64\n\npkgname = bar\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".SRCINFO")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "hand-edit .SRCINFO",
+            &tree,
+            &[&parent],
+        )
+        .unwrap();
+
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let source = SourceData::Aur {
+            name: "bar".to_string(),
+        };
+
+        let sourceinfo = store.sourceinfo(&source, None).await.unwrap();
+        assert_eq!(sourceinfo.base.name.to_string(), "bar");
+        assert_eq!(sourceinfo.base.version.to_string(), "1.0-1");
     }
 
     /// Build a `SnapshotStore` for tests: AUR sources resolve against local
