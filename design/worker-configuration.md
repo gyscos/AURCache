@@ -4,7 +4,7 @@ How a worker's settings could be seen and changed through AURCache's API and UI,
 instead of only through each machine's environment, and how the change would
 reach a running worker.
 
-Status: **proposal, second revision**. Nothing here is implemented.
+Status: **proposal, third revision**. Nothing here is implemented.
 
 - The first draft had a server-side allowlist of worker settings and a fleet
   default. Two reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
@@ -14,7 +14,10 @@ Status: **proposal, second revision**. Nothing here is implemented.
 - This revision replaces the allowlist with **settings each worker declares**,
   drops fleet defaults for now, and lets the worker **re-register** when a change
   alters what it registered with. The server no longer knows what any worker
-  setting means. [History](#history) records what each round changed.
+  setting means.
+- The third lets the environment set a **default the server may override**
+  (`WORKER_CONCURRENCY_DEFAULT`) beside the existing pin (`WORKER_CONCURRENCY`).
+  [History](#history) records what each round changed.
 
 ---
 
@@ -90,8 +93,8 @@ SettingDecl {
   kind:        ValueKind,       // see below
   description: String,
   category:    String,          // "Build limits", "Caches", ...
-  default:     Option<String>,  // shown when nothing else sets it
-  env_var:     Option<String>,  // "WORKER_BUILD_MEMORY_MAX": the variable that pins it
+  default:     Option<String>,  // the fallback in effect: `<env_var>_DEFAULT` if set, else built in
+  env_var:     Option<String>,  // "WORKER_BUILD_MEMORY_MAX": pins it; `_DEFAULT` suffixed, a default
   applies:     NextJob | NextLoop | Immediately,
 }
 ```
@@ -159,31 +162,69 @@ refused at fleet scope.
 
 ### Precedence
 
+Each declared setting reads two environment variables, which say different
+things:
+
+| In the worker's environment | Meaning |
+|---|---|
+| `WORKER_CONCURRENCY=4` | **Pin**: wins over the server |
+| `WORKER_CONCURRENCY_DEFAULT=4` | **Default**: used unless the server sets a value |
+
 Resolution per key on the worker, highest first:
 
-1. the worker's environment (the declared `env_var`),
+1. the pin (the declared `env_var`),
 2. the value set for this worker on the server,
-3. the declared default.
+3. the environment default (`<env_var>_DEFAULT`),
+4. the built-in default.
 
-**Environment wins**: it is the model the server's own settings use
-(`Package -> Env -> Global -> Default`), it is how the mirrorlist override
-works, and deploying this changes nothing for an existing worker.
+**A plain variable pins**, as it does today: it is the model the server's own
+settings use (`Package -> Env -> Global -> Default`), it is how the mirrorlist
+override works, and deploying this changes nothing for an existing worker. A
+machine can still veto a value for itself -- its memory limit, say -- without
+the server being able to change it.
 
-That means most deployed workers start with most rows pinned, because their
-policy is already in their environment. A pin is a deliberate local veto, so
-that is right, but it needs an adoption path:
+**`_DEFAULT` is what makes a value manageable without giving up the machine's
+own starting point.** Without it, a setting could only be handed to the server by
+deleting its variable, which dropped the machine back to the built-in default
+until someone set a server value. Why a second name rather than the alternatives:
 
+- **Versus a list of server-managed keys** (`WORKER_SERVER_MANAGED=concurrency,...`):
+  one line says both the value and whether the server may override it; with a
+  list, reading `WORKER_CONCURRENCY=4` would not say whether it is a pin.
+- **Versus a global switch** turning every variable into a default: per setting,
+  so a machine can pin its limits and leave its concurrency to the server.
+- **Versus a value syntax** (`WORKER_CONCURRENCY=default:4`): no new syntax, and
+  every existing parser stays as it is.
+
+Details:
+
+- **Both set**: the pin wins; the worker warns and reports it, since it is almost
+  certainly a mistake.
+- **The UI shows the real fallback**: the declaration's `default` is the
+  environment default when there is one, and the effective source says
+  `env_default`, so resetting a server value shows the value the worker returns
+  to, not a built-in one.
+- **Useful before server values exist**: with no server value, `_DEFAULT` behaves
+  exactly like the plain variable, so it can ship with the read-only phase.
+
+### Adopting it on existing workers
+
+Most deployed workers start with most rows pinned, because their policy is
+already in plain variables. A pin is a deliberate local veto, so that is right,
+but moving a value to the server should be easy:
+
+- **Adoption is a rename**: `WORKER_CONCURRENCY=2` becomes
+  `WORKER_CONCURRENCY_DEFAULT=2`, and the machine keeps its value until the server
+  sets one. Bootstrap, network and host-access variables stay as they are.
 - **The UI names the pin and the way out**: "Pinned by `WORKER_CONCURRENCY` on
-  this worker; remove it from the worker's environment to manage it here." A
-  value saved for a pinned key is stored and shown as *not in effect*, never as
-  a change that took.
-- **Shipped defaults stop pinning policy.** `docker-compose.remote-worker.yaml`
+  this worker; rename it to `WORKER_CONCURRENCY_DEFAULT` to manage it here." A
+  value saved for a pinned key is stored and shown as *not in effect*, never as a
+  change that took.
+- **Shipped files write defaults, not pins.** `docker-compose.remote-worker.yaml`
   sets `WORKER_CONCURRENCY=2`, and `aurcache-cli setup compose`/`setup worker`
-  write `WORKER_CONCURRENCY` when given. Templates keep bootstrap and host-access
-  variables set and leave policy commented out.
-- **Documented adoption**: keep bootstrap, network and host-access variables
-  local; set policy values on the server; remove them from the worker's
-  environment; restart once.
+  write `WORKER_CONCURRENCY` when given; they switch to the `_DEFAULT` names.
+  Only in files for workers new enough to read them: an older worker ignores
+  `_DEFAULT` and silently runs its built-in default.
 
 ### Storage
 
@@ -329,7 +370,7 @@ forever. So there are two things:
 - **`received_revision`** -- the revision of the last snapshot the worker parsed
   and gave every key a status. It only controls retransmission.
 - **`effective`** -- per declared key, the value in use, its source (`env`,
-  `server`, `default`) and its status. It controls what the UI shows.
+  `server`, `env_default`, `default`) and its status. It controls what the UI shows.
 
 The **revision** is the SHA-256 of the canonical serialization of the snapshot:
 that worker's stored values, keys sorted. It changes exactly when the snapshot
@@ -348,7 +389,7 @@ HeartbeatResponse { cancel: Vec<i32>, config: Option<ConfigSnapshot> }  // #[ser
 ConfigSnapshot    { revision: String, settings: BTreeMap<String, String> }
 EffectiveConfig   { received_revision: Option<String>,
                     settings: BTreeMap<String, EffectiveSetting> }
-EffectiveSetting  { value: Option<String>, source: Env | Server | Default,
+EffectiveSetting  { value: Option<String>, source: Env | Server | EnvDefault | Default,
                     status: Applied | Overridden | Unsupported | Rejected,
                     reason: Option<String> }
 ```
@@ -473,7 +514,8 @@ that the server can stop itself.
 
 1. `ValueKind` and its parsers in `aurcache-common`; `SettingDecl` for the native
    worker's policy keys. Retire the dead server settings `max_concurrent_builds`
-   and `builder_image` the way `cpu_limit`/`memory_limit` were.
+   and `builder_image` the way `cpu_limit`/`memory_limit` were. The worker reads
+   `<env_var>_DEFAULT` for every declared setting.
 2. **Read-only first.** The worker sends its declaration at registration and
    reports `effective` (value, source, status) in the heartbeat when it changes;
    the server stores both and the Workers page shows them, with parse errors
@@ -487,8 +529,8 @@ that the server can stop itself.
    re-registration when the registration request changes.
 6. UI: a worker detail page rendering the declaration generically by category
    and kind, with env-pinned rows naming their variable and the way to unpin
-   them. Policy variables commented out of the shipped compose files and the
-   CLI's generated ones.
+   them. The shipped compose files and the CLI's generated ones write policy as
+   `_DEFAULT` variables.
 
 **Later, if wanted:** fleet defaults, on the terms in
 [Per worker only, for now](#per-worker-only-for-now); declarations for the legacy
@@ -550,3 +592,11 @@ allows them too.
   stands (see [the protocol](#changes-to-what-the-worker-registered-with-re-register)).
   The concurrency race the reviews described does not arise, because the worker
   acquires a permit before it claims.
+
+### Third revision: environment defaults
+
+- A `<env_var>_DEFAULT` variable sets a default the server may override, below
+  the server value and above the built-in default; the plain variable still
+  pins. Handing a setting to the server became a rename that keeps the machine's
+  value, instead of a deletion that dropped it to the built-in default, and
+  shipped templates write defaults instead of commenting policy out.
