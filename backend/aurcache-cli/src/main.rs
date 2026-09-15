@@ -21,11 +21,11 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{
     load_config, resolve_runtime_config, save_config, set_token, set_url, summarize_config,
 };
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Select};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -191,6 +191,16 @@ struct ComposeArgs {
     /// Which services the file should contain.
     #[arg(long, value_enum, default_value_t = compose::ComposeRole::Bundle)]
     role: compose::ComposeRole,
+
+    /// The server's database. Asked for when omitted, and required when there
+    /// is no terminal to ask on. A worker file has no database.
+    #[arg(long, value_enum)]
+    database: Option<compose::DatabaseKind>,
+
+    /// Password for the PostgreSQL database. Generated when omitted; only
+    /// letters, digits and `-_.~`, since it goes into a connection URL as is.
+    #[arg(long)]
+    db_password: Option<String>,
 
     /// Where to write it. `-` writes to stdout.
     #[arg(long, short = 'o')]
@@ -773,9 +783,11 @@ fn run_setup_command(format: OutputFormat, command: SetupCommand) -> Result<()> 
 }
 
 fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
+    let database = compose_database(&args)?;
     let defaults = compose::ComposeParams::default();
     let params = compose::ComposeParams {
         role: args.role,
+        database: database.clone(),
         server_image: args.common.server_image.unwrap_or(defaults.server_image),
         worker_image: args.common.worker_image.unwrap_or(defaults.worker_image),
         public_url: args.public_url.unwrap_or(defaults.public_url),
@@ -800,9 +812,14 @@ fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
     std::fs::write(path, &rendered).with_context(|| format!("failed to write {target}"))?;
 
     match format {
-        OutputFormat::Json => print_json(
-            &json!({ "path": target, "role": format!("{:?}", args.role).to_lowercase() }),
-        ),
+        OutputFormat::Json => print_json(&json!({
+            "path": target,
+            "role": format!("{:?}", args.role).to_lowercase(),
+            "database": args.role.has_server().then_some(match database {
+                compose::ComposeDatabase::Sqlite => "sqlite",
+                compose::ComposeDatabase::Postgres { .. } => "postgres",
+            }),
+        })),
         OutputFormat::Text => {
             println!("wrote {target}");
             println!();
@@ -1222,6 +1239,78 @@ async fn render_package(
 /// a quiet operation: every entry resolves its dependencies and enqueues builds
 /// for them. So the list is printed and confirmed rather than acted on from one
 /// flag.
+/// The database a compose file's server uses: the one named on the command
+/// line, or the one picked at a prompt.
+///
+/// Without a terminal there is nobody to ask, and quietly picking one would
+/// decide where someone's data lives for them, so that is an error naming the
+/// flag.
+fn compose_database(args: &ComposeArgs) -> Result<compose::ComposeDatabase> {
+    if !args.role.has_server() {
+        if args.database.is_some() || args.db_password.is_some() {
+            bail!("a worker file has no database; --database and --db-password are for a server");
+        }
+        return Ok(compose::ComposeDatabase::Sqlite);
+    }
+
+    let kind = match args.database {
+        Some(kind) => kind,
+        None => prompt_database_kind()?,
+    };
+    match kind {
+        compose::DatabaseKind::Sqlite => {
+            if args.db_password.is_some() {
+                bail!("--db-password is for --database postgres; SQLite has no password");
+            }
+            Ok(compose::ComposeDatabase::Sqlite)
+        }
+        compose::DatabaseKind::Postgres => {
+            let password = match &args.db_password {
+                Some(password) if compose::is_plain_password(password) => password.clone(),
+                Some(_) => bail!(
+                    "--db-password may only use letters, digits and -_.~: the server puts it \
+                     into a connection URL without escaping it"
+                ),
+                None => generate_password()?,
+            };
+            Ok(compose::ComposeDatabase::Postgres { password })
+        }
+    }
+}
+
+fn prompt_database_kind() -> Result<compose::DatabaseKind> {
+    // The prompt is drawn on stderr, so a file written to stdout (`-o -`) can
+    // still be asked about; it is stdin and stderr that need a person.
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        bail!("choose the server's database with --database postgres or --database sqlite");
+    }
+    let choices = [
+        (
+            compose::DatabaseKind::Postgres,
+            "PostgreSQL — a database service beside the server; for a deployment you keep",
+        ),
+        (
+            compose::DatabaseKind::Sqlite,
+            "SQLite — a single file in the server's volume; fine for trying AURCache out",
+        ),
+    ];
+    let picked = Select::new()
+        .with_prompt("Which database should the server use?")
+        .items(choices.iter().map(|(_, label)| label))
+        .default(0)
+        .interact()
+        .context("failed to read the database choice")?;
+    Ok(choices[picked].0)
+}
+
+/// A password for a database nobody outside the compose network can reach:
+/// 128 random bits, hex, so it needs no escaping anywhere it is written.
+fn generate_password() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("failed to generate a password: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 fn confirm_bulk_add(packages: &[String], yes: bool) -> Result<()> {
     println!("{} package(s) to add:", packages.len());
     for name in packages {
@@ -2534,8 +2623,8 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddPackageArgs, Cli, Command, PackagesCommand, RepoCommand, SetupCommand,
-        build_status_label, compose, parse_key_val, repo,
+        AddPackageArgs, Cli, Command, ComposeArgs, PackagesCommand, RepoCommand, SetupCommand,
+        build_status_label, compose, compose_database, parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
@@ -2702,6 +2791,93 @@ mod tests {
         };
         assert_eq!(args.role, compose::ComposeRole::Bundle);
         assert!(!args.force);
+        // Unset, so that it is asked for rather than assumed.
+        assert_eq!(args.database, None);
+    }
+
+    fn compose_args(argv: &[&str]) -> ComposeArgs {
+        let cli = Cli::parse_from(["aurcache-cli", "setup", "compose"].iter().chain(argv));
+        let Command::Setup { command } = cli.command else {
+            panic!("expected setup");
+        };
+        let SetupCommand::Compose(args) = *command else {
+            panic!("expected compose");
+        };
+        args
+    }
+
+    #[test]
+    fn a_named_database_is_used_without_asking() {
+        assert_eq!(
+            compose_database(&compose_args(&["--database", "sqlite"])).unwrap(),
+            compose::ComposeDatabase::Sqlite
+        );
+        let postgres = compose_database(&compose_args(&[
+            "--database",
+            "postgres",
+            "--db-password",
+            "hunter2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            postgres,
+            compose::ComposeDatabase::Postgres {
+                password: "hunter2".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_postgres_password_is_generated_fresh_and_plain() {
+        let args = compose_args(&["--database", "postgres"]);
+        let compose::ComposeDatabase::Postgres { password: first } =
+            compose_database(&args).unwrap()
+        else {
+            panic!("expected postgres");
+        };
+        let compose::ComposeDatabase::Postgres { password: second } =
+            compose_database(&args).unwrap()
+        else {
+            panic!("expected postgres");
+        };
+        assert_eq!(first.len(), 32);
+        assert!(compose::is_plain_password(&first), "{first}");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_password_that_would_need_escaping_is_refused() {
+        let args = compose_args(&["--database", "postgres", "--db-password", "p@ss/word"]);
+        assert!(compose_database(&args).is_err());
+    }
+
+    /// Flags that cannot mean anything are refused rather than ignored.
+    #[test]
+    fn database_flags_that_do_not_apply_are_refused() {
+        assert!(
+            compose_database(&compose_args(&[
+                "--role",
+                "worker",
+                "--database",
+                "postgres"
+            ]))
+            .is_err()
+        );
+        assert!(
+            compose_database(&compose_args(&[
+                "--database",
+                "sqlite",
+                "--db-password",
+                "x"
+            ]))
+            .is_err()
+        );
+    }
+
+    /// A worker file needs no answer, so it is never asked for one.
+    #[test]
+    fn a_worker_file_does_not_ask_for_a_database() {
+        assert!(compose_database(&compose_args(&["--role", "worker"])).is_ok());
     }
 
     #[test]

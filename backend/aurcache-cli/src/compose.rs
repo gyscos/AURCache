@@ -18,6 +18,37 @@ use std::fmt::Write as _;
 pub const SERVER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-server:latest";
 pub const WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest";
 
+/// The PostgreSQL major version a generated file runs.
+///
+/// The image tag, the upgrade step's `TARGET_VERSION` and `PGDATA` all name
+/// it, and they only work together; a test holds them to this one number.
+pub const POSTGRES_MAJOR: u32 = 17;
+
+/// Pinned to the major version *and* the Debian release. `postgres:17` moves
+/// to a newer Debian from time to time, and a newer C library sorts text
+/// differently under indexes already built; `postgres:latest` can also jump a
+/// major version onto a data directory it refuses to start on.
+pub const POSTGRES_IMAGE: &str = "postgres:17-trixie";
+
+/// The one-shot container that brings the data directory up to
+/// [`POSTGRES_MAJOR`] before the database starts: `pg_upgrade` after a backup
+/// when the major version was raised, nothing when it already matches. It is
+/// the step TrueNAS's own apps (Nextcloud, Immich) run, and it works under any
+/// compose.
+pub const POSTGRES_UPGRADE_IMAGE: &str = "ixsystems/postgres-upgrade:1.2.16";
+
+/// The service name of the database, which is also the host name the server
+/// connects to.
+const DATABASE_SERVICE: &str = "aurcache_database";
+
+/// Role and database name. One name for both, so `psql -U aurcache` lands in
+/// the database AURCache uses rather than in `postgres`.
+const DATABASE_USER: &str = "aurcache";
+
+/// The uid the postgres images run as, and so the owner the upgrade step
+/// insists its data directory has.
+const POSTGRES_UID: &str = "999:999";
+
 /// Written into a generated worker file when the operator has not supplied a
 /// fingerprint, so the file is obviously unfinished rather than quietly
 /// trusting whatever answers.
@@ -53,7 +84,7 @@ impl ComposeRole {
         }
     }
 
-    const fn has_server(self) -> bool {
+    pub const fn has_server(self) -> bool {
         matches!(self, Self::Backend | Self::Bundle)
     }
 
@@ -123,9 +154,46 @@ fn join_list(values: &[String]) -> Option<String> {
     (!values.is_empty()).then(|| values.join(","))
 }
 
+/// Which database a generated server uses, as chosen on the command line.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DatabaseKind {
+    /// A PostgreSQL service beside the server: what a deployment you keep
+    /// should run.
+    Postgres,
+    /// A single file in the server's volume: nothing more to run, fine for
+    /// trying AURCache out.
+    Sqlite,
+}
+
+/// The server's database, with what rendering it needs.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ComposeDatabase {
+    Sqlite,
+    /// The password is shared by the server and the database service, and only
+    /// has to match between them: the database publishes no port.
+    Postgres {
+        password: String,
+    },
+}
+
+/// Whether `password` can be written into the file as it is.
+///
+/// The server puts it into a `postgres://user:password@host` URL without
+/// escaping it, and the file into YAML without quoting it, so only characters
+/// that mean nothing to either are accepted.
+#[must_use]
+pub fn is_plain_password(password: &str) -> bool {
+    !password.is_empty()
+        && password
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+}
+
 #[derive(Debug, Clone)]
 pub struct ComposeParams {
     pub role: ComposeRole,
+    /// Ignored for a worker file, which has no server.
+    pub database: ComposeDatabase,
     pub server_image: String,
     pub worker_image: String,
     pub public_url: String,
@@ -140,6 +208,7 @@ impl Default for ComposeParams {
     fn default() -> Self {
         Self {
             role: ComposeRole::default(),
+            database: ComposeDatabase::Sqlite,
             server_image: SERVER_IMAGE.to_string(),
             worker_image: WORKER_IMAGE.to_string(),
             public_url: format!("http://localhost:{AURCACHE_MIRROR_PORT}"),
@@ -153,17 +222,20 @@ impl Default for ComposeParams {
 #[must_use]
 pub fn render_compose(params: &ComposeParams) -> String {
     let mut out = String::new();
-    out.push_str(&header(params.role));
+    out.push_str(&header(params));
     out.push_str("services:\n");
 
     if params.role.has_server() {
         out.push_str(&server_service(params));
+        if let ComposeDatabase::Postgres { password } = &params.database {
+            out.push_str(&database_services(password));
+        }
     }
     if params.role.has_worker() {
         out.push_str(&worker_service(params));
     }
 
-    out.push_str(&volumes(params.role));
+    out.push_str(&volumes(params));
     if params.role.has_server() {
         // A single-service worker file needs no network: it reaches the server
         // over the host's, wherever that server happens to be.
@@ -172,7 +244,8 @@ pub fn render_compose(params: &ComposeParams) -> String {
     out
 }
 
-fn header(role: ComposeRole) -> String {
+fn header(params: &ComposeParams) -> String {
+    let role = params.role;
     let rule = "# =============================================================================\n";
     let body = match role {
         ComposeRole::Bundle => {
@@ -223,8 +296,18 @@ fn header(role: ComposeRole) -> String {
         }
     };
 
+    let database = match (&params.database, role.has_server()) {
+        (ComposeDatabase::Postgres { .. }, true) => {
+            "#\n\
+             # The server keeps its data in PostgreSQL, in the `aurcache_database` service.\n\
+             # Its password was generated for this file and only has to match between the\n\
+             # two services; the database publishes no port.\n"
+        }
+        _ => "",
+    };
+
     format!(
-        "{rule}{body}#\n# Generated by `aurcache-cli setup compose`. Edit freely — it is a\n\
+        "{rule}{body}{database}#\n# Generated by `aurcache-cli setup compose`. Edit freely — it is a\n\
          # starting point, not a managed file.\n{rule}\n"
     )
 }
@@ -235,8 +318,35 @@ fn server_service(params: &ComposeParams) -> String {
         public_url,
         log_level,
         tls_sans,
+        database,
         ..
     } = params;
+
+    let (database_env, database_volume, depends_on) = match database {
+        ComposeDatabase::Sqlite => (
+            String::new(),
+            "\x20     - aurcache_db:/app/db               # SQLite database\n".to_string(),
+            String::new(),
+        ),
+        ComposeDatabase::Postgres { password } => (
+            format!(
+                "\x20     # PostgreSQL, in the `{DATABASE_SERVICE}` service below.\n\
+                 \x20     - DB_TYPE=POSTGRESQL\n\
+                 \x20     - DB_HOST={DATABASE_SERVICE}\n\
+                 \x20     - DB_USER={DATABASE_USER}\n\
+                 \x20     - DB_PWD={password}\n\
+                 \x20     - DB_NAME={DATABASE_USER}\n"
+            ),
+            String::new(),
+            // Migrations run at startup, so the server waits for a database
+            // that answers rather than failing its first connection.
+            format!(
+                "\x20   depends_on:\n\
+                 \x20     {DATABASE_SERVICE}:\n\
+                 \x20       condition: service_healthy\n"
+            ),
+        ),
+    };
 
     format!(
         "  {SERVER_SERVICE}:\n\
@@ -259,11 +369,73 @@ fn server_service(params: &ComposeParams) -> String {
          \x20     # Auto-approve any worker that can write to the shared `enroll` volume,\n\
          \x20     # mounted read-only here. No secret, no approval click.\n\
          \x20     - AURCACHE_ENROLLMENT_DIR={ENROLLMENT_DIR}\n\
+         {database_env}\
          \x20   volumes:\n\
-         \x20     - aurcache_db:/app/db\n\
+         {database_volume}\
          \x20     - aurcache_repo:/app/repo\n\
          \x20     - aurcache_ca:/app/data/ca      # internal worker CA (persist across restarts)\n\
          \x20     - enroll:{ENROLLMENT_DIR}:ro             # read the workers' enrollment CSRs\n\
+         {depends_on}\
+         \x20   networks:\n\
+         \x20     - aurcache\n\
+         \x20   restart: unless-stopped\n\n"
+    )
+}
+
+/// The database and the step that upgrades its data before it starts.
+///
+/// Both mount the volume at `/var/lib/postgresql`, the parent of `PGDATA`
+/// rather than `PGDATA` itself: the data lives in `<major>/docker` below it,
+/// so an upgrade can build the new version's directory beside the old one.
+fn database_services(password: &str) -> String {
+    let pgdata = format!("/var/lib/postgresql/{POSTGRES_MAJOR}/docker");
+    let env = format!(
+        "\x20     - POSTGRES_USER={DATABASE_USER}\n\
+         \x20     - POSTGRES_PASSWORD={password}\n\
+         \x20     - POSTGRES_DB={DATABASE_USER}\n\
+         \x20     - PGDATA={pgdata}\n"
+    );
+
+    format!(
+        "  {DATABASE_SERVICE}_upgrade:\n\
+         \x20   # Runs before the database, then exits. When the data is from an older major\n\
+         \x20   # version it backs it up (under backups/ in the volume) and runs pg_upgrade;\n\
+         \x20   # otherwise it does nothing. It also moves data written by an older setup\n\
+         \x20   # straight into the volume (PG_VERSION at its root) into {POSTGRES_MAJOR}/docker.\n\
+         \x20   #\n\
+         \x20   # To move to a new major version, change these three together: TARGET_VERSION\n\
+         \x20   # here, and the database's image tag and PGDATA below.\n\
+         \x20   #\n\
+         \x20   # It runs as the postgres user and refuses a volume it does not own. A named\n\
+         \x20   # volume already is; for a host directory, `chown -R 999:999` it first.\n\
+         \x20   image: {POSTGRES_UPGRADE_IMAGE}\n\
+         \x20   # The image's own entrypoint starts a PostgreSQL server; the upgrade is this.\n\
+         \x20   entrypoint: [\"/bin/bash\", \"-c\", \"/upgrade.sh\"]\n\
+         \x20   user: \"{POSTGRES_UID}\"\n\
+         \x20   environment:\n\
+         \x20     - TARGET_VERSION={POSTGRES_MAJOR}\n\
+         {env}\
+         \x20   volumes:\n\
+         \x20     - aurcache_postgres:/var/lib/postgresql\n\
+         \x20   network_mode: none\n\
+         \x20   restart: \"no\"\n\n\
+         \x20 {DATABASE_SERVICE}:\n\
+         \x20   image: {POSTGRES_IMAGE}\n\
+         \x20   user: \"{POSTGRES_UID}\"\n\
+         \x20   environment:\n\
+         {env}\
+         \x20   volumes:\n\
+         \x20     - aurcache_postgres:/var/lib/postgresql\n\
+         \x20   # Over TCP rather than the socket: while the image initialises a new\n\
+         \x20   # database, a temporary server answers on the socket and then stops.\n\
+         \x20   healthcheck:\n\
+         \x20     test: [\"CMD\", \"pg_isready\", \"-h\", \"127.0.0.1\", \"-U\", \"{DATABASE_USER}\", \"-d\", \"{DATABASE_USER}\"]\n\
+         \x20     interval: 10s\n\
+         \x20     timeout: 5s\n\
+         \x20     retries: 30\n\
+         \x20   depends_on:\n\
+         \x20     {DATABASE_SERVICE}_upgrade:\n\
+         \x20       condition: service_completed_successfully\n\
          \x20   networks:\n\
          \x20     - aurcache\n\
          \x20   restart: unless-stopped\n\n"
@@ -330,10 +502,15 @@ fn worker_service(params: &ComposeParams) -> String {
     out
 }
 
-fn volumes(role: ComposeRole) -> String {
+fn volumes(params: &ComposeParams) -> String {
+    let role = params.role;
     let mut out = String::from("volumes:\n");
     if role.has_server() {
-        out.push_str("  aurcache_db:\n  aurcache_repo:\n  aurcache_ca:\n");
+        out.push_str(match params.database {
+            ComposeDatabase::Sqlite => "  aurcache_db:\n",
+            ComposeDatabase::Postgres { .. } => "  aurcache_postgres:\n",
+        });
+        out.push_str("  aurcache_repo:\n  aurcache_ca:\n");
     }
     // The bundle needs it on both sides; the backend declares it so a worker on
     // this host can be added later without editing the server service.
@@ -349,9 +526,10 @@ fn volumes(role: ComposeRole) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposeParams, ComposeRole, ENROLLMENT_DIR, FINGERPRINT_PLACEHOLDER, WorkerEnv,
-        render_compose,
+        ComposeDatabase, ComposeParams, ComposeRole, ENROLLMENT_DIR, FINGERPRINT_PLACEHOLDER,
+        POSTGRES_IMAGE, POSTGRES_MAJOR, WorkerEnv, is_plain_password, render_compose,
     };
+    use yaml_rust2::{Yaml, YamlLoader};
 
     fn params(role: ComposeRole) -> ComposeParams {
         ComposeParams {
@@ -387,9 +565,171 @@ mod tests {
             ComposeRole::Worker,
             ComposeRole::Bundle,
         ] {
-            let rendered = render_compose(&params(role));
-            yaml_rust2::YamlLoader::load_from_str(&rendered)
-                .unwrap_or_else(|e| panic!("{role:?} is not valid YAML: {e}\n{rendered}"));
+            for database in [ComposeDatabase::Sqlite, postgres()] {
+                let rendered = render_compose(&ComposeParams {
+                    database: database.clone(),
+                    ..params(role)
+                });
+                YamlLoader::load_from_str(&rendered).unwrap_or_else(|e| {
+                    panic!("{role:?} with {database:?} is not valid YAML: {e}\n{rendered}")
+                });
+            }
+        }
+    }
+
+    fn postgres() -> ComposeDatabase {
+        ComposeDatabase::Postgres {
+            password: "s3cret".to_string(),
+        }
+    }
+
+    fn parsed(params: &ComposeParams) -> Yaml {
+        let rendered = render_compose(params);
+        YamlLoader::load_from_str(&rendered)
+            .unwrap_or_else(|e| panic!("not valid YAML: {e}\n{rendered}"))
+            .remove(0)
+    }
+
+    /// A service's `environment` list as `KEY=value` strings.
+    fn environment(doc: &Yaml, service: &str) -> Vec<String> {
+        doc["services"][service]["environment"]
+            .as_vec()
+            .unwrap_or_else(|| panic!("{service} has no environment"))
+            .iter()
+            .map(|v| v.as_str().expect("a KEY=value entry").to_string())
+            .collect()
+    }
+
+    fn value_of(env: &[String], key: &str) -> Option<String> {
+        env.iter()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    #[test]
+    fn a_sqlite_server_keeps_its_database_in_a_volume_and_runs_no_postgres() {
+        let doc = parsed(&params(ComposeRole::Bundle));
+        assert!(doc["services"]["aurcache_database"].is_badvalue());
+        assert!(!doc["volumes"]["aurcache_db"].is_badvalue());
+        let env = environment(&doc, "aurcache");
+        assert_eq!(value_of(&env, "DB_TYPE"), None);
+    }
+
+    /// The server finds the database by service name, as the role the
+    /// database creates, with the same password on both sides.
+    #[test]
+    fn a_postgres_server_connects_to_the_database_it_is_given() {
+        for role in [ComposeRole::Bundle, ComposeRole::Backend] {
+            let doc = parsed(&ComposeParams {
+                database: postgres(),
+                ..params(role)
+            });
+            let server = environment(&doc, "aurcache");
+            let database = environment(&doc, "aurcache_database");
+            assert_eq!(value_of(&server, "DB_TYPE").as_deref(), Some("POSTGRESQL"));
+            assert_eq!(
+                value_of(&server, "DB_HOST").as_deref(),
+                Some("aurcache_database")
+            );
+            assert_eq!(
+                value_of(&server, "DB_USER"),
+                value_of(&database, "POSTGRES_USER")
+            );
+            assert_eq!(
+                value_of(&server, "DB_NAME"),
+                value_of(&database, "POSTGRES_DB")
+            );
+            assert_eq!(value_of(&server, "DB_PWD").as_deref(), Some("s3cret"));
+            assert_eq!(
+                value_of(&database, "POSTGRES_PASSWORD").as_deref(),
+                Some("s3cret")
+            );
+            assert!(doc["volumes"]["aurcache_db"].is_badvalue(), "{role:?}");
+            assert!(
+                !doc["volumes"]["aurcache_postgres"].is_badvalue(),
+                "{role:?}"
+            );
+        }
+    }
+
+    /// The image tag, the upgrade's target and both `PGDATA`s only work as a
+    /// set: an upgrade to 18 feeding a 17 server is a database that will not
+    /// start.
+    #[test]
+    fn the_postgres_major_version_agrees_everywhere() {
+        let doc = parsed(&ComposeParams {
+            database: postgres(),
+            ..params(ComposeRole::Bundle)
+        });
+        let pgdata = format!("/var/lib/postgresql/{POSTGRES_MAJOR}/docker");
+        let upgrade = environment(&doc, "aurcache_database_upgrade");
+        let database = environment(&doc, "aurcache_database");
+
+        assert!(POSTGRES_IMAGE.starts_with(&format!("postgres:{POSTGRES_MAJOR}-")));
+        assert_eq!(
+            doc["services"]["aurcache_database"]["image"].as_str(),
+            Some(POSTGRES_IMAGE)
+        );
+        assert_eq!(
+            value_of(&upgrade, "TARGET_VERSION"),
+            Some(POSTGRES_MAJOR.to_string())
+        );
+        assert_eq!(value_of(&upgrade, "PGDATA"), Some(pgdata.clone()));
+        // Left to its own entrypoint the image is a server, which never exits
+        // and so never lets the database start.
+        assert_eq!(
+            doc["services"]["aurcache_database_upgrade"]["entrypoint"][2].as_str(),
+            Some("/upgrade.sh")
+        );
+        assert_eq!(value_of(&database, "PGDATA"), Some(pgdata));
+        // Everything else the upgrade is told is what the database is told.
+        let upgrade_rest: Vec<_> = upgrade
+            .iter()
+            .filter(|kv| !kv.starts_with("TARGET_VERSION="))
+            .cloned()
+            .collect();
+        assert_eq!(upgrade_rest, database);
+    }
+
+    /// Start order is the point: upgrade, then a database that answers, then
+    /// the server that migrates it.
+    #[test]
+    fn postgres_services_start_in_order() {
+        let doc = parsed(&ComposeParams {
+            database: postgres(),
+            ..params(ComposeRole::Bundle)
+        });
+        assert_eq!(
+            doc["services"]["aurcache"]["depends_on"]["aurcache_database"]["condition"].as_str(),
+            Some("service_healthy")
+        );
+        assert_eq!(
+            doc["services"]["aurcache_database"]["depends_on"]["aurcache_database_upgrade"]
+                ["condition"]
+                .as_str(),
+            Some("service_completed_successfully")
+        );
+        assert!(
+            !doc["services"]["aurcache_database"]["healthcheck"].is_badvalue(),
+            "a service_healthy dependency needs a healthcheck"
+        );
+    }
+
+    /// A worker file has no server, so it has no database either.
+    #[test]
+    fn a_worker_file_has_no_database_whatever_is_chosen() {
+        let doc = parsed(&ComposeParams {
+            database: postgres(),
+            ..params(ComposeRole::Worker)
+        });
+        assert!(doc["services"]["aurcache_database"].is_badvalue());
+        assert!(doc["volumes"]["aurcache_postgres"].is_badvalue());
+    }
+
+    #[test]
+    fn only_passwords_that_need_no_escaping_are_plain() {
+        assert!(is_plain_password("Abc-123_x.y~z"));
+        for bad in ["", "p@ss", "a/b", "a:b", "with space", "quo\"te", "#hash"] {
+            assert!(!is_plain_password(bad), "{bad:?}");
         }
     }
 

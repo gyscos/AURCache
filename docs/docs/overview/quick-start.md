@@ -164,6 +164,18 @@ existing file without `--force`. The output keeps the comments explaining why th
 worker needs `privileged` and what the `enroll` volume is for, because those are
 the parts worth reading before you deploy it.
 
+A file with a server asks which database it should use, or takes
+`--database postgres` or `--database sqlite` (required when there is no terminal
+to ask on). PostgreSQL adds two services: the database, pinned to
+`postgres:17-trixie`, and a step that runs before it and exits. That step is
+`ixsystems/postgres-upgrade`, the one TrueNAS's own apps use. It does nothing
+while the data already matches the database's major version. When you raise the
+version, it backs the data up and runs `pg_upgrade`, and it moves data from the
+older layout (mounted straight at `/var/lib/postgresql/data`) into the one the
+file uses. The database password is generated unless you pass `--db-password`.
+The database publishes no port, so the password only has to match between the
+two services.
+
 ## Filling it, and using it
 
 A fresh instance is empty. If the machine you are on already installs packages

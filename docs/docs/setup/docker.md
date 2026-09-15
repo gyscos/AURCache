@@ -89,7 +89,9 @@ unprivileged.
 ## Generating these files
 
 `aurcache-cli setup compose --role bundle|backend|worker` writes the file for
-each of these topologies, with the same comments and the same defaults. It needs
+each of these topologies, with the same comments and the same defaults, and
+`--database postgres|sqlite` chooses the server's database (asked for when
+omitted). It needs
 no server and no token, so it is available before anything is running — useful
 for a system that deploys from a pasted compose file, such as TrueNAS, Portainer
 or Unraid. See [Quick Start](../overview/quick-start.md#for-truenas-portainer-unraid).
