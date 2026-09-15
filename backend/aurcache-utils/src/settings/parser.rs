@@ -17,6 +17,21 @@ macro_rules! impl_parse_setting {
 
 impl_parse_setting!(u32, i32, u64, i64);
 
+/// A byte count written as a size (`20G`, `512M`, `1024`).
+///
+/// Its own type rather than `u64`, whose plain number parse would read `20G`
+/// as garbage and quietly fall back to the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteSize(pub u64);
+
+impl ParseSetting for ByteSize {
+    fn parse_setting(s: &str) -> Result<Self, String> {
+        aurcache_common::units::parse_size(s)
+            .map(ByteSize)
+            .ok_or_else(|| format!("expected a size such as 20G, got {s:?}"))
+    }
+}
+
 impl ParseSetting for String {
     fn parse_setting(s: &str) -> Result<Self, String> {
         Ok(s.to_string())

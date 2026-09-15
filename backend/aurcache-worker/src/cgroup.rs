@@ -1,11 +1,12 @@
-//! A cgroup per build, for an exact peak-memory figure.
+//! A cgroup per build: its peak memory, its limits, and how it is killed.
 //!
 //! cgroup v2 records `memory.peak` for a cgroup and everything in it, so giving
 //! each build its own answers "how much did this build need" exactly, with no
 //! sampling and nothing to poll. The build is a tree -- `makechrootpkg` runs
 //! `systemd-nspawn` runs `makepkg` runs one compiler per core -- and every
 //! descendant inherits the cgroup its parent was placed in, so one number
-//! covers all of them.
+//! covers all of them. The same property makes it the place for the build's
+//! `memory.max`/`cpu.max` ([`BuildLimits`]) and for `cgroup.kill`.
 //!
 //! ## Why the worker has to prepare its own hierarchy
 //!
@@ -62,34 +63,101 @@ impl Hierarchy {
             let _ = fs::write(leaf.join("cgroup.procs"), pid.to_string());
         }
 
-        let control = base.join("cgroup.subtree_control");
-        if !fs::read_to_string(&control)
-            .unwrap_or_default()
-            .split_whitespace()
-            .any(|c| c == "memory")
-        {
-            fs::write(&control, "+memory").with_context(|| {
-                format!(
-                    "enabling the memory controller in {} -- the worker needs a \
-                     writable cgroup subtree (privileged container, or a systemd \
-                     unit with Delegate=yes)",
-                    control.display()
-                )
-            })?;
-        }
-
-        Ok(Self { base })
+        let hierarchy = Self { base };
+        hierarchy.enable_controller("memory")?;
+        Ok(hierarchy)
     }
 
-    /// Create the cgroup for one build.
-    pub fn for_build(&self, build_id: i32) -> Result<BuildCgroup> {
+    /// Enable the `cpu` controller for the builds, which `cpu.max` needs.
+    ///
+    /// Only when a CPU limit is configured, and not as part of [`Self::prepare`]:
+    /// with the controller on, builds compete by cgroup rather than by process,
+    /// so a `-j24` build and a single-threaded one get equal time under
+    /// contention. That is right when builds are capped anyway and a change
+    /// nobody asked for when they are not.
+    pub fn enable_cpu(&self) -> Result<()> {
+        self.enable_controller("cpu")
+    }
+
+    fn enable_controller(&self, controller: &str) -> Result<()> {
+        let control = self.base.join("cgroup.subtree_control");
+        if fs::read_to_string(&control)
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|c| c == controller)
+        {
+            return Ok(());
+        }
+        fs::write(&control, format!("+{controller}")).with_context(|| {
+            format!(
+                "enabling the {controller} controller in {} -- the worker needs a \
+                 writable cgroup subtree (privileged container, or a systemd \
+                 unit with Delegate=yes)",
+                control.display()
+            )
+        })
+    }
+
+    /// Create the cgroup for one build, with `limits` applied.
+    ///
+    /// A limit that cannot be applied fails this, and with it the build: a
+    /// configured limit is there to keep one build from taking the machine
+    /// down, and running without it is the outcome it exists to prevent.
+    pub fn for_build(&self, build_id: i32, limits: &BuildLimits) -> Result<BuildCgroup> {
         let dir = self.base.join(format!("build-{build_id}"));
         // A cgroup left by a previous attempt at the same build is empty by
         // now; removing it is what keeps `memory.peak` about this attempt.
         let _ = remove_cgroup_tree(&dir);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(BuildCgroup { dir })
+        let cgroup = BuildCgroup { dir };
+        cgroup.apply(limits)?;
+        Ok(cgroup)
     }
+}
+
+/// Resource limits for each build, from the worker's configuration.
+///
+/// Per build, not for the worker as a whole: `WORKER_CONCURRENCY` builds can
+/// each use this much. A cap on everything together belongs on what runs the
+/// worker -- `MemoryMax=`/`CPUQuota=` on the systemd unit, `--memory`/`--cpus`
+/// on the container.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BuildLimits {
+    /// `memory.max`, in bytes: the RAM the build may use.
+    pub memory_max: Option<u64>,
+    /// `memory.swap.max`, in bytes: the swap it may use besides.
+    ///
+    /// `memory.max` alone does not bound a build on a machine with swap: the
+    /// kernel pushes what is over the limit out to swap instead of killing
+    /// anything. Measured on a worker with zram, a 900 MiB allocation under a
+    /// 300 MiB `memory.max` simply succeeded. So a memory limit brings a swap
+    /// limit of `0` with it unless one is configured, and reaching the limit
+    /// then ends in the OOM kill it is expected to.
+    pub swap_max: Option<u64>,
+    /// `cpu.max`, in CPUs: `2.5` is two and a half cores' worth of time per
+    /// period, spread over as many cores as the build uses.
+    pub cpus: Option<f64>,
+}
+
+impl BuildLimits {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.memory_max.is_none() && self.swap_max.is_none() && self.cpus.is_none()
+    }
+}
+
+/// The scheduler period `cpu.max` is expressed against, in microseconds. The
+/// kernel's own default.
+const CPU_PERIOD_US: u64 = 100_000;
+
+/// `cpu.max` for a number of CPUs: quota and period, in microseconds.
+///
+/// The kernel refuses a quota under a millisecond, so a very small fraction is
+/// raised to that rather than turned into a failed build.
+fn cpu_max(cpus: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let quota = ((cpus * CPU_PERIOD_US as f64).round() as u64).max(1_000);
+    format!("{quota} {CPU_PERIOD_US}")
 }
 
 /// One build's cgroup. Removed when dropped.
@@ -98,6 +166,52 @@ pub struct BuildCgroup {
 }
 
 impl BuildCgroup {
+    /// Write `limits` into this cgroup. Everything placed in it afterwards --
+    /// the build and the container nspawn keeps in it -- is bound by them.
+    fn apply(&self, limits: &BuildLimits) -> Result<()> {
+        if let Some(bytes) = limits.memory_max {
+            fs::write(self.dir.join("memory.max"), bytes.to_string())
+                .with_context(|| format!("setting memory.max in {}", self.dir.display()))?;
+        }
+        if let Some(bytes) = limits.swap_max {
+            match fs::write(self.dir.join("memory.swap.max"), bytes.to_string()) {
+                Ok(()) => {}
+                // No swap accounting in this kernel: nothing to limit it with,
+                // and refusing every build over it would help no one.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        "no memory.swap.max in {}; swap is not limited",
+                        self.dir.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("setting memory.swap.max in {}", self.dir.display())
+                    });
+                }
+            }
+        }
+        if let Some(cpus) = limits.cpus {
+            fs::write(self.dir.join("cpu.max"), cpu_max(cpus)).with_context(|| {
+                format!(
+                    "setting cpu.max in {} -- is the cpu controller delegated to the worker?",
+                    self.dir.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// How many processes in this build the kernel's OOM killer ended.
+    ///
+    /// `memory.events` counts the whole subtree, so a compiler killed inside the
+    /// container counts here. `None` when it cannot be read.
+    #[must_use]
+    pub fn oom_kills(&self) -> Option<u64> {
+        let raw = fs::read_to_string(self.dir.join("memory.events")).ok()?;
+        parse_oom_kills(&raw)
+    }
+
     /// An open handle to `cgroup.procs`, for the child to place itself into.
     ///
     /// Opened here rather than in the child because opening a file after
@@ -217,9 +331,70 @@ fn parse_peak(raw: &str) -> Option<i64> {
     raw.trim().parse().ok()
 }
 
+/// The `oom_kill` line of `memory.events`, which is `key value` per line.
+fn parse_oom_kills(raw: &str) -> Option<u64> {
+    raw.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == "oom_kill").then(|| value.trim().parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_max_is_quota_over_the_default_period() {
+        assert_eq!(cpu_max(8.0), "800000 100000");
+        assert_eq!(cpu_max(2.5), "250000 100000");
+        assert_eq!(cpu_max(0.25), "25000 100000");
+        // Below the kernel's minimum quota, raised rather than refused.
+        assert_eq!(cpu_max(0.001), "1000 100000");
+    }
+
+    #[test]
+    fn oom_kills_come_from_memory_events() {
+        let events = "low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_oom_kills(events), Some(2));
+        assert_eq!(parse_oom_kills("low 0\nhigh 0\n"), None);
+    }
+
+    /// Limits land in the files the kernel reads them from. A plain directory
+    /// stands in for cgroupfs.
+    #[test]
+    fn limits_are_written_where_the_kernel_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cgroup = BuildCgroup {
+            dir: tmp.path().to_path_buf(),
+        };
+        cgroup
+            .apply(&BuildLimits {
+                memory_max: Some(32 * 1024 * 1024 * 1024),
+                swap_max: Some(0),
+                cpus: Some(6.0),
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("memory.max")).unwrap(),
+            "34359738368"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("cpu.max")).unwrap(),
+            "600000 100000"
+        );
+        // No limit, no file: the kernel's `max` stays in place.
+        let unlimited = tempfile::tempdir().unwrap();
+        BuildCgroup {
+            dir: unlimited.path().to_path_buf(),
+        }
+        .apply(&BuildLimits::default())
+        .unwrap();
+        assert!(!unlimited.path().join("memory.max").exists());
+    }
 
     /// The shape nspawn leaves under a build's cgroup. A plain directory tree
     /// stands in for cgroupfs, where the kernel's files go with each directory.

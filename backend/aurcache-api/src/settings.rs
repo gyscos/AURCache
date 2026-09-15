@@ -66,6 +66,9 @@ async fn setting_patch_impl(
     value: String,
 ) -> Result<(), ApiError> {
     let setting = parse_setting(key)?;
+    setting
+        .validate(&value)
+        .map_err(|e| err(Status::BadRequest, e))?;
     ApplicationSettings::patch(db, [(setting, pkg_id, Some(value))])
         .await
         .map_err(|e| err(Status::InternalServerError, e))
@@ -146,6 +149,7 @@ pub async fn package_setting_get(
 #[utoipa::path(
     responses(
         (status = 200, description = "Update a single setting"),
+        (status = 400, description = "Value not valid for this setting"),
         (status = 404, description = "Unknown setting key"),
     ),
     params(("key" = String, Path, description = "Setting key"))
@@ -163,6 +167,7 @@ pub async fn setting_patch(
 #[utoipa::path(
     responses(
         (status = 200, description = "Update a single setting for a package"),
+        (status = 400, description = "Value not valid for this setting"),
         (status = 404, description = "Unknown setting key or package"),
     ),
     params(

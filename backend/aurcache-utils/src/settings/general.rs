@@ -1,4 +1,4 @@
-use crate::settings::parser::ParseSetting;
+use crate::settings::parser::{ByteSize, ParseSetting};
 use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
@@ -195,12 +195,18 @@ pub trait SettingsTraits {
 impl SettingsTraits for ApplicationSettings {
     async fn get_all(db: &DatabaseConnection, pkgid: Option<i32>) -> anyhow::Result<Self> {
         Ok(Self {
-            cpu_limit: get_setting(Setting::CpuLimit, pkgid, db).await,
-            memory_limit: get_setting(Setting::MemoryLimit, pkgid, db).await,
             max_concurrent_builds: get_setting(Setting::MaxConcurrentBuilds, pkgid, db).await,
             version_check_interval: get_setting(Setting::VersionCheckInterval, pkgid, db).await,
             auto_update_interval: get_setting(Setting::AutoUpdateInterval, pkgid, db).await,
             job_timeout: get_setting(Setting::JobTimeout, pkgid, db).await,
+            max_artifact_size: {
+                let entry: SettingsEntry<ByteSize> =
+                    get_setting(Setting::MaxArtifactSize, pkgid, db).await;
+                SettingsEntry {
+                    value: entry.value.0,
+                    source: entry.source,
+                }
+            },
             builder_image: get_setting(Setting::BuilderImage, pkgid, db).await,
             date_format: get_setting(Setting::DateFormat, pkgid, db).await,
             build_on_new_version: get_setting(Setting::BuildOnNewVersion, pkgid, db).await,

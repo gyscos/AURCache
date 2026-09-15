@@ -115,6 +115,42 @@ when it was *downloaded*, not when it was last used — pacman does not touch it
 on a cache hit — so age-evicting would discard a package used in every build
 simply for being old. Size pressure is the honest bound for that pool.
 
+## Resource limits
+
+| Variable | Type | Description | Default |
+|---|---|---|---|
+| `WORKER_BUILD_MEMORY_MAX` | Size | Memory each build may use; past it, the kernel kills processes in the build | unlimited |
+| `WORKER_BUILD_SWAP_MAX` | Size | Swap each build may use besides that memory | `0` when `WORKER_BUILD_MEMORY_MAX` is set, otherwise unlimited |
+| `WORKER_BUILD_CPUS` | Number | CPU time each build may use, in cores; fractions such as `2.5` are allowed | unlimited |
+
+The limits apply to **each build**, so a worker running `WORKER_CONCURRENCY`
+builds can use that many times as much. To cap the worker as a whole, limit
+what runs it: `MemoryMax=` and `CPUQuota=` on the systemd unit, or `--memory`
+and `--cpus` on its container.
+
+**A memory limit limits swap too.** On its own, a cgroup's memory limit only
+bounds RAM: a build over it is pushed out to swap rather than stopped, which on
+a machine with swap means no limit at all. So setting `WORKER_BUILD_MEMORY_MAX`
+also sets the build's swap allowance to zero, and a build that needs more is
+killed. Set `WORKER_BUILD_SWAP_MAX` to allow some. A build killed this way fails
+with a reason that names the limit, rather than a bare exit code.
+
+**A CPU limit also limits parallelism.** `nproc` inside the build still counts
+every core, so the worker lowers `MAKEFLAGS`, `OMP_NUM_THREADS` and
+`CARGO_BUILD_JOBS` to the number of CPUs allowed. Without that, a build limited
+to 6 CPUs on a 24-core machine would start 24 compilers, each holding its own
+memory. A build that picks its parallelism some other way is still held to the
+limit, only less efficiently.
+
+The limits are enforced with the build's cgroup, which needs the same thing the
+build's memory figure does: a privileged container, or `Delegate=yes` on the
+systemd unit (the packaged unit has it). A worker that has limits configured
+but cannot enforce them **refuses every build** and says so at startup, rather
+than running builds without the limits it was given.
+
+The legacy container builder keeps its own `CPU_LIMIT` (milli-CPUs) and
+`MEMORY_LIMIT` (MB).
+
 ## Locations
 
 | Variable | Type | Description | Default |

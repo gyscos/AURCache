@@ -59,6 +59,42 @@ impl ChrootExecutor {
                 None
             }
         };
+        let limits = cfg.build_limits;
+        if !limits.is_empty() {
+            match &cgroups {
+                // Said once, here, rather than only as every build failing.
+                None => tracing::error!(
+                    "WORKER_BUILD_MEMORY_MAX/WORKER_BUILD_CPUS are set, but there is no \
+                     per-build cgroup to enforce them in; every build will be refused \
+                     rather than run unlimited"
+                ),
+                Some(hierarchy) => {
+                    if limits.cpus.is_some()
+                        && let Err(e) = hierarchy.enable_cpu()
+                    {
+                        tracing::error!(
+                            "WORKER_BUILD_CPUS is set, but the cpu controller cannot be \
+                             enabled ({e:#}); every build will be refused rather than run \
+                             unlimited"
+                        );
+                    }
+                    let gib = |bytes: Option<u64>| {
+                        bytes.map_or_else(
+                            || "unlimited".to_string(),
+                            |b| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30)),
+                        )
+                    };
+                    tracing::info!(
+                        "Build limits: memory {}, swap {}, CPUs {}",
+                        gib(limits.memory_max),
+                        gib(limits.swap_max),
+                        limits
+                            .cpus
+                            .map_or_else(|| "unlimited".to_string(), |c| c.to_string()),
+                    );
+                }
+            }
+        }
         let shared = Arc::new(Shared {
             active_pkgbases: Mutex::new(HashSet::new()),
             chroots: Chroots::new(

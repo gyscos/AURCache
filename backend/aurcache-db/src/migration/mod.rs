@@ -27,6 +27,7 @@ mod m20260907_000000_build_peak_memory;
 mod m20260910_000000_files_package_fk;
 mod m20260911_000000_build_trigger_end_reason;
 mod m20260914_000000_publishing_is_pending;
+mod m20260915_000000_retire_build_limit_settings;
 
 pub struct Migrator;
 
@@ -68,6 +69,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000000_files_package_fk::Migration),
             Box::new(m20260911_000000_build_trigger_end_reason::Migration),
             Box::new(m20260914_000000_publishing_is_pending::Migration),
+            Box::new(m20260915_000000_retire_build_limit_settings::Migration),
         ]
     }
 }

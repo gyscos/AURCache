@@ -46,9 +46,10 @@ pub async fn upload_artifacts(client: &WorkerClient, build_id: i32, pkgdir: &Pat
         let reader = tokio::fs::File::open(&path)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
+        let len = reader.metadata().await.ok().map(|m| m.len());
         log(client, build_id, &format!("[worker] uploading {name}\n")).await;
         client
-            .upload_artifact(build_id, &name, reader)
+            .upload_artifact(build_id, &name, reader, len)
             .await
             .with_context(|| format!("uploading {name}"))?;
     }

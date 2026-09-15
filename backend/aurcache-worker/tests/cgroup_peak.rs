@@ -26,7 +26,7 @@ use std::process::Command;
 fn a_builds_cgroup_reports_its_peak_memory() {
     let hierarchy = Hierarchy::prepare().expect("preparing the cgroup hierarchy");
     let cgroup = hierarchy
-        .for_build(4242)
+        .for_build(4242, &aurcache_worker::cgroup::BuildLimits::default())
         .expect("creating the build cgroup");
 
     let handle = cgroup.procs_handle().expect("opening cgroup.procs");

@@ -18,4 +18,6 @@ pub mod ports;
 pub mod repo;
 pub mod settings;
 pub mod source;
+/// Sizes and durations as configuration writes them (`40G`, `3h`).
+pub mod units;
 pub mod worker;

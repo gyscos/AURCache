@@ -25,12 +25,13 @@ pub struct SettingsEntry<T> {
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct ApplicationSettings {
-    pub cpu_limit: SettingsEntry<u32>,
-    pub memory_limit: SettingsEntry<i32>,
     pub max_concurrent_builds: SettingsEntry<u32>,
     pub version_check_interval: SettingsEntry<u32>,
     pub auto_update_interval: SettingsEntry<Option<String>>,
     pub job_timeout: SettingsEntry<u32>,
+    /// Largest package file a worker may upload, in bytes. Written as a size
+    /// (`20G`); see [`Setting::MaxArtifactSize`].
+    pub max_artifact_size: SettingsEntry<u64>,
     pub builder_image: SettingsEntry<String>,
     /// Default date format for the web UI. A browser may override it
     /// locally; nothing writes a per-client choice back here.
@@ -50,8 +51,6 @@ pub struct SettingsMeta {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
-    CpuLimit,
-    MemoryLimit,
     MaxConcurrentBuilds,
     VersionCheckInterval,
     AutoUpdateInterval,
@@ -59,10 +58,20 @@ pub enum Setting {
     PersistentBuilddir,
     DateFormat,
     JobTimeout,
+    MaxArtifactSize,
     BuilderImage,
     MakepkgConf,
     PacmanConf,
 }
+
+/// Keys of settings that no longer exist, which may still be stored or dumped.
+///
+/// `cpu_limit` and `memory_limit` were server settings that nothing read once
+/// builds moved to workers: limits apply where the build runs, so a worker sets
+/// its own (`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS`). A migration deletes
+/// their rows, and a restore skips them so an older dump does not bring them
+/// back.
+pub const RETIRED_SETTING_KEYS: &[&str] = &["cpu_limit", "memory_limit"];
 
 impl Setting {
     /// Every setting there is.
@@ -72,9 +81,7 @@ impl Setting {
     /// `date_format` and `build_on_new_version` were served by `GET /settings`
     /// but rejected by `PATCH /settings/<key>` as unknown, so neither could be
     /// changed through the API at all.
-    pub const ALL: [Self; 12] = [
-        Self::CpuLimit,
-        Self::MemoryLimit,
+    pub const ALL: [Self; 11] = [
         Self::MaxConcurrentBuilds,
         Self::VersionCheckInterval,
         Self::AutoUpdateInterval,
@@ -82,6 +89,7 @@ impl Setting {
         Self::PersistentBuilddir,
         Self::DateFormat,
         Self::JobTimeout,
+        Self::MaxArtifactSize,
         Self::BuilderImage,
         Self::MakepkgConf,
         Self::PacmanConf,
@@ -91,16 +99,6 @@ impl Setting {
     #[must_use]
     pub const fn meta(&self) -> SettingsMeta {
         match self {
-            Self::CpuLimit => SettingsMeta {
-                key: "cpu_limit",
-                env_name: Some("CPU_LIMIT"),
-                default: "0",
-            },
-            Self::MemoryLimit => SettingsMeta {
-                key: "memory_limit",
-                env_name: Some("MEMORY_LIMIT"),
-                default: "-1",
-            },
             Self::MaxConcurrentBuilds => SettingsMeta {
                 key: "max_concurrent_builds",
                 env_name: Some("MAX_CONCURRENT_BUILDS"),
@@ -159,6 +157,17 @@ impl Setting {
                 env_name: Some("JOB_TIMEOUT"),
                 default: "3600",
             },
+            // Largest package file a worker may upload, checked per package so
+            // one outsized package (an engine, a game) can be allowed more
+            // without raising the ceiling for everything. A cap exists at all
+            // because the upload lands on the server's disk before anything
+            // looks at it. Written as a size, `20G`, the way the worker's own
+            // limits are; see `units::parse_size`.
+            Self::MaxArtifactSize => SettingsMeta {
+                key: "max_artifact_size",
+                env_name: Some("MAX_ARTIFACT_SIZE"),
+                default: "20G",
+            },
             Self::BuilderImage => SettingsMeta {
                 key: "builder_image",
                 env_name: Some("BUILDER_IMAGE"),
@@ -181,6 +190,28 @@ impl Setting {
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.meta().key == key)
     }
+
+    /// Whether `value` is one this setting can use, checked before it is stored.
+    ///
+    /// Reading falls back to the default when a stored value does not parse,
+    /// which is right for a value that is already there and wrong for one being
+    /// saved: `max_artifact_size = 40GiB` misspelled as `40 gigs` would quietly
+    /// mean 20G. Only the settings that are not plain numbers or free text are
+    /// checked here; the rest parse as they always did.
+    ///
+    /// # Errors
+    /// A message saying what was expected.
+    pub fn validate(&self, value: &str) -> Result<(), String> {
+        match self {
+            Self::MaxArtifactSize => crate::units::parse_size(value)
+                .filter(|&bytes| bytes > 0)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    format!("{value:?} is not a size (expected e.g. 20G, 512M or a byte count)")
+                }),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,18 +230,17 @@ mod tests {
     fn every_setting_is_reachable_by_its_key() {
         fn position(setting: Setting) -> usize {
             match setting {
-                Setting::CpuLimit => 0,
-                Setting::MemoryLimit => 1,
-                Setting::MaxConcurrentBuilds => 2,
-                Setting::VersionCheckInterval => 3,
-                Setting::AutoUpdateInterval => 4,
-                Setting::BuildOnNewVersion => 5,
-                Setting::PersistentBuilddir => 6,
-                Setting::DateFormat => 7,
-                Setting::JobTimeout => 8,
-                Setting::BuilderImage => 9,
-                Setting::MakepkgConf => 10,
-                Setting::PacmanConf => 11,
+                Setting::MaxConcurrentBuilds => 0,
+                Setting::VersionCheckInterval => 1,
+                Setting::AutoUpdateInterval => 2,
+                Setting::BuildOnNewVersion => 3,
+                Setting::PersistentBuilddir => 4,
+                Setting::DateFormat => 5,
+                Setting::JobTimeout => 6,
+                Setting::MaxArtifactSize => 7,
+                Setting::BuilderImage => 8,
+                Setting::MakepkgConf => 9,
+                Setting::PacmanConf => 10,
             }
         }
 

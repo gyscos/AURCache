@@ -42,6 +42,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | AUTO_UPDATE_SCHEDULE   | String (CRON) | Auto update schedule in cronjob syntax with seconds (null to disable) | null    |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
 | JOB_TIMEOUT            | Integer       | Longest a build may run before the server reclaims it, in seconds     | 3600    |
+| MAX_ARTIFACT_SIZE      | Size          | Largest package file a worker may upload, e.g. `20G`; also a setting, per package or global | `20G` |
 | RETIRED_PACKAGE_GRACE  | Integer       | How long a package file stays downloadable after a newer build or a removal takes it out of the repository database, in seconds, so clients that synced just before can still fetch it | 86400 |
 | SECRET_KEY             | String        | \>32Byte Random String for singing cookies                            | Random  |
 | AURCACHE_PUBLIC_URL    | String        | Base URL workers use for the pacman repo, baked into build configs. Example: `http://aurcache:8081` | `http://localhost:8081` |
@@ -53,9 +54,9 @@ once and how long it will let one run.
 :::note Legacy build settings
 `BUILDER_IMAGE`, `CPU_LIMIT`, `MEMORY_LIMIT` and `BUILD_ARTIFACT_DIR`
 configured the per-build Docker container that AURCache used to spawn. In the
-split setup they do nothing: resource limits are whatever the worker's own
-container or host imposes, and the worker uploads packages over the API rather
-than through a shared directory.
+split setup they do nothing on the server: a worker limits its own builds with
+[`WORKER_BUILD_MEMORY_MAX` and `WORKER_BUILD_CPUS`](../workers/configuration.md#resource-limits),
+and uploads packages over the API rather than through a shared directory.
 
 They are still read by the [hybrid compatibility
 image](../setup/docker.md#backward-compatibility-the-hybrid-image), where they

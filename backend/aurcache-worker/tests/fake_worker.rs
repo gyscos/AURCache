@@ -23,12 +23,14 @@ use std::io::Write;
 use std::time::Duration;
 
 use aurcache_common::builder::BuildStates;
+use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{ClaimRequest, CompleteReport};
 use aurcache_db::builds;
 use aurcache_db::files;
 use aurcache_db::helpers::worker_jobs::{STATUS_FAILED, STATUS_SUCCESS};
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
+use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_worker_core::client::{WorkerClient, fetch_and_pin_ca};
 use aurcache_worker_core::config::CoreConfig;
 use aurcache_worker_core::enroll::ensure_enrolled;
@@ -193,9 +195,49 @@ async fn fake_worker_protocol_roundtrip() {
 
     client.append_log(1, "fake build starting\n").await.unwrap();
 
+    // --- The artifact limit is the package's setting, and an artifact over it
+    // is refused -- before a byte is read when the size is declared, and at the
+    // limit when it is not -- with the server's reason, and nothing staged.
+    ApplicationSettings::patch(
+        &db,
+        [(Setting::MaxArtifactSize, Some(1), Some("1K".to_string()))],
+    )
+    .await
+    .unwrap();
+    let oversized = vec![0u8; 64 * 1024];
+    for declared in [Some(oversized.len() as u64), None] {
+        let refused = client
+            .upload_artifact(
+                1,
+                "p1-1.0-1-x86_64.pkg.tar.zst",
+                std::io::Cursor::new(oversized.clone()),
+                declared,
+            )
+            .await
+            .expect_err("an artifact over the package's limit must be refused");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("413")
+                && message.contains("max_artifact_size")
+                && message.contains("1K"),
+            "the refusal should name the limit ({declared:?}): {message}"
+        );
+        assert!(
+            !repo_root
+                .join(".staging")
+                .join("1")
+                .join("p1-1.0-1-x86_64.pkg.tar.zst")
+                .exists(),
+            "a refused artifact left a partial file behind ({declared:?})"
+        );
+    }
+    ApplicationSettings::patch(&db, [(Setting::MaxArtifactSize, Some(1), None)])
+        .await
+        .unwrap();
+
     let (fname, bytes) = make_pkg("p1", "1.0-1");
     client
-        .upload_artifact(1, &fname, std::io::Cursor::new(bytes))
+        .upload_artifact(1, &fname, std::io::Cursor::new(bytes), None)
         .await
         .unwrap();
     client
@@ -254,7 +296,7 @@ async fn fake_worker_protocol_roundtrip() {
 
     let (bad_name, bad_bytes) = make_pkg("evil", "9.9-1");
     client
-        .upload_artifact(2, &bad_name, std::io::Cursor::new(bad_bytes))
+        .upload_artifact(2, &bad_name, std::io::Cursor::new(bad_bytes), None)
         .await
         .unwrap();
     client

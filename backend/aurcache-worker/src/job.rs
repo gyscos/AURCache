@@ -173,10 +173,13 @@ async fn run_job_inner(
         aurcache_worker_core::repo::append_to_pacman_conf(&job.pacman_conf, client.repo_section());
     let (makepkg_overrides, pacman_conf) = chroot::write_configs(
         &cfg_dir,
-        &credentials::augment_makepkg_conf(
-            &job.makepkg_conf,
-            credential.as_ref(),
-            agent_socket().as_deref(),
+        &build::limit_parallelism(
+            &credentials::augment_makepkg_conf(
+                &job.makepkg_conf,
+                credential.as_ref(),
+                agent_socket().as_deref(),
+            ),
+            cfg.build_limits.cpus,
         ),
         &pacman_conf,
         job.mirrorlist.as_deref(),
@@ -498,8 +501,21 @@ async fn run_build(
     // accounted to it, and `memory.peak` is the whole tree's high-water mark.
     //
     // A hierarchy the worker could not prepare means no figure, never a failed
-    // build: this measures the work, it does not do it.
-    let build_cgroup = ctx.cgroups.map(|h| h.for_build(build_id)).transpose()?;
+    // build: this measures the work, it does not do it -- unless limits are
+    // configured, which are enforced here or not at all, and a build does not
+    // run without the limits its operator set.
+    let limits = &ctx.cfg.build_limits;
+    if ctx.cgroups.is_none() && !limits.is_empty() {
+        anyhow::bail!(
+            "WORKER_BUILD_MEMORY_MAX/WORKER_BUILD_CPUS are set, but this worker has no \
+             per-build cgroup to enforce them in (see the worker's startup log)"
+        );
+    }
+    let build_cgroup = ctx
+        .cgroups
+        .map(|h| h.for_build(build_id, limits))
+        .transpose()
+        .context("applying the build's resource limits")?;
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
@@ -697,7 +713,39 @@ async fn run_build(
         report::classify_exit(status, canceled)
     };
     report.peak_memory_bytes = peak_memory_bytes;
+    // A process the kernel killed for memory looks, from makepkg's exit code,
+    // like any other failure -- a compiler "terminated by signal", an error
+    // several screens up the log. Say what happened where it is looked for.
+    if !report.success
+        && !canceled
+        && !timed_out
+        && let Some(kills) = build_cgroup
+            .as_ref()
+            .and_then(crate::cgroup::BuildCgroup::oom_kills)
+            .filter(|&n| n > 0)
+    {
+        let reason = oom_reason(kills, ctx.cfg.build_limits.memory_max);
+        log(client, build_id, &format!("\n[worker] {reason}\n")).await;
+        report.reason = Some(reason);
+    }
     Ok(report)
+}
+
+/// Why a build the OOM killer reached failed, naming the limit when it was ours.
+fn oom_reason(kills: u64, memory_max: Option<u64>) -> String {
+    let processes = if kills == 1 {
+        "a process".to_string()
+    } else {
+        format!("{kills} processes")
+    };
+    match memory_max {
+        Some(bytes) => format!(
+            "out of memory: the kernel killed {processes} at the build's memory limit of \
+             {:.1} GiB (WORKER_BUILD_MEMORY_MAX)",
+            bytes as f64 / f64::from(1u32 << 30)
+        ),
+        None => format!("out of memory: the kernel killed {processes} in the build"),
+    }
 }
 
 /// SIGKILL the child's whole process group.

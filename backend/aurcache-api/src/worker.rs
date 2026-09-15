@@ -564,12 +564,25 @@ pub async fn job_logs(
     Ok(())
 }
 
-/// The largest single artifact a worker may upload.
+/// The size a request says its body is, from `Content-Length`, when it says.
 ///
-/// A backstop against a runaway or hostile PKGBUILD filling the server's disk,
-/// not a statement about what a package should weigh: `unreal-engine` is past
-/// 2 GiB already, so the bound sits well above any package anyone builds.
-const MAX_ARTIFACT_SIZE: u64 = 20 << 30;
+/// What lets an artifact over the limit be refused before it is read. Without
+/// it the only way to find out is to read up to the limit: a 40 GiB package
+/// arrived as 20 GiB copied to the server's disk, then deleted, then refused.
+pub struct DeclaredLength(Option<u64>);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for DeclaredLength {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        Outcome::Success(Self(
+            req.headers()
+                .get_one("Content-Length")
+                .and_then(|v| v.trim().parse().ok()),
+        ))
+    }
+}
 
 /// Stream one built artifact into the job's staging area.
 ///
@@ -584,12 +597,38 @@ pub async fn job_artifact(
     auth: WorkerAuth,
     build_id: i32,
     filename: &str,
+    declared: DeclaredLength,
     data: Data<'_>,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    worker_complete::assert_owned_active(db, auth.worker.id, build_id)
+    let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
+
+    // A backstop against a runaway or hostile PKGBUILD filling the server's
+    // disk, not a statement about what a package should weigh -- which is why
+    // it is a setting, and per package: `unreal-engine` is past 20 GiB, and
+    // allowing it that should not allow everything else the same.
+    let limit = ApplicationSettings::get::<aurcache_utils::settings::ByteSize>(
+        Setting::MaxArtifactSize,
+        Some(build.pkg_id),
+        db,
+    )
+    .await;
+    let (limit, source) = (limit.value.0, limit.source);
+    let too_large = || {
+        err(
+            Status::PayloadTooLarge,
+            format!(
+                "{filename} is larger than this package's artifact limit of {} \
+                 (max_artifact_size, from {source:?}); raise it for the package or globally",
+                aurcache_common::units::format_size(limit)
+            ),
+        )
+    };
+    if declared.0.is_some_and(|len| len > limit) {
+        return Err(too_large());
+    }
 
     // Reject path traversal; only a bare filename is allowed.
     let name = Path::new(filename)
@@ -607,13 +646,10 @@ pub async fn job_artifact(
     // `open` stops reading at the limit without saying so; `is_complete` is the
     // only thing that tells a whole artifact from one cut off there. `into_file`
     // also flushes, so the file is fully written by the time ingest reads it.
-    let stored = data.open(MAX_ARTIFACT_SIZE.bytes()).into_file(&dest).await;
+    let stored = data.open(limit.bytes()).into_file(&dest).await;
     let problem = match &stored {
         Err(e) => Some(err(Status::BadRequest, e)),
-        Ok(file) if !file.is_complete() => Some(err(
-            Status::PayloadTooLarge,
-            format!("artifact exceeds {MAX_ARTIFACT_SIZE} bytes"),
-        )),
+        Ok(file) if !file.is_complete() => Some(too_large()),
         Ok(file) if file.n.written == 0 => Some(err(Status::BadRequest, "empty artifact")),
         Ok(_) => None,
     };

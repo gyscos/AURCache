@@ -563,6 +563,49 @@ async fn settings_are_restored_against_the_right_package() {
     );
 }
 
+/// A setting that has since been retired is not restored from an older dump:
+/// the migration removed its rows, and nothing reads it.
+#[tokio::test]
+async fn a_retired_setting_is_not_restored() {
+    let source = db().await;
+    // Written after the migrations ran, as an older server would have stored it.
+    for key in ["cpu_limit", "version_check_interval"] {
+        settings::ActiveModel {
+            key: Set(key.to_string()),
+            value: Set(Some("600".to_string())),
+            pkg_id: Set(Some(-1)),
+            ..Default::default()
+        }
+        .insert(&source)
+        .await
+        .unwrap();
+    }
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let loaded = load_dump(&bytes).unwrap();
+    assert!(
+        loaded.settings.global.contains_key("cpu_limit"),
+        "the dump should carry it, as an older one would"
+    );
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+
+    let keys: Vec<String> = settings::Entity::find()
+        .all(&target)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.key)
+        .collect();
+    assert!(
+        keys.contains(&"version_check_interval".to_string()),
+        "{keys:?}"
+    );
+    assert!(!keys.contains(&"cpu_limit".to_string()), "{keys:?}");
+}
+
 /// A package whose source cannot be read must be *reported*, not merely logged.
 ///
 /// This is the failure that looks like success: the row is written by pass 1,

@@ -789,6 +789,11 @@ async fn upsert_setting<C: sea_orm::ConnectionTrait>(
     value: &str,
     pkg_id: i32,
 ) -> anyhow::Result<()> {
+    // A dump from before a setting was retired still carries it; restoring it
+    // would bring back a row the migration removed and nothing reads.
+    if aurcache_common::settings::RETIRED_SETTING_KEYS.contains(&key) {
+        return Ok(());
+    }
     let existing = settings::Entity::find()
         .filter(settings::Column::Key.eq(key))
         .filter(settings::Column::PkgId.eq(pkg_id))

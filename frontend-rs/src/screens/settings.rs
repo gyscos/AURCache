@@ -158,6 +158,17 @@ fn SettingsSections(
                 editor: Editor::Number,
                 save,
             }
+            SettingRow {
+                setting: Setting::MaxArtifactSize,
+                label: "Max artifact size",
+                description: "Largest package file a worker may upload, such as 20G or 512M. A package's own setting overrides it.",
+                // Written back in the form it is typed in, so an untouched
+                // field saves the same value rather than a byte count.
+                value: aurcache_common::units::format_size(settings.max_artifact_size.value),
+                source: settings.max_artifact_size.source,
+                editor: Editor::Text { placeholder: "20G".to_string(), wide: false },
+                save,
+            }
         }
 
         ApiAccessSection {}
@@ -639,10 +650,10 @@ mod tests {
     fn Harness(source: SettingSource, editor: Editor) -> Element {
         rsx! {
             SettingRow {
-                setting: Setting::CpuLimit,
-                label: "CPU limit",
-                description: "µCPUs",
-                value: "4",
+                setting: Setting::VersionCheckInterval,
+                label: "Version check interval",
+                description: "seconds",
+                value: "3600",
                 source,
                 editor,
                 save: move |_| {},
@@ -683,7 +694,7 @@ mod tests {
         // Named from the setting's own metadata, so the banner cannot point at
         // a variable the server does not read.
         assert!(
-            html.contains("CPU_LIMIT"),
+            html.contains("VERSION_CHECK_INTERVAL"),
             "should name the variable: {html}"
         );
     }
@@ -711,11 +722,13 @@ mod tests {
         ] {
             let html = row(source, Editor::Number);
             assert!(
-                html.contains(r#"title="Set $CPU_LIMIT to pin this from the environment""#),
+                html.contains(
+                    r#"title="Set $VERSION_CHECK_INTERVAL to pin this from the environment""#
+                ),
                 "{source:?}: {html}"
             );
             assert!(
-                !html.contains("unset $CPU_LIMIT"),
+                !html.contains("unset $VERSION_CHECK_INTERVAL"),
                 "{source:?} is not pinned, so nothing needs unsetting: {html}"
             );
         }

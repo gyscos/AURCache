@@ -5,7 +5,7 @@
 //! read from the same environment, so a worker is still configured as one flat
 //! set of variables.
 
-use aurcache_worker_core::config::{CoreConfig, env_duration, env_opt, env_size};
+use aurcache_worker_core::config::{CoreConfig, env_duration, env_opt, env_parse, env_size};
 use std::path::PathBuf;
 
 /// Fully-resolved configuration for the chroot worker.
@@ -70,6 +70,10 @@ pub struct Config {
     /// it on a cache hit — so age-evicting would discard a package used daily
     /// simply for being old. Size pressure is the honest bound for this pool.
     pub pkgcache_ttl: u64,
+    /// Memory, swap and CPU each build may use (`WORKER_BUILD_MEMORY_MAX`,
+    /// `WORKER_BUILD_SWAP_MAX`, `WORKER_BUILD_CPUS`). Unset means unlimited, as
+    /// it always was.
+    pub build_limits: crate::cgroup::BuildLimits,
 }
 
 impl Config {
@@ -115,9 +119,37 @@ impl Config {
             chroot_mode: crate::chroots::ChrootMode::parse(
                 env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
             ),
+            build_limits: build_limits(),
             core,
         }
     }
+}
+
+/// `WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_SWAP_MAX` and `WORKER_BUILD_CPUS`.
+fn build_limits() -> crate::cgroup::BuildLimits {
+    // `0` is the unlimited that leaving it unset already is, and writing it
+    // would give every build no memory at all.
+    let memory_max = env_size("WORKER_BUILD_MEMORY_MAX").filter(|&bytes| bytes > 0);
+    crate::cgroup::BuildLimits {
+        memory_max,
+        // A memory limit means no swap beyond it unless swap is asked for; see
+        // `BuildLimits::swap_max` for why it cannot simply be left alone.
+        swap_max: env_size("WORKER_BUILD_SWAP_MAX").or_else(|| memory_max.map(|_| 0)),
+        cpus: cpus_limit(),
+    }
+}
+
+fn cpus_limit() -> Option<f64> {
+    env_parse::<f64>("WORKER_BUILD_CPUS").filter(|&cpus| {
+        let usable = cpus.is_finite() && cpus > 0.0;
+        if !usable {
+            tracing::warn!(
+                "ignoring WORKER_BUILD_CPUS={cpus} (expected a positive number of CPUs); \
+                 builds are not CPU-limited"
+            );
+        }
+        usable
+    })
 }
 
 /// Total worker cache budget when nothing is configured.

@@ -296,20 +296,37 @@ impl WorkerClient {
     /// `filename` is percent-encoded: it originates from whatever the PKGBUILD
     /// dropped in the build directory, and an unescaped `?` or `#` would be
     /// parsed as a query/fragment separator and silently truncate the path.
-    pub async fn upload_artifact<R>(&self, build_id: i32, filename: &str, reader: R) -> Result<()>
+    ///
+    /// `len` is sent as `Content-Length` when known, so a server that will not
+    /// take a file that size says so before any of it is sent rather than after
+    /// reading up to its limit. A refusal carries the server's own reason -- a
+    /// bare "413 Payload Too Large" says nothing about which limit, or where
+    /// it is set.
+    pub async fn upload_artifact<R>(
+        &self,
+        build_id: i32,
+        filename: &str,
+        reader: R,
+        len: Option<u64>,
+    ) -> Result<()>
     where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
     {
         let encoded = percent_encoding::utf8_percent_encode(filename, PATH_SEGMENT);
         let body = Body::wrap_stream(ReaderStream::new(reader));
-        self.upload_http
+        let mut request = self
+            .upload_http
             .post(self.url(&format!("/jobs/{build_id}/artifacts/{encoded}")))
-            .body(body)
-            .send()
-            .await
-            .context("artifact request")?
-            .error_for_status()
-            .context("artifact rejected")?;
+            .body(body);
+        if let Some(len) = len {
+            request = request.header(reqwest::header::CONTENT_LENGTH, len);
+        }
+        let response = request.send().await.context("artifact request")?;
+        let status = response.status();
+        if !status.is_success() {
+            let reason = response.text().await.unwrap_or_default();
+            anyhow::bail!("artifact rejected: {status}: {}", reason.trim());
+        }
         Ok(())
     }
 

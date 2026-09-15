@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 /// Build the `makechrootpkg` argv for a per-package build.
 ///
-/// The worker runs inside a container, so resource isolation (memory) is the
-/// container's responsibility and a build timeout is enforced worker-side by
-/// killing the child — no `systemd-run`/cgroup wrapper is used.
+/// No `systemd-run` wrapper: the worker places the build in a cgroup of its own
+/// (see `crate::cgroup`), which is where its limits are set, its memory is
+/// measured and a timeout or a Stop kills it.
 ///
 /// `makechrootpkg` copies the built packages into its **current working
 /// directory**, so the caller sets `cwd` to the desired destination (there is
@@ -120,9 +120,67 @@ pub fn build_command(
     argv
 }
 
+/// Match a build's parallelism to its CPU limit, in its makepkg drop-in.
+///
+/// `cpu.max` bounds the time a build gets, not how many processes it starts,
+/// and nothing inside the build can see the limit: `nproc` counts the cores the
+/// machine has, and the container hides the cgroup the limit is set on from
+/// anything that would look. So the server's `MAKEFLAGS=-j$(nproc)` still
+/// starts a compiler per core -- 24 of them sharing, say, six cores' worth of
+/// time, each holding its own memory, which is how a CPU limit turns into an
+/// out-of-memory kill.
+///
+/// Appended, because the server writes `MAKEFLAGS` last in this file to keep a
+/// user's makepkg.conf from dropping it; a later assignment is the only one
+/// that wins, and it replaces nothing but that. `OMP_NUM_THREADS` is what
+/// `nproc` itself, and OpenMP, defer to; `CARGO_BUILD_JOBS` is cargo's own. A
+/// build that picks its parallelism some other way is still held to the limit,
+/// only less efficiently.
+#[must_use]
+pub fn limit_parallelism(makepkg_conf: &str, cpus: Option<f64>) -> String {
+    let Some(cpus) = cpus else {
+        return makepkg_conf.to_string();
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let jobs = (cpus.ceil() as u64).max(1);
+    let mut out = makepkg_conf.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "# Added by aurcache-worker: this build is limited to {cpus} CPUs \
+         (WORKER_BUILD_CPUS), so it runs as many jobs rather than one per core.\n\
+         MAKEFLAGS=\"-j{jobs}\"\n\
+         export OMP_NUM_THREADS={jobs}\n\
+         export CARGO_BUILD_JOBS={jobs}\n"
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallelism_follows_the_cpu_limit() {
+        let server = "OPTIONS=(!debug)\nMAKEFLAGS=-j$(nproc)\nPKGDEST=/pkgdest";
+        assert_eq!(limit_parallelism(server, None), server);
+
+        let limited = limit_parallelism(server, Some(2.5));
+        // After the server's own MAKEFLAGS, so it is the one that counts.
+        let ours = limited
+            .find("MAKEFLAGS=\"-j3\"")
+            .expect("a MAKEFLAGS for the limit");
+        assert!(ours > limited.find("MAKEFLAGS=-j$(nproc)").unwrap());
+        assert!(limited.contains("export OMP_NUM_THREADS=3\n"));
+        assert!(limited.contains("export CARGO_BUILD_JOBS=3\n"));
+        assert!(
+            limited.contains("PKGDEST=/pkgdest\n#"),
+            "the line before is kept whole"
+        );
+
+        assert!(limit_parallelism("", Some(0.5)).contains("MAKEFLAGS=\"-j1\""));
+    }
 
     #[test]
     fn build_command_includes_flags() {
