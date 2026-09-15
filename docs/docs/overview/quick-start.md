@@ -72,7 +72,10 @@ services:
     restart: unless-stopped
 
   aurcache_database:
-    image: postgres:latest
+    # Pin both the major version and the Debian release. A new major version
+    # will not start on the old one's data directory, and a new Debian release
+    # changes how text sorts under indexes already built.
+    image: postgres:17-trixie
     volumes:
       - ./aurcache/db:/var/lib/postgresql/data
     environment:
@@ -100,6 +103,15 @@ The server and the worker authenticate to each other with mutual TLS on port
 trusted, so no secret has to be configured. For a worker on another machine —
 where there is no shared volume — see
 [Build Workers](../workers/configuration.md).
+
+Keep the Postgres image pinned as shown rather than `postgres:latest` or even
+`postgres:17`. Those tags move to a newer Debian release from time to time, and
+a database whose indexes were sorted by the old C library then needs its
+indexes rebuilt. AURCache checks for that at startup and logs the commands to
+run if it finds one (`REINDEX DATABASE` then `ALTER DATABASE ... REFRESH
+COLLATION VERSION`, in each database the warning names). Moving to a new major
+version of Postgres is a separate upgrade, with `pg_upgrade` or a dump and
+restore.
 
 ## Or let the CLI do it
 

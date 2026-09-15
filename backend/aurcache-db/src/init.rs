@@ -1,3 +1,4 @@
+use crate::helpers::collation::warn_on_stale_collations;
 use crate::helpers::dbtype::database_type;
 use crate::migration::Migrator;
 use anyhow::{anyhow, bail};
@@ -45,7 +46,9 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
             let conn_str = format!("postgres://{db_user}:{db_pwd}@{db_host}/{db_name}");
             let mut conn_opts = ConnectOptions::new(conn_str);
             conn_opts.sqlx_logging_level(LevelFilter::Trace);
-            Database::connect(conn_opts).await?
+            let db = Database::connect(conn_opts).await?;
+            warn_on_stale_collations(&db).await;
+            db
         }
         _ => bail!("Unsupported database type"),
     };

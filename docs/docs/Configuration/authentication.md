@@ -87,7 +87,7 @@ services:
 
   aurcache_database:
     restart: unless-stopped
-    image: postgres:17.4
+    image: postgres:17-trixie
     volumes:
       - ./aurcache/db:/var/lib/postgresql/data
     environment:
