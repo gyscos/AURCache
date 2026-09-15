@@ -55,7 +55,7 @@ once and how long it will let one run.
 `BUILDER_IMAGE`, `CPU_LIMIT`, `MEMORY_LIMIT` and `BUILD_ARTIFACT_DIR`
 configured the per-build Docker container that AURCache used to spawn. In the
 split setup they do nothing on the server: a worker limits its own builds with
-[`WORKER_BUILD_MEMORY_MAX` and `WORKER_BUILD_CPUS`](../workers/configuration.md#resource-limits),
+[`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS` and their `WORKER_TOTAL_BUILD_*` totals](../workers/configuration.md#resource-limits),
 and uploads packages over the API rather than through a shared directory.
 
 They are still read by the [hybrid compatibility

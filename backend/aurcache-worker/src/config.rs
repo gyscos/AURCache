@@ -74,6 +74,10 @@ pub struct Config {
     /// `WORKER_BUILD_SWAP_MAX`, `WORKER_BUILD_CPUS`). Unset means unlimited, as
     /// it always was.
     pub build_limits: crate::cgroup::BuildLimits,
+    /// Memory, swap and CPU all builds may use between them
+    /// (`WORKER_TOTAL_BUILD_MEMORY_MAX`, `WORKER_TOTAL_BUILD_SWAP_MAX`,
+    /// `WORKER_TOTAL_BUILD_CPUS`). Unset means unlimited.
+    pub total_build_limits: crate::cgroup::BuildLimits,
 }
 
 impl Config {
@@ -119,33 +123,36 @@ impl Config {
             chroot_mode: crate::chroots::ChrootMode::parse(
                 env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
             ),
-            build_limits: build_limits(),
+            build_limits: limits_from_env("WORKER_BUILD"),
+            total_build_limits: limits_from_env("WORKER_TOTAL_BUILD"),
             core,
         }
     }
 }
 
-/// `WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_SWAP_MAX` and `WORKER_BUILD_CPUS`.
-fn build_limits() -> crate::cgroup::BuildLimits {
+/// `<prefix>_MEMORY_MAX`, `<prefix>_SWAP_MAX` and `<prefix>_CPUS`: the same
+/// three limits per build (`WORKER_BUILD`) and for all builds together
+/// (`WORKER_TOTAL_BUILD`), read the same way.
+fn limits_from_env(prefix: &str) -> crate::cgroup::BuildLimits {
     // `0` is the unlimited that leaving it unset already is, and writing it
-    // would give every build no memory at all.
-    let memory_max = env_size("WORKER_BUILD_MEMORY_MAX").filter(|&bytes| bytes > 0);
+    // would give the builds no memory at all.
+    let memory_max = env_size(&format!("{prefix}_MEMORY_MAX")).filter(|&bytes| bytes > 0);
     crate::cgroup::BuildLimits {
         memory_max,
         // A memory limit means no swap beyond it unless swap is asked for; see
         // `BuildLimits::swap_max` for why it cannot simply be left alone.
-        swap_max: env_size("WORKER_BUILD_SWAP_MAX").or_else(|| memory_max.map(|_| 0)),
-        cpus: cpus_limit(),
+        swap_max: env_size(&format!("{prefix}_SWAP_MAX")).or_else(|| memory_max.map(|_| 0)),
+        cpus: cpus_limit(&format!("{prefix}_CPUS")),
     }
 }
 
-fn cpus_limit() -> Option<f64> {
-    env_parse::<f64>("WORKER_BUILD_CPUS").filter(|&cpus| {
+fn cpus_limit(var: &str) -> Option<f64> {
+    env_parse::<f64>(var).filter(|&cpus| {
         let usable = cpus.is_finite() && cpus > 0.0;
         if !usable {
             tracing::warn!(
-                "ignoring WORKER_BUILD_CPUS={cpus} (expected a positive number of CPUs); \
-                 builds are not CPU-limited"
+                "ignoring {var}={cpus} (expected a positive number of CPUs); \
+                 builds are not CPU-limited by it"
             );
         }
         usable

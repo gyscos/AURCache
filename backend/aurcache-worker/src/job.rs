@@ -179,7 +179,7 @@ async fn run_job_inner(
                 credential.as_ref(),
                 agent_socket().as_deref(),
             ),
-            cfg.build_limits.cpus,
+            parallelism_cpus(&cfg.build_limits, &cfg.total_build_limits),
         ),
         &pacman_conf,
         job.mirrorlist.as_deref(),
@@ -505,10 +505,10 @@ async fn run_build(
     // configured, which are enforced here or not at all, and a build does not
     // run without the limits its operator set.
     let limits = &ctx.cfg.build_limits;
-    if ctx.cgroups.is_none() && !limits.is_empty() {
+    if ctx.cgroups.is_none() && !(limits.is_empty() && ctx.cfg.total_build_limits.is_empty()) {
         anyhow::bail!(
-            "WORKER_BUILD_MEMORY_MAX/WORKER_BUILD_CPUS are set, but this worker has no \
-             per-build cgroup to enforce them in (see the worker's startup log)"
+            "build resource limits (WORKER_BUILD_* or WORKER_TOTAL_BUILD_*) are set, but \
+             this worker has no cgroup to enforce them in (see the worker's startup log)"
         );
     }
     let build_cgroup = ctx
@@ -516,6 +516,9 @@ async fn run_build(
         .map(|h| h.for_build(build_id, limits))
         .transpose()
         .context("applying the build's resource limits")?;
+    // The total's OOM count is cumulative over every build; what this build
+    // needs is whether it moved while it ran.
+    let total_ooms_before = ctx.cgroups.and_then(Hierarchy::total_ooms);
     let spawn = |argv: &[String]| {
         let mut cmd = chroot::devtools(&argv[0]);
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
@@ -724,27 +727,71 @@ async fn run_build(
             .and_then(crate::cgroup::BuildCgroup::oom_kills)
             .filter(|&n| n > 0)
     {
-        let reason = oom_reason(kills, ctx.cfg.build_limits.memory_max);
+        let build_ooms = build_cgroup
+            .as_ref()
+            .and_then(crate::cgroup::BuildCgroup::limit_ooms)
+            .unwrap_or(0);
+        let total_ooms_during = ctx
+            .cgroups
+            .and_then(Hierarchy::total_ooms)
+            .zip(total_ooms_before)
+            .map_or(0, |(after, before)| after.saturating_sub(before));
+        let reason = oom_reason(
+            kills,
+            crate::cgroup::OomCause::classify(build_ooms, total_ooms_during),
+            ctx.cfg,
+        );
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
         report.reason = Some(reason);
     }
     Ok(report)
 }
 
-/// Why a build the OOM killer reached failed, naming the limit when it was ours.
-fn oom_reason(kills: u64, memory_max: Option<u64>) -> String {
+/// The CPUs one build's parallelism is sized to: the smaller of its own limit
+/// and the total, since a single build can use no more than either.
+fn parallelism_cpus(
+    build: &crate::cgroup::BuildLimits,
+    total: &crate::cgroup::BuildLimits,
+) -> Option<f64> {
+    match (build.cpus, total.cpus) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Why a build the OOM killer reached failed, naming the limit that was reached
+/// when it was one of the worker's.
+fn oom_reason(kills: u64, cause: crate::cgroup::OomCause, cfg: &Config) -> String {
+    use crate::cgroup::OomCause;
     let processes = if kills == 1 {
         "a process".to_string()
     } else {
         format!("{kills} processes")
     };
-    match memory_max {
-        Some(bytes) => format!(
+    let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+    match (
+        cause,
+        cfg.build_limits.memory_max,
+        cfg.total_build_limits.memory_max,
+    ) {
+        (OomCause::BuildLimit, Some(bytes), _) => format!(
             "out of memory: the kernel killed {processes} at the build's memory limit of \
              {:.1} GiB (WORKER_BUILD_MEMORY_MAX)",
-            bytes as f64 / f64::from(1u32 << 30)
+            gib(bytes)
         ),
-        None => format!("out of memory: the kernel killed {processes} in the build"),
+        (OomCause::TotalLimit, _, Some(bytes)) => format!(
+            "out of memory: the kernel killed {processes} when the builds on this worker \
+             together reached {:.1} GiB (WORKER_TOTAL_BUILD_MEMORY_MAX); this build may \
+             have been under its own limit",
+            gib(bytes)
+        ),
+        (OomCause::Elsewhere, _, _) => format!(
+            "out of memory: the kernel killed {processes} in the build, at a limit outside \
+             the worker's own (the machine, or what runs the worker)"
+        ),
+        // A cause without the limit it names: configuration read at startup
+        // cannot disagree with the cgroups it set up, but say something true.
+        _ => format!("out of memory: the kernel killed {processes} in the build"),
     }
 }
 
@@ -772,6 +819,55 @@ async fn kill_process_group(child: &mut tokio::process::Child) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_limits(build: Option<u64>, total: Option<u64>) -> Config {
+        let mut cfg = Config::from_env();
+        cfg.build_limits.memory_max = build;
+        cfg.total_build_limits.memory_max = total;
+        cfg
+    }
+
+    /// Each cause names the variable an operator would change, and a kill at the
+    /// total says the build itself may not have been over anything.
+    #[test]
+    fn an_oom_reason_names_the_limit_that_was_reached() {
+        use crate::cgroup::OomCause;
+        let cfg = with_limits(Some(8 << 30), Some(48 << 30));
+
+        let own = oom_reason(1, OomCause::BuildLimit, &cfg);
+        assert!(own.contains("a process"), "{own}");
+        assert!(own.contains("8.0 GiB (WORKER_BUILD_MEMORY_MAX)"), "{own}");
+
+        let total = oom_reason(3, OomCause::TotalLimit, &cfg);
+        assert!(total.contains("3 processes"), "{total}");
+        assert!(
+            total.contains("48.0 GiB (WORKER_TOTAL_BUILD_MEMORY_MAX)"),
+            "{total}"
+        );
+        assert!(total.contains("under its own limit"), "{total}");
+
+        let elsewhere = oom_reason(1, OomCause::Elsewhere, &cfg);
+        assert!(!elsewhere.contains("WORKER_"), "{elsewhere}");
+    }
+
+    #[test]
+    fn parallelism_follows_the_tighter_cpu_limit() {
+        use crate::cgroup::BuildLimits;
+        let cpus = |c: Option<f64>| BuildLimits {
+            cpus: c,
+            ..BuildLimits::default()
+        };
+        assert_eq!(
+            parallelism_cpus(&cpus(Some(8.0)), &cpus(Some(6.0))),
+            Some(6.0)
+        );
+        assert_eq!(
+            parallelism_cpus(&cpus(Some(4.0)), &cpus(Some(6.0))),
+            Some(4.0)
+        );
+        assert_eq!(parallelism_cpus(&cpus(None), &cpus(Some(6.0))), Some(6.0));
+        assert_eq!(parallelism_cpus(&cpus(None), &cpus(None)), None);
+    }
 
     /// The build user is not the worker's user; makepkg can only rewrite the
     /// PKGBUILD for a `pkgver()` check where the extracted tree is writable.

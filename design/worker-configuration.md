@@ -140,7 +140,7 @@ arrives. What the native worker declares:
 | **Host access** | `WORKER_CHROOT_DIR`, `WORKER_CACHE_DIR`, `WORKER_BUILD_USER`, `WORKER_BIND_MOUNTS`, `WORKER_MAKECHROOTPKG`, `WORKER_GIT_SSH_KEY`, `WORKER_SSH_KNOWN_HOSTS`, `AURCACHE_NSPAWN_KEEP_UNIT`, `AURCACHE_DROPIN` | **No.** The security boundary above. |
 | **Machine facts** | `WORKER_ARCHES`, `WORKER_EMULATED_ARCHES`, `WORKER_NAME`, `WORKER_CHROOT_OVERLAY` | **No.** Reported, not chosen. |
 | **Mirrorlist** | `WORKER_MIRRORLIST_SERVERS`/`_FILE` | **No.** The server already delivers a per-architecture mirrorlist at registration, and these override it locally (`design/mirrorlist-configuration.md`). |
-| **Policy and tuning** | `WORKER_CONCURRENCY`, `WORKER_PRIORITY`, `WORKER_PACKAGES`, `WORKER_BUILD_MEMORY_MAX`/`_SWAP_MAX`/`_CPUS`, `WORKER_BUILD_TIMEOUT`, `WORKER_BUILDDIR_MAX_BYTES`/`_MIN_FREE`, `WORKER_CACHE_MAX_SIZE`/`_TTL`, `WORKER_PKGCACHE_MAX_SIZE`/`_TTL`, `WORKER_SRCCACHE_MAX_SIZE`, `WORKER_CHROOT_REFRESH_INTERVAL`, `WORKER_POLL_INTERVAL`, `WORKER_KEYSERVER` | **Yes.** |
+| **Policy and tuning** | `WORKER_CONCURRENCY`, `WORKER_PRIORITY`, `WORKER_PACKAGES`, `WORKER_BUILD_MEMORY_MAX`/`_SWAP_MAX`/`_CPUS`, `WORKER_TOTAL_BUILD_MEMORY_MAX`/`_SWAP_MAX`/`_CPUS`, `WORKER_BUILD_TIMEOUT`, `WORKER_BUILDDIR_MAX_BYTES`/`_MIN_FREE`, `WORKER_CACHE_MAX_SIZE`/`_TTL`, `WORKER_PKGCACHE_MAX_SIZE`/`_TTL`, `WORKER_SRCCACHE_MAX_SIZE`, `WORKER_CHROOT_REFRESH_INTERVAL`, `WORKER_POLL_INTERVAL`, `WORKER_KEYSERVER` | **Yes.** |
 
 `WORKER_KEYSERVER` is safe to declare: signature checks are pinned by the
 PKGBUILD's `validpgpkeys`, so a keyserver can withhold a key but not substitute
@@ -469,7 +469,15 @@ Each declaration says when it takes effect (`applies`), and the UI shows it:
 |---|---|
 | **Next job** | build limits, build timeout, builddir budget and floor, cache budgets and TTLs, keyserver |
 | **Next loop iteration** | chroot refresh interval, poll interval |
-| **Immediately** | concurrency (through the gate below); priority and package affinity (through re-registration) |
+| **Immediately** | concurrency (through the gate below); priority and package affinity (through re-registration); total build limits (below) |
+
+**Total build limits apply to running builds.** They live on the `builds`
+cgroup that holds every build, not on a build's own, so rewriting them takes
+effect at once -- which is the point of a total, but a lowered memory total
+below what the running builds already use makes the kernel reclaim and then
+kill one of them. The worker applies it anyway, as an operator asked; the UI
+should say so before saving a lower value. (Today the worker applies the totals
+only at startup.)
 
 Nothing declared needs a restart. That is part of why paths and users are not
 declared.

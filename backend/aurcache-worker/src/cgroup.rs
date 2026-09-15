@@ -8,6 +8,22 @@
 //! covers all of them. The same property makes it the place for the build's
 //! `memory.max`/`cpu.max` ([`BuildLimits`]) and for `cgroup.kill`.
 //!
+//! ## Layout
+//!
+//! ```text
+//! <the worker's cgroup>/        e.g. system.slice/aurcache-worker.service
+//! ├── worker/                   the worker process itself
+//! └── builds/                   every build together: the total limits
+//!     ├── build-1010/           one build: its own limits
+//!     └── build-1011/
+//! ```
+//!
+//! cgroup limits nest: `builds/`'s `memory.max` caps the sum of the builds
+//! under it, and each build's own `memory.max` still applies to that build.
+//! Putting the total on `builds/` rather than on the worker's cgroup keeps the
+//! worker process out of it, so reaching the total can only ever kill a build,
+//! and it tells the two limits apart afterwards (see [`OomCause`]).
+//!
 //! ## Why the worker has to prepare its own hierarchy
 //!
 //! cgroup v2 refuses to enable a controller in `cgroup.subtree_control` while
@@ -38,9 +54,15 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The leaf the worker moves itself into so its own cgroup can host children.
 const SELF_LEAF: &str = "worker";
 
+/// The cgroup holding every build, where the total limits go.
+const BUILDS_DIR: &str = "builds";
+
 /// The prepared cgroup the worker creates each build's cgroup under.
 pub struct Hierarchy {
+    /// The worker's own cgroup, holding [`SELF_LEAF`] and [`BUILDS_DIR`].
     base: PathBuf,
+    /// `base/builds`, the parent of every build's cgroup.
+    builds: PathBuf,
 }
 
 impl Hierarchy {
@@ -63,8 +85,14 @@ impl Hierarchy {
             let _ = fs::write(leaf.join("cgroup.procs"), pid.to_string());
         }
 
-        let hierarchy = Self { base };
-        hierarchy.enable_controller("memory")?;
+        let builds = base.join(BUILDS_DIR);
+        let hierarchy = Self { base, builds };
+        enable_controller(&hierarchy.base, "memory")?;
+        // In this order: a controller can only be enabled for `builds/`'s
+        // children once `builds/` itself has it from the level above.
+        fs::create_dir_all(&hierarchy.builds)
+            .with_context(|| format!("creating {}", hierarchy.builds.display()))?;
+        enable_controller(&hierarchy.builds, "memory")?;
         Ok(hierarchy)
     }
 
@@ -76,26 +104,32 @@ impl Hierarchy {
     /// contention. That is right when builds are capped anyway and a change
     /// nobody asked for when they are not.
     pub fn enable_cpu(&self) -> Result<()> {
-        self.enable_controller("cpu")
+        // Both levels: `builds/` needs it for a total `cpu.max`, and each build
+        // needs `builds/` to pass it down for its own.
+        enable_controller(&self.base, "cpu")?;
+        enable_controller(&self.builds, "cpu")
     }
 
-    fn enable_controller(&self, controller: &str) -> Result<()> {
-        let control = self.base.join("cgroup.subtree_control");
-        if fs::read_to_string(&control)
-            .unwrap_or_default()
-            .split_whitespace()
-            .any(|c| c == controller)
-        {
-            return Ok(());
-        }
-        fs::write(&control, format!("+{controller}")).with_context(|| {
-            format!(
-                "enabling the {controller} controller in {} -- the worker needs a \
-                 writable cgroup subtree (privileged container, or a systemd \
-                 unit with Delegate=yes)",
-                control.display()
-            )
-        })
+    /// Apply the limits for all builds together, on `builds/`.
+    ///
+    /// At startup, once; the files keep their values while the worker runs and
+    /// are rewritten by the next start, so a changed or removed variable takes
+    /// effect then. Unset limits are written as `max`, so removing one really
+    /// removes it rather than leaving the previous run's value in place.
+    pub fn apply_total(&self, limits: &BuildLimits) -> Result<()> {
+        write_limits(&self.builds, limits, true)
+    }
+
+    /// How many times the total memory limit has been reached, from
+    /// `builds/memory.events.local`: the local file, because the hierarchical
+    /// one also counts every build reaching its own limit.
+    ///
+    /// Cumulative for as long as `builds/` exists, so a build compares the value
+    /// from its start with the one from its end.
+    #[must_use]
+    pub fn total_ooms(&self) -> Option<u64> {
+        let raw = fs::read_to_string(self.builds.join("memory.events.local")).ok()?;
+        parse_event(&raw, "oom")
     }
 
     /// Create the cgroup for one build, with `limits` applied.
@@ -104,23 +138,43 @@ impl Hierarchy {
     /// configured limit is there to keep one build from taking the machine
     /// down, and running without it is the outcome it exists to prevent.
     pub fn for_build(&self, build_id: i32, limits: &BuildLimits) -> Result<BuildCgroup> {
-        let dir = self.base.join(format!("build-{build_id}"));
+        let dir = self.builds.join(format!("build-{build_id}"));
         // A cgroup left by a previous attempt at the same build is empty by
         // now; removing it is what keeps `memory.peak` about this attempt.
         let _ = remove_cgroup_tree(&dir);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let cgroup = BuildCgroup { dir };
-        cgroup.apply(limits)?;
+        write_limits(&cgroup.dir, limits, false)?;
         Ok(cgroup)
     }
 }
 
-/// Resource limits for each build, from the worker's configuration.
+fn enable_controller(cgroup: &Path, controller: &str) -> Result<()> {
+    let control = cgroup.join("cgroup.subtree_control");
+    if fs::read_to_string(&control)
+        .unwrap_or_default()
+        .split_whitespace()
+        .any(|c| c == controller)
+    {
+        return Ok(());
+    }
+    fs::write(&control, format!("+{controller}")).with_context(|| {
+        format!(
+            "enabling the {controller} controller in {} -- the worker needs a \
+             writable cgroup subtree (privileged container, or a systemd \
+             unit with Delegate=yes)",
+            control.display()
+        )
+    })
+}
+
+/// Resource limits for a cgroup, from the worker's configuration: each build's
+/// (`WORKER_BUILD_*`), or all builds' together (`WORKER_TOTAL_BUILD_*`).
 ///
-/// Per build, not for the worker as a whole: `WORKER_CONCURRENCY` builds can
-/// each use this much. A cap on everything together belongs on what runs the
-/// worker -- `MemoryMax=`/`CPUQuota=` on the systemd unit, `--memory`/`--cpus`
-/// on the container.
+/// Per build, `WORKER_CONCURRENCY` builds can each use this much; the total
+/// bounds what they use between them. Neither includes the worker process, so
+/// a cap on literally everything still belongs on what runs the worker --
+/// `MemoryMax=` on the systemd unit, `--memory` on the container.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BuildLimits {
     /// `memory.max`, in bytes: the RAM the build may use.
@@ -165,43 +219,93 @@ pub struct BuildCgroup {
     dir: PathBuf,
 }
 
-impl BuildCgroup {
-    /// Write `limits` into this cgroup. Everything placed in it afterwards --
-    /// the build and the container nspawn keeps in it -- is bound by them.
-    fn apply(&self, limits: &BuildLimits) -> Result<()> {
-        if let Some(bytes) = limits.memory_max {
-            fs::write(self.dir.join("memory.max"), bytes.to_string())
-                .with_context(|| format!("setting memory.max in {}", self.dir.display()))?;
-        }
-        if let Some(bytes) = limits.swap_max {
-            match fs::write(self.dir.join("memory.swap.max"), bytes.to_string()) {
-                Ok(()) => {}
-                // No swap accounting in this kernel: nothing to limit it with,
-                // and refusing every build over it would help no one.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::debug!(
-                        "no memory.swap.max in {}; swap is not limited",
-                        self.dir.display()
-                    );
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("setting memory.swap.max in {}", self.dir.display())
-                    });
-                }
+/// Write `limits` into a cgroup. Everything placed in it afterwards -- a build
+/// and the container nspawn keeps in it, or every build under `builds/` -- is
+/// bound by them.
+///
+/// `reset_unset` writes `max` for a limit that is not configured. A build's
+/// cgroup is new, where every file already says `max`, so it has nothing to
+/// reset; `builds/` outlives the worker process and would otherwise keep a
+/// limit from a previous run's configuration.
+fn write_limits(dir: &Path, limits: &BuildLimits, reset_unset: bool) -> Result<()> {
+    let value = |limit: Option<String>| match limit {
+        Some(v) => Some(v),
+        None if reset_unset => Some("max".to_string()),
+        None => None,
+    };
+    if let Some(v) = value(limits.memory_max.map(|b| b.to_string())) {
+        fs::write(dir.join("memory.max"), v)
+            .with_context(|| format!("setting memory.max in {}", dir.display()))?;
+    }
+    if let Some(v) = value(limits.swap_max.map(|b| b.to_string())) {
+        match fs::write(dir.join("memory.swap.max"), v) {
+            Ok(()) => {}
+            // No swap accounting in this kernel: nothing to limit it with, and
+            // refusing every build over it would help no one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    "no memory.swap.max in {}; swap is not limited",
+                    dir.display()
+                );
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("setting memory.swap.max in {}", dir.display()));
             }
         }
-        if let Some(cpus) = limits.cpus {
-            fs::write(self.dir.join("cpu.max"), cpu_max(cpus)).with_context(|| {
-                format!(
-                    "setting cpu.max in {} -- is the cpu controller delegated to the worker?",
-                    self.dir.display()
-                )
-            })?;
-        }
-        Ok(())
     }
+    match limits.cpus {
+        Some(cpus) => fs::write(dir.join("cpu.max"), cpu_max(cpus)).with_context(|| {
+            format!(
+                "setting cpu.max in {} -- is the cpu controller delegated to the worker?",
+                dir.display()
+            )
+        })?,
+        // Only where the file exists: without a CPU limit anywhere the
+        // controller is not enabled, and there is no `cpu.max` to reset.
+        None if reset_unset && dir.join("cpu.max").exists() => {
+            fs::write(dir.join("cpu.max"), format!("max {CPU_PERIOD_US}"))
+                .with_context(|| format!("resetting cpu.max in {}", dir.display()))?;
+        }
+        None => {}
+    }
+    Ok(())
+}
 
+/// Which limit an OOM kill in a build came from.
+///
+/// Told apart by where the kernel counts the event: `oom` in a cgroup's
+/// `memory.events` is the number of times *its own* limit (or one below it)
+/// was reached, while `oom_kill` counts its processes killed whatever limit
+/// was reached. So a build killed at the total has kills but no `oom` of its
+/// own, and `builds/` records the `oom` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OomCause {
+    /// The build reached its own `memory.max`.
+    BuildLimit,
+    /// The builds together reached the total on `builds/`.
+    TotalLimit,
+    /// Neither: a limit above the worker (the systemd unit, the container) or
+    /// the machine itself ran out.
+    Elsewhere,
+}
+
+impl OomCause {
+    /// Classify from the build's own `oom` count and how much the total's
+    /// count grew while the build ran.
+    #[must_use]
+    pub const fn classify(build_ooms: u64, total_ooms_during: u64) -> Self {
+        if build_ooms > 0 {
+            Self::BuildLimit
+        } else if total_ooms_during > 0 {
+            Self::TotalLimit
+        } else {
+            Self::Elsewhere
+        }
+    }
+}
+
+impl BuildCgroup {
     /// How many processes in this build the kernel's OOM killer ended.
     ///
     /// `memory.events` counts the whole subtree, so a compiler killed inside the
@@ -209,7 +313,14 @@ impl BuildCgroup {
     #[must_use]
     pub fn oom_kills(&self) -> Option<u64> {
         let raw = fs::read_to_string(self.dir.join("memory.events")).ok()?;
-        parse_oom_kills(&raw)
+        parse_event(&raw, "oom_kill")
+    }
+
+    /// How many times this build reached its own memory limit. See [`OomCause`].
+    #[must_use]
+    pub fn limit_ooms(&self) -> Option<u64> {
+        let raw = fs::read_to_string(self.dir.join("memory.events")).ok()?;
+        parse_event(&raw, "oom")
     }
 
     /// An open handle to `cgroup.procs`, for the child to place itself into.
@@ -331,11 +442,11 @@ fn parse_peak(raw: &str) -> Option<i64> {
     raw.trim().parse().ok()
 }
 
-/// The `oom_kill` line of `memory.events`, which is `key value` per line.
-fn parse_oom_kills(raw: &str) -> Option<u64> {
+/// One counter from `memory.events`, which is `key value` per line.
+fn parse_event(raw: &str, wanted: &str) -> Option<u64> {
     raw.lines().find_map(|line| {
         let (key, value) = line.split_once(' ')?;
-        (key == "oom_kill").then(|| value.trim().parse().ok())?
+        (key == wanted).then(|| value.trim().parse().ok())?
     })
 }
 
@@ -353,10 +464,26 @@ mod tests {
     }
 
     #[test]
-    fn oom_kills_come_from_memory_events() {
+    fn oom_counters_come_from_memory_events() {
         let events = "low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 0\n";
-        assert_eq!(parse_oom_kills(events), Some(2));
-        assert_eq!(parse_oom_kills("low 0\nhigh 0\n"), None);
+        assert_eq!(parse_event(events, "oom_kill"), Some(2));
+        // `oom` is its own key, not a prefix match on `oom_kill`.
+        assert_eq!(parse_event(events, "oom"), Some(3));
+        assert_eq!(parse_event("low 0\nhigh 0\n", "oom_kill"), None);
+    }
+
+    /// The counts as measured on Linux 7.2 with a 400M parent and two children:
+    /// a child killed at the parent's limit had `oom_kill 1` and `oom 0`, the
+    /// parent's `memory.events.local` `oom 1`; a child killed at its own had
+    /// `oom 1`, and the parent's local count did not move.
+    #[test]
+    fn an_oom_is_attributed_to_the_limit_whose_count_moved() {
+        assert_eq!(OomCause::classify(0, 1), OomCause::TotalLimit);
+        assert_eq!(OomCause::classify(1, 0), OomCause::BuildLimit);
+        // Both at once: the build's own limit was reached, which is what its
+        // operator has to change for it.
+        assert_eq!(OomCause::classify(1, 1), OomCause::BuildLimit);
+        assert_eq!(OomCause::classify(0, 0), OomCause::Elsewhere);
     }
 
     /// Limits land in the files the kernel reads them from. A plain directory
@@ -364,16 +491,16 @@ mod tests {
     #[test]
     fn limits_are_written_where_the_kernel_reads_them() {
         let tmp = tempfile::tempdir().unwrap();
-        let cgroup = BuildCgroup {
-            dir: tmp.path().to_path_buf(),
-        };
-        cgroup
-            .apply(&BuildLimits {
+        write_limits(
+            tmp.path(),
+            &BuildLimits {
                 memory_max: Some(32 * 1024 * 1024 * 1024),
                 swap_max: Some(0),
                 cpus: Some(6.0),
-            })
-            .unwrap();
+            },
+            false,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(tmp.path().join("memory.max")).unwrap(),
             "34359738368"
@@ -388,12 +515,37 @@ mod tests {
         );
         // No limit, no file: the kernel's `max` stays in place.
         let unlimited = tempfile::tempdir().unwrap();
-        BuildCgroup {
-            dir: unlimited.path().to_path_buf(),
-        }
-        .apply(&BuildLimits::default())
-        .unwrap();
+        write_limits(unlimited.path(), &BuildLimits::default(), false).unwrap();
         assert!(!unlimited.path().join("memory.max").exists());
+    }
+
+    /// `builds/` outlives the worker process, so a total removed from the
+    /// configuration has to be written back to `max`, not left as it was.
+    #[test]
+    fn an_unset_total_resets_what_a_previous_run_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("memory.max"), "1073741824").unwrap();
+        fs::write(tmp.path().join("memory.swap.max"), "0").unwrap();
+        fs::write(tmp.path().join("cpu.max"), "200000 100000").unwrap();
+
+        write_limits(tmp.path(), &BuildLimits::default(), true).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("memory.max")).unwrap(),
+            "max"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("memory.swap.max")).unwrap(),
+            "max"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("cpu.max")).unwrap(),
+            "max 100000"
+        );
+        // No cpu controller, no file: nothing is created where there was none.
+        let bare = tempfile::tempdir().unwrap();
+        write_limits(bare.path(), &BuildLimits::default(), true).unwrap();
+        assert!(!bare.path().join("cpu.max").exists());
     }
 
     /// The shape nspawn leaves under a build's cgroup. A plain directory tree

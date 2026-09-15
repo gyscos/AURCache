@@ -59,40 +59,69 @@ impl ChrootExecutor {
                 None
             }
         };
-        let limits = cfg.build_limits;
-        if !limits.is_empty() {
-            match &cgroups {
+        let (limits, total) = (cfg.build_limits, cfg.total_build_limits);
+        let cgroups = cgroups.and_then(|hierarchy| {
+            // Before the total: its `cpu.max` on `builds/` needs the controller.
+            // A failure here refuses builds on its own, when a build's cgroup
+            // cannot take its `cpu.max` either.
+            if (limits.cpus.is_some() || total.cpus.is_some())
+                && let Err(e) = hierarchy.enable_cpu()
+            {
+                tracing::error!(
+                    "a CPU limit is set, but the cpu controller cannot be enabled ({e:#}); \
+                     every build will be refused rather than run unlimited"
+                );
+            }
+            // Always applied, set or not: `builds/` outlives the worker, and a
+            // total removed from the configuration has to be taken off it
+            // rather than left from the previous run.
+            match hierarchy.apply_total(&total) {
+                Ok(()) => Some(hierarchy),
+                Err(e) if total.is_empty() => {
+                    tracing::warn!("could not clear total build limits ({e:#})");
+                    Some(hierarchy)
+                }
+                // Without the hierarchy `run_build` refuses every build, which is
+                // the point: a total that is configured is enforced or nothing
+                // runs.
+                Err(e) => {
+                    tracing::error!(
+                        "WORKER_TOTAL_BUILD_* limits are set but cannot be applied ({e:#}); \
+                         every build will be refused rather than run without them"
+                    );
+                    None
+                }
+            }
+        });
+        if !(limits.is_empty() && total.is_empty()) {
+            if cgroups.is_none() {
                 // Said once, here, rather than only as every build failing.
-                None => tracing::error!(
-                    "WORKER_BUILD_MEMORY_MAX/WORKER_BUILD_CPUS are set, but there is no \
-                     per-build cgroup to enforce them in; every build will be refused \
+                tracing::error!(
+                    "build resource limits (WORKER_BUILD_* or WORKER_TOTAL_BUILD_*) are set, \
+                     but there is no cgroup to enforce them in; every build will be refused \
                      rather than run unlimited"
-                ),
-                Some(hierarchy) => {
-                    if limits.cpus.is_some()
-                        && let Err(e) = hierarchy.enable_cpu()
-                    {
-                        tracing::error!(
-                            "WORKER_BUILD_CPUS is set, but the cpu controller cannot be \
-                             enabled ({e:#}); every build will be refused rather than run \
-                             unlimited"
-                        );
-                    }
+                );
+            } else {
+                let describe = |l: &crate::cgroup::BuildLimits| {
                     let gib = |bytes: Option<u64>| {
                         bytes.map_or_else(
                             || "unlimited".to_string(),
                             |b| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30)),
                         )
                     };
-                    tracing::info!(
-                        "Build limits: memory {}, swap {}, CPUs {}",
-                        gib(limits.memory_max),
-                        gib(limits.swap_max),
-                        limits
-                            .cpus
+                    format!(
+                        "memory {}, swap {}, CPUs {}",
+                        gib(l.memory_max),
+                        gib(l.swap_max),
+                        l.cpus
                             .map_or_else(|| "unlimited".to_string(), |c| c.to_string()),
-                    );
-                }
+                    )
+                };
+                tracing::info!(
+                    "Build limits: each build {}; all builds together {}",
+                    describe(&limits),
+                    describe(&total),
+                );
             }
         }
         let shared = Arc::new(Shared {
