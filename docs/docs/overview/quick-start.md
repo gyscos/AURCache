@@ -166,15 +166,19 @@ the parts worth reading before you deploy it.
 
 A file with a server asks which database it should use, or takes
 `--database postgres` or `--database sqlite` (required when there is no terminal
-to ask on). PostgreSQL adds two services: the database, pinned to
-`postgres:18-trixie`, and a step that runs before it and exits. That step is
-`ixsystems/postgres-upgrade`, the one TrueNAS's own apps use. It does nothing
-while the data already matches the database's major version. When you raise the
-version, it backs the data up and runs `pg_upgrade`, and it moves data from the
+to ask on). PostgreSQL adds a database service pinned to `postgres:18-trixie`.
+Its password is generated unless you pass `--db-password`, and since the database
+publishes no port, it only has to match between the two services.
+
+It also asks whether to add an upgrade step, or takes `--postgres-upgrade` or
+`--no-postgres-upgrade`. With no terminal to ask on, the step is left out. The
+step is `ixsystems/postgres-upgrade`, the one TrueNAS's own apps use, and runs
+before the database and exits. It does nothing while the data already matches
+the database's major version. After you raise `TARGET_VERSION` and the image tag
+together, it backs the data up and runs `pg_upgrade`. It also moves data from the
 older layout (mounted straight at `/var/lib/postgresql/data`) into the one the
-file uses. The database password is generated unless you pass `--db-password`.
-The database publishes no port, so the password only has to match between the
-two services.
+file uses. Without the step, changing the image's major version starts an empty
+database beside the old data, and upgrading is up to you.
 
 ## Filling it, and using it
 

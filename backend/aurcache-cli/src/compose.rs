@@ -180,6 +180,10 @@ pub enum ComposeDatabase {
     /// has to match between them: the database publishes no port.
     Postgres {
         password: String,
+        /// Whether to run [`POSTGRES_UPGRADE_IMAGE`] before the database. It is
+        /// a third-party image that rewrites the data directory, so it is only
+        /// there when asked for.
+        upgrade_step: bool,
     },
 }
 
@@ -234,8 +238,12 @@ pub fn render_compose(params: &ComposeParams) -> String {
 
     if params.role.has_server() {
         out.push_str(&server_service(params));
-        if let ComposeDatabase::Postgres { password } = &params.database {
-            out.push_str(&database_services(password));
+        if let ComposeDatabase::Postgres {
+            password,
+            upgrade_step,
+        } = &params.database
+        {
+            out.push_str(&database_services(password, *upgrade_step));
         }
     }
     if params.role.has_worker() {
@@ -335,7 +343,7 @@ fn server_service(params: &ComposeParams) -> String {
             "\x20     - aurcache_db:/app/db               # SQLite database\n".to_string(),
             String::new(),
         ),
-        ComposeDatabase::Postgres { password } => (
+        ComposeDatabase::Postgres { password, .. } => (
             format!(
                 "\x20     # PostgreSQL, in the `{DATABASE_SERVICE}` service below.\n\
                  \x20     - DB_TYPE=POSTGRESQL\n\
@@ -389,18 +397,68 @@ fn server_service(params: &ComposeParams) -> String {
     )
 }
 
-/// The database and the step that upgrades its data before it starts.
+/// The database, and the step that upgrades its data before it starts when
+/// `upgrade_step` asks for one.
 ///
-/// Both mount the volume at `/var/lib/postgresql`, the parent of `PGDATA`
+/// The volume is mounted at `/var/lib/postgresql`, the parent of `PGDATA`
 /// rather than `PGDATA` itself: the data lives in `<major>/docker` below it,
 /// so an upgrade can build the new version's directory beside the old one.
-fn database_services(password: &str) -> String {
+fn database_services(password: &str, upgrade_step: bool) -> String {
     let env = format!(
         "\x20     - POSTGRES_USER={DATABASE_USER}\n\
          \x20     - POSTGRES_PASSWORD={password}\n\
          \x20     - POSTGRES_DB={DATABASE_USER}\n"
     );
 
+    let (upgrade, version_note, depends_on) = if upgrade_step {
+        (
+            upgrade_service(&env),
+            "\x20   # Change the major version together with TARGET_VERSION above.\n",
+            format!(
+                "\x20   depends_on:\n\
+                 \x20     {DATABASE_SERVICE}_upgrade:\n\
+                 \x20       condition: service_completed_successfully\n"
+            ),
+        )
+    } else {
+        (
+            String::new(),
+            // Without the step, a new tag finds no `<new major>/docker` and
+            // initialises one: an empty database, with the old one beside it.
+            "\x20   # Changing the major version does not upgrade the data: the new version\n\
+             \x20   # starts an empty database in <major>/docker, leaving the old one beside\n\
+             \x20   # it. Upgrade first (pg_upgrade, or a dump and restore), or regenerate\n\
+             \x20   # this file with --postgres-upgrade to have a step that does it.\n",
+            String::new(),
+        )
+    };
+
+    format!(
+        "{upgrade}\
+         \x20 {DATABASE_SERVICE}:\n\
+         {version_note}\
+         \x20   image: {POSTGRES_IMAGE}\n\
+         \x20   user: \"{POSTGRES_UID}\"\n\
+         \x20   environment:\n\
+         {env}\
+         \x20   volumes:\n\
+         \x20     - aurcache_postgres:/var/lib/postgresql\n\
+         \x20   # Over TCP rather than the socket: while the image initialises a new\n\
+         \x20   # database, a temporary server answers on the socket and then stops.\n\
+         \x20   healthcheck:\n\
+         \x20     test: [\"CMD\", \"pg_isready\", \"-h\", \"127.0.0.1\", \"-U\", \"{DATABASE_USER}\", \"-d\", \"{DATABASE_USER}\"]\n\
+         \x20     interval: 10s\n\
+         \x20     timeout: 5s\n\
+         \x20     retries: 30\n\
+         {depends_on}\
+         \x20   networks:\n\
+         \x20     - aurcache\n\
+         \x20   restart: unless-stopped\n\n"
+    )
+}
+
+/// The one-shot service that brings the data up to [`POSTGRES_MAJOR`].
+fn upgrade_service(env: &str) -> String {
     format!(
         "  {DATABASE_SERVICE}_upgrade:\n\
          \x20   # Runs before the database, then exits. When the data is from an older major\n\
@@ -425,27 +483,7 @@ fn database_services(password: &str) -> String {
          \x20   volumes:\n\
          \x20     - aurcache_postgres:/var/lib/postgresql\n\
          \x20   network_mode: none\n\
-         \x20   restart: \"no\"\n\n\
-         \x20 {DATABASE_SERVICE}:\n\
-         \x20   image: {POSTGRES_IMAGE}\n\
-         \x20   user: \"{POSTGRES_UID}\"\n\
-         \x20   environment:\n\
-         {env}\
-         \x20   volumes:\n\
-         \x20     - aurcache_postgres:/var/lib/postgresql\n\
-         \x20   # Over TCP rather than the socket: while the image initialises a new\n\
-         \x20   # database, a temporary server answers on the socket and then stops.\n\
-         \x20   healthcheck:\n\
-         \x20     test: [\"CMD\", \"pg_isready\", \"-h\", \"127.0.0.1\", \"-U\", \"{DATABASE_USER}\", \"-d\", \"{DATABASE_USER}\"]\n\
-         \x20     interval: 10s\n\
-         \x20     timeout: 5s\n\
-         \x20     retries: 30\n\
-         \x20   depends_on:\n\
-         \x20     {DATABASE_SERVICE}_upgrade:\n\
-         \x20       condition: service_completed_successfully\n\
-         \x20   networks:\n\
-         \x20     - aurcache\n\
-         \x20   restart: unless-stopped\n\n"
+         \x20   restart: \"no\"\n\n"
     )
 }
 
@@ -572,7 +610,11 @@ mod tests {
             ComposeRole::Worker,
             ComposeRole::Bundle,
         ] {
-            for database in [ComposeDatabase::Sqlite, postgres()] {
+            for database in [
+                ComposeDatabase::Sqlite,
+                postgres(),
+                postgres_without_upgrade(),
+            ] {
                 let rendered = render_compose(&ComposeParams {
                     database: database.clone(),
                     ..params(role)
@@ -587,6 +629,14 @@ mod tests {
     fn postgres() -> ComposeDatabase {
         ComposeDatabase::Postgres {
             password: "s3cret".to_string(),
+            upgrade_step: true,
+        }
+    }
+
+    fn postgres_without_upgrade() -> ComposeDatabase {
+        ComposeDatabase::Postgres {
+            password: "s3cret".to_string(),
+            upgrade_step: false,
         }
     }
 
@@ -722,6 +772,31 @@ mod tests {
             !doc["services"]["aurcache_database"]["healthcheck"].is_badvalue(),
             "a service_healthy dependency needs a healthcheck"
         );
+    }
+
+    /// Declining the step leaves a database that starts on its own, and says
+    /// in the file what a version change will then not do.
+    #[test]
+    fn without_the_upgrade_step_the_database_stands_alone() {
+        let params = ComposeParams {
+            database: postgres_without_upgrade(),
+            ..params(ComposeRole::Bundle)
+        };
+        let doc = parsed(&params);
+        assert!(doc["services"]["aurcache_database_upgrade"].is_badvalue());
+        assert!(doc["services"]["aurcache_database"]["depends_on"].is_badvalue());
+        assert_eq!(
+            doc["services"]["aurcache_database"]["image"].as_str(),
+            Some(POSTGRES_IMAGE)
+        );
+        // The server still waits for it.
+        assert_eq!(
+            doc["services"]["aurcache"]["depends_on"]["aurcache_database"]["condition"].as_str(),
+            Some("service_healthy")
+        );
+        let rendered = render_compose(&params);
+        assert!(rendered.contains("does not upgrade the data"), "{rendered}");
+        assert!(!rendered.contains("postgres-upgrade:"), "{rendered}");
     }
 
     /// A worker file has no server, so it has no database either.

@@ -202,6 +202,17 @@ struct ComposeArgs {
     #[arg(long)]
     db_password: Option<String>,
 
+    /// Add a step that upgrades PostgreSQL's data when its major version is
+    /// raised (the `ixsystems/postgres-upgrade` image TrueNAS apps use). Asked
+    /// for when neither this nor `--no-postgres-upgrade` is given, and left
+    /// out when there is no terminal to ask on.
+    #[arg(long, conflicts_with = "no_postgres_upgrade")]
+    postgres_upgrade: bool,
+
+    /// Leave the PostgreSQL upgrade step out without being asked.
+    #[arg(long)]
+    no_postgres_upgrade: bool,
+
     /// Where to write it. `-` writes to stdout.
     #[arg(long, short = 'o')]
     output: Option<String>,
@@ -783,7 +794,7 @@ fn run_setup_command(format: OutputFormat, command: SetupCommand) -> Result<()> 
 }
 
 fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
-    let database = compose_database(&args)?;
+    let database = compose_database(&args, can_prompt())?;
     let defaults = compose::ComposeParams::default();
     let params = compose::ComposeParams {
         role: args.role,
@@ -819,6 +830,10 @@ fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
                 compose::ComposeDatabase::Sqlite => "sqlite",
                 compose::ComposeDatabase::Postgres { .. } => "postgres",
             }),
+            "postgres_upgrade": match database {
+                compose::ComposeDatabase::Postgres { upgrade_step, .. } => Some(upgrade_step),
+                compose::ComposeDatabase::Sqlite => None,
+            },
         })),
         OutputFormat::Text => {
             println!("wrote {target}");
@@ -1240,27 +1255,38 @@ async fn render_package(
 /// for them. So the list is printed and confirmed rather than acted on from one
 /// flag.
 /// The database a compose file's server uses: the one named on the command
-/// line, or the one picked at a prompt.
+/// line, or the one picked at a prompt when `interactive`.
 ///
-/// Without a terminal there is nobody to ask, and quietly picking one would
-/// decide where someone's data lives for them, so that is an error naming the
-/// flag.
-fn compose_database(args: &ComposeArgs) -> Result<compose::ComposeDatabase> {
+/// Without a terminal there is nobody to ask, and quietly picking a database
+/// would decide where someone's data lives for them, so that is an error
+/// naming the flag. The upgrade step is the other way round: it is opt-in, so
+/// with nobody to ask it is left out.
+fn compose_database(args: &ComposeArgs, interactive: bool) -> Result<compose::ComposeDatabase> {
+    let upgrade_flag = args.postgres_upgrade || args.no_postgres_upgrade;
     if !args.role.has_server() {
-        if args.database.is_some() || args.db_password.is_some() {
-            bail!("a worker file has no database; --database and --db-password are for a server");
+        if args.database.is_some() || args.db_password.is_some() || upgrade_flag {
+            bail!(
+                "a worker file has no database; --database, --db-password and \
+                 --[no-]postgres-upgrade are for a server"
+            );
         }
         return Ok(compose::ComposeDatabase::Sqlite);
     }
 
     let kind = match args.database {
         Some(kind) => kind,
-        None => prompt_database_kind()?,
+        None if interactive => prompt_database_kind()?,
+        None => {
+            bail!("choose the server's database with --database postgres or --database sqlite")
+        }
     };
     match kind {
         compose::DatabaseKind::Sqlite => {
             if args.db_password.is_some() {
                 bail!("--db-password is for --database postgres; SQLite has no password");
+            }
+            if upgrade_flag {
+                bail!("--[no-]postgres-upgrade is for --database postgres");
             }
             Ok(compose::ComposeDatabase::Sqlite)
         }
@@ -1273,17 +1299,44 @@ fn compose_database(args: &ComposeArgs) -> Result<compose::ComposeDatabase> {
                 ),
                 None => generate_password()?,
             };
-            Ok(compose::ComposeDatabase::Postgres { password })
+            let upgrade_step = if args.postgres_upgrade {
+                true
+            } else if args.no_postgres_upgrade || !interactive {
+                false
+            } else {
+                prompt_postgres_upgrade()?
+            };
+            Ok(compose::ComposeDatabase::Postgres {
+                password,
+                upgrade_step,
+            })
         }
     }
 }
 
+/// Whether there is a person to ask. The prompts are drawn on stderr, so a
+/// file written to stdout (`-o -`) can still be asked about; it is stdin and
+/// stderr that need a terminal.
+fn can_prompt() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+fn prompt_postgres_upgrade() -> Result<bool> {
+    eprintln!(
+        "An upgrade step runs {} before the database: when you raise PostgreSQL's\n\
+         major version it backs the data up and runs pg_upgrade, and otherwise does\n\
+         nothing. Without it, a new major version starts an empty database and the\n\
+         upgrade is yours to do.",
+        compose::POSTGRES_UPGRADE_IMAGE
+    );
+    Confirm::new()
+        .with_prompt("Add the PostgreSQL upgrade step?")
+        .default(false)
+        .interact()
+        .context("failed to read the upgrade step choice")
+}
+
 fn prompt_database_kind() -> Result<compose::DatabaseKind> {
-    // The prompt is drawn on stderr, so a file written to stdout (`-o -`) can
-    // still be asked about; it is stdin and stderr that need a person.
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-        bail!("choose the server's database with --database postgres or --database sqlite");
-    }
     let choices = [
         (
             compose::DatabaseKind::Postgres,
@@ -2806,40 +2859,80 @@ mod tests {
         args
     }
 
+    /// Every call here passes `interactive: false`: under `cargo test` in a
+    /// terminal, a prompt would wait for an answer nobody gives.
+    fn database_for(argv: &[&str]) -> Result<compose::ComposeDatabase, anyhow::Error> {
+        compose_database(&compose_args(argv), false)
+    }
+
     #[test]
     fn a_named_database_is_used_without_asking() {
         assert_eq!(
-            compose_database(&compose_args(&["--database", "sqlite"])).unwrap(),
+            database_for(&["--database", "sqlite"]).unwrap(),
             compose::ComposeDatabase::Sqlite
         );
-        let postgres = compose_database(&compose_args(&[
+        assert_eq!(
+            database_for(&[
+                "--database",
+                "postgres",
+                "--db-password",
+                "hunter2",
+                "--postgres-upgrade",
+            ])
+            .unwrap(),
+            compose::ComposeDatabase::Postgres {
+                password: "hunter2".to_string(),
+                upgrade_step: true,
+            }
+        );
+    }
+
+    /// Nobody to ask about the database is an error: which one holds the data
+    /// is not something to guess.
+    #[test]
+    fn with_nobody_to_ask_the_database_must_be_named() {
+        let err = database_for(&[]).unwrap_err().to_string();
+        assert!(err.contains("--database"), "{err}");
+    }
+
+    /// The upgrade step is opt-in: without a flag and nobody to ask, it is
+    /// left out, and each flag decides it without a question.
+    #[test]
+    fn the_upgrade_step_is_opt_in() {
+        let upgrade_step = |argv: &[&str]| match database_for(argv).unwrap() {
+            compose::ComposeDatabase::Postgres { upgrade_step, .. } => upgrade_step,
+            compose::ComposeDatabase::Sqlite => panic!("expected postgres"),
+        };
+        assert!(!upgrade_step(&["--database", "postgres"]));
+        assert!(upgrade_step(&[
             "--database",
             "postgres",
-            "--db-password",
-            "hunter2",
-        ]))
-        .unwrap();
-        assert_eq!(
-            postgres,
-            compose::ComposeDatabase::Postgres {
-                password: "hunter2".to_string()
-            }
+            "--postgres-upgrade"
+        ]));
+        assert!(!upgrade_step(&[
+            "--database",
+            "postgres",
+            "--no-postgres-upgrade"
+        ]));
+        assert!(
+            Cli::try_parse_from([
+                "aurcache-cli",
+                "setup",
+                "compose",
+                "--postgres-upgrade",
+                "--no-postgres-upgrade",
+            ])
+            .is_err()
         );
     }
 
     #[test]
     fn a_postgres_password_is_generated_fresh_and_plain() {
-        let args = compose_args(&["--database", "postgres"]);
-        let compose::ComposeDatabase::Postgres { password: first } =
-            compose_database(&args).unwrap()
-        else {
-            panic!("expected postgres");
+        let password = || match database_for(&["--database", "postgres"]).unwrap() {
+            compose::ComposeDatabase::Postgres { password, .. } => password,
+            compose::ComposeDatabase::Sqlite => panic!("expected postgres"),
         };
-        let compose::ComposeDatabase::Postgres { password: second } =
-            compose_database(&args).unwrap()
-        else {
-            panic!("expected postgres");
-        };
+        let (first, second) = (password(), password());
         assert_eq!(first.len(), 32);
         assert!(compose::is_plain_password(&first), "{first}");
         assert_ne!(first, second);
@@ -2847,37 +2940,22 @@ mod tests {
 
     #[test]
     fn a_password_that_would_need_escaping_is_refused() {
-        let args = compose_args(&["--database", "postgres", "--db-password", "p@ss/word"]);
-        assert!(compose_database(&args).is_err());
+        assert!(database_for(&["--database", "postgres", "--db-password", "p@ss/word"]).is_err());
     }
 
     /// Flags that cannot mean anything are refused rather than ignored.
     #[test]
     fn database_flags_that_do_not_apply_are_refused() {
-        assert!(
-            compose_database(&compose_args(&[
-                "--role",
-                "worker",
-                "--database",
-                "postgres"
-            ]))
-            .is_err()
-        );
-        assert!(
-            compose_database(&compose_args(&[
-                "--database",
-                "sqlite",
-                "--db-password",
-                "x"
-            ]))
-            .is_err()
-        );
+        assert!(database_for(&["--role", "worker", "--database", "postgres"]).is_err());
+        assert!(database_for(&["--role", "worker", "--postgres-upgrade"]).is_err());
+        assert!(database_for(&["--database", "sqlite", "--db-password", "x"]).is_err());
+        assert!(database_for(&["--database", "sqlite", "--no-postgres-upgrade"]).is_err());
     }
 
     /// A worker file needs no answer, so it is never asked for one.
     #[test]
     fn a_worker_file_does_not_ask_for_a_database() {
-        assert!(compose_database(&compose_args(&["--role", "worker"])).is_ok());
+        assert!(database_for(&["--role", "worker"]).is_ok());
     }
 
     #[test]
