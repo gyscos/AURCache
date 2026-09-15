@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_common::build_state::BuildTrigger;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
@@ -112,7 +113,7 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
                 continue;
             }
         };
-        match package_update(services, pkg, force).await {
+        match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
                 if let Err(e) = activity_log
                     .add(
@@ -153,6 +154,9 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
 /// * `db` - A reference to the database connection.
 /// * `pkg_model` - The package model to update.
 /// * `force` - A boolean flag to force an update even if the package version is unchanged.
+/// * `trigger` - Why the builds are being queued, recorded on each build row --
+///   and on the rows of any dependency rebuilt along the way, which is part of
+///   the same request.
 /// * `tx` - A broadcast channel sender for triggering build actions.
 ///
 /// # Returns
@@ -164,9 +168,10 @@ pub async fn package_update(
     services: &Services,
     pkg_model: packages::Model,
     force: bool,
+    trigger: BuildTrigger,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let mut visited = HashSet::new();
-    package_update_inner(services, pkg_model, force, &mut visited).await
+    package_update_inner(services, pkg_model, force, trigger, &mut visited).await
 }
 
 /// Recompute and persist a package's dependency graph from its current
@@ -207,6 +212,7 @@ async fn package_update_inner(
     services: &Services,
     pkg_model: packages::Model,
     force: bool,
+    trigger: BuildTrigger,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     if !visited.insert(pkg_model.id) {
@@ -251,6 +257,7 @@ async fn package_update_inner(
             pkg_model: &pkg_model,
             version: &upstream_version,
             graph: &graph,
+            trigger,
         },
         visited,
     )
@@ -572,6 +579,7 @@ async fn dependencies_ready_for_platform(
     services: &Services,
     platform: &Platform,
     graph: &DependencyGraph,
+    trigger: BuildTrigger,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<bool> {
     for dep_info in graph.deps.values() {
@@ -601,7 +609,8 @@ async fn dependencies_ready_for_platform(
 
         // A dependency whose last build failed is not auto-retried.
         if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
-            package_update_inner(services, dep_info.package.clone(), true, visited).await?;
+            package_update_inner(services, dep_info.package.clone(), true, trigger, visited)
+                .await?;
         }
 
         return Ok(false);
@@ -615,6 +624,7 @@ struct BuildRequest<'a> {
     pkg_model: &'a packages::Model,
     version: &'a str,
     graph: &'a DependencyGraph,
+    trigger: BuildTrigger,
 }
 
 /// Outcome of triggering an update for a single platform of a package.
@@ -646,14 +656,21 @@ async fn enqueue_platform_builds(
     let mut results = Vec::new();
 
     for platform in &configured_platforms {
-        let ready =
-            dependencies_ready_for_platform(services, platform, request.graph, visited).await?;
+        let ready = dependencies_ready_for_platform(
+            services,
+            platform,
+            request.graph,
+            request.trigger,
+            visited,
+        )
+        .await?;
 
         if ready {
             let result = update_platform(
                 *platform,
                 request.pkg_model.clone(),
                 request.version.to_string(),
+                request.trigger,
                 &services.db,
                 &services.tx,
             )
@@ -674,7 +691,7 @@ async fn enqueue_platform_builds(
                 request.version,
                 start_time,
                 BuildStates::WAITING_FOR_DEPS,
-                aurcache_common::build_state::BuildTriggers::AUTO_UPDATE,
+                request.trigger.as_i32(),
             )
             .await?;
             txn.commit().await?;
@@ -699,6 +716,7 @@ pub async fn update_platform(
     platform: Platform,
     pkg: packages::Model,
     new_version: String,
+    trigger: BuildTrigger,
     db: &DatabaseConnection,
     tx: &Sender<Action>,
 ) -> anyhow::Result<aurcache_db::helpers::build_enqueue::EnqueueBuildResult> {
@@ -720,7 +738,7 @@ pub async fn update_platform(
         &new_version,
         start_time,
         BuildStates::ENQUEUED_BUILD,
-        aurcache_common::build_state::BuildTriggers::AUTO_UPDATE,
+        trigger.as_i32(),
     )
     .await?;
     txn.commit().await?;
@@ -737,6 +755,7 @@ pub async fn update_platform(
 #[cfg(test)]
 mod tests {
     use super::package_update;
+    use aurcache_common::build_state::{BuildTrigger, BuildTriggers};
     /// A repository of its own for a test that never publishes to it.
     fn test_repo() -> Arc<crate::repository::Repository> {
         Arc::new(crate::repository::Repository::new(
@@ -1080,6 +1099,7 @@ mod tests {
             ),
             parent.clone(),
             false,
+            BuildTrigger::User,
         )
         .await
         .unwrap();
@@ -1113,15 +1133,29 @@ mod tests {
             Some(BuildStates::WAITING_FOR_DEPS),
             "parent build should be WAITING_FOR_DEPS"
         );
+        // The request's own trigger, on the build left waiting as much as on
+        // one queued outright -- it used to be `AutoUpdate` for everything,
+        // which made an operator's rebuild indistinguishable from the scheduler.
+        assert_eq!(parent_builds[0].trigger, BuildTriggers::USER);
 
         let child_builds = builds::Entity::find()
             .filter(builds::Column::PkgId.eq(child.id))
-            .count(&db)
+            .all(&db)
             .await
             .unwrap();
         assert_eq!(
-            child_builds, 2,
+            child_builds.len(),
+            2,
             "dependency should get a new rebuild queued"
+        );
+        let rebuild = child_builds
+            .iter()
+            .find(|b| b.status != Some(BuildStates::SUCCESSFUL_BUILD))
+            .expect("the dependency's new build");
+        assert_eq!(
+            rebuild.trigger,
+            BuildTriggers::USER,
+            "a dependency rebuilt for the request is part of the request"
         );
 
         let parent_after = Packages::find_by_id(parent.id)
@@ -1300,6 +1334,7 @@ mod tests {
             ),
             parent.clone(),
             false,
+            BuildTrigger::User,
         )
         .await
         .unwrap();
@@ -1529,6 +1564,7 @@ mod tests {
             ),
             parent.clone(),
             true,
+            BuildTrigger::User,
         )
         .await
         .unwrap();
@@ -1731,6 +1767,7 @@ mod tests {
             ),
             parent.clone(),
             false,
+            BuildTrigger::User,
         )
         .await
         .unwrap();
@@ -1985,6 +2022,7 @@ mod tests {
             ),
             pkg.clone(),
             true,
+            BuildTrigger::User,
         )
         .await
         .unwrap();
@@ -2116,6 +2154,18 @@ mod tests {
             0,
             "an unchanged version with no VCS source is not rebuilt"
         );
+        let scheduled = builds::Entity::find()
+            .filter(builds::Column::PkgId.eq(ids["tracks-git"]))
+            .filter(builds::Column::Status.eq(BuildStates::ENQUEUED_BUILD))
+            .one(&db)
+            .await
+            .unwrap()
+            .expect("the queued rebuild");
+        assert_eq!(
+            scheduled.trigger,
+            BuildTriggers::AUTO_UPDATE,
+            "the scheduler's builds say they are the scheduler's"
+        );
     }
 
     #[tokio::test]
@@ -2213,6 +2263,7 @@ mod tests {
             ),
             parent.clone(),
             false,
+            BuildTrigger::User,
         )
         .await
         .unwrap();

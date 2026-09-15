@@ -16,6 +16,7 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_common::build_state::BuildTrigger;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
@@ -645,7 +646,8 @@ pub async fn package_update_endpoint(
     let package_name = pkg_model.name.clone();
     let forced = input.force;
 
-    let pkg_update = package_update(services, pkg_model, forced)
+    // An operator's Update or Rebuild, from the UI or the CLI.
+    let pkg_update = package_update(services, pkg_model, forced, BuildTrigger::User)
         .await
         .map(|results| {
             Json(

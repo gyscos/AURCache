@@ -7,8 +7,12 @@ use crate::models::authenticated::Authenticated;
 use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_common::api::waiting::WaitingReason;
+use aurcache_common::build_state::BuildTrigger;
 use aurcache_db::action::Action;
+use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
@@ -455,7 +459,8 @@ pub async fn retry_build(
     services: &State<Services>,
     pkgbase: &str,
     number: i32,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<Json<i32>, ApiError> {
     let db = &services.db;
 
@@ -475,9 +480,23 @@ pub async fn retry_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let platform_results = package_update(services, package, true)
+    let package_name = package.name.clone();
+    // An operator's retry: recorded as theirs on the build rows, and in the
+    // activity log like an Update, so a build nobody remembers queueing can be
+    // traced to whoever did.
+    let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.add(
+        PackageUpdateActivity {
+            package: package_name,
+            forced: true,
+        },
+        ActivityType::UpdatePackage,
+        a.username,
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))?;
 
     // Pick out the build explicitly reported for the platform that was
     // retried; it may have been enqueued/promoted or left waiting on a
