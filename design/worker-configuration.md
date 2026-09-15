@@ -4,13 +4,17 @@ How a worker's settings could be seen and changed through AURCache's API and UI,
 instead of only through each machine's environment, and how the change would
 reach a running worker.
 
-Status: **proposal, revised after review**. Nothing here is implemented. Two
-reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
-[`worker-configuration-review-codex.md`](worker-configuration-review-codex.md))
-agreed with the security boundary, the precedence model and the transport, and
-found the protocol under-specified. This revision adopts most of what they
-raised; [Review outcomes](#review-outcomes) lists what changed, what did not,
-and the few review claims that do not match the code.
+Status: **proposal, second revision**. Nothing here is implemented.
+
+- The first draft had a server-side allowlist of worker settings and a fleet
+  default. Two reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
+  [`worker-configuration-review-codex.md`](worker-configuration-review-codex.md))
+  agreed with the security boundary and the transport and found the protocol
+  under-specified; the first revision adopted most of what they raised.
+- This revision replaces the allowlist with **settings each worker declares**,
+  drops fleet defaults for now, and lets the worker **re-register** when a change
+  alters what it registered with. The server no longer knows what any worker
+  setting means. [History](#history) records what each round changed.
 
 ---
 
@@ -47,7 +51,7 @@ up to a heartbeat interval to arrive, plus the build loop's 5 s tick.
   `max_concurrent_builds` and `builder_image` are dead the same way and are
   still on the settings API.
 - Giving `unreal-engine` a bigger build-tree budget meant an SSH session to the
-  one worker allowed to build it. A fleet of five is five edits.
+  one worker allowed to build it.
 
 The last two point at the same thing: a setting that belongs to the worker has
 nowhere on the server to live, so it was either put in the wrong place or left
@@ -55,179 +59,184 @@ unreachable.
 
 ---
 
-## Two separate questions
+## 1. The worker declares its settings
 
-"Configure workers from the server" is two decisions that are easy to conflate:
+A worker tells the server which settings it accepts, at registration. The server
+stores that declaration and renders, validates and delivers values for it
+generically. It does not know what `concurrency` or `build_memory_max` *mean*,
+only their types.
 
-1. **Where the value lives and who wins** -- the worker's environment, the
-   server's database, or both with a precedence.
-2. **How a change reaches a running worker** -- at the next start, on the next
-   heartbeat, or pushed the moment it is saved.
+### Why the worker and not the server
 
-The first decides what the UI can promise; the second only how soon. They are
-treated in that order, followed by the protocol that carries a change and what
-a running worker does with it.
+- **The server and the workers are deployed separately** -- the server as a
+  container on one host, a worker as a native package on another, upgraded when
+  each is. With a server-side list, a new worker setting needs a server release
+  before anyone can set it. Declared, it appears when the worker that has it
+  registers.
+- **Different worker implementations have different settings.** The legacy
+  container worker (`aurcache-worker-docker`) reads `CPU_LIMIT` in milli-CPUs
+  and `MEMORY_LIMIT` in MB; it can declare exactly those, with its own
+  descriptions, instead of the server translating a shared vocabulary onto it.
+- **The boundary is enforced where it is declared.** Only the worker ever
+  decided what it would accept; now the same code says so.
 
----
+### The declaration
 
-## 1. Which settings the server may set
+Sent in `RegisterRequest`, one entry per setting:
 
-Not all of them. Some are facts about the machine, some are the machine's
-security boundary, and some are policy that is genuinely better set in one
-place.
+```text
+SettingDecl {
+  key:         String,          // "build_memory_max"
+  kind:        ValueKind,       // see below
+  description: String,
+  category:    String,          // "Build limits", "Caches", ...
+  default:     Option<String>,  // shown when nothing else sets it
+  env_var:     Option<String>,  // "WORKER_BUILD_MEMORY_MAX": the variable that pins it
+  applies:     NextJob | NextLoop | Immediately,
+}
+```
 
-| Class | Keys | Server may set? |
+The one thing server and worker must share is **`ValueKind`**, a closed list
+in `aurcache-common` with its parsers:
+
+| Kind | Parsed with | Rendered as |
 |---|---|---|
-| **Bootstrap** -- needed before the server can be reached | `AURCACHE_URL`, `AURCACHE_SERVER_CA_FINGERPRINT`, `AURCACHE_ENROLLMENT_TOKEN`, `AURCACHE_ENROLLMENT_DIR`, `WORKER_DATA_DIR` | **No.** Circular. |
-| **Local network view** | `AURCACHE_REPO_HOST`, `AURCACHE_REPO_URL` | **No.** How *this* machine reaches the repository (split DNS, a VPN, a proxy); the server's view of its own address is exactly what these exist to override. |
-| **Protocol timing** | `WORKER_HEARTBEAT_INTERVAL` | **No.** It has to stay well inside the server's `LEASE_TTL` and `WORKER_LIVENESS_TIMEOUT` (both 60 s); a server-set interval that drifted past them would get running builds reaped. |
-| **Host access** -- paths, users, binaries, mounts | `WORKER_CHROOT_DIR`, `WORKER_CACHE_DIR`, `WORKER_BUILD_USER`, `WORKER_BIND_MOUNTS`, `WORKER_MAKECHROOTPKG`, `WORKER_GIT_SSH_KEY`, `WORKER_SSH_KNOWN_HOSTS`, `AURCACHE_NSPAWN_KEEP_UNIT`, `AURCACHE_DROPIN` | **No.** See below. |
-| **Machine facts** | `WORKER_ARCHES`, `WORKER_EMULATED_ARCHES`, `WORKER_NAME`, `WORKER_CHROOT_OVERLAY` | No -- reported, not chosen. The chroot mode depends on what the filesystem can do. |
-| **Policy and tuning** | `WORKER_CONCURRENCY`, `WORKER_PRIORITY`, `WORKER_PACKAGES` (per worker only, see below), `WORKER_BUILD_MEMORY_MAX`/`_SWAP_MAX`/`_CPUS`, `WORKER_BUILD_TIMEOUT`, `WORKER_BUILDDIR_MAX_BYTES`/`_MIN_FREE`, `WORKER_CACHE_MAX_SIZE`/`_TTL`, `WORKER_PKGCACHE_MAX_SIZE`/`_TTL`, `WORKER_SRCCACHE_MAX_SIZE`, `WORKER_CHROOT_REFRESH_INTERVAL`, `WORKER_POLL_INTERVAL`, `WORKER_KEYSERVER` | **Yes.** |
+| `Integer { min, max }` | integer, range-checked | number input |
+| `Float { min, max }` | float, range-checked | number input |
+| `Bool` | `true`/`false` | toggle |
+| `Size` | `units::parse_size` | text, shown with `units::format_size` |
+| `Duration` | `units::parse_duration` | text |
+| `Choice { options }` | one of the options | select |
+| `Text` | as is | text |
+| `List` | comma-separated | text |
 
-Two keys the first draft listed are no longer here:
+A declaration with a kind the server does not know (a newer worker) is stored
+and shown as text; the worker still validates it on delivery, where a bad value
+becomes a `rejected` status rather than a failure.
 
-- **Mirrorlist.** The server already delivers a per-architecture mirrorlist at
-  registration (`design/mirrorlist-configuration.md`), and a worker's
-  `WORKER_MIRRORLIST_SERVERS`/`_FILE` overrides it locally. A single worker-level
-  mirrorlist setting would be a third, architecture-blind mechanism beside those.
-  If a server-side mirrorlist change should reach running workers, it rides the
-  same configuration snapshot below as a separate field, keyed by architecture.
-- **Drain/pause.** A lifecycle state, not configuration; see
-  [Decisions](#decisions-on-the-open-questions).
+### What a worker must not declare
 
-`WORKER_KEYSERVER` is safe to set centrally: signature checks are pinned by the
+The worker runs devtools as root (`aurcache ALL=(ALL) NOPASSWD: ALL`, with the
+reasoning in `packaging/aurcache-worker.sudoers`), and the isolation that
+constrains untrusted input is the chroot and the separate build user. Today a
+compromised server can make a worker build anything, but that code runs as
+`builder` inside a chroot. A server that could set `WORKER_BIND_MOUNTS` could
+bind `/` into the chroot; one that could set `WORKER_BUILD_USER` or
+`WORKER_MAKECHROOTPKG` could run a build as root outright.
+
+So the declaration is **compiled into the worker**. It is never derived from the
+environment ("expose every `WORKER_*` variable") or from anything the server
+sends, and a value for a key the worker did not declare is refused however it
+arrives. What the native worker declares:
+
+| Class | Keys | Declared? |
+|---|---|---|
+| **Bootstrap** | `AURCACHE_URL`, `AURCACHE_SERVER_CA_FINGERPRINT`, `AURCACHE_ENROLLMENT_TOKEN`, `AURCACHE_ENROLLMENT_DIR`, `WORKER_DATA_DIR` | **No.** Needed before the server can be reached. |
+| **Local network view** | `AURCACHE_REPO_HOST`, `AURCACHE_REPO_URL` | **No.** How this machine reaches the repository (split DNS, a VPN, a proxy). |
+| **Protocol timing** | `WORKER_HEARTBEAT_INTERVAL` | **No.** Has to stay well inside the server's `LEASE_TTL` and `WORKER_LIVENESS_TIMEOUT` (both 60 s). |
+| **Host access** | `WORKER_CHROOT_DIR`, `WORKER_CACHE_DIR`, `WORKER_BUILD_USER`, `WORKER_BIND_MOUNTS`, `WORKER_MAKECHROOTPKG`, `WORKER_GIT_SSH_KEY`, `WORKER_SSH_KNOWN_HOSTS`, `AURCACHE_NSPAWN_KEEP_UNIT`, `AURCACHE_DROPIN` | **No.** The security boundary above. |
+| **Machine facts** | `WORKER_ARCHES`, `WORKER_EMULATED_ARCHES`, `WORKER_NAME`, `WORKER_CHROOT_OVERLAY` | **No.** Reported, not chosen. |
+| **Mirrorlist** | `WORKER_MIRRORLIST_SERVERS`/`_FILE` | **No.** The server already delivers a per-architecture mirrorlist at registration, and these override it locally (`design/mirrorlist-configuration.md`). |
+| **Policy and tuning** | `WORKER_CONCURRENCY`, `WORKER_PRIORITY`, `WORKER_PACKAGES`, `WORKER_BUILD_MEMORY_MAX`/`_SWAP_MAX`/`_CPUS`, `WORKER_BUILD_TIMEOUT`, `WORKER_BUILDDIR_MAX_BYTES`/`_MIN_FREE`, `WORKER_CACHE_MAX_SIZE`/`_TTL`, `WORKER_PKGCACHE_MAX_SIZE`/`_TTL`, `WORKER_SRCCACHE_MAX_SIZE`, `WORKER_CHROOT_REFRESH_INTERVAL`, `WORKER_POLL_INTERVAL`, `WORKER_KEYSERVER` | **Yes.** |
+
+`WORKER_KEYSERVER` is safe to declare: signature checks are pinned by the
 PKGBUILD's `validpgpkeys`, so a keyserver can withhold a key but not substitute
 one.
 
-**Why host access must stay local.** The worker runs devtools as root
-(`aurcache ALL=(ALL) NOPASSWD: ALL`, with the reasoning in
-`packaging/aurcache-worker.sudoers`), and the isolation that constrains
-untrusted input is the chroot and the separate build user. Today a compromised
-server can make a worker build anything, but that code runs as `builder` inside
-a chroot. A server that could set `WORKER_BIND_MOUNTS` could bind `/` into the
-chroot; one that could set `WORKER_BUILD_USER` or `WORKER_MAKECHROOTPKG` could
-run a build as root outright. Keeping those keys off the wire keeps a server
-compromise a build compromise rather than root on every worker.
+### Per worker only, for now
 
-So the design is an **allowlist**: a `WorkerSetting` enum in `aurcache-common`,
-like `Setting` for the server, naming exactly the keys the server may send. A
-key not on it is refused by the worker however it arrives, and reported as
-unsupported (below).
+Values are set for one worker at a time. There is no fleet default.
+
+A fleet default is the only feature that would need workers to agree on what a
+key means: one value applied to every worker that declares `build_timeout`
+assumes they all mean the same thing by it, with the same kind -- and some keys
+must never have one (a fleet-wide `packages` would give every worker the same
+reservation, the opposite of affinity). Per-worker values need none of that.
+If fleet defaults are wanted later, they can be added on top: a default applies
+to the workers whose declaration has that key and kind, a declaration can mark a
+key as having no fleet default, and a key declared with conflicting kinds is
+refused at fleet scope.
 
 ### Precedence
 
-Three candidates:
+Resolution per key on the worker, highest first:
 
-| Model | Behaviour | Against it |
-|---|---|---|
-| **Server wins** | The UI is always right about what a worker does | A machine cannot pin its own safety limit; a mistaken fleet-wide change applies everywhere with no local veto |
-| **Environment wins** (server as default) | A local value is a deliberate pin; the server fills in what is unset | An env-pinned key cannot be changed from the UI -- which the UI must then say |
-| **Per-key lock** | Each key says which side wins | A policy knob per key; nobody has asked for it |
+1. the worker's environment (the declared `env_var`),
+2. the value set for this worker on the server,
+3. the declared default.
 
-**Recommend: environment wins.** It is the model the server's own settings
-already use (`Package -> Env -> Global -> Default`, where Env beats the
-database), it is how the mirrorlist override already works, and it means
-deploying this changes nothing for an existing worker.
+**Environment wins**: it is the model the server's own settings use
+(`Package -> Env -> Global -> Default`), it is how the mirrorlist override
+works, and deploying this changes nothing for an existing worker.
 
-That last property cuts both ways, as both reviews pointed out: most deployed
-workers already set their policy in the environment, so on day one most rows
-are pinned and the UI cannot change them. That is the right default -- a pin
-is a deliberate local veto -- but it needs an adoption path, not just a
-read-only row:
+That means most deployed workers start with most rows pinned, because their
+policy is already in their environment. A pin is a deliberate local veto, so
+that is right, but it needs an adoption path:
 
 - **The UI names the pin and the way out**: "Pinned by `WORKER_CONCURRENCY` on
   this worker; remove it from the worker's environment to manage it here." A
-  server value saved for a pinned key is stored, and shown as *not in effect*,
-  never as a change that took.
+  value saved for a pinned key is stored and shown as *not in effect*, never as
+  a change that took.
 - **Shipped defaults stop pinning policy.** `docker-compose.remote-worker.yaml`
   sets `WORKER_CONCURRENCY=2`, and `aurcache-cli setup compose`/`setup worker`
   write `WORKER_CONCURRENCY` when given. Templates keep bootstrap and host-access
-  variables set and leave policy commented out, so a new worker is manageable
-  from the server unless someone chooses otherwise.
-- **The documented adoption workflow**: keep bootstrap, network and host-access
-  variables local; move policy values to the server (fleet default or per
-  worker); remove them from the worker's environment; restart once.
-
-### Who resolves which layer
-
-The first draft had the worker resolve all four layers. The server owns two of
-them, so it resolves those:
-
-- **Server**: `snapshot[key] = per_worker[key] or fleet_default[key]`, for every
-  allowlisted key that has either. The snapshot is a flat map; it never
-  mentions "fleet" or "per worker".
-- **Worker**: `effective[key] = environment[key] or snapshot[key] or built_in_default[key]`.
-
-This keeps the database model off the wire, keeps the payload small, and gives
-the snapshot a single meaning, which is what makes its revision unambiguous
-(below).
-
-**Package affinity has no fleet default.** A fleet-wide `packages` value would
-give every otherwise-unset worker the same reservation, which is the opposite of
-affinity. The API refuses `packages` at fleet scope.
+  variables set and leave policy commented out.
+- **Documented adoption**: keep bootstrap, network and host-access variables
+  local; set policy values on the server; remove them from the worker's
+  environment; restart once.
 
 ### Storage
 
-`worker_settings (worker_id NULL for the fleet default, key, value)`, the fleet
-default the way the global settings row is, with:
+- **The declaration** as JSON on the `workers` row, replaced at each
+  registration, so a worker's settings can be viewed and edited while it is
+  offline.
+- **Values** in `worker_settings (worker_id NOT NULL, key, value)`, with
+  `UNIQUE (worker_id, key)` and `worker_id` referencing `workers(id) ON DELETE
+  CASCADE`. Without a fleet default there is no `NULL` scope and no partial
+  index.
+- **The last reported effective configuration** as JSON on the `workers` row.
+- **Dump and restore** carry `worker_settings`, remapped by certificate
+  fingerprint the way `restore.rs` already matches workers, and dropped with a
+  worker whose fingerprint is not restored.
 
-- **Two partial unique indexes**, because `UNIQUE (worker_id, key)` does not stop
-  duplicate fleet rows: NULLs are distinct in a unique constraint on SQLite and
-  on Postgres alike.
-  ```sql
-  CREATE UNIQUE INDEX idx_worker_settings_fleet  ON worker_settings (key)            WHERE worker_id IS NULL;
-  CREATE UNIQUE INDEX idx_worker_settings_worker ON worker_settings (worker_id, key) WHERE worker_id IS NOT NULL;
-  ```
-- **`worker_id` references `workers(id) ON DELETE CASCADE`**; foreign keys are
-  enforced on both backends.
-- **Dump and restore** carry the table. Fleet rows restore as they are;
-  per-worker rows are remapped by certificate fingerprint, the way
-  `restore.rs` already matches workers, and dropped with the worker when its
-  fingerprint is not restored.
+A stored value whose key the worker no longer declares (renamed or removed in a
+newer version) is kept and shown as "no longer offered by this worker", never
+deleted silently.
 
 ### Validation
 
-Validated on both sides with the same code. The server parses a value before
-storing it, so the UI rejects `1.5G` at save time rather than a worker
-discarding it later. The parsers already live in `aurcache-common::units`.
+The server validates a value against the worker's stored declaration when it is
+saved, using the `ValueKind` parsers, so the UI rejects `1.5G` for a `Size` at
+save time.
 
-The worker can still refuse a value the server accepted: a key newer than the
-worker binary, a CPU limit on a host whose cgroup `cpu` controller cannot be
-enabled, a memory limit above what the machine has. The first draft said such a
-value is "treated as unset", which for a safety limit means falling back to
-*unlimited* while the server shows the limit as set. Instead:
+The worker can still refuse a value the server accepted: a key it no longer
+declares, a CPU limit on a host whose cgroup `cpu` controller cannot be enabled,
+a memory limit above what the machine has. Then:
 
-- A refused value **keeps the worker's previous usable value** for that key: the
-  last one it applied from a snapshot, or its environment/default if it never
-  had one. A limit is never loosened by a rejection.
-- The worker reports **per-key status** for every key it received: `applied`,
-  `overridden` (env-pinned), `unsupported` (not on this binary's allowlist), or
-  `rejected` with a short, operator-readable reason.
-- The UI flags a worker with a rejected or unsupported key, rather than showing
-  the saved value as in effect.
+- a refused value **keeps the worker's previous usable value** for that key --
+  the last one it applied, or its environment/default if it never had one. A
+  limit is never loosened by a rejection;
+- the worker reports **per-key status**: `applied`, `overridden` (env-pinned),
+  `unsupported` (not declared), or `rejected` with a short, operator-readable
+  reason;
+- the UI flags the worker, rather than showing the saved value as in effect.
 
 ### Saving is one transaction
 
 An operator often changes related keys together -- lower concurrency with a
-higher per-build memory limit, say. Written row by row, a heartbeat between
-two writes could deliver a combination nobody chose. So a save is one
-`PATCH` of a set of keys at one scope:
-
-1. validate every key, and any cross-key rule, before writing anything;
-2. insert, update and delete the rows in one transaction;
-3. write one activity entry for the save;
-4. the next snapshot computed for an affected worker includes all of it or none.
-
-Because the revision is derived from the snapshot's content (below), step 4
-needs no revision counter to bump: a worker cannot observe a half-written save
-because the snapshot is only ever read from committed rows.
+higher per-build memory limit, say. Written row by row, a heartbeat between two
+writes could deliver a combination nobody chose. So a save is one `PATCH` of a
+set of keys for one worker: validate every key first, write the rows in one
+transaction, record one activity entry (`WorkerConfigUpdated { worker,
+changed_keys }`). The snapshot is only ever read from committed rows, so a
+worker cannot see half a save.
 
 ### Visibility is worth having on its own
 
-Independent of editing: the worker reports its **effective** configuration,
-with the source and status of each value. The UI shows every key and where it
-came from. That alone would have shown a `450G` that meant 200 GiB.
+Independent of editing: the worker reports its **effective** configuration, with
+the source and status of each value, and the Workers page shows every declared
+setting and where its value came from. That alone would have shown a `450G` that
+meant 200 GiB. It is the first thing to ship.
 
 ---
 
@@ -239,7 +248,7 @@ What actually needs to be timely:
 |---|---|---|
 | Stop a build | server -> worker | seconds (an operator is watching) |
 | Configuration changed | server -> worker | tens of seconds is fine |
-| Drain / resume | server only | immediate, and needs no message (see Decisions) |
+| Drain / resume | server only | immediate, and needs no message (see Drain) |
 | Leases, liveness | worker -> server | the heartbeat interval, by design |
 | Logs | worker -> server | already streamed by POST |
 
@@ -248,10 +257,9 @@ Only Stop is latency-sensitive, and it already works through the heartbeat.
 ### Options
 
 **A. Registration only.** The server returns the worker's configuration in the
-registration response; a change applies at the next start. The server can
-prompt a restart (a flag in `HeartbeatResponse`) that the worker honours once
-idle. Smallest change, no new transport. But "apply" means "restart when idle",
-which on a worker building `unreal-engine` is hours away.
+registration response; a change applies at the next start. Smallest change, no
+new transport. But "apply" means "restart when idle", which on a worker building
+`unreal-engine` is hours away.
 
 **B. Heartbeat piggyback.** The heartbeat carries the revision of the last
 snapshot the worker received; when the server's differs, `HeartbeatResponse`
@@ -303,9 +311,9 @@ be renewed by the worker and expire on the server regardless of any connection.
 A socket that carries heartbeats still needs lease expiry behind it, so E does
 not remove the heartbeat; it adds a second path beside it.
 
-**Recommended: B**, with the snapshot also returned at registration (next
-section), so a worker that restarts has its server configuration before it
-claims anything rather than one heartbeat later.
+**Recommended: B**, with the snapshot also returned at registration, so a worker
+that restarts has its server values before it claims anything rather than one
+heartbeat later.
 
 ---
 
@@ -313,35 +321,29 @@ claims anything rather than one heartbeat later.
 
 ### Delivery and effect are separate
 
-The first draft had one `config_version` that the worker reported as "applied".
-With environment-wins that cannot work: a worker that receives revision 12 with
-an env-pinned key has correctly *received* 12 but deliberately does not run it,
-and a server comparing one version against its desired state would resend the
-same snapshot on every heartbeat forever. So there are two things:
+With environment-wins, a worker that receives a snapshot with an env-pinned key
+has correctly *received* it but deliberately does not run that value. One
+version number meaning "applied" would make the server resend the snapshot
+forever. So there are two things:
 
 - **`received_revision`** -- the revision of the last snapshot the worker parsed
-  and accepted (every key given a status). It only controls retransmission.
-- **`effective`** -- the worker's resolved configuration: per key, the value,
-  its source (`env`, `server`, `default`) and its status. It controls what the
-  UI shows and the scheduling fields (below).
+  and gave every key a status. It only controls retransmission.
+- **`effective`** -- per declared key, the value in use, its source (`env`,
+  `server`, `default`) and its status. It controls what the UI shows.
 
-The **revision** is the SHA-256 of the canonical serialization of the snapshot
-the server would send that worker: sorted keys, normalized values. It changes
-exactly when that worker's snapshot changes -- a fleet default edit changes it
-for every worker without a per-worker override of that key and for no other --
-with no counter to keep consistent across restarts or replicas. It is a
-revision of the server's payload, never a hash of the worker's env-resolved
-result.
+The **revision** is the SHA-256 of the canonical serialization of the snapshot:
+that worker's stored values, keys sorted. It changes exactly when the snapshot
+does, with no counter to keep consistent across restarts or replicas.
 
 ### Messages
 
 ```text
-RegisterRequest   { ...as today, config_protocol: 1 }
+RegisterRequest   { ...as today, settings: Option<Vec<SettingDecl>> }
 RegisterResponse  { ...as today, config: Option<ConfigSnapshot> }
 
 Heartbeat         { ...as today, received_revision: Option<String>,
-                    effective: Option<EffectiveConfig> }      // only when it changed
-HeartbeatResponse { cancel: Vec<i32>, config: Option<ConfigSnapshot> }   // #[serde(default)]
+                    effective: Option<EffectiveConfig> }     // only when it changed
+HeartbeatResponse { cancel: Vec<i32>, config: Option<ConfigSnapshot> }  // #[serde(default)]
 
 ConfigSnapshot    { revision: String, settings: BTreeMap<String, String> }
 EffectiveConfig   { received_revision: Option<String>,
@@ -353,34 +355,59 @@ EffectiveSetting  { value: Option<String>, source: Env | Server | Default,
 
 - **A snapshot is always complete**, never a delta, so a worker that missed
   heartbeats needs nothing it did not receive.
-- **Settings travel as a string map**, not as a `WorkerSetting`-keyed struct. A
-  key this worker does not know is reported `unsupported`; it cannot fail
-  deserialization.
-- **Old workers keep working.** `parse_heartbeat_response` today falls back to an
-  empty response when the body does not deserialize -- which would also drop
-  `cancel`. So `config` is optional with `#[serde(default)]`, and the server only
-  ever sends it to a worker that declared `config_protocol` at registration. A
-  worker that never declared it is shown as "configuration not supported by this
-  worker version", and its saved overrides as not delivered.
+- **Settings travel as a string map.** A key the worker does not declare is
+  reported `unsupported`; it cannot fail deserialization.
+- **Old workers keep working.** `parse_heartbeat_response` falls back to an empty
+  response when a body does not deserialize, which would also drop `cancel`. So
+  `config` is optional with `#[serde(default)]`, and the server only sends it to
+  a worker whose registration carried `settings`. A worker that never declared
+  any is shown as "configuration not supported by this worker version".
 - **Unreachable server**: nothing changes, as with cancel today. A worker keeps
-  its last snapshot until it receives a newer one; a restarted worker gets one at
-  registration before claiming.
+  its last snapshot; a restarted one gets it at registration before claiming.
+
+### Changes to what the worker registered with: re-register
+
+Concurrency, priority and package affinity are also fields of `RegisterRequest`,
+which the server's scheduler reads from the `workers` row. The server does not
+need to know that the `concurrency` setting it saved is that same field: after
+applying a snapshot, the worker rebuilds its `RegisterRequest` from its new
+effective configuration and, **if it differs from the one it last sent,
+registers again**. No key is special-cased on either side, and an env-pinned
+value is reported as what it is, because registration always carries effective
+values.
+
+Re-registering a running worker is safe as registration stands today:
+
+- `worker_store::register_worker` is an upsert keyed on the certificate
+  fingerprint. For an existing row it refreshes name, architectures, version,
+  kind, affinity, priority and concurrency, and nothing else: no leases, no
+  running builds, no approval status.
+- The certificate is re-issued only if the worker has none or the CA changed,
+  and auto-approval applies only to a pending worker.
+- The worker's identity key persists, and it generates a certificate request
+  from it at each registration.
+
+The window between applying a snapshot and re-registering is harmless. The
+worker acquires a permit before each claim (`runner.rs`), so the server can
+never give it more work than its own gate allows; the server's stored
+concurrency only decides when a higher-priority worker counts as full, and a
+stale value there is bounded by the re-registration, well within the existing
+`WORKER_SPILL_DELAY` (60 s) backstop.
 
 ### Sequence
 
 ```text
-Worker                               Server
-  |-- register {config_protocol:1} ->  |
-  |<- {config: rev a1b2, settings} --  |   worker applies, reports statuses
-  |-- heartbeat {received a1b2,        |
-  |    effective{...}} -------------->  |   stores effective config
-  |<- {cancel:[]} -------------------  |
-  |                                    |   operator saves: one transaction
-  |-- heartbeat {received a1b2} ----->  |   worker's snapshot now hashes to c3d4
-  |<- {cancel:[], config: rev c3d4} --  |
-  |-- heartbeat {received c3d4,        |
-  |    effective{...}} -------------->  |   UI shows what took, what was pinned
-  |<- {cancel:[]} -------------------  |
+Worker                                   Server
+  |-- register {settings:[decl...]} ----->  |   stores the declaration
+  |<- {config: rev a1b2, {...}} ---------  |   worker applies, gives each key a status
+  |-- heartbeat {received a1b2, effective}->|   stores the effective config
+  |<- {cancel:[]} -----------------------  |
+  |                                        |   operator saves concurrency=3: one transaction
+  |-- heartbeat {received a1b2} --------->  |   snapshot now hashes to c3d4
+  |<- {cancel:[], config: rev c3d4} ------  |
+  |   raises its gate to 3                 |
+  |-- register {concurrency:3, ...} ----->  |   workers.concurrency = 3
+  |-- heartbeat {received c3d4, effective}->|
 ```
 
 ---
@@ -390,85 +417,82 @@ Worker                               Server
 ### Snapshots per job
 
 A job reads the runtime configuration once, when it starts, and keeps that copy
-for its lifetime; a later snapshot is seen whole by the next job. No job ever
-runs with half of one save and half of another, and a build keeps the limits it
+for its lifetime; a later snapshot is seen whole by the next job. No job runs
+with half of one save and half of another, and a build keeps the limits it
 started with -- a build sized for one limit and killed by another is a worse
 outcome than waiting for the next one.
 
-| Takes effect | Keys |
+Each declaration says when it takes effect (`applies`), and the UI shows it:
+
+| Takes effect | Native worker keys |
 |---|---|
 | **Next job** | build limits, build timeout, builddir budget and floor, cache budgets and TTLs, keyserver |
 | **Next loop iteration** | chroot refresh interval, poll interval |
-| **Through the concurrency gate** | concurrency (below) |
-| **On the server, at once** | priority, package affinity (below) |
+| **Immediately** | concurrency (through the gate below); priority and package affinity (through re-registration) |
 
-Nothing on the allowlist needs a restart. That is part of why paths and users
-are not on it.
+Nothing declared needs a restart. That is part of why paths and users are not
+declared.
 
 ### Concurrency
 
-The claim loop holds a `tokio::sync::Semaphore` sized once at startup
-(`runner.rs`). Resizing it in place does not work for lowering: while every
-permit is held, `forget_permits` removes none, and each finishing build then
-returns its permit and restores the old capacity. So the semaphore is replaced by
-a small **concurrency gate**: a target, a running count, and a deficit -- a
-permit returned while running is above the target is absorbed instead of
-released. Lowering lets running builds finish; raising releases permits at once.
-
-The server's claim query already refuses a worker whose `active` has reached
-`workers.concurrency`, so lowering is enforced on the server side immediately
-too. Raising is not: if the server raised `workers.concurrency` before the
-worker's gate had, it would offer jobs the worker cannot start. So
-`workers.concurrency` is set from the concurrency the worker **reports as
-effective**, never from the saved value.
-
-### Priority and package affinity
-
-These are consumed only by the server's claim logic; the worker never uses
-them. The first draft had the worker re-register to deliver them, which is
-circular -- a running worker registers once per process -- and would bring
-back the restart this design exists to avoid. Instead the server updates
-`workers.priority` and `workers.package_affinity` itself as soon as it knows
-the effective value: the saved server value when the worker has reported the
-key as not env-pinned, the worker's own value when it is pinned. Registration
-keeps reporting the worker's environment values, and stops overwriting a
-server-managed value that the environment does not pin.
+The claim loop holds a `tokio::sync::Semaphore` sized once at startup. Resizing
+it in place does not work for lowering: while every permit is held,
+`forget_permits` removes none, and each finishing build then returns its permit
+and restores the old capacity. So the semaphore becomes a small **concurrency
+gate**: a target, a running count, and a deficit -- a permit returned while the
+running count is above the target is absorbed instead of released. Lowering lets
+running builds finish; raising releases permits at once. The worker adjusts the
+gate *before* re-registering, so the server never records more capacity than
+the worker has.
 
 ### CPU limits need the controller first
 
 The worker writes `+cpu` to `cgroup.subtree_control` once, at startup, and only
 if `WORKER_BUILD_CPUS` was set. A CPU limit that arrives later would make every
 following build fail writing `cpu.max`. So `Hierarchy::for_build` enables the
-controllers the job's limits need, on demand, and verifies them; if that fails
-the CPU limit is `rejected` with the reason and the previous value kept, rather
-than failing builds.
+controllers a job's limits need, on demand, and verifies them; if that fails the
+limit is `rejected` with the reason and the previous value kept, rather than
+failing builds.
+
+---
+
+## Drain
+
+Drain is a lifecycle state, not a setting: a `draining` column on `workers`, set
+by an operator action. The claim query stops offering that worker jobs at once;
+running builds finish; the worker needs no message and no new code. As a worker
+setting it would be wrong twice over -- a worker could boot drained from its
+environment, and it would take a heartbeat and a re-registration to stop claims
+that the server can stop itself.
 
 ---
 
 ## Recommendation
 
-**Phase 1 -- visibility, then configuration over the heartbeat (B).**
+**Phase 1 -- visibility, then per-worker configuration over the heartbeat (B).**
 
-1. `WorkerSetting` allowlist in `aurcache-common`, with the per-key parsers the
-   environment already uses. Retire the dead server settings
-   `max_concurrent_builds` and `builder_image` the way `cpu_limit`/`memory_limit`
-   were.
-2. **Read-only first.** The worker reports `effective` (value, source, status)
-   at registration and in the heartbeat when it changes; the server stores it and
-   the Workers page shows it, with parse errors flagged. Useful on its own; ship
-   it first.
-3. `worker_settings` table with the partial indexes, cascade and dump/restore;
-   transactional `PATCH` for a worker and for the fleet default; one activity
-   entry per save.
-4. Snapshot delivery: `config_protocol` at registration, `config` in the
-   registration and heartbeat responses, `received_revision` back.
+1. `ValueKind` and its parsers in `aurcache-common`; `SettingDecl` for the native
+   worker's policy keys. Retire the dead server settings `max_concurrent_builds`
+   and `builder_image` the way `cpu_limit`/`memory_limit` were.
+2. **Read-only first.** The worker sends its declaration at registration and
+   reports `effective` (value, source, status) in the heartbeat when it changes;
+   the server stores both and the Workers page shows them, with parse errors
+   flagged. Useful on its own; ship it first.
+3. `worker_settings` table, dump/restore, transactional `PATCH` per worker, one
+   activity entry per save.
+4. Snapshot delivery: `config` in the registration and heartbeat responses,
+   `received_revision` back.
 5. Worker application: per-job snapshots, the concurrency gate, on-demand cgroup
-   controllers, per-key status with rejected values keeping the previous one.
-   Server scheduling fields follow the reported effective values.
-6. UI: a worker detail page with the effective table (env-pinned rows name their
-   variable and the way to unpin them) and editable overrides; fleet defaults in
-   a Workers section of Settings. Policy variables commented out of the shipped
-   compose files and the CLI's generated ones.
+   controllers, per-key status with rejected values keeping the previous one,
+   re-registration when the registration request changes.
+6. UI: a worker detail page rendering the declaration generically by category
+   and kind, with env-pinned rows naming their variable and the way to unpin
+   them. Policy variables commented out of the shipped compose files and the
+   CLI's generated ones.
+
+**Later, if wanted:** fleet defaults, on the terms in
+[Per worker only, for now](#per-worker-only-for-now); declarations for the legacy
+container worker.
 
 **Phase 2, only if latency is felt -- SSE (D) for server-to-worker events.** Stop
 and "configuration changed" become events; the heartbeat stays exactly as it is
@@ -484,67 +508,45 @@ bidirectional connection.
 
 ---
 
-## Decisions on the open questions
+## History
 
-The first draft left four questions open. Both reviews answered them the same
-way, and this revision adopts those answers.
-
-1. **Package affinity from the server: yes, per worker only.** `design/worker-routing.md`
-   made affinity worker-declared because the capability (a key, a toolchain) is
-   on the machine. The server may now set it for one worker -- an operator who
-   has just provisioned a credential should not need a restart -- but not as a
-   fleet default, which would defeat the reservation. The editor says that the
-   worker must actually have what those packages need.
-2. **Audit: one entry per save**, `WorkerConfigUpdated { worker: Option<name>,
-   changed_keys }`, with `None` for the fleet default. One entry per key would
-   flood the log whenever a form saves several fields.
-3. **Drain: a server-side lifecycle state, not a setting.** A `draining` column
-   on `workers`, set by an operator action. The claim query stops offering that
-   worker jobs at once; running builds finish; the worker needs no message and
-   no new code. As a setting it would be wrong twice over: a worker could boot
-   drained from its environment, and a fleet default of `true` would stop the
-   whole fleet.
-4. **The legacy container worker stays env-only.** `aurcache-worker-docker`
-   reads different variables in different units (`CPU_LIMIT` in milli-CPUs,
-   `MEMORY_LIMIT` in MB) and is on its way out; mapping the allowlist onto it
-   would be a second, barely tested implementation.
-
----
-
-## Review outcomes
-
-What changed from the first draft because of the reviews:
+### First revision: the reviews
 
 | Raised | By | Outcome |
 |---|---|---|
-| One `config_version` cannot mean both received and effective | codex | Adopted: `received_revision` and `effective` are separate |
+| One `config_version` cannot mean both received and effective | codex | Adopted: `received_revision` and `effective` |
 | Revision as a content hash of the server's payload | both | Adopted |
 | Saves must be atomic; snapshots complete, not deltas | codex | Adopted |
-| Rejected values must not fall back to a weaker default; per-key status | both | Adopted, with the previous usable value kept |
-| Server resolves fleet vs per-worker; worker only env > snapshot > default | both | Adopted |
-| Priority/affinity must not wait for re-registration | both | Adopted: server updates scheduling fields directly |
-| Semaphore cannot be resized in place; schedule from reported capacity | both | Adopted: concurrency gate |
-| CPU controller only enabled at startup | both | Adopted: enabled on demand, rejection on failure |
-| Forward compatibility of `HeartbeatResponse` | both | Adopted, plus a `config_protocol` capability so old workers are never counted as configured |
-| Env-wins leaves existing workers unmanageable | both | Kept env-wins; added the adoption path and template changes |
-| Partial unique indexes, cascade, dump/restore | both | Adopted |
-| Allowlist gaps (repo host/URL, keyserver, overlay, heartbeat interval, poll interval) | review | Adopted as classified in the review |
-| Mirrorlist as a worker setting conflicts with per-arch mirrorlists | review | Adopted: removed from the allowlist |
-| Open questions (affinity, audit, drain, legacy worker) | both | Adopted as answered |
+| Rejected values must not fall back to a weaker default; per-key status | both | Adopted, keeping the previous usable value |
+| Server resolves fleet vs per-worker layers | both | Adopted, then made moot: no fleet defaults |
+| Priority/affinity must not wait for a restart | both | Adopted; second revision delivers them by re-registration |
+| Semaphore cannot be resized in place | both | Adopted: concurrency gate |
+| CPU controller only enabled at startup | both | Adopted: enabled on demand |
+| Forward compatibility of `HeartbeatResponse` | both | Adopted |
+| Env-wins leaves existing workers unmanageable | both | Kept env-wins; added the adoption path |
+| Partial unique indexes for the fleet `NULL` scope | both | Adopted, then made moot: no fleet scope |
+| Cascade and dump/restore | both | Adopted |
+| Allowlist gaps (repo host/URL, keyserver, overlay, heartbeat and poll intervals); mirrorlist conflicts with per-arch mirrorlists | review | Adopted, now as what the native worker declares |
+| Open questions: affinity per worker only, one audit entry per save, drain as server state, legacy worker env-only | both | Adopted; the legacy worker can now declare its own settings instead |
 
-Added in this revision beyond the reviews: the snapshot is also returned at
-registration, so a restarted worker has its configuration before its first
-claim; and registration stops overwriting server-managed routing fields that
-the environment does not pin.
+Where the reviews did not match the code, for the record: `forget_permits` does
+not panic when no permits are free (it returns how many it removed, which is
+none); the mirrorlist is delivered at registration, not per build; and duplicate
+`NULL` rows under a unique constraint are not specific to SQLite -- Postgres
+allows them too.
 
-Where the reviews do not match the code, for the record -- none of these
-change a conclusion:
+### Second revision: declared settings
 
-- `Semaphore::forget_permits` does not panic when no permits are available; it
-  returns how many it removed, which is none. The point that returned permits
-  restore the old capacity stands.
-- The existing mirrorlist mechanism delivers the mirrorlist at registration, not
-  per build.
-- Duplicate `NULL` rows under a plain unique constraint are not specific to
-  SQLite; Postgres allows them too (without `NULLS NOT DISTINCT`), so the partial
-  indexes are needed on both backends.
+- The server-side `WorkerSetting` allowlist became a declaration each worker
+  sends, with a shared `ValueKind` vocabulary as the only common definition.
+  Server and workers can then be upgraded independently, and different worker
+  implementations expose different settings.
+- Fleet defaults were dropped for now. They were the only feature that needed
+  workers to agree on what a key means.
+- Priority, affinity and concurrency reach the scheduler by the worker
+  re-registering when its registration request changes, instead of the server
+  interpreting those keys. The reviews' objection to re-registration was to
+  waiting for a restart; a worker re-registering itself is safe as registration
+  stands (see [the protocol](#changes-to-what-the-worker-registered-with-re-register)).
+  The concurrency race the reviews described does not arise, because the worker
+  acquires a permit before it claims.
