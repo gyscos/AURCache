@@ -52,6 +52,14 @@ pub struct Model {
     /// terminal outcome the worker reported, whose `CompleteReport.reason` text
     /// is the record.
     pub end_reason: Option<i32>,
+    /// What this build's VCS (`git+...`) sources were at, as a JSON object of
+    /// `source_url -> commit`.
+    ///
+    /// The record of what the build was *made from*, as against
+    /// [`crate::package_vcs_sources`], which is what the version check last
+    /// *saw*. `None` is unknown -- a build that predates this, or one whose
+    /// sources could not be resolved -- and never means "nothing changed".
+    pub vcs_sources: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

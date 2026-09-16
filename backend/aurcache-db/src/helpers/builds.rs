@@ -8,6 +8,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
     Select,
 };
+use std::collections::BTreeMap;
 
 /// The most recent *successful* build row selection, newest by end time with
 /// start time as the tie-break.
@@ -81,6 +82,65 @@ pub async fn latest_successful_version_any_platform<C: ConnectionTrait>(
         .map(|row| row.map(|(version,)| version))
 }
 
+/// What the most recently *successful* build of `pkg_id` was made from:
+/// `source_url -> commit`, empty when nothing is recorded.
+///
+/// The baseline for "has upstream moved since we built it?". It has to be a
+/// successful build: one that failed at a commit says nothing about what is in
+/// the repository, and treating it as the baseline would leave the package
+/// quietly sitting at a commit nothing ever produced -- the same trap
+/// [`latest_successful_version`] exists to avoid for versions.
+///
+/// Empty means *unknown*, never "unchanged": a package built before this was
+/// recorded, or whose sources could not be resolved, falls back to the version
+/// check's own watermark rather than being declared up to date. Unparseable
+/// JSON is treated the same way, since a stored string nobody can read is not
+/// evidence either.
+pub async fn latest_successful_build_vcs_sources<C: ConnectionTrait>(
+    db: &C,
+    pkg_id: i32,
+) -> Result<BTreeMap<String, String>, DbErr> {
+    let recorded = newest_success_query(pkg_id)
+        .select_only()
+        .column(builds::Column::VcsSources)
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await?
+        .flatten();
+    let Some(json) = recorded else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(serde_json::from_str(&json).unwrap_or_else(|e| {
+        tracing::warn!("build of package {pkg_id} has unreadable vcs_sources: {e}");
+        BTreeMap::new()
+    }))
+}
+
+/// Record what a build's VCS sources were at, replacing whatever was there --
+/// the worker's report of what it checked out overwrites the guess made when
+/// the build was queued.
+///
+/// An empty set clears the column rather than storing `{}`: "no sources" and
+/// "sources unknown" both mean there is nothing to compare against, and one
+/// spelling for that is enough.
+pub async fn record_build_vcs_sources<C: ConnectionTrait>(
+    db: &C,
+    build_id: i32,
+    commits: &BTreeMap<String, String>,
+) -> Result<(), DbErr> {
+    let json = if commits.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(commits).map_err(|e| DbErr::Custom(e.to_string()))?)
+    };
+    Builds::update_many()
+        .col_expr(builds::Column::VcsSources, json.into())
+        .filter(builds::Column::Id.eq(build_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// The repository version of the package row in the *enclosing* query, as a
 /// correlated scalar subquery.
 ///
@@ -126,11 +186,18 @@ pub fn latest_successful_version_expr() -> Expr {
 
 #[cfg(test)]
 mod tests {
-    use super::latest_successful_version_any_platform;
+    use super::{
+        latest_successful_build_vcs_sources, latest_successful_version_any_platform,
+        record_build_vcs_sources,
+    };
     use crate::migration::Migrator;
     use aurcache_common::builder::BuildStates;
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
+        QuerySelect,
+    };
     use sea_orm_migration::MigratorTrait;
+    use std::collections::BTreeMap;
 
     async fn setup() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -139,6 +206,32 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    /// One tracked source, spelled as `.SRCINFO` would.
+    fn url() -> String {
+        "git+https://example.test/repo.git".to_string()
+    }
+
+    /// A recorded set, in the shape the column holds.
+    fn sources(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The row id behind a build number, which is what the rows hang off.
+    async fn build_id(db: &DatabaseConnection, number: i32) -> i32 {
+        crate::prelude::Builds::find()
+            .select_only()
+            .column(crate::builds::Column::Id)
+            .filter(crate::builds::Column::Number.eq(number))
+            .into_tuple::<i32>()
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn build(db: &DatabaseConnection, number: i32, status: i32, version: &str, start: i64) {
@@ -199,6 +292,116 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("1.4.1-1")
+        );
+    }
+
+    /// The *successful* build is the baseline: what a failed attempt was made
+    /// from is not what is in the repository.
+    #[tokio::test]
+    async fn the_baseline_is_what_the_last_successful_build_was_made_from() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        build(&db, 6, BuildStates::FAILED_BUILD, "r2.bbb-1", 200).await;
+        let (success, failure) = (build_id(&db, 5).await, build_id(&db, 6).await);
+
+        record_build_vcs_sources(&db, success, &sources(&[(&url(), "aaa")]))
+            .await
+            .unwrap();
+        record_build_vcs_sources(&db, failure, &sources(&[(&url(), "bbb")]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            latest_successful_build_vcs_sources(&db, 1).await.unwrap(),
+            sources(&[(&url(), "aaa")]),
+            "the failed attempt's commit must not become the baseline"
+        );
+    }
+
+    /// Nothing recorded is *unknown*, not "unchanged" — every build predates
+    /// this column, and reading NULL as up-to-date would freeze them all.
+    #[tokio::test]
+    async fn a_build_with_no_record_reports_nothing() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+
+        assert!(
+            latest_successful_build_vcs_sources(&db, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A PKGBUILD can carry several `git+` sources, and re-recording replaces
+    /// the set — the worker's report of what it checked out overwrites the
+    /// guess made when the build was queued.
+    #[tokio::test]
+    async fn several_sources_are_recorded_and_re_recording_replaces() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        let id = build_id(&db, 5).await;
+
+        let two = sources(&[
+            ("git+https://example.test/a.git", "a1"),
+            ("git+https://example.test/b.git", "b1"),
+        ]);
+        record_build_vcs_sources(&db, id, &two).await.unwrap();
+        assert_eq!(
+            latest_successful_build_vcs_sources(&db, 1).await.unwrap(),
+            two
+        );
+
+        let one = sources(&[("git+https://example.test/a.git", "a2")]);
+        record_build_vcs_sources(&db, id, &one).await.unwrap();
+        assert_eq!(
+            latest_successful_build_vcs_sources(&db, 1).await.unwrap(),
+            one,
+            "re-recording replaces the set rather than merging into it"
+        );
+    }
+
+    /// An empty set clears the column instead of storing `{}`: "no sources" and
+    /// "sources unknown" are the same answer to the only question asked of it.
+    #[tokio::test]
+    async fn recording_nothing_clears_the_record() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        let id = build_id(&db, 5).await;
+        record_build_vcs_sources(&db, id, &sources(&[(&url(), "aaa")]))
+            .await
+            .unwrap();
+
+        record_build_vcs_sources(&db, id, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        assert!(
+            latest_successful_build_vcs_sources(&db, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A stored string nobody can parse is not evidence of anything, so it
+    /// reads as unknown rather than taking the version check down with it.
+    #[tokio::test]
+    async fn unreadable_json_reads_as_unknown() {
+        let db = setup().await;
+        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        let id = build_id(&db, 5).await;
+        db.execute_unprepared(&format!(
+            "UPDATE builds SET vcs_sources = 'not json' WHERE id = {id}"
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            latest_successful_build_vcs_sources(&db, 1)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

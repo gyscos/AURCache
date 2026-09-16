@@ -2,6 +2,7 @@ use crate::package::add::{
     ensure_aur_package_exists_recursive, provides_json, split_packages_json,
 };
 use crate::services::Services;
+use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sources_moved};
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
@@ -247,8 +248,33 @@ async fn package_update_inner(
     )
     .await?;
 
-    if !force && built_version.as_deref() == Some(upstream_version.as_str()) {
-        bail!("Latest build is already up to date (version {upstream_version})");
+    if !force {
+        // A VCS package's published `pkgver` says when its PKGBUILD was last
+        // touched, not what upstream is at, so the version comparison below
+        // cannot answer for one: it compares `1:r11002.cdabad3d0-1` from the
+        // AUR against `1:r14632.02cac3259-1` that `pkgver()` produced, which
+        // never match, and every unforced update rebuilt. The sources are what
+        // it should be asking about.
+        match vcs_sources_moved(&services.db, pkg_model.id, &sourceinfo).await {
+            Ok(Some(false)) => bail!(
+                "Latest build is already up to date (no tracked source has moved; \
+                 use --force to rebuild anyway)"
+            ),
+            Ok(Some(true)) => {}
+            // Not a VCS package, or nothing recorded to compare against: the
+            // version is the only question there is.
+            Ok(None) => {
+                if built_version.as_deref() == Some(upstream_version.as_str()) {
+                    bail!("Latest build is already up to date (version {upstream_version})");
+                }
+            }
+            // A remote we could not reach is not evidence of anything. Falling
+            // through to the build is the safe direction.
+            Err(e) => warn!(
+                "VCS check for {} failed, building anyway: {e}",
+                pkg_model.name
+            ),
+        }
     }
 
     let platform_results = enqueue_platform_builds(
@@ -262,6 +288,26 @@ async fn package_update_inner(
         visited,
     )
     .await?;
+
+    // What these builds are being made from, recorded against each of them, so
+    // the next version check compares upstream with what was built rather than
+    // with whatever it last happened to look at. Resolving costs one
+    // `ls-remote` per VCS source and nothing at all for a package that has
+    // none. Best-effort: an unrecorded build reads as unknown later, which
+    // costs a redundant rebuild, where failing here would cost the build.
+    let queued_commits = resolve_vcs_commits(&sourceinfo).await;
+    if !queued_commits.is_empty() {
+        for result in &platform_results {
+            if let Err(e) =
+                record_queued_vcs_sources(&services.db, result.build_id, &queued_commits).await
+            {
+                warn!(
+                    "could not record VCS sources for build {}: {e}",
+                    result.build_id
+                );
+            }
+        }
+    }
 
     let any_enqueued = platform_results.iter().any(|r| r.enqueued);
     let has_waiting = platform_results.iter().any(|r| !r.enqueued);
