@@ -22,6 +22,7 @@ use bollard::query_parameters::{
     StartContainerOptions,
 };
 use futures::StreamExt;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -330,8 +331,10 @@ impl DockerExecutor {
                 exit_code: Some(0),
                 reason: None,
                 canceled: false,
-                // The legacy container builder does not sample the build tree.
+                // The legacy container builder samples neither the build tree
+                // nor the sources it was made from.
                 peak_memory_bytes: None,
+                vcs_commits: BTreeMap::new(),
             },
             Some(code) => CompleteReport {
                 success: false,
@@ -341,8 +344,10 @@ impl DockerExecutor {
                     c => format!("build failed (exit {c})"),
                 }),
                 canceled: false,
-                // The legacy container builder does not sample the build tree.
+                // The legacy container builder samples neither the build tree
+                // nor the sources it was made from.
                 peak_memory_bytes: None,
+                vcs_commits: BTreeMap::new(),
             },
             None => report::setup_failure("build container exited without a status"),
         })

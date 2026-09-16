@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod build;
+pub mod built_sources;
 pub mod cache;
 pub mod cgroup;
 pub mod chroot;

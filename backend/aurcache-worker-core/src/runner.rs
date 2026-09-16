@@ -323,6 +323,7 @@ mod mirrorlist_tests {
             mirrorlist_checksum: checksum.map(ToString::to_string),
             mirrorlist_unchanged: unchanged,
             pgp_keys: vec![],
+            vcs_sources: vec![],
         }
     }
 

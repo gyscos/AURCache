@@ -6,6 +6,7 @@
 //! the executor's business.
 
 use aurcache_common::worker::{CompleteReport, JobDescriptor};
+use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
 /// Map a build process exit status into a terminal report.
@@ -21,6 +22,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
             reason: None,
             canceled: false,
             peak_memory_bytes: None,
+            vcs_commits: BTreeMap::new(),
         };
     }
     let code = status.code();
@@ -36,6 +38,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         reason: Some(reason),
         canceled: false,
         peak_memory_bytes: None,
+        vcs_commits: BTreeMap::new(),
     }
 }
 
@@ -49,6 +52,7 @@ pub fn setup_failure(reason: impl std::fmt::Display) -> CompleteReport {
         reason: Some(reason.to_string()),
         canceled: false,
         peak_memory_bytes: None,
+        vcs_commits: BTreeMap::new(),
     }
 }
 
@@ -67,6 +71,7 @@ fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
         reason: Some("build canceled".to_string()),
         canceled: true,
         peak_memory_bytes: None,
+        vcs_commits: BTreeMap::new(),
     }
 }
 
@@ -79,6 +84,7 @@ pub fn timeout_failure(secs: u64) -> CompleteReport {
         reason: Some(format!("build timed out after {secs}s")),
         canceled: false,
         peak_memory_bytes: None,
+        vcs_commits: BTreeMap::new(),
     }
 }
 

@@ -27,6 +27,7 @@ use aurcache_utils::publish::publish_build;
 use aurcache_utils::repository::Repository;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
+use aurcache_utils::vcs_check::job_vcs_sources;
 use aurcache_utils::worker_complete;
 use rocket::data::ToByteUnit;
 use rocket::http::Status;
@@ -445,19 +446,24 @@ async fn build_descriptor(
         mirrorlist_for(&arch, &mirrorlist_dir()).await,
     );
 
-    // Best-effort PGP keys from the parsed .SRCINFO; the worker can still
-    // self-extract if parsing failed.
-    let pgp_keys = match store
+    // Best-effort, from the parsed .SRCINFO: the `validpgpkeys` the worker must
+    // trust, and the `git+` sources whose commit it should report back. A
+    // parse failure costs neither outright -- the worker can still self-extract
+    // the keys, and an unreported source leaves the commit recorded at queue
+    // time standing.
+    let (pgp_keys, vcs_sources) = match store
         .sourceinfo(&pkg.source_data, pkg.patch.as_deref())
         .await
     {
-        Ok(si) => si
-            .base
-            .pgp_fingerprints
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        Err(_) => Vec::new(),
+        Ok(si) => (
+            si.base
+                .pgp_fingerprints
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            job_vcs_sources(&si),
+        ),
+        Err(_) => (Vec::new(), Vec::new()),
     };
 
     let build_flags = pkg
@@ -487,6 +493,7 @@ async fn build_descriptor(
         mirrorlist_checksum,
         mirrorlist_unchanged,
         pgp_keys,
+        vcs_sources,
     })
 }
 
@@ -756,6 +763,21 @@ async fn complete_job_inner(
     }
 
     if report.success {
+        // What the worker actually checked out replaces what the server
+        // guessed when it queued the build. Only from a success, and only when
+        // the worker reported something: one that predates this, or could not
+        // resolve a source, leaves the queue-time record standing -- the older
+        // commit, so the error is a redundant rebuild rather than a missed one.
+        if !report.vcs_commits.is_empty()
+            && let Err(e) = aurcache_db::helpers::builds::record_build_vcs_sources(
+                db,
+                build_id,
+                &report.vcs_commits,
+            )
+            .await
+        {
+            tracing::warn!("Failed to record built VCS sources for build {build_id}: {e}");
+        }
         worker_complete::accept_for_publishing(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::Forbidden, e))?;

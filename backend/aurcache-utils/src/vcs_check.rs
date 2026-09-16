@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use alpm_srcinfo::SourceInfoV1;
 use alpm_types::Source;
 use alpm_types::url::{GitFragment, VcsInfo};
+use aurcache_common::worker::JobVcsSource;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use aurcache_db::helpers::builds::{latest_successful_build_vcs_sources, record_build_vcs_sources};
@@ -43,6 +44,66 @@ impl VcsSource {
     pub fn resolve_commit(&self) -> anyhow::Result<String> {
         ls_remote(&self.repo_url, &self.git_ref)
     }
+
+    /// The ref makepkg checks out: a branch or tag name, or `HEAD`.
+    #[must_use]
+    pub fn git_ref(&self) -> &str {
+        &self.git_ref
+    }
+
+    /// What two sources must share for one remote lookup to answer both: the
+    /// repository and the ref, never the `.SRCINFO` string, which also carries
+    /// the per-package `name::` prefix.
+    fn remote_key(&self) -> (String, String) {
+        (self.repo_url.clone(), self.git_ref.clone())
+    }
+}
+
+/// The directory makepkg clones a source into, relative to `SRCDEST`.
+///
+/// makepkg's own rule (`get_filename`, `util/source.sh`): a `name::` prefix
+/// wins outright; otherwise take the URL with its `#fragment` and `?query`
+/// stripped, drop a trailing slash, keep the last path component, and cut it at
+/// `.git`. So `git+https://github.com/google/fonts.git` lands in `fonts`.
+///
+/// Derived on the server and sent to the worker rather than worked out at both
+/// ends: two implementations of this rule drifting apart would key a commit to
+/// a `source_url` nobody compares against, and nothing would look wrong.
+#[must_use]
+pub fn makepkg_source_dir(filename: Option<&str>, url: &str) -> String {
+    if let Some(name) = filename {
+        return name.to_string();
+    }
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let trimmed = without_query.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    last.split(".git").next().unwrap_or(last).to_string()
+}
+
+/// The `git+` sources of `sourceinfo`, in the shape a job descriptor carries.
+#[must_use]
+pub fn job_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<JobVcsSource> {
+    sourceinfo
+        .base
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let vcs = git_vcs_source_from(source)?;
+            let filename = source
+                .filename()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string);
+            Some(JobVcsSource {
+                dir: makepkg_source_dir(filename.as_deref(), &vcs.repo_url),
+                source_url: vcs.source_url,
+                git_ref: vcs.git_ref,
+            })
+        })
+        .collect()
 }
 
 /// Extract all *trackable* `git+` VCS sources from `sourceinfo`.
@@ -98,6 +159,7 @@ pub async fn sync_vcs_sources(
     db: &DatabaseConnection,
     package_id: i32,
     sourceinfo: &SourceInfoV1,
+    round: &mut RoundCache,
 ) -> anyhow::Result<bool> {
     let vcs_sources = extract_git_vcs_sources(sourceinfo);
 
@@ -121,9 +183,8 @@ pub async fn sync_vcs_sources(
     let mut upserts = Vec::new();
 
     for source in vcs_sources {
-        // `resolve_commit` performs blocking network I/O via git2.
         let source_url = source.source_url.clone();
-        let commit = tokio::task::spawn_blocking(move || source.resolve_commit()).await??;
+        let commit = round.resolve(source).await?;
 
         seen_urls.insert(source_url.clone());
 
@@ -241,6 +302,45 @@ pub async fn vcs_sources_moved(
     })))
 }
 
+/// Remote commits already resolved during one pass over the packages.
+///
+/// Several packages can name the same upstream -- `gtk2` and `lib32-gtk2`, and
+/// four more pairs on the reference server, 50 tracked sources over 45 distinct
+/// URLs -- and each was asking the remote separately. What a remote's ref points
+/// at is one fact at one instant, so it is worth asking once; what each package
+/// *built* is not, and stays per package.
+///
+/// Per pass, deliberately, and never held between them: a cache that outlived
+/// the round would answer for a moment that has gone, and this is the very
+/// thing that decides whether upstream has moved.
+#[derive(Default)]
+pub struct RoundCache {
+    seen: HashMap<(String, String), String>,
+}
+
+impl RoundCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The commit this source points at, asking the remote only the first time
+    /// this pass sees it.
+    ///
+    /// A failure is not cached: the next package naming the same remote should
+    /// get its own attempt rather than inheriting a transient error.
+    async fn resolve(&mut self, source: VcsSource) -> anyhow::Result<String> {
+        let key = source.remote_key();
+        if let Some(commit) = self.seen.get(&key) {
+            return Ok(commit.clone());
+        }
+        // `resolve_commit` performs blocking network I/O via git2.
+        let commit = tokio::task::spawn_blocking(move || source.resolve_commit()).await??;
+        self.seen.insert(key, commit.clone());
+        Ok(commit)
+    }
+}
+
 /// Whether a source now at `commit` counts as moved.
 ///
 /// `built` is what the last successful build was made from and is the honest
@@ -271,6 +371,42 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// makepkg's naming rule, which the worker must not re-derive: the server
+    /// sends the directory it produces.
+    #[test]
+    fn the_source_directory_follows_makepkg() {
+        use super::makepkg_source_dir;
+
+        assert_eq!(
+            makepkg_source_dir(None, "https://github.com/google/fonts.git"),
+            "fonts"
+        );
+        assert_eq!(
+            makepkg_source_dir(None, "https://github.com/google/fonts"),
+            "fonts"
+        );
+        assert_eq!(
+            makepkg_source_dir(None, "https://example.test/repo.git#branch=develop"),
+            "repo",
+            "the fragment is not part of the name"
+        );
+        assert_eq!(
+            makepkg_source_dir(None, "https://example.test/repo.git?signed"),
+            "repo",
+            "nor is the query"
+        );
+        assert_eq!(
+            makepkg_source_dir(None, "https://example.test/repo/"),
+            "repo",
+            "a trailing slash does not make the name empty"
+        );
+        assert_eq!(
+            makepkg_source_dir(Some("mypkg"), "https://example.test/repo.git"),
+            "mypkg",
+            "an explicit `name::` wins outright"
+        );
     }
 
     /// What a build recorded, in the shape the column deserializes to.

@@ -249,6 +249,7 @@ async fn fake_worker_protocol_roundtrip() {
                 reason: None,
                 canceled: false,
                 peak_memory_bytes: Some(512 * 1024 * 1024),
+                vcs_commits: Default::default(),
             },
         )
         .await
@@ -280,6 +281,7 @@ async fn fake_worker_protocol_roundtrip() {
                 reason: None,
                 canceled: false,
                 peak_memory_bytes: None,
+                vcs_commits: Default::default(),
             },
         )
         .await
@@ -308,6 +310,7 @@ async fn fake_worker_protocol_roundtrip() {
                 reason: None,
                 canceled: false,
                 peak_memory_bytes: Some(512 * 1024 * 1024),
+                vcs_commits: Default::default(),
             },
         )
         .await

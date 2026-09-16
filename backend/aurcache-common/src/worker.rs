@@ -4,6 +4,7 @@
 //! so their JSON representation is a stable contract. Keep field names stable.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 /// Enrollment request a worker sends on first contact (no client cert yet).
@@ -169,6 +170,28 @@ pub struct JobDescriptor {
     /// `validpgpkeys` the worker must trust before building.
     #[serde(default)]
     pub pgp_keys: Vec<String>,
+    /// The `git+` sources whose commit the worker should report back, so the
+    /// server learns what the build was *actually* made from rather than what
+    /// it guessed when it queued it.
+    ///
+    /// Sent by the server rather than worked out on the worker because the
+    /// directory a source lands in follows makepkg's naming rule, and two
+    /// implementations of that rule drifting apart would key a commit to a
+    /// `source_url` nobody compares against -- silently.
+    #[serde(default)]
+    pub vcs_sources: Vec<JobVcsSource>,
+}
+
+/// One `git+` source of a build, as the worker needs to find it.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct JobVcsSource {
+    /// The raw `.SRCINFO` source string, which is the key the server records
+    /// the answer under.
+    pub source_url: String,
+    /// The directory makepkg clones it into, relative to `SRCDEST`.
+    pub dir: String,
+    /// The ref makepkg checks out: a branch or tag name, or `HEAD`.
+    pub git_ref: String,
 }
 
 /// Periodic liveness signal. Carries the set of builds the worker is actively
@@ -213,6 +236,15 @@ pub struct CompleteReport {
     /// Distinct from a build that genuinely used nothing, which cannot happen.
     #[serde(default)]
     pub peak_memory_bytes: Option<i64>,
+    /// What each `git+` source was at in the worker's own source cache when the
+    /// build finished, keyed by `source_url`.
+    ///
+    /// Empty from a worker that predates this, or for a source it could not
+    /// resolve; the server keeps the commit it recorded at queue time in that
+    /// case, which is the older of the two and so errs toward a redundant
+    /// rebuild rather than a missed one.
+    #[serde(default)]
+    pub vcs_commits: BTreeMap<String, String>,
 }
 
 /// Worker's poll response for cancel on a specific job.
@@ -247,9 +279,15 @@ mod tests {
             mirrorlist_checksum: Some("abc123".into()),
             mirrorlist_unchanged: false,
             pgp_keys: vec!["ABCDEF".into()],
+            vcs_sources: vec![JobVcsSource {
+                source_url: "git+https://example.test/repo.git".into(),
+                dir: "repo".into(),
+                git_ref: "HEAD".into(),
+            }],
         };
         let back = round_trip(&job);
         assert_eq!(job.build_id, back.build_id);
+        assert_eq!(job.vcs_sources, back.vcs_sources);
         assert_eq!(job.pgp_keys, back.pgp_keys);
         assert_eq!(job.mirrorlist, back.mirrorlist);
         assert_eq!(job.mirrorlist_checksum, back.mirrorlist_checksum);

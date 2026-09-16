@@ -707,6 +707,14 @@ async fn run_build(
         report::classify_exit(status, canceled)
     };
     report.peak_memory_bytes = peak_memory_bytes;
+    // What the build was actually made from, while the job still holds its
+    // SRCDEST guard and no sibling can have fetched into the mirror. Only for a
+    // success: nothing else is ever consulted as a baseline, and a failure has
+    // no business moving one.
+    if report.success {
+        report.vcs_commits =
+            crate::built_sources::resolve(&job.vcs_sources, srcdest.as_deref()).await;
+    }
     // A process the kernel killed for memory looks, from makepkg's exit code,
     // like any other failure -- a compiler "terminated by signal", an error
     // several screens up the log. Say what happened where it is looked for.

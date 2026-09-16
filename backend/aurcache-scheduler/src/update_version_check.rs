@@ -9,7 +9,7 @@ use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::services::Services;
 use aurcache_utils::settings::general::SettingsTraits;
-use aurcache_utils::vcs_check::sync_vcs_sources;
+use aurcache_utils::vcs_check::{RoundCache, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -68,6 +68,10 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
             .map_err(|e| anyhow!("couldn't download version update: {e}"))?
     };
 
+    // One pass, one answer per remote: several packages can name the same
+    // upstream, and what its ref points at does not change between two of them.
+    let mut round = RoundCache::new();
+
     for package in packages {
         let package_id = package.id;
         let mut package_model: packages::ActiveModel = package.clone().into();
@@ -121,7 +125,9 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         {
                             Ok((sourceinfo, metadata)) => {
                                 apply_source_metadata(&mut package_model, &metadata);
-                                match sync_vcs_sources(db, package_id, &sourceinfo).await {
+                                match sync_vcs_sources(db, package_id, &sourceinfo, &mut round)
+                                    .await
+                                {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                                     Err(e) => warn!(
                                         "Failed to sync VCS sources for {}: {e}",
@@ -191,7 +197,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 let mut is_outdated =
                     upstream_is_newer(&version, latest_version.as_deref(), &package.name);
 
-                match sync_vcs_sources(db, package_id, &sourceinfo).await {
+                match sync_vcs_sources(db, package_id, &sourceinfo, &mut round).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
                     Err(e) => warn!("Failed to sync VCS sources for {}: {e}", package.name),
                 }
