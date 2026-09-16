@@ -93,10 +93,7 @@ async fn run_job_inner(
     // blocking `read_dir`/`metadata`, so it runs on the blocking pool: with
     // `concurrency` jobs starting at once it would otherwise tie up that many
     // runtime worker threads and stall heartbeats, claims, and log streaming.
-    let in_use: Vec<String> = {
-        let guard = shared.active_pkgbases.lock().await;
-        guard.iter().cloned().collect()
-    };
+    let in_use = shared.srcdest.in_use();
     {
         let cache = cache.clone();
         let _ = tokio::task::spawn_blocking(move || cache.evict(&in_use)).await;
@@ -250,13 +247,7 @@ async fn run_job_inner(
         // Before the build, so the reserve is what bounds usage going in
         // rather than a post-hoc tidy. Never drops a tree a build is using:
         // this one's, or a sibling's still running (the set includes both).
-        let in_use: Vec<String> = shared
-            .active_pkgbases
-            .lock()
-            .await
-            .iter()
-            .cloned()
-            .collect();
+        let in_use = shared.srcdest.in_use();
         // On the blocking pool: deleting a tree of millions of files takes
         // minutes, and this build waits for it anyway.
         let (reclaim_cache, arch) = (cache.clone(), job.arch.clone());

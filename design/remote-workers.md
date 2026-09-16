@@ -384,6 +384,47 @@ opportunistic GC when disk is low; same budget for the pacman cache
 (`paccache`-style); ccache self-caps; keyring is tiny (no eviction); never evict
 in-use entries.
 
+**Exclusive per pkgbase, and it is the tarballs that require it.** `SRCDEST` is
+keyed by pkgbase and not by platform, so an x86_64 and an aarch64 build of one
+package share the directory; a plain source is downloaded as `<file>.part` and
+renamed, keyed by filename, so two such builds race on the same name. Git would
+tolerate the concurrency on its own -- a fetch only *adds* objects and moves
+refs atomically, and makepkg's `-p` prunes refs rather than objects, so a
+checkout taken at any moment stays readable. What no amount of concurrency
+tolerates is *removal*: `git gc`/`prune` in a mirror, or our own eviction of it,
+strands the checkouts that borrow its objects through `alternates`. Auto-gc is
+live (makepkg points `GIT_CONFIG_SYSTEM` at a file that does not exist, so
+`gc.auto` is at its default); `gc.pruneExpire`'s two weeks is what has kept
+orphaned commits readable so far, not design.
+
+`crate::srcdest_lock` therefore hands out one guard per pkgbase, which is both
+the right to use the directory and the record that keeps the GC off it.
+
+### Pooling the git mirrors by URL was looked at again, and parked
+
+Two packages often share an upstream (`gtk2` and `lib32-gtk2`, four more pairs
+on the reference server: 50 tracked sources over 45 distinct URLs), and each
+keeps its own mirror. One bare repo per URL with a checkout per package is a
+natural fit for git itself -- that is already makepkg's own two-tier shape, and
+checkouts of different commits from one mirror do not interfere.
+
+It is the *placement* that does not fit. makepkg only ever looks at
+`$SRCDEST/<name>`, keyed by the source's name rather than its URL, and devtools
+binds `$SRCDEST` itself, so a pool must sit at the same absolute path on the
+host and inside the chroot -- the source download runs outside, the build runs
+inside. That means an extra `-d /pool:/pool` bind and a symlink per source,
+keyed by URL so the pool is not a namespace shared by every package on the
+worker. (A name collision would at least be loud: `download_git` compares
+`remote.origin.url` and fails `E_NOT_A_CLONE_OF` rather than fetching the wrong
+source into an existing directory.)
+
+Against that: locks become per source, several per build, so they must be taken
+in a fixed order; and evicting one pooled mirror strands borrowed checkouts in
+every package that used it rather than in one. The saving today is nil -- the
+duplicated URLs are all small `#tag=` pins, and the 4.5 GB `google/fonts` mirror
+has exactly one user. Parked, with the reasoning recorded so it is not
+re-derived from scratch.
+
 ---
 
 ## Configuration reference

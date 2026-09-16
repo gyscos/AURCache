@@ -1,22 +1,22 @@
 //! The `devtools` chroot executor.
 //!
 //! Owns the state that spans concurrent builds on this worker — currently the
-//! set of pkgbases with a live `SRCDEST`, which the cache garbage-collector
-//! must not evict out from under a sibling build.
+//! pkgbases with a live `SRCDEST`, which the cache garbage-collector must not
+//! evict out from under a sibling build and which no two builds may fetch into
+//! at once.
 
 use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use crate::cgroup::Hierarchy;
 use crate::chroots::Chroots;
 use crate::config::Config;
 use crate::job;
+use crate::srcdest_lock::SrcdestLocks;
 
 /// State that spans the concurrent builds on this worker.
 ///
@@ -24,9 +24,10 @@ use crate::job;
 /// to see all of them: the cache garbage-collector must know which `SRCDEST`
 /// directories are live, and the chroots must know which copies are.
 pub struct Shared {
-    /// Pkgbases of currently-running jobs, so the garbage-collector never
-    /// evicts a sibling job's in-progress `SRCDEST` when `concurrency > 1`.
-    pub active_pkgbases: Mutex<HashSet<String>>,
+    /// Who holds which pkgbase's `SRCDEST`. Both the right to fetch into one
+    /// and the record that stops the garbage-collector evicting it; see
+    /// [`crate::srcdest_lock`].
+    pub srcdest: Arc<SrcdestLocks>,
     /// Where a build gets its chroot, and gives it back.
     pub chroots: Chroots,
 }
@@ -125,7 +126,7 @@ impl ChrootExecutor {
             }
         }
         let shared = Arc::new(Shared {
-            active_pkgbases: Mutex::new(HashSet::new()),
+            srcdest: SrcdestLocks::new(),
             chroots: Chroots::new(
                 cfg.chroot_dir.clone(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
@@ -150,17 +151,16 @@ impl Executor for ChrootExecutor {
         job: JobDescriptor,
         cancel: Arc<AtomicBool>,
     ) -> CompleteReport {
-        let pkgbase = job.pkgbase.clone();
-        // Register before building so this job's own SRCDEST (and every
-        // sibling's) is protected from the cache GC that runs at each job's
-        // start.
-        self.shared
-            .active_pkgbases
-            .lock()
-            .await
-            .insert(pkgbase.clone());
+        // Taken before building, and held until the report is on its way: it
+        // is what protects this job's own SRCDEST (and every sibling's) from
+        // the cache GC that runs at each job's start, and what keeps a second
+        // build of the same pkgbase -- another platform of it -- from fetching
+        // into the same directory meanwhile. Anything that reads what this
+        // build used belongs inside this scope, while the sources still say
+        // what they said.
+        let _srcdest = self.shared.srcdest.acquire(&job.pkgbase).await;
 
-        let report = job::run_job(
+        job::run_job(
             &self.cfg,
             self.cgroups.as_ref(),
             &client,
@@ -168,10 +168,7 @@ impl Executor for ChrootExecutor {
             cancel,
             Arc::clone(&self.shared),
         )
-        .await;
-
-        self.shared.active_pkgbases.lock().await.remove(&pkgbase);
-        report
+        .await
     }
 
     async fn ready_for_work(&self) -> bool {
