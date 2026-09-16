@@ -240,34 +240,27 @@ build_and_start() {
 }
 
 request_package() {
-    log "=== Adding package: $PACKAGE ==="
+    log "=== Adding package: $PACKAGE (timeout: ${BUILD_TIMEOUT}s) ==="
     # `pkg add` takes package names positionally and auto-detects git URLs; the
     # old `add aur <name>` / `add git <url>` subcommands are gone. Passing `aur`
     # here made it the *first package name*, so the run died trying to add a
     # nonexistent AUR package called "aur".
-    if ! aurcache_cli pkg add "$PACKAGE" --platform x86_64; then
-        echo "ERROR: Package request failed"
-        dump_logs_on_failure
-        exit 1
-    fi
-
-    # Report what the add actually produced. Dependency resolution is recursive,
-    # so one request can create many packages, and the count is the first sign
-    # that resolution went wrong — a mis-resolved dependency tree shows up here
-    # as an implausible number long before any build fails.
-    local pkgs builds
-    pkgs=$(aurcache_cli --format json pkg list --limit 500 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
-    builds=$(aurcache_cli --format json builds list --limit 500 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
-    log "    tracked packages: $pkgs, builds queued: $builds"
-
-    log "=== Waiting for build to complete (timeout: ${BUILD_TIMEOUT}s) ==="
-    # Progress reporting, stall detection and requeue detection live in the CLI
-    # (`builds watch`), not here: they are useful to anyone watching a queue, and
-    # keeping them there avoids this script re-encoding build status codes and
-    # re-parsing `waiting_reason` by hand.
-    if ! aurcache_cli builds watch \
-        --timeout "$BUILD_TIMEOUT" \
-        --stall-after "${STALL_AFTER:-120}" \
+    #
+    # `--wait` rather than a separate `builds watch`, because the two are a
+    # race: a build can be queued, run and fail between the add returning and a
+    # watcher's first listing, and from that listing a build that failed a
+    # second ago is indistinguishable from one that failed last week. `--wait`
+    # lists the builds *before* it adds, so everything that appears afterwards
+    # is this run's, however fast it failed. It reports the count the same way
+    # this script used to — dependency resolution is recursive, so an
+    # implausible number of builds shows a mis-resolved tree long before any of
+    # them fails. Progress reporting, stall detection and requeue detection are
+    # the CLI's for the same reason they always were: this script has no
+    # business re-encoding build status codes or re-parsing `waiting_reason`.
+    if ! aurcache_cli pkg add "$PACKAGE" --platform x86_64 \
+        --wait \
+        --wait-timeout "$BUILD_TIMEOUT" \
+        --wait-stall-after "${STALL_AFTER:-120}" \
         --fail-on-requeue; then
         # A dead container explains a failure better than the build log does, so
         # check that first.

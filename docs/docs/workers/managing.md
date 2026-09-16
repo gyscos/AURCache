@@ -118,6 +118,49 @@ says so instead of waiting out the timeout.
 `--package NAME` narrows it to one package; `--timeout` and `--stall-after`
 adjust the limits.
 
+**It follows what it watched.** Builds that had already finished when it started
+are history — it says how many it is not following, and how many of those
+failed, but they do not affect the exit code. A build it never saw run is not
+one it can report on, and on a server that has been up for a while almost every
+build in the list is of that kind.
+
+### Waiting for builds you just triggered
+
+Do not follow a trigger with a separate `builds watch`: the two are separate
+processes, and a build can be queued, run and fail in the gap between them. From
+the watcher's first listing that build is indistinguishable from any other
+finished build, so the failure is silently skipped.
+
+Use `--wait` on the command that does the triggering:
+
+```
+$ aurcache-cli pkg add turso --wait
+queued 3 build(s) across 3 package(s)
+[   0s] libaegis/1: active
+[  47s] libaegis/1: successful
+[  96s] turso/3: active
+[ 140s] turso/3: successful
+3 build(s) succeeded in 140s
+```
+
+One process can list the builds *before* it fires the request, so everything
+that appears afterwards is that trigger's work — including a build that failed
+before the request returned, and including the dependency builds that are queued
+later as the graph fans out. It exits non-zero if any of them fails.
+
+`pkg add`, `pkg update` and `builds retry` all take it, with
+`--wait-timeout`, `--wait-stall-after` and `--fail-on-requeue`. Under
+`--format json` the progress lines go to stderr so stdout stays a single
+document.
+
+A build that was already running before the trigger is **not** included: `--wait`
+answers for what it queued, not for the queue as a whole. `builds watch` is
+still the tool for that.
+
+If a script already knows a build reference — `pkg update` and `builds retry`
+both print what they queued — `builds watch --build hello/3` follows it by name
+whatever state it has reached.
+
 ## What the Builds page is telling you
 
 An enqueued build that no worker can claim is flagged with the reason:

@@ -24,7 +24,7 @@ use config::{
 use dialoguer::{Confirm, Select};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -541,6 +541,9 @@ struct AddPackageArgs {
     /// Only valid when adding a single package.
     #[arg(long = "patch", value_parser = parse_patch_arg)]
     patches: Vec<(String, String)>,
+
+    #[command(flatten)]
+    wait: WaitOpts,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -551,6 +554,9 @@ struct UpdatePackageArgs {
     /// Force the update even when the version did not change.
     #[arg(long)]
     force: bool,
+
+    #[command(flatten)]
+    wait: WaitOpts,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -582,6 +588,8 @@ enum BuildsCommand {
     Retry {
         /// Build reference, e.g. `hello/3`.
         build: BuildRef,
+        #[command(flatten)]
+        wait: WaitOpts,
     },
     /// Cancel a build.
     Cancel {
@@ -623,6 +631,57 @@ struct WatchArgs {
     /// and intended for tests.
     #[arg(long = "fail-on-requeue")]
     fail_on_requeue: bool,
+    /// Follow this build even if it has already finished, e.g. `hello/3`.
+    /// Repeat for several.
+    ///
+    /// Without it, a build that finished before this command's first listing is
+    /// treated as history and does not affect the exit code — there is no way
+    /// to tell it apart from any other old build. A caller that knows what it
+    /// triggered says so here; `--wait` on the triggering command does it for
+    /// you, and cannot miss the builds the trigger created.
+    #[arg(long = "build")]
+    builds: Vec<BuildRef>,
+}
+
+/// Wait for what a trigger queues, on the command that triggers it.
+///
+/// This exists because `trigger; watch` is two processes and the gap between
+/// them is unobservable: a build can be created, run and fail inside it, and
+/// the watcher that starts afterwards cannot distinguish that from a failure
+/// last week. One process can — it lists the builds *before* it fires — so the
+/// wait is offered where the trigger is rather than as advice to watch quickly.
+#[derive(Args, Debug, Clone, Default)]
+struct WaitOpts {
+    /// Wait for the builds this queues, and exit non-zero if any of them fails.
+    #[arg(long)]
+    wait: bool,
+    /// Give up after this many seconds.
+    #[arg(long = "wait-timeout", default_value_t = 900)]
+    wait_timeout: u64,
+    /// Fail if nothing changes for this long while nothing is building.
+    #[arg(long = "wait-stall-after", default_value_t = 120)]
+    wait_stall_after: u64,
+    /// Fail if a build returns to the queue after running. See
+    /// `builds watch --fail-on-requeue`.
+    #[arg(long = "fail-on-requeue")]
+    fail_on_requeue: bool,
+}
+
+impl WaitOpts {
+    /// The watch this wait performs. `package` is left unset: a trigger fans
+    /// out into dependency builds under other names, and filtering to the
+    /// package named on the command line would hide exactly the builds the
+    /// trigger is waiting for.
+    fn as_watch_args(&self) -> WatchArgs {
+        WatchArgs {
+            package: None,
+            timeout: self.wait_timeout,
+            stall_after: self.wait_stall_after,
+            heartbeat: 60,
+            fail_on_requeue: self.fail_on_requeue,
+            builds: Vec::new(),
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1148,10 +1207,12 @@ async fn run_builds_command(
         BuildsCommand::List(args) => render_builds_list(client, format, args).await,
         BuildsCommand::Get { build } => render_build(client, format, build).await,
         BuildsCommand::Output(args) => render_build_output(client, format, args).await,
-        BuildsCommand::Retry { build } => retry_build_command(client, format, build).await,
+        BuildsCommand::Retry { build, wait } => {
+            retry_build_command(client, format, build, wait).await
+        }
         BuildsCommand::Cancel { build } => cancel_build_command(client, format, build).await,
         BuildsCommand::Delete { build } => delete_build_command(client, format, build).await,
-        BuildsCommand::Watch(args) => watch_builds_command(client, args).await,
+        BuildsCommand::Watch(args) => watch_builds_command(client, format, args).await,
     }
 }
 
@@ -1418,6 +1479,15 @@ async fn add_package_command(
     let git_ref = args.git_ref;
 
     let patched_files = read_patch_files(&args.patches)?;
+    // Before the request. An add fans out into a dependency tree whose build
+    // numbers nobody can predict, so what makes this trigger's work
+    // identifiable is not knowing the builds in advance but knowing which ones
+    // were already there.
+    let scope = if args.wait.wait {
+        Some(snapshot_builds(client, None).await?)
+    } else {
+        None
+    };
     let mut sources = Vec::new();
     for package in packages {
         sources.push(if looks_like_git_url(&package) {
@@ -1454,7 +1524,10 @@ async fn add_package_command(
         if format == OutputFormat::Text {
             println!("package add request complete");
         }
-        return Ok(());
+        return match scope {
+            Some(scope) => wait_for_queued(client, format, &args.wait, scope).await,
+            None => Ok(()),
+        };
     }
 
     // One request for the whole list. Adding them one at a time made the server
@@ -1468,7 +1541,40 @@ async fn add_package_command(
         })
         .await?;
 
-    follow_bulk_add(client, format, accepted).await
+    follow_bulk_add(client, format, accepted).await?;
+    // Only after the add job has finished: it creates the packages and enqueues
+    // the leaves as it goes, so before that the delta is a half-built picture of
+    // what the add will produce.
+    match scope {
+        Some(scope) => wait_for_queued(client, format, &args.wait, scope).await,
+        None => Ok(()),
+    }
+}
+
+/// Say what a trigger queued, then follow it to the end.
+///
+/// The count is the first sign that dependency resolution went wrong -- an
+/// implausible number of builds shows it long before any of them fails -- so it
+/// is reported before the waiting starts rather than after.
+async fn wait_for_queued(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    wait: &WaitOpts,
+    scope: WatchScope,
+) -> Result<()> {
+    let progress = Progress(format);
+    let queued: Vec<Build> = list_watched_builds(client, None)
+        .await?
+        .into_iter()
+        .filter(|b| scope.includes(b))
+        .collect();
+    let packages: HashSet<&str> = queued.iter().map(|b| b.pkg_name.as_str()).collect();
+    progress.line(&format!(
+        "queued {} build(s) across {} package(s)",
+        queued.len(),
+        packages.len()
+    ));
+    follow_builds(client, progress, &wait.as_watch_args(), scope).await
 }
 
 /// What an import should do about the dump's secrets.
@@ -1799,12 +1905,30 @@ async fn update_package_command(
     format: OutputFormat,
     args: UpdatePackageArgs,
 ) -> Result<()> {
+    // Before the request, so a build that is queued, runs and fails while we
+    // are still reading the response is still ours to report.
+    let scope = if args.wait.wait {
+        Some(snapshot_builds(client, None).await?)
+    } else {
+        None
+    };
     let queued = client
         .update_package(&args.pkgbase, &UpdatePackageRequest { force: args.force })
         .await?;
     render(format, &queued, |numbers| {
         print_queued_builds(&args.pkgbase, numbers);
-    })
+    })?;
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    // The response names what it enqueued, which pins those builds into scope
+    // whatever state they have reached by now. It omits a build left waiting on
+    // a dependency, which is why this package's unfinished builds are adopted
+    // too: an update that reused an existing row still has to wait for it.
+    let scope = scope
+        .with_explicit(queued.iter().map(|n| (args.pkgbase.clone(), *n)))
+        .adopting(&args.pkgbase);
+    follow_builds(client, Progress(format), &args.wait.as_watch_args(), scope).await
 }
 
 /// The numbers come back bare, so they are printed against the package they
@@ -2090,15 +2214,25 @@ async fn retry_build_command(
     client: &AurCacheClient,
     format: OutputFormat,
     build: BuildRef,
+    wait: WaitOpts,
 ) -> Result<()> {
+    let scope = if wait.wait {
+        Some(snapshot_builds(client, None).await?)
+    } else {
+        None
+    };
     let number = client.retry_build(&build.pkgbase, build.number).await?;
     match format {
-        OutputFormat::Json => print_json(&number),
-        OutputFormat::Text => {
-            println!("enqueued build: {}/{number}", build.pkgbase);
-            Ok(())
-        }
+        OutputFormat::Json => print_json(&number)?,
+        OutputFormat::Text => println!("enqueued build: {}/{number}", build.pkgbase),
     }
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    let scope = scope
+        .with_explicit([(build.pkgbase.clone(), number)])
+        .adopting(&build.pkgbase);
+    follow_builds(client, Progress(format), &wait.as_watch_args(), scope).await
 }
 
 async fn cancel_build_command(
@@ -2488,34 +2622,175 @@ fn print_raw_response(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where a watch's progress lines go.
+///
+/// Machine output owns stdout: a `--format json` caller is parsing one
+/// document, so progress goes to stderr rather than interleaving text into it.
+#[derive(Copy, Clone, Debug)]
+struct Progress(OutputFormat);
+
+impl Progress {
+    fn line(self, text: &str) {
+        if self.0 == OutputFormat::Json {
+            eprintln!("{text}");
+        } else {
+            println!("{text}");
+        }
+    }
+}
+
+/// A build's public identity: the row id is not part of the API.
+type BuildKey = (String, i32);
+
+fn build_key(build: &Build) -> BuildKey {
+    (build.pkg_name.clone(), build.number)
+}
+
+fn is_terminal(status: i32) -> bool {
+    status == BuildStates::SUCCESSFUL_BUILD || status == BuildStates::FAILED_BUILD
+}
+
+/// Which builds one invocation is answerable for.
+///
+/// Every listing mixes the work this invocation is about with whatever else the
+/// server has ever done, and the difference cannot be recovered from the rows:
+/// a build that failed last week and one that failed a second ago look
+/// identical. So the caller states it, once, before any polling — and what it
+/// can state depends on what it knows:
+///
+/// * `builds watch` learns it from its own first listing: anything already
+///   finished by then is somebody else's history, because a build it never saw
+///   run is not one it can report on.
+/// * a `--wait` trigger takes its listing *before* sending the request, so
+///   everything that appears afterwards is its own doing — including a build
+///   that failed before the response came back, which is precisely the case a
+///   watcher started afterwards can never see.
+#[derive(Debug, Default, Clone)]
+struct WatchScope {
+    /// Builds that were already there and are not ours.
+    ignore: HashSet<BuildKey>,
+    /// Ours by name, whatever state they are in when first seen. This is what
+    /// makes a build the server told us it queued impossible to lose.
+    explicit: HashSet<BuildKey>,
+    /// Packages whose unfinished builds we adopt even though they predate us:
+    /// a trigger that reused an existing build row rather than creating one
+    /// still has to wait for it.
+    adopt: HashSet<String>,
+}
+
+impl WatchScope {
+    /// For `builds watch`: only the already-finished builds are history.
+    /// Anything still in flight is happening now and is worth following.
+    fn from_history(builds: &[Build]) -> Self {
+        Self {
+            ignore: builds
+                .iter()
+                .filter(|b| is_terminal(b.status))
+                .map(build_key)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// For `--wait`: everything that existed before the trigger is somebody
+    /// else's, running or not, so the verdict covers this trigger's work alone.
+    fn from_snapshot(builds: &[Build]) -> Self {
+        Self {
+            ignore: builds.iter().map(build_key).collect(),
+            ..Self::default()
+        }
+    }
+
+    fn with_explicit(mut self, keys: impl IntoIterator<Item = BuildKey>) -> Self {
+        self.explicit.extend(keys);
+        self
+    }
+
+    fn adopting(mut self, pkgbase: &str) -> Self {
+        self.adopt.insert(pkgbase.to_string());
+        self
+    }
+
+    fn includes(&self, build: &Build) -> bool {
+        let key = build_key(build);
+        if self.explicit.contains(&key) {
+            return true;
+        }
+        if !self.ignore.contains(&key) {
+            return true;
+        }
+        self.adopt.contains(&build.pkg_name) && !is_terminal(build.status)
+    }
+}
+
 /// Follow builds until they settle, printing transitions and detecting stalls.
 ///
 /// Written for humans watching a queue and for scripts driving one: it reports
 /// what changed rather than repeating the current state, and it fails fast when
 /// the queue cannot progress instead of waiting out the timeout.
-async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Result<()> {
-    use std::collections::HashMap;
+async fn watch_builds_command(
+    client: &AurCacheClient,
+    format: OutputFormat,
+    args: WatchArgs,
+) -> Result<()> {
+    let progress = Progress(format);
+    let builds = list_watched_builds(client, args.package.as_deref()).await?;
+    let scope = WatchScope::from_history(&builds)
+        .with_explicit(args.builds.iter().map(|b| (b.pkgbase.clone(), b.number)));
+
+    // Said once, rather than as a burst of transition lines for builds that
+    // transitioned before anyone was watching. Failures among them are named
+    // because they are the reason the exit code may not be what a reader of
+    // the list expects.
+    let history: Vec<&Build> = builds.iter().filter(|b| !scope.includes(b)).collect();
+    if !history.is_empty() {
+        let failed = history
+            .iter()
+            .filter(|b| b.status == BuildStates::FAILED_BUILD)
+            .count();
+        let failed = if failed == 0 {
+            String::new()
+        } else {
+            format!(", {failed} of them failed")
+        };
+        progress.line(&format!(
+            "not following {} build(s) that finished before this{failed}",
+            history.len()
+        ));
+    }
+
+    follow_builds(client, progress, &args, scope).await
+}
+
+/// Poll until every build in scope has settled.
+///
+/// Stall detection deliberately looks at the *whole* queue rather than the
+/// scope: a build waiting on a dependency is not stalled while that dependency
+/// — a different package, outside a `--package` filter — is building. The
+/// question is whether the queue can advance, not whether our part of it is
+/// moving.
+async fn follow_builds(
+    client: &AurCacheClient,
+    progress: Progress,
+    args: &WatchArgs,
+    scope: WatchScope,
+) -> Result<()> {
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
     let mut last_change = Instant::now();
     let mut last_beat = Instant::now();
-    // Keyed by the build's public identity, since the row id is no longer
-    // part of the API.
-    let mut seen: HashMap<(String, i32), i32> = HashMap::new();
+    let mut seen: HashMap<BuildKey, i32> = HashMap::new();
 
     loop {
-        let builds: Vec<_> = client
-            .list_builds(None, Some(100), None)
-            .await?
-            .into_iter()
-            .filter(|b| args.package.as_ref().is_none_or(|name| &b.pkg_name == name))
-            .collect();
+        let builds = list_watched_builds(client, args.package.as_deref()).await?;
+        let (watched, rest): (Vec<&Build>, Vec<&Build>) =
+            builds.iter().partition(|b| scope.includes(b));
 
         const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
         let mut changed = false;
-        for build in &builds {
-            let key = (build.pkg_name.clone(), build.number);
+        for build in &watched {
+            let key = build_key(build);
             if seen.get(&key) != Some(&build.status) {
                 if args.fail_on_requeue
                     && seen.get(&key) == Some(&BuildStates::ACTIVE_BUILD)
@@ -2534,12 +2809,12 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
                     .as_ref()
                     .map(|r| format!(" — {r}"))
                     .unwrap_or_default();
-                println!(
+                progress.line(&format!(
                     "[{elapsed:>4}s] {}/{}: {}{reason}",
                     build.pkg_name,
                     build.number,
                     build_status_label(build.status),
-                );
+                ));
                 seen.insert(key, build.status);
                 changed = true;
             }
@@ -2548,33 +2823,35 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
             last_change = Instant::now();
         }
 
-        // Settled when every build has reached a terminal state. An empty list
-        // is not settled: the caller may be watching for a build that has not
-        // been queued yet.
-        let settled = !builds.is_empty()
-            && builds.iter().all(|b| {
-                b.status == BuildStates::SUCCESSFUL_BUILD || b.status == BuildStates::FAILED_BUILD
-            });
-        if settled {
-            let failed: Vec<&str> = builds
+        // Settled when every build in scope has reached a terminal state. An
+        // empty scope is settled too: there was nothing to follow, which is an
+        // answer rather than a reason to wait — a `--wait` trigger that queued
+        // nothing says so at once instead of sitting out the stall timeout.
+        if watched.iter().all(|b| is_terminal(b.status)) {
+            let failed: Vec<String> = watched
                 .iter()
                 .filter(|b| b.status == BuildStates::FAILED_BUILD)
-                .map(|b| b.pkg_name.as_str())
+                .map(|b| format!("{}/{}", b.pkg_name, b.number))
                 .collect();
-            if failed.is_empty() {
-                println!("all builds succeeded in {}s", start.elapsed().as_secs());
-                return Ok(());
+            if !failed.is_empty() {
+                bail!("build failed: {}", failed.join(", "));
             }
-            bail!("build failed: {}", failed.join(", "));
+            if watched.is_empty() {
+                progress.line("nothing to follow");
+            } else {
+                progress.line(&format!(
+                    "{} build(s) succeeded in {}s",
+                    watched.len(),
+                    start.elapsed().as_secs()
+                ));
+            }
+            return Ok(());
         }
 
         let anything_running = builds.iter().any(|b| b.status == BuildStates::ACTIVE_BUILD);
 
         if !anything_running && last_change.elapsed() >= Duration::from_secs(args.stall_after) {
-            for build in builds
-                .iter()
-                .filter(|b| b.status != BuildStates::SUCCESSFUL_BUILD)
-            {
+            for build in watched.iter().filter(|b| !is_terminal(b.status)) {
                 let reason = build
                     .waiting_reason
                     .as_ref()
@@ -2594,23 +2871,24 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
         }
 
         if last_beat.elapsed() >= Duration::from_secs(args.heartbeat) {
-            let active = builds
+            let active = watched
                 .iter()
                 .filter(|b| b.status == BuildStates::ACTIVE_BUILD)
                 .count();
-            println!(
-                "[{:>4}s] {} building, {} of {} finished",
+            progress.line(&format!(
+                "[{:>4}s] {} building, {} of {} finished{}",
                 start.elapsed().as_secs(),
                 active,
-                builds
-                    .iter()
-                    .filter(|b| {
-                        b.status == BuildStates::SUCCESSFUL_BUILD
-                            || b.status == BuildStates::FAILED_BUILD
-                    })
-                    .count(),
-                builds.len()
-            );
+                watched.iter().filter(|b| is_terminal(b.status)).count(),
+                watched.len(),
+                // Only work still in flight: that the server has a hundred
+                // finished builds on record is not news, but that something
+                // else is running explains why ours is waiting.
+                match rest.iter().filter(|b| !is_terminal(b.status)).count() {
+                    0 => String::new(),
+                    other => format!(" ({other} other build(s) in flight, not followed)"),
+                }
+            ));
             last_beat = Instant::now();
         }
 
@@ -2619,6 +2897,29 @@ async fn watch_builds_command(client: &AurCacheClient, args: WatchArgs) -> Resul
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// One page of builds, optionally narrowed to a package.
+///
+/// The page bounds how far back the scope can see, which is why the scope is
+/// taken as a set of identities rather than by counting: an old build dropping
+/// off the end of the page must not change the verdict.
+async fn list_watched_builds(client: &AurCacheClient, package: Option<&str>) -> Result<Vec<Build>> {
+    Ok(client
+        .list_builds(None, Some(100), None)
+        .await?
+        .into_iter()
+        .filter(|b| package.is_none_or(|name| b.pkg_name == name))
+        .collect())
+}
+
+/// The listing a `--wait` trigger takes *before* it fires, which is the whole
+/// reason `--wait` can report on a build that finished before the trigger
+/// returned.
+async fn snapshot_builds(client: &AurCacheClient, package: Option<&str>) -> Result<WatchScope> {
+    Ok(WatchScope::from_snapshot(
+        &list_watched_builds(client, package).await?,
+    ))
 }
 
 fn build_status_label(status: i32) -> &'static str {
@@ -2676,8 +2977,9 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddPackageArgs, Cli, Command, ComposeArgs, PackagesCommand, RepoCommand, SetupCommand,
-        build_status_label, compose, compose_database, parse_key_val, repo,
+        AddPackageArgs, Build, BuildStates, Cli, Command, ComposeArgs, PackagesCommand,
+        RepoCommand, SetupCommand, WatchScope, build_status_label, compose, compose_database,
+        parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
@@ -2687,6 +2989,115 @@ mod tests {
     fn parse_key_val_requires_separator() {
         assert!(parse_key_val("limit=10").is_ok());
         assert!(parse_key_val("missing").is_err());
+    }
+
+    /// A build row as the list endpoint returns one; only identity and status
+    /// matter to a scope.
+    fn build(pkg: &str, number: i32, status: i32) -> Build {
+        Build {
+            number,
+            pkg_name: pkg.to_string(),
+            version: "1-1".to_string(),
+            status,
+            start_time: None,
+            end_time: None,
+            platform: "x86_64".to_string(),
+            size: None,
+            peak_memory: None,
+            worker_name: None,
+            log_size: None,
+            waiting_reason: None,
+        }
+    }
+
+    const ACTIVE: i32 = BuildStates::ACTIVE_BUILD;
+    const FAILED: i32 = BuildStates::FAILED_BUILD;
+    const SUCCESSFUL: i32 = BuildStates::SUCCESSFUL_BUILD;
+
+    /// `builds watch` reports on what it watched. A build that was already over
+    /// before it looked is history it cannot speak for -- and on a long-lived
+    /// instance every listing is mostly history, which is what used to make the
+    /// exit code a statement about last week.
+    #[test]
+    fn watch_follows_what_is_in_flight_and_not_old_builds() {
+        let history = [
+            build("fonts", 5, FAILED),
+            build("fonts", 6, FAILED),
+            build("fonts", 7, SUCCESSFUL),
+        ];
+        let scope = WatchScope::from_history(&history);
+
+        assert!(!history.iter().any(|b| scope.includes(b)));
+        assert!(
+            scope.includes(&build("fonts", 8, ACTIVE)),
+            "a build that appears later is this watch's business"
+        );
+        assert!(
+            scope.includes(&build("fonts", 9, FAILED)),
+            "including one that has already failed by the time we see it: it \
+             failed while we were watching"
+        );
+    }
+
+    /// Anything still running when the watch starts is in scope without being
+    /// named: it is happening now.
+    #[test]
+    fn watch_follows_a_build_that_was_already_running() {
+        let scope = WatchScope::from_history(&[build("fonts", 8, ACTIVE)]);
+        assert!(scope.includes(&build("fonts", 8, ACTIVE)));
+        assert!(scope.includes(&build("fonts", 8, FAILED)));
+    }
+
+    /// The race `--wait` exists for: the trigger queues a build that fails
+    /// before the request even returns. A watcher started afterwards sees an
+    /// old failed build and cannot tell; a snapshot taken beforehand can.
+    #[test]
+    fn wait_catches_a_build_that_failed_before_the_trigger_returned() {
+        let before = [build("fonts", 7, SUCCESSFUL), build("other", 2, ACTIVE)];
+        let scope = WatchScope::from_snapshot(&before);
+
+        assert!(
+            scope.includes(&build("fonts", 8, FAILED)),
+            "queued and failed inside the gap, and still ours"
+        );
+        assert!(
+            !scope.includes(&build("fonts", 7, SUCCESSFUL)),
+            "what was already there is not"
+        );
+        assert!(
+            !scope.includes(&build("other", 2, FAILED)),
+            "nor is a build that was running before we triggered anything: a \
+             stranger's failure is not this trigger's verdict"
+        );
+    }
+
+    /// A build the server says it queued is in scope by name, so the answer
+    /// does not depend on how fast it ran.
+    #[test]
+    fn explicitly_named_builds_are_followed_however_they_are_found() {
+        let scope = WatchScope::from_history(&[build("fonts", 8, FAILED)])
+            .with_explicit([("fonts".to_string(), 8)]);
+        assert!(scope.includes(&build("fonts", 8, FAILED)));
+    }
+
+    /// An update that reused an existing build row reports no new build, and
+    /// the row predates the snapshot -- so the package's unfinished builds are
+    /// adopted, or `--wait` would return before the build it is waiting for.
+    #[test]
+    fn a_reused_build_is_adopted_for_the_triggered_package_only() {
+        let before = [
+            build("fonts", 7, SUCCESSFUL),
+            build("fonts", 8, ACTIVE),
+            build("other", 3, ACTIVE),
+        ];
+        let scope = WatchScope::from_snapshot(&before).adopting("fonts");
+
+        assert!(scope.includes(&build("fonts", 8, ACTIVE)));
+        assert!(!scope.includes(&build("other", 3, ACTIVE)));
+        assert!(
+            !scope.includes(&build("fonts", 7, SUCCESSFUL)),
+            "adoption is for work still in flight, not for the package's history"
+        );
     }
 
     #[test]
