@@ -106,6 +106,37 @@ certainly fail. That is the correct trade — but it must be *visible*:
 
 ---
 
+## One package at a time per worker
+
+On top of affinity, architecture and priority, a worker is never handed a build
+of a package it is already building. This is not routing policy but a hard
+constraint of the caches: `SRCDEST` is keyed by pkgbase and *not* by platform,
+since downloads are architecture-independent, so an x86_64 and an aarch64 build
+of one package share a directory and would fetch into it at once. Plain sources
+are written as `<file>.part` and renamed, keyed by filename, so two such builds
+race on the same name.
+
+The worker refuses to run them concurrently regardless
+(`aurcache_worker::srcdest_lock`), so offering the job would not make it build
+any sooner -- it would sit claimed, holding a concurrency slot and spending its
+own `job_timeout`, which the reaper measures from the claim rather than from
+when the build actually started. Left queued instead, another worker can take it
+at once.
+
+**Per worker, not fleet-wide.** Two workers have separate source caches, and
+building a package's platforms simultaneously on different machines is what
+multi-arch is for. The predicate is `ACTIVE` alone, like the rest of lease
+policing: a build that has reached `PUBLISHING` has ended its lease and its
+worker has finished with the sources.
+
+It cannot be the *only* guard, which is why the worker-side lock exists too: a
+worker with free slots issues claims concurrently, and a build becomes `ACTIVE`
+only when its claim's compare-and-swap wins, so two claims for different
+platforms of one package can both pass this filter before either commits. Rare,
+and exactly when the mirror must not be fetched twice.
+
+---
+
 ## Part 2 — Worker priority
 
 ### The pull problem

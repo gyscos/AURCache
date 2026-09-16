@@ -221,6 +221,15 @@ impl Fleet {
 ///    higher-priority worker is live and under its concurrency limit, until the
 ///    job has waited `spill_delay_secs`.
 ///
+/// On top of those, a worker is never handed a second build of a package it is
+/// already building. The two would share one `SRCDEST` — it is keyed by pkgbase
+/// and not by platform — and fetch into it at once. The worker refuses to run
+/// them concurrently anyway (`aurcache_worker::srcdest_lock`), so offering the
+/// job would only park a claimed build against its own timeout while it waited
+/// its turn. Per *worker*, deliberately: two workers building different
+/// platforms of one package share nothing, and that is the parallelism
+/// multi-arch exists for.
+///
 /// Arches, affinity and priority all come from the worker's stored row rather
 /// than from the request, because each worker's decision depends on what *other*
 /// workers declared: they must be read from one consistent source.
@@ -248,6 +257,21 @@ pub async fn claim_job<C: ConnectionTrait>(
         return Ok(None);
     }
 
+    // Packages this worker already has in flight. `ACTIVE` alone: a build that
+    // has moved on to `PUBLISHING` has ended its lease, and its worker has
+    // finished with the sources — the same predicate the rest of lease policing
+    // uses.
+    let busy_pkgs: HashSet<i32> = Builds::find()
+        .select_only()
+        .column(builds::Column::PkgId)
+        .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+        .filter(builds::Column::WorkerId.eq(worker_id))
+        .into_tuple::<i32>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+
     // Resolve pkgbase names for the queued builds in one query.
     let pkg_ids: Vec<i32> = candidates.iter().map(|b| b.pkg_id).collect();
     let names: HashMap<i32, String> = Packages::find()
@@ -267,6 +291,11 @@ pub async fn claim_job<C: ConnectionTrait>(
         let Some(pkg) = names.get(&build.pkg_id) else {
             continue;
         };
+        // Leave it queued rather than parking it here: another worker has its
+        // own `SRCDEST` and can take it now.
+        if busy_pkgs.contains(&build.pkg_id) {
+            continue;
+        }
         let platform = build.platform.as_str();
         if !fleet.capable(me, platform, pkg) {
             continue;
@@ -953,6 +982,116 @@ mod tests {
         claim_job(db, worker_id, LEASE, SPILL, LIVENESS)
             .await
             .unwrap()
+    }
+
+    /// One package with a build queued per platform, and a worker that could
+    /// take either. `SRCDEST` is keyed by pkgbase and not by platform, so the
+    /// two would share one source directory.
+    async fn enqueue_second_platform(db: &DatabaseConnection, build_id: i32, pkg_id: i32) {
+        db.execute_unprepared(&format!(
+            "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, \
+                attempt_count, number) \
+             VALUES ({build_id}, {pkg_id}, {STATUS_ENQUEUED}, 100, 'aarch64', '1.0', 0, 2)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// A worker is never handed a second build of a package it is already
+    /// building: the two would fetch into one `SRCDEST`. The worker refuses to
+    /// run them at once regardless, so offering it would park a claimed build
+    /// against its own timeout while it waited its turn.
+    #[tokio::test]
+    async fn a_worker_is_not_offered_a_second_build_of_what_it_is_building() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                native: "x86_64,aarch64",
+                concurrency: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 10, "x86_64", 100).await;
+        enqueue_second_platform(&db, 11, 10).await;
+
+        let first = claim(&db, 1)
+            .await
+            .expect("the first platform is claimable");
+        assert_eq!(first.id, 10);
+
+        assert!(
+            claim(&db, 1).await.is_none(),
+            "the other platform of a package this worker is building must stay queued"
+        );
+    }
+
+    /// Per worker, not fleet-wide: two workers have separate source caches, and
+    /// building a package's platforms at once is what multi-arch is for.
+    #[tokio::test]
+    async fn another_worker_may_take_the_other_platform() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                native: "x86_64,aarch64",
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                native: "aarch64",
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 10, "x86_64", 100).await;
+        enqueue_second_platform(&db, 11, 10).await;
+
+        assert_eq!(claim(&db, 1).await.expect("first platform").id, 10);
+        assert_eq!(
+            claim(&db, 2).await.expect("second platform elsewhere").id,
+            11,
+            "another worker has its own SRCDEST and is free to take it"
+        );
+    }
+
+    /// The exclusion follows `ACTIVE`, like the rest of lease policing: once a
+    /// build is publishing, its lease is over and its worker has finished with
+    /// the sources.
+    #[tokio::test]
+    async fn publishing_releases_the_package_for_the_next_platform() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                native: "x86_64,aarch64",
+                concurrency: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        enqueue(&db, 10, "x86_64", 100).await;
+        enqueue_second_platform(&db, 11, 10).await;
+
+        claim(&db, 1).await.expect("the first platform");
+        db.execute_unprepared(&format!(
+            "UPDATE builds SET status = {} WHERE id = 10",
+            BuildStates::PUBLISHING
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            claim(&db, 1).await.expect("the second platform").id,
+            11,
+            "a publishing build no longer holds the package's sources"
+        );
     }
 
     /// The package's own status has to follow the build's, because that is the
