@@ -80,17 +80,33 @@ server-side and serialized by the build-state machine, so there is no race:
         "message": "network fetch inside package()", "file": "PKGBUILD" }
     ]
   },
-  "artifact": {
-    "findings": [
-      { "rule": "A-INSTALL-NET", "severity": "blocking?",
-        "message": ".INSTALL runs curl toward an undeclared host", "file": ".INSTALL" }
-    ]
-  }
+  "artifacts": {
+    "unreal-engine-5.8.2-1-x86_64.pkg.tar.zst": {
+      "findings": [
+        { "rule": "A-INSTALL-NET", "severity": "blocking?", "weight": 20,
+          "message": ".INSTALL runs curl toward an undeclared host", "file": ".INSTALL" }
+      ],
+      "score": 20
+    }
+  },
+  "score": 24
 }
 ```
 
-Each finding also carries the weight it contributes, and the blob carries their
-sum as `score`. A `severity` of `"blocking?"` is a *marker*, not a verdict:
+The artifact half is **keyed by file name**, because a build of a split package
+stages several (`packages.split_packages` records them, and `read_staging`
+returns whatever the build produced). Each is scanned on its own: they have
+their own `.INSTALL`, their own units, their own file lists, and a payload that
+rides in one subpackage is invisible in its siblings.
+
+Each finding carries the weight it contributes. An artifact's `score` is the sum
+of its own findings plus the recipe's — the recipe is shared by every subpackage
+of the build, so it counts once in each — and the build's `score` is the
+**highest** of those, not their sum: three subpackages shipping the same
+scriptlet from one PKGBUILD are one suspicious recipe, not three, and summing
+would make a package's score grow with how finely it splits.
+
+A `severity` of `"blocking?"` is a *marker*, not a verdict:
 nothing acts on it unless an operator sets a withhold threshold (Change 6),
 which ships unset. Rule hits are capped (e.g. 50) and the message truncated per hit, so the
 blob stays a bounded, log-line-sized object.
@@ -213,9 +229,10 @@ must never be held by, or held up by, a heuristic.
 - **Build page** (`frontend-rs/src/screens/build.rs`): the existing header row
   gains a warning chip when the build's signals are non-empty, and an
   expandable "N suspicion signals" panel lists rule, severity and message per
-  finding. A withheld build says so plainly — "held back from the repository:
-  score 34 (threshold 30); clients still have <previous version>" — with the
-  download and Release actions beside it. The poll loop already re-reads the build each cycle
+  finding, grouped by artifact for a split build. A withheld build says so
+  plainly — "held back from the repository: score 34 (threshold 30), from
+  <name>; clients still have <previous version>" — with the per-artifact
+  downloads and the Release action beside it. The poll loop already re-reads the build each cycle
   (`build.rs:398-417`), so the chip appears as soon as the completion report
   lands, and the artifact findings when the publish transaction commits.
 - **Build rows** (`frontend-rs/src/screens/package.rs`, the `BuildRow` at
@@ -238,10 +255,19 @@ artifact has already spent its hours, and the artifact is the evidence — the
 `xsnow`-shaped payload only exists *in* it. So the gate is about **publication**:
 
 > `signals_withhold_score` (`Package -> Env -> Global -> Default`, default
-> unset = never withhold). When a finished build's score is at or above it, the
-> artifact is kept and recorded but **not added to the repository**: no
-> `repo.db` entry, so no client installs it, while an operator can still fetch
-> it, unpack it, and decide.
+> unset = never withhold). When a finished build's score is at or above it, its
+> artifacts are kept and recorded but **not added to the repository**: no
+> `repo.db` entries, so no client installs them, while an operator can still
+> fetch them, unpack them, and decide.
+
+**Withholding is per build, not per artifact**, even though scanning is per
+artifact. One recipe produced the whole set, so a subpackage that scores is
+evidence about the recipe, and publishing its siblings would ship code from a
+PKGBUILD an operator has not cleared. Partial publication would also be a
+worse artifact than either outcome: a split set whose members reference each
+other, half in the repository and half not, is a dependency graph nobody asked
+for. The build's score is the highest artifact score, and the whole set goes or
+stays.
 
 How it fits the publish path (`backend/aurcache-utils/src/publish.rs`):
 
@@ -286,15 +312,18 @@ How it fits the publish path (`backend/aurcache-utils/src/publish.rs`):
 cannot be opened is useless, so it is downloadable through the authenticated
 API rather than the public repository:
 
-- `GET /api/build/<id>/artifact` streams the withheld file for a build that has
-  one, with its name and `sha256` in the response headers, behind the same
-  authentication every other API route uses. The build page offers it as
-  "Download artifact (withheld)" beside the signal panel, and
-  `aurcache-cli builds artifact <pkg>/<n> -o <path>` writes it to disk, which is
-  what an operator with a shell will actually use. The route is deliberately
-  *not* the mirror: analysing a suspicious package is an operator action, not a
-  public one.
-- The same route serves a published build's artifact too, which costs nothing
+- `GET /api/build/<id>/artifacts` lists what the build produced (name, size,
+  `sha256`, and per-file findings), and `GET /api/build/<id>/artifact/<name>`
+  streams one, with its `sha256` in the response headers, behind the same
+  authentication every other API route uses. A split build therefore lists
+  several and each is fetched by name.
+- The build page lists them beside the signal panel, each with its own score and
+  a download action, and `aurcache-cli builds artifacts <pkg>/<n>` /
+  `builds artifact <pkg>/<n> <name> -o <path>` do the same from a shell, which
+  is what an operator will actually use. The route is deliberately *not* the
+  mirror: analysing a suspicious package is an operator action, not a public
+  one.
+- The same routes serve a published build's artifacts too, which costs nothing
   extra and saves knowing the repository URL layout.
 
 Operator actions, all audited like other package changes:
