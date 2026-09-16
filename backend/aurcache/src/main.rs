@@ -56,7 +56,9 @@ async fn main() {
     // repeat requests reuse the same checkout instead of re-cloning/
     // re-downloading. Handing any of these its own instance would put two
     // stores on the same checkout directories with no shared locking.
-    let store = Arc::new(SnapshotStore::new());
+    // The database comes along so the store can read `parse_network` when it
+    // parses a PKGBUILD; without it every parse would use the default.
+    let store = Arc::new(SnapshotStore::new().with_db(db.clone()));
 
     // One AUR client for the whole server, for the same reason as the store
     // above: it owns the cached official repository databases and the names

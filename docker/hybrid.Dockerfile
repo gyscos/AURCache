@@ -160,9 +160,8 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
 
 # Everything this image runs, installed as packages: the four binaries, the two
 # users and their group membership, the directories and their modes, the
-# sudoers entry, the patched makechrootpkg, and the wrapper that confines the
-# server's PKGBUILD parser. pacman pulls devtools and alpm-pkgbuild-bridge as
-# ordinary dependencies.
+# sudoers entry, and the patched makechrootpkg. pacman pulls devtools and
+# alpm-pkgbuild-bridge as ordinary dependencies.
 #
 # This is the point of packaging: the image stops being a second,
 # hand-maintained copy of the host contract that can drift from the documented

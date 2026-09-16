@@ -55,15 +55,6 @@ server)
     install -Dm644 "$PKG/aurcache.service" \
         "$PKGDIR/usr/lib/systemd/system/aurcache.service"
     install -Dm644 "$PKG/server.env" "$PKGDIR/etc/aurcache/server.env"
-
-    # The server parses a PKGBUILD by sourcing it, which runs attacker-supplied
-    # bash in the process holding the database credentials. `alpm-srcinfo`
-    # resolves the bridge through PATH, so the confining wrapper is installed
-    # under the same name in a directory the unit puts *first* -- shadowing
-    # /usr/bin/alpm-pkgbuild-bridge the way the worker shadows makechrootpkg.
-    # Installing the bridge without this wrapper would parse unconfined.
-    install -Dm755 "$PKG/alpm-pkgbuild-bridge-wrapper" \
-        "$PKGDIR/usr/lib/aurcache/bin/alpm-pkgbuild-bridge"
     ;;
 worker)
     install -Dm755 "$BINDIR/aurcache-worker" "$PKGDIR/usr/bin/aurcache-worker"

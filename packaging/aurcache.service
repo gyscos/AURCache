@@ -17,12 +17,6 @@ RestartSec=5s
 
 # Read at start, so an operator edits one file rather than the unit.
 EnvironmentFile=-/etc/aurcache/server.env
-# /usr/lib/aurcache/bin first so `alpm-srcinfo` resolves the confining wrapper
-# rather than /usr/bin/alpm-pkgbuild-bridge, which would source a PKGBUILD
-# unsandboxed in this process. Deliberately *after* the EnvironmentFile:
-# systemd applies these in file order and the last wins, so a PATH in
-# server.env cannot drop the wrapper's directory and quietly unconfine parsing.
-Environment=PATH=/usr/lib/aurcache/bin:/usr/local/bin:/usr/bin:/bin
 
 # The server needs no privilege at all: it listens on three high ports, talks to
 # a database and writes files under its own directory. Hardened accordingly --

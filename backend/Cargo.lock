@@ -826,6 +826,7 @@ dependencies = [
 name = "aurcache-utils"
 version = "0.0.0"
 dependencies = [
+ "alpm-pkgbuild",
  "alpm-srcinfo",
  "alpm-types",
  "anyhow",

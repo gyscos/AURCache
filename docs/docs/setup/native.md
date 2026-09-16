@@ -66,15 +66,40 @@ to you.
 
 Reading a PKGBUILD means *sourcing* it, so every package the server inspects
 runs bash in the process that holds the database credentials and owns the
-repository. The package therefore ships a wrapper at
-`/usr/lib/aurcache/bin/alpm-pkgbuild-bridge` that confines each parse with
-`aurcache-sandbox`, and the unit puts that directory ahead of `/usr/bin` on
-`PATH` so `alpm-srcinfo` resolves the wrapper rather than the bridge from the
-`alpm-pkgbuild-bridge` package directly.
+repository. The server never runs `alpm-pkgbuild-bridge` directly: it runs it
+through `aurcache-sandbox`, naming both by absolute path, and refuses to parse
+at all if that binary is missing. Nothing depends on `PATH`, so nothing about
+your environment can quietly unconfine a parse.
 
-The unit sets `PATH` *after* its `EnvironmentFile`, so a `PATH` in
-`server.env` cannot drop that directory and quietly unconfine parsing. If you
-override `PATH` by other means, keep `/usr/lib/aurcache/bin` first.
+Each parse may write only the PKGBUILD's own directory, and cannot read the
+server's working directory (the database, the repository and the CA) or
+`/etc/aurcache` (where `server.env` keeps the database password and the OAuth
+secret). Its environment is replaced, so a PKGBUILD cannot read a secret out of
+it either. It also cannot signal the processes around it, which needs Linux
+6.12 — the server's minimum.
+
+TCP is denied as well, but that is hardening rather than a boundary: Landlock
+only covers TCP, so UDP and DNS still leave the machine. It is there because a
+parse has no reason to connect anywhere, not because it contains one that
+tries. If a package could be added that you would mind phoning home, a host
+firewall is the control that stops it.
+
+### When a package needs the network to parse
+
+About one AUR package in five hundred computes its version while being sourced,
+with `pkgver=$(curl -s https://api.github.com/…)` or `git ls-remote`. Denied the
+connection, `pkgver` comes out empty and the parse fails on the missing version
+rather than on the connection — so the error says which command wanted the
+network and names the setting below.
+
+`parse_network` (or `PARSE_NETWORK=true`) lifts the TCP denial for parsing.
+Everything else stays: the parse still writes only its own directory, still
+cannot read the server's state, still gets no secrets in its environment, and
+is still isolated from the processes around it. It is a global setting today,
+so turn it on only if you would run those packages' `pkgver` command yourself.
+
+`AURCACHE_PROTECTED_DIR` names further directories to keep unreadable
+(colon-separated). It adds to the list above rather than replacing it.
 
 Everything is optional in `server.env`; the defaults work for a single machine.
 Two worth setting before anything else reaches it:

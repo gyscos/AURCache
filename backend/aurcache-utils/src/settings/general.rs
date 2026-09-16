@@ -211,6 +211,7 @@ impl SettingsTraits for ApplicationSettings {
             date_format: get_setting(Setting::DateFormat, pkgid, db).await,
             build_on_new_version: get_setting(Setting::BuildOnNewVersion, pkgid, db).await,
             persistent_builddir: get_setting(Setting::PersistentBuilddir, pkgid, db).await,
+            parse_network: get_setting(Setting::ParseNetwork, pkgid, db).await,
         })
     }
 

@@ -40,6 +40,9 @@ pub struct ApplicationSettings {
     /// Keep this package's build tree between builds instead of starting from
     /// an empty one. See `design/persistent-build-directory.md`.
     pub persistent_builddir: SettingsEntry<bool>,
+    /// Let a PKGBUILD reach the network while the server parses it.
+    /// See [`Setting::ParseNetwork`].
+    pub parse_network: SettingsEntry<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +65,7 @@ pub enum Setting {
     BuilderImage,
     MakepkgConf,
     PacmanConf,
+    ParseNetwork,
 }
 
 /// Keys of settings that no longer exist, which may still be stored or dumped.
@@ -81,7 +85,7 @@ impl Setting {
     /// `date_format` and `build_on_new_version` were served by `GET /settings`
     /// but rejected by `PATCH /settings/<key>` as unknown, so neither could be
     /// changed through the API at all.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::MaxConcurrentBuilds,
         Self::VersionCheckInterval,
         Self::AutoUpdateInterval,
@@ -93,6 +97,7 @@ impl Setting {
         Self::BuilderImage,
         Self::MakepkgConf,
         Self::PacmanConf,
+        Self::ParseNetwork,
     ];
 
     /// This setting's stable key, environment variable, and built-in default.
@@ -183,6 +188,18 @@ impl Setting {
                 env_name: None,
                 default: "",
             },
+            // Parsing a PKGBUILD runs it, so the parse is confined and denied
+            // TCP. A small minority of packages compute `pkgver` from the
+            // network while being sourced -- `pkgver=$(curl -s
+            // https://api.github.com/...)` and `git ls-remote` are the usual
+            // shapes -- and parse to nothing without it. Off by default
+            // because it is the rare case, and because the answer a PKGBUILD
+            // fetches is under the same control as the PKGBUILD itself.
+            Self::ParseNetwork => SettingsMeta {
+                key: "parse_network",
+                env_name: Some("PARSE_NETWORK"),
+                default: "false",
+            },
         }
     }
 
@@ -241,6 +258,7 @@ mod tests {
                 Setting::BuilderImage => 8,
                 Setting::MakepkgConf => 9,
                 Setting::PacmanConf => 10,
+                Setting::ParseNetwork => 11,
             }
         }
 

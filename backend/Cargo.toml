@@ -69,6 +69,7 @@ tar = "0.4.46"
 utoipa = { version = "5.5.0", features = ["rocket_extras"] }
 tempfile = "3.27.0"
 alpm-srcinfo = "0.6.3"
+alpm-pkgbuild = "0.2.4"
 diffy = "0.5"
 
 [profile.release]

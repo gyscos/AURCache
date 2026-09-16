@@ -6,14 +6,17 @@ use std::sync::Arc;
 
 use alpm_srcinfo::SourceInfoV1;
 use aurcache_common::api::package::SourceFileContent;
+use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_db::packages::SourceData;
 use git2::Oid;
 use lru::LruCache;
+use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex;
 
 use crate::git::checkout::EmptyRepository;
 use crate::patch::SourcePatch;
 use crate::pkgbuild::fix_source_urls;
+use crate::settings::general::SettingsTraits;
 
 /// Base URL for AUR git repositories. AUR packages are unified with git
 /// sources: `https://aur.archlinux.org/{pkgbase}.git`, ref `HEAD`, no
@@ -115,6 +118,15 @@ pub struct SnapshotStore {
     cache: Mutex<LruCache<String, Arc<CacheEntry>>>,
     checkout_root: PathBuf,
     aur_git_base_url: String,
+    /// Where the `parse_network` setting is read from, when there is one.
+    ///
+    /// Parsing a PKGBUILD runs it, so it happens confined and without the
+    /// network unless a deployment says otherwise; see
+    /// [`crate::pkgbuild::Bridge`]. The setting is resolved per parse rather
+    /// than once, so turning it on through the API applies to the next parse
+    /// instead of the next restart. Tests construct a store without a database
+    /// and get the default.
+    db: Option<DatabaseConnection>,
 }
 
 impl Default for SnapshotStore {
@@ -144,7 +156,29 @@ impl SnapshotStore {
             )),
             checkout_root,
             aur_git_base_url: aur_git_base_url.into(),
+            db: None,
         }
+    }
+
+    /// Attach the database the `parse_network` setting is stored in.
+    #[must_use]
+    pub fn with_db(mut self, db: DatabaseConnection) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Whether a PKGBUILD parsed now may use the network.
+    ///
+    /// Global only: the packages that need it are identified by what their
+    /// PKGBUILD does when sourced, which is known before any package row
+    /// exists. A per-package override can layer on later by passing the id.
+    async fn parse_network(&self) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        ApplicationSettings::get::<bool>(Setting::ParseNetwork, None, db)
+            .await
+            .value
     }
 
     /// Return the parsed `.SRCINFO` for `source_data`, fetching it if not cached.
@@ -497,10 +531,15 @@ impl SnapshotStore {
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
 
-        let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path)
-                .await
-                .map_err(|e| explain_source_failure(source_data, e))?;
+        let (commit, archive_bytes, pkgbase, sourceinfo) = checkout_and_parse(
+            &repo_url,
+            &git_ref,
+            &subfolder,
+            &path,
+            self.parse_network().await,
+        )
+        .await
+        .map_err(|e| explain_source_failure(source_data, e))?;
 
         let changed = previous_commit != Some(commit);
         if changed {
@@ -513,7 +552,7 @@ impl SnapshotStore {
             // Re-apply whichever patch (if any) was previously active for
             // this source, so a `refresh` doesn't silently drop it.
             let existing_patch = previous.and_then(|entry| entry.patch.clone());
-            let entry = build_cache_entry(commit, raw, existing_patch)?;
+            let entry = build_cache_entry(commit, raw, existing_patch, self.parse_network().await)?;
             self.cache.lock().await.put(cache_key, entry);
         }
         Ok(changed)
@@ -542,17 +581,22 @@ impl SnapshotStore {
 
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
-        let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path)
-                .await
-                .map_err(|e| explain_source_failure(source_data, e))?;
+        let (commit, archive_bytes, pkgbase, sourceinfo) = checkout_and_parse(
+            &repo_url,
+            &git_ref,
+            &subfolder,
+            &path,
+            self.parse_network().await,
+        )
+        .await
+        .map_err(|e| explain_source_failure(source_data, e))?;
         let raw = SourceSnapshot {
             archive_bytes,
             sourceinfo,
             pkgbase,
         };
 
-        let entry = build_cache_entry(commit, raw, patch)?;
+        let entry = build_cache_entry(commit, raw, patch, self.parse_network().await)?;
 
         self.cache.lock().await.put(cache_key, Arc::clone(&entry));
         Ok(entry)
@@ -721,6 +765,7 @@ async fn checkout_and_parse(
     git_ref: &str,
     subfolder: &str,
     path: &Path,
+    network: bool,
 ) -> anyhow::Result<(Oid, Vec<u8>, String, Option<SourceInfoV1>)> {
     use crate::git::checkout::checkout_or_fetch_repo_ref;
     use crate::pkgbuild::parse_pkgbuild;
@@ -754,10 +799,10 @@ async fn checkout_and_parse(
                     "{} does not parse, parsing the PKGBUILD instead: {err:#}",
                     srcinfo_path.display()
                 );
-                parse_pkgbuild(&pkgbuild_path)
+                parse_pkgbuild(&pkgbuild_path, network)
             })
     } else {
-        parse_pkgbuild(&pkgbuild_path)
+        parse_pkgbuild(&pkgbuild_path, network)
     };
 
     let (pkgbase, sourceinfo) = match parsed {
@@ -811,6 +856,7 @@ fn fallback_pkgbase(package_dir: &Path) -> String {
 fn apply_patch_to_archive(
     archive_bytes: &[u8],
     patch: &SourcePatch,
+    network: bool,
 ) -> anyhow::Result<(Vec<u8>, SourceInfoV1)> {
     use crate::pkgbuild::parse_pkgbuild_content;
 
@@ -829,7 +875,7 @@ fn apply_patch_to_archive(
         .ok_or_else(|| anyhow::anyhow!("Archive has no PKGBUILD to parse"))?;
     let pkgbuild = std::str::from_utf8(pkgbuild)
         .map_err(|_| anyhow::anyhow!("PKGBUILD is not valid UTF-8, cannot parse"))?;
-    let sourceinfo = parse_pkgbuild_content(pkgbuild)?;
+    let sourceinfo = parse_pkgbuild_content(pkgbuild, network)?;
 
     let tar_gz_bytes = create_archive_from_memory(&pkgbase, &files)?;
 
@@ -843,6 +889,7 @@ fn build_cache_entry(
     commit: Oid,
     raw: SourceSnapshot,
     patch: Option<SourcePatch>,
+    network: bool,
 ) -> anyhow::Result<Arc<CacheEntry>> {
     Ok(match patch {
         None => Arc::new(CacheEntry {
@@ -853,7 +900,7 @@ fn build_cache_entry(
         }),
         Some(patch) => {
             let (patched_bytes, patched_sourceinfo) =
-                apply_patch_to_archive(&raw.archive_bytes, &patch)?;
+                apply_patch_to_archive(&raw.archive_bytes, &patch, network)?;
             let patched = SourceSnapshot {
                 archive_bytes: patched_bytes,
                 sourceinfo: Some(patched_sourceinfo),
@@ -1044,17 +1091,13 @@ license=('MIT')
         create_archive_with_pkgbase_dir(&package_dir, pkgbase).unwrap()
     }
 
-    /// `parse_pkgbuild` shells out to an external bridge script that's only
-    /// guaranteed to be present inside the builder image (see
-    /// `docker/Dockerfile`), not in plain `cargo test` environments. Skip
-    /// tests that need it when it's missing instead of failing the suite.
+    /// `parse_pkgbuild` runs an external bridge script through
+    /// `aurcache-sandbox`; see [`crate::pkgbuild::tests::bridge_available`].
     ///
     /// Anything that applies a `SourcePatch` needs it too: patching regenerates
     /// `.SRCINFO` from the patched `PKGBUILD` via the same bridge.
     fn pkgbuild_bridge_available() -> bool {
-        std::env::var_os("PATH").is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join("alpm-pkgbuild-bridge").is_file())
-        })
+        crate::pkgbuild::tests::bridge_available()
     }
 
     /// Every entry path in an archive, directories included.
@@ -1080,7 +1123,7 @@ license=('MIT')
     #[test]
     fn apply_patch_to_archive_regenerates_srcinfo_from_patched_pkgbuild() {
         if !pkgbuild_bridge_available() {
-            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
 
@@ -1091,7 +1134,7 @@ license=('MIT')
         patch.merge_file("PKGBUILD", PKGBUILD, &patched_pkgbuild);
 
         let (new_archive_bytes, sourceinfo) =
-            apply_patch_to_archive(&archive_bytes, &patch).unwrap();
+            apply_patch_to_archive(&archive_bytes, &patch, false).unwrap();
 
         // .SRCINFO was regenerated from the patched PKGBUILD (version 2.0),
         // not copied over from the (stale, unpatched) shipped .SRCINFO.
@@ -1153,7 +1196,7 @@ license=('MIT')
     #[tokio::test]
     async fn unparseable_srcinfo_falls_back_to_pkgbuild() {
         if !pkgbuild_bridge_available() {
-            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
 
@@ -1304,7 +1347,7 @@ license=('MIT')
     #[tokio::test]
     async fn list_files_and_read_file_reuse_cache_regardless_of_active_patch() {
         if !pkgbuild_bridge_available() {
-            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
 
@@ -1352,7 +1395,7 @@ license=('MIT')
     #[tokio::test]
     async fn at_most_one_cache_entry_per_source_across_patch_changes() {
         if !pkgbuild_bridge_available() {
-            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
 
@@ -1394,7 +1437,7 @@ license=('MIT')
     #[tokio::test]
     async fn refresh_reapplies_previously_active_patch() {
         if !pkgbuild_bridge_available() {
-            eprintln!("skipping: alpm-pkgbuild-bridge not found on PATH");
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
 

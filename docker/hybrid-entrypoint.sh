@@ -91,17 +91,6 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-# The server parses a PKGBUILD by sourcing it, so every package it inspects runs
-# bash in this process. aurcache-server ships a wrapper that confines each parse
-# with aurcache-sandbox, installed under the same name the parser looks up; it
-# only takes effect if its directory comes first. The systemd unit sets this
-# with Environment=PATH, which a container has no manager to apply.
-export PATH="/usr/lib/aurcache/bin:$PATH"
-if [ "$(command -v alpm-pkgbuild-bridge)" != /usr/lib/aurcache/bin/alpm-pkgbuild-bridge ]; then
-    echo "refusing to start: PKGBUILD parsing would run unconfined" >&2
-    exit 1
-fi
-
 # Same delegation the split worker image does, minus the sudo: this entrypoint
 # already runs as root. The embedded worker is dropped to `aurcache` below, and
 # without this it cannot create the per-build cgroup that reports peak memory.
