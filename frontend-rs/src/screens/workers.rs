@@ -157,7 +157,7 @@ pub fn Workers() -> Element {
                                     }
                                 }
                             }
-                            WorkersTable { workers: shown, busy: busy(), act, known }
+                            WorkersTable { workers: shown, fleet: list.clone(), busy: busy(), act, known }
                         }
                     },
                 }
@@ -275,6 +275,12 @@ fn AddFirstWorker() -> Element {
 #[component]
 fn WorkersTable(
     workers: Vec<Worker>,
+    /// Every worker there is, retired ones included.
+    ///
+    /// Beside the rows actually shown, because a link has to know whether a
+    /// name is unique across the *whole* fleet: the row a shared name collides
+    /// with is most often the retired one this list is hiding.
+    fleet: Vec<Worker>,
     /// The worker with an action in flight, if any.
     busy: Option<i32>,
     /// `(id, approve)` — true approves, false revokes.
@@ -315,13 +321,40 @@ fn WorkersTable(
                 }
                 tbody {
                     for worker in workers.iter() {
+                        // Computed once per row and used by both links: it needs
+                        // the whole fleet to know whether this worker's name is
+                        // unique, which the row itself does not.
+                        {
+                        let route = crate::screens::worker::worker_route(worker, &fleet);
+                        rsx! {
                         tr { key: "{worker.id}", class: if worker.status.is_retired() { "opacity-50" } else { "" },
                             td {
                                 // The fingerprint is the identity; the name is
                                 // whatever the machine called itself and is not
                                 // unique.
-                                div { class: "font-mono text-sm", title: "{worker.cert_fingerprint}",
-                                    "{worker.name}"
+                                div { class: "font-mono text-sm flex items-center gap-1",
+                                    // The name is the way in. The fingerprint
+                                    // is the identity behind it; the name is
+                                    // whatever the machine called itself and is
+                                    // not unique.
+                                    Link {
+                                        class: "link-hover",
+                                        title: "{worker.cert_fingerprint}",
+                                        to: route.clone(),
+                                        "{worker.name}"
+                                    }
+                                    // Something this machine was configured
+                                    // with is not what it is running. Shown
+                                    // here rather than only inside the panel:
+                                    // nobody opens a panel they have no reason
+                                    // to suspect.
+                                    if worker.settings_rejected.is_some_and(|n| n > 0) {
+                                        span {
+                                            class: "text-warning",
+                                            title: "This worker refused a configured value; open it to see which.",
+                                            "\u{26a0}"
+                                        }
+                                    }
                                 }
                             }
                             td { StatusBadge { status: worker.status } }
@@ -382,8 +415,11 @@ fn WorkersTable(
                                     worker: worker.clone(),
                                     busy: busy == Some(worker.id),
                                     act,
+                                    route,
                                 }
                             }
+                        }
+                        }
                         }
                     }
                 }
@@ -399,12 +435,25 @@ fn WorkersTable(
 /// first time. Revoke disappears once revoked, because there is nothing left to
 /// take away.
 #[component]
-fn WorkerActions(worker: Worker, busy: bool, act: EventHandler<(i32, bool)>) -> Element {
+fn WorkerActions(
+    worker: Worker,
+    busy: bool,
+    /// `(id, approve)` -- true approves, false revokes.
+    act: EventHandler<(i32, bool)>,
+    /// Where this worker's own page is.
+    route: Route,
+) -> Element {
     let id = worker.id;
     rsx! {
         div { class: "flex gap-2 justify-end",
             if busy {
                 span { class: "loading loading-spinner loading-xs" }
+            }
+            Link {
+                class: "btn btn-ghost btn-xs",
+                title: "What this worker can be configured with, and what it is running",
+                to: route,
+                "Settings"
             }
             if !worker.status.can_build() {
                 button {
@@ -428,7 +477,7 @@ fn WorkerActions(worker: Worker, busy: bool, act: EventHandler<(i32, bool)>) -> 
 }
 
 #[component]
-fn StatusBadge(status: ApprovalStatus) -> Element {
+pub(crate) fn StatusBadge(status: ApprovalStatus) -> Element {
     let (label, class) = match status {
         ApprovalStatus::Approved => ("approved", "badge-success"),
         ApprovalStatus::Pending => ("pending", "badge-warning"),
@@ -470,7 +519,7 @@ fn kind_label(worker: &Worker) -> Option<String> {
 /// worth flagging: "which of my workers are still on it" is the question an
 /// operator asks before removing it.
 #[component]
-fn KindBadge(worker: Worker) -> Element {
+pub(crate) fn KindBadge(worker: Worker) -> Element {
     let Some(label) = kind_label(&worker) else {
         return rsx! {
             span {
@@ -501,7 +550,7 @@ fn KindBadge(worker: Worker) -> Element {
 /// Emulated architectures are marked rather than listed alongside the native
 /// ones: they work, but slowly, and a fleet that looks like it has four native
 /// aarch64 machines when it has none is worth not implying.
-fn architectures(worker: &Worker) -> String {
+pub(crate) fn architectures(worker: &Worker) -> String {
     match (
         worker.native_arches.is_empty(),
         worker.emulated_arches.is_empty(),
@@ -545,6 +594,7 @@ mod tests {
             active_builds: 0,
             successful_builds: 0,
             failed_builds: 0,
+            settings_rejected: None,
         }
     }
 
@@ -672,7 +722,7 @@ fn liveness_hint(online: bool) -> &'static str {
 /// saying so for as long as the machine stayed off. This is the column that
 /// answers whether the fleet is actually there.
 #[component]
-fn Liveness(worker: Worker) -> Element {
+pub(crate) fn Liveness(worker: Worker) -> Element {
     // A revoked worker is not expected to be connected, so absence is not
     // worth reporting as though something were wrong.
     if worker.status.is_retired() {

@@ -245,25 +245,66 @@ INSERT INTO download_counts (file_name, count, last_download) VALUES
 -- `signed_cert` is left NULL throughout: the list endpoint no longer returns
 -- it, and a fixture carrying a fake PEM would only suggest it mattered here.
 DELETE FROM workers;
+-- Ids are explicit because the worker page is reached at `/worker/<id>`, and a
+-- route check naming one has to land on the same machine every run.
 INSERT INTO workers
-  (name, status, cert_fingerprint, native_arches, emulated_arches, last_seen, version, package_affinity, priority)
+  (id, name, status, cert_fingerprint, native_arches, emulated_arches, last_seen, version, package_affinity, priority)
 VALUES
   -- Approved, busy, and tuned: reserved for one package and preferred over the
   -- others, so both of those columns have something to show.
-  ('builder-01', 'approved', 'sha256:1111111111111111aaaa', 'x86_64', '',
+  (1, 'builder-01', 'approved', '1111111111111111aaaa1111111111111111aaaa1111111111111111aaaa1111', 'x86_64', '',
    CAST(strftime('%s','now') AS INTEGER) - 5, '0.1.0', 'visual-studio-code-bin', 10),
   -- Approved, but only reaches aarch64 through emulation. Its reservation
   -- names no known package, so the column has to leave it as plain text.
-  ('builder-arm', 'approved', 'sha256:2222222222222222bbbb', 'aarch64', 'armv7h',
+  (2, 'builder-arm', 'approved', '2222222222222222bbbb2222222222222222bbbb2222222222222222bbbb2222', 'aarch64', 'armv7h',
    CAST(strftime('%s','now') AS INTEGER) - 200000, '0.1.0', 'not-a-package', 0),
   -- Enrolled and waiting. Has never checked in, so "last seen" is never rather
   -- than a long time ago.
-  ('new-machine', 'pending', 'sha256:3333333333333333cccc', 'x86_64', '',
+  (3, 'new-machine', 'pending', '3333333333333333cccc3333333333333333cccc3333333333333333cccc3333', 'x86_64', '',
    NULL, '0.1.0', '', 0),
   -- Retired. Kept so old builds still name the machine that ran them, and
   -- hidden behind the toggle by default.
-  ('old-builder', 'revoked', 'sha256:4444444444444444dddd', 'x86_64', '',
-   CAST(strftime('%s','now') AS INTEGER) - 5000000, '0.0.9', '', 0);
+  (4, 'old-builder', 'revoked', '4444444444444444dddd4444444444444444dddd4444444444444444dddd4444', 'x86_64', '',
+   CAST(strftime('%s','now') AS INTEGER) - 5000000, '0.0.9', '', 0),
+  -- A machine replaced by another of the same hostname: the retired row keeps
+  -- the name, so two workers answer to it. This is why worker names are not
+  -- unique and the URL has a way past them.
+  (5, 'replaced-host', 'approved', '5555555555555555eeee5555555555555555eeee5555555555555555eeee5555', 'x86_64', '',
+   CAST(strftime('%s','now') AS INTEGER) - 20, '0.1.0', '', 0),
+  (6, 'replaced-host', 'revoked', '6666666666666666ffff6666666666666666ffff6666666666666666ffff6666', 'x86_64', '',
+   CAST(strftime('%s','now') AS INTEGER) - 9000000, '0.0.9', '', 0);
+
+-- What builder-01 declares it can be configured with, and what those settings
+-- actually resolved to on it. Stored exactly as a worker reports them: an array
+-- of declarations, and a map of effective values keyed by the same names.
+--
+-- One of them is rejected on purpose. `WORKER_BUILDDIR_MAX_BYTES=450 giraffes`
+-- is the shape of the failure this page exists for -- a value that was
+-- configured, did not parse, and left the machine silently running the default.
+UPDATE workers SET
+  settings_declaration = '[
+    {"key":"concurrency","kind":{"type":"integer","min":1},
+     "description":"How many builds this worker runs at once.",
+     "category":"Scheduling","default":"1","env_var":"WORKER_CONCURRENCY",
+     "applies":"next_job"},
+    {"key":"builddir_max_bytes","kind":{"type":"size"},
+     "description":"Total disk the kept build trees may occupy.",
+     "category":"Build trees","default":"200G",
+     "env_var":"WORKER_BUILDDIR_MAX_BYTES","applies":"next_loop"},
+    {"key":"build_memory_max","kind":{"type":"size"},
+     "description":"Memory one build may use before it is killed.",
+     "category":"Build limits","env_var":"WORKER_BUILD_MEMORY_MAX",
+     "applies":"next_job"}
+  ]',
+  effective_config = '{
+    "settings":{
+      "concurrency":{"value":"2","source":"env","status":"applied"},
+      "builddir_max_bytes":{"value":"200G","source":"default","status":"rejected",
+        "reason":"WORKER_BUILDDIR_MAX_BYTES ignored: \"450 giraffes\" is not a size (bytes, or a size such as 500M, 450G, 450GiB or 450GB)"},
+      "build_memory_max":{"source":"default","status":"applied"}
+    }
+  }'
+ WHERE name IN ('builder-01', 'replaced-host') AND status = 'approved';
 
 -- Attribute builds to the machines that ran them, so the fleet page has a
 -- record to report rather than "no builds yet" on every row. The split is

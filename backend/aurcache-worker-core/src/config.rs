@@ -7,6 +7,7 @@
 //! executor concern, so each executor crate parses its own settings alongside
 //! this (see `aurcache_worker::config::Config`).
 
+use crate::settings::{WorkerSettings, keys, protocol_settings};
 pub use aurcache_common::units::{parse_duration, parse_size};
 use std::path::PathBuf;
 
@@ -81,6 +82,16 @@ pub struct CoreConfig {
     /// When this is set the server is told not to send one at all, rather than
     /// sending bytes the worker would discard.
     pub mirrorlist: Option<String>,
+    /// The settings this worker declares, resolved against its environment.
+    ///
+    /// Held rather than consumed and discarded: it is what registration reports
+    /// as this worker's configurable surface and what the heartbeat reports it
+    /// is running, and both have to say the same thing as the fields above,
+    /// which read their values from it.
+    ///
+    /// An executor extends it with its own table
+    /// ([`WorkerSettings::extended`](crate::settings::WorkerSettings::extended)).
+    pub settings: WorkerSettings,
 }
 
 /// Read an environment variable, treating blank values as unset.
@@ -201,30 +212,14 @@ impl CoreConfig {
             .map(|s| parse_arches(&s))
             .unwrap_or_default();
 
-        // Reuses `parse_arches`: both are comma/space separated token lists.
-        let packages = env_opt("WORKER_PACKAGES")
-            .map(|s| parse_arches(&s))
-            .unwrap_or_default();
+        let settings = WorkerSettings::from_env(protocol_settings());
 
-        // Default to one build at a time, not to the core count.
-        //
-        // Each build is *already* parallel: the server renders
-        // `MAKEFLAGS=-j$(nproc)` into every job's makepkg.conf. Defaulting
-        // concurrency to nproc therefore multiplies out to nproc x nproc
-        // compiler processes — 576 on a 24-core machine — while each build also
-        // holds its own chroot copy and its own package cache. The result is
-        // memory exhaustion and disk pressure, not throughput.
-        //
-        // One is the honest default: predictable, and an operator who has the
-        // headroom opts in with WORKER_CONCURRENCY.
-        let concurrency = env_parse::<usize>("WORKER_CONCURRENCY")
-            .filter(|n| {
-                if *n == 0 {
-                    tracing::warn!("ignoring WORKER_CONCURRENCY=0 (must be at least 1); using 1");
-                }
-                *n > 0
-            })
-            .unwrap_or(1);
+        // Clamped rather than refused: a worker that ran no builds at all would
+        // be a machine silently doing nothing, and the declared minimum of 1 is
+        // what the value is checked against before it ever gets here.
+        let concurrency = usize::try_from(settings.integer(keys::CONCURRENCY).unwrap_or(1))
+            .unwrap_or(1)
+            .max(1);
 
         Self {
             aurcache_url: env_opt("AURCACHE_URL")
@@ -239,8 +234,9 @@ impl CoreConfig {
             enrollment_token: env_opt("AURCACHE_ENROLLMENT_TOKEN"),
             native_arches,
             emulated_arches,
-            packages,
-            priority: env_parse("WORKER_PRIORITY").unwrap_or(0),
+            packages: settings.list(keys::PACKAGES),
+            priority: i32::try_from(settings.integer(keys::PRIORITY).unwrap_or(0))
+                .unwrap_or(i32::MAX),
             concurrency,
             name: env_opt("WORKER_NAME").unwrap_or_else(detect_hostname),
             data_dir: env_opt("WORKER_DATA_DIR")
@@ -248,22 +244,25 @@ impl CoreConfig {
                 .unwrap_or_else(|| PathBuf::from("/var/lib/aurcache-worker")),
             heartbeat_interval: env_duration("WORKER_HEARTBEAT_INTERVAL").unwrap_or(15),
             lease_ttl: env_duration("LEASE_TTL").unwrap_or(60),
-            poll_interval: env_duration("WORKER_POLL_INTERVAL").unwrap_or(10),
+            poll_interval: settings
+                .duration(keys::POLL_INTERVAL)
+                .unwrap_or(crate::settings::DEFAULT_POLL_INTERVAL),
             // What bounds the persistent build cache. A cap rather than only
             // a free-space floor, because a floor does nothing on a large pool:
             // trees would grow into the terabytes before it ever triggered.
-            // Default 200 GiB -- enough for one very large tree, small enough
-            // that opting in a second makes an operator choose.
-            builddir_max_bytes: env_size("WORKER_BUILDDIR_MAX_BYTES")
-                .unwrap_or(200 * 1024 * 1024 * 1024),
-            // Secondary floor, covering what the cap cannot see: a small disk,
-            // or one shared with something else that grew.
-            builddir_min_free: env_size("WORKER_BUILDDIR_MIN_FREE")
-                .unwrap_or(50 * 1024 * 1024 * 1024),
-            build_timeout: env_duration("WORKER_BUILD_TIMEOUT").unwrap_or(3 * 60 * 60),
+            builddir_max_bytes: settings
+                .size(keys::BUILDDIR_MAX_BYTES)
+                .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MAX_BYTES),
+            builddir_min_free: settings
+                .size(keys::BUILDDIR_MIN_FREE)
+                .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MIN_FREE),
+            build_timeout: settings
+                .duration(keys::BUILD_TIMEOUT)
+                .unwrap_or(crate::settings::DEFAULT_BUILD_TIMEOUT),
             repo_host: env_opt("AURCACHE_REPO_HOST"),
             repo_url: env_opt("AURCACHE_REPO_URL"),
             mirrorlist: local_mirrorlist(),
+            settings,
         }
     }
 }

@@ -23,3 +23,5 @@ pub mod protocol;
 pub mod repo;
 pub mod report;
 pub mod runner;
+/// What a worker declares it can be configured with, and how it resolves one.
+pub mod settings;

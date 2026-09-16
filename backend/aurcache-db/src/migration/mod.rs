@@ -29,6 +29,8 @@ mod m20260911_000000_build_trigger_end_reason;
 mod m20260914_000000_publishing_is_pending;
 mod m20260915_000000_retire_build_limit_settings;
 mod m20260916_000000_build_vcs_sources;
+mod m20260917_000000_retire_server_build_settings;
+mod m20260917_000001_worker_configuration;
 
 pub struct Migrator;
 
@@ -72,6 +74,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000000_publishing_is_pending::Migration),
             Box::new(m20260915_000000_retire_build_limit_settings::Migration),
             Box::new(m20260916_000000_build_vcs_sources::Migration),
+            Box::new(m20260917_000000_retire_server_build_settings::Migration),
+            Box::new(m20260917_000001_worker_configuration::Migration),
         ]
     }
 }

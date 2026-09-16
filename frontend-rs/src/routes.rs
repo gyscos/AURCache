@@ -71,11 +71,31 @@ pub enum Route {
 
         #[route("/workers")]
         Workers {},
+        // Singular for one of them, as `/package/:pkgbase` is beside
+        // `/packages`. By name, which is what an operator has in hand -- but a
+        // name is whatever a machine reports and a retired row keeps its own
+        // for ever, so two workers can share one, and the name alone then
+        // offers a choice rather than guessing.
+        //
+        // `:..name` is a catch-all because a worker name is free text: nothing
+        // stops `WORKER_NAME` containing a slash, and a single segment would
+        // silently resolve `/worker/ci/runner` as something else.
+        #[route("/worker/:..name")]
+        Worker { name: Vec<String> },
+        // The escape hatch out of a shared name, and the one URL here that does
+        // not carry one: the fingerprint is the identity, so it needs no help
+        // to pick a worker out. Under `/workers/` rather than `/worker/` so it
+        // cannot be mistaken for a name by the catch-all above.
+        #[route("/workers/by-cert/:fingerprint")]
+        WorkerByFingerprint { fingerprint: String },
         #[route("/activities")]
         Activities {},
         #[route("/settings")]
         Settings {},
-        #[route("/config-files")]
+        // Under Settings because that is the only way in: it left the sidebar
+        // once the section it belongs to was the one place that linked it.
+        #[redirect("/config-files", || Route::ConfigFiles {})]
+        #[route("/settings/config-files")]
         ConfigFiles {},
 
         #[route("/:..segments")]
@@ -95,7 +115,6 @@ pub enum MenuEntry {
     Activities,
     Workers,
     Settings,
-    ConfigFiles,
 }
 
 impl Route {
@@ -118,9 +137,12 @@ impl Route {
             | Self::PackageSource { .. }
             | Self::PackageConfigFiles { .. } => Some(MenuEntry::Packages),
             Self::Activities { .. } => Some(MenuEntry::Activities),
-            Self::Workers { .. } => Some(MenuEntry::Workers),
-            Self::Settings { .. } => Some(MenuEntry::Settings),
-            Self::ConfigFiles { .. } => Some(MenuEntry::ConfigFiles),
+            Self::Workers { .. } | Self::Worker { .. } | Self::WorkerByFingerprint { .. } => {
+                Some(MenuEntry::Workers)
+            }
+            // Reached from the Settings page and nowhere else, so it keeps
+            // that entry highlighted rather than clearing the menu.
+            Self::Settings { .. } | Self::ConfigFiles { .. } => Some(MenuEntry::Settings),
             Self::NotFound { .. } => None,
         }
     }
@@ -161,6 +183,13 @@ mod tests {
         assert_eq!(
             entry_for("/package/hello/config-files"),
             Some(MenuEntry::Packages)
+        );
+
+        assert_eq!(entry_for("/workers"), Some(MenuEntry::Workers));
+        assert_eq!(entry_for("/worker/builder-01"), Some(MenuEntry::Workers));
+        assert_eq!(
+            entry_for("/workers/by-cert/0f1e2d3c4b5a"),
+            Some(MenuEntry::Workers)
         );
     }
 
@@ -210,6 +239,18 @@ mod tests {
                 view: ViewParams::default(),
                 q: String::new()
             }
+        );
+    }
+
+    /// The config files moved under Settings when they left the sidebar. A
+    /// bookmark of the old path still has to land on them.
+    #[test]
+    fn the_old_config_files_path_still_arrives() {
+        assert_eq!(Route::ConfigFiles {}.to_string(), "/settings/config-files");
+        assert_eq!(entry_for("/config-files"), Some(MenuEntry::Settings));
+        assert_eq!(
+            entry_for("/settings/config-files"),
+            Some(MenuEntry::Settings)
         );
     }
 
@@ -282,6 +323,12 @@ mod tests {
                 path: vec!["subdir".into(), "patch.diff".into()],
             },
             Route::Workers {},
+            Route::Worker {
+                name: vec!["builder-01".into()],
+            },
+            Route::WorkerByFingerprint {
+                fingerprint: "0f1e2d3c4b5a".into(),
+            },
             Route::Activities {},
             Route::Settings {},
             Route::ConfigFiles {},
@@ -290,6 +337,30 @@ mod tests {
             let parsed =
                 Route::from_str(&url).unwrap_or_else(|e| panic!("{url} should parse back: {e}"));
             assert_eq!(parsed, route, "round trip through {url}");
+        }
+    }
+
+    /// A worker is called whatever its machine calls itself, which is a
+    /// hostname at best and arbitrary at worst -- so the name has to survive a
+    /// URL the same way a pkgbase does.
+    #[test]
+    fn worker_names_with_url_significant_characters_survive() {
+        for name in [
+            "builder-01",
+            "build.example.com",
+            "worker 2",
+            "a+b",
+            "ci/runner",
+        ] {
+            let route = Route::Worker {
+                name: name.split('/').map(str::to_string).collect(),
+            };
+            let url = route.to_string();
+            assert_eq!(
+                Route::from_str(&url).ok(),
+                Some(route),
+                "worker name {name} broke on the way through {url}"
+            );
         }
     }
 

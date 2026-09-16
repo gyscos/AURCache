@@ -123,9 +123,56 @@ pub fn parse_duration(raw: impl AsRef<str>) -> Option<u64> {
     (terms > 0).then_some(total)
 }
 
+/// A number of seconds as the shortest span [`parse_duration`] reads back to
+/// exactly it: `10800` is `3h`, `5400` is `90m`, `901` stays `901`.
+///
+/// The counterpart of [`format_size`], and for the same reason: a duration
+/// shown in the field it is edited in must not change by being displayed.
+/// Single-term, because `90m` and `1h30m` are the same span and the shorter
+/// one is easier to read back.
+#[must_use]
+pub fn format_duration(seconds: u64) -> String {
+    const UNITS: [(char, u64); 4] = [
+        ('w', 7 * 24 * 60 * 60),
+        ('d', 24 * 60 * 60),
+        ('h', 60 * 60),
+        ('m', 60),
+    ];
+    UNITS
+        .iter()
+        .find(|&&(_, unit)| seconds != 0 && seconds.is_multiple_of(unit))
+        .map_or_else(
+            || seconds.to_string(),
+            |&(letter, unit)| format!("{}{letter}", seconds / unit),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every duration this renders must read back as the same number: that is
+    /// the whole contract, and it is what keeps a form from changing a value
+    /// nobody edited.
+    #[test]
+    fn formatted_durations_read_back_exactly() {
+        for seconds in [
+            0, 1, 59, 60, 90, 900, 3600, 5400, 10800, 86400, 604_800, 901,
+        ] {
+            let written = format_duration(seconds);
+            assert_eq!(parse_duration(&written), Some(seconds), "{written}");
+        }
+    }
+
+    #[test]
+    fn durations_render_in_the_largest_whole_unit() {
+        assert_eq!(format_duration(0), "0");
+        assert_eq!(format_duration(45), "45");
+        assert_eq!(format_duration(900), "15m");
+        assert_eq!(format_duration(5400), "90m");
+        assert_eq!(format_duration(3 * 3600), "3h");
+        assert_eq!(format_duration(30 * 86400), "30d");
+    }
 
     #[test]
     fn a_plain_number_is_seconds() {

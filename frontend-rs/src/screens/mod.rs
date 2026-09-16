@@ -14,7 +14,8 @@ mod package_config_files;
 mod package_source;
 mod packages;
 pub mod settings;
-mod workers;
+pub mod worker;
+pub mod workers;
 
 pub use activities::Activities;
 pub use build::Build;
@@ -29,4 +30,5 @@ pub use package_config_files::PackageConfigFiles;
 pub use package_source::PackageSource;
 pub use packages::Packages;
 pub use settings::Settings;
+pub use worker::{Worker, WorkerByFingerprint};
 pub use workers::Workers;

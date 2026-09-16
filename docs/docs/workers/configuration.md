@@ -18,6 +18,47 @@ Workers are configured entirely through environment variables — AURCache's
 Settings pages do not override them, and a worker reports its configuration
 every time it starts, so changing a value means restarting that worker.
 
+## Seeing what a worker is running
+
+A worker tells the server which of its settings can be configured, and what each
+of them resolved to on that machine. Follow a worker from the **Workers** list to
+its own page — `/worker/<name>` — to see both: the value in force, where it came
+from, and the variable that set it.
+
+Worker names are not required to be unique: a worker is called whatever its
+machine reports (`WORKER_NAME`, or the hostname), and a revoked worker keeps its
+row so old builds still name the machine that ran them. Where two workers share
+a name the page asks which you meant, and each is also reachable by the
+fingerprint that is its real identity.
+
+This is where a value that did not parse shows up. `WORKER_BUILDDIR_MAX_BYTES`
+set to something the worker cannot read does not stop it starting — it falls back
+and carries on — but the page then says the value was refused and names what is
+running instead, and the worker's row is flagged in the list. Before, the only
+trace was a line in that machine's journal.
+
+The page is read-only. Values are still the worker's own.
+
+### `_DEFAULT`: a value the server may take over
+
+Every setting that page lists reads two variables:
+
+| In the worker's environment | Meaning |
+|---|---|
+| `WORKER_CONCURRENCY=4` | **Pin.** This machine runs 4, whatever anything else says. |
+| `WORKER_CONCURRENCY_DEFAULT=4` | **Default.** This machine runs 4 until a value is set for it on the server. |
+
+Today the two behave identically, because nothing can set a value on the server
+yet. The difference is what happens when that arrives: a pinned setting stays the
+machine's to decide, and a `_DEFAULT` one becomes manageable from AURCache
+without the machine losing the value it starts from. Renaming a variable is the
+whole of the handover.
+
+Only the settings that page lists read `_DEFAULT`. The ones that decide what a
+build can reach — the chroot directory, the bind mounts, the build user — are
+deliberately not among them: a worker runs `devtools` as root, so those stay on
+the machine, where they always were.
+
 ## Identity and capabilities
 
 | Variable | Type | Description | Default |

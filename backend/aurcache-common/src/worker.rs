@@ -3,6 +3,7 @@
 //! These are shared between the backend API and the `aurcache-worker` binary,
 //! so their JSON representation is a stable contract. Keep field names stable.
 
+use crate::worker_config::{EffectiveConfig, SettingDecl};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -41,6 +42,15 @@ pub struct RegisterRequest {
     /// whether this worker still has capacity.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
+    /// The settings this worker accepts, compiled into it.
+    ///
+    /// Sent at every registration, because a worker's environment is the source
+    /// of truth for what its defaults currently are. `None` from a worker that
+    /// predates this, which the Workers page shows as "configuration not
+    /// reported by this worker version" rather than as a worker with no
+    /// settings.
+    #[serde(default)]
+    pub settings: Option<Vec<SettingDecl>>,
 }
 
 /// A worker that does not report its concurrency is assumed to run one build.
@@ -200,6 +210,14 @@ pub struct JobVcsSource {
 pub struct Heartbeat {
     pub active_build_ids: Vec<i32>,
     pub version: String,
+    /// What each declared setting resolved to, sent when it differs from what
+    /// this worker last got the server to store — which, until the server
+    /// delivers values of its own, means once per worker process.
+    ///
+    /// Rides the heartbeat rather than registration so a value that changes
+    /// without re-registering still reaches the server.
+    #[serde(default)]
+    pub effective: Option<EffectiveConfig>,
 }
 
 /// The server's answer to a heartbeat.
@@ -353,8 +371,20 @@ mod tests {
         let hb = Heartbeat {
             active_build_ids: vec![1, 2, 3],
             version: "0.1.0".into(),
+            effective: None,
         };
         assert_eq!(round_trip(&hb).active_build_ids, hb.active_build_ids);
+    }
+
+    /// A worker that predates the configuration report sends neither field, and
+    /// both ends have to keep working: the server reads a heartbeat without
+    /// `effective`, and a worker reads a registration it did not declare
+    /// settings in.
+    #[test]
+    fn the_configuration_fields_are_optional_on_the_wire() {
+        let hb: Heartbeat =
+            serde_json::from_str(r#"{"active_build_ids":[],"version":"0.1.0"}"#).expect("parse");
+        assert!(hb.effective.is_none());
     }
 
     /// An empty cancel list must deserialize — a server that has nothing to

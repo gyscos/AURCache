@@ -5,7 +5,9 @@
 //! read from the same environment, so a worker is still configured as one flat
 //! set of variables.
 
-use aurcache_worker_core::config::{CoreConfig, env_duration, env_opt, env_parse, env_size};
+use crate::settings::keys;
+use aurcache_worker_core::config::{CoreConfig, env_opt};
+use aurcache_worker_core::settings::WorkerSettings;
 use std::path::PathBuf;
 
 /// Fully-resolved configuration for the chroot worker.
@@ -85,12 +87,18 @@ impl Config {
     /// defaults for everything not explicitly set.
     #[must_use]
     pub fn from_env() -> Self {
-        let core = CoreConfig::from_env();
+        let mut core = CoreConfig::from_env();
+        // The executor's settings are declared beside the protocol ones, so
+        // registration reports one table and the fields below read from the
+        // same resolved values the server is shown.
+        core.settings =
+            std::mem::take(&mut core.settings).extended(crate::settings::chroot_settings());
+        let settings = &core.settings;
 
         let (src_budget, pkg_budget) = split_cache_budgets(
-            env_size("WORKER_CACHE_MAX_SIZE"),
-            env_size("WORKER_SRCCACHE_MAX_SIZE"),
-            env_size("WORKER_PKGCACHE_MAX_SIZE"),
+            settings.size(keys::CACHE_MAX_SIZE),
+            settings.size(keys::SRCCACHE_MAX_SIZE),
+            settings.size(keys::PKGCACHE_MAX_SIZE),
         );
 
         // The chroot lives under the data dir by default so that persisting one
@@ -111,56 +119,64 @@ impl Config {
             cache_dir: env_opt("WORKER_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/cache/aurcache-worker")),
-            keyserver: env_opt("WORKER_KEYSERVER")
-                .unwrap_or_else(|| "hkps://keyserver.ubuntu.com".to_string()),
+            keyserver: settings
+                .raw(keys::KEYSERVER)
+                .unwrap_or(crate::settings::DEFAULT_KEYSERVER)
+                .to_string(),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
             cache_max_size: src_budget,
-            cache_ttl: env_duration("WORKER_CACHE_TTL").unwrap_or(30 * 24 * 60 * 60),
+            cache_ttl: settings
+                .duration(keys::CACHE_TTL)
+                .unwrap_or(crate::settings::DEFAULT_CACHE_TTL),
             pkgcache_max_size: pkg_budget,
-            pkgcache_ttl: env_duration("WORKER_PKGCACHE_TTL").unwrap_or(0),
-            chroot_refresh_interval: env_duration("WORKER_CHROOT_REFRESH_INTERVAL")
-                .unwrap_or(15 * 60),
+            pkgcache_ttl: settings.duration(keys::PKGCACHE_TTL).unwrap_or(0),
+            chroot_refresh_interval: settings
+                .duration(keys::CHROOT_REFRESH_INTERVAL)
+                .unwrap_or(crate::settings::DEFAULT_CHROOT_REFRESH_INTERVAL),
             chroot_mode: crate::chroots::ChrootMode::parse(
                 env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
             ),
-            build_limits: limits_from_env("WORKER_BUILD"),
-            total_build_limits: limits_from_env("WORKER_TOTAL_BUILD"),
+            build_limits: limits_from_settings(
+                settings,
+                keys::BUILD_MEMORY_MAX,
+                keys::BUILD_SWAP_MAX,
+                keys::BUILD_CPUS,
+            ),
+            total_build_limits: limits_from_settings(
+                settings,
+                keys::TOTAL_BUILD_MEMORY_MAX,
+                keys::TOTAL_BUILD_SWAP_MAX,
+                keys::TOTAL_BUILD_CPUS,
+            ),
             core,
         }
     }
 }
 
-/// `<prefix>_MEMORY_MAX`, `<prefix>_SWAP_MAX` and `<prefix>_CPUS`: the same
-/// three limits per build (`WORKER_BUILD`) and for all builds together
-/// (`WORKER_TOTAL_BUILD`), read the same way.
-fn limits_from_env(prefix: &str) -> crate::cgroup::BuildLimits {
+/// The same three limits per build and for all builds together, read the same
+/// way from whichever pair of keys names them.
+fn limits_from_settings(
+    settings: &WorkerSettings,
+    memory_key: &str,
+    swap_key: &str,
+    cpus_key: &str,
+) -> crate::cgroup::BuildLimits {
     // `0` is the unlimited that leaving it unset already is, and writing it
     // would give the builds no memory at all.
-    let memory_max = env_size(&format!("{prefix}_MEMORY_MAX")).filter(|&bytes| bytes > 0);
+    let memory_max = settings.size(memory_key).filter(|&bytes| bytes > 0);
     crate::cgroup::BuildLimits {
         memory_max,
         // A memory limit means no swap beyond it unless swap is asked for; see
         // `BuildLimits::swap_max` for why it cannot simply be left alone.
-        swap_max: env_size(&format!("{prefix}_SWAP_MAX")).or_else(|| memory_max.map(|_| 0)),
-        cpus: cpus_limit(&format!("{prefix}_CPUS")),
+        swap_max: settings.size(swap_key).or_else(|| memory_max.map(|_| 0)),
+        // A non-positive count is the unlimited that unset is: zero CPUs is not
+        // a limit anyone means, and the declared minimum already turns a
+        // negative one into a reported rejection.
+        cpus: settings
+            .float(cpus_key)
+            .filter(|&cpus| cpus.is_finite() && cpus > 0.0),
     }
 }
-
-fn cpus_limit(var: &str) -> Option<f64> {
-    env_parse::<f64>(var).filter(|&cpus| {
-        let usable = cpus.is_finite() && cpus > 0.0;
-        if !usable {
-            tracing::warn!(
-                "ignoring {var}={cpus} (expected a positive number of CPUs); \
-                 builds are not CPU-limited by it"
-            );
-        }
-        usable
-    })
-}
-
-/// Total worker cache budget when nothing is configured.
-const DEFAULT_TOTAL_CACHE_SIZE: u64 = 20 * 1024 * 1024 * 1024;
 
 /// Resolve the source and package cache budgets.
 ///
@@ -176,7 +192,7 @@ const DEFAULT_TOTAL_CACHE_SIZE: u64 = 20 * 1024 * 1024 * 1024;
 /// exceeding one they did not.
 #[must_use]
 pub fn split_cache_budgets(total: Option<u64>, src: Option<u64>, pkg: Option<u64>) -> (u64, u64) {
-    let half = total.unwrap_or(DEFAULT_TOTAL_CACHE_SIZE) / 2;
+    let half = total.unwrap_or(crate::settings::DEFAULT_TOTAL_CACHE_SIZE) / 2;
     (src.unwrap_or(half), pkg.unwrap_or(half))
 }
 
@@ -202,7 +218,51 @@ mod tests {
     fn defaults_split_the_default_total() {
         let (src, pkg) = split_cache_budgets(None, None, None);
         assert_eq!(src, pkg);
-        assert_eq!(src + pkg, DEFAULT_TOTAL_CACHE_SIZE);
+        assert_eq!(src + pkg, crate::settings::DEFAULT_TOTAL_CACHE_SIZE);
+    }
+
+    /// The values every field had before they were resolved through the
+    /// declared settings table, so a key wired to the wrong field is caught
+    /// here rather than on a worker.
+    ///
+    /// Reads the process environment, as the worker does, so it asserts nothing
+    /// on a machine that has configured any of these -- which is the same
+    /// reason it is worth having: those variables are exactly what this
+    /// resolves.
+    #[test]
+    fn a_clean_environment_still_produces_the_documented_defaults() {
+        let configured: Vec<_> = crate::settings::chroot_settings()
+            .into_iter()
+            .chain(aurcache_worker_core::settings::protocol_settings())
+            .map(|spec| spec.env_var)
+            .filter(|var| {
+                std::env::var_os(var).is_some()
+                    || std::env::var_os(format!("{var}_DEFAULT")).is_some()
+            })
+            .collect();
+        if !configured.is_empty() {
+            eprintln!("skipped: {configured:?} set in this environment");
+            return;
+        }
+
+        let cfg = Config::from_env();
+        assert_eq!(cfg.core.concurrency, 1);
+        assert_eq!(cfg.core.priority, 0);
+        assert!(cfg.core.packages.is_empty());
+        assert_eq!(cfg.core.poll_interval, 10);
+        assert_eq!(cfg.core.build_timeout, 3 * 60 * 60);
+        assert_eq!(cfg.core.builddir_max_bytes, 200 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.core.builddir_min_free, 50 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.keyserver, "hkps://keyserver.ubuntu.com");
+        assert_eq!(cfg.cache_max_size, 10 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.pkgcache_max_size, 10 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.cache_ttl, 30 * 24 * 60 * 60);
+        assert_eq!(cfg.pkgcache_ttl, 0);
+        assert_eq!(cfg.chroot_refresh_interval, 15 * 60);
+        assert_eq!(cfg.build_limits.memory_max, None);
+        assert_eq!(cfg.build_limits.swap_max, None);
+        assert_eq!(cfg.build_limits.cpus, None);
+        assert_eq!(cfg.total_build_limits.memory_max, None);
     }
 
     /// `0` disables a budget, and must survive as `0` rather than being

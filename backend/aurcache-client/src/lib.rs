@@ -37,7 +37,9 @@ pub use aurcache_common::api::repo::RepoInfo;
 pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
 pub use aurcache_common::api::stats::{GraphDataPoint, ListStats, UserInfo};
 pub use aurcache_common::api::waiting::WaitingReason;
-pub use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary as Worker};
+pub use aurcache_common::api::worker::{
+    ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary as Worker,
+};
 pub use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
@@ -666,6 +668,21 @@ impl AurCacheClient {
     pub async fn list_workers(&self) -> Result<Vec<Worker>> {
         self.request_json::<Vec<Worker>, Value>(Method::GET, "/workers", &[], None)
             .await
+    }
+
+    /// What one worker declares it can be configured with, and what it reports
+    /// it is running.
+    ///
+    /// Apart from [`Self::list_workers`] because it is fetched for the one
+    /// worker being looked at, while the list is polled for the whole fleet.
+    pub async fn worker_config(&self, id: i32) -> Result<WorkerConfigView> {
+        self.request_json::<WorkerConfigView, Value>(
+            Method::GET,
+            &format!("/workers/{id}/config"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// The image and worker-protocol port a new worker's `docker run` needs.

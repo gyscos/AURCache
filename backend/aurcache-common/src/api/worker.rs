@@ -55,6 +55,36 @@ pub struct WorkerSummary {
     /// one until you count.
     pub successful_builds: i32,
     pub failed_builds: i32,
+    /// How many of this worker's settings it refused the configured value for
+    /// -- a size that did not parse, a number out of range.
+    ///
+    /// Carried in the list so a worker running something other than what its
+    /// machine was configured with is visible without opening it. `None` from a
+    /// worker version that does not report its configuration, which is not the
+    /// same answer as a worker that reports no problems.
+    #[serde(default)]
+    pub settings_rejected: Option<i32>,
+}
+
+/// A worker's configurable surface, as the Workers page shows it.
+///
+/// Fetched per worker rather than carried in the list: the list is polled while
+/// anything is building, and a declaration is a few kilobytes of descriptions
+/// that change only when a worker is upgraded.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+pub struct WorkerConfigView {
+    pub worker_id: i32,
+    /// What this worker declared it accepts, at its last registration.
+    ///
+    /// `None` from a worker version that does not declare its settings, which
+    /// the page says outright -- it is a different statement from a worker that
+    /// declares none.
+    pub settings: Option<Vec<crate::worker_config::SettingDecl>>,
+    /// What those settings resolved to on the machine, as last reported.
+    ///
+    /// `None` until a worker has been up long enough to send one heartbeat, so
+    /// a freshly enrolled worker shows its declaration before its values.
+    pub effective: Option<crate::worker_config::EffectiveConfig>,
 }
 
 /// The deployment-specific pieces the Workers page needs to show a

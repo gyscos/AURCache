@@ -10,13 +10,16 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use aurcache_ca::Ca;
-use aurcache_common::api::worker::{ApprovalStatus, WorkerJoinInfo, WorkerSummary};
+use aurcache_common::api::worker::{
+    ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
+};
 use aurcache_common::builder::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
     MirrorlistPreference, RegisterRequest, RegisterStatus,
 };
+use aurcache_common::worker_config::{EffectiveConfig, SettingStatus};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
@@ -205,6 +208,7 @@ impl<'r> FromRequest<'r> for WorkerAuth {
     register_status,
     get_ca,
     list_workers,
+    worker_config,
     worker_join_info,
     approve_worker,
     revoke_worker
@@ -239,6 +243,7 @@ pub fn worker_protocol_routes() -> Vec<rocket::Route> {
 pub fn worker_admin_routes() -> Vec<rocket::Route> {
     rocket::routes![
         list_workers,
+        worker_config,
         worker_join_info,
         approve_worker,
         revoke_worker,
@@ -269,6 +274,20 @@ pub async fn register_worker(
     let fingerprint = aurcache_ca::fingerprint_from_csr_pem(&input.csr_pem)
         .map_err(|e| err(Status::BadRequest, e))?;
 
+    // Stored as the JSON the worker sent, because the server renders a
+    // declaration and never reasons about it: a setting whose kind this server
+    // predates has to survive the trip to the page that shows it.
+    let declaration = input.settings.as_ref().and_then(|settings| {
+        serde_json::to_string(settings)
+            .map_err(|e| {
+                tracing::warn!(
+                    "worker {} sent a declaration that could not be stored: {e}",
+                    input.name
+                );
+            })
+            .ok()
+    });
+
     let worker = worker_store::register_worker(
         db,
         &worker_store::WorkerRegistration {
@@ -284,6 +303,7 @@ pub async fn register_worker(
             // permanently full and could never block a lower-priority worker,
             // silently defeating its own priority.
             concurrency: i32::try_from(input.concurrency.max(1)).unwrap_or(i32::MAX),
+            settings_declaration: declaration.as_deref(),
         },
     )
     .await
@@ -820,6 +840,24 @@ pub async fn heartbeat(
     worker_store::touch_last_seen(db, auth.worker.id, Some(&hb.version))
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    // Sent only when it changed, so this is normally absent. A report that
+    // cannot be stored must not cost the worker its heartbeat -- the leases
+    // this renews are what keep its builds alive.
+    if let Some(effective) = &hb.effective {
+        match serde_json::to_string(effective) {
+            Ok(json) => {
+                if let Err(e) =
+                    worker_store::store_effective_config(db, auth.worker.id, &json).await
+                {
+                    tracing::warn!(
+                        "could not store worker {}'s configuration report: {e}",
+                        auth.worker.id
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("unreadable configuration report from a worker: {e}"),
+        }
+    }
     let outcome = worker_jobs::heartbeat(
         db,
         auth.worker.id,
@@ -961,7 +999,26 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         active_builds: tally.active,
         successful_builds: tally.successful,
         failed_builds: tally.failed,
+        settings_rejected: rejected_settings(worker.effective_config.as_deref(), worker.id),
     }
+}
+
+/// How many settings the worker could not use the configured value for.
+///
+/// A count rather than the report itself: this rides the workers list, which is
+/// polled, and what the list needs is only whether there is something to look
+/// at. `None` when the worker has reported nothing -- "not known" and "nothing
+/// wrong" are different answers, and the page shows them differently.
+fn rejected_settings(effective: Option<&str>, id: i32) -> Option<i32> {
+    let report: EffectiveConfig = parse_stored(effective?, id, "configuration report")?;
+    i32::try_from(
+        report
+            .settings
+            .values()
+            .filter(|setting| setting.status == SettingStatus::Rejected)
+            .count(),
+    )
+    .ok()
 }
 
 /// Whether a worker has checked in recently enough to count as connected.
@@ -1014,6 +1071,48 @@ pub async fn worker_join_info(_a: Authenticated) -> Json<WorkerJoinInfo> {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
     Json(WorkerJoinInfo { image, worker_port })
+}
+
+/// What one worker can be configured with, and what it is running.
+///
+/// Both halves are stored as the worker sent them and parsed here. A stored
+/// blob that no longer parses is reported as absent rather than failing the
+/// request: it means a worker newer than this server in a way the shared
+/// vocabulary did not cover, and the rest of the page is still worth showing.
+#[utoipa::path(get, path = "/workers/{id}/config", responses((status = 200, body = WorkerConfigView)))]
+#[get("/workers/<id>/config")]
+pub async fn worker_config(
+    db: &State<DatabaseConnection>,
+    _a: Authenticated,
+    id: i32,
+) -> Result<Json<WorkerConfigView>, ApiError> {
+    let db = db.inner();
+    let worker = worker_store::find_worker(db, id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
+
+    Ok(Json(WorkerConfigView {
+        worker_id: worker.id,
+        settings: worker
+            .settings_declaration
+            .as_deref()
+            .and_then(|json| parse_stored(json, id, "declaration")),
+        effective: worker
+            .effective_config
+            .as_deref()
+            .and_then(|json| parse_stored(json, id, "configuration report")),
+    }))
+}
+
+/// Read one of the stored worker-configuration blobs, saying so rather than
+/// failing when it cannot be read.
+fn parse_stored<T: serde::de::DeserializeOwned>(json: &str, id: i32, what: &str) -> Option<T> {
+    serde_json::from_str(json)
+        .map_err(|e| {
+            tracing::warn!("worker {id}'s stored {what} could not be read: {e}");
+        })
+        .ok()
 }
 
 #[utoipa::path(post, path = "/workers/{id}/approve", responses((status = 200)))]

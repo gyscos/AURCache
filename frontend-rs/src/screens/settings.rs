@@ -141,13 +141,17 @@ fn SettingsSections(
         }
 
         Section { title: "Builds",
-            div { class: "py-2",
-                Link { class: "link link-primary text-sm", to: Route::ConfigFiles {},
-                    "Config files"
+            // Laid out as the setting rows below it are, rather than as a
+            // link in running text: it belongs to this section's list of
+            // things you can change, and reads as one of them.
+            div { class: "py-3 flex gap-3 items-center",
+                div { class: "min-w-0 flex-1",
+                    div { class: "font-medium text-sm", "Config files" }
+                    p { class: "text-xs opacity-60 max-w-prose",
+                        "The makepkg.conf and pacman.conf every build uses."
+                    }
                 }
-                p { class: "text-xs opacity-60",
-                    "Edit the makepkg.conf and pacman.conf used by builds."
-                }
+                Link { class: "btn btn-sm btn-outline", to: Route::ConfigFiles {}, "Edit" }
             }
             SettingRow {
                 setting: Setting::JobTimeout,

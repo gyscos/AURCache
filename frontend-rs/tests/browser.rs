@@ -240,6 +240,7 @@ async fn interactions() {
     the_export_dialog_warns_only_when_secrets_are_asked_for(&session).await;
     the_restore_dialog_offers_its_options(&session).await;
     approving_a_worker_lets_it_build(&session).await;
+    a_workers_settings_say_where_each_value_came_from(&session).await;
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
     dependencies_stay_out_of_the_list_until_asked_for(&session).await;
@@ -478,7 +479,7 @@ async fn filtering_narrows_the_list_and_updates_the_url(session: &Session) {
 /// serialised markup, so an editor that renders but never fills looks
 /// identical there.
 async fn a_stored_config_file_is_loaded_into_the_editor(session: &Session) {
-    session.open("/config-files").await;
+    session.open("/settings/config-files").await;
     session.wait_for("textarea").await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -535,6 +536,97 @@ async fn approving_a_worker_lets_it_build(session: &Session) {
         .wait_until("the pending notice to clear", |t| {
             !t.contains("waiting for approval")
         })
+        .await;
+}
+
+/// What a worker is configured with, and what it is actually running.
+///
+/// Reached by following the worker from the fleet list, which is the half a
+/// route check cannot see: the page loads its own declaration, and the link
+/// that gets there has to carry the right worker. What the page has to say is
+/// not the value alone but where the value came from -- a `200G` that the
+/// machine's own variable asked to be `450 giraffes` reads as correct until the
+/// source and the refusal are beside it.
+async fn a_workers_settings_say_where_each_value_came_from(session: &Session) {
+    session.open("/workers").await;
+    session
+        .wait_until("the fleet to load", |t| t.contains("builder-01"))
+        .await;
+    // Not in the list: the settings are a page, not a column.
+    assert!(
+        !session.text().await.contains("builddir_max_bytes"),
+        "the fleet list should not carry a worker's settings"
+    );
+
+    // builder-01 sorts first, and it is the one the fixture gives a declaration.
+    session.click_labelled("table a", "builder-01").await;
+
+    session
+        .wait_until("the declaration to load", |t| {
+            t.contains("builddir_max_bytes")
+        })
+        .await;
+    assert!(
+        session.url().await.ends_with("/worker/builder-01"),
+        "following a worker should land on its own page, named: {}",
+        session.url().await
+    );
+
+    let panel = session.text().await;
+    // Grouped the way the worker grouped them. Matched case-insensitively:
+    // the headings are uppercased in CSS, and `innerText` reports what the
+    // browser renders rather than what the markup says.
+    let headings = panel.to_lowercase();
+    assert!(headings.contains("scheduling"), "{panel}");
+    assert!(headings.contains("build trees"), "{panel}");
+    // The value, and the variable that pinned it -- naming the variable is what
+    // makes the panel actionable on the machine.
+    assert!(panel.contains("pinned by WORKER_CONCURRENCY"), "{panel}");
+    // The refusal, with what stands instead.
+    assert!(panel.contains("450 giraffes"), "{panel}");
+    assert!(panel.contains("built-in default"), "{panel}");
+    // A limit nobody set reads as unset, not as zero.
+    assert!(panel.contains("build_memory_max"), "{panel}");
+    // The page confirms which machine was opened, identity and all.
+    assert!(panel.contains("builder-01"), "{panel}");
+    assert!(
+        panel.contains("1111111111111111aaaa1111111111111111aaaa1111111111111111aaaa1111"),
+        "{panel}"
+    );
+
+    // A name two machines answer to cannot be a page. Nothing here guesses
+    // which one was meant -- the retired row and the live one differ in exactly
+    // what the reader is trying to tell apart.
+    session.open("/worker/replaced-host").await;
+    session
+        .wait_until("the choice to appear", |t| {
+            t.contains("workers call themselves this")
+        })
+        .await;
+    // By href: the entry carries badges and a date beside the fingerprint, so
+    // its text is not the fingerprint alone.
+    session
+        .click("a[href=\"/workers/by-cert/555555555555\"]")
+        .await;
+    session
+        .wait_until("the chosen worker to load", |t| {
+            t.contains("builddir_max_bytes")
+        })
+        .await;
+    assert!(
+        session
+            .url()
+            .await
+            .ends_with("/workers/by-cert/555555555555"),
+        "choosing one should go by certificate: {}",
+        session.url().await
+    );
+
+    // Back to the fleet, so the scenarios after this one start where they
+    // expect to.
+    session.click_labelled("a", "Workers").await;
+    session
+        .wait_until("the fleet to come back", |t| t.contains("builder-arm"))
         .await;
 }
 
@@ -726,7 +818,7 @@ async fn a_per_package_file_leaves_the_server_wide_one_alone(session: &Session) 
 
     // The actual assertion. A textarea's contents are a property rather than
     // markup, so this is also the only way to read the file back at all.
-    session.open("/config-files").await;
+    session.open("/settings/config-files").await;
     session.wait_for("textarea").await;
     let global = session.value_of("textarea").await;
     assert!(

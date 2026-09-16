@@ -25,14 +25,12 @@ pub struct SettingsEntry<T> {
 
 #[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct ApplicationSettings {
-    pub max_concurrent_builds: SettingsEntry<u32>,
     pub version_check_interval: SettingsEntry<u32>,
     pub auto_update_interval: SettingsEntry<Option<String>>,
     pub job_timeout: SettingsEntry<u32>,
     /// Largest package file a worker may upload, in bytes. Written as a size
     /// (`20G`); see [`Setting::MaxArtifactSize`].
     pub max_artifact_size: SettingsEntry<u64>,
-    pub builder_image: SettingsEntry<String>,
     /// Default date format for the web UI. A browser may override it
     /// locally; nothing writes a per-client choice back here.
     pub date_format: SettingsEntry<String>,
@@ -54,7 +52,6 @@ pub struct SettingsMeta {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
-    MaxConcurrentBuilds,
     VersionCheckInterval,
     AutoUpdateInterval,
     BuildOnNewVersion,
@@ -62,7 +59,6 @@ pub enum Setting {
     DateFormat,
     JobTimeout,
     MaxArtifactSize,
-    BuilderImage,
     MakepkgConf,
     PacmanConf,
     ParseNetwork,
@@ -70,12 +66,26 @@ pub enum Setting {
 
 /// Keys of settings that no longer exist, which may still be stored or dumped.
 ///
-/// `cpu_limit` and `memory_limit` were server settings that nothing read once
-/// builds moved to workers: limits apply where the build runs, so a worker sets
-/// its own (`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS`). A migration deletes
-/// their rows, and a restore skips them so an older dump does not bring them
-/// back.
-pub const RETIRED_SETTING_KEYS: &[&str] = &["cpu_limit", "memory_limit"];
+/// All four are server settings from when the server ran builds itself, and
+/// nothing has read any of them since builds moved to workers:
+///
+/// - `cpu_limit` and `memory_limit` apply where the build runs, so a worker
+///   sets its own (`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS`);
+/// - `max_concurrent_builds` is the worker's `WORKER_CONCURRENCY`, and the
+///   scheduler counts leases rather than consulting a server setting;
+/// - `builder_image` named the container the server built in, which no longer
+///   exists. The image a *worker* runs is that machine's own business, and the
+///   one the Workers page suggests for enrolling a new worker comes from
+///   `AURCACHE_WORKER_IMAGE`.
+///
+/// A migration deletes their rows, and a restore skips them so an older dump
+/// does not bring them back.
+pub const RETIRED_SETTING_KEYS: &[&str] = &[
+    "cpu_limit",
+    "memory_limit",
+    "max_concurrent_builds",
+    "builder_image",
+];
 
 impl Setting {
     /// Every setting there is.
@@ -85,8 +95,7 @@ impl Setting {
     /// `date_format` and `build_on_new_version` were served by `GET /settings`
     /// but rejected by `PATCH /settings/<key>` as unknown, so neither could be
     /// changed through the API at all.
-    pub const ALL: [Self; 12] = [
-        Self::MaxConcurrentBuilds,
+    pub const ALL: [Self; 10] = [
         Self::VersionCheckInterval,
         Self::AutoUpdateInterval,
         Self::BuildOnNewVersion,
@@ -94,7 +103,6 @@ impl Setting {
         Self::DateFormat,
         Self::JobTimeout,
         Self::MaxArtifactSize,
-        Self::BuilderImage,
         Self::MakepkgConf,
         Self::PacmanConf,
         Self::ParseNetwork,
@@ -104,11 +112,6 @@ impl Setting {
     #[must_use]
     pub const fn meta(&self) -> SettingsMeta {
         match self {
-            Self::MaxConcurrentBuilds => SettingsMeta {
-                key: "max_concurrent_builds",
-                env_name: Some("MAX_CONCURRENT_BUILDS"),
-                default: "1",
-            },
             Self::VersionCheckInterval => SettingsMeta {
                 key: "version_check_interval",
                 env_name: Some("VERSION_CHECK_INTERVAL"),
@@ -172,11 +175,6 @@ impl Setting {
                 key: "max_artifact_size",
                 env_name: Some("MAX_ARTIFACT_SIZE"),
                 default: "20G",
-            },
-            Self::BuilderImage => SettingsMeta {
-                key: "builder_image",
-                env_name: Some("BUILDER_IMAGE"),
-                default: "ghcr.io/lukas-heiligenbrunner/aurcache-builder:latest",
             },
             Self::MakepkgConf => SettingsMeta {
                 key: "makepkg_conf",
@@ -247,18 +245,16 @@ mod tests {
     fn every_setting_is_reachable_by_its_key() {
         fn position(setting: Setting) -> usize {
             match setting {
-                Setting::MaxConcurrentBuilds => 0,
-                Setting::VersionCheckInterval => 1,
-                Setting::AutoUpdateInterval => 2,
-                Setting::BuildOnNewVersion => 3,
-                Setting::PersistentBuilddir => 4,
-                Setting::DateFormat => 5,
-                Setting::JobTimeout => 6,
-                Setting::MaxArtifactSize => 7,
-                Setting::BuilderImage => 8,
-                Setting::MakepkgConf => 9,
-                Setting::PacmanConf => 10,
-                Setting::ParseNetwork => 11,
+                Setting::VersionCheckInterval => 0,
+                Setting::AutoUpdateInterval => 1,
+                Setting::BuildOnNewVersion => 2,
+                Setting::PersistentBuilddir => 3,
+                Setting::DateFormat => 4,
+                Setting::JobTimeout => 5,
+                Setting::MaxArtifactSize => 6,
+                Setting::MakepkgConf => 7,
+                Setting::PacmanConf => 8,
+                Setting::ParseNetwork => 9,
             }
         }
 

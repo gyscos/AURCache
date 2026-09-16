@@ -7,6 +7,7 @@ use anyhow::Result;
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistPreference,
 };
+use aurcache_common::worker_config::EffectiveConfig;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +38,13 @@ pub struct Runner<E: Executor> {
     /// exactly when a worker should re-read the deployment's configuration
     /// anyway.
     mirrorlists: Mutex<BTreeMap<String, (String, String)>>,
+    /// What the server has been told this worker's settings resolved to.
+    ///
+    /// The report rides the heartbeat and is sent only when it differs from
+    /// this, so a fleet at rest costs one report per worker process rather than
+    /// one every heartbeat. `None` until the first accepted heartbeat, which is
+    /// what makes a restarted worker tell a server that has forgotten it.
+    reported_config: Mutex<Option<EffectiveConfig>>,
 }
 
 fn now_secs() -> u64 {
@@ -90,6 +98,7 @@ impl<E: Executor> Runner<E> {
             last_contact: AtomicU64::new(now_secs()),
             permits: Arc::new(Semaphore::new(concurrency)),
             mirrorlists: Mutex::new(BTreeMap::new()),
+            reported_config: Mutex::new(None),
         })
     }
 
@@ -256,13 +265,27 @@ impl<E: Executor> Runner<E> {
                 guard.keys().copied().collect()
             };
 
+            // Resolved once at startup, so this only differs from what the
+            // server holds on the first heartbeat of a worker process.
+            let effective = self.cfg.settings.effective();
+            let report = {
+                let reported = self.reported_config.lock().await;
+                (reported.as_ref() != Some(&effective)).then(|| effective.clone())
+            };
+
             let hb = Heartbeat {
                 active_build_ids: active_build_ids.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                effective: report.clone(),
             };
             match self.client.heartbeat(&hb).await {
                 Ok(resp) => {
                     self.mark_contact();
+                    // Only once the server has taken it: a heartbeat that never
+                    // arrived has told it nothing.
+                    if report.is_some() {
+                        *self.reported_config.lock().await = Some(effective);
+                    }
                     // The server's abort list: any of our builds that were
                     // abandoned (lease lost) or cancelled by an operator. Set
                     // each flag; the build's next 5 s tick then aborts it.

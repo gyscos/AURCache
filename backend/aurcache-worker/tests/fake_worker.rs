@@ -175,6 +175,59 @@ async fn fake_worker_protocol_roundtrip() {
         .await
         .expect("worker should enroll and be auto-approved via token");
 
+    // --- The worker's declaration reaches the server over the real wire, and
+    // the heartbeat carries what those settings resolved to.
+    //
+    // Both are what the Workers page reads, and both travel as JSON the server
+    // stores without interpreting -- so a shape that serializes on the worker
+    // and does not deserialize on the server would show up nowhere but here.
+    {
+        let stored = worker_store::find_worker_by_fingerprint(&db, &identity.fingerprint)
+            .await
+            .unwrap()
+            .expect("the enrolled worker should have a row");
+        let declared: Vec<aurcache_common::worker_config::SettingDecl> = serde_json::from_str(
+            stored
+                .settings_declaration
+                .as_deref()
+                .expect("registration should have carried a declaration"),
+        )
+        .expect("the stored declaration should read back");
+        assert!(
+            declared.iter().any(|decl| decl.key == "concurrency"),
+            "the protocol settings should be declared: {declared:?}"
+        );
+        assert!(
+            stored.effective_config.is_none(),
+            "nothing is reported until the first heartbeat"
+        );
+
+        client
+            .heartbeat(&aurcache_common::worker::Heartbeat {
+                active_build_ids: vec![],
+                version: "test".to_string(),
+                effective: Some(cfg.settings.effective()),
+            })
+            .await
+            .expect("heartbeat should be accepted");
+
+        let stored = worker_store::find_worker_by_fingerprint(&db, &identity.fingerprint)
+            .await
+            .unwrap()
+            .expect("the worker row should still be there");
+        let report: aurcache_common::worker_config::EffectiveConfig = serde_json::from_str(
+            stored
+                .effective_config
+                .as_deref()
+                .expect("the heartbeat should have stored a report"),
+        )
+        .expect("the stored report should read back");
+        assert!(
+            report.settings.contains_key("concurrency"),
+            "the report should cover the declared settings: {report:?}"
+        );
+    }
+
     let claim_req = ClaimRequest {
         native_arches: vec!["x86_64".to_string()],
         emulated_arches: vec![],

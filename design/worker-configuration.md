@@ -4,7 +4,11 @@ How a worker's settings could be seen and changed through AURCache's API and UI,
 instead of only through each machine's environment, and how the change would
 reach a running worker.
 
-Status: **proposal, third revision**. Nothing here is implemented.
+Status: **third revision; phase 1 steps 1-2 implemented**. The worker declares
+its settings, reads `<env_var>_DEFAULT` for each, reports what each resolved to,
+and the Workers page shows all of it with refused values flagged. Nothing is
+*set* from the server yet: the `worker_settings` table, the `PATCH`, snapshot
+delivery and application (steps 3-6) are still proposal.
 
 - The first draft had a server-side allowlist of worker settings and a fleet
   default. Two reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
@@ -520,14 +524,34 @@ that the server can stop itself.
 
 **Phase 1 -- visibility, then per-worker configuration over the heartbeat (B).**
 
-1. `ValueKind` and its parsers in `aurcache-common`; `SettingDecl` for the native
+1. ~~`ValueKind` and its parsers in `aurcache-common`; `SettingDecl` for the native
    worker's policy keys. Retire the dead server settings `max_concurrent_builds`
    and `builder_image` the way `cpu_limit`/`memory_limit` were. The worker reads
-   `<env_var>_DEFAULT` for every declared setting.
-2. **Read-only first.** The worker sends its declaration at registration and
+   `<env_var>_DEFAULT` for every declared setting.~~ **Done.**
+2. ~~**Read-only first.** The worker sends its declaration at registration and
    reports `effective` (value, source, status) in the heartbeat when it changes;
    the server stores both and the Workers page shows them, with parse errors
-   flagged. Useful on its own; ship it first.
+   flagged. Useful on its own; ship it first.~~ **Done.**
+
+   As built: the spec tables are `aurcache_worker_core::settings` (protocol) and
+   `aurcache_worker::settings` (the chroot executor), resolved once at startup
+   into `CoreConfig::settings`, which every config field then reads -- so the
+   value the worker runs and the value it reports cannot differ. The declaration
+   and the report are stored as JSON on the `workers` row and served from
+   `GET /workers/<id>/config`.
+
+   The UI is the worker detail page of step 6, read-only: `/worker/<name>`,
+   reached by following a worker from the fleet list, rendering the declaration
+   generically by category and kind. The list stays as it was apart from a count
+   of refused settings, which is all it needs to flag a row worth opening.
+
+   The URL carries the name rather than the id because that is what an operator
+   has in hand, but a name is not unique and deliberately is not made so: a
+   worker is called whatever its machine reports, a retired row keeps its name
+   for ever, and a machine replaced by another of the same hostname is the
+   ordinary case. So a shared name resolves to a choice rather than a guess, and
+   `/workers/by-cert/<fingerprint>` is the way past it -- the fingerprint being
+   the identity the whole protocol is already keyed on.
 3. `worker_settings` table, dump/restore, transactional `PATCH` per worker, one
    activity entry per save.
 4. Snapshot delivery: `config` in the registration and heartbeat responses,
@@ -535,10 +559,10 @@ that the server can stop itself.
 5. Worker application: per-job snapshots, the concurrency gate, on-demand cgroup
    controllers, per-key status with rejected values keeping the previous one,
    re-registration when the registration request changes.
-6. UI: a worker detail page rendering the declaration generically by category
-   and kind, with env-pinned rows naming their variable and the way to unpin
-   them. The shipped compose files and the CLI's generated ones write policy as
-   `_DEFAULT` variables.
+6. UI: the worker detail page (now read-only) grows the editing half -- a field
+   per setting, per-key status, and env-pinned rows naming the variable and the
+   way to unpin them. The shipped compose files and the CLI's generated ones
+   write policy as `_DEFAULT` variables.
 
 **Later, if wanted:** fleet defaults, on the terms in
 [Per worker only, for now](#per-worker-only-for-now); declarations for the legacy

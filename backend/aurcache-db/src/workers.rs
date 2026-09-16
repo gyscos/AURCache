@@ -47,6 +47,18 @@ pub struct Model {
     /// Maximum concurrent builds the worker reported at registration, used to
     /// decide whether it still has capacity.
     pub concurrency: i32,
+    /// JSON array of the settings this worker declared it accepts
+    /// (`aurcache_common::worker_config::SettingDecl`), replaced at every
+    /// registration.
+    ///
+    /// A string rather than a richer type for the same reason `source_data` is
+    /// one: the server stores and forwards it without interpreting it. `None`
+    /// from a worker version that does not declare its settings.
+    pub settings_declaration: Option<String>,
+    /// JSON of what those settings resolved to on the worker
+    /// (`aurcache_common::worker_config::EffectiveConfig`), as last reported
+    /// over the heartbeat. `None` until a worker has reported one.
+    pub effective_config: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -136,12 +136,6 @@ fn SideMenu() -> Element {
                         active: active == Some(MenuEntry::Settings),
                         icon: rsx! { SettingsIcon {} },
                     }
-                    MenuLink {
-                        to: Route::ConfigFiles {},
-                        label: "Config files",
-                        active: active == Some(MenuEntry::ConfigFiles),
-                        icon: rsx! { ConfigFilesIcon {} },
-                    }
                     ExternalMenuLink { href: DOCS_URL, label: "Help" }
                     // Client-side only: a display preference, kept in the
                     // browser rather than in server settings. See `crate::theme`.
@@ -433,13 +427,6 @@ fn SettingsIcon() -> Element {
 }
 
 #[component]
-fn ConfigFilesIcon() -> Element {
-    rsx! {
-        Icon { path: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5M9 13h6M9 17h4" }
-    }
-}
-
-#[component]
 fn SlidersIcon() -> Element {
     rsx! {
         Icon { path: "M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2M14 4v4M8 10v4M14 16v4" }
@@ -498,7 +485,7 @@ mod tests {
     /// screen is current — not per screen.
     #[test]
     fn every_screen_renders_inside_the_menu_shell() {
-        for path in ["/", "/settings", "/config-files", "/workers"] {
+        for path in ["/", "/settings", "/settings/config-files", "/workers"] {
             let html = render_at(path);
             assert!(html.contains("AURCache"), "{path} lost the menu header");
             assert!(html.contains("Dashboard"), "{path} lost the menu: {html}");

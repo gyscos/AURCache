@@ -375,6 +375,7 @@ mod tests {
             active_builds: 0,
             successful_builds: 0,
             failed_builds: 0,
+            settings_rejected: None,
         }
     }
 

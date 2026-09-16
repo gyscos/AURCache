@@ -44,6 +44,7 @@ fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> RegisterRe
         packages: cfg.packages.clone(),
         priority: cfg.priority,
         concurrency: cfg.concurrency as u32,
+        settings: Some(cfg.settings.declare()),
     }
 }
 

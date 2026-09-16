@@ -31,6 +31,11 @@ pub struct WorkerRegistration<'a> {
     pub priority: i32,
     /// Maximum concurrent builds the worker will run.
     pub concurrency: i32,
+    /// JSON array of the settings the worker declares it accepts, exactly as it
+    /// sent them. `None` from a worker version that declares none, which
+    /// replaces any declaration stored for it: a worker that stopped declaring
+    /// a setting no longer accepts it.
+    pub settings_declaration: Option<&'a str>,
 }
 
 /// Register a worker on first contact, or refresh the existing row when a worker
@@ -66,6 +71,7 @@ pub async fn register_worker<C: ConnectionTrait>(
             workers::Column::PackageAffinity,
             workers::Column::Priority,
             workers::Column::Concurrency,
+            workers::Column::SettingsDeclaration,
         ])
         .values([
             reg.name.into(),
@@ -79,6 +85,7 @@ pub async fn register_worker<C: ConnectionTrait>(
             reg.package_affinity.into(),
             reg.priority.into(),
             reg.concurrency.into(),
+            reg.settings_declaration.into(),
         ])
         .map_err(|e| DbErr::Custom(e.to_string()))?
         .on_conflict(
@@ -93,6 +100,7 @@ pub async fn register_worker<C: ConnectionTrait>(
                     workers::Column::PackageAffinity,
                     workers::Column::Priority,
                     workers::Column::Concurrency,
+                    workers::Column::SettingsDeclaration,
                 ])
                 .to_owned(),
         )
@@ -103,6 +111,14 @@ pub async fn register_worker<C: ConnectionTrait>(
     find_worker_by_fingerprint(db, reg.fingerprint)
         .await?
         .ok_or_else(|| DbErr::Custom("worker vanished after registration".to_string()))
+}
+
+/// Look up a worker by id.
+pub async fn find_worker<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+) -> Result<Option<workers::Model>, DbErr> {
+    Workers::find_by_id(id).one(db).await
 }
 
 /// Look up a worker by its public-key fingerprint (used by the mTLS guard).
@@ -190,6 +206,25 @@ pub async fn list_workers<C: ConnectionTrait>(db: &C) -> Result<Vec<workers::Mod
         .await
 }
 
+/// Store what a worker reported its settings resolved to.
+///
+/// Kept whole, as the JSON the worker sent: the server renders this and never
+/// reasons about it, so parsing it here would only add a way for a newer
+/// worker's report to be lost on the way to the page that shows it.
+pub async fn store_effective_config<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+    effective: &str,
+) -> Result<(), DbErr> {
+    let Some(worker) = Workers::find_by_id(id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active: workers::ActiveModel = worker.into();
+    active.effective_config = Set(Some(effective.to_string()));
+    active.update(db).await?;
+    Ok(())
+}
+
 /// Update a worker's `last_seen` (and optionally its reported version).
 pub async fn touch_last_seen<C: ConnectionTrait>(
     db: &C,
@@ -233,7 +268,71 @@ mod tests {
             package_affinity: "",
             priority: 0,
             concurrency: 1,
+            settings_declaration: None,
         }
+    }
+
+    /// A worker's declaration is stored verbatim and replaced wholesale when it
+    /// registers again: the worker's own code is the source of truth for what
+    /// it accepts, and an upgrade that drops a setting must not leave the
+    /// server offering it.
+    #[tokio::test]
+    async fn registration_replaces_the_declaration() {
+        let db = setup().await;
+        let first = r#"[{"key":"concurrency"}]"#;
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                settings_declaration: Some(first),
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.settings_declaration.as_deref(), Some(first));
+        assert!(w.effective_config.is_none());
+
+        let second = r#"[{"key":"build_timeout"}]"#;
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                settings_declaration: Some(second),
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.settings_declaration.as_deref(), Some(second));
+    }
+
+    /// The effective configuration arrives on the heartbeat, so it is stored
+    /// apart from the declaration and survives the next registration.
+    #[tokio::test]
+    async fn effective_config_is_stored_and_outlives_registration() {
+        let db = setup().await;
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                settings_declaration: Some("[]"),
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+
+        let reported = r#"{"settings":{"concurrency":{"value":"2"}}}"#;
+        store_effective_config(&db, w.id, reported).await.unwrap();
+
+        let w = register_worker(
+            &db,
+            &WorkerRegistration {
+                settings_declaration: Some("[]"),
+                ..reg("w1", "fp-1")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(w.effective_config.as_deref(), Some(reported));
     }
 
     /// The kind is stored as reported, and re-registration updates it: a

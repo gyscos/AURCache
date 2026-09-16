@@ -275,12 +275,15 @@ ROUTES=(
     "/settings|Drop a dump here|a dump can be dropped as well as chosen"
     # Seeded as a stored global value, which is the only state offering a Reset.
     "/settings|>Reset<|settings can undo a stored value"
-    "/config-files|makepkg.conf|config files"
+    "/settings|href=\"/settings/config-files\"|the settings page is the way to the config files"
+    "/settings/config-files|makepkg.conf|config files"
+    # The path before they moved under Settings; a bookmark of it still lands.
+    "/config-files|makepkg.conf|the old config files path redirects"
     # That the stored file reaches the editor is checked in the interaction
     # tests instead: a textarea's value is a DOM property, and a dump of the
     # serialised document does not carry it.
     # Stored and unset render differently; only the stored one offers a Reset.
-    "/config-files|>stored<|a stored file says so"
+    "/settings/config-files|>stored<|a stored file says so"
     "/workers|builder-01|workers"
     # The affinity column resolves its entries: a reservation naming a package
     # becomes a link to it, one naming nothing stays plain text.
@@ -295,7 +298,7 @@ ROUTES=(
     "/workers|emulated: armv7h|emulated architectures are marked"
     # Revoked rows are kept so old builds still name their machine, so they are
     # hidden until asked for.
-    "/workers|Show retired (1)|retired workers are hidden behind a toggle"
+    "/workers|Show retired (2)|retired workers are hidden behind a toggle"
     "/workers|never|a worker that never checked in says so"
     # What the page is for: whether a machine is there, whether it is working,
     # and whether it matters. Approval status cannot answer any of the three --
@@ -303,6 +306,23 @@ ROUTES=(
     "/workers|1 building|a worker with work in flight says so"
     "/workers|offline|a worker that stopped checking in is marked offline"
     "/workers|% of fleet|a worker's share of the work is shown"
+    # The value a machine was configured with is not the one it is running.
+    # Flagged in the list, because nobody opens a panel they have no reason to
+    # suspect.
+    "/workers|refused a configured value|a worker not running its configuration is flagged"
+    "/workers|href=\"/worker/builder-01\"|a worker links to its own page by name"
+    # A name two machines answer to is linked by certificate instead, so a link
+    # from the list never lands on the chooser.
+    "/workers|href=\"/workers/by-cert/|a shared name is linked by certificate"
+    # The worker page itself: its identity, and the settings it declares.
+    "/worker/builder-01|builder-01|one worker"
+    "/worker/builder-01|builddir_max_bytes|a worker's declared settings are listed"
+    "/worker/builder-01|pinned by WORKER_CONCURRENCY|a value names the variable that set it"
+    "/worker/builder-01|450 giraffes|a refused value says what was wrong with it"
+    # Two machines have called themselves this, so the name alone is a choice
+    # rather than a page.
+    "/worker/replaced-host|2 workers call themselves this|a shared name offers a choice"
+    "/workers/by-cert/555555555555|builddir_max_bytes|a worker can be reached by its certificate"
     "/activities|added package hello|activities"
     # The text is rendered server-side from the stored JSON, so this also
     # proves the payload shapes in the fixture are ones the server can parse.
