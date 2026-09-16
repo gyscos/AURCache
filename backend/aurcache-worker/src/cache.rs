@@ -570,10 +570,76 @@ impl Cache {
 
     /// Wipe a possibly-corrupt pkgbase source cache so the next build starts
     /// cold (self-heal). Best-effort.
+    ///
+    /// Takes with it the persistent build trees' checkouts of that cache, which
+    /// cannot outlive it; see [`Self::wipe_borrowed_checkouts`].
     pub fn wipe_srcdest(&self, pkgbase: &str) {
         let path = self.root.join("srcdest").join(sanitize(pkgbase));
         if let Err(e) = remove_tree(&path) {
             tracing::warn!("could not wipe cache {}: {e}", path.display());
+        }
+        self.wipe_borrowed_checkouts(pkgbase);
+    }
+
+    /// Remove the checkouts in a pkgbase's persistent build trees whose objects
+    /// lived in the `SRCDEST` mirror just wiped.
+    ///
+    /// makepkg makes a VCS working copy with `git clone -s`, so the tree's only
+    /// object store is the mirror, reached through
+    /// `.git/objects/info/alternates`. The two caches are reclaimed
+    /// independently and against very different budgets -- the mirrors against
+    /// 10 GiB, the trees against 200 GiB -- so the mirror is always what goes
+    /// first, leaving a checkout whose objects are gone. Usually nothing
+    /// notices, because the next build re-clones the mirror and the fresh one
+    /// holds everything the stale checkout still references.
+    ///
+    /// It does not when upstream rewrote a ref. `ttf-google-fonts-git` tracks
+    /// `google/fonts`, whose `gh-pages` is a deploy branch force-pushed on
+    /// every deploy: a checkout from six days earlier still had
+    /// `refs/remotes/origin/gh-pages` at a commit that had been pushed over,
+    /// which no fresh clone contains. makepkg's `git fetch` in that checkout
+    /// then fails its connectivity check -- "fatal: bad object ... did not send
+    /// all necessary objects" -- before the build starts, and identically on
+    /// every retry, since nothing was clearing the checkout.
+    ///
+    /// Only the borrowed checkouts, never the tree around them: a checkout is a
+    /// local clone of a mirror and costs seconds to make again, while the
+    /// compiled output beside it is the hours a persistent tree exists to save,
+    /// and it borrows nothing.
+    fn wipe_borrowed_checkouts(&self, pkgbase: &str) {
+        let root = self.root.join("builddir");
+        for platform in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            if is_set_aside(&platform.file_name()) {
+                continue;
+            }
+            // makepkg's own layout: `$BUILDDIR/$pkgbase/src/<repo>`.
+            let src = platform.path().join(sanitize(pkgbase)).join("src");
+            let Ok(entries) = std::fs::read_dir(&src) else {
+                continue;
+            };
+            let mut removed = false;
+            for checkout in entries.flatten() {
+                let path = checkout.path();
+                if is_set_aside(&checkout.file_name()) || !borrows_from_srcdest(&path) {
+                    continue;
+                }
+                match remove_tree(&path) {
+                    Ok(()) => {
+                        removed = true;
+                        tracing::info!(
+                            "wiped {} with the source cache holding its objects",
+                            path.display()
+                        );
+                    }
+                    Err(e) => tracing::warn!("could not wipe {}: {e}", path.display()),
+                }
+            }
+            // The tree is smaller than its stamp now says. Drop the stamp
+            // rather than correct it: reclaim measures a tree without one, and
+            // an overstated size makes it evict trees it did not need to.
+            if removed && let Some(name) = platform.file_name().to_str() {
+                let _ = std::fs::remove_file(self.size_stamp(name, pkgbase));
+            }
         }
     }
 
@@ -941,6 +1007,80 @@ mod tests {
         assert_eq!(sanitize("ttf-google-fonts-git"), "ttf-google-fonts-git");
         assert_eq!(sanitize("../etc/passwd"), ".._etc_passwd");
         assert_eq!(sanitize("a/b"), "a_b");
+    }
+
+    /// Lay out one platform's persistent tree for `pkgbase`: a checkout whose
+    /// objects are in the `SRCDEST` mirror, one that owns its objects, and one
+    /// borrowing from somewhere else entirely.
+    fn tree_with_checkouts(cache: &Cache, platform: &str, pkgbase: &str) -> PathBuf {
+        let src = cache.builddir(platform).unwrap().join(pkgbase).join("src");
+        for (name, alternates) in [
+            ("borrowed", Some("/srcdest/fonts/objects\n")),
+            ("owned", None),
+            ("elsewhere", Some("/var/cache/other/objects\n")),
+        ] {
+            let git = src.join(name).join(".git").join("objects").join("info");
+            std::fs::create_dir_all(&git).unwrap();
+            if let Some(text) = alternates {
+                std::fs::write(git.join("alternates"), text).unwrap();
+            }
+        }
+        std::fs::create_dir_all(src.join("build-output")).unwrap();
+        src
+    }
+
+    /// Wiping a source cache must take the checkouts that borrowed their
+    /// objects from it: left behind, `git fetch` in one fails the next build
+    /// outright once upstream has rewritten a ref the checkout still tracks.
+    #[test]
+    fn wiping_a_srcdest_takes_the_checkouts_that_borrowed_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = Cache::new(tmp.path(), 0, 0, 0, 0);
+        let srcdest = c.srcdest("fonts-git").unwrap();
+        let src = tree_with_checkouts(&c, "x86_64", "fonts-git");
+        c.write_size_stamp("x86_64", "fonts-git", 5_000);
+
+        c.wipe_srcdest("fonts-git");
+
+        assert!(!srcdest.exists(), "the source cache itself goes");
+        assert!(
+            !src.join("borrowed").exists(),
+            "a checkout whose objects were in that cache cannot outlive it"
+        );
+        assert!(
+            src.join("owned").exists() && src.join("build-output").exists(),
+            "what does not borrow from the cache is the hours the tree exists to save"
+        );
+        assert!(
+            src.join("elsewhere").exists(),
+            "borrowing from another object store is not ours to wipe"
+        );
+        assert!(
+            !c.size_stamp("x86_64", "fonts-git").exists(),
+            "the tree is smaller than the stamp says; drop it so reclaim measures"
+        );
+    }
+
+    /// Every platform's tree of that pkgbase, and no other package's.
+    #[test]
+    fn wiping_a_srcdest_reaches_every_platform_and_only_that_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = Cache::new(tmp.path(), 0, 0, 0, 0);
+        let x86 = tree_with_checkouts(&c, "x86_64", "fonts-git");
+        let arm = tree_with_checkouts(&c, "aarch64", "fonts-git");
+        let other = tree_with_checkouts(&c, "x86_64", "other-git");
+
+        c.wipe_srcdest("fonts-git");
+
+        assert!(!x86.join("borrowed").exists());
+        assert!(
+            !arm.join("borrowed").exists(),
+            "downloads are shared by every platform, so every platform's tree borrowed from the one cache"
+        );
+        assert!(
+            other.join("borrowed").exists(),
+            "another package's checkout borrows from its own cache"
+        );
     }
 }
 
@@ -1562,6 +1702,30 @@ const SET_ASIDE_SUFFIX: &str = ".aurcache-removing";
 /// cache entry of its own.
 fn is_set_aside(name: &std::ffi::OsStr) -> bool {
     name.to_string_lossy().ends_with(SET_ASIDE_SUFFIX)
+}
+
+/// Where devtools binds `SRCDEST` inside every build's chroot, and so the path
+/// a checkout borrowing from it records.
+const CHROOT_SRCDEST: &str = "/srcdest/";
+
+/// Whether a checkout's objects live in the `SRCDEST` mirror rather than in
+/// itself.
+///
+/// `git clone -s` records the mirror it borrows from in `alternates`, as the
+/// absolute path it was cloned by -- which is the in-chroot one, since that is
+/// where the clone ran. A checkout borrowing from anywhere else, or from
+/// nowhere, owns its objects and is none of our business.
+fn borrows_from_srcdest(checkout: &Path) -> bool {
+    // Non-bare first, which is what makepkg makes; the bare spelling costs one
+    // failed `read_to_string` to also cover a PKGBUILD that made its own.
+    [checkout.join(".git"), checkout.to_path_buf()]
+        .iter()
+        .filter_map(|git| std::fs::read_to_string(git.join("objects/info/alternates")).ok())
+        .any(|alternates| {
+            alternates
+                .lines()
+                .any(|line| line.trim().starts_with(CHROOT_SRCDEST))
+        })
 }
 
 /// Remove a cache tree the build user may have written into.

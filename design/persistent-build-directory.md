@@ -218,6 +218,42 @@ since refusing to build over it would turn a full disk into an idle worker.
 Neither limit bounds a *single* build: `unreal-engine` can grow by ~130 GB after
 the check passes. Nothing short of a filesystem quota would.
 
+## A tree's VCS checkouts cannot outlive `SRCDEST`
+
+The two caches are reclaimed independently and against very different budgets
+-- sources against 10 GiB, trees against 200 GiB -- but a tree's VCS checkout
+is makepkg's `git clone -s` of the `SRCDEST` mirror, so the mirror is its only
+object store, reached through `.git/objects/info/alternates`. The mirror is
+therefore always what goes first, leaving checkouts whose objects are gone.
+
+Usually nothing notices: the next build re-clones the mirror, and a fresh clone
+holds everything the stale checkout still refers to. It breaks when upstream
+rewrote a ref. `ttf-google-fonts-git` tracks `google/fonts`, whose `gh-pages`
+is a deploy branch force-pushed on every deploy, so a checkout left from six
+days earlier still had `refs/remotes/origin/gh-pages` at a commit that had been
+pushed over -- and a fresh clone has no such commit. makepkg's `git fetch` in
+that checkout fails its connectivity check before the build starts:
+
+```
+fatal: bad object refs/remotes/origin/gh-pages
+error: /srcdest/fonts did not send all necessary objects
+==> ERROR: Failure while updating working copy of fonts git repo
+```
+
+and fails identically on every retry, because nothing was clearing the
+checkout. It cost two builds before it was understood, and it would have gone
+on failing.
+
+So `Cache::wipe_srcdest` now takes the borrowed checkouts with it: under every
+platform's `builddir/<platform>/<pkgbase>/src`, each entry whose `alternates`
+names the in-chroot `/srcdest` mount. Only those. A checkout is a local clone
+of a mirror and costs seconds to make again, while the compiled output beside
+it is the hours this whole feature exists to save, and it borrows nothing --
+`unreal-engine`'s tree, cloned in `prepare()` rather than declared in
+`source=()`, has no `alternates` file at all and is untouched. The tree's size
+stamp is dropped rather than corrected, so the next reclaim measures instead of
+over-counting a tree that just shrank.
+
 ## What this does not solve
 
 A retry still re-runs `prepare()` and `build()`. `prepare()` does
