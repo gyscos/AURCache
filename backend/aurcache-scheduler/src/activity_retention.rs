@@ -10,7 +10,7 @@
 //! `ACTIVITY_RETENTION=0` for a deployment that would rather the log were
 //! complete than bounded.
 
-use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::activity_utils::ActivityStore;
 use aurcache_db::helpers::time::now_secs;
 use sea_orm::DatabaseConnection;
 use std::env;
@@ -44,7 +44,7 @@ pub fn start_activity_retention(db: DatabaseConnection) -> JoinHandle<()> {
         }
         info!("Activity log retention: keeping {keep}s of entries");
 
-        let log = ActivityLog::new(db);
+        let log = ActivityStore::new(db);
         loop {
             // Swept before the first sleep as well, so an instance that is
             // restarted more often than the interval still prunes.

@@ -18,6 +18,8 @@ impl ActivitySerializer for PackageUpdateActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Package(self.package.clone()))
+        Some(ActivitySubject::Package {
+            name: self.package.clone(),
+        })
     }
 }

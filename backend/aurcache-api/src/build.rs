@@ -487,16 +487,14 @@ pub async fn retry_build(
     let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    al.add(
+    al.record(
         PackageUpdateActivity {
             package: package_name,
             forced: true,
         },
         ActivityType::UpdatePackage,
         a.username,
-    )
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    );
 
     // Pick out the build explicitly reported for the platform that was
     // retried; it may have been enqueued/promoted or left waiting on a

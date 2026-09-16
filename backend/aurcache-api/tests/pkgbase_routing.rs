@@ -100,7 +100,7 @@ async fn test_client() -> (Client, DatabaseConnection) {
     let rocket = rocket::build()
         .manage(db.clone())
         .manage(Arc::new(DownloadCounter::new()))
-        .manage(ActivityLog::new(db.clone()))
+        .manage(ActivityLog::discarding())
         .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
         // one, but Rocket refuses to launch with an unmanaged type.
@@ -117,6 +117,7 @@ async fn test_client() -> (Client, DatabaseConnection) {
             Arc::new(aurcache_utils::repository::Repository::new(
                 checkouts.path().join("repo"),
             )),
+            ActivityLog::discarding(),
         ))
         // The dump route reports which AURCache wrote a dump. Rocket's
         // sentinels refuse to launch without it, which is the point: a route

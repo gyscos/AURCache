@@ -233,7 +233,7 @@ fn EntryText(entry: Activity) -> Element {
     let Some((before, name, after)) = entry
         .subject
         .as_ref()
-        .and_then(|subject| split_on(&entry.text, subject.name()))
+        .and_then(|subject| split_on(&entry.text, &subject.label()))
     else {
         return rsx! { "{entry.text}" };
     };
@@ -258,11 +258,15 @@ fn EntryText(entry: Activity) -> Element {
 /// at one of them.
 fn subject_route(subject: &ActivitySubject) -> Route {
     match subject {
-        ActivitySubject::Package(name) => Route::Package {
+        ActivitySubject::Package { name } => Route::Package {
             pkgbase: name.clone(),
         },
-        ActivitySubject::Worker(name) => Route::Worker {
+        ActivitySubject::Worker { name } => Route::Worker {
             name: crate::screens::worker::name_segments(name),
+        },
+        ActivitySubject::Build { pkgbase, number } => Route::Build {
+            pkgbase: pkgbase.clone(),
+            number: *number,
         },
     }
 }
@@ -518,16 +522,49 @@ mod tests {
     #[test]
     fn a_subject_opens_its_own_page() {
         assert_eq!(
-            subject_route(&ActivitySubject::Package("hello".to_string())),
+            subject_route(&ActivitySubject::Package {
+                name: "hello".to_string()
+            }),
             Route::Package {
                 pkgbase: "hello".to_string()
             }
         );
         assert_eq!(
-            subject_route(&ActivitySubject::Worker("builder-01".to_string())),
+            subject_route(&ActivitySubject::Worker {
+                name: "builder-01".to_string()
+            }),
             Route::Worker {
                 name: vec!["builder-01".to_string()]
             }
+        );
+        assert_eq!(
+            subject_route(&ActivitySubject::Build {
+                pkgbase: "hello".to_string(),
+                number: 7,
+            }),
+            Route::Build {
+                pkgbase: "hello".to_string(),
+                number: 7
+            }
+        );
+    }
+
+    /// A build is referred to in the text by its number, so that is what the
+    /// link is on -- the package name is in the same sentence and must not be
+    /// what sends a reader to a build page.
+    #[test]
+    fn a_build_is_labelled_by_its_number() {
+        let subject = ActivitySubject::Build {
+            pkgbase: "yay".to_string(),
+            number: 7,
+        };
+        assert_eq!(subject.label(), "#7");
+        assert_eq!(
+            split_on(
+                "publishing build #7 of yay failed: disk full",
+                &subject.label()
+            ),
+            Some(("publishing build ", "#7", " of yay failed: disk full"))
         );
     }
 }

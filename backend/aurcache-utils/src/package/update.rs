@@ -6,7 +6,6 @@ use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sourc
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
-use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_common::build_state::BuildTrigger;
 use aurcache_common::builder::BuildStates;
@@ -85,7 +84,7 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
         .order_by_asc(packages::Column::Name)
         .all(db)
         .await?;
-    let activity_log = ActivityLog::new(db.clone());
+    let activity_log = &services.activity;
 
     let mut ids_total = vec![];
     // One package's failure must not starve the rest. A sourceinfo that no
@@ -116,19 +115,14 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
         };
         match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
-                if let Err(e) = activity_log
-                    .add(
-                        PackageUpdateActivity {
-                            package: package_name.clone(),
-                            forced: force,
-                        },
-                        ActivityType::UpdatePackage,
-                        Some("Server".to_string()),
-                    )
-                    .await
-                {
-                    warn!("Failed to log update of {package_name}: {e}");
-                }
+                activity_log.record(
+                    PackageUpdateActivity {
+                        package: package_name.clone(),
+                        forced: force,
+                    },
+                    ActivityType::UpdatePackage,
+                    Some("Server".to_string()),
+                );
                 ids_total.extend(
                     results
                         .into_iter()
@@ -801,6 +795,7 @@ pub async fn update_platform(
 #[cfg(test)]
 mod tests {
     use super::package_update;
+    use aurcache_activitylog::activity_utils::ActivityLog;
     use aurcache_common::build_state::{BuildTrigger, BuildTriggers};
     /// A repository of its own for a test that never publishes to it.
     fn test_repo() -> Arc<crate::repository::Repository> {
@@ -1142,6 +1137,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             parent.clone(),
             false,
@@ -1377,6 +1373,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             parent.clone(),
             false,
@@ -1607,6 +1604,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             parent.clone(),
             true,
@@ -1810,6 +1808,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             parent.clone(),
             false,
@@ -1945,6 +1944,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             &parent,
         )
@@ -1990,6 +1990,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             &parent,
         )
@@ -2065,6 +2066,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             pkg.clone(),
             true,
@@ -2175,6 +2177,7 @@ mod tests {
             Arc::new(store),
             Arc::new(client),
             test_repo(),
+            ActivityLog::discarding(),
         );
         super::package_update_all_outdated(&services).await.unwrap();
 
@@ -2306,6 +2309,7 @@ mod tests {
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
+                ActivityLog::discarding(),
             ),
             parent.clone(),
             false,

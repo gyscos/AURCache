@@ -33,7 +33,7 @@ async fn test_client() -> (Client, DatabaseConnection) {
     let checkouts = tempfile::tempdir().expect("tempdir");
     let rocket = rocket::build()
         .manage(db.clone())
-        .manage(ActivityLog::new(db.clone()))
+        .manage(ActivityLog::discarding())
         .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
         // one, but Rocket refuses to launch with an unmanaged type.
@@ -50,6 +50,7 @@ async fn test_client() -> (Client, DatabaseConnection) {
             Arc::new(aurcache_utils::repository::Repository::new(
                 checkouts.path().join("repo"),
             )),
+            ActivityLog::discarding(),
         ))
         .mount("/api", aurcache_api::backend::build_api())
         .mount("/", aurcache_api::embed::CustomHandler);

@@ -28,7 +28,9 @@ impl ActivitySerializer for WorkerEnrollActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Worker(self.worker.clone()))
+        Some(ActivitySubject::Worker {
+            name: self.worker.clone(),
+        })
     }
 }
 
@@ -43,7 +45,9 @@ impl ActivitySerializer for WorkerApproveActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Worker(self.worker.clone()))
+        Some(ActivitySubject::Worker {
+            name: self.worker.clone(),
+        })
     }
 }
 
@@ -58,6 +62,8 @@ impl ActivitySerializer for WorkerRevokeActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Worker(self.worker.clone()))
+        Some(ActivitySubject::Worker {
+            name: self.worker.clone(),
+        })
     }
 }

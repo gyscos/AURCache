@@ -1,3 +1,4 @@
+use aurcache_activitylog::activity_utils::ActivityLog;
 use std::sync::Arc;
 
 use aurcache_db::action::Action;
@@ -31,6 +32,10 @@ pub struct Services {
     pub client: Arc<AurClient>,
     /// The pacman repository, which every change to goes through.
     pub repo: Arc<Repository>,
+    /// Where anything worth a line in the log is recorded. A handle, not a
+    /// connection: one task owns the writing, so nothing here has to decide
+    /// what to do when a write fails.
+    pub activity: ActivityLog,
 }
 
 impl Services {
@@ -41,6 +46,7 @@ impl Services {
         store: Arc<SnapshotStore>,
         client: Arc<AurClient>,
         repo: Arc<Repository>,
+        activity: ActivityLog,
     ) -> Self {
         Self {
             db,
@@ -48,6 +54,7 @@ impl Services {
             store,
             client,
             repo,
+            activity,
         }
     }
 }

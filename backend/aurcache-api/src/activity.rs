@@ -1,6 +1,6 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
-use aurcache_activitylog::activity_utils::{ActivityLog, ActivityPage, LogFilter, Severity};
+use aurcache_activitylog::activity_utils::{ActivityPage, ActivityStore, LogFilter, Severity};
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get};
@@ -27,7 +27,7 @@ const DEFAULT_LIMIT: u64 = 100;
 #[get("/activity?<limit>&<offset>&<severity>&<since_boot>")]
 pub async fn activity(
     _a: Authenticated,
-    al: &State<ActivityLog>,
+    db: &State<sea_orm::DatabaseConnection>,
     limit: Option<u64>,
     offset: Option<u64>,
     severity: Option<String>,
@@ -40,7 +40,7 @@ pub async fn activity(
         severity: severity.as_deref().and_then(Severity::from_slug),
         since_boot: since_boot.unwrap_or(false),
     };
-    let page = al
+    let page = ActivityStore::new(db.inner().clone())
         .page(limit, offset.unwrap_or(0), &filter)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;

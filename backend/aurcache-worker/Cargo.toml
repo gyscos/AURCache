@@ -32,6 +32,7 @@ aurcache-worker-core = { path = "../aurcache-worker-core" }
 libc = "0.2"
 
 [dev-dependencies]
+aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-worker-core = { path = "../aurcache-worker-core" }
 tempfile = { workspace = true }
 aurcache-api = { path = "../aurcache-api" }

@@ -34,7 +34,12 @@ use tracing::{error, info, warn};
 /// reason in its log, and the staging directory is removed either way. A build
 /// that is not `PUBLISHING` (published already, or its package deleted) is left
 /// alone.
-pub async fn publish_build(db: &DatabaseConnection, repo: &Repository, build_id: i32) {
+pub async fn publish_build(
+    db: &DatabaseConnection,
+    repo: &Repository,
+    activity: &ActivityLog,
+    build_id: i32,
+) {
     let Ok(Some(build)) = Builds::find_by_id(build_id).one(db).await else {
         let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
         return;
@@ -75,17 +80,15 @@ pub async fn publish_build(db: &DatabaseConnection, repo: &Repository, build_id:
             // The build worked and the package exists; it is the last step that
             // did not. That is worth an entry someone will come across, rather
             // than only a line in this process's journal.
-            ActivityLog::new(db.clone())
-                .record(
-                    PublishFailedActivity {
-                        package: pkgbase.clone().unwrap_or_else(|| "?".to_string()),
-                        build: build.number,
-                        reason: format!("{e:#}"),
-                    },
-                    ActivityType::PublishFailed,
-                    None,
-                )
-                .await;
+            activity.record(
+                PublishFailedActivity {
+                    package: pkgbase.clone().unwrap_or_else(|| "?".to_string()),
+                    build: build.number,
+                    reason: format!("{e:#}"),
+                },
+                ActivityType::PublishFailed,
+                None,
+            );
             log(
                 pkgbase.as_deref(),
                 build.number,

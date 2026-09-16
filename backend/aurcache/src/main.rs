@@ -1,6 +1,6 @@
 use crate::logger::init_logger;
 use crate::startup::{post_startup_tasks, pre_startup_tasks};
-use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::activity_utils as activitylog;
 use aurcache_activitylog::server_start_activity::ServerStartActivity;
 use aurcache_api::init::{CaDirectory, ServerVersion, init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
@@ -42,24 +42,21 @@ async fn main() {
         warn!("Startup cleanup did not complete: {e}");
     }
 
-    // A line in the log for the process starting. It says which version came
-    // up, which is what lines a deploy up against whatever happened after it --
-    // and it is the marker a "since this boot" view would count back to.
-    //
-    // Best effort: a server that cannot write its own start entry should still
-    // start.
-    if let Err(e) = ActivityLog::new(db.clone())
-        .add(
-            ServerStartActivity {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            ActivityType::ServerStart,
-            None,
-        )
-        .await
-    {
-        warn!("Could not record the server start in the activity log: {e}");
-    }
+    // The one task that writes the log. Everything else records through a
+    // handle to it and never touches the table, so no call site has to decide
+    // what to do about a write that did not land.
+    let (activity, activity_writer_handle) = activitylog::spawn(db.clone());
+
+    // A line for the process starting. It says which version came up, which is
+    // what lines a deploy up against whatever happened after it -- and it is
+    // the marker the "since the last restart" view counts back to.
+    activity.record(
+        ServerStartActivity {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        ActivityType::ServerStart,
+        None,
+    );
 
     // Load (or create on first run) the internal CA used to authenticate remote
     // build workers over mutual TLS. Persisted under the data directory.
@@ -109,10 +106,11 @@ async fn main() {
         Arc::clone(&store),
         client,
         Arc::clone(&repo),
+        activity.clone(),
     );
 
     // Builds a restart caught mid-publish pick up where they were.
-    startup::resume_publishing(&db, &repo).await;
+    startup::resume_publishing(&db, &repo, &activity).await;
 
     // Before anything else can resolve a source: a prune cannot distinguish a
     // clone in flight from a stranded one.
@@ -130,7 +128,7 @@ async fn main() {
     }
 
     // Reclaim build jobs whose remote worker went silent (lease liveness).
-    let lease_reaper_handle = start_lease_reaper(db.clone());
+    let lease_reaper_handle = start_lease_reaper(db.clone(), activity.clone());
 
     // Delete package files the repository stopped listing, once clients with
     // an older repo.db have had time to fetch them.
@@ -153,7 +151,7 @@ async fn main() {
         ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
         CaDirectory(ca_dir.clone()),
     );
-    let worker_api_handle = init_worker_api(db, ca, store, Arc::clone(&repo));
+    let worker_api_handle = init_worker_api(db, ca, store, Arc::clone(&repo), activity);
     let repo_handle = init_repo(downloads, repo);
 
     tokio::select! {
@@ -174,6 +172,9 @@ async fn main() {
         }
         _ = activity_retention_handle => {
             warn!("Activity log retention handle exited");
+        }
+        _ = activity_writer_handle => {
+            warn!("Activity log writer exited");
         }
         _ = official_repo_handle => {
             warn!("Official repository refresh handle exited");

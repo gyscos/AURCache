@@ -34,7 +34,12 @@ impl ActivitySerializer for PublishFailedActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Package(self.package.clone()))
+        // The build rather than the package: the build page is where its log
+        // is, which is the next thing anyone reading this wants.
+        Some(ActivitySubject::Build {
+            pkgbase: self.package.clone(),
+            number: self.build,
+        })
     }
 }
 
@@ -116,7 +121,9 @@ impl ActivitySerializer for WorkerSettingRejectedActivity {
     }
 
     fn subject(&self) -> Option<ActivitySubject> {
-        Some(ActivitySubject::Worker(self.worker.clone()))
+        Some(ActivitySubject::Worker {
+            name: self.worker.clone(),
+        })
     }
 }
 

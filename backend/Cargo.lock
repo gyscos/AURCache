@@ -864,6 +864,7 @@ name = "aurcache-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aurcache-activitylog",
  "aurcache-api",
  "aurcache-ca",
  "aurcache-common",

@@ -1,6 +1,7 @@
 //! Publishing a build a worker has handed over: what reaches the repository,
 //! what the database records, and what a failure leaves untouched.
 
+use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::migration::Migrator;
 use aurcache_db::prelude::{Builds, Files, Packages};
@@ -119,7 +120,7 @@ async fn a_published_build_is_in_the_repository_and_recorded() {
     let staged = stage(&repo, 1, "hello", "2.12.1-1");
     let size = std::fs::metadata(&staged).unwrap().len();
 
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
     let build = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
@@ -161,11 +162,11 @@ async fn a_new_version_replaces_the_old_one() {
     package(&db, 1, "hello").await;
     publishing_build(&db, 1, 1).await;
     stage(&repo, 1, "hello", "1.0-1");
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     publishing_build(&db, 2, 1).await;
     stage(&repo, 2, "hello", "1.1-1");
-    publish_build(&db, &repo, 2).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 2).await;
 
     assert_eq!(status(&db, 2).await, Some(BuildStates::SUCCESSFUL_BUILD));
     assert_eq!(listed(tmp.path()), ["hello-1.1-1"]);
@@ -203,7 +204,7 @@ async fn a_file_owned_by_a_live_package_fails_the_build_and_changes_nothing() {
     publishing_build(&db, 1, 2).await;
     stage(&repo, 1, "hello", "2.12.1-1");
 
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
     let pkg = Packages::find_by_id(2).one(&db).await.unwrap().unwrap();
@@ -247,7 +248,7 @@ async fn a_file_whose_owner_is_gone_is_claimed() {
     publishing_build(&db, 1, 2).await;
     stage(&repo, 1, "hello", "2.12.1-1");
 
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
     let rows = Files::find().all(&db).await.unwrap();
@@ -265,7 +266,7 @@ async fn a_wrong_named_artifact_fails_the_build() {
     publishing_build(&db, 1, 1).await;
     stage(&repo, 1, "openssh", "9.9-1");
 
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
     assert!(Files::find().all(&db).await.unwrap().is_empty());
@@ -285,7 +286,7 @@ async fn an_interrupted_publication_is_resumed_from_staging() {
 
     assert_eq!(interrupted(&db).await.unwrap(), [1]);
     for build_id in interrupted(&db).await.unwrap() {
-        publish_build(&db, &repo, build_id).await;
+        publish_build(&db, &repo, &ActivityLog::discarding(), build_id).await;
     }
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
@@ -310,7 +311,7 @@ async fn a_build_not_publishing_is_left_alone() {
     .unwrap();
     let staged = stage(&repo, 1, "hello", "1.0-1");
 
-    publish_build(&db, &repo, 1).await;
+    publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
     assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
     assert!(staged.exists());

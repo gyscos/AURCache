@@ -237,7 +237,7 @@ async fn finalize_package_add(
         store,
         db,
         tx,
-        repo: _,
+        ..
     } = services;
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
@@ -325,13 +325,7 @@ async fn add_package_with_source(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
-    let Services {
-        client,
-        store: _,
-        db: _,
-        tx: _,
-        repo: _,
-    } = services;
+    let Services { client, .. } = services;
     let source_data = resolve_source_pkgbase(client, source_data).await?;
     add_resolved_source(services, context, source_data, patched_files).await
 }
@@ -367,11 +361,7 @@ pub(crate) async fn add_resolved_source(
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let Services {
-        client: _,
-        store,
-        db: _,
-        tx: _,
-        repo: _,
+        client: _, store, ..
     } = services;
     let package_spec = resolve_srcinfo_to_spec(
         store,

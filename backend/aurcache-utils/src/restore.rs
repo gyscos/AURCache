@@ -329,6 +329,7 @@ pub async fn apply(
         db,
         tx: _,
         repo,
+        ..
     } = services;
     // PASS 1: rows. One transaction, because a half-applied dump is neither
     // what the instance was nor what the dump describes.

@@ -1,3 +1,4 @@
+use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
@@ -335,6 +336,7 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
             Arc::new(aurcache_utils::repository::Repository::new(
                 tempfile::tempdir().unwrap().keep(),
             )),
+            ActivityLog::discarding(),
         ),
         None,
         None,

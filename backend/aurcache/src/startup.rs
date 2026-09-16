@@ -1,3 +1,4 @@
+use aurcache_activitylog::activity_utils::ActivityLog;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -361,7 +362,11 @@ pub async fn prune_source_checkouts(db: &DatabaseConnection, store: &SnapshotSto
 /// Publish again the builds a restart interrupted while they were being
 /// published. Nothing about them was made public yet, and their uploads are
 /// still staged, so they simply start over.
-pub async fn resume_publishing(db: &DatabaseConnection, repo: &Arc<Repository>) {
+pub async fn resume_publishing(
+    db: &DatabaseConnection,
+    repo: &Arc<Repository>,
+    activity: &ActivityLog,
+) {
     let interrupted = match publish::interrupted(db).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -372,7 +377,8 @@ pub async fn resume_publishing(db: &DatabaseConnection, repo: &Arc<Repository>) 
     for build_id in interrupted {
         info!("resuming publication of build #{build_id}");
         let (db, repo) = (db.clone(), Arc::clone(repo));
-        tokio::spawn(async move { publish::publish_build(&db, &repo, build_id).await });
+        let activity = activity.clone();
+        tokio::spawn(async move { publish::publish_build(&db, &repo, &activity, build_id).await });
     }
 }
 

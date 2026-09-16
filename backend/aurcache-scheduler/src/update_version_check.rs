@@ -1,5 +1,4 @@
 use anyhow::anyhow;
-use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::failure_activity::VersionCheckFailedActivity;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::activities::ActivityType;
@@ -27,15 +26,13 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
                 error!("Failed to perform aur version check: {e}");
                 // Nothing was found to be out of date this pass, which looks
                 // exactly like nothing *being* out of date unless it says so.
-                ActivityLog::new(services.db.clone())
-                    .record(
-                        VersionCheckFailedActivity {
-                            reason: format!("{e:#}"),
-                        },
-                        ActivityType::VersionCheckFailed,
-                        None,
-                    )
-                    .await;
+                services.activity.record(
+                    VersionCheckFailedActivity {
+                        reason: format!("{e:#}"),
+                    },
+                    ActivityType::VersionCheckFailed,
+                    None,
+                );
             }
 
             let check_interval: SettingsEntry<u64> =
@@ -51,7 +48,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
         tx: _,
         store,
         client,
-        repo: _,
+        ..
     } = services;
     let packages = Packages::find().all(db).await?;
     let aur_query_names: Vec<String> = packages

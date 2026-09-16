@@ -199,7 +199,7 @@ pub fn init_api(
             .manage(services.db.clone())
             .manage(services.tx.clone())
             .manage(OauthEnabled(oauth_config.is_ok()))
-            .manage(ActivityLog::new(services.db.clone()))
+            .manage(services.activity.clone())
             // Also managed on their own: a route that needs one of them says
             // so, rather than asking for the bundle and using a field.
             .manage(Arc::clone(&services.store))
@@ -254,6 +254,7 @@ pub fn init_worker_api(
     ca: aurcache_ca::Ca,
     store: Arc<SnapshotStore>,
     repo: Arc<Repository>,
+    activity: ActivityLog,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Some(tls) = worker_tls_config(&ca) else {
@@ -278,7 +279,7 @@ pub fn init_worker_api(
         let launch_result = rocket::custom(config)
             // A worker enrolling or being auto-approved is worth a line in the
             // log, and this listener is where both happen.
-            .manage(ActivityLog::new(db.clone()))
+            .manage(activity)
             .manage(db)
             .manage(ca)
             .manage(store)

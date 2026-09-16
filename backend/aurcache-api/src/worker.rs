@@ -332,8 +332,7 @@ pub async fn register_worker(
             },
             ActivityType::WorkerEnroll,
             None,
-        )
-        .await;
+        );
     }
 
     // Issue the leaf certificate, or re-issue one this CA did not sign.
@@ -376,8 +375,7 @@ pub async fn register_worker(
             },
             ActivityType::WorkerApprove,
             None,
-        )
-        .await;
+        );
     }
 
     register_status_for(db, ca, &fingerprint).await
@@ -736,6 +734,7 @@ pub async fn job_artifact(
 pub async fn complete_job(
     db: &State<DatabaseConnection>,
     repo: &State<Arc<Repository>>,
+    al: &State<ActivityLog>,
     auth: WorkerAuth,
     build_id: i32,
     input: Json<CompleteReport>,
@@ -748,6 +747,7 @@ pub async fn complete_job(
     let outcome = complete_job_inner(
         db.inner(),
         repo.inner(),
+        al.inner(),
         &auth,
         build_id,
         input.into_inner(),
@@ -767,6 +767,7 @@ pub async fn complete_job(
 async fn complete_job_inner(
     db: &DatabaseConnection,
     repo: &Arc<Repository>,
+    activity: &ActivityLog,
     auth: &WorkerAuth,
     build_id: i32,
     report: CompleteReport,
@@ -837,8 +838,8 @@ async fn complete_job_inner(
         worker_complete::accept_for_publishing(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::Forbidden, e))?;
-        let (db, repo) = (db.clone(), Arc::clone(repo));
-        tokio::spawn(async move { publish_build(&db, &repo, build_id).await });
+        let (db, repo, activity) = (db.clone(), Arc::clone(repo), activity.clone());
+        tokio::spawn(async move { publish_build(&db, &repo, &activity, build_id).await });
         return Ok(());
     }
 
@@ -912,8 +913,7 @@ pub async fn heartbeat(
                 },
                 ActivityType::WorkerSettingRejected,
                 None,
-            )
-            .await;
+            );
         }
     }
     let outcome = worker_jobs::heartbeat(
@@ -1191,8 +1191,7 @@ pub async fn approve_worker(
         },
         ActivityType::WorkerApprove,
         a.username,
-    )
-    .await;
+    );
     Ok(())
 }
 
@@ -1214,8 +1213,7 @@ pub async fn revoke_worker(
         },
         ActivityType::WorkerRevoke,
         a.username,
-    )
-    .await;
+    );
     Ok(())
 }
 

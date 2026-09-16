@@ -1,5 +1,6 @@
 //! What a dump carries, and what it deliberately leaves behind.
 
+use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_common::api::dump::{DUMP_SCHEMA_VERSION, MANIFEST_FILE, PACKAGES_FILE};
 use aurcache_common::source::GitSourceSpec;
 use aurcache_db::migration::Migrator;
@@ -657,6 +658,7 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
             Arc::new(aurcache_utils::repository::Repository::new(
                 tempfile::tempdir().unwrap().keep(),
             )),
+            ActivityLog::discarding(),
         ),
         &tempfile::tempdir().unwrap().keep(),
         loaded,
@@ -949,6 +951,7 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
             Arc::new(aurcache_utils::repository::Repository::new(
                 tempfile::tempdir().unwrap().keep(),
             )),
+            ActivityLog::discarding(),
         ),
         target_ca.path(),
         load_dump(&bytes).unwrap(),
@@ -1015,6 +1018,7 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
             Arc::new(aurcache_utils::repository::Repository::new(
                 tempfile::tempdir().unwrap().keep(),
             )),
+            ActivityLog::discarding(),
         ),
         target_ca.path(),
         load_dump(&bytes).unwrap(),

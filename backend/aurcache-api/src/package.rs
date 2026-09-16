@@ -191,20 +191,14 @@ pub async fn packages_add_endpoint(
                 BulkAddOutcome::Failed { .. } => failed += 1,
                 _ => completed += 1,
             }
-            if matches!(entry.outcome, BulkAddOutcome::Added)
-                && let Err(e) = al_task
-                    .add(
-                        PackageAddActivity {
-                            package: entry.name.clone(),
-                        },
-                        ActivityType::AddPackage,
-                        username.clone(),
-                    )
-                    .await
-            {
-                // The package is added; only the record of who asked is
-                // missing. Not worth failing the job over.
-                warn!("could not log activity for {}: {e}", entry.name);
+            if matches!(entry.outcome, BulkAddOutcome::Added) {
+                al_task.record(
+                    PackageAddActivity {
+                        package: entry.name.clone(),
+                    },
+                    ActivityType::AddPackage,
+                    username.clone(),
+                );
             }
             if let Err(e) =
                 operations::append(&db_task, job_id, completed, failed, &[entry], false).await
@@ -339,15 +333,13 @@ pub async fn package_add_endpoint(
     // untyped `anyhow` error we cannot tell apart from an internal one.
     .map_err(|e| err(Status::BadRequest, e))?;
 
-    al.add(
+    al.record(
         PackageAddActivity {
             package: new_pkg_name,
         },
         ActivityType::AddPackage,
         a.username,
-    )
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    );
     Ok(())
 }
 
@@ -662,16 +654,14 @@ pub async fn package_update_endpoint(
         // patch that no longer applies are all caller-visible conditions.
         .map_err(|e| err(Status::BadRequest, e))?;
 
-    al.add(
+    al.record(
         PackageUpdateActivity {
             package: package_name,
             forced,
         },
         ActivityType::UpdatePackage,
         a.username,
-    )
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    );
     Ok(pkg_update)
 }
 
@@ -701,13 +691,11 @@ pub async fn package_del(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    al.add(
+    al.record(
         PackageDeleteActivity { package: pkg.name },
         ActivityType::RemovePackage,
         a.username,
-    )
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    );
 
     Ok(())
 }

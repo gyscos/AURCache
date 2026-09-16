@@ -32,7 +32,7 @@ fn env_i64(key: &str, default: i64) -> i64 {
 }
 
 /// Spawn the reaper loop. Runs every `REAP_INTERVAL` seconds (default 20s).
-pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
+pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> JoinHandle<()> {
     let interval = Duration::from_secs(env_i64("REAP_INTERVAL", 20).max(1) as u64);
     let max_attempts = env_i64("MAX_ATTEMPTS", 3) as i32;
     // Backstop grace beyond a build's own timeout before we forcibly reclaim a
@@ -61,24 +61,22 @@ pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
                         );
                         // One entry for the pass, not one per build: the reaper
                         // finds them together and they have one cause.
-                        ActivityLog::new(db.clone())
-                            .record(
-                                WorkerReapedActivity {
-                                    // The build the operator was watching, not
-                                    // the fresh row standing in for it: the
-                                    // replacement is a number they have never
-                                    // seen.
-                                    retried: out
-                                        .retried
-                                        .iter()
-                                        .map(|&(abandoned, _replacement)| abandoned)
-                                        .collect(),
-                                    failed: out.failed.clone(),
-                                },
-                                ActivityType::WorkerReaped,
-                                None,
-                            )
-                            .await;
+                        activity.record(
+                            WorkerReapedActivity {
+                                // The build the operator was watching, not
+                                // the fresh row standing in for it: the
+                                // replacement is a number they have never
+                                // seen.
+                                retried: out
+                                    .retried
+                                    .iter()
+                                    .map(|&(abandoned, _replacement)| abandoned)
+                                    .collect(),
+                                failed: out.failed.clone(),
+                            },
+                            ActivityType::WorkerReaped,
+                            None,
+                        );
                     }
 
                     // Explain each abandoned build in its own log. The row is

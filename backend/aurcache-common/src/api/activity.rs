@@ -54,18 +54,33 @@ impl Default for Severity {
 /// prose, and prose with links in it would be the server deciding how the
 /// browser lays a page out.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "name")]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ActivitySubject {
-    Package(String),
-    Worker(String),
+    Package {
+        name: String,
+    },
+    Worker {
+        name: String,
+    },
+    /// One build of a package, which is addressed by both.
+    Build {
+        pkgbase: String,
+        number: i32,
+    },
 }
 
 impl ActivitySubject {
-    /// The name as it appears in the entry's text.
+    /// The token in the entry's text that stands for this subject.
+    ///
+    /// What the reader clicks, so it is the words the entry actually uses: a
+    /// package or a worker goes by name, while a build goes by the `#7` it is
+    /// called in the sentence -- the package name is in there too, and linking
+    /// that to a build page would send a reader somewhere they did not point.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn label(&self) -> String {
         match self {
-            Self::Package(name) | Self::Worker(name) => name,
+            Self::Package { name } | Self::Worker { name } => name.clone(),
+            Self::Build { number, .. } => format!("#{number}"),
         }
     }
 }

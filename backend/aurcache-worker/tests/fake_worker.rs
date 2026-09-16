@@ -153,6 +153,7 @@ async fn fake_worker_protocol_roundtrip() {
         ca,
         std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::new()),
         std::sync::Arc::new(aurcache_utils::repository::Repository::new(&repo_root)),
+        aurcache_activitylog::activity_utils::ActivityLog::discarding(),
     );
 
     // Wait for the TLS listener to accept and serve the CA.

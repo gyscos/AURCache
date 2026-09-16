@@ -35,55 +35,152 @@ pub struct LogFilter {
     pub since_boot: bool,
 }
 
+/// One entry on its way to the database.
+///
+/// Rendered and timestamped where it was recorded, not where it is written: a
+/// backlog must not misdate what it is holding.
+#[derive(Debug, Clone)]
+struct Record {
+    activity_type: ActivityType,
+    data: String,
+    user: Option<String>,
+    timestamp: i64,
+}
+
+/// How many entries may be waiting to be written.
+///
+/// Generous: the log takes a few hundred entries on a busy day, so reaching
+/// this means the database is not answering, which is a problem the log is not
+/// going to fix by holding on.
+const QUEUE: usize = 1024;
+
+/// A handle for recording activity, which knows nothing about the database.
+///
+/// Recording is what callers do everywhere -- in a publish, in a heartbeat, in
+/// a scheduler pass -- and none of those places should be writing rows or
+/// deciding what to do when a write fails. So [`Self::record`] is synchronous
+/// and infallible, and one task ([`ActivityStore`]) owns the connection and the
+/// error handling.
+///
+/// Cheap to clone; every clone feeds the same writer.
 #[derive(Debug, Clone)]
 pub struct ActivityLog {
-    db: DatabaseConnection,
+    tx: tokio::sync::mpsc::Sender<Record>,
 }
 
 impl ActivityLog {
-    #[must_use]
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
-    }
-
-    /// Record an event, saying so in the journal rather than failing when the
-    /// log cannot be written.
+    /// Record an event.
     ///
-    /// Every caller is describing something that already happened: an approval
-    /// that went through and was not logged is a gap in the record, while one
-    /// reported as failed after the fact is a lie about the instance. So the
-    /// write is best effort, and the only thing a caller could do with the
-    /// error is what this does.
-    pub async fn record<T: Serialize + ActivitySerializer>(
+    /// Does not block, does not fail, does not await. Every caller is
+    /// describing something that *already happened*: an approval that went
+    /// through and was not logged is a gap in the record, while one reported as
+    /// failed after the fact is a lie about the instance. So there is nothing
+    /// useful for a caller to do about a write that did not land, and nothing
+    /// is asked of them.
+    pub fn record<T: Serialize + ActivitySerializer>(
         &self,
         activity: T,
         activity_type: ActivityType,
         user: Option<String>,
     ) {
-        if let Err(e) = self.add(activity, activity_type, user).await {
-            tracing::warn!("could not write to the activity log: {e}");
+        let data = match serde_json::to_string(&activity) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("could not render an activity entry: {e}");
+                return;
+            }
+        };
+        let record = Record {
+            activity_type,
+            data,
+            user,
+            timestamp: aurcache_db::helpers::time::now_secs(),
+        };
+        // Dropped rather than waited on: a log must never be the reason the
+        // thing it is recording got slower. A full queue means the database is
+        // not answering, and the journal still has the line this sits beside.
+        if self.tx.try_send(record).is_err() {
+            tracing::warn!("activity log queue is full or closed; an entry was dropped");
         }
     }
+}
 
-    pub async fn add<T: Serialize + ActivitySerializer>(
+impl ActivityLog {
+    /// A handle with nothing on the other end, whose entries go nowhere.
+    ///
+    /// For tests, and for anything run outside a server process. Named for what
+    /// it does so it cannot be reached for by accident: a deployment wiring
+    /// this in would have a log that silently stayed empty.
+    #[must_use]
+    pub fn discarding() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        Self { tx }
+    }
+}
+
+/// Start the one task that writes the log, and hand back a handle to it.
+///
+/// The task ends when the last handle is dropped, draining what is queued
+/// first.
+#[must_use]
+pub fn spawn(db: DatabaseConnection) -> (ActivityLog, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(QUEUE);
+    let store = ActivityStore::new(db);
+    let writer = tokio::spawn(async move {
+        while let Some(record) = rx.recv().await {
+            store.write(record).await;
+        }
+    });
+    (ActivityLog { tx }, writer)
+}
+
+/// The log as the database holds it: reading it, and the one place that writes
+/// it.
+#[derive(Debug, Clone)]
+pub struct ActivityStore {
+    db: DatabaseConnection,
+}
+
+impl ActivityStore {
+    #[must_use]
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+
+    /// Record straight to the database, skipping the queue.
+    ///
+    /// Test-only: the queue is what production writes through, and a test that
+    /// reads back what it just wrote would otherwise be racing the writer. The
+    /// queue has a test of its own.
+    #[cfg(test)]
+    pub(crate) async fn write_now<T: Serialize + ActivitySerializer>(
         &self,
         activity: T,
         activity_type: ActivityType,
         user: Option<String>,
-    ) -> anyhow::Result<()> {
-        let activity = serde_json::to_string(&activity)?;
-        let timestamp = aurcache_db::helpers::time::now_secs();
+    ) {
+        self.write(Record {
+            activity_type,
+            data: serde_json::to_string(&activity).expect("a test fixture serializes"),
+            user,
+            timestamp: aurcache_db::helpers::time::now_secs(),
+        })
+        .await;
+    }
 
-        activities::ActiveModel {
-            timestamp: Set(timestamp),
-            data: Set(activity),
-            user: Set(user),
-            typ: Set(activity_type),
+    /// Write one entry, reporting a failure here rather than at the call site.
+    async fn write(&self, record: Record) {
+        let row = activities::ActiveModel {
+            timestamp: Set(record.timestamp),
+            data: Set(record.data),
+            user: Set(record.user),
+            typ: Set(record.activity_type),
             ..Default::default()
+        };
+        if let Err(e) = row.save(&self.db).await {
+            tracing::warn!("could not write to the activity log: {e}");
         }
-        .save(&self.db)
-        .await?;
-        Ok(())
     }
 
     /// One page of the log, newest first, with how long the filtered log is.
@@ -268,13 +365,17 @@ mod tests {
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
 
-    async fn log() -> ActivityLog {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        ActivityLog::new(db)
+    async fn log() -> ActivityStore {
+        ActivityStore::new(memory_db().await)
     }
 
-    async fn add(log: &ActivityLog, kind: ActivityType) {
+    async fn memory_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    async fn add(log: &ActivityStore, kind: ActivityType) {
         // The payload only has to deserialize as *something* the renderer
         // knows; these tests are about which rows come back, not their prose.
         let activity = PackageAddActivity {
@@ -282,18 +383,17 @@ mod tests {
         };
         match kind {
             ActivityType::ServerStart => {
-                log.add(
+                log.write_now(
                     crate::server_start_activity::ServerStartActivity {
                         version: "0.1.0".to_string(),
                     },
                     kind,
                     None,
                 )
-                .await
-                .unwrap();
+                .await;
             }
             ActivityType::PublishFailed => {
-                log.add(
+                log.write_now(
                     PublishFailedActivity {
                         package: "hello".to_string(),
                         build: 1,
@@ -302,11 +402,10 @@ mod tests {
                     kind,
                     None,
                 )
-                .await
-                .unwrap();
+                .await;
             }
             ActivityType::WorkerReaped => {
-                log.add(
+                log.write_now(
                     WorkerReapedActivity {
                         retried: vec![1],
                         failed: vec![],
@@ -314,10 +413,9 @@ mod tests {
                     kind,
                     None,
                 )
-                .await
-                .unwrap();
+                .await;
             }
-            _ => log.add(activity, kind, None).await.unwrap(),
+            _ => log.write_now(activity, kind, None).await,
         }
     }
 
@@ -454,6 +552,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.total, 2);
+    }
+
+    /// What a caller actually does: record, and carry on. The entry reaches the
+    /// database without the caller ever seeing a connection, an await or an
+    /// error.
+    #[tokio::test]
+    async fn recording_reaches_the_database_through_the_queue() {
+        let db = memory_db().await;
+        let (log, writer) = spawn(db.clone());
+
+        log.record(
+            PackageAddActivity {
+                package: "hello".to_string(),
+            },
+            ActivityType::AddPackage,
+            Some("alice".to_string()),
+        );
+
+        // The writer ends once the last handle is gone, draining first -- which
+        // is also how the process shuts down without losing what it queued.
+        drop(log);
+        writer.await.unwrap();
+
+        let page = ActivityStore::new(db)
+            .page(50, 0, &LogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.entries[0].text, "added package hello");
+        assert_eq!(page.entries[0].user.as_deref(), Some("alice"));
     }
 
     /// Pruning takes what has aged out and leaves the rest. The log is read
