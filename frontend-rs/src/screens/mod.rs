@@ -1,11 +1,11 @@
 //! One module per route.
 
-mod activities;
 pub mod backup;
 mod build;
 mod builds;
 pub mod config_files;
 mod dashboard;
+mod logs;
 mod not_found;
 pub mod package;
 mod package_add;
@@ -17,11 +17,11 @@ pub mod settings;
 pub mod worker;
 pub mod workers;
 
-pub use activities::Activities;
 pub use build::Build;
 pub use builds::Builds;
 pub use config_files::ConfigFiles;
 pub use dashboard::Dashboard;
+pub use logs::Logs;
 pub use not_found::NotFound;
 pub use package::{Package, PackageHeader};
 pub use package_add::PackageAdd;

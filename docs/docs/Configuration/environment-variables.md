@@ -44,6 +44,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | JOB_TIMEOUT            | Integer       | Longest a build may run before the server reclaims it, in seconds     | 3600    |
 | MAX_ARTIFACT_SIZE      | Size          | Largest package file a worker may upload, e.g. `20G`; also a setting, per package or global | `20G` |
 | RETIRED_PACKAGE_GRACE  | Integer       | How long a package file stays downloadable after a newer build or a removal takes it out of the repository database, in seconds, so clients that synced just before can still fetch it | 86400 |
+| ACTIVITY_RETENTION     | Integer       | How long an entry stays in the **Logs** page, in seconds. `0` keeps everything | 7776000 (90 days) |
 | PARSE_NETWORK          | Boolean       | Let a PKGBUILD reach the network while the server parses it; also a setting, global | false |
 | SECRET_KEY             | String        | \>32Byte Random String for singing cookies                            | Random  |
 | AURCACHE_PUBLIC_URL    | String        | Base URL workers use for the pacman repo, baked into build configs. Example: `http://aurcache:8081` | `http://localhost:8081` |

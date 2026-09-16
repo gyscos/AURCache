@@ -1,11 +1,15 @@
 use crate::logger::init_logger;
 use crate::startup::{post_startup_tasks, pre_startup_tasks};
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::server_start_activity::ServerStartActivity;
 use aurcache_api::init::{CaDirectory, ServerVersion, init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
+use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::init::init_db;
 use aurcache_deps::AurClient;
+use aurcache_scheduler::activity_retention::start_activity_retention;
 use aurcache_scheduler::auto_update::start_auto_update_job;
 use aurcache_scheduler::download_flush::start_download_flush;
 use aurcache_scheduler::lease_reaper::start_lease_reaper;
@@ -36,6 +40,25 @@ async fn main() {
 
     if let Err(e) = post_startup_tasks(&db).await {
         warn!("Startup cleanup did not complete: {e}");
+    }
+
+    // A line in the log for the process starting. It says which version came
+    // up, which is what lines a deploy up against whatever happened after it --
+    // and it is the marker a "since this boot" view would count back to.
+    //
+    // Best effort: a server that cannot write its own start entry should still
+    // start.
+    if let Err(e) = ActivityLog::new(db.clone())
+        .add(
+            ServerStartActivity {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            ActivityType::ServerStart,
+            None,
+        )
+        .await
+    {
+        warn!("Could not record the server start in the activity log: {e}");
     }
 
     // Load (or create on first run) the internal CA used to authenticate remote
@@ -113,6 +136,10 @@ async fn main() {
     // an older repo.db have had time to fetch them.
     let retired_sweep_handle = start_retired_package_sweep(Arc::clone(&repo));
 
+    // Keep the log from growing for ever. Nothing has ever pruned it, and it
+    // now records restarts and failures as well as what people did.
+    let activity_retention_handle = start_activity_retention(db.clone());
+
     // Repository downloads are counted in memory by the file server and folded
     // into the database from here, so serving a package costs no write. Both
     // sides share this one buffer; a second instance would count into a map
@@ -144,6 +171,9 @@ async fn main() {
         }
         _ = retired_sweep_handle => {
             warn!("Retired package sweep handle exited");
+        }
+        _ = activity_retention_handle => {
+            warn!("Activity log retention handle exited");
         }
         _ = official_repo_handle => {
             warn!("Official repository refresh handle exited");

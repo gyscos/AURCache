@@ -611,6 +611,7 @@ name = "aurcache"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "aurcache-activitylog",
  "aurcache-api",
  "aurcache-builder",
  "aurcache-ca",
@@ -637,8 +638,10 @@ dependencies = [
  "aurcache-common",
  "aurcache-db",
  "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "utoipa",
 ]
@@ -807,6 +810,7 @@ version = "0.1.0"
 dependencies = [
  "alpm-srcinfo",
  "anyhow",
+ "aurcache-activitylog",
  "aurcache-builder",
  "aurcache-common",
  "aurcache-db",

@@ -9,6 +9,11 @@
 
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::failure_activity::WorkerSettingRejectedActivity;
+use aurcache_activitylog::worker_activity::{
+    WorkerApproveActivity, WorkerEnrollActivity, WorkerRevokeActivity,
+};
 use aurcache_ca::Ca;
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
@@ -20,6 +25,7 @@ use aurcache_common::worker::{
     MirrorlistPreference, RegisterRequest, RegisterStatus,
 };
 use aurcache_common::worker_config::{EffectiveConfig, SettingStatus};
+use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
@@ -266,6 +272,7 @@ const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worke
 pub async fn register_worker(
     db: &State<DatabaseConnection>,
     ca: &State<Ca>,
+    al: &State<ActivityLog>,
     input: Json<RegisterRequest>,
 ) -> Result<Json<RegisterStatus>, ApiError> {
     let db = db.inner();
@@ -273,6 +280,15 @@ pub async fn register_worker(
 
     let fingerprint = aurcache_ca::fingerprint_from_csr_pem(&input.csr_pem)
         .map_err(|e| err(Status::BadRequest, e))?;
+
+    // Asked before registering, because registering is an upsert and would
+    // erase the difference. A worker re-registers on every startup, so only the
+    // first time is an event: logging the rest would turn an ordinary restart
+    // -- or a crash loop -- into a log nobody can read past.
+    let known = worker_store::find_worker_by_fingerprint(db, &fingerprint)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .is_some();
 
     // Stored as the JSON the worker sent, because the server renders a
     // declaration and never reasons about it: a setting whose kind this server
@@ -309,6 +325,17 @@ pub async fn register_worker(
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
 
+    if !known {
+        al.record(
+            WorkerEnrollActivity {
+                worker: worker.name.clone(),
+            },
+            ActivityType::WorkerEnroll,
+            None,
+        )
+        .await;
+    }
+
     // Issue the leaf certificate, or re-issue one this CA did not sign.
     //
     // The second case is a CA that has been regenerated -- a deployment that
@@ -342,6 +369,15 @@ pub async fn register_worker(
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
         tracing::info!("Auto-approved worker '{}' ({fingerprint})", worker.name);
+        // No user: nobody clicked this. The log says the server did it.
+        al.record(
+            WorkerApproveActivity {
+                worker: worker.name.clone(),
+            },
+            ActivityType::WorkerApprove,
+            None,
+        )
+        .await;
     }
 
     register_status_for(db, ca, &fingerprint).await
@@ -833,6 +869,7 @@ async fn complete_job_inner(
 pub async fn heartbeat(
     db: &State<DatabaseConnection>,
     auth: WorkerAuth,
+    al: &State<ActivityLog>,
     input: Json<Heartbeat>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
     let db = db.inner();
@@ -856,6 +893,27 @@ pub async fn heartbeat(
                 }
             }
             Err(e) => tracing::warn!("unreadable configuration report from a worker: {e}"),
+        }
+
+        // A worker sends this only when it changes, so this is once per worker
+        // process rather than once per heartbeat: the log records a machine
+        // coming up running something other than what it was configured with.
+        let refused: Vec<String> = effective
+            .settings
+            .iter()
+            .filter(|(_, setting)| setting.status == SettingStatus::Rejected)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !refused.is_empty() {
+            al.record(
+                WorkerSettingRejectedActivity {
+                    worker: auth.worker.name.clone(),
+                    settings: refused,
+                },
+                ActivityType::WorkerSettingRejected,
+                None,
+            )
+            .await;
         }
     }
     let outcome = worker_jobs::heartbeat(
@@ -1119,13 +1177,22 @@ fn parse_stored<T: serde::de::DeserializeOwned>(json: &str, id: i32, what: &str)
 #[post("/workers/<id>/approve")]
 pub async fn approve_worker(
     db: &State<DatabaseConnection>,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
     id: i32,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    worker_store::approve_worker(db, id)
+    let worker = worker_store::approve_worker(db, id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.record(
+        WorkerApproveActivity {
+            worker: worker.name,
+        },
+        ActivityType::WorkerApprove,
+        a.username,
+    )
+    .await;
     Ok(())
 }
 
@@ -1133,13 +1200,22 @@ pub async fn approve_worker(
 #[post("/workers/<id>/revoke")]
 pub async fn revoke_worker(
     db: &State<DatabaseConnection>,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
     id: i32,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    worker_store::revoke_worker(db, id, max_attempts())
+    let worker = worker_store::revoke_worker(db, id, max_attempts())
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.record(
+        WorkerRevokeActivity {
+            worker: worker.name,
+        },
+        ActivityType::WorkerRevoke,
+        a.username,
+    )
+    .await;
     Ok(())
 }
 

@@ -189,6 +189,26 @@ impl Session {
         .await;
     }
 
+    /// Pick an option in a `<select>` by its value, firing the change event the
+    /// way a person choosing one would.
+    ///
+    /// Setting `value` alone changes what is displayed and nothing else: the
+    /// framework listens for `change`, so without dispatching it the page would
+    /// look filtered while showing the same rows.
+    async fn select_option(&self, selector: &str, value: &str) {
+        self.wait_for_script(
+            &format!("{selector:?} to offer {value:?}"),
+            format!(
+                "const el = document.querySelector({}); \
+                 if (!el) return false; el.value = {}; \
+                 el.dispatchEvent(new Event('change', {{ bubbles: true }})); return true;",
+                json(selector),
+                json(value),
+            ),
+        )
+        .await;
+    }
+
     /// How many nodes match, for checking how much of a list is on screen.
     async fn count(&self, selector: &str) -> i64 {
         self.eval(format!(
@@ -241,6 +261,7 @@ async fn interactions() {
     the_restore_dialog_offers_its_options(&session).await;
     approving_a_worker_lets_it_build(&session).await;
     a_workers_settings_say_where_each_value_came_from(&session).await;
+    the_log_filters_narrow_what_it_shows(&session).await;
     a_per_package_file_leaves_the_server_wide_one_alone(&session).await;
     a_build_flag_survives_a_reload_and_can_be_taken_off(&session).await;
     dependencies_stay_out_of_the_list_until_asked_for(&session).await;
@@ -628,6 +649,102 @@ async fn a_workers_settings_say_where_each_value_came_from(session: &Session) {
     session
         .wait_until("the fleet to come back", |t| t.contains("builder-arm"))
         .await;
+}
+
+/// The log's two filters, which are the half a route check cannot see: those
+/// only ask what is present, and a filter is judged by what it takes away.
+///
+/// Both are applied by the *server* -- the log is the one list too long to
+/// fetch whole -- so this also proves the query reaches it and comes back
+/// narrowed, rather than the browser hiding rows it already had.
+async fn the_log_filters_narrow_what_it_shows(session: &Session) {
+    session.open("/logs").await;
+    session
+        .wait_until("the log to load", |t| t.contains("added package"))
+        .await;
+    let all = session.text().await;
+    assert!(all.contains("no space left on device"), "{all}");
+    assert!(all.contains("forced update of package"), "{all}");
+
+    // Errors only: the failure stays, the ordinary entries go.
+    session
+        .select_option("select[aria-label=\"Filter by severity\"]", "error")
+        .await;
+    session
+        .wait_until("the ordinary entries to go", |t| {
+            !t.contains("forced update of package")
+        })
+        .await;
+    let errors = session.text().await;
+    assert!(errors.contains("no space left on device"), "{errors}");
+    assert!(
+        !errors.contains("a worker stopped answering"),
+        "a warning is not an error: {errors}"
+    );
+    // The filter is in the URL, so a narrowed log can be linked to.
+    assert!(
+        session.url().await.contains("v=error"),
+        "{}",
+        session.url().await
+    );
+
+    // Warnings and errors: the reaped worker comes back, the rest stays gone.
+    session
+        .select_option("select[aria-label=\"Filter by severity\"]", "warning")
+        .await;
+    session
+        .wait_until("the warning to appear", |t| {
+            t.contains("a worker stopped answering")
+        })
+        .await;
+    assert!(
+        !session.text().await.contains("forced update of package"),
+        "an ordinary entry is neither"
+    );
+
+    // Back to everything, then cut at the last restart: the fixture puts two
+    // entries before the server-start row.
+    session
+        .select_option("select[aria-label=\"Filter by severity\"]", "")
+        .await;
+    session
+        .wait_until("everything to come back", |t| {
+            t.contains("forced update of package")
+        })
+        .await;
+    assert!(
+        session
+            .text()
+            .await
+            .contains("deleted package obsolete-thing"),
+        "an entry from before the restart is there to be dropped"
+    );
+
+    session
+        .click("input[aria-label=\"Since the last restart\"]")
+        .await;
+    session
+        .wait_until("the older entries to go", |t| {
+            !t.contains("deleted package obsolete-thing")
+        })
+        .await;
+    let booted = session.text().await;
+    // The marker is *this* server's own start row, not the one in the fixture:
+    // the suite boots a real backend, and it records its own restart. So "this
+    // boot" is everything since the test's server came up.
+    assert!(booted.contains("started"), "{booted}");
+    // Which includes what this test run itself caused: the worker approved by
+    // an earlier scenario was logged, and shows up here. That is the whole loop
+    // -- an action in the UI, an entry in the log, found by the filter.
+    assert!(
+        booted.contains("approved worker new-machine"),
+        "an action from this run should be in this boot: {booted}"
+    );
+    assert!(
+        session.url().await.contains("b=1"),
+        "{}",
+        session.url().await
+    );
 }
 
 /// Queueing two packages and taking one back off again.

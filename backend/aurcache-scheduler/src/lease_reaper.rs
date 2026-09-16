@@ -9,8 +9,11 @@
 //! allows — never a requeue of the same row. Explicit failures are handled
 //! synchronously in the `complete` endpoint and are never seen here.
 
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::failure_activity::WorkerReapedActivity;
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
+use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
 use aurcache_utils::build_logger::append_build_output;
@@ -56,6 +59,26 @@ pub fn start_lease_reaper(db: DatabaseConnection) -> JoinHandle<()> {
                             "Lease reaper: retried {:?}, gave up on {:?} (silent/hung workers)",
                             out.retried, out.failed
                         );
+                        // One entry for the pass, not one per build: the reaper
+                        // finds them together and they have one cause.
+                        ActivityLog::new(db.clone())
+                            .record(
+                                WorkerReapedActivity {
+                                    // The build the operator was watching, not
+                                    // the fresh row standing in for it: the
+                                    // replacement is a number they have never
+                                    // seen.
+                                    retried: out
+                                        .retried
+                                        .iter()
+                                        .map(|&(abandoned, _replacement)| abandoned)
+                                        .collect(),
+                                    failed: out.failed.clone(),
+                                },
+                                ActivityType::WorkerReaped,
+                                None,
+                            )
+                            .await;
                     }
 
                     // Explain each abandoned build in its own log. The row is

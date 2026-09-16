@@ -323,13 +323,30 @@ ROUTES=(
     # rather than a page.
     "/worker/replaced-host|2 workers call themselves this|a shared name offers a choice"
     "/workers/by-cert/555555555555|builddir_max_bytes|a worker can be reached by its certificate"
-    "/activities|added package hello|activities"
+    # The package name is a link, so the entry's text is split around it in the
+    # DOM: the prose and the link are checked separately rather than as one
+    # contiguous string.
+    "/logs|added package|logs"
     # The text is rendered server-side from the stored JSON, so this also
     # proves the payload shapes in the fixture are ones the server can parse.
-    "/activities|forced update of package yay|the log renders each entry type"
+    "/logs|forced update of package|the log renders each entry type"
     # Nobody asked for this one; a schedule did. The Dart frontend called that
     # "You", which claims work the reader did not do.
-    "/activities|AURCache|an unattributed entry is credited to the server"
+    "/logs|AURCache|an unattributed entry is credited to the server"
+    # The log carries what went wrong, not only what people did.
+    "/logs|no space left on device|a failure says what went wrong"
+    "/logs|a worker stopped answering|a reaped worker is recorded"
+    "/logs|AURCache 0.5.0 started|a restart is recorded, with the version"
+    "/logs|badge-error|a failure is marked as one"
+    # A package an entry is about opens from the log.
+    "/logs|href=\"/package/hello\"|an entry links to the package it is about"
+    "/logs|href=\"/worker/|a worker entry links to the worker"
+    # The path before Activity became Logs; a bookmark of it still lands.
+    "/activities|added package|the old activities path redirects"
+    # Filters ride the query, so a narrowed log is linkable. What a filter
+    # *drops* cannot be checked here -- these checks only ask what is present --
+    # so the interaction suite covers that.
+    "/logs?v=error|no space left on device|a severity filter in the URL is applied"
     "/no/such/page|Not found|404 (depth 3)"
 )
 if [ "$ONLINE" = "1" ]; then

@@ -31,6 +31,7 @@ mod m20260915_000000_retire_build_limit_settings;
 mod m20260916_000000_build_vcs_sources;
 mod m20260917_000000_retire_server_build_settings;
 mod m20260917_000001_worker_configuration;
+mod m20260917_000002_activity_timestamp_index;
 
 pub struct Migrator;
 
@@ -76,6 +77,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000000_build_vcs_sources::Migration),
             Box::new(m20260917_000000_retire_server_build_settings::Migration),
             Box::new(m20260917_000001_worker_configuration::Migration),
+            Box::new(m20260917_000002_activity_timestamp_index::Migration),
         ]
     }
 }

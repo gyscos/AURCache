@@ -276,6 +276,9 @@ pub fn init_worker_api(
 
         info!("Starting remote-worker mTLS protocol listener on port {port}");
         let launch_result = rocket::custom(config)
+            // A worker enrolling or being auto-approved is worth a line in the
+            // log, and this listener is where both happen.
+            .manage(ActivityLog::new(db.clone()))
             .manage(db)
             .manage(ca)
             .manage(store)

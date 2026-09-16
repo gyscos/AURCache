@@ -9,7 +9,7 @@ use reqwest::Url;
 // this client, and the browser frontend alike. Types still declared below are
 // ones whose server-side counterpart has a different shape or name; converging
 // those is the remaining half of the job.
-pub use aurcache_common::api::activity::Activity;
+pub use aurcache_common::api::activity::{Activity, ActivityPage, ActivitySubject, Severity};
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::dump::{
@@ -657,10 +657,27 @@ impl AurCacheClient {
         path
     }
 
-    /// The most recent entries in the activity log, newest first.
-    pub async fn activities(&self, limit: Option<u64>) -> Result<Vec<Activity>> {
-        let query = Query::default().opt("limit", limit);
-        self.request_json::<Vec<Activity>, Value>(Method::GET, "/activity", query.pairs(), None)
+    /// One page of the activity log, newest first, with how long the log is.
+    ///
+    /// Paged *and filtered* on the server because the log only grows: there is
+    /// no point at which fetching all of it is the cheap option, and a filter
+    /// applied after the fact would only search the page it was given.
+    ///
+    /// `severity` shows that level and worse; `since_boot` limits it to what
+    /// happened since the server last started. Both omitted means the whole log.
+    pub async fn activities(
+        &self,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        severity: Option<Severity>,
+        since_boot: bool,
+    ) -> Result<ActivityPage> {
+        let query = Query::default()
+            .opt("limit", limit)
+            .opt("offset", offset)
+            .opt("severity", severity.map(|s| s.slug().to_string()))
+            .opt("since_boot", since_boot.then_some(true));
+        self.request_json::<ActivityPage, Value>(Method::GET, "/activity", query.pairs(), None)
             .await
     }
 

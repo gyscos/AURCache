@@ -116,10 +116,10 @@ fn SideMenu() -> Element {
                         icon: rsx! { BuildsIcon {} },
                     }
                     MenuLink {
-                        to: Route::Activities {},
-                        label: "Activity",
-                        active: active == Some(MenuEntry::Activities),
-                        icon: rsx! { ActivitiesIcon {} },
+                        to: Route::Logs { view: crate::listing::ViewParams::default() },
+                        label: "Logs",
+                        active: active == Some(MenuEntry::Logs),
+                        icon: rsx! { LogsIcon {} },
                     }
                     MenuLink {
                         to: Route::Workers {},
@@ -408,7 +408,7 @@ pub(crate) fn DownloadIcon() -> Element {
 }
 
 #[component]
-fn ActivitiesIcon() -> Element {
+fn LogsIcon() -> Element {
     rsx! { Icon { path: "M4 6h16M4 12h16M4 18h10" } }
 }
 
@@ -485,7 +485,13 @@ mod tests {
     /// screen is current — not per screen.
     #[test]
     fn every_screen_renders_inside_the_menu_shell() {
-        for path in ["/", "/settings", "/settings/config-files", "/workers"] {
+        for path in [
+            "/",
+            "/settings",
+            "/settings/config-files",
+            "/workers",
+            "/logs",
+        ] {
             let html = render_at(path);
             assert!(html.contains("AURCache"), "{path} lost the menu header");
             assert!(html.contains("Dashboard"), "{path} lost the menu: {html}");

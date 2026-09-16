@@ -7,7 +7,7 @@
 //! already on. If the fetch itself ever becomes the problem, the pure functions
 //! here are what would move.
 
-use aurcache_client::{Build, SimplePackage};
+use aurcache_client::{Build, Severity, SimplePackage};
 use aurcache_common::build_state::BuildState;
 
 /// Which column a list is ordered by.
@@ -370,7 +370,12 @@ mod tests {
                 status: Some(StatusFilter::OutOfDate),
                 sort: None,
                 dependencies: false,
+                ..ViewParams::default()
             },
+            // The log's own dimensions, which share the same query encoding.
+            ViewParams::for_logs(Some(Severity::Warning), false),
+            ViewParams::for_logs(Some(Severity::Error), true),
+            ViewParams::for_logs(None, true),
             ViewParams {
                 status: Some(StatusFilter::State(BuildState::Failed)),
                 sort: Some(Sort {
@@ -378,6 +383,7 @@ mod tests {
                     dir: SortDir::Desc,
                 }),
                 dependencies: true,
+                ..ViewParams::default()
             },
         ] {
             let encoded = view.to_string();
@@ -1190,6 +1196,10 @@ pub struct ViewParams {
     /// no `o=` at all rather than spelling out what it would have done anyway.
     pub sort: Option<Sort>,
     pub dependencies: bool,
+    /// Logs only: show this severity and worse. `None` is the whole log.
+    pub severity: Option<Severity>,
+    /// Logs only: only what happened since the server last started.
+    pub since_boot: bool,
 }
 
 impl ViewParams {
@@ -1206,6 +1216,21 @@ impl ViewParams {
             status: (status != StatusFilter::Any).then_some(status),
             sort: (sort != default_sort).then_some(sort),
             dependencies,
+            ..Self::default()
+        }
+    }
+
+    /// Build from the log's own controls. A separate constructor because the
+    /// log shares none of the other lists' dimensions -- it has no status and
+    /// no sort, and its filters are applied by the server rather than here.
+    #[must_use]
+    pub fn for_logs(severity: Option<Severity>, since_boot: bool) -> Self {
+        Self {
+            // `Info` is every severity there is, so it is not a filter; keeping
+            // it out of the URL is what stops an untouched log carrying one.
+            severity: severity.filter(|&s| s != Severity::Info),
+            since_boot,
+            ..Self::default()
         }
     }
 
@@ -1243,6 +1268,14 @@ impl std::fmt::Display for ViewParams {
         }
         if self.dependencies {
             write!(f, "{sep}d=1")?;
+            sep = "&";
+        }
+        if let Some(severity) = self.severity {
+            write!(f, "{sep}v={}", severity.slug())?;
+            sep = "&";
+        }
+        if self.since_boot {
+            write!(f, "{sep}b=1")?;
         }
         Ok(())
     }
@@ -1269,6 +1302,10 @@ impl From<&str> for ViewParams {
                     }
                 }
                 "d" => view.dependencies = value == "1",
+                "v" => {
+                    view.severity = Severity::from_slug(value).filter(|&s| s != Severity::Info);
+                }
+                "b" => view.since_boot = value == "1",
                 _ => {}
             }
         }

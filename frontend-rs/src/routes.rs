@@ -88,8 +88,11 @@ pub enum Route {
         // cannot be mistaken for a name by the catch-all above.
         #[route("/workers/by-cert/:fingerprint")]
         WorkerByFingerprint { fingerprint: String },
-        #[route("/activities")]
-        Activities {},
+        // Renamed from Activities once it carried failures as well as actions.
+        // The old path still lands: a bookmark predates the rename.
+        #[redirect("/activities", || Route::Logs { view: ViewParams::default() })]
+        #[route("/logs?:..view")]
+        Logs { view: ViewParams },
         #[route("/settings")]
         Settings {},
         // Under Settings because that is the only way in: it left the sidebar
@@ -112,7 +115,7 @@ pub enum MenuEntry {
     Dashboard,
     Builds,
     Packages,
-    Activities,
+    Logs,
     Workers,
     Settings,
 }
@@ -136,7 +139,7 @@ impl Route {
             | Self::Build { .. }
             | Self::PackageSource { .. }
             | Self::PackageConfigFiles { .. } => Some(MenuEntry::Packages),
-            Self::Activities { .. } => Some(MenuEntry::Activities),
+            Self::Logs { .. } => Some(MenuEntry::Logs),
             Self::Workers { .. } | Self::Worker { .. } | Self::WorkerByFingerprint { .. } => {
                 Some(MenuEntry::Workers)
             }
@@ -151,6 +154,7 @@ impl Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aurcache_client::Severity;
     use aurcache_common::build_state::BuildState;
     use std::str::FromStr;
 
@@ -242,6 +246,35 @@ mod tests {
         );
     }
 
+    /// Activity became Logs when it started carrying failures as well as
+    /// actions. A bookmark of the old path still has to land on them.
+    #[test]
+    fn the_old_activities_path_still_arrives() {
+        assert_eq!(entry_for("/activities"), Some(MenuEntry::Logs));
+        assert_eq!(entry_for("/logs"), Some(MenuEntry::Logs));
+    }
+
+    /// An unfiltered log carries no filter in its URL, and a filtered one
+    /// carries exactly what was set.
+    #[test]
+    fn log_filters_ride_the_query() {
+        let bare = Route::Logs {
+            view: ViewParams::default(),
+        }
+        .to_string();
+        assert!(
+            bare.split_once('?').is_none_or(|(_, q)| q.is_empty()),
+            "an unfiltered log wrote {bare:?}"
+        );
+
+        let filtered = Route::Logs {
+            view: ViewParams::for_logs(Some(Severity::Warning), true),
+        }
+        .to_string();
+        assert!(filtered.contains("v=warning"), "{filtered}");
+        assert!(filtered.contains("b=1"), "{filtered}");
+    }
+
     /// The config files moved under Settings when they left the sidebar. A
     /// bookmark of the old path still has to land on them.
     #[test]
@@ -329,7 +362,12 @@ mod tests {
             Route::WorkerByFingerprint {
                 fingerprint: "0f1e2d3c4b5a".into(),
             },
-            Route::Activities {},
+            Route::Logs {
+                view: ViewParams::default(),
+            },
+            Route::Logs {
+                view: ViewParams::for_logs(Some(Severity::Warning), true),
+            },
             Route::Settings {},
             Route::ConfigFiles {},
         ] {

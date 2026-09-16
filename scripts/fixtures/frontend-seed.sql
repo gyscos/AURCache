@@ -155,13 +155,26 @@ INSERT INTO settings (key, value, pkg_id) VALUES ('auto_update_interval', '4', -
 -- A few lines of activity log. The text is not stored: the server renders it
 -- from `typ` and the JSON in `data`, so these have to be shapes the serializers
 -- actually parse (see aurcache-activitylog/src/*_activity.rs). Types are
--- 0=add, 1=remove, 2=update.
+-- 0=add, 1=remove, 2=update, 5=server start, 7=worker approved, 9=publish
+-- failed, 10=worker reaped.
 --
--- The last row has no user, which is the case the screen renders differently:
--- nobody asked for it, a schedule did.
+-- One row has no user, which is the case the screen renders differently: nobody
+-- asked for it, a schedule did.
+--
+-- Arranged around the server-start row at -1000s, because that is the marker
+-- "since the last restart" counts back to: two entries are older than it and
+-- must drop out when that filter is on. The two failures give the severity
+-- filter something to find, one of each level.
 INSERT INTO activity (typ, data, timestamp, user) VALUES
   (0, '{"package":"hello"}',                    CAST(strftime('%s','now') AS INTEGER) - 30,    'alice'),
+  (9, '{"package":"yay","build":7,"reason":"no space left on device"}',
+                                                CAST(strftime('%s','now') AS INTEGER) - 100,   NULL),
+  (10, '{"retried":[12],"failed":[11]}',        CAST(strftime('%s','now') AS INTEGER) - 200,   NULL),
+  -- A worker entry, so the log has a subject that opens a worker rather than a
+  -- package.
+  (7, '{"worker":"builder-01"}',                CAST(strftime('%s','now') AS INTEGER) - 300,   'alice'),
   (2, '{"package":"yay","forced":true}',        CAST(strftime('%s','now') AS INTEGER) - 900,   'alice'),
+  (5, '{"version":"0.5.0"}',                    CAST(strftime('%s','now') AS INTEGER) - 1000,  NULL),
   (1, '{"package":"obsolete-thing"}',           CAST(strftime('%s','now') AS INTEGER) - 4000,  'bob'),
   (2, '{"package":"neofetch","forced":false}',  CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);
 

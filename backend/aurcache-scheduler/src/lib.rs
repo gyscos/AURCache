@@ -1,3 +1,4 @@
+pub mod activity_retention;
 pub mod auto_update;
 pub mod download_flush;
 pub mod lease_reaper;
