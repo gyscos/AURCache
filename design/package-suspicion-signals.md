@@ -213,7 +213,9 @@ must never be held by, or held up by, a heuristic.
 - **Build page** (`frontend-rs/src/screens/build.rs`): the existing header row
   gains a warning chip when the build's signals are non-empty, and an
   expandable "N suspicion signals" panel lists rule, severity and message per
-  finding. The poll loop already re-reads the build each cycle
+  finding. A withheld build says so plainly — "held back from the repository:
+  score 34 (threshold 30); clients still have <previous version>" — with the
+  download and Release actions beside it. The poll loop already re-reads the build each cycle
   (`build.rs:398-417`), so the chip appears as soon as the completion report
   lands, and the artifact findings when the publish transaction commits.
 - **Build rows** (`frontend-rs/src/screens/package.rs`, the `BuildRow` at
@@ -255,6 +257,21 @@ How it fits the publish path (`backend/aurcache-utils/src/publish.rs`):
   (`withheld_artifacts`: build, filename, size, sha256, path) rather than in
   `files`. The repository transaction is not entered at all, so the repository
   is untouched and its lock is never taken for a package nobody will install.
+- **Where the file goes.** A quarantine directory beside the staging area under
+  the repository root (`.quarantine`, as staging is `.staging`,
+  `repository.rs:25`), so moving a staged artifact into it is a rename on one
+  filesystem, as publishing already is. It is not in `repo.db`, so no client
+  discovers it — but "not listed" is not "not served", and the mirror serves
+  the repository root as files. The quarantine directory must therefore be
+  excluded from what that server exposes, or live outside the root entirely;
+  otherwise withholding only costs an attacker a guessed URL.
+- **The previous version stays installable.** Retiring the file a new version
+  replaces happens inside the repository commit, which a withheld build never
+  reaches, so the last published version keeps its `repo.db` entry and its file.
+  `Repository::sweep` judges by `repo.db` and still lists it, so it is not swept
+  either. Clients simply keep installing the version they had — which is the
+  behaviour you want from a quarantine, and falls out of not touching the
+  repository rather than needing code.
 - **Dependents do not fan out.** Rebuild fan-out and "is this version
   satisfied" both read *successful* builds; `WITHHELD` is not one, so a package
   depending on a withheld one keeps waiting rather than building against
@@ -265,7 +282,22 @@ How it fits the publish path (`backend/aurcache-utils/src/publish.rs`):
   `SUCCESSFUL` for "have we built this version", and like `FAILED_BUILD` for
   "may clients have it".
 
-Operator actions, both audited like other package changes:
+**Getting at the artifact.** A withheld package is evidence, and evidence that
+cannot be opened is useless, so it is downloadable through the authenticated
+API rather than the public repository:
+
+- `GET /api/build/<id>/artifact` streams the withheld file for a build that has
+  one, with its name and `sha256` in the response headers, behind the same
+  authentication every other API route uses. The build page offers it as
+  "Download artifact (withheld)" beside the signal panel, and
+  `aurcache-cli builds artifact <pkg>/<n> -o <path>` writes it to disk, which is
+  what an operator with a shell will actually use. The route is deliberately
+  *not* the mirror: analysing a suspicious package is an operator action, not a
+  public one.
+- The same route serves a published build's artifact too, which costs nothing
+  extra and saves knowing the repository URL layout.
+
+Operator actions, all audited like other package changes:
 
 - **Release** — publish the withheld artifact unchanged, through the normal
   `Repository` commit, moving the build to `SUCCESSFUL`. This is the reviewed
