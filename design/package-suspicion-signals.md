@@ -89,9 +89,10 @@ server-side and serialized by the build-state machine, so there is no race:
 }
 ```
 
-A `severity` of `"blocking?"` is a *marker*, not a verdict: nothing acts on it
-unless an operator flips the per-package gate setting (Change 6), which ships
-off. Rule hits are capped (e.g. 50) and the message truncated per hit, so the
+Each finding also carries the weight it contributes, and the blob carries their
+sum as `score`. A `severity` of `"blocking?"` is a *marker*, not a verdict:
+nothing acts on it unless an operator sets a withhold threshold (Change 6),
+which ships unset. Rule hits are capped (e.g. 50) and the message truncated per hit, so the
 blob stays a bounded, log-line-sized object.
 
 The typed shape lives in `aurcache-common` (`api`), added once and shared with
@@ -220,20 +221,73 @@ must never be held by, or held up by, a heuristic.
   rows whose `signals` is non-empty. No new columns: the whole point of a
   signal is the *build you go look at*.
 
-### 6. A per-package gate (future, default off)
+### 6. A score, and withholding a package from the repository
 
-Not implemented in the first pass — recorded so the shape is known, like the
-network ladder in the sandbox-attempt doc. A setting resolved through the
-established `Package -> Env -> Global -> Default` precedence
-(`backend/aurcache-common/src/settings.rs`, `Setting::ALL` at `settings.rs:84`)
-decides whether a `"blocking?"`-marked finding holds the build at `PUBLISHING`
-and fails it with the signal in its log. The default is `off`
-(`SIGNALS_GATE=false`): flagging is what ships; interruption is a per-package
-opt-in that operators earn by trusting the catalogue.
+Rule hits are the evidence; a **score** is what a threshold can be set against.
+Each rule carries a weight, the score is their sum for the build (recipe and
+artifact together), and the blob records both the number and the rules that
+produced it, so a score is always traceable back to what it came from. Weights
+live beside the catalogue and change with it; a score is therefore comparable
+between builds of the same AURCache version and not a number to store meaning
+in beyond that.
+
+The interesting action is not failing the build. A build that produced an
+artifact has already spent its hours, and the artifact is the evidence — the
+`xsnow`-shaped payload only exists *in* it. So the gate is about **publication**:
+
+> `signals_withhold_score` (`Package -> Env -> Global -> Default`, default
+> unset = never withhold). When a finished build's score is at or above it, the
+> artifact is kept and recorded but **not added to the repository**: no
+> `repo.db` entry, so no client installs it, while an operator can still fetch
+> it, unpack it, and decide.
+
+How it fits the publish path (`backend/aurcache-utils/src/publish.rs`):
+
+- **A new terminal state, `WITHHELD`**, beside `SUCCESSFUL` and `FAILED_BUILD`
+  in `BuildStates`. `PUBLISHING` already exists as the state between a worker's
+  completion and the repository write, which is exactly where the decision
+  belongs: `publish_build` scans the staged artifact (Change 3), computes the
+  score, and either commits through `Repository` as today or moves the files to
+  a quarantine directory beside the repository and ends the build `WITHHELD`.
+- **No `files` rows, no `repo.db` entry.** An orphaned `files` row is not a
+  harmless leak (publishing reads it as "already produced by another package"),
+  so a withheld build records its artifact in its own table
+  (`withheld_artifacts`: build, filename, size, sha256, path) rather than in
+  `files`. The repository transaction is not entered at all, so the repository
+  is untouched and its lock is never taken for a package nobody will install.
+- **Dependents do not fan out.** Rebuild fan-out and "is this version
+  satisfied" both read *successful* builds; `WITHHELD` is not one, so a package
+  depending on a withheld one keeps waiting rather than building against
+  something the repository does not have.
+- **The version is still recorded as built.** A withheld build must not make the
+  scheduler rebuild the same version on its next pass — that would quarantine it
+  again every interval, forever. The version check treats `WITHHELD` like
+  `SUCCESSFUL` for "have we built this version", and like `FAILED_BUILD` for
+  "may clients have it".
+
+Operator actions, both audited like other package changes:
+
+- **Release** — publish the withheld artifact unchanged, through the normal
+  `Repository` commit, moving the build to `SUCCESSFUL`. This is the reviewed
+  path: the signal did its job, a person looked, the package is fine.
+- **Discard** — delete the artifact and leave the build `WITHHELD`, or delete
+  the build outright through the existing deletion path.
+
+Not implemented in the first pass; the first pass is the signal and the score.
+But the shape is worth fixing now, because it is what the score is *for*: a
+number nobody can act on is a number nobody reads. The default stays unset —
+flagging is what ships, withholding is an operator's choice, and a fleet that
+has never looked at a report should not start having packages disappear from
+its repository.
 
 ## What we deliberately do not do
 
-- **Fail or gate builds on signals by default.** Legitimate packages ship
+- **Fail builds on signals.** Even with a threshold set, a scored build still
+  finishes and keeps its artifact; what a threshold withholds is *publication*,
+  because the artifact is the evidence and throwing it away is the one
+  irreversible move available. Failing the build would also lose the hours it
+  cost to find out.
+- **Gate publication by default.** Legitimate packages ship
   `.INSTALL` scriptlets, hooks, and `Restart=always` units (`dockerd`, `containerd`,
   any watchdog). A heuristic that turned those into failures would break the
   fleet; the catalogue is honest and the gate is an explicit per-package opt-in.
