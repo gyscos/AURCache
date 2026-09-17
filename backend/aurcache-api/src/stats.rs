@@ -157,7 +157,7 @@ async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
         avg_build_time: Option<BigDecimal>,
     }
 
-    let unique: BuildTimeStruct = Builds::find()
+    let unique: Option<BuildTimeStruct> = Builds::find()
         .select_only()
         .column_as(
             Expr::from(Func::avg(
@@ -169,11 +169,13 @@ async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
         .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
         .into_model::<BuildTimeStruct>()
         .one(db)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("No Average build time"))?;
-
+        .await?;
+    // An aggregate without `GROUP BY` always returns a row, so "no rows" can
+    // only mean an empty table — which deserves a 0 average, not a failed
+    // `/stats` page. (The old `ok_or_else` arm was dead code that errored the
+    // whole endpoint exactly when there was nothing to average.)
     Ok(unique
-        .avg_build_time
+        .and_then(|row| row.avg_build_time)
         .and_then(|avg| avg.to_u32())
         .unwrap_or(0))
 }

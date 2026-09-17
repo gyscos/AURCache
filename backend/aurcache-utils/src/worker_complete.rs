@@ -32,6 +32,17 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
+    check_owned_active(worker_id, &build)?;
+    Ok(build)
+}
+
+/// The ownership half of [`assert_owned_active`], for callers that already
+/// hold the row: completions fetch the build first for their idempotency
+/// checks, and re-querying it here would pay a second point lookup on the
+/// hottest worker endpoint for a row that cannot usefully change between the
+/// two reads (a concurrent state change fails the CAS further down anyway).
+pub fn check_owned_active(worker_id: i32, build: &builds::Model) -> Result<(), DbErr> {
+    let build_id = build.id;
     if build.status != Some(BuildStates::ACTIVE_BUILD) {
         return Err(DbErr::Custom(format!("build {build_id} is not active")));
     }
@@ -40,7 +51,7 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
             "build {build_id} is not owned by worker {worker_id}"
         )));
     }
-    Ok(build)
+    Ok(())
 }
 
 /// Record the peak memory a worker reported for a build.

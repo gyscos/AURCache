@@ -12,6 +12,7 @@ use crate::models::package::{
     CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
 };
 use crate::utils::error::{ApiError, err};
+use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_add_activity::PackageAddActivity;
 use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
@@ -119,10 +120,12 @@ fn normalize_build_flags(build_flags: &[String]) -> Vec<String> {
 fn parse_platforms(platforms: Option<Vec<String>>) -> Result<Option<Vec<Platform>>, ApiError> {
     platforms
         .map(|v| {
+            // `ParsePlatformError` names the rejected value (`unknown
+            // platform 'x'`), which a fixed string could not.
             v.into_iter()
-                .map(|s| Platform::from_str(&s).ok())
-                .collect::<Option<Vec<Platform>>>()
-                .ok_or_else(|| err(Status::BadRequest, "Invalid platform name"))
+                .map(|s| Platform::from_str(&s))
+                .collect::<Result<Vec<Platform>, _>>()
+                .map_err(|e| err(Status::BadRequest, e))
         })
         .transpose()
 }
@@ -386,29 +389,18 @@ pub async fn package_update_entity_endpoint(
         name: input.name.map_or(NotSet, Set),
         status: input.status.map_or(NotSet, Set),
         out_of_date: input.out_of_date.map_or(NotSet, Set),
-        upstream_version: NotSet,
-        // Mirrored AUR metadata is owned by the version-check scheduler; a
-        // package patch must not clear it.
-        source_description: NotSet,
-        source_maintainer: NotSet,
-        source_project_url: NotSet,
-        source_licenses: NotSet,
-        source_first_submitted: NotSet,
-        source_last_modified: NotSet,
-        aur_flagged_outdated: NotSet,
-        aur_missing: NotSet,
         latest_build: input.latest_build.map_or(NotSet, Set),
         build_flags: input
             .build_flags
             .as_deref()
             .map_or(NotSet, |v| Set(normalize_build_flags(v).join(";"))),
         platforms: requested_platforms.map_or(NotSet, |v| Set(Platform::join_canonical(&v))),
-        source_type: NotSet,
-        source_data: NotSet,
-        directly_requested: NotSet,
-        split_packages: NotSet,
-        provides: NotSet,
         patch: input.patch.map_or(NotSet, Set),
+        // Everything else is `NotSet`, left untouched, so a column added
+        // later cannot be cleared by a patch that never mentions it. The
+        // mirrored AUR metadata in particular belongs to the version-check
+        // scheduler.
+        ..Default::default()
     };
 
     // Execute the update query
@@ -770,7 +762,12 @@ async fn list_packages(
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
-        .offset(page.zip(limit).map(|(page, limit)| page * limit))
+        // Saturating: user input must never reach unchecked arithmetic — a
+        // huge `page` would wrap the offset in release or panic in debug.
+        .offset(
+            page.zip(limit)
+                .map(|(page, limit)| page.saturating_mul(limit)),
+        )
         .into_model::<SimplePackage>()
         .all(db)
         .await?;
@@ -890,31 +887,32 @@ pub async fn get_package(
 
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
-    let latest_version = latest_successful_version_any_platform(db, pkg.id)
-        .await
+    // Independent reads over one pooled connection: serial awaits would pay
+    // each round trip in turn for queries that share only the package id.
+    let (latest_version, dependencies, dependents, files) = tokio::join!(
+        latest_successful_version_any_platform(db, pkg.id),
+        list_package_relations(db, pkg.id, RelationDirection::Dependencies),
+        list_package_relations(db, pkg.id, RelationDirection::Dependents),
+        package_files(db, pkg.id),
+    );
+    let latest_version = latest_version
         .map_err(|e| err(Status::InternalServerError, e))?
         // Same rule as the list query: an enqueued build's empty version is not
         // a version.
         .filter(|v| !v.is_empty());
-    let dependencies = list_package_relations(db, pkg.id, RelationDirection::Dependencies)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-    let dependents = list_package_relations(db, pkg.id, RelationDirection::Dependents)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-
-    let files = package_files(db, pkg.id)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+    let dependencies = dependencies.map_err(|e| err(Status::InternalServerError, e))?;
+    let dependents = dependents.map_err(|e| err(Status::InternalServerError, e))?;
+    let files = files.map_err(|e| err(Status::InternalServerError, e))?;
 
     let has_patch = pkg.patch.is_some();
 
     let (package_source, upstream_version) = package_source_and_version(&pkg)?;
 
+    // Borrowed: the stored string is not used after this, only the parse.
     let split_packages: Option<Vec<String>> = pkg
         .split_packages
-        .clone()
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
 
     // Read before the struct below consumes `pkg.name`.
     let download_count =
@@ -936,8 +934,8 @@ pub async fn get_package(
         outofdate: pkg.out_of_date,
         latest_version,
         package_source,
-        selected_platforms: split_semicolon_field(&pkg.platforms),
-        selected_build_flags: Some(split_semicolon_field(&pkg.build_flags)),
+        selected_platforms: split_delimited(&pkg.platforms, ';'),
+        selected_build_flags: Some(split_delimited(&pkg.build_flags, ';')),
         upstream_version,
         split_packages,
         files,
@@ -1427,15 +1425,6 @@ fn json_string_list(raw: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Split a `;`-delimited column, dropping empty entries so an empty column
-/// means "no entries" rather than `[""]`.
-fn split_semicolon_field(raw: &str) -> Vec<String> {
-    raw.split(';')
-        .filter(|entry| !entry.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
 async fn official_holds(services: &Services, name: &str) -> Result<bool, ApiError> {
     services
         .client
@@ -1451,8 +1440,13 @@ async fn dependency_edge(
     dependent: &str,
     dependency: &str,
 ) -> Result<(packages::Model, packages::Model, dependencies::Model), ApiError> {
-    let dependent = package_by_pkgbase(db, dependent).await?;
-    let current = package_by_pkgbase(db, dependency).await?;
+    // The two endpoints are independent point lookups; the edge query below is
+    // what genuinely depends on both.
+    let (dependent, current) = tokio::join!(
+        package_by_pkgbase(db, dependent),
+        package_by_pkgbase(db, dependency),
+    );
+    let (dependent, current) = (dependent?, current?);
     let edge = Dependencies::find()
         .filter(dependencies::Column::DependentId.eq(dependent.id))
         .filter(dependencies::Column::DependeeId.eq(current.id))
@@ -1797,7 +1791,6 @@ async fn ensure_replacement_exists(
 mod dependency_tests {
     use super::{
         ReplacementVerdict, candidate_verdict, dependency_edge, provided_names, repoint_edge,
-        split_semicolon_field,
     };
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
@@ -1872,19 +1865,6 @@ mod dependency_tests {
             provided_names(&package),
             vec!["foo-compat", "libfoo", "libfoo-docs", "libfoo.so"],
             "a versioned `provides` contributes the name, not the whole entry"
-        );
-    }
-
-    /// An empty `;`-delimited column is "no entries", not one empty entry --
-    /// otherwise an empty `platforms`/`build_flags` column renders as a blank
-    /// chip.
-    #[test]
-    fn an_empty_semicolon_column_means_no_entries() {
-        assert!(split_semicolon_field("").is_empty());
-        assert_eq!(split_semicolon_field("x86_64"), vec!["x86_64"]);
-        assert_eq!(
-            split_semicolon_field("x86_64;;aarch64"),
-            vec!["x86_64", "aarch64"]
         );
     }
 

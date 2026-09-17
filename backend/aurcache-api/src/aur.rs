@@ -23,16 +23,17 @@ pub async fn search(
     query: &str,
     _a: Authenticated,
 ) -> Result<Json<Vec<ApiPackage>>, BadRequest<String>> {
-    if query.len() < 3 {
+    // Chars, not bytes: a byte length miscounts non-ASCII queries against the
+    // minimum the info endpoint needs. One shared tail, so the two branches
+    // cannot drift apart again.
+    let result = if query.chars().count() < 3 {
         // Iterate over the Option, giving either a single result or an empty list.
-        return get_package_info(query)
+        get_package_info(query)
             .await
-            .map(|pkg| Json(pkg.into_iter().map(ApiPackage::from).collect()))
-            .map_err(|e| BadRequest(e.to_string()));
-    }
-
-    query_aur(query)
-        .await
-        .map(|packages| Json(packages.into_iter().map(ApiPackage::from).collect()))
-        .map_err(|e| BadRequest(e.to_string()))
+            .map(|pkg| pkg.into_iter().collect::<Vec<_>>())
+    } else {
+        query_aur(query).await
+    };
+    let packages = result.map_err(|e| BadRequest(e.to_string()))?;
+    Ok(Json(packages.into_iter().map(ApiPackage::from).collect()))
 }

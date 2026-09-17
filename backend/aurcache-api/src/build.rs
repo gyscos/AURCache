@@ -10,7 +10,7 @@ use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
 use aurcache_common::api::waiting::WaitingReason;
-use aurcache_common::build_state::BuildTrigger;
+use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use aurcache_db::action::Action;
 use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::worker_jobs;
@@ -155,10 +155,7 @@ pub async fn download_build_output(
                 format!("no log for build {pkgbase}/{number}: {e}"),
             )
         })?;
-    Ok(LogDownload(
-        file,
-        format!("attachment; filename=\"{pkgbase}-{number}.log\""),
-    ))
+    Ok(LogDownload(file, content_disposition(pkgbase, number)))
 }
 
 #[utoipa::path(
@@ -218,7 +215,12 @@ async fn list_builds_impl(
     let basequery = build_row_select()
         .order_by(started, Order::Desc)
         .limit(limit)
-        .offset(page.zip(limit).map(|(page, limit)| page * limit));
+        // Saturating: user input must never reach unchecked arithmetic — a
+        // huge `page` would wrap the offset in release or panic in debug.
+        .offset(
+            page.zip(limit)
+                .map(|(page, limit)| page.saturating_mul(limit)),
+        );
 
     let rows = match pkg_id {
         None => basequery.into_model::<BuildRow>().all(db),
@@ -321,24 +323,53 @@ async fn annotate_waiting(db: &DatabaseConnection, rows: Vec<BuildRow>) -> Vec<B
         .collect()
 }
 
-/// Resolve a public build identity — `<pkgbase>/<number>` — to its row.
+/// Scope a build select to one public build identity — `<pkgbase>/<number>`.
 ///
 /// The row id never leaves the server: it is a global sequence that says
 /// nothing about which package a build belongs to. Everything public keys on
-/// the package and the build's number within it.
+/// the package and the build's number within it, so that rule lives here and a
+/// change to it (e.g. scoping) lands once for both resolvers below.
+fn build_identity(select: Select<Builds>, pkgbase: &str, number: i32) -> Select<Builds> {
+    select
+        .filter(packages::Column::Name.eq(pkgbase))
+        .filter(builds::Column::Number.eq(number))
+}
+
+/// `Content-Disposition` for a build-log download.
+///
+/// The pkgbase is interpolated into a response header, so it is confined to
+/// the package-name alphabet first: a crafted name reaching this line would
+/// otherwise turn into response-header injection. Legitimate names pass
+/// through untouched.
+fn content_disposition(pkgbase: &str, number: i32) -> String {
+    let safe: String = pkgbase
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{safe}-{number}.log\"")
+}
+
+/// Resolve a public build identity — `<pkgbase>/<number>` — to its row.
 async fn build_by_number(
     db: &DatabaseConnection,
     pkgbase: &str,
     number: i32,
 ) -> Result<builds::Model, ApiError> {
-    Builds::find()
-        .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
-        .filter(packages::Column::Name.eq(pkgbase))
-        .filter(builds::Column::Number.eq(number))
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))
+    build_identity(
+        Builds::find().join_rev(JoinType::InnerJoin, packages::Relation::Builds.def()),
+        pkgbase,
+        number,
+    )
+    .one(db)
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))?
+    .ok_or_else(|| err(Status::NotFound, format!("no build {pkgbase}/{number}")))
 }
 
 /// Resolve a single build to its [`BuildRow`] projection, for the detail route.
@@ -347,9 +378,7 @@ async fn build_row_by_number(
     pkgbase: &str,
     number: i32,
 ) -> Result<BuildRow, ApiError> {
-    build_row_select()
-        .filter(packages::Column::Name.eq(pkgbase))
-        .filter(builds::Column::Number.eq(number))
+    build_identity(build_row_select(), pkgbase, number)
         .into_model::<BuildRow>()
         .one(db)
         .await
@@ -376,19 +405,26 @@ pub async fn get_build(
     let db = db.inner();
 
     let row = build_row_by_number(db, pkgbase, number).await?;
-    // `annotate_waiting` maps rows 1:1, so this always yields the one row —
-    // but an HTTP handler should not panic on an invariant it cannot enforce
-    // locally, so the impossible case is an error rather than an `expect`.
-    let mut summary = annotate_waiting(db, vec![row])
-        .await
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            err(
-                Status::InternalServerError,
-                "build vanished while annotating",
-            )
-        })?;
+    // Waiting reasons only exist for queued builds, and computing them scans
+    // the whole queue plus the fleet — skip that for a build whose status
+    // already says the annotation would be `None`.
+    let mut summary = if row.status == BuildStates::ENQUEUED_BUILD {
+        // `annotate_waiting` maps rows 1:1, so this always yields the one row —
+        // but an HTTP handler should not panic on an invariant it cannot enforce
+        // locally, so the impossible case is an error rather than an `expect`.
+        annotate_waiting(db, vec![row])
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                err(
+                    Status::InternalServerError,
+                    "build vanished while annotating",
+                )
+            })?
+    } else {
+        row.into_summary(None)
+    };
     // The one field only the detail route fills: a metadata stat, not a read.
     summary.log_size = build_log_size(pkgbase, number)
         .await

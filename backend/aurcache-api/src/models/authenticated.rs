@@ -37,11 +37,14 @@ impl<'r> FromRequest<'r> for Authenticated {
                 return Outcome::Success(Self { username });
             }
 
+            // The scheme is case-insensitive (RFC 7235); some clients send
+            // `bearer` or `BEARER`.
             let bearer_token = req
                 .headers()
                 .get_one("Authorization")
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .map(str::trim)
+                .and_then(|value| value.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, token)| token.trim())
                 .filter(|token| !token.is_empty());
 
             let Some(bearer_token) = bearer_token else {

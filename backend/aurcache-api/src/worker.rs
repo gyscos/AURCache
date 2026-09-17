@@ -9,6 +9,7 @@
 
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::failure_activity::WorkerSettingRejectedActivity;
 use aurcache_activitylog::worker_activity::{
@@ -536,13 +537,7 @@ async fn build_descriptor(
         Err(_) => (Vec::new(), Vec::new()),
     };
 
-    let build_flags = pkg
-        .build_flags
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let build_flags = split_delimited(&pkg.build_flags, ';');
 
     // Resolved here rather than on the worker: settings are the server's,
     // with the package overriding the global default.
@@ -823,8 +818,7 @@ async fn complete_job_inner(
         }
     }
 
-    let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
-        .await
+    worker_complete::check_owned_active(auth.worker.id, &build)
         .map_err(|e| err(Status::Forbidden, e))?;
 
     // Before the branch below: an OOM-killed build never reaches the success
@@ -982,19 +976,6 @@ pub async fn job_status(
 // Admin management (operator auth)
 // ----------------------------------------------------------------------------
 
-/// The comma-separated lists the database stores, as actual lists.
-///
-/// Empty entries are dropped: an empty column splits to `[""]`, which would
-/// render as a blank chip.
-fn split_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
 /// How many builds a worker is running, and how its finished ones went.
 #[derive(Default, Clone, Copy)]
 struct BuildTally {
@@ -1062,9 +1043,9 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         name: worker.name,
         status: worker.status,
         cert_fingerprint: worker.cert_fingerprint,
-        native_arches: split_list(&worker.native_arches),
-        emulated_arches: split_list(&worker.emulated_arches),
-        package_affinity: split_list(&worker.package_affinity),
+        native_arches: split_delimited(&worker.native_arches, ','),
+        emulated_arches: split_delimited(&worker.emulated_arches, ','),
+        package_affinity: split_delimited(&worker.package_affinity, ','),
         priority: worker.priority,
         last_seen: worker.last_seen,
         version: worker.version,
@@ -1111,12 +1092,10 @@ pub async fn list_workers(
     _a: Authenticated,
 ) -> Result<Json<Vec<WorkerSummary>>, ApiError> {
     let db = db.inner();
-    let workers = worker_store::list_workers(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-    let tallies = build_tallies(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+    // Independent reads: serial awaits would pay both round trips in turn.
+    let (workers, tallies) = tokio::join!(worker_store::list_workers(db), build_tallies(db),);
+    let workers = workers.map_err(|e| err(Status::InternalServerError, e))?;
+    let tallies = tallies.map_err(|e| err(Status::InternalServerError, e))?;
     let now = now_secs();
     let timeout = liveness_timeout_secs();
     Ok(Json(

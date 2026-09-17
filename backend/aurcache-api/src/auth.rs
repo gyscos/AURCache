@@ -151,10 +151,15 @@ pub async fn oauth_callback(
     // function returns, and `Authenticated` treats the mere presence of the
     // `token` cookie as a valid session -- so setting it before the check would
     // hand a refused user a working session along with their rejection.
-    let user_info: OauthUserInfo = reqwest::Client::builder()
-        .build()
-        .context("failed to build reqwest client")
-        .map_err(|e| Unauthorized(e.to_string()))?
+    // One process-wide client: building one per login buys nothing (no
+    // per-request configuration) and costs a connection pool each time.
+    static OAUTH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = OAUTH_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .build()
+            .expect("default reqwest client builds")
+    });
+    let user_info: OauthUserInfo = client
         .get(std::env::var("OAUTH_USERINFO_URI").map_err(|e| Unauthorized(e.to_string()))?)
         .header(AUTHORIZATION, format!("Bearer {}", token.access_token()))
         .send()
