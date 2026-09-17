@@ -268,7 +268,7 @@ impl LogStore {
         if keep_secs == 0 {
             return Ok(0);
         }
-        let cutoff = now.saturating_sub(i64::try_from(keep_secs).unwrap_or(i64::MAX));
+        let cutoff = crate::activity_utils::prune_cutoff(now, keep_secs);
         let deleted = Logs::delete_many()
             .filter(logs::Column::Timestamp.lt(cutoff))
             .exec(&self.db)

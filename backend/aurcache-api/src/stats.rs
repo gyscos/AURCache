@@ -285,22 +285,46 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
     let now = aurcache_db::helpers::time::now_secs();
     let cutoff = now - RECENT_DAYS * 24 * 60 * 60;
 
-    let trends = build_trends(db).await?;
+    // Independent reads over one pooled connection: serial awaits paid each
+    // round trip in turn for queries that share nothing.
+    let (
+        total_builds,
+        successful_builds,
+        failed_builds,
+        recent_builds,
+        recent_successful,
+        recent_failed,
+        trends,
+        avg_build_time,
+        requested_packages,
+        dependency_packages,
+    ) = tokio::join!(
+        count_builds(db, None, None),
+        count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), None),
+        count_builds(db, Some(BuildStates::FAILED_BUILD), None),
+        count_builds(db, None, Some(cutoff)),
+        count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), Some(cutoff)),
+        count_builds(db, Some(BuildStates::FAILED_BUILD), Some(cutoff)),
+        build_trends(db),
+        avg_build_time(db),
+        count_packages(db, true),
+        count_packages(db, false),
+    );
 
+    let trends = trends?;
     Ok(ListStats {
-        total_builds: count_builds(db, None, None).await?,
-        successful_builds: count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), None).await?,
-        failed_builds: count_builds(db, Some(BuildStates::FAILED_BUILD), None).await?,
+        total_builds: total_builds?,
+        successful_builds: successful_builds?,
+        failed_builds: failed_builds?,
 
-        recent_builds: count_builds(db, None, Some(cutoff)).await?,
-        recent_successful: count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), Some(cutoff))
-            .await?,
-        recent_failed: count_builds(db, Some(BuildStates::FAILED_BUILD), Some(cutoff)).await?,
+        recent_builds: recent_builds?,
+        recent_successful: recent_successful?,
+        recent_failed: recent_failed?,
 
-        avg_build_time: avg_build_time(db).await?,
+        avg_build_time: avg_build_time?,
         repo_size: dir_size("repo/"),
-        requested_packages: count_packages(db, true).await?,
-        dependency_packages: count_packages(db, false).await?,
+        requested_packages: requested_packages?,
+        dependency_packages: dependency_packages?,
         total_build_trend: trends.count,
         avg_build_time_trend: trends.duration,
     })

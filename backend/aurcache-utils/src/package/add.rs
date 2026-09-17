@@ -124,11 +124,7 @@ pub(crate) fn build_add_context(
     // nothing left to check.
     let platforms = platforms.unwrap_or_else(|| vec![Platform::X86_64]);
 
-    let platforms_str = platforms
-        .iter()
-        .map(Platform::as_str)
-        .collect::<Vec<_>>()
-        .join(";");
+    let platforms_str = Platform::join_canonical(&platforms);
 
     let build_flags_str = normalize_build_flags(build_flags.unwrap_or_else(|| {
         vec![

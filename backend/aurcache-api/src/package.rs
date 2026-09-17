@@ -371,12 +371,14 @@ pub async fn package_update_entity_endpoint(
     // `depends_aarch64` separately — and the graph is the union across the
     // platforms a package is built for. Changing that set therefore changes
     // which dependencies are required, so it needs the same resync a patch
-    // gets. Compared against the stored value so a no-op write does not
-    // trigger a needless source checkout.
-    let platforms_changed = input
-        .platforms
-        .as_ref()
-        .is_some_and(|requested| requested.join(";") != pkg.platforms);
+    // gets. Compared canonically against the stored value so a no-op write
+    // (including the same set in a different order) does not trigger a
+    // needless source checkout. Validated like the add endpoints: storing an
+    // unknown name would fail every later build that reads the set.
+    let requested_platforms = parse_platforms(input.platforms.clone())?;
+    let platforms_changed = requested_platforms.as_ref().is_some_and(|requested| {
+        Platform::join_canonical(requested) != Platform::canonicalize_joined(&pkg.platforms)
+    });
 
     // Start building the update operation
     let update_pkg = packages::ActiveModel {
@@ -400,7 +402,7 @@ pub async fn package_update_entity_endpoint(
             .build_flags
             .as_deref()
             .map_or(NotSet, |v| Set(normalize_build_flags(v).join(";"))),
-        platforms: input.platforms.map_or(NotSet, |v| Set(v.join(";"))),
+        platforms: requested_platforms.map_or(NotSet, |v| Set(Platform::join_canonical(&v))),
         source_type: NotSet,
         source_data: NotSet,
         directly_requested: NotSet,

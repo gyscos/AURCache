@@ -238,6 +238,14 @@ impl ActivityLog {
     }
 }
 
+/// Timestamps older than this are pruned. Saturating: the clock is trusted
+/// here, and a far-future `now` must prune everything rather than wrap to
+/// keeping it all. Shared with the structured log store, whose prune is the
+/// same line over a different table.
+pub(crate) fn prune_cutoff(now: i64, keep_secs: u64) -> i64 {
+    now.saturating_sub(i64::try_from(keep_secs).unwrap_or(i64::MAX))
+}
+
 /// Start the one task that writes the log, and hand back a handle to it.
 ///
 /// The task ends when the last handle is dropped, draining what is queued
@@ -434,7 +442,7 @@ impl ActivityStore {
         if keep_secs == 0 {
             return Ok(0);
         }
-        let cutoff = now.saturating_sub(i64::try_from(keep_secs).unwrap_or(i64::MAX));
+        let cutoff = prune_cutoff(now, keep_secs);
         let deleted = Activities::delete_many()
             .filter(activities::Column::Timestamp.lt(cutoff))
             .exec(&self.db)

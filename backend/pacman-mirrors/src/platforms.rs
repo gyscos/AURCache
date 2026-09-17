@@ -40,6 +40,31 @@ impl Platform {
             .filter(|s| !s.is_empty())
             .map(|s| Self::from_str(s).map_err(|_| anyhow!("Invalid platform '{s}'")))
     }
+
+    /// Canonical `;`-joined form: sorted and deduplicated, so the same set
+    /// always stores (and compares) the same way regardless of request order.
+    /// Without this, `["aarch64", "x86_64"]` and `["x86_64", "aarch64"]` store
+    /// differently and every re-listing of the same set reads as a change.
+    #[must_use]
+    pub fn join_canonical(platforms: &[Self]) -> String {
+        let mut names: Vec<&'static str> = platforms.iter().map(Self::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        names.join(";")
+    }
+
+    /// Canonical form of an already-stored `;`-joined list: sorted and
+    /// deduplicated without validating, so rows written before
+    /// [`Self::join_canonical`] (request order, possibly with repeats) still
+    /// compare equal to the same set. Unknown segments are kept as-is — this
+    /// is a comparison helper, not validation.
+    #[must_use]
+    pub fn canonicalize_joined(raw: &str) -> String {
+        let mut parts: Vec<&str> = raw.split(';').filter(|s| !s.is_empty()).collect();
+        parts.sort_unstable();
+        parts.dedup();
+        parts.join(";")
+    }
 }
 
 impl std::fmt::Display for Platform {
@@ -88,5 +113,40 @@ impl IntoIterator for Platforms {
 
     fn into_iter(self) -> Self::IntoIter {
         [Platform::X86_64, Platform::Aarch64, Platform::Armv7h].into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Platform;
+
+    /// The same set in any order — or with repeats — stores one way, so
+    /// re-listing it never reads as a change.
+    #[test]
+    fn canonical_join_is_order_and_duplicate_free() {
+        use Platform::{Aarch64, Armv7h, X86_64};
+        assert_eq!(
+            Platform::join_canonical(&[Aarch64, X86_64]),
+            Platform::join_canonical(&[X86_64, Aarch64, X86_64]),
+        );
+        assert_eq!(
+            Platform::join_canonical(&[Armv7h, Aarch64, X86_64, Aarch64]),
+            "aarch64;armv7h;x86_64"
+        );
+        assert_eq!(Platform::join_canonical(&[]), "");
+    }
+
+    /// Stored lists from before canonical storage still match the same set,
+    /// whatever order (or repeats) they were written in.
+    #[test]
+    fn canonicalize_joined_matches_join_canonical() {
+        use Platform::{Aarch64, X86_64};
+        let canonical = Platform::join_canonical(&[X86_64, Aarch64]);
+        assert_eq!(Platform::canonicalize_joined("x86_64;aarch64"), canonical);
+        assert_eq!(
+            Platform::canonicalize_joined("aarch64;x86_64;x86_64"),
+            canonical
+        );
+        assert_eq!(Platform::canonicalize_joined(""), "");
     }
 }
