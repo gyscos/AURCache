@@ -999,7 +999,7 @@ fn list_files_in_archive(archive_bytes: &[u8], pkgbase: &str) -> anyhow::Result<
         }
         files.push(rel_path.to_string());
     }
-    files.sort();
+    files.sort_unstable();
     Ok(files)
 }
 

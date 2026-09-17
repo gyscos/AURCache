@@ -92,7 +92,7 @@ pub fn describe_package(pkgfile: &Path) -> anyhow::Result<PackageEntry> {
     desc.csize = csize.to_string();
     desc.sha256sum = sha256sum;
 
-    files.sort();
+    files.sort_unstable();
     Ok(PackageEntry {
         filename,
         dir_name,

@@ -84,8 +84,10 @@ pub fn Dashboard() -> Element {
 /// would make a busy queue look like a broken server. `None` when nothing has
 /// finished, because zero out of zero is not zero per cent.
 fn success_rate(successful: u32, failed: u32) -> Option<f64> {
-    let finished = successful + failed;
-    (finished > 0).then(|| f64::from(successful) / f64::from(finished) * 100.0)
+    // Added wide: the counters run over an unbounded history, so `u32 + u32`
+    // would wrap at 2^32 builds into a wrong percentage.
+    let finished = u64::from(successful) + u64::from(failed);
+    (finished > 0).then(|| u64::from(successful) as f64 / finished as f64 * 100.0)
 }
 
 /// A rate as a percentage, or a dash.

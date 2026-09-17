@@ -15,6 +15,7 @@ use aurcache_utils::services::Services;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::vcs_check::{RoundCache, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -81,6 +82,12 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("couldn't download version update: {e}"))?
     };
+    // Indexed once: the per-package loop below looks every package up by its
+    // pkgbase, which a linear scan would make quadratic in the package count.
+    let by_base: HashMap<&str, _> = results
+        .iter()
+        .map(|result| (result.package_base.as_str(), result))
+        .collect();
 
     // One pass, one answer per remote: several packages can name the same
     // upstream, and what its ref points at does not change between two of them.
@@ -100,7 +107,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
         let source_data = package.source_data;
         match source_data {
             SourceData::Aur { .. } => {
-                match results.iter().find(|x1| x1.package_base == package.name) {
+                match by_base.get(package.name.as_str()) {
                     None => {
                         // Removed from the AUR. Recorded so the package page
                         // can say so: its metadata still comes from the

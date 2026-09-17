@@ -45,8 +45,13 @@ pub fn init_build_queue(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandl
                         warn!("Failed to cancel build #{build_id}: {e}");
                     }
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // Every sender is gone; `recv()` would fail immediately
+                    // forever, so staying in the loop is a busy-loop.
+                    break;
+                }
                 Err(e) => {
-                    // Lagged/closed channel: keep the coordinator alive.
+                    // Lagged: keep the coordinator alive.
                     warn!("Build action channel error: {e}");
                 }
             }
