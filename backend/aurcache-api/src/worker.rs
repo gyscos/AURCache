@@ -354,7 +354,16 @@ pub async fn register_worker(
             .map_err(|e| err(Status::InternalServerError, e))?;
         worker_store::store_signed_cert(db, worker.id, &signed.cert_pem, signed.not_after)
             .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
+            .map_err(|e| err(Status::InternalServerError, e))?
+            // The row was read earlier in this request; gone now means a
+            // concurrent delete raced registration, which is a server-side
+            // inconsistency rather than a bad id.
+            .ok_or_else(|| {
+                err(
+                    Status::InternalServerError,
+                    "worker vanished mid-registration",
+                )
+            })?;
     }
 
     // Non-interactive enrollment: auto-approve when a configured mode matches.
@@ -367,7 +376,13 @@ pub async fn register_worker(
     ) {
         worker_store::approve_worker(db, worker.id)
             .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
+            .map_err(|e| err(Status::InternalServerError, e))?
+            .ok_or_else(|| {
+                err(
+                    Status::InternalServerError,
+                    "worker vanished mid-registration",
+                )
+            })?;
         tracing::info!("Auto-approved worker '{}' ({fingerprint})", worker.name);
         // No user: nobody clicked this. The log says the server did it.
         al.record(
@@ -1185,7 +1200,8 @@ pub async fn approve_worker(
     let db = db.inner();
     let worker = worker_store::approve_worker(db, id)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
     al.record(
         WorkerApproveActivity {
             worker: worker.name,
@@ -1207,7 +1223,8 @@ pub async fn revoke_worker(
     let db = db.inner();
     let worker = worker_store::revoke_worker(db, id, max_attempts())
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
     al.record(
         WorkerRevokeActivity {
             worker: worker.name,

@@ -7,6 +7,7 @@ use crate::{builds, packages, workers};
 use aurcache_common::api::worker::ApprovalStatus;
 use aurcache_common::build_state::{BuildTriggers, EndReasons};
 use aurcache_common::builder::BuildStates;
+use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, TransactionSession, TransactionTrait,
@@ -22,6 +23,34 @@ pub const STATUS_SUCCESS: i32 = BuildStates::SUCCESSFUL_BUILD;
 pub const STATUS_FAILED: i32 = BuildStates::FAILED_BUILD;
 pub const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
 pub const STATUS_WAITING_FOR_DEPS: i32 = BuildStates::WAITING_FOR_DEPS;
+
+/// The columns the queue scans (`claim_job`, `waiting_reasons`) actually read.
+///
+/// The claim re-reads the winner by id after its compare-and-swap, and both
+/// scans only rank — so selecting whole rows (including the large
+/// `vcs_sources` JSON) on every poll is pure overhead.
+#[derive(Debug, Clone, FromQueryResult)]
+struct QueuedBuild {
+    id: i32,
+    pkg_id: i32,
+    platform: Platform,
+    start_time: Option<i64>,
+}
+
+impl QueuedBuild {
+    async fn queued<C: ConnectionTrait>(db: &C) -> Result<Vec<Self>, DbErr> {
+        Builds::find()
+            .select_only()
+            .column(builds::Column::Id)
+            .column(builds::Column::PkgId)
+            .column(builds::Column::Platform)
+            .column(builds::Column::StartTime)
+            .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
+            .into_model::<Self>()
+            .all(db)
+            .await
+    }
+}
 
 /// One approved worker's routing-relevant configuration, plus its live state.
 #[derive(Debug)]
@@ -249,10 +278,7 @@ pub async fn claim_job<C: ConnectionTrait>(
         return Ok(None);
     };
 
-    let candidates: Vec<builds::Model> = Builds::find()
-        .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
-        .all(db)
-        .await?;
+    let candidates: Vec<QueuedBuild> = QueuedBuild::queued(db).await?;
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -693,10 +719,7 @@ pub async fn waiting_reasons<C: ConnectionTrait>(
     db: &C,
     liveness_timeout_secs: i64,
 ) -> Result<HashMap<i32, WaitingReason>, DbErr> {
-    let queued: Vec<builds::Model> = Builds::find()
-        .filter(builds::Column::Status.eq(STATUS_ENQUEUED))
-        .all(db)
-        .await?;
+    let queued: Vec<QueuedBuild> = QueuedBuild::queued(db).await?;
     if queued.is_empty() {
         return Ok(HashMap::new());
     }

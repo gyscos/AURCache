@@ -18,9 +18,9 @@ use crate::helpers::time::now_secs;
 use crate::operations;
 use crate::prelude::Operations;
 use sea_orm::ActiveValue::Set;
+use sea_orm::sea_query::{BinOper, Expr, ExprTrait};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -52,6 +52,12 @@ pub async fn create<C: ConnectionTrait>(db: &C, kind: &str, total: i32) -> Resul
 /// runs for minutes and reports nothing until it stops reports nothing for the
 /// whole time anyone would want to watch it, and the write is trivial beside
 /// the work each entry represents.
+///
+/// One `UPDATE`, no read: concatenating in SQL keeps the write constant-size
+/// no matter how long the log has grown (a read-modify-write would rewrite the
+/// whole log per item), and `||` concatenates on both SQLite and Postgres.
+/// Operation rows are never deleted, so a missing `id` writes nothing — the
+/// same outcome as before, without a query to establish it.
 pub async fn append<C: ConnectionTrait, T: Serialize>(
     db: &C,
     id: i32,
@@ -60,33 +66,30 @@ pub async fn append<C: ConnectionTrait, T: Serialize>(
     entries: &[T],
     finished: bool,
 ) -> Result<(), DbErr> {
-    let entries = entries
-        .iter()
-        .filter_map(|entry| {
-            // An entry that will not serialise is dropped rather than failing
-            // the operation: the work is done either way, and losing one line
-            // of the report is better than abandoning the rest of the run.
-            serde_json::to_string(entry).ok()
-        })
-        .collect::<Vec<_>>();
-
-    let Some(row) = Operations::find_by_id(id).one(db).await? else {
-        return Ok(());
-    };
-    let mut log = row.log.clone();
+    let mut appended = String::new();
     for entry in entries {
-        log.push_str(&entry);
-        log.push('\n');
+        // An entry that will not serialise is dropped rather than failing
+        // the operation: the work is done either way, and losing one line
+        // of the report is better than abandoning the rest of the run.
+        if let Ok(line) = serde_json::to_string(entry) {
+            appended.push_str(&line);
+            appended.push('\n');
+        }
     }
 
-    let mut active = row.into_active_model();
-    active.log = Set(log);
-    active.completed = Set(completed);
-    active.failed = Set(failed);
+    // No `Concat` variant in this sea-query: `Custom` renders verbatim, and
+    // `||` concatenates text on both SQLite and Postgres.
+    let log = Expr::col((operations::Entity, operations::Column::Log))
+        .binary(BinOper::Custom("||"), appended);
+    let mut update = operations::Entity::update_many()
+        .col_expr(operations::Column::Log, log)
+        .col_expr(operations::Column::Completed, completed.into())
+        .col_expr(operations::Column::Failed, failed.into())
+        .filter(operations::Column::Id.eq(id));
     if finished {
-        active.finished_at = Set(Some(now_secs()));
+        update = update.col_expr(operations::Column::FinishedAt, Some(now_secs()).into());
     }
-    active.update(db).await?;
+    update.exec(db).await?;
     Ok(())
 }
 
@@ -144,7 +147,10 @@ pub async fn active<C: ConnectionTrait>(db: &C) -> Result<Vec<operations::Model>
 
 #[cfg(test)]
 mod tests {
-    use super::entries_after;
+    use super::{KIND_BULK_ADD, append, create, entries_after, get};
+    use crate::migration::Migrator;
+    use sea_orm::Database;
+    use sea_orm_migration::MigratorTrait;
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -196,5 +202,44 @@ mod tests {
         let mixed = format!("{}\n{{\"unknown\":true}}\n{}", log(&["a"]), log(&["b"]));
         let seen: Vec<Entry> = entries_after(&mixed, 0);
         assert_eq!(seen.len(), 2);
+    }
+
+    /// Appends accumulate in SQL rather than rewriting the log per item: two
+    /// appends leave both lines, the counters both writes, and `finished_at`
+    /// only the closing write. This also proves the `||` concatenation the
+    /// single-statement append relies on.
+    #[tokio::test]
+    async fn appends_accumulate_in_sql() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let id = create(&db, KIND_BULK_ADD, 2).await.unwrap();
+
+        append(&db, id, 1, 0, &[Entry { name: "a".into() }], false)
+            .await
+            .unwrap();
+        append(&db, id, 1, 1, &[Entry { name: "b".into() }], true)
+            .await
+            .unwrap();
+
+        let op = get(&db, id).await.unwrap().unwrap();
+        assert_eq!(op.completed, 1);
+        assert_eq!(op.failed, 1);
+        assert!(op.finished_at.is_some());
+        let seen: Vec<Entry> = entries_after(&op.log, 0);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].name, "a");
+        assert_eq!(seen[1].name, "b");
+    }
+
+    /// Appending to a missing operation writes nothing and fails nothing --
+    /// rows are never deleted, so this is only defence in depth, matching the
+    /// old read-then-write's early return.
+    #[tokio::test]
+    async fn appending_to_a_missing_operation_is_a_no_op() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        append(&db, 999, 1, 0, &[Entry { name: "a".into() }], true)
+            .await
+            .unwrap();
     }
 }

@@ -419,13 +419,17 @@ impl ActivityStore {
     /// existed, in which case "this boot" cannot mean anything and the filter
     /// does not narrow -- showing everything beats showing nothing.
     async fn last_start(&self) -> anyhow::Result<Option<i64>> {
+        // Only the timestamp: the row also carries the entry's data JSON.
         Ok(Activities::find()
+            .select_only()
+            .column(activities::Column::Timestamp)
             .filter(activities::Column::Typ.eq(ActivityType::ServerStart))
             .order_by(activities::Column::Timestamp, Order::Desc)
             .order_by(activities::Column::Id, Order::Desc)
+            .into_tuple::<(i64,)>()
             .one(&self.db)
             .await?
-            .map(|row| row.timestamp))
+            .map(|(timestamp,)| timestamp))
     }
 
     /// Delete entries older than `keep_secs`, returning how many went.

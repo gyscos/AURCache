@@ -11,11 +11,15 @@ use sea_orm::{
 use std::collections::BTreeMap;
 
 /// The most recent *successful* build row selection, newest by end time with
-/// start time as the tie-break.
-fn newest_success_query(pkg_id: i32) -> Select<Builds> {
+/// start time as the tie-break, projecting one column.
+///
+/// The column is a parameter rather than a second `select_only` at the call
+/// site: stacking `select_only` reads as resetting the projection, and the
+/// next reader *will* "fix" it into returning two columns for a one-tuple.
+fn newest_success_query(pkg_id: i32, column: builds::Column) -> Select<Builds> {
     Builds::find()
         .select_only()
-        .column(builds::Column::Version)
+        .column(column)
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
         .order_by(builds::Column::EndTime, Order::Desc)
@@ -36,7 +40,7 @@ pub async fn latest_successful_version<C: ConnectionTrait>(
     pkg_id: i32,
     platform: &str,
 ) -> Result<Option<String>, DbErr> {
-    newest_success_query(pkg_id)
+    newest_success_query(pkg_id, builds::Column::Version)
         .filter(builds::Column::Platform.eq(platform))
         .into_tuple::<(String,)>()
         .one(db)
@@ -75,7 +79,7 @@ pub async fn latest_successful_version_any_platform<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
 ) -> Result<Option<String>, DbErr> {
-    newest_success_query(pkg_id)
+    newest_success_query(pkg_id, builds::Column::Version)
         .into_tuple::<(String,)>()
         .one(db)
         .await
@@ -100,9 +104,7 @@ pub async fn latest_successful_build_vcs_sources<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
 ) -> Result<BTreeMap<String, String>, DbErr> {
-    let recorded = newest_success_query(pkg_id)
-        .select_only()
-        .column(builds::Column::VcsSources)
+    let recorded = newest_success_query(pkg_id, builds::Column::VcsSources)
         .into_tuple::<Option<String>>()
         .one(db)
         .await?

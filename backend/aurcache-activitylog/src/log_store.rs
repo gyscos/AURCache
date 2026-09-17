@@ -134,13 +134,17 @@ impl LogStore {
     /// cannot mean anything and the filter does not narrow: showing everything
     /// beats showing nothing.
     async fn last_start(&self) -> anyhow::Result<Option<i64>> {
+        // Only the timestamp: the row also carries the entry's data JSON.
         Ok(Logs::find()
+            .select_only()
+            .column(logs::Column::Timestamp)
             .filter(logs::Column::Kind.eq(crate::kinds::SERVER_START))
             .order_by(logs::Column::Timestamp, Order::Desc)
             .order_by(logs::Column::Id, Order::Desc)
+            .into_tuple::<(i64,)>()
             .one(&self.db)
             .await?
-            .map(|row| row.timestamp))
+            .map(|(timestamp,)| timestamp))
     }
 
     /// Which of the entities this page names can still be opened.

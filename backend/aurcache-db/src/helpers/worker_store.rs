@@ -133,25 +133,28 @@ pub async fn find_worker_by_fingerprint<C: ConnectionTrait>(
 }
 
 /// Load a worker as an `ActiveModel` ready to be mutated and updated.
+///
+/// `None` when the row is gone. Absence is an `Option`, not a `DbErr::Custom`:
+/// a caller holding a stale id made a client error, and the endpoints map this
+/// to 404 — a database-shaped error for it would surface as a 500 and mask
+/// real server faults in monitoring.
 async fn load_for_update<C: ConnectionTrait>(
     db: &C,
     id: i32,
-) -> Result<workers::ActiveModel, DbErr> {
-    Workers::find_by_id(id)
-        .one(db)
-        .await?
-        .map(Into::into)
-        .ok_or_else(|| DbErr::Custom(format!("worker {id} not found")))
+) -> Result<Option<workers::ActiveModel>, DbErr> {
+    Ok(Workers::find_by_id(id).one(db).await?.map(Into::into))
 }
 
 async fn set_status<C: ConnectionTrait>(
     db: &C,
     id: i32,
     status: ApprovalStatus,
-) -> Result<workers::Model, DbErr> {
-    let mut active = load_for_update(db, id).await?;
+) -> Result<Option<workers::Model>, DbErr> {
+    let Some(mut active) = load_for_update(db, id).await? else {
+        return Ok(None);
+    };
     active.status = Set(status);
-    active.update(db).await
+    Ok(Some(active.update(db).await?))
 }
 
 /// Store the CA-signed leaf certificate for a worker (done at registration time,
@@ -162,16 +165,21 @@ pub async fn store_signed_cert<C: ConnectionTrait>(
     id: i32,
     signed_cert: &str,
     not_after: i64,
-) -> Result<workers::Model, DbErr> {
-    let mut active = load_for_update(db, id).await?;
+) -> Result<Option<workers::Model>, DbErr> {
+    let Some(mut active) = load_for_update(db, id).await? else {
+        return Ok(None);
+    };
     active.signed_cert = Set(Some(signed_cert.to_string()));
     active.not_after = Set(Some(not_after));
-    active.update(db).await
+    Ok(Some(active.update(db).await?))
 }
 
 /// Approve a worker so it may claim jobs. The signed certificate is issued at
 /// registration time; approval only flips the gating status.
-pub async fn approve_worker<C: ConnectionTrait>(db: &C, id: i32) -> Result<workers::Model, DbErr> {
+pub async fn approve_worker<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+) -> Result<Option<workers::Model>, DbErr> {
     set_status(db, id, ApprovalStatus::Approved).await
 }
 
@@ -186,10 +194,12 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     db: &C,
     id: i32,
     max_attempts: i32,
-) -> Result<workers::Model, DbErr> {
-    let worker = set_status(db, id, ApprovalStatus::Revoked).await?;
+) -> Result<Option<workers::Model>, DbErr> {
+    let Some(worker) = set_status(db, id, ApprovalStatus::Revoked).await? else {
+        return Ok(None);
+    };
     crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
-    Ok(worker)
+    Ok(Some(worker))
 }
 
 /// List all workers in name order.
@@ -468,7 +478,7 @@ mod tests {
         let db = setup().await;
         let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
         store_signed_cert(&db, w.id, "CERTPEM", 9999).await.unwrap();
-        let approved = approve_worker(&db, w.id).await.unwrap();
+        let approved = approve_worker(&db, w.id).await.unwrap().unwrap();
         assert_eq!(approved.status, ApprovalStatus::Approved);
         assert_eq!(approved.signed_cert.as_deref(), Some("CERTPEM"));
         assert_eq!(approved.not_after, Some(9999));
@@ -485,8 +495,23 @@ mod tests {
         .unwrap();
         assert_eq!(re.status, ApprovalStatus::Approved);
 
-        let revoked = revoke_worker(&db, w.id, 3).await.unwrap();
+        let revoked = revoke_worker(&db, w.id, 3).await.unwrap().unwrap();
         assert_eq!(revoked.status, ApprovalStatus::Revoked);
+    }
+
+    /// The contract the endpoints rely on: an unknown id is `None`, not a
+    /// database-shaped error, so it can map to 404 instead of 500.
+    #[tokio::test]
+    async fn unknown_worker_status_changes_are_absence_not_error() {
+        let db = setup().await;
+        assert!(approve_worker(&db, 999).await.unwrap().is_none());
+        assert!(revoke_worker(&db, 999, 3).await.unwrap().is_none());
+        assert!(
+            store_signed_cert(&db, 999, "CERTPEM", 9999)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Revoking must release the worker's grip on work in flight, not leave it

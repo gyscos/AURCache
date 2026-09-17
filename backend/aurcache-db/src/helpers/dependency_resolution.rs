@@ -13,7 +13,7 @@
 //! [`AurClient::resolve_dependencies`](aurcache_deps::AurClient::resolve_dependencies).
 
 use aurcache_deps::{AurClient, Dependency, Resolutions, SatisfyIndex};
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QuerySelect};
 use std::collections::HashSet;
 
 use crate::packages;
@@ -32,16 +32,6 @@ pub struct PackageCandidate {
     pub split_packages: Option<String>,
     /// JSON array of `provides` entries, as stored on `packages`.
     pub provides: Option<String>,
-}
-
-impl From<&packages::Model> for PackageCandidate {
-    fn from(pkg: &packages::Model) -> Self {
-        Self {
-            name: pkg.name.clone(),
-            split_packages: pkg.split_packages.clone(),
-            provides: pkg.provides.clone(),
-        }
-    }
 }
 
 /// The packages AURCache tracks, read once and reused.
@@ -83,14 +73,31 @@ impl TrackedPackages {
     /// stage later by its artifact sitting in the repository, which reports
     /// "already published" and records no dependency link at all.
     pub async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, DbErr> {
-        Ok(Self {
-            candidates: packages::Entity::find()
-                .all(db)
-                .await?
-                .iter()
-                .map(PackageCandidate::from)
-                .collect(),
-        })
+        // Only the three columns matching consults. The rows also carry the
+        // large `source_data` JSON, which a full-model load would haul in for
+        // every package on every resolution.
+        #[derive(Debug, Clone, FromQueryResult)]
+        struct Row {
+            name: String,
+            split_packages: Option<String>,
+            provides: Option<String>,
+        }
+        let candidates = packages::Entity::find()
+            .select_only()
+            .column(packages::Column::Name)
+            .column(packages::Column::SplitPackages)
+            .column(packages::Column::Provides)
+            .into_model::<Row>()
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row: Row| PackageCandidate {
+                name: row.name,
+                split_packages: row.split_packages,
+                provides: row.provides,
+            })
+            .collect();
+        Ok(Self { candidates })
     }
 
     /// Index the loaded rows, plus anything `planned`, under the names each
