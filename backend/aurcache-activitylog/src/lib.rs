@@ -1,5 +1,6 @@
 pub mod activity_serializer;
 pub mod activity_utils;
+pub mod event;
 pub mod failure_activity;
 pub mod package_add_activity;
 pub mod package_delete_activity;

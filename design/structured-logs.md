@@ -1,0 +1,514 @@
+# Design: Structured operation logs
+
+Status: **Planned, second revision** · Last updated: 2026-09-16
+
+AURCache's logging today is rich in *sites* and poor in *shape*: every binary
+logs through `tracing` with a plain text formatter (`aurcache/src/logger.rs`,
+`aurcache-worker/src/main.rs`, `aurcache-worker-docker/src/main.rs` — all
+`EnvFilter` at `info` by default), and nothing persists. The one structured
+surface is the curated activity log, which already does the two things this
+design wants — severity, and links to entities — but for a small set of
+operator-facing rows.
+
+This design introduces **structured operation logs**: every significant event is
+a Rust type that serializes to a flat JSON payload, stored beside a stable
+`kind`, a `severity` and a rendered `message`.
+
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepsReplaced {
+    pub dependent: PackageRef,
+    pub old: PackageRef,
+    pub new: PackageRef,
+}
+```
+
+```json
+// Stored:
+{
+  "kind": "deps.replaced",
+  "severity": "info",
+  "ts": 1758030000,
+  "message": "Replaced package foo with package bar as dependency of baz",
+  "data": {"dependent": "pkg:baz", "old": "pkg:foo", "new": "pkg:bar"}
+}
+
+// What the API returns: every reference resolved against the current database,
+// so a package that has since been deleted comes back with no link.
+{
+  "kind": "deps.replaced",
+  "message": "Replaced package foo with package bar as dependency of baz",
+  "data": {"dependent": "pkg:baz", "old": "pkg:foo", "new": "pkg:bar"},
+  "hrefs": {
+    "dependent": "/package/baz",
+    "old": null,
+    "new": "/package/bar"
+  }
+}
+```
+
+The payload key is a **role** (`old`, `new`, `dependent`); the value carries its
+own type as a namespaced id (`pkg:foo`). Context values that name no entity are
+ordinary scalars (`error`, `reason`, `attempt`). `message` is rendered at emit
+time and stored, and `hrefs` is the read-time answer to "which of these still
+has a page".
+
+There is **no primary subject**: every entity a row names is an equal citizen,
+so "everything that relates to package foo" finds this row whether foo is the
+removed dependency, the new one, or the dependent.
+
+The dependency-replacement example is not hypothetical: it is the shape of
+`PUT /package/<pkgbase>/dependency/<dependency>` (survey below), and it is
+exactly the case where some entities are gone by the time anyone reads the row —
+the old dependency is removed from the database by the same request that records
+the replacement (see "Links, and the deleted-entity case").
+
+The survey below is the argument that the material is there: AURCache already
+has on the order of a hundred log sites, each with an implicit kind and a hand
+formatted string that mixes entity names with prose. The design is mostly a
+matter of naming what already exists and carrying the fields it already has in
+its format string.
+
+## What the activity log already settles
+
+Two questions are already answered by the curated log, and the answers carry
+over.
+
+- **Severity is a property of the kind, not of the row.** `ActivityType`
+  (`aurcache-db/src/activities.rs`) derives it by an exhaustive match, with a
+  test that "ordinary news must never be filed as a failure". Two events of one
+  kind cannot differ in severity — "publishing failed" and "package added" are
+  not one event with a field.
+- **Links are carried beside the text, never as markup inside it.**
+  `ActivitySubject` is `Package | Worker | Build`, and the frontend finds the
+  label in the prose and links it (`frontend-rs/src/screens/logs.rs`). The
+  structured log keeps the separation and drops the prose-matching: a reference
+  is a typed value in the payload, not a substring of a sentence.
+
+One correction to the first revision of this document, which justified rendering
+`message` at emit time as continuity with the activity log. The activity log
+renders at **read** time — `serializer.format()` is called in `list_where`
+(`activity_utils.rs:296`) — and the comment it cited
+(`failure_activity.rs:9-12`) is about the captured `error` string inside a
+payload, not about the sentence. Storing `message` is therefore a *departure*,
+and a deliberate one, for a different reason: it is the fallback for a row whose
+payload can no longer be parsed, which is the one failure the payload-as-record
+model cannot otherwise survive.
+
+## The survey: what the log sites look like
+
+Every site below is a current `warn!`/`error!`/`info!` whose format string
+already names the fields it wants. Listed as: current call site → what it
+becomes. Line numbers are from the current tree.
+
+### Version check and update scheduling (`aurcache-scheduler/src/update_version_check.rs`)
+
+The densest cluster of per-package failures in the codebase — eleven sites,
+every one already carrying `package.name`:
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `Couldn't find {} in AUR response` (106) | `version_check.aur_missing` (warning) | `pkg` |
+| `Failed to refresh git source for {}: {e}` (175) | `source.refresh_failed` (warning) | `pkg`, `error` |
+| `Failed to refresh snapshot cache for {}: {e}` (165) | `source.refresh_failed` (warning) | `pkg`, `error` |
+| `Failed to get sourceinfo for {}: {e}` (192) | `source.sourceinfo_failed` (warning) | `pkg`, `error` |
+| `Failed to sync VCS sources for {}: {e}` (143, 213) | `vcs.sync_failed` (warning) | `pkg`, `error` |
+| `Failed to store version check result for {name}: {e}` (272) | `version_check.store_failed` (warning) | `pkg`, `error` |
+| `Cannot compare versions for {package}: upstream '{upstream}' vs built '{built}'` (259–262) | `version.compare_fallback` (warning) | `pkg`, `upstream_version`, `built_version` |
+| `Failed to queue builds for newly outdated packages: {e}` (239) | `update.queue_failed` (error) | `error` |
+| `Failed to perform aur version check: {e}` (26, + activity `VersionCheckFailed`) | `version_check.pass_failed` (error) | `error` |
+
+The interesting field at 259–262 is the pair of *versions*; today they are
+fused into one sentence only so a human can compare them. Structured, they
+become filterable data and the catalog can render "upstream 3.2 vs built 3.1".
+
+### Worker lifecycle and build reporting (`aurcache-worker-core/src/runner.rs`, `report.rs`)
+
+`runner.rs` is the fleet's chronicle — claim, heartbeat, lease, completion:
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `claim failed: {e}` (162) | `worker.claim_failed` (warning) | `error` |
+| `heartbeat failed: {e}` (302) | `worker.heartbeat_failed` (warning) | `error` |
+| `server asked to stop build #{id}; aborting` (297) | `build.cancel_requested` (info) | `build_id` |
+| `server unreachable for {}s (> lease {}s); self-aborting {} build(s)` (309–314) | `worker.lease_expired` (error) | `build_ids`, `since_contact`, `lease_ttl` |
+| `Build {build_id} failed: {reason}` (236–239) | `build.failed` (error) | `build_id`, `reason`, `exit_code` |
+| `reporting completion for {build_id} failed: {e:#}` (249) | `worker.complete_report_failed` (warning) | `build_id`, `error` |
+| `gave up reporting completion for {build_id}; server will requeue` (254) | `worker.complete_report_gave_up` (error) | `build_id` |
+
+`report.rs` already *classifies* exit codes into kinds without naming them
+(`classify_exit`, `report.rs:14-43`): exit 137 → OOM, 124 → timeout,
+signal → killed, other → failed. Those become `build.oom`, `build.timeout`,
+`build.killed_by_signal`, `build.failed` with `exit_code` and (for timeout)
+`timeout_secs` as fields. The vocabulary exists; it is currently a string.
+
+### Build execution (`aurcache-worker/src/job.rs`, `executor.rs`)
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `build spawn failed ({e}); retrying cold` (575) | `build.spawn_retry` (warning) | `pkg`, `arch`, `error` |
+| `cgroup.kill failed for build {build_id}: {e:#}; falling back...` (637–640) | `build.kill_fallback` (warning) | `build_id`, `error` |
+| `process-group kill failed for build {build_id}: {e}` (648–651) | `build.kill_fallback` (warning) | `build_id`, `error` |
+| `{} asked for a persistent build directory but one could not be prepared` (262–266) | `build.persistent_dir_unavailable` (warning) | `pkg`, `arch` |
+| `promoting without a repository DB to validate against` (322) | `cache.promote_unverified` (warning) | `pkg`, `arch`, `error` |
+| `package cache: promoted {promoted}, evicted {}` (335–338) | `cache.decided` (info) | `promoted`, `evicted` |
+
+### Publishing (`aurcache-utils/src/publish.rs`)
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `publishing build #{build_id} failed: {e:#}` (79, + activity `PublishFailed`) | `publish.failed` (error) | `build_id`, `pkg`, `error` |
+| `Failed to trigger dependents of package {}: {e}` (72–75) | `dependents.trigger_failed` (error) | `pkg_id`, `error` |
+| `could not mark build #{build_id} failed: {e}` (99) | `build.mark_failed` (error) | `build_id`, `error` |
+| `could not write to the log of {pkgbase}/{number}: {e}` (110) | `build_log.append_failed` (warning) | `pkg`, `build_number` |
+
+### Server-side ingest (`aurcache-api/src/worker.rs`)
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `Failed to record peak memory for build {build_id}: {e}` (819) | `build.record_peak_memory_failed` (warning) | `build_id`, `error` |
+| `Failed to record built VCS sources for build {build_id}: {e}` (836) | `build.record_vcs_failed` (warning) | `build_id`, `error` |
+| `Failed to record failure reason for build {build_id}: {e}` (855) | `build.record_reason_failed` (warning) | `build_id`, `error` |
+| `could not store worker {}'s configuration report: {e}` (890–893) | `worker.config_report_store_failed` (warning) | `worker`, `error` |
+| `unreadable configuration report from a worker: {e}` (896) | `worker.config_report_unreadable` (warning) | `error` |
+
+### Package edges and dependency replacement (`aurcache-api/src/package.rs`)
+
+The one place the survey finds no `warn!`/`error!`, because there is nothing
+today: `PUT /package/<pkgbase>/dependency/<dependency>` (`package.rs:1622-1712`)
+repoints or drops a dependency edge and records no entry of any kind. The
+events it should emit mention several packages each, and the old one is deleted
+by the request's own `live_check` (`package.rs:1707`) when nothing depends on
+it any more — so "linked, or not linked" has to be decided per entity, and for
+`old_pkg` the honest answer at read time is usually "not linked" — and nobody
+has to declare which of the three packages the row is *about*.
+
+| Would-be kind (severity) | Fields | Notes |
+|---|---|---|
+| `deps.replaced` (info) | `dependent`, `old_pkg`, `new_pkg` | `new_pkg` may be added from the AUR by the same request (`ensure_replacement_exists` call, `package.rs:1676`) |
+| `deps.dropped` (info) | `dependent`, `dropped` | the `replacement: None` arm (`package.rs:1634-1652`) |
+| `deps.rejected` (warning) | `dependent`, `old_pkg`, `reason` | the refusals at `package.rs:1654-1686` — identical to current, self-dependency, nothing to replace, edge would be undone; today they exist only as response text a client shows once |
+
+### Repository and cache maintenance (`aurcache-utils/src/repository.rs`, worker `cache.rs`/`chroot.rs`)
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `repository update did not commit (attempt {attempt}): {e:#}` (`repository.rs:296`) | `repo.commit_retry` (warning) | `attempt`, `error` |
+| `publishing a committed repository update panicked: {e}` (`repository.rs:312`) | `repo.publish_panicked` (error) | `error` |
+| `could not move {} to {}: {e}` (`repository.rs:585`) | `repo.move_failed` (warning) | `from_path`, `to_path`, `error` |
+| `could not remove {}: {e}` (`repository.rs:593`, `build_logger.rs:121,131`, `delete.rs:68`) | `repo.remove_failed` (warning) | `path`, `error` |
+| `image pull reported: {e}` (`worker-docker/executor.rs:108`) | `chroot.image_pull_failed` (warning) | `error` |
+| `chroot refresh returned non-zero:` (`chroot.rs:78`) | `chroot.refresh_failed` (warning) | `path`, `log` |
+| `could not import pgp key {key}:\n{log}` (`chroot.rs:248`) | `gpg.import_failed` (warning) | `key`, `log` |
+| `evicted cache entry {pkgbase}` (`cache.rs:654`) | `cache.evicted` (info) | `pkg` |
+
+### Restore, bulk add, and misc server paths
+
+| Current site | Would-be kind (severity) | Fields |
+|---|---|---|
+| `restore: could not read the source of {pkgbase}: {e}` (`restore.rs:374`) | `restore.source_failed` (warning) | `pkg`, `error` |
+| `restore: could not resolve dependencies for {pkgbase}: {e}` (`restore.rs:400`) | `restore.deps_failed` (warning) | `pkg`, `error` |
+| `bulk add could not batch-resolve pkgbases, continuing per package: {e}` (`bulk_add.rs:66`) | `bulk_add.batch_resolve_failed` (warning) | `error` |
+| `could not record bulk add {job_id} progress: {e}` / `bulk add {job_id} ended abnormally` (`api/package.rs:206,214`) | `operation.bulk_add_*` (warning) | `job_id`, `error` |
+| `Failed to issue server certificate, TLS disabled: {e}` (`api/init.rs:65`) | `server.tls_setup_failed` (error) | `error` |
+| `\`SECRET_KEY\` env not set, generating random key.` (`api/init.rs:35`) | `server.ephemeral_secret` (warning) | — |
+| `failed to build oauth redirect: {e}` (`api/auth.rs:133`) | `auth.oauth_redirect_failed` (error) | `error` |
+| `Auto update skipped {package_name}: {e}` (`package/update.rs:112,133`) | `update.skipped` (warning) | `pkg`, `error` |
+| `{} could not be parsed: {err:#}` (`snapshot.rs:811`) | `source.pkgbuild_unparseable` (warning) | `pkg`, `path`, `error` |
+
+## The kinds, consolidated
+
+Dotted `domain.verb.object` names, one dot-separated identity per row, grouped
+by subsystem. Severity is derived from the kind by an exhaustive match (the
+`ActivityType::severity` pattern), never carried by the caller:
+
+- **version-check / update**: `version_check.pass_failed` (E), `version_check.store_failed` (W),
+  `version_check.aur_missing` (W), `version.compare_fallback` (W),
+  `source.refresh_failed` (W), `source.sourceinfo_failed` (W), `source.pkgbuild_unparseable` (W),
+  `vcs.sync_failed` (W), `update.queue_failed` (E), `update.skipped` (W)
+- **build (worker side)**: `build.failed` (E), `build.oom` (E), `build.timeout` (E),
+  `build.killed_by_signal` (E), `build.cancelled` (I), `build.cancel_requested` (I),
+  `build.spawn_retry` (W), `build.kill_fallback` (W), `build.persistent_dir_unavailable` (W)
+- **build (server side)**: `publish.failed` (E), `build.mark_failed` (E),
+  `build.record_peak_memory_failed` (W), `build.record_vcs_failed` (W),
+  `build.record_reason_failed` (W), `build_log.append_failed` (W), `dependents.trigger_failed` (E)
+- **worker / fleet**: `worker.claim_failed` (W), `worker.heartbeat_failed` (W),
+  `worker.lease_expired` (E), `worker.complete_report_failed` (W),
+  `worker.complete_report_gave_up` (E), `worker.config_report_store_failed` (W),
+  `worker.config_report_unreadable` (W)
+- **repository / cache / chroot**: `repo.commit_retry` (W), `repo.publish_panicked` (E),
+  `repo.move_failed` (W), `repo.remove_failed` (W), `cache.promote_unverified` (W),
+  `cache.decided` (I), `cache.evicted` (I), `chroot.image_pull_failed` (W),
+  `chroot.refresh_failed` (W), `chroot.layer_flattened` (I), `gpg.import_failed` (W)
+- **operations**: `restore.source_failed` (W), `restore.deps_failed` (W),
+  `bulk_add.batch_resolve_failed` (W), `operation.bulk_add_progress_failed` (W),
+  `operation.bulk_add_aborted` (W)
+- **dependencies**: `deps.replaced` (I), `deps.dropped` (I), `deps.rejected` (W)
+- **server / auth**: `server.tls_setup_failed` (E), `server.ephemeral_secret` (W),
+  `auth.oauth_redirect_failed` (E)
+
+That is on the order of 50 kinds from a first pass over ~100 sites — small
+enough to be one type each, large enough to be the app's failure vocabulary
+(and due a consolidation pass, below). The existing `ActivityType` kinds (12 of them) map onto this
+catalogue by construction: every activity that records a failure today
+(PublishFailed, VersionCheckFailed, WorkerReaped, WorkerSettingRejected) has a
+structured counterpart above, and the activity row's `data` JSON is precisely
+the payload this design wants.
+
+## References and context values
+
+The payload is one flat JSON object. The **key is the role** the value plays;
+the **value carries its own type**.
+
+### Entity references
+
+Three newtypes, serialized as `namespace:id`, whose `Deserialize` rejects a
+foreign prefix:
+
+| Type | Wire | Route |
+|---|---|---|
+| `PackageRef` | `pkg:hello` | `/package/hello` |
+| `WorkerRef` | `worker:builder-01` | `/worker/builder-01` |
+| `BuildRef { pkgbase, number }` | `build:hello/7` | `/package/hello/build/7` |
+
+Typing the *field* is what makes the encoding safe. A first revision put the
+namespace in the key (`pkg.old`) so that storage could read the prefix
+mechanically, and accepted that nothing stopped a role from holding the wrong
+kind of id. With `old: PackageRef`, `"old": "build:baz/1"` is unwritable at the
+call site and unreadable from the database, and the namespace is still there in
+the value for anything that wants to scan for it.
+
+It also removes the special cases the keyed form needed: a build is one
+`BuildRef` rather than `build.base` + `build.number` (or a bare `build.id` the
+reader has to map through the `builds` table), and a role naming several
+entities is `Vec<BuildRef>` rather than a pluralised key.
+
+### Context values
+
+Anything that is not an entity: `error`, `reason`, `attempt`, `exit_code`,
+`upstream_version`, `built_version`, `timeout_secs`, `since_contact`,
+`lease_ttl`, `log`, `job_id`. Rendered as text or in a detail view; never
+linked, never matched by the entity filter.
+
+Durations are whole seconds, as everywhere else here (`units::format_duration`)
+— not the floats the first revision used for `since_contact` and `lease_ttl`.
+
+Display-only values (`platform`, `path`, `url`) are context, not references:
+they carry no link, and nothing in the UI should try to make one.
+
+## The emission surface
+
+One type per kind, with a hand-written impl. No derive macro, no enum, no
+`tracing` Layer.
+
+```rust
+pub trait LogEvent: Serialize {
+    const KIND: &'static str;
+    const SEVERITY: Severity;
+    /// Rendered now and stored, so the row still reads if its payload can no
+    /// longer be parsed.
+    fn message(&self) -> String;
+}
+
+impl LogEvent for DepsReplaced {
+    const KIND: &'static str = "deps.replaced";
+    const SEVERITY: Severity = Severity::Info;
+    fn message(&self) -> String {
+        format!("Replaced {} with {} as dependency of {}", self.old, self.new, self.dependent)
+    }
+}
+
+// The whole call site — it replaces today's `warn!("…", …)` one for one:
+emit(DepsReplaced { dependent, old: current.name.into(), new: replacement.into() });
+```
+
+Why this shape rather than the first revision's `#[derive(StructuredEvent)]`
+over one big enum:
+
+- **The payload struct is the field set.** Serde produces the flat map on the
+  way out and validates required and unknown keys (`deny_unknown_fields`) on
+  the way back. A separate `fields: Vec<(&'static str, FieldValue)>`
+  representation is not needed, and neither is a generated schema to re-check
+  at the storage boundary what the types already guarantee.
+- **A missing or misspelled field does not compile.** A struct literal cannot
+  omit `new` or invent `nwe`.
+- **Severity cannot be forgotten.** It is a required associated const, so a new
+  event type does not compile without one — the guarantee the first revision
+  wanted an exhaustive match over an enum for.
+- **Nothing is parsed out of doc comments.** The first revision put the kind,
+  the severity and a message template in `///` lines for a macro to read;
+  rustfmt cannot see those, grep handles them badly, and rustdoc renders them
+  as prose.
+
+`emit` writes to the bounded queue the activity log already uses
+(`ActivityLog`, `aurcache-activitylog/src/activity_utils.rs`) and calls
+`tracing::event!` beside it, so the text logger keeps printing its line. One
+source, two consumers. The first revision routed the typed event *through*
+`tracing` and recovered it in a `Layer`, which discarded the types it had just
+established and then needed boundary validation to get them back.
+
+### Scope
+
+A scope is an entity reference, so grouping needs no second vocabulary: a row
+carries `scope: Option<EntityRef>`, and `build:hello/7` gathers both the events
+*about* that build and those emitted *during* it.
+
+It comes from a scoped handle — `let log = log.scoped(BuildRef { .. })` — rather
+than a `tracing` span, because the log handle is already threaded through
+`Services` and this keeps it explicit. If threading it down a deep call stack
+proves to be the painful part, a `tokio::task_local` that `emit` consults when
+the handle carries no scope is a drop-in upgrade. A `tracing` Layer is the only
+option that needs the dynamic round trip, and is not planned.
+
+## Links, and the deleted-entity case
+
+1. **The record is pure.** An event says `old: PackageRef("foo")` and never says
+   whether `foo` has a page. Baking a link (or a `null`) at emit time would let
+   the row lie within seconds — `live_check` can delete `foo` in the same
+   request that records the replacement (`aurcache-api/src/package.rs:1707`).
+2. **The API resolves at read time, in one batched query.** A page of rows
+   yields its distinct references; one `IN` lookup per namespace returns which
+   still exist; the response annotates each with a route or `null`.
+3. **The UI trusts the annotation.** Non-null renders an anchor, `null` renders
+   plain text, an unknown namespace renders plain text. No existence checks in
+   the browser, no 404 links.
+
+`message` keeps the name either way, so a row whose `old` has no link still
+reads correctly, and nothing is lost when the UI drops an anchor.
+
+## Storage
+
+One log store, not two. The survey is dominated by failure paths, so the volume
+is hundreds of rows a day rather than millions, which makes a second table with
+its own retention unjustified. The curated activity events become `LogEvent`
+types in the same store, and the existing retention sweep and pager apply
+unchanged.
+
+```
+log(id, kind, severity, message, ts, user, scope, data TEXT)
+log_entity(log_id -> log(id) ON DELETE CASCADE, role, ns, id)
+  PRIMARY KEY (log_id, role, ns, id);  INDEX (ns, id)
+```
+
+At insert, walk the serialized payload (and `scope`) for every `namespace:id`
+and write the rows in the same transaction, keeping the payload key as `role`.
+
+Carrying `role` is what keeps **every** query off JSON: a role-scoped filter is
+a column comparison rather than `data->>'dependent'`, which sea-query only
+exposes as a Postgres operator (`PgBinOper::CastJsonField`). `data` is then
+written and read whole, and nothing queries into it.
+
+**Why a side table rather than a `refs jsonb` column with a GIN index.** The
+jsonb form indexes better on Postgres — `refs @> '["pkg:foo"]'` against
+`gin (refs jsonb_path_ops)` is the best-indexed shape Postgres offers — but the
+filter would then be a *different query per backend*. Every test in this repo
+connects to `sqlite::memory:`, and `docker-compose.e2e.yaml` sets no `DB_TYPE`,
+so nothing is exercised against Postgres anywhere: the branch the tests cover
+would be the one that never runs in production. A side table is one query on
+both backends, expressible in sea-orm without `PgBinOper` or a raw-SQL index, so
+the SQLite tests exercise the SQL that actually ships — and backend-agnostic
+queries are the standing preference here, with anything backend-specific to be
+raised before it is written.
+
+The usual objection to a derived index — that it drifts from what it indexes —
+is weak here because the log is append-only: rows are never mutated, and deletes
+come only from the retention sweep, which one `ON DELETE CASCADE` covers. What
+remains is a bug in the extraction function, and that risk is identical for a
+derived `refs` column.
+
+Revisit the jsonb form if a Postgres test lane is ever added and the side
+table's write cost starts to matter.
+
+### The queries
+
+```sql
+-- everything about one entity, whatever role it played
+WHERE id IN (SELECT log_id FROM log_entity WHERE ns='pkg' AND id='foo')
+
+-- mentions both
+... GROUP BY log_id HAVING COUNT(*) = 2
+
+-- one role specifically
+WHERE id IN (SELECT log_id FROM log_entity
+              WHERE role='dependent' AND ns='pkg' AND id='foo')
+```
+
+All three are ordinary SQL that sea-orm builds identically for both backends —
+no JSON operators, no `PgBinOper`, no raw SQL, and so no branch that only one
+backend's tests would cover.
+
+None of them names a kind, so they run against rows of kinds that did not exist
+when the query was written. A *family* of events ("worker events") is
+`kind LIKE 'worker.%'` on the log table itself — the UI holds the catalogue and
+crafts that; it is not a storage concern.
+
+`?build=hello/7` returns both the events about that build and those emitted
+under its scope, because `scope` is extracted into `log_entity` alongside the
+payload's references.
+
+## Frontend rendering
+
+The Logs screen renders each row from three inputs, in order:
+
+1. `kind` + `data` + `hrefs` → catalogue lookup; a known kind renders its
+   sentence with values substituted, each reference an anchor when `hrefs` gives
+   a route and plain text when it gives `null`.
+2. `message` → the fallback when the kind is unknown (an older row, a newer
+   server) or when the payload no longer parses.
+3. The entity filter is the server-side query above; the UI renders the active
+   filter but does not re-implement it.
+
+Localization becomes a change to the UI catalogue alone; `message` never
+changes, so non-UI consumers are unaffected.
+
+## Consolidation to do while porting
+
+The catalogue above has several kinds that are one-per-call-site:
+`build.record_peak_memory_failed`, `build.record_vcs_failed` and
+`build.record_reason_failed` are three kinds for "a database write about a build
+failed". Merge where an operator would never filter on the difference, keeping
+the distinction as a context value. The test is whether anyone would ever want
+the two apart in a filter.
+
+Also: several events are user-initiated (`deps.replaced` comes from a `PUT`),
+so the record needs the actor the activity log already carries as `user`.
+
+## Non-goals
+
+- Parsing or linking entities out of `message` text. A reference is a typed
+  value in the payload or it is not a reference. (The `split_on` whole-word
+  linker in `logs.rs` stays only for activity prose written before this design,
+  where the prose is all there is.)
+- A primary subject, or any ranking among the entities a row names.
+- Resolving entity existence in the browser.
+- Structured *build logs*. Per-line instrumentation of a makepkg build is out of
+  scope; what gets structured here is the events *about* builds, not the bytes
+  of their output. The build log stays a bounded byte stream
+  (`design/build-log-capping.md`).
+- OTel/metrics export, full-text search, or log shipping. The shape is chosen to
+  be export-friendly, but export is a later step.
+
+## Verification
+
+- **Round trip**: every `LogEvent` type serializes and deserializes back
+  unchanged; a payload with a missing or unknown key is refused.
+- **Reference typing**: a `PackageRef` field refuses `worker:x` and
+  `build:x/1`; `BuildRef` round-trips `build:hello/7`, including a pkgbase
+  containing `-` and `+`.
+- **Fallback**: a row whose payload no longer matches its type renders from the
+  stored `message` and is not dropped — the failure the stored message exists
+  for, and the one the current activity log gets wrong by skipping the row while
+  still counting it.
+- **Entity filter**: `?pkg=foo` finds a row where `foo` is the old dependency,
+  the new one, and the dependent; the test asserts the query names no kind.
+- **Extraction**: `log_entity` rows regenerated from a payload match what was
+  written, for every event type — the one place a side table can drift.
+- **Hrefs**: a package deleted after emission comes back `null` and renders as
+  plain text; a present one links; one batched query per page.
+- **Scope**: events emitted under `log.scoped(build)` carry it, and
+  `?build=hello/7` returns both those and the events naming that build.
+- **Severity**: stored from the type's associated const, so a row's severity
+  cannot disagree with its kind at write time.
+- `scripts/test-frontend.sh` for the Logs screen, which already covers the page,
+  both filters and entity links.
