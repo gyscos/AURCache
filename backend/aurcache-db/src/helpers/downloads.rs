@@ -20,7 +20,7 @@ use crate::helpers::time::now_secs;
 use crate::prelude::DownloadCounts;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// The download counter: the in-memory tally and every way to read it.
@@ -57,7 +57,7 @@ impl DownloadCounter {
 
     /// Counts held in memory for every file the predicate accepts.
     #[must_use]
-    fn pending_matching(&self, wanted: &dyn Fn(&str) -> bool) -> i64 {
+    fn pending_matching(&self, wanted: impl Fn(&str) -> bool) -> i64 {
         let Ok(pending) = self.pending.lock() else {
             return 0;
         };
@@ -90,9 +90,9 @@ impl DownloadCounter {
         if pkgnames.is_empty() {
             return Ok(0);
         }
-        let wanted = |file_name: &str| {
-            pkgname_of(file_name).is_some_and(|name| pkgnames.iter().any(|p| p == name))
-        };
+        let wanted_set: HashSet<&str> = pkgnames.iter().map(String::as_str).collect();
+        let wanted =
+            |file_name: &str| pkgname_of(file_name).is_some_and(|name| wanted_set.contains(name));
 
         let stored: i64 = DownloadCounts::find()
             .select_only()
@@ -106,7 +106,7 @@ impl DownloadCounter {
             .map(|(_, count)| count)
             .sum();
 
-        Ok(stored + self.pending_matching(&wanted))
+        Ok(stored + self.pending_matching(wanted))
     }
 
     /// Fold the buffer into the table.

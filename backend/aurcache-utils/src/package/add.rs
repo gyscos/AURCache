@@ -108,8 +108,10 @@ impl AddPlan {
 fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
     flags
         .into_iter()
-        .map(|flag| flag.trim().to_string())
-        .filter(|flag| !flag.is_empty())
+        .filter_map(|flag| {
+            let trimmed = flag.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
         .collect()
 }
 

@@ -127,10 +127,10 @@ DROP COLUMN build_flags;
 ALTER TABLE public.packages
 DROP COLUMN platforms;
 
-ALTER TABLE builds
+ALTER TABLE public.builds
 DROP COLUMN platform;
 
-ALTER TABLE files
+ALTER TABLE public.files
 DROP COLUMN platform;
 ",
                 )

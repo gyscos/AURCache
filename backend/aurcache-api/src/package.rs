@@ -108,8 +108,9 @@ pub struct PackageApi;
 fn normalize_build_flags(build_flags: &[String]) -> Vec<String> {
     build_flags
         .iter()
-        .map(|flag| flag.trim().to_string())
+        .map(|flag| flag.trim())
         .filter(|flag| !flag.is_empty())
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -932,13 +933,8 @@ pub async fn get_package(
         outofdate: pkg.out_of_date,
         latest_version,
         package_source,
-        selected_platforms: pkg.platforms.split(';').map(ToString::to_string).collect(),
-        selected_build_flags: Some(
-            pkg.build_flags
-                .split(';')
-                .map(ToString::to_string)
-                .collect(),
-        ),
+        selected_platforms: split_semicolon_field(&pkg.platforms),
+        selected_build_flags: Some(split_semicolon_field(&pkg.build_flags)),
         upstream_version,
         split_packages,
         files,
@@ -1418,7 +1414,7 @@ fn provided_names(pkg: &packages::Model) -> Vec<String> {
                 None => entry,
             }),
     );
-    names.sort();
+    names.sort_unstable();
     names.dedup();
     names
 }
@@ -1426,6 +1422,15 @@ fn provided_names(pkg: &packages::Model) -> Vec<String> {
 fn json_string_list(raw: Option<&str>) -> Vec<String> {
     raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
         .unwrap_or_default()
+}
+
+/// Split a `;`-delimited column, dropping empty entries so an empty column
+/// means "no entries" rather than `[""]`.
+fn split_semicolon_field(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn official_holds(services: &Services, name: &str) -> Result<bool, ApiError> {
@@ -1789,6 +1794,7 @@ async fn ensure_replacement_exists(
 mod dependency_tests {
     use super::{
         ReplacementVerdict, candidate_verdict, dependency_edge, provided_names, repoint_edge,
+        split_semicolon_field,
     };
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
@@ -1863,6 +1869,19 @@ mod dependency_tests {
             provided_names(&package),
             vec!["foo-compat", "libfoo", "libfoo-docs", "libfoo.so"],
             "a versioned `provides` contributes the name, not the whole entry"
+        );
+    }
+
+    /// An empty `;`-delimited column is "no entries", not one empty entry --
+    /// otherwise an empty `platforms`/`build_flags` column renders as a blank
+    /// chip.
+    #[test]
+    fn an_empty_semicolon_column_means_no_entries() {
+        assert!(split_semicolon_field("").is_empty());
+        assert_eq!(split_semicolon_field("x86_64"), vec!["x86_64"]);
+        assert_eq!(
+            split_semicolon_field("x86_64;;aarch64"),
+            vec!["x86_64", "aarch64"]
         );
     }
 

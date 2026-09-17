@@ -53,17 +53,17 @@ pub fn hash_api_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-fn generate_api_token() -> String {
+fn generate_api_token() -> anyhow::Result<String> {
     let mut bytes = [0_u8; 32];
     // `SysRng` is rand 0.10's name for what was `OsRng`, and reading from it is
     // now fallible: the OS can refuse entropy. Refusing to mint a token is the
     // only safe answer -- a token from a degraded source is worse than none --
-    // and the old `fill_bytes` panicked on the same condition, so this keeps
-    // the behaviour while naming the reason.
+    // so the failure is returned for the endpoint to report instead of
+    // panicking the server.
     SysRng
         .try_fill_bytes(&mut bytes)
-        .expect("system entropy unavailable; refusing to mint an API token");
-    hex::encode(bytes)
+        .context("system entropy unavailable; refusing to mint an API token")?;
+    Ok(hex::encode(bytes))
 }
 
 pub async fn username_for_api_token(
@@ -92,7 +92,7 @@ pub async fn regenerate_api_token(
     db: &DatabaseConnection,
     username: &str,
 ) -> anyhow::Result<String> {
-    let token = generate_api_token();
+    let token = generate_api_token()?;
     let token_hash = hash_api_token(&token);
 
     if let Some(existing) = ApiTokens::find()
