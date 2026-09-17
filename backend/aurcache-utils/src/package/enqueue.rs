@@ -9,8 +9,9 @@ use futures::future::try_join_all;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, TransactionTrait,
+    PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
 };
+use std::collections::{HashMap, HashSet};
 
 use tokio::sync::broadcast::Sender;
 use tracing::warn;
@@ -28,21 +29,45 @@ pub async fn trigger_initial_builds(
     platforms: &[Platform],
     pkgbases: &[String],
 ) -> anyhow::Result<()> {
+    if pkgbases.is_empty() {
+        return Ok(());
+    }
+    // The rows, in one query — not one lookup per added package. Iteration
+    // stays over `pkgbases` so a missing name is still skipped in order.
+    let pkgs: HashMap<String, packages::Model> = Packages::find()
+        .filter(packages::Column::Name.is_in(pkgbases.iter().map(String::as_str)))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|pkg| (pkg.name.clone(), pkg))
+        .collect();
+    // All names missed: the loop below would skip everything, and the empty
+    // `IN` below is not valid SQL everywhere.
+    if pkgs.is_empty() {
+        return Ok(());
+    }
+    // Which of them have dependency edges, in one grouped query — zero-vs-one
+    // is the only question, so the set of non-empty dependees is the answer.
+    let has_deps: HashSet<i32> = Dependencies::find()
+        .select_only()
+        .column(dependencies::Column::DependentId)
+        .filter(dependencies::Column::DependentId.is_in(pkgs.values().map(|pkg| pkg.id)))
+        .group_by(dependencies::Column::DependentId)
+        .into_tuple::<i32>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+
     for pkgbase in pkgbases {
-        let Some(pkg) = Packages::find()
-            .filter(packages::Column::Name.eq(pkgbase))
-            .one(db)
-            .await?
-        else {
+        let Some(pkg) = pkgs.get(pkgbase) else {
             continue;
         };
+        // Owned from here, as the row used to arrive: the trigger takes the
+        // model by value (and clones it again per send).
+        let pkg = pkg.clone();
 
-        let dep_count = Dependencies::find()
-            .filter(dependencies::Column::DependentId.eq(pkg.id))
-            .count(db)
-            .await?;
-
-        if dep_count == 0 {
+        if !has_deps.contains(&pkg.id) {
             // Leaf package – no deps, can start right away.
             trigger_build_for_package(db, tx, platforms, pkg, BuildStates::ENQUEUED_BUILD).await?;
         } else {
@@ -129,10 +154,16 @@ pub async fn enqueue_missing_buildable_packages(
                             txn.commit().await?;
                             continue;
                         };
-                        // Reflect the promotion in the package's own status.
-                        let mut pkg_active: packages::ActiveModel = pkg.clone().into();
-                        pkg_active.status = Set(BuildStates::ENQUEUED_BUILD);
-                        pkg_active.save(&txn).await?;
+                        // Reflect the promotion in the package's own status: one
+                        // column, not the whole row (which carries the large
+                        // `source_data` JSON).
+                        packages::ActiveModel {
+                            id: Set(pkg.id),
+                            status: Set(BuildStates::ENQUEUED_BUILD),
+                            ..Default::default()
+                        }
+                        .update(&txn)
+                        .await?;
                         txn.commit().await?;
                         let _ = tx.send(Action::Build(Box::new(pkg.clone()), Box::new(promoted)));
                         queued += 1;
@@ -265,10 +296,16 @@ async fn trigger_build_for_package(
         .await?;
 
         if enqueue_result.inserted {
-            let mut pkg_active: packages::ActiveModel = pkg.clone().into();
-            pkg_active.latest_build = Set(Some(enqueue_result.build.id));
-            pkg_active.status = Set(initial_status);
-            pkg_active.save(&txn).await?;
+            // Two columns, not the whole row (which carries the large
+            // `source_data` JSON).
+            packages::ActiveModel {
+                id: Set(pkg.id),
+                latest_build: Set(Some(enqueue_result.build.id)),
+                status: Set(initial_status),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
         }
 
         txn.commit().await?;

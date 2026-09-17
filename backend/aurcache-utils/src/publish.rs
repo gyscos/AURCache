@@ -240,12 +240,22 @@ async fn plan(
     described: &[Staged],
     version: String,
 ) -> anyhow::Result<Plan> {
+    // What this platform already publishes, in one query rather than one per
+    // staged file (see `Update::published_files`).
+    let known = update
+        .published_files(
+            db,
+            platform,
+            &described
+                .iter()
+                .map(|staged| staged.filename.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
     let mut rows = Vec::with_capacity(described.len());
     for staged in described {
-        let existing = update
-            .published_file(db, platform, &staged.filename)
-            .await?;
-        if let Some(existing) = &existing
+        let existing = known.get(&staged.filename);
+        if let Some(existing) = existing
             && existing.package_id() != pkg.id
         {
             // Counted rather than read: all this needs is whether the row is
@@ -270,7 +280,7 @@ async fn plan(
         }
         rows.push((
             staged.filename.clone(),
-            existing.map(|file| file.id()),
+            existing.map(PublishedFile::id),
             staged.size,
         ));
     }
@@ -317,31 +327,34 @@ async fn record(
         bail!("build #{build_id} is no longer being published");
     }
 
-    for (filename, existing, size) in &plan.rows {
-        match existing {
-            // Updated even when otherwise unchanged: a rebuild at the same
-            // version has the same filename and different contents.
-            Some(id) => {
-                files::ActiveModel {
-                    id: Set(*id),
-                    package_id: Set(pkg.id),
-                    size: Set(Some(*size)),
-                    ..Default::default()
-                }
-                .update(&txn)
-                .await?;
+    // New rows go in one statement. Updates stay one per row: each touches a
+    // distinct id, and a rebuild at the same version is updated even when
+    // otherwise unchanged — same filename, different contents.
+    let new_rows: Vec<files::ActiveModel> = plan
+        .rows
+        .iter()
+        .filter(|(_, existing, _)| existing.is_none())
+        .map(|(filename, _, size)| files::ActiveModel {
+            filename: Set(filename.clone()),
+            platform: Set(platform),
+            package_id: Set(pkg.id),
+            size: Set(Some(*size)),
+            ..Default::default()
+        })
+        .collect();
+    if !new_rows.is_empty() {
+        files::Entity::insert_many(new_rows).exec(&txn).await?;
+    }
+    for (_, existing, size) in &plan.rows {
+        if let Some(id) = existing {
+            files::ActiveModel {
+                id: Set(*id),
+                package_id: Set(pkg.id),
+                size: Set(Some(*size)),
+                ..Default::default()
             }
-            None => {
-                files::ActiveModel {
-                    filename: Set(filename.clone()),
-                    platform: Set(platform),
-                    package_id: Set(pkg.id),
-                    size: Set(Some(*size)),
-                    ..Default::default()
-                }
-                .insert(&txn)
-                .await?;
-            }
+            .update(&txn)
+            .await?;
         }
     }
     if !plan.stale.is_empty() {

@@ -17,8 +17,8 @@ use aurcache_db::{builds, dependencies, package_vcs_sources, packages};
 use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -41,22 +41,34 @@ use tracing::{info, warn};
 /// artifacts leave the repository with them.
 async fn remove_orphaned_packages(services: &Services, exclude_id: i32) -> anyhow::Result<()> {
     let db = &services.db;
-    let candidates = Packages::find()
+    // Only ids: the rows are never read, only their keys collected.
+    let candidate_ids: Vec<i32> = Packages::find()
+        .select_only()
+        .column(packages::Column::Id)
         .filter(packages::Column::DirectlyRequested.eq(false))
         .filter(packages::Column::Id.ne(exclude_id))
+        .into_tuple::<i32>()
         .all(db)
         .await?;
-
-    let mut orphaned = Vec::new();
-    for pkg in &candidates {
-        let dep_count = Dependencies::find()
-            .filter(dependencies::Column::DependeeId.eq(pkg.id))
-            .count(db)
-            .await?;
-        if dep_count == 0 {
-            orphaned.push(pkg.id);
-        }
+    if candidate_ids.is_empty() {
+        return Ok(());
     }
+    // The dependees that still have edges, in one grouped query — not one
+    // `COUNT` per candidate.
+    let referenced: HashSet<i32> = Dependencies::find()
+        .select_only()
+        .column(dependencies::Column::DependeeId)
+        .filter(dependencies::Column::DependeeId.is_in(candidate_ids.iter().copied()))
+        .group_by(dependencies::Column::DependeeId)
+        .into_tuple::<i32>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
+    let orphaned: Vec<i32> = candidate_ids
+        .into_iter()
+        .filter(|id| !referenced.contains(id))
+        .collect();
     crate::package::delete::package_delete(db, &services.store, &services.repo, &orphaned).await
 }
 
@@ -185,7 +197,7 @@ pub async fn package_resync_dependencies(
         .store
         .sourceinfo(&pkg_model.source_data, pkg_model.patch.as_deref())
         .await
-        .map_err(|e| anyhow!("Failed to resolve source info: {e}"))?;
+        .map_err(|e| anyhow!("Failed to resolve source info: {e:#}"))?;
     let deps = aurcache_deps::deps_from_srcinfo(
         &sourceinfo,
         &crate::pkg::architectures_for_platforms(&pkg_model.platforms),
@@ -218,7 +230,7 @@ async fn package_update_inner(
         .store
         .sourceinfo(&pkg_model.source_data, pkg_model.patch.as_deref())
         .await
-        .map_err(|e| anyhow!("Failed to resolve source info: {e}"))?;
+        .map_err(|e| anyhow!("Failed to resolve source info: {e:#}"))?;
     let upstream_version = sourceinfo.base.version.to_string();
     let deps = aurcache_deps::deps_from_srcinfo(
         &sourceinfo,
@@ -307,19 +319,24 @@ async fn package_update_inner(
     let has_waiting = platform_results.iter().any(|r| !r.enqueued);
 
     let pkgbase = sourceinfo.base.name.to_string();
-    let mut pkg_model_active: packages::ActiveModel = pkg_model.clone().into();
     let initial_status = if has_waiting && !any_enqueued {
         BuildStates::WAITING_FOR_DEPS
     } else {
         BuildStates::ENQUEUED_BUILD
     };
-    pkg_model_active.status = Set(initial_status);
-    pkg_model_active.upstream_version = Set(Some(upstream_version.clone()));
-    pkg_model_active.split_packages = Set(split_packages_json(&pkgbase, &deps.pkgnames)?);
-    pkg_model_active.provides = Set(provides_json(&deps.provides)?);
-    let txn = services.db.begin().await?;
-    pkg_model_active.save(&txn).await?;
-    txn.commit().await?;
+    // Four columns, not the whole row (which carries the large `source_data`
+    // JSON), and no transaction: this is one statement, so there is nothing
+    // to make atomic.
+    packages::ActiveModel {
+        id: Set(pkg_model.id),
+        status: Set(initial_status),
+        upstream_version: Set(Some(upstream_version.clone())),
+        split_packages: Set(split_packages_json(&pkgbase, &deps.pkgnames)?),
+        provides: Set(provides_json(&deps.provides)?),
+        ..Default::default()
+    }
+    .update(&services.db)
+    .await?;
 
     Ok(platform_results)
 }
@@ -496,13 +513,23 @@ async fn ensure_missing_dependency_packages(
     pkg_model: &packages::Model,
     dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
 ) -> anyhow::Result<()> {
+    // The packages already tracked, in one query — not one probe per
+    // declared dependency. Nothing declared means nothing to look up (`IN ()`
+    // is not valid SQL everywhere).
+    if dep_constraints_by_pkgbase.is_empty() {
+        return Ok(());
+    }
+    let tracked: HashSet<String> = Packages::find()
+        .select_only()
+        .column(packages::Column::Name)
+        .filter(packages::Column::Name.is_in(dep_constraints_by_pkgbase.keys().map(String::as_str)))
+        .into_tuple::<String>()
+        .all(&services.db)
+        .await?
+        .into_iter()
+        .collect();
     for dep_pkgbase in dep_constraints_by_pkgbase.keys() {
-        if Packages::find()
-            .filter(packages::Column::Name.eq(dep_pkgbase.as_str()))
-            .one(&services.db)
-            .await?
-            .is_none()
-        {
+        if !tracked.contains(dep_pkgbase) {
             ensure_aur_package_exists_recursive(
                 &services.client,
                 &services.store,
@@ -539,16 +566,29 @@ async fn sync_dependency_rows(
     dep_packages: &HashMap<String, packages::Model>,
 ) -> anyhow::Result<()> {
     let txn = db.begin().await?;
-    let desired_dependee_ids = dep_packages.values().map(|pkg| pkg.id).collect::<Vec<_>>();
+    let desired_dependee_ids: HashSet<i32> = dep_packages.values().map(|pkg| pkg.id).collect();
 
-    for existing in Dependencies::find()
+    // Loaded once and shared by both passes below: the rows the upsert pass
+    // needs are already here, so re-querying each edge is pure overhead.
+    let existing: HashMap<i32, dependencies::Model> = Dependencies::find()
         .filter(dependencies::Column::DependentId.eq(dependent_id))
         .all(&txn)
         .await?
-    {
-        if !desired_dependee_ids.contains(&existing.dependee_id) {
-            existing.delete(&txn).await?;
-        }
+        .into_iter()
+        .map(|row| (row.dependee_id, row))
+        .collect();
+
+    let stale: Vec<i32> = existing
+        .keys()
+        .filter(|id| !desired_dependee_ids.contains(id))
+        .copied()
+        .collect();
+    if !stale.is_empty() {
+        Dependencies::delete_many()
+            .filter(dependencies::Column::DependentId.eq(dependent_id))
+            .filter(dependencies::Column::DependeeId.is_in(stale))
+            .exec(&txn)
+            .await?;
     }
 
     for (dep_pkgbase, constraint) in dep_constraints_by_pkgbase {
@@ -560,13 +600,8 @@ async fn sync_dependency_rows(
             .map(ToString::to_string)
             .unwrap_or_default();
 
-        if let Some(existing) = Dependencies::find()
-            .filter(dependencies::Column::DependentId.eq(dependent_id))
-            .filter(dependencies::Column::DependeeId.eq(dep_pkg.id))
-            .one(&txn)
-            .await?
-        {
-            let mut active: dependencies::ActiveModel = existing.into();
+        if let Some(edge) = existing.get(&dep_pkg.id) {
+            let mut active: dependencies::ActiveModel = edge.clone().into();
             active.version_constraint = Set(serialized.clone());
             active.save(&txn).await?;
         } else {

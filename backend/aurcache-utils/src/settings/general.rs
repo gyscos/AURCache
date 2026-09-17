@@ -194,22 +194,40 @@ pub trait SettingsTraits {
 
 impl SettingsTraits for ApplicationSettings {
     async fn get_all(db: &DatabaseConnection, pkgid: Option<i32>) -> anyhow::Result<Self> {
+        // Independent reads over one pooled connection: eight serial awaits
+        // would pay up to sixteen point queries (package + global each) in
+        // turn on every scheduler tick and settings read.
+        let (
+            version_check_interval,
+            auto_update_interval,
+            job_timeout,
+            max_artifact_size,
+            date_format,
+            build_on_new_version,
+            persistent_builddir,
+            parse_network,
+        ) = tokio::join!(
+            get_setting(Setting::VersionCheckInterval, pkgid, db),
+            get_setting(Setting::AutoUpdateInterval, pkgid, db),
+            get_setting(Setting::JobTimeout, pkgid, db),
+            get_setting::<ByteSize>(Setting::MaxArtifactSize, pkgid, db),
+            get_setting(Setting::DateFormat, pkgid, db),
+            get_setting(Setting::BuildOnNewVersion, pkgid, db),
+            get_setting(Setting::PersistentBuilddir, pkgid, db),
+            get_setting(Setting::ParseNetwork, pkgid, db),
+        );
         Ok(Self {
-            version_check_interval: get_setting(Setting::VersionCheckInterval, pkgid, db).await,
-            auto_update_interval: get_setting(Setting::AutoUpdateInterval, pkgid, db).await,
-            job_timeout: get_setting(Setting::JobTimeout, pkgid, db).await,
-            max_artifact_size: {
-                let entry: SettingsEntry<ByteSize> =
-                    get_setting(Setting::MaxArtifactSize, pkgid, db).await;
-                SettingsEntry {
-                    value: entry.value.0,
-                    source: entry.source,
-                }
+            version_check_interval,
+            auto_update_interval,
+            job_timeout,
+            max_artifact_size: SettingsEntry {
+                value: max_artifact_size.value.0,
+                source: max_artifact_size.source,
             },
-            date_format: get_setting(Setting::DateFormat, pkgid, db).await,
-            build_on_new_version: get_setting(Setting::BuildOnNewVersion, pkgid, db).await,
-            persistent_builddir: get_setting(Setting::PersistentBuilddir, pkgid, db).await,
-            parse_network: get_setting(Setting::ParseNetwork, pkgid, db).await,
+            date_format,
+            build_on_new_version,
+            persistent_builddir,
+            parse_network,
         })
     }
 

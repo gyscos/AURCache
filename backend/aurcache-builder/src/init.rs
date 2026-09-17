@@ -19,9 +19,8 @@ use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_W
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
-use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
+    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
@@ -116,9 +115,16 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
     if let Some(pkg) = &pkg
         && pkg.latest_build == Some(build_id)
     {
-        let mut active: aurcache_db::packages::ActiveModel = pkg.clone().into();
-        active.status = Set(BuildStates::FAILED_BUILD);
-        active.update(&txn).await?;
+        // One column, not the whole row (which carries the large
+        // `source_data` JSON).
+        aurcache_db::packages::Entity::update_many()
+            .col_expr(
+                aurcache_db::packages::Column::Status,
+                BuildStates::FAILED_BUILD.into(),
+            )
+            .filter(aurcache_db::packages::Column::Id.eq(pkg.id))
+            .exec(&txn)
+            .await?;
     }
     txn.commit().await?;
 

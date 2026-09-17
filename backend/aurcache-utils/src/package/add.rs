@@ -216,20 +216,22 @@ async fn resolve_srcinfo_to_spec(
         pkgnames: deps.pkgnames,
         provides: deps.provides,
         patch,
-        source_type: match source_data {
-            SourceData::Aur { .. } => SourceType::Aur,
-            SourceData::Git { .. } => SourceType::Git,
-            SourceData::Upload { .. } => SourceType::Upload,
-        },
+        source_type: crate::restore::source_type_of(source_data),
         source_data: source_data.clone(),
     })
 }
 
+/// The pkgbase, plus whether it was already tracked.
+///
+/// Reporting pre-existence from here rather than probing before the call: the
+/// check-then-act is one step inside the finalize, so the reported outcome
+/// always matches the branch taken — a probe up front races a concurrent add
+/// and can report `Added` for a row that already existed (or vice versa).
 async fn finalize_package_add(
     services: &Services,
     context: &AddContext,
     package_spec: PackageInsertSpec,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let Services {
         client,
         store,
@@ -242,7 +244,7 @@ async fn finalize_package_add(
         // It may have been a dependency row that no version check has reached
         // yet, so it can still be missing its metadata.
         refresh_source_metadata(store, db, std::slice::from_ref(&package_spec.pkgbase)).await;
-        return Ok(package_spec.pkgbase);
+        return Ok((package_spec.pkgbase, true));
     }
 
     let mut visited: HashSet<String> = HashSet::from([package_spec.pkgbase.clone()]);
@@ -292,7 +294,7 @@ async fn finalize_package_add(
         .ok_or_else(|| anyhow!("Package add produced no inserted packages"))?;
 
     trigger_initial_builds(db, tx, &context.platforms, &added_order).await?;
-    Ok(pkgbase)
+    Ok((pkgbase, false))
 }
 
 // Each argument is an independent input to the add flow (services, targeting,
@@ -325,7 +327,9 @@ async fn add_package_with_source(
 ) -> anyhow::Result<String> {
     let Services { client, .. } = services;
     let source_data = resolve_source_pkgbase(client, source_data).await?;
-    add_resolved_source(services, context, source_data, patched_files).await
+    add_resolved_source(services, context, source_data, patched_files)
+        .await
+        .map(|(pkgbase, _existed)| pkgbase)
 }
 
 /// Turn a caller's source into one naming a pkgbase.
@@ -352,12 +356,15 @@ pub(crate) async fn resolve_source_pkgbase(
 ///
 /// The half of the add that stays per-package: a checkout, a dependency plan,
 /// and the rows. Only the resolution in front of it batches.
+///
+/// Returns whether the package was already tracked (see
+/// [`finalize_package_add`]).
 pub(crate) async fn add_resolved_source(
     services: &Services,
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let Services {
         client: _, store, ..
     } = services;

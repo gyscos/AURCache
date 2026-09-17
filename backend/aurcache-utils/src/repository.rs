@@ -175,19 +175,31 @@ pub struct Update<'a> {
 }
 
 impl Update<'_> {
-    /// The file `platform` publishes as `filename`, if any.
-    pub async fn published_file<C: ConnectionTrait>(
+    /// Which of `filenames` are already published on `platform`, keyed by
+    /// filename.
+    ///
+    /// One query rather than one per file: a split package publishes several
+    /// outputs, and planning runs under the repository lock, where every
+    /// round trip lengthens the critical section. Stamped with this update
+    /// like the single-file read, so the retire discipline is unchanged.
+    pub async fn published_files<C: ConnectionTrait>(
         &self,
         db: &C,
         platform: Platform,
-        filename: &str,
-    ) -> anyhow::Result<Option<PublishedFile>> {
-        let row = Files::find()
-            .filter(files::Column::Filename.eq(filename))
+        filenames: &[String],
+    ) -> anyhow::Result<HashMap<String, PublishedFile>> {
+        if filenames.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = Files::find()
+            .filter(files::Column::Filename.is_in(filenames.iter().map(String::as_str)))
             .filter(files::Column::Platform.eq(platform))
-            .one(db)
+            .all(db)
             .await?;
-        Ok(row.map(|row| self.published(row)))
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.filename.clone(), self.published(row)))
+            .collect())
     }
 
     /// Every file the packages `pkg_ids` publish, on every platform.

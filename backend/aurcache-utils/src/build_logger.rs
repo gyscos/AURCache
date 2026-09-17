@@ -221,8 +221,27 @@ impl BuildLogger {
                 if task_shared.is_shutdown() {
                     break;
                 }
-                // Debounce, so a burst of appends becomes a single write.
-                tokio::time::sleep(FLUSH_INTERVAL).await;
+                // Debounce, so a burst of appends becomes a single write --
+                // but a shutdown (which notifies the same `wake`) cuts the
+                // sleep short, so dropping the last handle during the window
+                // drains promptly instead of waiting it out. An append also
+                // notifies `wake`, and must not cut it short: it keeps
+                // sleeping, since the flush below covers it anyway.
+                let window = tokio::time::sleep(FLUSH_INTERVAL);
+                tokio::pin!(window);
+                loop {
+                    tokio::select! {
+                        () = &mut window => break,
+                        () = task_shared.wake.notified() => {
+                            if task_shared.is_shutdown() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if task_shared.is_shutdown() {
+                    break;
+                }
                 task_shared.flush_or_log().await;
             }
             // The last handle is gone: drain the remainder and stop.

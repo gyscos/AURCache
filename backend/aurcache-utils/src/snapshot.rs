@@ -319,7 +319,7 @@ impl SnapshotStore {
         patch: Option<&str>,
     ) -> anyhow::Result<crate::package::source_metadata::SourceMetadata> {
         let entry = self.get_or_fetch(source_data, patch).await?;
-        Ok(self.metadata_from_entry(&entry, source_data))
+        Ok(self.metadata_from_entry(&entry, source_data).await)
     }
 
     /// The parsed `.SRCINFO` and the metadata, from a single resolve.
@@ -337,7 +337,7 @@ impl SnapshotStore {
         crate::package::source_metadata::SourceMetadata,
     )> {
         let entry = self.get_or_fetch(source_data, patch).await?;
-        let metadata = self.metadata_from_entry(&entry, source_data);
+        let metadata = self.metadata_from_entry(&entry, source_data).await;
         let sourceinfo = entry
             .active
             .sourceinfo
@@ -346,7 +346,7 @@ impl SnapshotStore {
         Ok((sourceinfo, metadata))
     }
 
-    fn metadata_from_entry(
+    async fn metadata_from_entry(
         &self,
         entry: &CacheEntry,
         source_data: &SourceData,
@@ -370,7 +370,15 @@ impl SnapshotStore {
             metadata.maintainer = maintainer_from_pkgbuild(&pkgbuild);
         }
 
-        let (first, last) = self.packaging_history(source_data);
+        // Off the executor: walking the full git history holds no `.await`.
+        // Best-effort stays best-effort — a panicked walk still yields
+        // `(None, None)`, like an unreadable repository.
+        let history_path = self
+            .checkout_root
+            .join(sanitize_cache_key(&source_data.cache_key()));
+        let (first, last) = tokio::task::spawn_blocking(move || Self::history_at(&history_path))
+            .await
+            .unwrap_or((None, None));
         metadata.first_submitted = first;
         metadata.last_modified = last;
         metadata
@@ -384,12 +392,8 @@ impl SnapshotStore {
     ///
     /// Returns `(None, None)` rather than failing — a shallow or unreadable
     /// repository should cost two display fields, not the whole lookup.
-    fn packaging_history(&self, source_data: &SourceData) -> (Option<i64>, Option<i64>) {
-        let path = self
-            .checkout_root
-            .join(sanitize_cache_key(&source_data.cache_key()));
-
-        let Ok(repo) = git2::Repository::open(&path) else {
+    fn history_at(path: &std::path::Path) -> (Option<i64>, Option<i64>) {
+        let Ok(repo) = git2::Repository::open(path) else {
             return (None, None);
         };
         let Ok(mut walk) = repo.revwalk() else {
@@ -531,15 +535,13 @@ impl SnapshotStore {
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
 
-        let (commit, archive_bytes, pkgbase, sourceinfo) = checkout_and_parse(
-            &repo_url,
-            &git_ref,
-            &subfolder,
-            &path,
-            self.parse_network().await,
-        )
-        .await
-        .map_err(|e| explain_source_failure(source_data, e))?;
+        // Read once (see the fetch path): both consumers below want the same
+        // answer, and each call is a DB round trip.
+        let network = self.parse_network().await;
+        let (commit, archive_bytes, pkgbase, sourceinfo) =
+            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path, network)
+                .await
+                .map_err(|e| explain_source_failure(source_data, e))?;
 
         let changed = previous_commit != Some(commit);
         if changed {
@@ -552,7 +554,11 @@ impl SnapshotStore {
             // Re-apply whichever patch (if any) was previously active for
             // this source, so a `refresh` doesn't silently drop it.
             let existing_patch = previous.and_then(|entry| entry.patch.clone());
-            let entry = build_cache_entry(commit, raw, existing_patch, self.parse_network().await)?;
+            // Off the executor, as above.
+            let entry = tokio::task::spawn_blocking(move || {
+                build_cache_entry(commit, raw, existing_patch, network)
+            })
+            .await??;
             self.cache.lock().await.put(cache_key, entry);
         }
         Ok(changed)
@@ -581,22 +587,24 @@ impl SnapshotStore {
 
         let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
-        let (commit, archive_bytes, pkgbase, sourceinfo) = checkout_and_parse(
-            &repo_url,
-            &git_ref,
-            &subfolder,
-            &path,
-            self.parse_network().await,
-        )
-        .await
-        .map_err(|e| explain_source_failure(source_data, e))?;
+        // Read once: a DB round trip per call, and both consumers below want
+        // the same answer.
+        let network = self.parse_network().await;
+        let (commit, archive_bytes, pkgbase, sourceinfo) =
+            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path, network)
+                .await
+                .map_err(|e| explain_source_failure(source_data, e))?;
         let raw = SourceSnapshot {
             archive_bytes,
             sourceinfo,
             pkgbase,
         };
 
-        let entry = build_cache_entry(commit, raw, patch, self.parse_network().await)?;
+        // Off the executor: patching unpacks, re-tars and re-parses the whole
+        // archive with no `.await` in between.
+        let entry =
+            tokio::task::spawn_blocking(move || build_cache_entry(commit, raw, patch, network))
+                .await??;
 
         self.cache.lock().await.put(cache_key, Arc::clone(&entry));
         Ok(entry)
@@ -788,32 +796,42 @@ async fn checkout_and_parse(
     })
     .await??;
 
-    let srcinfo_path = package_dir.join(".SRCINFO");
-    let pkgbuild_path = package_dir.join("PKGBUILD");
-    let parsed = if srcinfo_path.exists() {
-        std::fs::read_to_string(&srcinfo_path)
-            .map_err(anyhow::Error::from)
-            .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
-            .or_else(|err| {
-                tracing::warn!(
-                    "{} does not parse, parsing the PKGBUILD instead: {err:#}",
-                    srcinfo_path.display()
-                );
+    // Parsing and archiving run in the same blocking closure as the checkout
+    // above: PKGBUILD parsing shells out to a bridge script and archiving
+    // tar+gzs the whole tree, and neither holds an `.await` — running them on
+    // the executor would stall unrelated tasks.
+    let (pkgbase, sourceinfo, tar_gz_bytes) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let srcinfo_path = package_dir.join(".SRCINFO");
+            let pkgbuild_path = package_dir.join("PKGBUILD");
+            let parsed = if srcinfo_path.exists() {
+                std::fs::read_to_string(&srcinfo_path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
+                    .or_else(|err| {
+                        tracing::warn!(
+                            "{} does not parse, parsing the PKGBUILD instead: {err:#}",
+                            srcinfo_path.display()
+                        );
+                        parse_pkgbuild(&pkgbuild_path, network)
+                    })
+            } else {
                 parse_pkgbuild(&pkgbuild_path, network)
-            })
-    } else {
-        parse_pkgbuild(&pkgbuild_path, network)
-    };
+            };
 
-    let (pkgbase, sourceinfo) = match parsed {
-        Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
-        Err(err) => {
-            tracing::warn!("{} could not be parsed: {err:#}", pkgbuild_path.display());
-            (fallback_pkgbase(&package_dir), None)
-        }
-    };
+            let (pkgbase, sourceinfo) = match parsed {
+                Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
+                Err(err) => {
+                    tracing::warn!("{} could not be parsed: {err:#}", pkgbuild_path.display());
+                    (fallback_pkgbase(&package_dir), None)
+                }
+            };
 
-    let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
+            let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
+
+            Ok((pkgbase, sourceinfo, tar_gz_bytes))
+        })
+        .await??;
 
     Ok((commit, tar_gz_bytes, pkgbase, sourceinfo))
 }

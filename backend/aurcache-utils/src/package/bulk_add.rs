@@ -131,19 +131,15 @@ async fn add_one(
     context: &AddContext,
     source: SourceData,
 ) -> (BulkAddOutcome, Option<String>) {
-    let existed = match &source {
-        SourceData::Aur { name } => crate::package::add::package_exists(&services.db, name)
-            .await
-            .unwrap_or(false),
-        _ => false,
-    };
-
+    // No probe up front: `add_resolved_source` reports whether the package
+    // was already tracked, from the check inside its own finalize — one query
+    // for one fact, and no race with a concurrent add in between.
     match add_resolved_source(services, context, source, None).await {
-        Ok(pkgbase) if existed => (BulkAddOutcome::Existed, Some(pkgbase)),
-        Ok(pkgbase) => (BulkAddOutcome::Added, Some(pkgbase)),
+        Ok((pkgbase, true)) => (BulkAddOutcome::Existed, Some(pkgbase)),
+        Ok((pkgbase, false)) => (BulkAddOutcome::Added, Some(pkgbase)),
         Err(e) => (
             BulkAddOutcome::Failed {
-                error: e.to_string(),
+                error: format!("{e:#}"),
             },
             None,
         ),

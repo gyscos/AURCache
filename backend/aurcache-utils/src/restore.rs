@@ -22,7 +22,7 @@
 //! either -- an imported graph could disagree with today's AUR -- so the depends
 //! lists have to be rediscovered from the sources regardless.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
 use aurcache_common::api::dump::{
@@ -341,7 +341,7 @@ pub async fn apply(
             let _ = progress.send(RestoreEntry {
                 pkgbase: String::new(),
                 outcome: RestoreOutcome::Failed {
-                    error: format!("nothing was imported: {e}"),
+                    error: format!("nothing was imported: {e:#}"),
                 },
             });
             return;
@@ -359,7 +359,7 @@ pub async fn apply(
         let _ = progress.send(RestoreEntry {
             pkgbase: String::new(),
             outcome: RestoreOutcome::Failed {
-                error: format!("the packages were imported, but the secrets were not: {e}"),
+                error: format!("the packages were imported, but the secrets were not: {e:#}"),
             },
         });
     }
@@ -368,21 +368,23 @@ pub async fn apply(
     // names, so that pass 3 can recognise them. Until this is done for *all* of
     // them, resolving any one would fall through to the AUR and adopt a package
     // in place of one the dump carried.
-    let mut unresolved = Vec::new();
+    // A set: pass 3 tests every touched package against it, which is quadratic
+    // over a `Vec`.
+    let mut unresolved = HashSet::new();
     for pkgbase in &applied.touched {
         if let Err(e) = fill_source_facts(db, store, pkgbase).await {
-            warn!("restore: could not read the source of {pkgbase}: {e}");
+            warn!("restore: could not read the source of {pkgbase}: {e:#}");
             let _ = progress.send(RestoreEntry {
                 pkgbase: pkgbase.clone(),
                 outcome: RestoreOutcome::Failed {
                     error: format!(
                         "imported, but its source could not be read, so other packages \
-                         will not find it by its split package names or what it provides: {e}. \
+                         will not find it by its split package names or what it provides: {e:#}. \
                          Fix the source and restore again with --on-existing overwrite."
                     ),
                 },
             });
-            unresolved.push(pkgbase.clone());
+            unresolved.insert(pkgbase.clone());
         }
     }
 
@@ -397,13 +399,13 @@ pub async fn apply(
             continue;
         };
         if let Err(e) = crate::package::update::package_resync_dependencies(services, &row).await {
-            warn!("restore: could not resolve dependencies for {pkgbase}: {e}");
+            warn!("restore: could not resolve dependencies for {pkgbase}: {e:#}");
             let _ = progress.send(RestoreEntry {
                 pkgbase: pkgbase.clone(),
                 outcome: RestoreOutcome::Failed {
                     error: format!(
                         "imported, but its dependencies could not be resolved, so it will not \
-                         build until they are: {e}"
+                         build until they are: {e:#}"
                     ),
                 },
             });
@@ -728,7 +730,11 @@ fn apply_config(active: &mut packages::ActiveModel, package: &DumpPackage, patch
     active.patch = Set(patch);
 }
 
-const fn source_type_of(source_data: &SourceData) -> SourceType {
+/// The [`SourceType`] a [`SourceData`] carries.
+///
+/// One spelling shared by restore and the add path, so a new source variant
+/// cannot update one and miss the other.
+pub(crate) const fn source_type_of(source_data: &SourceData) -> SourceType {
     match source_data {
         SourceData::Aur { .. } => SourceType::Aur,
         SourceData::Git { .. } => SourceType::Git,

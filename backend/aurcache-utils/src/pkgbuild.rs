@@ -201,15 +201,17 @@ fn explain_network_need(error: anyhow::Error, content: &str, network: bool) -> a
     if network {
         return error;
     }
-    let top_level: String = content
+    // Borrowed lines, not a joined `String` copy: the question is which
+    // network command the top-level lines name, and the order asked is
+    // commands-first (the first listed command found anywhere wins).
+    let top_level: Vec<&str> = content
         .lines()
         .take_while(|line| !line.contains("() {") && !line.trim_end().ends_with("()"))
         .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
     let Some(command) = NETWORK_COMMANDS
         .into_iter()
-        .find(|command| top_level.contains(command))
+        .find(|command| top_level.iter().any(|line| line.contains(command)))
     else {
         return error;
     };
