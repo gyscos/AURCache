@@ -15,27 +15,32 @@ use std::path::{Path, PathBuf};
 ///
 /// Directory symlinks are *not* traversed: the `is_dir` decision uses
 /// [`fs::DirEntry::metadata`], which does not follow symlinks, so a symlink to
-/// a directory counts as the single symlink entry instead of being recursed
-/// into. That keeps a symlink loop from recursing forever and stops an external
+/// a directory counts as the single symlink entry instead of being descended
+/// into. That keeps a symlink loop from descending forever and stops an external
 /// symlink target from leaking its contents into an entry's size.
+///
+/// The walk is iterative over an explicit stack: recursion depth would follow
+/// directory depth, and these roots include extracted archives whose nesting
+/// nobody controls.
 #[must_use]
 pub fn dir_size(path: impl AsRef<Path>) -> u64 {
-    fn walk(path: &Path) -> u64 {
-        let Ok(dir) = fs::read_dir(path) else {
-            return 0;
+    let mut total = 0;
+    let mut stack = vec![path.as_ref().to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(dir) = fs::read_dir(&path) else {
+            continue;
         };
-        dir.flatten()
-            .map(|entry| match entry.metadata() {
+        for entry in dir.flatten() {
+            match entry.metadata() {
                 // `DirEntry::metadata` does not follow symlinks; `fs::metadata`
-                // here would recurse into symlinked directories.
-                Ok(data) if data.is_dir() => walk(&entry.path()),
-                Ok(data) => data.len(),
-                Err(_) => 0,
-            })
-            .sum()
+                // here would descend into symlinked directories.
+                Ok(data) if data.is_dir() => stack.push(entry.path()),
+                Ok(data) => total += data.len(),
+                Err(_) => {}
+            }
+        }
     }
-
-    walk(path.as_ref())
+    total
 }
 
 /// Directory holding one log file per build.
@@ -130,6 +135,29 @@ mod tests {
             total < 1_000_000 + 2_000,
             "symlinked directory contents leaked into total: {total}"
         );
+    }
+
+    /// Depth nobody controls must not become stack depth. Paths cap nesting
+    /// around 1500 levels (`PATH_MAX`), which a recursive walk survives on a
+    /// normal stack — so this runs the walk on a 64 KiB thread stack, where
+    /// recursion per level overflows and the explicit stack does not.
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut dir = tmp.path().to_path_buf();
+        for _ in 0..1500 {
+            dir.push("d");
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("deep"), [b'x'; 7]).unwrap();
+        let root = tmp.path().to_path_buf();
+        let total = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || dir_size(&root))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(total, 7);
     }
 
     /// A symlink loop terminates: each symlink is one entry, counted once and

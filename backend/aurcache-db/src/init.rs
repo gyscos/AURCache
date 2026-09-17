@@ -13,6 +13,26 @@ fn required_env(name: &str) -> anyhow::Result<String> {
     env::var(name).map_err(|_| anyhow!("No {name} envvar specified"))
 }
 
+/// Percent-encode a URL userinfo component (username or password).
+///
+/// Only unreserved characters pass through: everything else — `@` and `:`
+/// which structure the URL, `%` which starts an escape, `/`, `?`, `#`, and
+/// any non-ASCII byte — becomes `%XX`. Over-encoding the sub-delims is
+/// harmless in userinfo and keeps the allowlist to what cannot break.
+fn encode_userinfo(s: &str) -> String {
+    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if UNRESERVED.contains(&byte) {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(out, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    out
+}
+
 pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
     let db: DatabaseConnection = match database_type() {
         DbBackend::Sqlite => {
@@ -43,7 +63,15 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
             let db_host = required_env("DB_HOST")?;
             let db_name = env::var("DB_NAME").unwrap_or_else(|_| "postgres".to_string());
 
-            let conn_str = format!("postgres://{db_user}:{db_pwd}@{db_host}/{db_name}");
+            // Encoded, never raw: a password containing `@`, `:` or `%`
+            // would corrupt a formatted URL or fail to parse. Local helper
+            // rather than a crate: it is fifteen lines with a test, and the
+            // only alternative here is a new dependency for one call.
+            let conn_str = format!(
+                "postgres://{}:{}@{db_host}/{db_name}",
+                encode_userinfo(&db_user),
+                encode_userinfo(&db_pwd)
+            );
             let mut conn_opts = ConnectOptions::new(conn_str);
             conn_opts.sqlx_logging_level(LevelFilter::Trace);
             let db = Database::connect(conn_opts).await?;
@@ -55,4 +83,18 @@ pub async fn init_db() -> anyhow::Result<DatabaseConnection> {
 
     Migrator::up(&db, None).await?;
     Ok(db)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_userinfo;
+
+    /// The characters that structure a URL must not survive into userinfo:
+    /// `@` would start a host, `:` a port, `%` an escape.
+    #[test]
+    fn userinfo_encoding_escapes_url_structure() {
+        assert_eq!(encode_userinfo("user"), "user");
+        assert_eq!(encode_userinfo("p@ss:w%rd"), "p%40ss%3Aw%25rd");
+        assert_eq!(encode_userinfo("a/b?c#d"), "a%2Fb%3Fc%23d");
+    }
 }

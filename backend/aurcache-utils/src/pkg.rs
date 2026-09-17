@@ -35,44 +35,194 @@ pub fn vercmp(a: &str, b: &str) -> Option<Ordering> {
     }
 }
 
-/// Insert a dependency constraint into a map. For constraints in the same
-/// direction (both lower or both upper bounds) the stricter one is kept.
-/// When directions differ (which would require a Range), the existing entry wins.
+/// Insert a dependency bound into the conjunction for `name`.
+///
+/// Same-direction bounds tighten: only the strictest lower and the strictest
+/// upper bound survive (a strict operator wins a version tie, so `>1.0`
+/// replaces `>=1.0` rather than the other way round). Bounds in opposite
+/// directions accumulate — one package declaring `foo>=1.0` and `foo<2.0` is
+/// a range, and rejecting it rejects a valid package. A conjunction that is
+/// statically empty (`>=2.0` with `<1.0`) still fails loudly: nothing could
+/// ever satisfy it, so building anyway would only waste a build.
 pub fn merge_constraint_into(
-    constraints: &mut HashMap<String, Option<Constraint>>,
+    constraints: &mut HashMap<String, Vec<Constraint>>,
     name: &str,
     constraint: Option<Constraint>,
 ) -> anyhow::Result<()> {
-    use alpm_types::VersionComparison::{Greater, GreaterOrEqual, Less, LessOrEqual};
-    let merged = match (constraints.remove(name).flatten(), constraint) {
-        (None, new) => new,
-        (existing, None) => existing,
-        (Some(lhs), Some(rhs)) => {
-            let l = &lhs.0;
-            let r = &rhs.0;
-            Some(match (l.comparison, r.comparison) {
-                (GreaterOrEqual | Greater, GreaterOrEqual | Greater) => {
-                    if r.version > l.version {
-                        rhs
-                    } else {
-                        lhs
-                    }
-                }
-                (LessOrEqual | Less, LessOrEqual | Less) => {
-                    if r.version < l.version {
-                        rhs
-                    } else {
-                        lhs
-                    }
-                }
-                _ => anyhow::bail!(
-                    "conflicting constraints for '{name}': '{lhs}' and '{rhs}' bound in opposite directions"
-                ),
-            })
-        }
+    use alpm_types::VersionComparison::Equal;
+    let Some(bound) = constraint else {
+        constraints.entry(name.to_string()).or_default();
+        return Ok(());
     };
-    constraints.insert(name.to_string(), merged);
+    let conjunction = constraints.entry(name.to_string()).or_default();
+
+    // An exact pin subsumes every bound it is consistent with, and contradicts
+    // the rest — decide it against the conjunction as a whole.
+    if bound.0.comparison == Equal {
+        for existing in conjunction.iter() {
+            if !bound_admits_version(existing, &bound.0.version) {
+                anyhow::bail!(
+                    "conflicting constraints for '{name}': '{existing}' excludes '= {}'",
+                    bound.0.version
+                );
+            }
+        }
+        conjunction.clear();
+        conjunction.push(bound);
+        return Ok(());
+    }
+    if let Some(pin) = conjunction.iter().find(|b| b.0.comparison == Equal) {
+        if !bound_admits_version(&bound, &pin.0.version) {
+            anyhow::bail!("conflicting constraints for '{name}': '{bound}' excludes '{pin}'");
+        }
+        // The pin stands; the new bound adds nothing.
+        return Ok(());
+    }
+
+    let lower = is_lower(&bound.0);
+    if conjunction
+        .iter()
+        .filter(|b| is_lower(&b.0) == lower)
+        .any(|b| at_least_as_strict(&b.0, &bound.0))
+    {
+        // Something already here admits no more than the new bound does.
+        return Ok(());
+    }
+    conjunction.retain(|b| is_lower(&b.0) != lower);
+    conjunction.push(bound);
+    if let Some(conflict) = empty_conjunction(name, conjunction) {
+        return Err(conflict);
+    }
     Ok(())
+}
+
+/// Merge every bound one dependency name declares onto `pkgbase`'s entry.
+///
+/// One name can carry a whole range, so each bound merges in turn. An
+/// unversioned name has no bounds at all, and still records `pkgbase`: the
+/// entry is the edge, and a loop over the bounds alone would drop it.
+pub fn merge_bounds_into(
+    constraints: &mut HashMap<String, Vec<Constraint>>,
+    pkgbase: &str,
+    bounds: Option<&Vec<Constraint>>,
+) -> anyhow::Result<()> {
+    constraints.entry(pkgbase.to_string()).or_default();
+    for bound in bounds.into_iter().flatten() {
+        merge_constraint_into(constraints, pkgbase, Some(bound.clone()))?;
+    }
+    Ok(())
+}
+
+/// Whether `bound` is a lower (`>`/`>=`) rather than an upper (`<`/`<=`)
+/// bound. Exact pins never reach here; see [`merge_constraint_into`].
+fn is_lower(bound: &alpm_types::VersionRequirement) -> bool {
+    use alpm_types::VersionComparison::{Greater, GreaterOrEqual};
+    matches!(bound.comparison, Greater | GreaterOrEqual)
+}
+
+/// Whether `keeper` admits no version `candidate` does not, for two bounds
+/// in the same direction: a higher lower bound (a lower upper bound) wins,
+/// and a strict operator wins a version tie.
+fn at_least_as_strict(
+    keeper: &alpm_types::VersionRequirement,
+    candidate: &alpm_types::VersionRequirement,
+) -> bool {
+    use alpm_types::VersionComparison::{Greater, GreaterOrEqual, Less, LessOrEqual};
+    let ordering = keeper.version.partial_cmp(&candidate.version);
+    if is_lower(keeper) {
+        match ordering {
+            Some(std::cmp::Ordering::Greater) => true,
+            Some(std::cmp::Ordering::Equal) => {
+                matches!(keeper.comparison, Greater)
+                    || matches!(candidate.comparison, GreaterOrEqual)
+            }
+            _ => false,
+        }
+    } else {
+        match ordering {
+            Some(std::cmp::Ordering::Less) => true,
+            Some(std::cmp::Ordering::Equal) => {
+                matches!(keeper.comparison, Less) || matches!(candidate.comparison, LessOrEqual)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether the single bound `bound` admits `version` — the static half of a
+/// pin-consistency check. An uncomparable pair admits: the runtime check
+/// decides those, and merge must not fail a package over versions it cannot
+/// even order.
+fn bound_admits_version(bound: &Constraint, version: &alpm_types::Version) -> bool {
+    use alpm_types::VersionComparison::{Equal, Greater, GreaterOrEqual, Less, LessOrEqual};
+    // Ordered as bound-version against the candidate: `>=1.0` admits 1.5
+    // because 1.0 orders below it.
+    let ordering = bound.0.version.partial_cmp(version);
+    match bound.0.comparison {
+        Greater => !matches!(
+            ordering,
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+        ),
+        GreaterOrEqual => !matches!(ordering, Some(std::cmp::Ordering::Greater)),
+        Less => !matches!(
+            ordering,
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Less)
+        ),
+        LessOrEqual => !matches!(ordering, Some(std::cmp::Ordering::Less)),
+        Equal => matches!(ordering, Some(std::cmp::Ordering::Equal) | None),
+    }
+}
+
+/// The tightest lower and upper bounds, when the conjunction provably admits
+/// nothing: a lower bound above the upper one, or equal bounds that exclude
+/// the shared version between them (`>1.0` with `<=1.0`). `None` when
+/// versions cannot be ordered or the range is non-empty. Exact pins never
+/// reach here; merge decides those directly.
+fn empty_conjunction(name: &str, conjunction: &[Constraint]) -> Option<anyhow::Error> {
+    use std::cmp::Ordering;
+    let mut lower: Option<&alpm_types::VersionRequirement> = None;
+    let mut upper: Option<&alpm_types::VersionRequirement> = None;
+    for bound in conjunction {
+        let slot = if is_lower(&bound.0) {
+            &mut lower
+        } else {
+            &mut upper
+        };
+        let replace = match slot {
+            None => true,
+            Some(current) => !at_least_as_strict(current, &bound.0),
+        };
+        if replace {
+            *slot = Some(&bound.0);
+        }
+    }
+    let (lower, upper) = (lower?, upper?);
+    match lower.version.partial_cmp(&upper.version) {
+        Some(Ordering::Greater) => Some(anyhow::anyhow!(
+            "conflicting constraints for '{name}': '{lower}' excludes '{upper}'"
+        )),
+        Some(Ordering::Equal)
+            if lower.comparison != alpm_types::VersionComparison::GreaterOrEqual
+                || upper.comparison != alpm_types::VersionComparison::LessOrEqual =>
+        {
+            Some(anyhow::anyhow!(
+                "conflicting constraints for '{name}': '{lower}' excludes '{upper}'"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The stored form of merged bounds: comma-joined single requirements, which
+/// [`aurcache_deps::satisfies_constraint`] checks one by one. Empty (an
+/// unversioned dependency) stores as the empty string, as before.
+#[must_use]
+pub fn join_constraints(bounds: &[Constraint]) -> String {
+    bounds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The dependencies a package declares.
@@ -88,9 +238,13 @@ pub struct DependencySet {
     /// planned and therefore the order their builds are enqueued. Iterating
     /// `constraints` instead would vary between processes and make identical
     /// input produce different build orders.
+    ///
+    /// One name can carry several bounds (a range declared as two entries);
+    /// see [`merge_constraint_into`].
     pub names: Vec<String>,
-    /// The merged constraint for each name.
-    pub constraints: HashMap<String, Option<Constraint>>,
+    /// The merged bounds for each name: several when a range was declared,
+    /// empty for an unversioned dependency.
+    pub constraints: HashMap<String, Vec<Constraint>>,
 }
 
 impl DependencySet {
@@ -119,14 +273,13 @@ impl DependencySet {
     }
 
     /// The constraint recorded for `name`, in the plain string form that both
-    /// resolution and the `dependencies` rows use. Empty means unversioned.
+    /// resolution and the `dependencies` rows use: comma-joined when a range
+    /// was declared. Empty means unversioned.
     #[must_use]
     pub fn constraint_of(&self, name: &str) -> String {
         self.constraints
             .get(name)
-            .cloned()
-            .flatten()
-            .map(|constraint| constraint.to_string())
+            .map(|bounds| join_constraints(bounds))
             .unwrap_or_default()
     }
 
@@ -209,21 +362,89 @@ mod tests {
         assert_eq!(vercmp("1.0", "not a version!"), None);
     }
 
+    fn merged_string(constraints: &HashMap<String, Vec<Constraint>>, name: &str) -> String {
+        constraints
+            .get(name)
+            .map(|bounds| join_constraints(bounds))
+            .unwrap_or_default()
+    }
+
     #[test]
     fn test_merge_constraint_into_last_wins() {
         let mut constraints = HashMap::new();
         merge_constraint_into(&mut constraints, "glibc", parse_dep_constraint(">=2.0")).unwrap();
         merge_constraint_into(&mut constraints, "glibc", parse_dep_constraint(">=3.0")).unwrap();
 
-        assert_eq!(
-            constraints
-                .get("glibc")
-                .cloned()
-                .flatten()
-                .map(|c| c.to_string())
-                .unwrap_or_default(),
-            ">=3.0"
+        assert_eq!(merged_string(&constraints, "glibc"), ">=3.0");
+    }
+
+    /// An unversioned dependency is still a dependency: no bounds must not
+    /// mean no entry, or the edge it stands for is never written.
+    #[test]
+    fn merging_no_bounds_still_records_the_dependency() {
+        let mut constraints = HashMap::new();
+        merge_bounds_into(&mut constraints, "mydep", None).unwrap();
+        merge_bounds_into(&mut constraints, "other", Some(&Vec::new())).unwrap();
+        assert_eq!(merged_string(&constraints, "mydep"), "");
+        assert!(constraints.contains_key("mydep"));
+        assert!(constraints.contains_key("other"));
+    }
+
+    /// Bounds in opposite directions are a range, not a conflict: one
+    /// package declaring both must stay addable.
+    #[test]
+    fn test_merge_constraint_into_accumulates_a_range() {
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "python", parse_dep_constraint(">=3.11")).unwrap();
+        merge_constraint_into(&mut constraints, "python", parse_dep_constraint("<3.13")).unwrap();
+
+        assert_eq!(merged_string(&constraints, "python"), ">=3.11,<3.13");
+    }
+
+    /// A strict operator wins a version tie: `>1.0` after `>=1.0` tightens,
+    /// and `>=1.0` after `>1.0` adds nothing.
+    #[test]
+    fn test_merge_constraint_into_strict_wins_ties() {
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">=1.0")).unwrap();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">1.0")).unwrap();
+        assert_eq!(merged_string(&constraints, "foo"), ">1.0");
+
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">1.0")).unwrap();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">=1.0")).unwrap();
+        assert_eq!(merged_string(&constraints, "foo"), ">1.0");
+    }
+
+    /// A range nothing can satisfy fails at merge time, not three builds
+    /// later when no version ever matches.
+    #[test]
+    fn test_merge_constraint_into_rejects_empty_ranges() {
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">=2.0")).unwrap();
+        assert!(
+            merge_constraint_into(&mut constraints, "foo", parse_dep_constraint("<1.0")).is_err()
         );
+
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">1.0")).unwrap();
+        assert!(
+            merge_constraint_into(&mut constraints, "foo", parse_dep_constraint("<=1.0")).is_err()
+        );
+    }
+
+    /// An exact pin absorbs the bounds it is consistent with and refuses the
+    /// ones it is not.
+    #[test]
+    fn test_merge_constraint_into_pin() {
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint(">=1.0")).unwrap();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint("=1.5")).unwrap();
+        assert_eq!(merged_string(&constraints, "foo"), "=1.5");
+
+        let mut constraints = HashMap::new();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint("=1.5")).unwrap();
+        merge_constraint_into(&mut constraints, "foo", parse_dep_constraint("<1.0")).unwrap_err();
     }
 }
 

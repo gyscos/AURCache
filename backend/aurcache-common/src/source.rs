@@ -110,12 +110,26 @@ impl FromStr for SourceData {
 
 impl SourceData {
     /// Unique cache key for this source.
+    ///
+    /// The git fields are length-prefixed, not plain-joined: they are URLs
+    /// and refs, which contain `:`, so `url="a:b", ref="c"` and `url="a",
+    /// ref="b:c"` would otherwise share a key — and check out over each
+    /// other in the snapshot cache. Digits survive `sanitize_cache_key`,
+    /// keeping the on-disk name unambiguous too.
     #[must_use]
     pub fn cache_key(&self) -> String {
         match self {
             Self::Aur { name } => format!("aur:{name}"),
             Self::Git { spec } => {
-                format!("git:{}:{}:{}", spec.url, spec.r#ref, spec.subfolder)
+                format!(
+                    "git:{}:{}:{}:{}:{}:{}",
+                    spec.url.len(),
+                    spec.url,
+                    spec.r#ref.len(),
+                    spec.r#ref,
+                    spec.subfolder.len(),
+                    spec.subfolder
+                )
             }
             Self::Upload { .. } => String::from("upload"),
         }
@@ -130,7 +144,7 @@ impl Display for SourceData {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_git_url;
+    use super::{SourceData, looks_like_git_url};
 
     #[test]
     fn detects_scp_like_git_urls() {
@@ -152,5 +166,27 @@ mod tests {
         assert!(!looks_like_git_url("paru-git"));
         assert!(!looks_like_git_url("lab.git"));
         assert!(!looks_like_git_url("hello"));
+    }
+
+    /// Colons move across field boundaries: `url="a:b", ref="c"` and
+    /// `url="a", ref="b:c"` must not share a snapshot cache directory.
+    #[test]
+    fn git_cache_keys_survive_colons_in_every_field() {
+        use crate::source::GitSourceSpec;
+        let left = SourceData::Git {
+            spec: GitSourceSpec {
+                url: "a:b".to_string(),
+                r#ref: "c".to_string(),
+                subfolder: String::new(),
+            },
+        };
+        let right = SourceData::Git {
+            spec: GitSourceSpec {
+                url: "a".to_string(),
+                r#ref: "b:c".to_string(),
+                subfolder: String::new(),
+            },
+        };
+        assert_ne!(left.cache_key(), right.cache_key());
     }
 }

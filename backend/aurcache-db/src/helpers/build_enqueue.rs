@@ -64,10 +64,13 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     initial_status: i32,
     trigger: i32,
 ) -> Result<EnqueueBuildResult, DbErr> {
-    assert!(
-        valid_trigger(trigger),
-        "enqueue with unknown trigger {trigger}: a row whose purpose the budget walk cannot read"
-    );
+    // An error, not an assert: this runs in the server on caller-supplied
+    // values, and a panic would take the process down for a bad row.
+    if !valid_trigger(trigger) {
+        return Err(DbErr::Custom(format!(
+            "enqueue with unknown trigger {trigger}: a row whose purpose the budget walk cannot read"
+        )));
+    }
     let platform_str = platform.as_str();
 
     // Two conflicts can stop this insert, and they mean opposite things.

@@ -533,7 +533,7 @@ async fn plan_package_with_deps(
     // a HashMap's order varies per process, which would make the plan order —
     // and therefore the order builds are enqueued in — differ between runs for
     // identical input.
-    let mut dep_constraints_by_pkgbase: HashMap<String, Option<crate::pkg::Constraint>> =
+    let mut dep_constraints_by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> =
         HashMap::new();
     let mut planned_pkgbases: HashSet<String> = HashSet::new();
     for (dep_name, _) in &pairs {
@@ -557,15 +557,10 @@ async fn plan_package_with_deps(
         if planned_pkgbases.insert(dep_pkgbase.clone()) && needs_building {
             plan_dependency_recursive(plan_context, dep_pkgbase, visited, plan).await?;
         }
-        crate::pkg::merge_constraint_into(
+        crate::pkg::merge_bounds_into(
             &mut dep_constraints_by_pkgbase,
             dep_pkgbase,
-            package_spec
-                .deps
-                .constraints
-                .get(dep_name)
-                .cloned()
-                .flatten(),
+            package_spec.deps.constraints.get(dep_name),
         )?;
     }
 
@@ -573,7 +568,7 @@ async fn plan_package_with_deps(
         plan.edges.push(PlannedEdge {
             dependent: package_spec.pkgbase.clone(),
             dependee: dep_pkgbase,
-            version_constraint: constraint.map(|c| c.to_string()).unwrap_or_default(),
+            version_constraint: crate::pkg::join_constraints(&constraint),
         });
     }
 

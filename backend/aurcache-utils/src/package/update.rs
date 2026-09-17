@@ -341,9 +341,10 @@ async fn package_update_inner(
     Ok(platform_results)
 }
 
-/// A single dependency of the package being updated, with its constraint.
+/// A single dependency of the package being updated, with its merged bounds
+/// (several when a range was declared).
 struct DepInfo {
-    constraint: Option<crate::pkg::Constraint>,
+    constraint: Vec<crate::pkg::Constraint>,
     package: packages::Model,
 }
 
@@ -419,7 +420,7 @@ async fn resolve_dependency_edges(
     services: &Services,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
-) -> anyhow::Result<HashMap<String, Option<crate::pkg::Constraint>>> {
+) -> anyhow::Result<HashMap<String, Vec<crate::pkg::Constraint>>> {
     let declared = crate::pkg::DependencySet::of(deps)?;
     if declared.names.is_empty() {
         return Ok(HashMap::new());
@@ -447,7 +448,7 @@ async fn resolve_dependency_edges(
         );
     }
 
-    let mut by_pkgbase: HashMap<String, Option<crate::pkg::Constraint>> = HashMap::new();
+    let mut by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> = HashMap::new();
     for (dep_name, _) in &pairs {
         let Some(resolution) = resolved_deps.get(dep_name) else {
             continue;
@@ -461,10 +462,10 @@ async fn resolve_dependency_edges(
         if dep_pkgbase == &pkg_model.name {
             continue;
         }
-        crate::pkg::merge_constraint_into(
+        crate::pkg::merge_bounds_into(
             &mut by_pkgbase,
             dep_pkgbase,
-            declared.constraints.get(dep_name).cloned().flatten(),
+            declared.constraints.get(dep_name),
         )?;
     }
 
@@ -511,7 +512,7 @@ async fn current_dependee_names(
 async fn ensure_missing_dependency_packages(
     services: &Services,
     pkg_model: &packages::Model,
-    dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
+    dep_constraints_by_pkgbase: &HashMap<String, Vec<crate::pkg::Constraint>>,
 ) -> anyhow::Result<()> {
     // The packages already tracked, in one query — not one probe per
     // declared dependency. Nothing declared means nothing to look up (`IN ()`
@@ -547,7 +548,7 @@ async fn ensure_missing_dependency_packages(
 /// Fetch a name→model map of all dependency packages from the database.
 async fn fetch_dep_packages_map(
     db: &DatabaseConnection,
-    dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
+    dep_constraints_by_pkgbase: &HashMap<String, Vec<crate::pkg::Constraint>>,
 ) -> anyhow::Result<HashMap<String, packages::Model>> {
     Ok(Packages::find()
         .filter(packages::Column::Name.is_in(dep_constraints_by_pkgbase.keys().cloned()))
@@ -562,7 +563,7 @@ async fn fetch_dep_packages_map(
 async fn sync_dependency_rows(
     db: &DatabaseConnection,
     dependent_id: i32,
-    dep_constraints_by_pkgbase: &HashMap<String, Option<crate::pkg::Constraint>>,
+    dep_constraints_by_pkgbase: &HashMap<String, Vec<crate::pkg::Constraint>>,
     dep_packages: &HashMap<String, packages::Model>,
 ) -> anyhow::Result<()> {
     let txn = db.begin().await?;
@@ -595,10 +596,7 @@ async fn sync_dependency_rows(
         let Some(dep_pkg) = dep_packages.get(dep_pkgbase) else {
             continue;
         };
-        let serialized = constraint
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let serialized = crate::pkg::join_constraints(constraint);
 
         if let Some(edge) = existing.get(&dep_pkg.id) {
             let mut active: dependencies::ActiveModel = edge.clone().into();
@@ -620,12 +618,13 @@ async fn sync_dependency_rows(
     Ok(())
 }
 
-/// Check whether a successful build of `dependee` satisfies the given version constraint.
+/// Check whether a successful build of `dependee` satisfies the given version
+/// bounds: every one of them must hold.
 async fn dependency_satisfies_constraint(
     db: &DatabaseConnection,
     dependee_id: i32,
     platform: &Platform,
-    constraint: Option<&crate::pkg::Constraint>,
+    constraint: &[crate::pkg::Constraint],
 ) -> anyhow::Result<bool> {
     let Some(version) =
         aurcache_db::helpers::builds::latest_successful_version(db, dependee_id, platform.as_str())
@@ -634,13 +633,13 @@ async fn dependency_satisfies_constraint(
         return Ok(false);
     };
 
-    let Some(constraint) = constraint else {
+    if constraint.is_empty() {
         return Ok(true);
     };
     let Ok(version) = Version::from_str(&version) else {
         return Ok(false);
     };
-    Ok(constraint.is_satisfied(&version))
+    Ok(constraint.iter().all(|bound| bound.is_satisfied(&version)))
 }
 
 /// Check whether every dependency in the graph is satisfied, or already has a
@@ -662,7 +661,7 @@ async fn dependencies_ready_for_platform(
             &services.db,
             dep_info.package.id,
             platform,
-            dep_info.constraint.as_ref(),
+            &dep_info.constraint,
         )
         .await?
         {

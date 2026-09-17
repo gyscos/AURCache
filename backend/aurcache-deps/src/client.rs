@@ -148,7 +148,17 @@ impl AurClient {
         // One `reqwest::Client` for the AUR and the mirrors alike: it is a
         // handle to a connection pool, so cloning shares the pool rather than
         // opening a second one.
-        let http = Client::new();
+        //
+        // Bounded, or a blackholed network hangs every caller forever — most
+        // sharply the dependency backfill migration, which runs at startup
+        // before anything else can time it out. These are metadata RPCs and
+        // mirrorlist reads, never bulk transfers, so a minute total is a
+        // hung socket, not a slow server.
+        let http = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             official: OfficialRepos::new(
                 http.clone(),

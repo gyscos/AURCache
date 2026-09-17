@@ -27,11 +27,28 @@ pub fn server_url_for_host(public_url: &str, host: &str) -> String {
         .map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
 
     // A URL without an explicit port still needs one, or the result points at
-    // the web UI instead of the repository.
-    let port = authority.rsplit_once(':').map_or_else(
-        || format!(":{AURCACHE_MIRROR_PORT}"),
-        |(_, p)| format!(":{p}"),
-    );
+    // the web UI instead of the repository. A bracketed `[v6]` authority has
+    // colons of its own, so the port is read past the `]`, not after the
+    // last `:` (which would read `:1]` out of `[::1]` as a port).
+    let port = if let Some(inside) = authority.strip_prefix('[') {
+        inside.split_once("]:").map_or_else(
+            || format!(":{AURCACHE_MIRROR_PORT}"),
+            |(_, p)| format!(":{p}"),
+        )
+    } else {
+        authority.rsplit_once(':').map_or_else(
+            || format!(":{AURCACHE_MIRROR_PORT}"),
+            |(_, p)| format!(":{p}"),
+        )
+    };
+
+    // Brackets for a bare IPv6 literal: without them the port merges into
+    // the address and pacman reads garbage.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
 
     format!("{scheme}://{host}{port}{path}/$arch")
 }
@@ -89,6 +106,30 @@ mod tests {
         assert_eq!(
             server_url_for_host("https://aurcache.example.com/arch", "HOST"),
             format!("https://HOST:{AURCACHE_MIRROR_PORT}/arch/$arch")
+        );
+    }
+
+    /// An IPv6 host needs brackets, or the port merges into the address and
+    /// pacman reads garbage.
+    #[test]
+    fn an_ipv6_host_is_bracketed() {
+        assert_eq!(
+            server_url_for_host("http://aurcache.example.com:9000/repo", "::1"),
+            "http://[::1]:9000/repo/$arch"
+        );
+    }
+
+    /// ...and an IPv6 public URL keeps its own port rather than reading
+    /// `:1]` out of `[::1]` as one.
+    #[test]
+    fn an_ipv6_public_url_keeps_its_port() {
+        assert_eq!(
+            server_url_for_host("http://[fd00::1]:9000/repo", "worker"),
+            "http://worker:9000/repo/$arch"
+        );
+        assert_eq!(
+            server_url_for_host("http://[fd00::1]/repo", "worker"),
+            format!("http://worker:{AURCACHE_MIRROR_PORT}/repo/$arch")
         );
     }
 }
