@@ -637,6 +637,7 @@ dependencies = [
  "anyhow",
  "aurcache-common",
  "aurcache-db",
+ "pacman-mirrors",
  "sea-orm",
  "sea-orm-migration",
  "serde",

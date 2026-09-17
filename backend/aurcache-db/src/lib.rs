@@ -11,6 +11,8 @@ pub mod download_counts;
 pub mod files;
 pub mod helpers;
 pub mod init;
+pub mod log_entities;
+pub mod logs;
 pub mod migration;
 pub mod operations;
 pub mod package_vcs_sources;

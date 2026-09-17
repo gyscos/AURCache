@@ -1,4 +1,5 @@
 use crate::activity_serializer::ActivitySerializer;
+use crate::event::LogEvent;
 use crate::failure_activity::{
     PublishFailedActivity, VersionCheckFailedActivity, WorkerReapedActivity,
     WorkerSettingRejectedActivity,
@@ -11,7 +12,8 @@ use crate::worker_activity::{WorkerApproveActivity, WorkerEnrollActivity, Worker
 use anyhow::anyhow;
 use aurcache_db::activities;
 use aurcache_db::activities::ActivityType;
-use aurcache_db::prelude::Activities;
+use aurcache_db::prelude::{Activities, LogEntities};
+use aurcache_db::{log_entities, logs};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order,
@@ -22,6 +24,7 @@ use serde::Serialize;
 // Defined in aurcache-common so the HTTP client and the browser frontend use
 // the same struct rather than a hand-mirrored copy.
 pub use aurcache_common::api::activity::{Activity, ActivityPage, Severity};
+use aurcache_common::api::log::EntityRef;
 
 /// What to narrow the log to.
 ///
@@ -47,6 +50,40 @@ struct Record {
     timestamp: i64,
 }
 
+/// One structured entry on its way to the database, with the index rows it
+/// implies already worked out.
+///
+/// The references are read from the same serialized payload that gets stored,
+/// at the moment of emission, so the entry and its index cannot describe
+/// different things.
+#[derive(Debug, Clone)]
+struct LogRecord {
+    kind: &'static str,
+    severity: Severity,
+    message: String,
+    data: String,
+    scope: Option<EntityRef>,
+    user: Option<String>,
+    timestamp: i64,
+    references: Vec<(String, EntityRef)>,
+}
+
+/// What the queue carries.
+///
+/// Two shapes while the curated activity log and the structured log are
+/// separate tables; porting the activity events to `LogEvent` collapses them.
+#[derive(Debug, Clone)]
+enum Queued {
+    Activity(Record),
+    Log(Box<LogRecord>),
+}
+
+/// The role an entry's own scope is indexed under.
+///
+/// A payload key, so it sits in the same namespace as the roles read out of the
+/// payload; no event declares a field called this.
+pub const SCOPE_ROLE: &str = "scope";
+
 /// How many entries may be waiting to be written.
 ///
 /// Generous: the log takes a few hundred entries on a busy day, so reaching
@@ -65,7 +102,12 @@ const QUEUE: usize = 1024;
 /// Cheap to clone; every clone feeds the same writer.
 #[derive(Debug, Clone)]
 pub struct ActivityLog {
-    tx: tokio::sync::mpsc::Sender<Record>,
+    tx: tokio::sync::mpsc::Sender<Queued>,
+    /// What everything recorded through this handle happened *under*.
+    ///
+    /// Set by [`Self::scoped`], so a build's own handle files everything it
+    /// emits against that build without each call site repeating it.
+    scope: Option<EntityRef>,
 }
 
 impl ActivityLog {
@@ -96,10 +138,60 @@ impl ActivityLog {
             user,
             timestamp: aurcache_db::helpers::time::now_secs(),
         };
+        self.send(Queued::Activity(record));
+    }
+
+    /// Record a structured event.
+    ///
+    /// Like [`Self::record`]: synchronous, infallible, and never blocking.
+    pub fn emit<E: LogEvent>(&self, event: E) {
+        self.emit_by(event, None);
+    }
+
+    /// Record a structured event somebody asked for.
+    ///
+    /// The actor matters for anything a person set in motion -- a dependency
+    /// repointed through the API is not the same entry as the scheduler doing
+    /// it -- and is `None` for everything the server does on its own.
+    pub fn emit_by<E: LogEvent>(&self, event: E, user: Option<String>) {
+        let rendered = match crate::event::render(&event) {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                tracing::warn!("could not render a {} log event: {e}", E::KIND);
+                return;
+            }
+        };
+        self.send(Queued::Log(Box::new(LogRecord {
+            kind: rendered.kind,
+            severity: rendered.severity,
+            message: rendered.message,
+            data: rendered.payload.to_string(),
+            scope: self.scope.clone(),
+            user,
+            timestamp: aurcache_db::helpers::time::now_secs(),
+            references: rendered.references,
+        })));
+    }
+
+    /// A handle whose entries are all filed under one entity.
+    ///
+    /// `log.scoped(BuildRef { .. })` makes everything emitted through it part of
+    /// that build's story, so one query returns both the entries *about* a build
+    /// and those written *during* it. Scopes do not nest: the innermost handle
+    /// wins, which is what a caller holding a build's handle means by it.
+    #[must_use]
+    pub fn scoped(&self, entity: impl Into<EntityRef>) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            scope: Some(entity.into()),
+        }
+    }
+
+    fn send(&self, queued: Queued) {
         // Dropped rather than waited on: a log must never be the reason the
         // thing it is recording got slower. A full queue means the database is
         // not answering, and the journal still has the line this sits beside.
-        if self.tx.try_send(record).is_err() {
+        if self.tx.try_send(queued).is_err() {
             tracing::warn!("activity log queue is full or closed; an entry was dropped");
         }
     }
@@ -115,7 +207,7 @@ impl ActivityLog {
     pub fn discarding() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
-        Self { tx }
+        Self { tx, scope: None }
     }
 }
 
@@ -125,14 +217,17 @@ impl ActivityLog {
 /// first.
 #[must_use]
 pub fn spawn(db: DatabaseConnection) -> (ActivityLog, tokio::task::JoinHandle<()>) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Record>(QUEUE);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Queued>(QUEUE);
     let store = ActivityStore::new(db);
     let writer = tokio::spawn(async move {
-        while let Some(record) = rx.recv().await {
-            store.write(record).await;
+        while let Some(queued) = rx.recv().await {
+            match queued {
+                Queued::Activity(record) => store.write(record).await,
+                Queued::Log(record) => store.write_log(*record).await,
+            }
         }
     });
-    (ActivityLog { tx }, writer)
+    (ActivityLog { tx, scope: None }, writer)
 }
 
 /// The log as the database holds it: reading it, and the one place that writes
@@ -167,6 +262,61 @@ impl ActivityStore {
             timestamp: aurcache_db::helpers::time::now_secs(),
         })
         .await;
+    }
+
+    /// Write one structured entry and the index of what it refers to.
+    ///
+    /// Both in one transaction: an entry that exists but is not indexed would
+    /// be invisible to every entity filter, which is worse than not having been
+    /// written at all, because nothing would show it was missing.
+    async fn write_log(&self, record: LogRecord) {
+        if let Err(e) = self.try_write_log(record).await {
+            tracing::warn!("could not write to the log: {e}");
+        }
+    }
+
+    async fn try_write_log(&self, record: LogRecord) -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        // The scope is indexed like any other reference, under a role of its
+        // own, so one query answers both "about this build" and "during it".
+        let mut refs: Vec<(String, EntityRef)> = record.references;
+        if let Some(scope) = &record.scope {
+            refs.push((SCOPE_ROLE.to_string(), scope.clone()));
+        }
+        // A role may legitimately name one entity twice -- a list with a
+        // repeat -- and the index keys on the three together.
+        refs.sort();
+        refs.dedup();
+
+        let txn = self.db.begin().await?;
+        let entry = logs::ActiveModel {
+            kind: Set(record.kind.to_string()),
+            severity: Set(record.severity),
+            message: Set(record.message),
+            data: Set(record.data),
+            scope: Set(record.scope.map(|scope| scope.to_string())),
+            timestamp: Set(record.timestamp),
+            user: Set(record.user),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+
+        if !refs.is_empty() {
+            let rows = refs
+                .into_iter()
+                .map(|(role, entity)| log_entities::ActiveModel {
+                    log_id: Set(entry.id),
+                    role: Set(role),
+                    ns: Set(entity.namespace().to_string()),
+                    id: Set(entity.id()),
+                });
+            LogEntities::insert_many(rows).exec(&txn).await?;
+        }
+
+        txn.commit().await?;
+        Ok(())
     }
 
     /// Write one entry, reporting a failure here rather than at the call site.

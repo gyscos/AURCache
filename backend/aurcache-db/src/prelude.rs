@@ -6,6 +6,8 @@ pub use super::builds::Entity as Builds;
 pub use super::dependencies::Entity as Dependencies;
 pub use super::download_counts::Entity as DownloadCounts;
 pub use super::files::Entity as Files;
+pub use super::log_entities::Entity as LogEntities;
+pub use super::logs::Entity as Logs;
 pub use super::operations::Entity as Operations;
 pub use super::package_vcs_sources::Entity as PackageVcsSources;
 pub use super::packages::Entity as Packages;

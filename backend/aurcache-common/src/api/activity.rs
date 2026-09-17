@@ -10,14 +10,25 @@ use utoipa::ToSchema;
 /// moment the server knows about it, with no column and no backfill. Two events
 /// of one kind therefore cannot differ in severity, which is the right shape --
 /// "publishing failed" and "package added" are not one event with a field.
+/// Stored as the number its variants are ordered by, so "this severity and
+/// worse" is `severity >= n` -- one indexable comparison rather than a list of
+/// kinds the query would have to know.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    feature = "db",
+    derive(sea_orm::DeriveActiveEnum, sea_orm::EnumIter),
+    sea_orm(rs_type = "i32", db_type = "Integer")
+)]
 pub enum Severity {
     /// Something happened. Most of the log.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 0))]
     Info,
     /// Something did not work and the server carried on. Worth a look.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 1))]
     Warning,
     /// Something did not work and left the instance worse off.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 2))]
     Error,
 }
 

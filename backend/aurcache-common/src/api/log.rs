@@ -16,6 +16,7 @@
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -275,6 +276,44 @@ string_schema! {
     WorkerRef => "worker:builder-01",
     BuildRef => "build:hello/7",
     EntityRef => "pkg:hello",
+}
+
+/// One entry, as the API returns it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct LogEntry {
+    pub id: i32,
+    /// Stable identity of what happened, `domain.verb_object`.
+    pub kind: String,
+    pub severity: crate::api::activity::Severity,
+    /// The sentence as it was rendered when the entry was written. The UI may
+    /// re-render from `kind` and `data`; this is what it falls back to, and
+    /// what every consumer without a catalogue reads.
+    pub message: String,
+    /// The typed payload, keyed by the role each value played.
+    pub data: serde_json::Value,
+    /// What the entry was emitted under, if anything.
+    #[serde(default)]
+    pub scope: Option<EntityRef>,
+    /// Unix seconds.
+    pub timestamp: i64,
+    /// `None` for anything the server did on its own.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Where each referenced entity can be opened, decided when this was read
+    /// rather than when it was written: `None` for one that no longer exists.
+    ///
+    /// Keyed by the same role as `data`, so the UI looks up what it is about to
+    /// render. A role naming several entities has an entry per reference, in the
+    /// order they appear.
+    #[serde(default)]
+    pub hrefs: BTreeMap<String, Vec<Option<String>>>,
+}
+
+/// One page of the log, and how long the filtered log is.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct LogPage {
+    pub entries: Vec<LogEntry>,
+    pub total: u64,
 }
 
 #[cfg(test)]
