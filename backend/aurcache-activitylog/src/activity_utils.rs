@@ -59,6 +59,7 @@ struct Record {
 #[derive(Debug, Clone)]
 struct LogRecord {
     kind: &'static str,
+    subkind: Option<&'static str>,
     severity: Severity,
     message: String,
     data: String,
@@ -189,6 +190,7 @@ impl ActivityLog {
 
         self.send(Queued::Log(Box::new(LogRecord {
             kind: rendered.kind,
+            subkind: rendered.subkind,
             severity: rendered.severity,
             message: rendered.message,
             data: rendered.payload.to_string(),
@@ -318,6 +320,7 @@ impl ActivityStore {
         let txn = self.db.begin().await?;
         let entry = logs::ActiveModel {
             kind: Set(record.kind.to_string()),
+            subkind: Set(record.subkind.map(str::to_string)),
             severity: Set(record.severity),
             message: Set(record.message),
             data: Set(record.data),

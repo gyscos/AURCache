@@ -48,6 +48,19 @@ pub trait LogEvent: Serialize {
     /// and "package added" are not one event with a field.
     const SEVERITY: Severity;
 
+    /// Which case of this kind, when one kind covers several.
+    ///
+    /// Kinds are consolidated where an operator would not filter on the
+    /// difference -- refreshing a git remote and refreshing a snapshot cache
+    /// are both `source.refresh_failed` -- and this is the detail that
+    /// consolidation would otherwise throw away. Read from the payload, like
+    /// the references are, so the two cannot disagree.
+    ///
+    /// `None` for a kind with one case, which is most of them.
+    fn subkind(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The sentence, rendered now.
     ///
     /// Stored alongside the payload so a row still reads when its payload can
@@ -106,6 +119,7 @@ pub fn references(payload: &serde_json::Value) -> Vec<(String, EntityRef)> {
 /// the index and the row describing the same thing.
 pub struct Rendered {
     pub kind: &'static str,
+    pub subkind: Option<&'static str>,
     pub severity: Severity,
     pub message: String,
     pub payload: serde_json::Value,
@@ -122,6 +136,7 @@ pub fn render<E: LogEvent>(event: &E) -> Result<Rendered, serde_json::Error> {
     let payload = serde_json::to_value(event)?;
     Ok(Rendered {
         kind: E::KIND,
+        subkind: event.subkind(),
         severity: E::SEVERITY,
         message: event.message(),
         references: references(&payload),
@@ -295,11 +310,61 @@ mod tests {
         assert_eq!(rendered.references[0].0, "pkg");
     }
 
+    /// A kind covering several cases keeps the difference, without splitting
+    /// into kinds nobody would filter apart.
+    #[test]
+    fn a_subkind_distinguishes_cases_of_one_kind() {
+        #[derive(Serialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Which {
+            Git,
+            Snapshot,
+        }
+
+        #[derive(Serialize)]
+        struct RefreshFailed {
+            pkg: PackageRef,
+            source: Which,
+        }
+        impl LogEvent for RefreshFailed {
+            const KIND: &'static str = "source.refresh_failed";
+            const SEVERITY: Severity = Severity::Warning;
+            fn subkind(&self) -> Option<&'static str> {
+                Some(match self.source {
+                    Which::Git => "git",
+                    Which::Snapshot => "snapshot",
+                })
+            }
+            fn message(&self) -> String {
+                String::new()
+            }
+        }
+
+        let git = render(&RefreshFailed {
+            pkg: "hello".into(),
+            source: Which::Git,
+        })
+        .unwrap();
+        let snapshot = render(&RefreshFailed {
+            pkg: "hello".into(),
+            source: Which::Snapshot,
+        })
+        .unwrap();
+
+        assert_eq!(git.kind, snapshot.kind);
+        assert_eq!(git.subkind, Some("git"));
+        assert_eq!(snapshot.subkind, Some("snapshot"));
+        // And it is in the payload too, so re-rendering does not need the
+        // column.
+        assert_eq!(git.payload["source"], "git");
+    }
+
     /// The kind and the severity come from the type, never from the call site.
     #[test]
     fn the_type_carries_its_kind_and_severity() {
         let rendered = render(&deps_replaced()).unwrap();
         assert_eq!(rendered.kind, "deps.replaced");
+        assert_eq!(rendered.subkind, None, "most kinds have one case");
         assert_eq!(rendered.severity, Severity::Info);
         assert_eq!(
             rendered.message,

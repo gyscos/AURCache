@@ -466,7 +466,70 @@ async fn a_build_links_only_while_its_package_exists() {
         .map(|e| e.hrefs["build"][0].clone())
         .collect();
     links.sort();
-    assert_eq!(links, vec![None, Some("/package/hello/build/7".to_string())]);
+    assert_eq!(
+        links,
+        vec![None, Some("/package/hello/build/7".to_string())]
+    );
+}
+
+/// One kind covering several cases keeps the difference in a column, so it can
+/// be filtered on without splitting into kinds nobody would ask apart -- and
+/// without reading into the payload.
+#[tokio::test]
+async fn a_subkind_narrows_within_a_kind() {
+    use aurcache_activitylog::events::source::{RefreshFailed, RefreshTarget};
+
+    let db = db().await;
+    let (log, writer) = spawn(db.clone());
+    log.emit(RefreshFailed {
+        pkg: "hello".into(),
+        target: RefreshTarget::Git,
+        error: "host is unreachable".to_string(),
+    });
+    log.emit(RefreshFailed {
+        pkg: "yay".into(),
+        target: RefreshTarget::Snapshot,
+        error: "checksum mismatch".to_string(),
+    });
+    drop(log);
+    writer.await.unwrap();
+
+    let store = LogStore::new(db);
+    let kind = RefreshFailed::KIND_STR.to_string();
+
+    let both = store
+        .page(
+            50,
+            0,
+            &LogFilter {
+                kind: Some(kind.clone()),
+                ..LogFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(both.total, 2);
+
+    let git = store
+        .page(
+            50,
+            0,
+            &LogFilter {
+                kind: Some(kind),
+                subkind: Some("git".to_string()),
+                ..LogFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(git.total, 1);
+    assert_eq!(git.entries[0].subkind.as_deref(), Some("git"));
+    // And the message says which, so the row reads without the column.
+    assert!(
+        git.entries[0].message.contains("git source"),
+        "{:?}",
+        git.entries[0].message
+    );
 }
 
 /// Pruning takes the index with it, or the filter would keep finding entries
@@ -487,9 +550,6 @@ async fn pruning_removes_the_index_too() {
     let now = aurcache_db::helpers::time::now_secs();
     assert_eq!(store.prune(3600, now + 7200).await.unwrap(), 1);
 
-    let orphans = LogEntities::find()
-        .count(&db)
-        .await
-        .unwrap();
+    let orphans = LogEntities::find().count(&db).await.unwrap();
     assert_eq!(orphans, 0, "the cascade should have taken the index rows");
 }

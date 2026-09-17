@@ -284,6 +284,10 @@ pub struct LogEntry {
     pub id: i32,
     /// Stable identity of what happened, `domain.verb_object`.
     pub kind: String,
+    /// Which case of that kind, for a kind that covers several. `None` for a
+    /// kind with one case, which is most of them.
+    #[serde(default)]
+    pub subkind: Option<String>,
     pub severity: crate::api::activity::Severity,
     /// The sentence as it was rendered when the entry was written. The UI may
     /// re-render from `kind` and `data`; this is what it falls back to, and

@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::source::{RefreshFailed, SourceinfoFailed, VcsSyncFailed};
+use aurcache_activitylog::events::source::{
+    RefreshFailed, RefreshTarget, SourceinfoFailed, SourceinfoPurpose, VcsSyncFailed,
+};
 use aurcache_activitylog::events::version_check::{
     AurMissing, CompareFallback, QueueFailed, StoreFailed,
 };
@@ -157,6 +159,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                             }
                             Err(e) => activity.emit(SourceinfoFailed {
                                 pkg: package.name.as_str().into(),
+                                purpose: SourceinfoPurpose::Vcs,
                                 error: format!("{e:#}"),
                             }),
                         }
@@ -173,6 +176,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         if is_outdated && let Err(e) = store.refresh(&source_data).await {
                             activity.emit(RefreshFailed {
                                 pkg: package.name.as_str().into(),
+                                target: RefreshTarget::Snapshot,
                                 error: format!("{e:#}"),
                             });
                         }
@@ -186,6 +190,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 if let Err(e) = store.refresh(&source_data).await {
                     activity.emit(RefreshFailed {
                         pkg: package.name.as_str().into(),
+                        target: RefreshTarget::Git,
                         error: format!("{e:#}"),
                     });
                     save_package(db, activity, package_model, &package.name).await;
@@ -206,6 +211,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                     Err(e) => {
                         activity.emit(SourceinfoFailed {
                             pkg: package.name.as_str().into(),
+                            purpose: SourceinfoPurpose::Version,
                             error: format!("{e:#}"),
                         });
                         save_package(db, activity, package_model, &package.name).await;

@@ -18,6 +18,13 @@ pub struct Model {
     /// and a server reading a row written by a newer version should store and
     /// show it rather than fail to parse the listing.
     pub kind: String,
+    /// Which case of that kind, when one kind covers several: `git` or
+    /// `snapshot` for a source refresh. `None` for a kind with one case, which
+    /// is most of them.
+    ///
+    /// Beside the kind rather than inside the payload so it can be filtered on
+    /// without reading JSON.
+    pub subkind: Option<String>,
     /// The severity that kind carries, stored as the number its variants are
     /// ordered by so "this and worse" is one comparison.
     pub severity: Severity,
