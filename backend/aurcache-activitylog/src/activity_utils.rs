@@ -78,6 +78,14 @@ enum Queued {
     Log(Box<LogRecord>),
 }
 
+/// Where structured events appear in the journal.
+///
+/// One target for all of them rather than the emitting module, so a deployment
+/// can turn the whole stream up or down in `LOG_LEVEL` without naming every
+/// crate. The kind rides along as a field, and says more than a module path
+/// would.
+pub const EVENT_TARGET: &str = "aurcache::event";
+
 /// The role an entry's own scope is indexed under.
 ///
 /// A payload key, so it sits in the same namespace as the roles read out of the
@@ -161,6 +169,24 @@ impl ActivityLog {
                 return;
             }
         };
+        // The journal keeps its line, so `docker logs` and `journalctl` show
+        // what they always did and a call site formats the sentence once. The
+        // target is fixed rather than the emitting module, with the kind as a
+        // field: `deps.replaced` says more about what happened than
+        // `aurcache_api::package` does, and it is what a filter would rather
+        // match on.
+        match rendered.severity {
+            Severity::Info => {
+                tracing::info!(target: EVENT_TARGET, kind = rendered.kind, "{}", rendered.message);
+            }
+            Severity::Warning => {
+                tracing::warn!(target: EVENT_TARGET, kind = rendered.kind, "{}", rendered.message);
+            }
+            Severity::Error => {
+                tracing::error!(target: EVENT_TARGET, kind = rendered.kind, "{}", rendered.message);
+            }
+        }
+
         self.send(Queued::Log(Box::new(LogRecord {
             kind: rendered.kind,
             severity: rendered.severity,

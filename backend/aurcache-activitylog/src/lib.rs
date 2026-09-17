@@ -1,6 +1,7 @@
 pub mod activity_serializer;
 pub mod activity_utils;
 pub mod event;
+pub mod events;
 pub mod failure_activity;
 pub mod kinds;
 pub mod log_store;

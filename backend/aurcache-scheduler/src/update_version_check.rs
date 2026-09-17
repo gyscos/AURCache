@@ -1,4 +1,9 @@
 use anyhow::anyhow;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::source::{RefreshFailed, SourceinfoFailed, VcsSyncFailed};
+use aurcache_activitylog::events::version_check::{
+    AurMissing, CompareFallback, QueueFailed, StoreFailed,
+};
 use aurcache_activitylog::failure_activity::VersionCheckFailedActivity;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::activities::ActivityType;
@@ -15,7 +20,7 @@ use aurcache_utils::vcs_check::{RoundCache, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[must_use]
 pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
@@ -48,6 +53,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
         tx: _,
         store,
         client,
+        activity,
         ..
     } = services;
     let packages = Packages::find().all(db).await?;
@@ -103,7 +109,9 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // can say so: its metadata still comes from the
                         // checkout, which continues to exist, so absent
                         // metadata no longer implies absence from the AUR.
-                        warn!("Couldn't find {} in AUR response", package.name);
+                        activity.emit(AurMissing {
+                            pkg: package.name.as_str().into(),
+                        });
                         package_model.aur_missing = Set(Some(true));
                     }
                     Some(result) => {
@@ -124,6 +132,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                             &result.version,
                             latest_version.as_deref(),
                             &package.name,
+                            activity,
                         );
 
                         // `pkgver` alone doesn't catch VCS packages (-git etc.)
@@ -140,16 +149,16 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                                     .await
                                 {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
-                                    Err(e) => warn!(
-                                        "Failed to sync VCS sources for {}: {e}",
-                                        package.name
-                                    ),
+                                    Err(e) => activity.emit(VcsSyncFailed {
+                                        pkg: package.name.as_str().into(),
+                                        error: format!("{e:#}"),
+                                    }),
                                 }
                             }
-                            Err(e) => warn!(
-                                "Failed to resolve sourceinfo for VCS check of {}: {e}",
-                                package.name
-                            ),
+                            Err(e) => activity.emit(SourceinfoFailed {
+                                pkg: package.name.as_str().into(),
+                                error: format!("{e:#}"),
+                            }),
                         }
 
                         package_model.out_of_date = Set(i32::from(is_outdated));
@@ -162,7 +171,10 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // instead of unconditionally re-fetching every package
                         // on every check.
                         if is_outdated && let Err(e) = store.refresh(&source_data).await {
-                            warn!("Failed to refresh snapshot cache for {}: {e}", package.name);
+                            activity.emit(RefreshFailed {
+                                pkg: package.name.as_str().into(),
+                                error: format!("{e:#}"),
+                            });
                         }
                     }
                 }
@@ -172,8 +184,11 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // so always refresh: this is an incremental `git fetch`
                 // against the persistent checkout, not a full re-clone.
                 if let Err(e) = store.refresh(&source_data).await {
-                    warn!("Failed to refresh git source for {}: {e}", package.name);
-                    save_package(db, package_model, &package.name).await;
+                    activity.emit(RefreshFailed {
+                        pkg: package.name.as_str().into(),
+                        error: format!("{e:#}"),
+                    });
+                    save_package(db, activity, package_model, &package.name).await;
                     continue;
                 }
                 // A failure here (e.g. a patch that no longer applies
@@ -189,8 +204,11 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 {
                     Ok(resolved) => resolved,
                     Err(e) => {
-                        warn!("Failed to get sourceinfo for {}: {e}", package.name);
-                        save_package(db, package_model, &package.name).await;
+                        activity.emit(SourceinfoFailed {
+                            pkg: package.name.as_str().into(),
+                            error: format!("{e:#}"),
+                        });
+                        save_package(db, activity, package_model, &package.name).await;
                         continue;
                     }
                 };
@@ -206,11 +224,14 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
                 let mut is_outdated =
-                    upstream_is_newer(&version, latest_version.as_deref(), &package.name);
+                    upstream_is_newer(&version, latest_version.as_deref(), &package.name, activity);
 
                 match sync_vcs_sources(db, package_id, &sourceinfo, &mut round).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
-                    Err(e) => warn!("Failed to sync VCS sources for {}: {e}", package.name),
+                    Err(e) => activity.emit(VcsSyncFailed {
+                        pkg: package.name.as_str().into(),
+                        error: format!("{e:#}"),
+                    }),
                 }
 
                 package_model.out_of_date = Set(i32::from(is_outdated));
@@ -220,7 +241,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
             }
         }
 
-        save_package(db, package_model, &package.name).await;
+        save_package(db, activity, package_model, &package.name).await;
     }
 
     // Detection is the only thing that knows a package went out of date —
@@ -236,7 +257,9 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     if build_now.value
         && let Err(e) = package_update_all_outdated(services).await
     {
-        warn!("Failed to queue builds for newly outdated packages: {e}");
+        activity.emit(QueueFailed {
+            error: format!("{e:#}"),
+        });
     }
 
     Ok(())
@@ -249,17 +272,23 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
 /// back to "did the string change", which errs towards scheduling a build:
 /// reporting "not newer" would silently freeze the package forever, whereas a
 /// spurious rebuild is merely wasted work.
-fn upstream_is_newer(upstream: &str, built: Option<&str>, package: &str) -> bool {
+fn upstream_is_newer(
+    upstream: &str,
+    built: Option<&str>,
+    package: &str,
+    activity: &ActivityLog,
+) -> bool {
     let Some(built) = built else {
         return true;
     };
     match vercmp(upstream, built) {
         Some(ordering) => ordering == std::cmp::Ordering::Greater,
         None => {
-            warn!(
-                "Cannot compare versions for {package}: upstream '{upstream}' vs built '{built}'; \
-                 falling back to a plain difference check"
-            );
+            activity.emit(CompareFallback {
+                pkg: package.into(),
+                upstream_version: upstream.to_string(),
+                built_version: built.to_string(),
+            });
             upstream != built
         }
     }
@@ -267,8 +296,16 @@ fn upstream_is_newer(upstream: &str, built: Option<&str>, package: &str) -> bool
 
 /// Persist the version-check outcome for one package. A write failure only
 /// costs this package one round of tracking, so it is logged, not propagated.
-async fn save_package(db: &DatabaseConnection, model: packages::ActiveModel, name: &str) {
+async fn save_package(
+    db: &DatabaseConnection,
+    activity: &ActivityLog,
+    model: packages::ActiveModel,
+    name: &str,
+) {
     if let Err(e) = model.update(db).await {
-        warn!("Failed to store version check result for {name}: {e}");
+        activity.emit(StoreFailed {
+            pkg: name.into(),
+            error: format!("{e:#}"),
+        });
     }
 }
