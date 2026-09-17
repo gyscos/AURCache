@@ -61,13 +61,14 @@ pub fn ConfigFileTabs(pkgbase: Option<String>) -> Element {
             }
         }
 
-        // Keyed on the file so switching tabs remounts the editor.
-        // Without that, the draft signal would survive the change and
-        // one file's edits would appear under the other's name.
+        // Keyed on the scope and the file so switching either remounts the
+        // editor. Without that, the draft signal would survive the change:
+        // one file's edits under the other's name, or one package's file
+        // read — and written — as the package left behind.
         for (key, name) in FILES {
             if showing() == key {
                 ConfigFileEditor {
-                    key: "{key}",
+                    key: "{pkgbase.as_deref().unwrap_or(\"global\")}-{key}",
                     setting: key,
                     name,
                     pkgbase: pkgbase.clone(),
@@ -91,6 +92,59 @@ fn overridden(source: SettingSource, scoped: bool) -> bool {
     }
 }
 
+/// Write one config file: `Some` stores, `None` resets to inherited.
+/// Split out of [`ConfigFileEditor`] so both buttons can share it; see the
+/// `save` binding there for why it is not a closure.
+#[allow(clippy::too_many_arguments)]
+async fn run_save(
+    mut busy: Signal<bool>,
+    mut status: Signal<Option<(String, bool)>>,
+    mut stored: Signal<String>,
+    mut reload: Signal<u32>,
+    scoped: bool,
+    setting: String,
+    pkgbase: Option<String>,
+    value: Option<String>,
+) {
+    busy.set(true);
+    status.set(None);
+    let outcome = match crate::api::client() {
+        Err(e) => Err(e),
+        Ok(client) => match &value {
+            Some(value) => {
+                client
+                    .patch_setting(pkgbase.as_deref(), &setting, value)
+                    .await
+            }
+            None => client.reset_setting(pkgbase.as_deref(), &setting).await,
+        }
+        .map_err(|e| e.to_string()),
+    };
+    busy.set(false);
+    match outcome {
+        Ok(()) => {
+            status.set(Some((
+                match (&value, scoped) {
+                    (Some(_), _) => "Saved.".to_string(),
+                    (None, true) => "Reset to the server-wide file.".to_string(),
+                    (None, false) => "Reset to the builder's own copy.".to_string(),
+                },
+                true,
+            )));
+            // The box already shows what was just saved, so it stays clean
+            // through the re-read below — and anything typed during the
+            // flight stays dirty, correctly. A reset leaves both alone: the
+            // box still matches, so it counts as clean and the re-read
+            // reseeds the inherited file.
+            if let Some(value) = value {
+                stored.set(value);
+            }
+            reload += 1;
+        }
+        Err(e) => status.set(Some((e, false))),
+    }
+}
+
 /// One file: what it currently is, and a way to change it.
 ///
 /// `pkgbase` picks the scope. In the package scope the file is an override:
@@ -99,53 +153,46 @@ fn overridden(source: SettingSource, scoped: bool) -> bool {
 /// rather than naming a specific fallback they cannot see from here.
 #[component]
 fn ConfigFileEditor(setting: String, name: String, pkgbase: Option<String>) -> Element {
-    // Held in signals so the closures below stay `Copy`; two buttons share the
-    // save path, and a captured `String` would let only one of them have it.
-    //
-    // Synced from the props rather than seeded once: this component stays
-    // mounted when the route moves from one package's config files to
-    // another's, and a signal initialised on the first mount would keep
-    // reading -- and `patch_setting` writing -- the package left behind.
-    let setting_prop = setting.clone();
-    let setting = use_signal(|| setting);
-    use_effect(use_reactive(&setting_prop, move |setting_prop: String| {
-        let mut setting = setting;
-        setting.set(setting_prop);
-    }));
-
+    // Props read directly, not mirrored into signals: the call site keys on
+    // scope and file, so a new scope or file remounts rather than reusing a
+    // draft — and a `patch_setting` can never write the package left behind.
     let scoped = pkgbase.is_some();
-    let pkgbase_prop = pkgbase.clone();
-    let pkgbase = use_signal(|| pkgbase);
-    use_effect(use_reactive(
-        &pkgbase_prop,
-        move |pkgbase_prop: Option<String>| {
-            let mut pkgbase = pkgbase;
-            pkgbase.set(pkgbase_prop);
-        },
-    ));
-    let mut reload = use_signal(|| 0u32);
-    let loaded = use_resource(move || async move {
-        // Read so a save re-fetches: the server owns the value, and the source
-        // badge has to follow what it actually stored.
-        let _ = reload();
-        crate::api::client()?
-            .get_setting(pkgbase().as_deref(), &setting())
-            .await
-            .map_err(|e| e.to_string())
+    let reload = use_signal(|| 0u32);
+    // Its own pair: the resource closure is `FnMut`, so it clones per run
+    // instead of moving the props, which the save buttons still need.
+    let res_props = (setting.clone(), pkgbase.clone());
+    let loaded = use_resource(move || {
+        let (setting, pkgbase) = res_props.clone();
+        async move {
+            // Read so a save re-fetches: the server owns the value, and the
+            // source badge has to follow what it actually stored.
+            let _ = reload();
+            crate::api::client()?
+                .get_setting(pkgbase.as_deref(), &setting)
+                .await
+                .map_err(|e| e.to_string())
+        }
     });
 
     let mut draft = use_signal(String::new);
     let mut stored = use_signal(String::new);
     let mut source = use_signal(|| SettingSource::Default);
-    let mut busy = use_signal(|| false);
-    let mut status = use_signal(|| Option::<(String, bool)>::None);
+    let busy = use_signal(|| false);
+    let status = use_signal(|| Option::<(String, bool)>::None);
 
-    // Seed the editor once the value arrives, and again after each save.
+    // Seed the editor once the value arrives, and again after each save — but
+    // only while clean. A refetch landing mid-edit today overwrites
+    // in-progress typing; with the gate, typing wins and the refetch only
+    // refreshes the source badge. After a save or reset the box matches what
+    // was just written, so it counts as clean and the re-read still lands.
     use_effect(move || {
         if let Some(Ok(response)) = &*loaded.read_unchecked() {
-            draft.set(response.value.clone());
-            stored.set(response.value.clone());
             source.set(response.source);
+            // `peek` borrows through a guard, so compare through it.
+            if draft.peek().as_str() == stored.peek().as_str() {
+                draft.set(response.value.clone());
+                stored.set(response.value.clone());
+            }
         }
     });
 
@@ -156,36 +203,14 @@ fn ConfigFileEditor(setting: String, name: String, pkgbase: Option<String>) -> E
         "Discard the stored file and use the builder's own copy"
     };
 
-    let save = move |value: Option<String>| async move {
-        busy.set(true);
-        status.set(None);
-        let outcome = match crate::api::client() {
-            Err(e) => Err(e),
-            Ok(client) => match &value {
-                Some(value) => {
-                    client
-                        .patch_setting(pkgbase().as_deref(), &setting(), value)
-                        .await
-                }
-                None => client.reset_setting(pkgbase().as_deref(), &setting()).await,
-            }
-            .map_err(|e| e.to_string()),
-        };
-        busy.set(false);
-        match outcome {
-            Ok(()) => {
-                status.set(Some((
-                    match (value, scoped) {
-                        (Some(_), _) => "Saved.".to_string(),
-                        (None, true) => "Reset to the server-wide file.".to_string(),
-                        (None, false) => "Reset to the builder's own copy.".to_string(),
-                    },
-                    true,
-                )));
-                reload += 1;
-            }
-            Err(e) => status.set(Some((e, false))),
-        }
+    // Owns its own scope pair, cloned per call, so both buttons can share it
+    // without either moving the props out. The signals are all `Copy`.
+    let save_props = (setting, pkgbase);
+    let save = move |value: Option<String>| {
+        let (setting, pkgbase) = save_props.clone();
+        run_save(
+            busy, status, stored, reload, scoped, setting, pkgbase, value,
+        )
     };
 
     rsx! {
@@ -223,7 +248,12 @@ fn ConfigFileEditor(setting: String, name: String, pkgbase: Option<String>) -> E
                                 class: "btn btn-ghost btn-sm",
                                 disabled: busy(),
                                 title: reset_title,
-                                onclick: move |_| save(None),
+                                onclick: {
+                                    // Cloned, not moved: the Save button below
+                                    // needs its own.
+                                    let save = save.clone();
+                                    move |_| save(None)
+                                },
                                 "Reset"
                             }
                         }

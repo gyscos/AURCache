@@ -54,6 +54,42 @@ pub fn looks_like_git_url(s: &str) -> bool {
     s.contains('@') || s.contains("://")
 }
 
+/// How to write a source on screen: the AUR name, the git remote with its
+/// ref and subfolder, or a placeholder for an upload.
+///
+/// The label is derived rather than stored: two sources with the same label
+/// are the same source, which is what duplicate checks rely on — and a
+/// failure is reported against what the request carried.
+///
+/// Shared for the same reason as [`looks_like_git_url`]: the add dialog and
+/// the progress cards each had a copy, with only punctuation drift between
+/// them.
+///
+/// (The server's bulk-add path keeps its own shorter form — a bare URL and
+/// `"upload"` — because it reports back into API responses, not onto chips.)
+#[must_use]
+pub fn source_label(source: &SourceData) -> String {
+    match source {
+        SourceData::Aur { name } => name.clone(),
+        SourceData::Git { spec } => {
+            let mut label = spec.url.clone();
+            if !spec.r#ref.is_empty() {
+                label.push('#');
+                label.push_str(&spec.r#ref);
+            }
+            if !spec.subfolder.is_empty() {
+                label.push('/');
+                label.push_str(&spec.subfolder);
+            }
+            label
+        }
+        // Never built from here — the upload it belongs to was never
+        // implemented server-side — but the variant exists, so it gets a
+        // label rather than a panic.
+        SourceData::Upload { .. } => "uploaded archive".to_string(),
+    }
+}
+
 impl From<GitSourceSpec> for SourceData {
     fn from(spec: GitSourceSpec) -> Self {
         Self::Git { spec }

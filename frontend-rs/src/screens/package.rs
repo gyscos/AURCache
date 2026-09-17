@@ -433,9 +433,13 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>) -> Element {
                     p { class: "opacity-60 text-sm", "This package has never been built." }
                 } else {
                     div { class: "divide-y divide-base-300",
-                        for (index, (label, entry)) in rows.iter().enumerate() {
+                        for (label, entry) in rows.iter() {
                             BuildRow {
-                                key: "{index}-{entry.number}",
+                                // No index prefix: an insert above would
+                                // restamp every key below it, which is what
+                                // keys exist to survive. Platform and number
+                                // are unique across a package's builds.
+                                key: "{label}-{entry.number}",
                                 label: label.clone(),
                                 entry: entry.clone(),
                                 now,
@@ -541,6 +545,10 @@ fn RelationList(
                     ul { class: "divide-y divide-base-300",
                         for item in items.iter() {
                             RelationRow {
+                                // On the loop child, where the diff needs it:
+                                // the key inside `RelationRow`'s own template
+                                // cannot tell sibling rows apart.
+                                key: "{item.id}",
                                 item: item.clone(),
                                 show_blocking,
                                 replace_for: replace_for.clone(),
@@ -1151,8 +1159,15 @@ fn PersistBuildDirField(pkgbase: String) -> Element {
             .map_err(|e| e.to_string())
     }));
 
+    // Whether the user has touched the toggle: a slow first load must not
+    // overwrite a choice already made, so the resolve only seeds an
+    // untouched control. Reset clears it so the re-read reseeds.
+    let mut touched = use_signal(|| false);
     use_effect(move || {
-        if let Some(Ok(settings)) = entry.read().as_ref() {
+        // `peek` borrows through a guard; `*` sees through it.
+        if !*touched.peek()
+            && let Some(Ok(settings)) = entry.read().as_ref()
+        {
             value.set(settings.persistent_builddir.value);
         }
     });
@@ -1210,7 +1225,12 @@ fn PersistBuildDirField(pkgbase: String) -> Element {
             };
             busy.set(false);
             match outcome {
-                Ok(()) => entry.restart(),
+                // Back to inherited: the re-read is the new truth, so let it
+                // seed the toggle again.
+                Ok(()) => {
+                    touched.set(false);
+                    entry.restart();
+                }
                 Err(e) => error.set(Some(e)),
             }
         }
@@ -1237,7 +1257,10 @@ fn PersistBuildDirField(pkgbase: String) -> Element {
                                     class: "toggle toggle-primary",
                                     disabled: locked || busy(),
                                     checked: value(),
-                                    onchange: move |e: FormEvent| set(e.checked()),
+                                    onchange: move |e: FormEvent| {
+                                        touched.set(true);
+                                        set(e.checked())
+                                    },
                                 }
                                 if source == SettingSource::Package && !locked && !busy() {
                                     button {
@@ -1286,7 +1309,13 @@ fn ArtifactSizeField(pkgbase: String) -> Element {
     }));
 
     use_effect(move || {
-        if let Some(Ok(settings)) = entry.read().as_ref() {
+        // Seed only: a refetch (after save, after reset) landing mid-edit
+        // must not overwrite what is being typed. `None` means nothing has
+        // been typed or seeded yet; save and reset both leave the last shown
+        // value in place.
+        if draft.peek().is_none()
+            && let Some(Ok(settings)) = entry.read().as_ref()
+        {
             draft.set(Some(aurcache_common::units::format_size(
                 settings.max_artifact_size.value,
             )));
@@ -1333,7 +1362,12 @@ fn ArtifactSizeField(pkgbase: String) -> Element {
             };
             busy.set(false);
             match outcome {
-                Ok(()) => entry.restart(),
+                // Back to inherited: drop the draft so the re-read reseeds
+                // the box instead of leaving the discarded override in it.
+                Ok(()) => {
+                    draft.set(None);
+                    entry.restart();
+                }
                 Err(e) => error.set(Some(e)),
             }
         }

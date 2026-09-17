@@ -99,6 +99,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurcache-common",
+ "bytes",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -120,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "aurcache-client",
  "aurcache-common",
+ "bytes",
  "dioxus",
  "dioxus-charts",
  "dioxus-ssr",

@@ -99,6 +99,9 @@ pub enum StatusFilter {
 }
 
 impl StatusFilter {
+    /// The URL/query value. `String` rather than a borrow: rsx `value:`
+    /// attributes take owned values, and only the numeric arm allocates
+    /// anyway — the two words below are the only other callers' cost.
     pub fn id(self) -> String {
         match self {
             Self::Any => "any".to_string(),
@@ -972,6 +975,9 @@ pub fn use_url_search(
 ) -> Signal<String> {
     let term = use_signal(|| initial);
 
+    // A timer per keystroke rather than one writer looping for the life of the
+    // screen: an idle list then costs nothing, where a loop would wake every
+    // debounce interval whether or not anything was typed.
     use_effect(move || {
         if !sync {
             return;
@@ -1146,6 +1152,10 @@ pub fn paginate<T: Clone>(items: &[T], page: usize) -> Page<T> {
 }
 
 /// One page of a list, and where it sits in the whole.
+///
+/// Comparable so memoized pipelines can hold it: [`use_memo`] only keeps a
+/// value it can tell apart from the last one.
+#[derive(PartialEq)]
 pub struct Page<T> {
     pub items: Vec<T>,
     /// Zero-based, and clamped to the list that actually exists.
@@ -1414,22 +1424,27 @@ impl From<&str> for ViewParams {
 /// `sync` matches `use_url_search`: the packages list passes `false` behind the
 /// add dialog, which owns the URL there. A parameter rather than the caller
 /// skipping the hook, because Dioxus identifies hooks by order.
+///
+/// The term is `None` on screens with no search box (the logs page): `Option`
+/// rather than a dummy signal, so no caller has to fabricate state the hook
+/// never reads.
 pub fn use_url_view(
-    term: Signal<String>,
+    term: Option<Signal<String>>,
     sync: bool,
     to_route: impl Fn(String) -> Route + Clone + 'static,
 ) {
+    let read_term = move || term.map(|term| term.peek().clone()).unwrap_or_default();
     // Seeded with the route we arrived on, *not* `None`. Starting empty made
     // the first effect run navigate to the URL the page was already showing;
     // that re-entered the router on mount and the app intermittently failed to
     // come up at all. Nothing is written until a control actually moves.
     let seed = to_route.clone();
-    let mut previous = use_signal(move || seed(term.peek().clone()));
+    let mut previous = use_signal(move || seed(read_term()));
     use_effect(move || {
         if !sync {
             return;
         }
-        let route = to_route(term.peek().clone());
+        let route = to_route(term.map(|term| term.peek().clone()).unwrap_or_default());
         // Unchanged means an unrelated render rather than a control moving, and
         // replacing again would be a wasted navigation.
         if *previous.peek() == route {

@@ -152,7 +152,10 @@ impl OnExisting {
 #[component]
 fn RestoreDialog(open: Signal<bool>) -> Element {
     let mut file_name = use_signal(String::new);
-    let mut bytes = use_signal(Vec::<u8>::new);
+    // `Bytes`, not `Vec<u8>`: the file reader hands back `Bytes`, signal
+    // reads then cost a refcount bump rather than a copy, and the client
+    // streams them into the request body without copying either.
+    let mut bytes = use_signal(bytes::Bytes::new);
     let on_existing = use_signal(|| OnExisting::Skip);
     let clear = use_signal(|| false);
     let secrets = use_signal(|| false);
@@ -165,7 +168,7 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
 
     let mut reset = move || {
         file_name.set(String::new());
-        bytes.set(Vec::new());
+        bytes.set(bytes::Bytes::new());
         preview.set(Vec::new());
         error.set(None);
         hovering.set(false);
@@ -203,7 +206,7 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
                 preview.set(Vec::new());
                 error.set(None);
                 file_name.set(name);
-                bytes.set(content.to_vec());
+                bytes.set(content);
             }
             Err(e) => error.set(Some(format!("{name} could not be read: {e}"))),
         }

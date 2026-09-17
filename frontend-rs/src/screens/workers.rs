@@ -130,10 +130,12 @@ pub fn Workers() -> Element {
                         // The package names in `known` are what a reservation
                         // can be resolved to. Missing or erroring leaves the
                         // column as plain text, which is the fallback anyway.
-                        let known: HashSet<String> = match known_packages().as_ref() {
-                            Some(Ok(pkgs)) => pkgs.clone(),
-                            _ => HashSet::new(),
-                        };
+                        // One clone per render into the table props; the row
+                        // loop then only runs `contains` on it.
+                        let known_packages = known_packages.read();
+                        let known = known_packages
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok());
 
                         rsx! {
                             div { class: "flex items-center gap-3 flex-wrap",
@@ -157,7 +159,7 @@ pub fn Workers() -> Element {
                                     }
                                 }
                             }
-                            WorkersTable { workers: shown, fleet: list.clone(), busy: busy(), act, known }
+                            WorkersTable { workers: shown, fleet: list.clone(), busy: busy(), act, known: known.cloned() }
                         }
                     },
                 }
@@ -286,8 +288,10 @@ fn WorkersTable(
     /// `(id, approve)` — true approves, false revokes.
     act: EventHandler<(i32, bool)>,
     /// Package names that resolve to a real package. A reservation naming one
-    /// is a link; any other reservation stays plain text.
-    known: HashSet<String>,
+    /// is a link; any other reservation stays plain text. `None` while the
+    /// package list is still loading or failed — plain text is the fallback
+    /// anyway.
+    known: Option<HashSet<String>>,
 ) -> Element {
     // Read once for the whole table rather than per row, so every "3m ago" on
     // screen is measured from the same instant.
@@ -303,6 +307,10 @@ fn WorkersTable(
         .iter()
         .map(|w| w.successful_builds + w.failed_builds)
         .sum();
+
+    // Counted once per table, not once per row: each row's link needs to
+    // know whether its name is shared.
+    let shared_names = crate::screens::worker::shared_names(&fleet);
 
     rsx! {
         div { class: "overflow-x-auto",
@@ -323,11 +331,14 @@ fn WorkersTable(
                 }
                 tbody {
                     for worker in workers.iter() {
-                        // Computed once per row and used by both links: it needs
-                        // the whole fleet to know whether this worker's name is
-                        // unique, which the row itself does not.
+                        // Computed once per row and used by both links, from
+                        // the table-wide shared set above rather than a fresh
+                        // fleet scan per row.
                         {
-                        let route = crate::screens::worker::worker_route(worker, &fleet);
+                        let route = crate::screens::worker::worker_route(
+                            worker,
+                            shared_names.contains(worker.name.as_str()),
+                        );
                         rsx! {
                         tr { key: "{worker.id}", class: if worker.status.is_retired() { "opacity-50" } else { "" },
                             td {
@@ -371,7 +382,7 @@ fn WorkersTable(
                                 } else {
                                     div { class: "flex flex-wrap gap-1",
                                         for package in worker.package_affinity.iter() {
-                                            if known.contains(package) {
+                                            if known.as_ref().is_some_and(|known| known.contains(package)) {
                                                 Link {
                                                     key: "{package}",
                                                     title: "Open package page",

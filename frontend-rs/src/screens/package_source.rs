@@ -60,8 +60,15 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
 
     let open_file = move |pkgbase: String, path: String| async move {
         reset_open.set(false);
-        let Ok(client) = crate::api::client() else {
-            return;
+        // A click that silently does nothing reads as broken: the client
+        // only fails to construct when the API URL is misconfigured, and
+        // that is exactly what the status line is for.
+        let client = match crate::api::client() {
+            Ok(client) => client,
+            Err(e) => {
+                status.set(Some((e, false)));
+                return;
+            }
         };
         match client.get_source_file(&pkgbase, &path).await {
             Ok(content) => {
@@ -270,7 +277,13 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                             let pkgbase = pkgbase.clone();
                             async move {
                                 let Some(path) = selected() else { return };
-                                let Ok(client) = crate::api::client() else { return };
+                                let client = match crate::api::client() {
+                                    Ok(client) => client,
+                                    Err(e) => {
+                                        status.set(Some((e, false)));
+                                        return;
+                                    }
+                                };
                                 match client.put_source_file(&pkgbase, &path, &draft()).await {
                                     Ok(()) => {
                                         navigator().push(Route::Package { pkgbase: pkgbase.clone() });
@@ -293,7 +306,13 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                             let pkgbase = pkgbase.clone();
                             async move {
                                 let Some(path) = selected() else { return };
-                                let Ok(client) = crate::api::client() else { return };
+                                let client = match crate::api::client() {
+                                    Ok(client) => client,
+                                    Err(e) => {
+                                        status.set(Some((e, false)));
+                                        return;
+                                    }
+                                };
                                 // The rebuild is only queued if the save
                                 // worked: rebuilding the old source would
                                 // report success for a change never stored.

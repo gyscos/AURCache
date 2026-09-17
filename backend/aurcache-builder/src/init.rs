@@ -19,9 +19,7 @@ use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_W
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
-};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait};
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};

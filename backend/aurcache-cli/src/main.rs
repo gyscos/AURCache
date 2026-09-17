@@ -1638,7 +1638,7 @@ async fn restore_command(
 
     let accepted = client
         .restore(
-            bytes,
+            bytes.into(),
             dry_run,
             on_existing.as_str(),
             clear,

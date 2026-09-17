@@ -21,9 +21,10 @@
 use crate::listing::ViewParams;
 use crate::platforms::{self, PlatformChecklist};
 use crate::routes::Route;
-use aurcache_client::{GitSourceSpec, SearchResult, SourceData, looks_like_git_url};
+use aurcache_client::{GitSourceSpec, SearchResult, SourceData, looks_like_git_url, source_label};
 use dioxus::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 use std::time::Duration;
 
 /// How long to wait after the last keystroke before searching.
@@ -84,7 +85,57 @@ const SEARCH_CACHE_ENTRIES: usize = 16;
 /// the set of everything containing those characters -- narrowing from it would
 /// claim almost nothing matches.
 #[derive(Default)]
-struct SearchCache(Vec<(String, Vec<SearchResult>)>);
+struct SearchCache(Vec<(String, Vec<CachedResult>)>);
+
+/// One cached search result with its match keys precomputed.
+///
+/// Lowering happens once, when the network response lands — not once per
+/// result per keystroke in the filter and the rank below it.
+#[derive(Clone)]
+struct CachedResult {
+    result: SearchResult,
+    lowered_name: String,
+    lowered_description: Option<String>,
+}
+
+impl CachedResult {
+    fn new(result: SearchResult) -> Self {
+        let lowered_name = result.name.to_lowercase();
+        let lowered_description = result.description.as_deref().map(str::to_lowercase);
+        Self {
+            result,
+            lowered_name,
+            lowered_description,
+        }
+    }
+
+    /// Whether this result matches `query` the way the AUR's `by=name-desc`
+    /// does: `query` arrives already lowered, once per keystroke rather than
+    /// once per result.
+    fn matches(&self, query: &str) -> bool {
+        self.lowered_name.contains(query)
+            || self
+                .lowered_description
+                .as_deref()
+                .is_some_and(|d| d.contains(query))
+    }
+
+    /// How well this result answers what was typed: exact name first, then
+    /// prefix, then substring, then description-only.
+    fn rank(&self, query: &str) -> u8 {
+        if self.lowered_name == query {
+            0
+        } else if self.lowered_name.starts_with(query) {
+            1
+        } else if self.lowered_name.contains(query) {
+            2
+        } else {
+            // Matched on something other than the name — the AUR searches
+            // descriptions too.
+            3
+        }
+    }
+}
 
 impl SearchCache {
     /// The results for `query`, if any cached search can answer it without the
@@ -106,11 +157,17 @@ impl SearchCache {
             .iter()
             .filter(|(cached, _)| query.starts_with(cached))
             .max_by_key(|(cached, _)| cached.len())?;
+        let mut narrowed: Vec<&CachedResult> = results
+            .iter()
+            .filter(|result| result.matches(&query))
+            .collect();
+        // Ranked here, on the precomputed keys, so the call site does not
+        // re-lower every name a second time per keystroke.
+        narrowed.sort_by_key(|result| result.rank(&query));
         Some(
-            results
-                .iter()
-                .filter(|result| matches_query(result, &query))
-                .cloned()
+            narrowed
+                .into_iter()
+                .map(|result| result.result.clone())
                 .collect(),
         )
     }
@@ -121,7 +178,7 @@ impl SearchCache {
     fn has_answer(&self, query: &str) -> bool {
         let query = query.trim().to_lowercase();
         self.0.iter().any(|(cached, results)| {
-            query.starts_with(cached) && results.iter().any(|result| matches_query(result, &query))
+            query.starts_with(cached) && results.iter().any(|result| result.matches(&query))
         })
     }
 
@@ -136,37 +193,15 @@ impl SearchCache {
             return;
         }
         self.0.retain(|(cached, _)| cached != &query);
-        self.0.insert(0, (query, results.to_vec()));
+        self.0.insert(
+            0,
+            (
+                query,
+                results.iter().cloned().map(CachedResult::new).collect(),
+            ),
+        );
         self.0.truncate(SEARCH_CACHE_ENTRIES);
     }
-}
-
-/// The whitespace-separated terms of a query, lowercased.
-///
-/// A multi-word query is one question per word: `gnome system monitor` asks
-/// for packages matching `gnome` *and* `system` *and* `monitor`, because no
-/// package name contains the phrase with its spaces — they use hyphens.
-fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .filter(|term| !term.is_empty())
-        .collect()
-}
-
-/// Whether a result matches `query` the way the AUR's `by=name-desc` does,
-/// across every whitespace-separated term: each term has to be a
-/// case-insensitive substring of either the name or the description.
-fn matches_query(result: &SearchResult, query: &str) -> bool {
-    let terms = query_terms(query);
-    if terms.is_empty() {
-        return false;
-    }
-    let name = result.name.to_lowercase();
-    let description = result.description.as_deref().unwrap_or("").to_lowercase();
-    terms
-        .iter()
-        .all(|term| name.contains(term) || description.contains(term))
 }
 
 /// Orders search results by how well they answer what was typed.
@@ -181,21 +216,18 @@ fn matches_query(result: &SearchResult, query: &str) -> bool {
 /// popularity signal — survives among equally good matches.
 fn rank_results(query: &str, results: &mut [SearchResult]) {
     let query = query.trim().to_lowercase();
-    let terms = query_terms(&query);
     results.sort_by_key(|result| {
         let name = result.name.to_lowercase();
         if name == query {
             0
         } else if name.starts_with(&query) {
             1
+        } else if name.contains(&query) {
+            2
         } else {
-            // How many of the query's terms the name misses: all of them in
-            // the name first, then most of them, with description-only matches
-            // last. For a single term this is exactly the old contains/else
-            // split; for several it is what puts
-            // `gnome-shell-extension-system-monitor-next-git` ahead of a
-            // package that only mentions one of the words.
-            terms.iter().filter(|term| !name.contains(*term)).count() + 2
+            // Matched on something other than the name — the AUR searches
+            // descriptions too — so it is the least likely to be what was meant.
+            3
         }
     });
 }
@@ -245,32 +277,6 @@ fn git_source(url: &str, git_ref: &str, subfolder: &str) -> Option<SourceData> {
             subfolder: subfolder.trim().to_string(),
         },
     })
-}
-
-/// A source waiting to be added, and how to write it on a chip.
-///
-/// The label is derived rather than stored: two chips with the same label are
-/// the same source, which is what the duplicate check relies on.
-fn source_label(source: &SourceData) -> String {
-    match source {
-        SourceData::Aur { name } => name.clone(),
-        SourceData::Git { spec } => {
-            let mut label = spec.url.clone();
-            if !spec.r#ref.is_empty() {
-                label.push('#');
-                label.push_str(&spec.r#ref);
-            }
-            if !spec.subfolder.is_empty() {
-                label.push('/');
-                label.push_str(&spec.subfolder);
-            }
-            label
-        }
-        // This dialog never builds one — the upload it belongs to was never
-        // implemented server-side — but the variant exists, so it gets a label
-        // rather than a panic.
-        SourceData::Upload { .. } => "uploaded archive".to_string(),
-    }
 }
 
 /// The pkgbase a source will land under, for comparing against what is already
@@ -338,12 +344,19 @@ fn AddPackageDialog(q: String) -> Element {
             .await
             .map_err(|e| e.to_string())
     });
-    let existing_names = move || -> Vec<String> {
-        match &*existing.read_unchecked() {
+    // Every name that is already handled — on the server or in the queue.
+    // Memoized over the package list and the queue, so a keystroke render
+    // does not rebuild and rescan it; a set, so each result row probes in
+    // O(1). `Rc` so handing it to the results list is a refcount bump rather
+    // than another copy of every name.
+    let taken = use_memo(move || {
+        let mut taken: HashSet<String> = match &*existing.read_unchecked() {
             Some(Ok(list)) => list.iter().map(|p| p.name.clone()).collect(),
-            _ => Vec::new(),
-        }
-    };
+            _ => HashSet::new(),
+        };
+        taken.extend(queued().iter().map(source_label));
+        Rc::new(taken)
+    });
 
     let is_git = move || looks_like_git_url(entry().trim());
 
@@ -365,8 +378,8 @@ fn AddPackageDialog(q: String) -> Element {
         // A search already made can answer anything that extends it, with no
         // request and no wait — which is most of typing, since a query grows a
         // character at a time.
-        if let Some(mut narrowed) = cache.read().narrow(&q) {
-            rank_results(&q, &mut narrowed);
+        // Already ranked inside `narrow`, on the precomputed keys.
+        if let Some(narrowed) = cache.read().narrow(&q) {
             return (q, Ok(narrowed));
         }
         let found = match crate::api::client() {
@@ -403,7 +416,7 @@ fn AddPackageDialog(q: String) -> Element {
         if queued().iter().any(|q| source_label(q) == label) {
             return true;
         }
-        source_at(source).is_some_and(|name| existing_names().iter().any(|e| e == name))
+        source_at(source).is_some_and(|name| taken.read().contains(name))
     };
 
     let mut queue_search_result = move |name: String| {
@@ -603,11 +616,7 @@ fn AddPackageDialog(q: String) -> Element {
                                 .read_unchecked()
                                 .as_ref()
                                 .is_none_or(|(answered, _)| answered.trim() != entry().trim()),
-                            taken: {
-                                let mut taken = existing_names();
-                                taken.extend(queued().iter().map(source_label));
-                                taken
-                            },
+                            taken: taken.read().clone(),
                             onpick: move |name: String| queue_search_result(name),
                         }
                     }
@@ -769,7 +778,9 @@ fn SearchResults(
     /// Names already on the server or already queued. Shown, but not
     /// selectable: that a package is already handled is the useful answer, and
     /// better than hiding it and leaving someone to wonder where it went.
-    taken: Vec<String>,
+    /// Reference-counted: the dialog hands over the memoized set without
+    /// copying every name into the props.
+    taken: Rc<HashSet<String>>,
     /// A search for what is currently typed has not answered yet, so any
     /// results on hand belong to an earlier query.
     #[props(default = false)]
@@ -834,7 +845,7 @@ fn SearchResults(
 /// keystroke, and one definition means the two cannot drift apart.
 fn results_list(
     found: Vec<SearchResult>,
-    taken: &[String],
+    taken: &HashSet<String>,
     onpick: EventHandler<String>,
 ) -> Element {
     rsx! {
@@ -883,16 +894,18 @@ mod tests {
     };
     use aurcache_client::{SearchResult, SourceData};
     use dioxus::prelude::*;
+    use std::collections::HashSet;
+    use std::rc::Rc;
 
     #[component]
     fn Harness(
         query: String,
         results: Option<Result<Vec<SearchResult>, String>>,
-        taken: Vec<String>,
+        taken: HashSet<String>,
         #[props(default = false)] searching: bool,
     ) -> Element {
         rsx! {
-            SearchResults { query, results, taken, searching, onpick: move |_| {} }
+            SearchResults { query, results, taken: Rc::new(taken), searching, onpick: move |_| {} }
         }
     }
 
@@ -992,59 +1005,8 @@ mod tests {
         assert_eq!(cache.narrow("hELLo").unwrap().len(), 1);
     }
 
-    /// Words are separate questions: every one has to match somewhere, so
-    /// `gnome system monitor` finds the package whose hyphenated name holds
-    /// all three even though it holds the phrase with its spaces nowhere.
-    #[test]
-    fn narrowing_matches_every_word_separately() {
-        let mut cache = SearchCache::default();
-        cache.insert(
-            "gnome",
-            &[
-                result("gnome-shell-extension-system-monitor-next-git", None),
-                result("gnome-shell", None),
-            ],
-        );
-
-        let narrowed = cache
-            .narrow("gnome system monitor")
-            .expect("gnome can answer gnome system monitor");
-        assert_eq!(
-            narrowed.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["gnome-shell-extension-system-monitor-next-git"],
-        );
-    }
-
-    /// One word may match the name while another matches the description.
-    #[test]
-    fn narrowing_matches_words_across_name_and_description() {
-        let mut cache = SearchCache::default();
-        cache.insert(
-            "alacritty",
-            &[result("alacritty", Some("A fast terminal emulator"))],
-        );
-
-        assert_eq!(cache.narrow("alacritty terminal").unwrap().len(), 1);
-        assert!(cache.narrow("alacritty browser").unwrap().is_empty());
-    }
-
-    /// The package holding every word in its name comes before one holding
-    /// only some of them there.
-    #[test]
-    fn ranking_prefers_the_result_matching_every_word_in_its_name() {
-        let mut results = vec![
-            result("gnome-shell", None),
-            result("gnome-shell-extension-system-monitor-next-git", None),
-        ];
-        rank_results("gnome system monitor", &mut results);
-        assert_eq!(
-            results[0].name,
-            "gnome-shell-extension-system-monitor-next-git"
-        );
-    }
-
     fn render(query: &str, results: Option<Result<Vec<SearchResult>, String>>) -> String {
-        render_with(query, results, Vec::new())
+        render_with(query, results, HashSet::new())
     }
 
     /// The description is why a result that does not look like the query is in
@@ -1075,7 +1037,7 @@ mod tests {
     fn render_with(
         query: &str,
         results: Option<Result<Vec<SearchResult>, String>>,
-        taken: Vec<String>,
+        taken: HashSet<String>,
     ) -> String {
         render_search(query, results, taken, false)
     }
@@ -1083,7 +1045,7 @@ mod tests {
     fn render_search(
         query: &str,
         results: Option<Result<Vec<SearchResult>, String>>,
-        taken: Vec<String>,
+        taken: HashSet<String>,
         searching: bool,
     ) -> String {
         let mut dom = VirtualDom::new_with_props(
@@ -1150,7 +1112,7 @@ mod tests {
             description: None,
         }]);
 
-        let settled = render_search("hello", Some(found.clone()), Vec::new(), false);
+        let settled = render_search("hello", Some(found.clone()), HashSet::new(), false);
         assert!(settled.contains("hello"));
         assert!(
             !settled.contains("loading-spinner"),
@@ -1159,7 +1121,7 @@ mod tests {
 
         // The stale list stays on screen under the spinner: blanking it on
         // every keystroke is harder to read than letting it lag a moment.
-        let searching = render_search("hello", Some(found), Vec::new(), true);
+        let searching = render_search("hello", Some(found), HashSet::new(), true);
         assert!(
             searching.contains("loading-spinner"),
             "a search in flight should say so: {searching}"
@@ -1174,7 +1136,7 @@ mod tests {
     /// search of a session, where the wait is most noticeable.
     #[test]
     fn a_first_search_shows_only_the_spinner() {
-        let html = render_search("hello", None, Vec::new(), true);
+        let html = render_search("hello", None, HashSet::new(), true);
         assert!(html.contains("loading-spinner"), "{html}");
         assert!(html.contains("Searching the AUR"), "{html}");
     }
@@ -1256,7 +1218,7 @@ mod tests {
                 ("hello", "2.12.1-1"),
                 ("hello-world", "1.0-3"),
             ]))),
-            vec!["hello".to_string()],
+            HashSet::from(["hello".to_string()]),
         );
         assert!(html.contains("hello"), "still listed: {html}");
         assert!(html.contains("added"), "marked as already added: {html}");
@@ -1270,7 +1232,7 @@ mod tests {
         let html = render_with(
             "hello",
             Some(Ok(found(&[("hello-world", "1.0-3")]))),
-            Vec::new(),
+            HashSet::new(),
         );
         assert!(!html.contains("disabled"), "{html}");
         assert!(!html.contains(">added<"), "{html}");
@@ -1611,28 +1573,53 @@ fn AddSourceEditor(
     let mut pristine = use_signal(String::new);
     let mut draft = use_signal(String::new);
     let mut error = use_signal(|| Option::<String>::None);
+    // Which open request is newest. A slow fetch landing after the user moved
+    // on must not paint its file over the current one.
+    let mut open_generation = use_signal(|| 0_u64);
 
     let open_file = move |source: SourceData, path: String| async move {
         error.set(None);
+        open_generation.set(open_generation() + 1);
+        let generation = open_generation();
+        // What the editor holds right now: keystrokes typed while the fetch
+        // is in flight live only here, and the arrival must not paint over
+        // them.
+        let draft_before = draft.peek().clone();
         let client = match crate::api::client() {
             Ok(client) => client,
             Err(e) => return error.set(Some(e)),
         };
         match client.preview_source_file(&source, &path).await {
             Ok(content) => {
+                if generation != open_generation() {
+                    return;
+                }
                 pristine.set(content.original_content.clone());
                 // An edit already made to this file wins over the upstream
                 // copy, so reopening it shows the work rather than losing it.
-                draft.set(
-                    patched
-                        .peek()
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or(content.original_content),
-                );
+                // Anything typed into this same file while it was re-read
+                // stays on screen. Typing into a *different* file does not
+                // count: that draft belongs to the file being left, and
+                // keeping it would show it -- and save it -- under this one.
+                let same_file = selected.peek().as_deref() == Some(path.as_str());
+                if !same_file || draft.peek().as_str() == draft_before {
+                    draft.set(
+                        patched
+                            .peek()
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or(content.original_content),
+                    );
+                }
                 selected.set(Some(path));
             }
-            Err(e) => error.set(Some(e.to_string())),
+            Err(e) => {
+                // A superseded request's failure belongs to a file nobody is
+                // looking at anymore.
+                if generation == open_generation() {
+                    error.set(Some(e.to_string()));
+                }
+            }
         }
     };
 

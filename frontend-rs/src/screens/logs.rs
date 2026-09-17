@@ -37,11 +37,12 @@ pub fn Logs(view: ViewParams) -> Element {
     let since_boot = use_signal(|| view.since_boot);
 
     // The whole route from live control state, which is what keeps a filtered
-    // log linkable and survives a reload.
+    // log linkable and survives a reload. No search box on this screen, so no
+    // term signal.
     let to_route = move |_: String| Route::Logs {
         view: ViewParams::for_logs(severity(), since_boot()),
     };
-    use_url_view(use_signal(String::new), true, to_route);
+    use_url_view(None, true, to_route);
 
     // Narrowing the log changes what page 1 even is, so start again from it --
     // otherwise a filter applied on page 4 lands past the end of a shorter log.
@@ -128,12 +129,22 @@ fn RunningOperations() -> Element {
     // a slow network it cancels every fetch and the list starves. Here the
     // next fetch starts one interval after the last one completed.
     let mut list = use_signal(Vec::new);
+    // Whether the last fetch failed: an empty list is ambiguous otherwise —
+    // nothing running reads exactly like a dead server.
+    let mut failed = use_signal(|| false);
     use_future(move || async move {
         loop {
-            if let Ok(client) = crate::api::client()
+            // No fetch while hidden: a build server sitting in a background
+            // tab should not emit requests, same rule as `use_poll`. The
+            // sleep below keeps ticking so the return is noticed.
+            if !crate::poll::hidden()
+                && let Ok(client) = crate::api::client()
                 && let Ok(running) = client.active_operations().await
             {
                 list.set(running);
+                failed.set(false);
+            } else if !crate::poll::hidden() {
+                failed.set(true);
             }
             gloo_timers::future::sleep(RUNNING_POLL).await;
         }
@@ -141,7 +152,15 @@ fn RunningOperations() -> Element {
 
     let list = list.read().clone();
     if list.is_empty() {
-        return rsx! {};
+        return if failed() {
+            rsx! {
+                div { class: "alert alert-warning",
+                    span { "Could not reach the server — operations may be running unseen." }
+                }
+            }
+        } else {
+            rsx! {}
+        };
     }
 
     rsx! {

@@ -8,7 +8,7 @@
 use crate::api::client;
 use crate::format::format_bytes;
 use crate::listing::{
-    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
+    ListControls, ListHeader, Page, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
     filter_packages, paginate, sort_packages, use_url_search, use_url_view,
 };
 use crate::routes::Route;
@@ -81,8 +81,46 @@ pub fn Packages(
         q,
     };
     let query = use_url_search(q, sync_url, to_route);
-    use_url_view(query, sync_url, to_route);
+    use_url_view(Some(query), sync_url, to_route);
     let mut page = use_signal(|| 0usize);
+
+    // The scope/filter/sort/paginate pipeline, memoized like the builds
+    // screen's: it re-runs only when its inputs change, not on every render
+    // a poll tick or a parent causes.
+    let rows = use_memo(move || {
+        let query = query();
+        let status = status();
+        let sort = sort();
+        let page = page();
+        let show_all = show_dependencies();
+        match packages.read().as_ref() {
+            None => Rows::Loading,
+            Some(Err(e)) => Rows::Failed(e.clone()),
+            Some(Ok(list)) => {
+                let dependencies = list.iter().filter(|p| !p.directly_requested).count();
+                // The toggle narrows first, so `total` is the size of the
+                // list being searched rather than of the fetch. Otherwise the
+                // count beside the search box would report packages the page
+                // is not showing.
+                let total = if show_all {
+                    list.len()
+                } else {
+                    list.len() - dependencies
+                };
+                let in_scope = list.iter().filter(|pkg| show_all || pkg.directly_requested);
+                let mut shown = filter_packages(in_scope, &query, status);
+                sort_packages(&mut shown, sort);
+                // Sorted first, so a page is a slice of the order on screen
+                // rather than of the order it arrived in.
+                Rows::Ready {
+                    found: shown.len(),
+                    total,
+                    dependencies,
+                    current: paginate(&shown, page),
+                }
+            }
+        }
+    });
 
     // Anything that changes which rows exist puts you back at the start.
     // Without this, narrowing a filter while on page 3 lands on a page that no
@@ -102,55 +140,37 @@ pub fn Packages(
                     }
                 }
 
-                match &*packages.read_unchecked() {
-                    None => rsx! {
+                match &*rows.read() {
+                    Rows::Loading => rsx! {
                         div { class: "flex justify-center p-8",
                             span { class: "loading loading-spinner loading-lg" }
                         }
                     },
-                    Some(Err(e)) => rsx! {
+                    Rows::Failed(e) => rsx! {
                         div { class: "alert alert-error",
                             span { "Could not load packages: {e}" }
                         }
                     },
-                    Some(Ok(list)) if list.is_empty() => rsx! {
+                    // Empty fetch, not an empty scope: with the toggle off and
+                    // only dependencies fetched, `total` is 0 but there are
+                    // packages, so that case reads "nothing matches" below.
+                    Rows::Ready { total: 0, dependencies: 0, .. } => rsx! {
                         div { class: "alert", span { "No packages yet." } }
                     },
-                    Some(Ok(list)) => {
-                        let dependencies = list.iter().filter(|p| !p.directly_requested).count();
-                        // The toggle narrows first, so `total` is the size of
-                        // the list being searched rather than of the fetch.
-                        // Otherwise the count beside the search box would
-                        // report packages the page is not showing. Filtered
-                        // lazily: the old code cloned the whole fetch here on
-                        // every render (every keystroke) before filtering it.
-                        let show_all = show_dependencies();
-                        let in_scope =
-                            list.iter().filter(move |p| show_all || p.directly_requested);
-                        let total = if show_all {
-                            list.len()
-                        } else {
-                            in_scope.clone().count()
-                        };
-                        let mut shown = filter_packages(in_scope, &query(), status());
-                        sort_packages(&mut shown, sort());
-                        let found = shown.len();
-                        // Sorted first, so a page is a slice of the order on
-                        // screen rather than of the order it arrived in.
-                        let current = paginate(&shown, page());
+                    Rows::Ready { found, total, dependencies, current } => {
                         rsx! {
                         ListControls {
                             query,
                             status,
                             placeholder: "Filter packages…",
-                            shown: found,
-                            total,
+                            shown: *found,
+                            total: *total,
                             show_outdated: true,
                             // Sits beside the status filter. Only when there
                             // are dependencies to reveal — a checkbox that
                             // changes nothing invites the reader to wonder
                             // what it is for.
-                            if dependencies > 0 {
+                            if *dependencies > 0 {
                                 label { class: "label cursor-pointer gap-2 py-0",
                                     input {
                                         r#type: "checkbox",
@@ -164,7 +184,7 @@ pub fn Packages(
                                 }
                             }
                         }
-                        if shown.is_empty() {
+                        if *found == 0 {
                             div { class: "alert mt-2", span { "Nothing matches that filter." } }
                         } else {
                         div { class: "overflow-x-auto",
@@ -277,6 +297,21 @@ pub fn Packages(
             }
         }
     }
+}
+
+/// The scope/filter/sort/paginate pipeline's output, memoized in the component.
+/// Same shape as the builds screen's, plus the dependency count the toggle's
+/// checkbox carries. Comparable because [`use_memo`] demands it.
+#[derive(PartialEq)]
+enum Rows {
+    Loading,
+    Failed(String),
+    Ready {
+        found: usize,
+        total: usize,
+        dependencies: usize,
+        current: Page<SimplePackage>,
+    },
 }
 
 /// A package's combined artifact size for the list column.

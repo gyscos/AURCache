@@ -26,18 +26,26 @@ pub fn api_base() -> String {
 /// trip the server gives an unauthenticated full-page load. A plain page jump
 /// rather than a router navigate: `/api/login` is a server route, and a SPA
 /// navigation to it would render a frontend error screen instead of the login.
-pub fn client() -> Result<AurCacheClient, String> {
-    // Read once: each call reaches into the DOM, and the two reads below
-    // must agree with each other anyway.
-    let base = api_base();
-    let login_url = format!("{base}/login");
-    AurCacheClient::new(base, None)
-        .map(|client| {
-            client.on_unauthorized(move || {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.location().assign(&login_url);
-                }
+/// One process-wide client: building one per call would throw away connection
+/// pooling on every poll tick, and re-read the DOM for a base URL that cannot
+/// change without a page load.
+static CLIENT: std::sync::LazyLock<Result<AurCacheClient, String>> =
+    std::sync::LazyLock::new(|| {
+        // Read once: each call reaches into the DOM, and the two reads below
+        // must agree with each other anyway.
+        let base = api_base();
+        let login_url = format!("{base}/login");
+        AurCacheClient::new(base, None)
+            .map(|client| {
+                client.on_unauthorized(move || {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().assign(&login_url);
+                    }
+                })
             })
-        })
-        .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())
+    });
+
+pub fn client() -> Result<AurCacheClient, String> {
+    CLIENT.clone()
 }

@@ -738,6 +738,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurcache-common",
+ "bytes",
  "reqwest",
  "serde",
  "serde_json",

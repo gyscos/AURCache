@@ -4,7 +4,7 @@ use crate::api::client;
 use crate::dates::DateOnly;
 use crate::format::{format_bytes, format_duration};
 use crate::listing::{
-    ListControls, ListHeader, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
+    ListControls, ListHeader, Page, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
     filter_builds, paginate, sort_builds, use_url_search, use_url_view,
 };
 use crate::routes::Route;
@@ -56,8 +56,32 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
         q,
     };
     let query = use_url_search(q, true, to_route);
-    use_url_view(query, true, to_route);
+    use_url_view(Some(query), true, to_route);
     let mut page = use_signal(|| 0usize);
+
+    // The filter/sort/paginate pipeline, memoized: it re-runs only when its
+    // inputs change (new data, new query/filter/sort/page), not on every
+    // render a poll tick or a parent causes. The list only grows, so an
+    // unmemoized render re-filters, re-sorts and re-clones all of it.
+    let rows = use_memo(move || {
+        let query = query();
+        let status = status();
+        let sort = sort();
+        let page = page();
+        match builds.read().as_ref() {
+            None => Rows::Loading,
+            Some(Err(e)) => Rows::Failed(e.clone()),
+            Some(Ok(list)) => {
+                let mut shown = filter_builds(list, &query, status);
+                sort_builds(&mut shown, sort);
+                Rows::Ready {
+                    found: shown.len(),
+                    total: list.len(),
+                    current: paginate(&shown, page),
+                }
+            }
+        }
+    });
 
     // Changing what is listed puts you back at the start; see the same effect
     // on the packages screen.
@@ -68,33 +92,29 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
             div { class: "card-body",
                 ListHeader { title: "Builds" }
 
-                match &*builds.read_unchecked() {
-                    None => rsx! {
+                match &*rows.read() {
+                    Rows::Loading => rsx! {
                         div { class: "flex justify-center p-8",
                             span { class: "loading loading-spinner loading-lg" }
                         }
                     },
-                    Some(Err(e)) => rsx! {
+                    Rows::Failed(e) => rsx! {
                         div { class: "alert alert-error", span { "Could not load builds: {e}" } }
                     },
-                    Some(Ok(list)) if list.is_empty() => rsx! {
+                    Rows::Ready { total: 0, .. } => rsx! {
                         div { class: "alert", span { "No builds yet." } }
                     },
-                    Some(Ok(list)) => {
-                        let mut shown = filter_builds(list, &query(), status());
-                        sort_builds(&mut shown, sort());
-                        let (found, total) = (shown.len(), list.len());
-                        let current = paginate(&shown, page());
+                    Rows::Ready { found, total, current } => {
                         rsx! {
                         ListControls {
                             query,
                             status,
                             placeholder: "Filter by package or build…",
-                            shown: found,
-                            total,
+                            shown: *found,
+                            total: *total,
                             show_outdated: false,
                         }
-                        if shown.is_empty() {
+                        if *found == 0 {
                             div { class: "alert mt-2", span { "Nothing matches that filter." } }
                         } else {
                         div { class: "overflow-x-auto",
@@ -205,6 +225,20 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
             }
         }
     }
+}
+
+/// The filter/sort/paginate pipeline's output, memoized in the component.
+/// Comparable because [`use_memo`] demands it, which is also what skips a
+/// re-render when a poll tick changes nothing.
+#[derive(PartialEq)]
+enum Rows {
+    Loading,
+    Failed(String),
+    Ready {
+        found: usize,
+        total: usize,
+        current: Page<Build>,
+    },
 }
 
 /// A build's output size for the list column.

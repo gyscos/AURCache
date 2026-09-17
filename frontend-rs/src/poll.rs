@@ -30,7 +30,9 @@ const HIDDEN: Duration = Duration::from_secs(2);
 /// tick after it becomes visible again.
 ///
 /// `busy` is read every render, so a page that goes from idle to active
-/// shortens the *next* wait rather than taking a whole idle interval to notice.
+/// shortens the wait in progress (within one [`CHUNK`]), not just the next
+/// one: an idle page would otherwise take a whole idle interval to notice a
+/// build that started elsewhere.
 pub fn use_poll<T: 'static>(mut resource: Resource<T>, busy: bool) {
     // The loop reads this rather than closing over `busy` directly, because the
     // future is spawned once and `busy` changes over the life of the page.
@@ -50,7 +52,7 @@ pub fn use_poll<T: 'static>(mut resource: Resource<T>, busy: bool) {
                 // full idle interval on the stale data the hidden tab kept.
                 was_hidden = false;
             } else {
-                gloo_timers::future::sleep(interval()).await;
+                sleep_interval(interval).await;
                 // Re-check rather than trust the value from before the sleep:
                 // the tab may have been hidden the whole time.
                 if hidden() {
@@ -62,6 +64,29 @@ pub fn use_poll<T: 'static>(mut resource: Resource<T>, busy: bool) {
     });
 }
 
+/// The wait granularity: an idle→active flip applies at the next chunk
+/// boundary rather than after the whole idle interval.
+const CHUNK: Duration = Duration::from_secs(5);
+
+/// Sleep `interval()`, re-reading it every [`CHUNK`] so a flip applies
+/// mid-wait: shrinking the interval below the time already waited ends the
+/// wait, growing it extends it. Returns early when the tab hides.
+async fn sleep_interval(interval: Signal<Duration>) {
+    let mut waited = Duration::ZERO;
+    loop {
+        let wait = interval();
+        if waited >= wait {
+            break;
+        }
+        let chunk = (wait - waited).min(CHUNK);
+        gloo_timers::future::sleep(chunk).await;
+        if hidden() {
+            break;
+        }
+        waited += chunk;
+    }
+}
+
 const fn pick(busy: bool) -> Duration {
     if busy { ACTIVE } else { IDLE }
 }
@@ -69,7 +94,7 @@ const fn pick(busy: bool) -> Duration {
 /// Whether the tab is currently not visible. Any failure to tell is treated as
 /// visible: a missed pause costs one request, a wrong "hidden" would freeze the
 /// page silently.
-fn hidden() -> bool {
+pub(crate) fn hidden() -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .is_some_and(|d| d.hidden())

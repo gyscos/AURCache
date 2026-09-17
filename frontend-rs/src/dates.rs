@@ -260,11 +260,11 @@ pub fn AbsoluteDate(ts: Option<i64>) -> Element {
 #[component]
 pub fn DateOnly(ts: Option<i64>) -> Element {
     let style = use_date_style();
-    let full = absolute(ts, style());
-    let short = ts.map_or_else(
-        || "—".to_string(),
-        |ts| render_date(local_parts(ts), style()),
-    );
+    // Converted once: `absolute` would run the same `local_parts` conversion
+    // a second time for the hover text.
+    let parts = ts.map(local_parts);
+    let full = parts.map_or_else(|| "—".to_string(), |parts| render(parts, style()));
+    let short = parts.map_or_else(|| "—".to_string(), |parts| render_date(parts, style()));
 
     rsx! {
         span { title: "{full}", "{short}" }

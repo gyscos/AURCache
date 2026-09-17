@@ -80,19 +80,33 @@ pub(crate) fn name_segments(name: &str) -> Vec<String> {
     name.split('/').map(str::to_string).collect()
 }
 
+/// Names claimed by more than one worker: a link to one of those goes by
+/// fingerprint, never by name.
+///
+/// Counted once per table render rather than once per row — the fleet only
+/// grows, and asking the whole fleet per row is quadratic.
+pub(crate) fn shared_names(fleet: &[WorkerRow]) -> std::collections::HashSet<&str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut shared = std::collections::HashSet::new();
+    for worker in fleet {
+        if !seen.insert(worker.name.as_str()) {
+            shared.insert(worker.name.as_str());
+        }
+    }
+    shared
+}
+
 /// The URL for a worker, among the fleet it belongs to.
 ///
 /// The bare name wherever it is unambiguous, which is nearly always. A worker
 /// sharing its name with another is linked by fingerprint instead, so a link
 /// from the list never lands on a chooser -- that is for a name someone typed
 /// or pasted.
+///
+/// `shared` comes from [`shared_names`]: the table counts once per render and
+/// hands each row its answer.
 #[must_use]
-pub(crate) fn worker_route(worker: &WorkerRow, fleet: &[WorkerRow]) -> Route {
-    let shared = fleet
-        .iter()
-        .filter(|other| other.name == worker.name)
-        .count()
-        > 1;
+pub(crate) fn worker_route(worker: &WorkerRow, shared: bool) -> Route {
     if shared {
         Route::WorkerByFingerprint {
             fingerprint: short_fingerprint(&worker.cert_fingerprint),
@@ -482,7 +496,8 @@ fn SourceNote(decl: SettingDecl, effective: EffectiveSetting) -> Element {
 #[cfg(test)]
 mod tests {
     use super::{
-        Resolved, group_by_category, name_segments, resolve, short_fingerprint, worker_route,
+        Resolved, group_by_category, name_segments, resolve, shared_names, short_fingerprint,
+        worker_route,
     };
     use crate::routes::Route;
     use aurcache_client::{ApprovalStatus, Worker as WorkerRow};
@@ -568,23 +583,33 @@ mod tests {
             "aaaa1111",
             ApprovalStatus::Approved,
         )];
+        let shared = shared_names(&unique);
+        assert!(shared.is_empty());
         assert_eq!(
-            worker_route(&unique[0], &unique),
+            worker_route(&unique[0], shared.contains("builder-01")),
             Route::Worker {
                 name: vec!["builder-01".to_string()]
             }
         );
 
-        let shared = [
+        let fleet = [
             worker(1, "builder-01", "aaaa11112222", ApprovalStatus::Revoked),
             worker(2, "builder-01", "bbbb22223333", ApprovalStatus::Approved),
+            worker(3, "builder-arm", "cccc33334444", ApprovalStatus::Approved),
         ];
+        let shared = shared_names(&fleet);
+        assert_eq!(shared, ["builder-01"].into_iter().collect());
         assert_eq!(
-            worker_route(&shared[1], &shared),
+            worker_route(&fleet[1], shared.contains("builder-01")),
             Route::WorkerByFingerprint {
                 fingerprint: "bbbb22223333".to_string(),
             }
         );
+        // Everyone else still links by name.
+        assert!(matches!(
+            worker_route(&fleet[2], shared.contains("builder-arm")),
+            Route::Worker { .. }
+        ));
     }
 
     /// A name with a slash in it goes into the URL in one piece and comes back
@@ -593,7 +618,7 @@ mod tests {
     #[test]
     fn a_name_with_a_slash_survives_the_url() {
         let fleet = [worker(1, "ci/runner", "aaaa1111", ApprovalStatus::Approved)];
-        let Route::Worker { name } = worker_route(&fleet[0], &fleet) else {
+        let Route::Worker { name } = worker_route(&fleet[0], false) else {
             panic!("a unique name should link by name");
         };
         assert_eq!(name, vec!["ci".to_string(), "runner".to_string()]);

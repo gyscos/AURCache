@@ -43,7 +43,7 @@ pub use aurcache_common::api::worker::{
 pub use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
-pub use aurcache_common::source::{GitSourceSpec, SourceData, looks_like_git_url};
+pub use aurcache_common::source::{GitSourceSpec, SourceData, looks_like_git_url, source_label};
 use reqwest::Response;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -122,13 +122,16 @@ pub enum ApiReachability {
 #[cfg(not(target_arch = "wasm32"))]
 const CLIENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long one request may take overall. Every call through this client is a
-/// quick API round trip — except the dump-restore upload, which overrides this
-/// per request — so two minutes is a hung socket, not a slow server.
+/// quick API round trip — except a dump, which overrides this per request —
+/// so two minutes is a hung socket, not a slow server.
 const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// How long a dump may take to travel either way, the restore upload and the
 /// download alike: up to 64 MiB on a slow link.
 const CLIENT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Cheap to clone (the pool is shared): screens hold one per resource, and the
+/// browser frontend keeps a single process-wide client.
+#[derive(Clone)]
 pub struct AurCacheClient {
     base_url: String,
     /// The base as a parsed URL (with trailing slash), so per-request paths
@@ -851,7 +854,7 @@ impl AurCacheClient {
     /// nothing to watch.
     pub async fn restore(
         &self,
-        archive: Vec<u8>,
+        archive: bytes::Bytes,
         dry_run: bool,
         on_existing: &str,
         clear: bool,

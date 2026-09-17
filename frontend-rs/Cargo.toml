@@ -57,6 +57,9 @@ js-sys = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["async-await", "alloc"] }
 # Timers: the build log polls, so it needs a sleep that works in the browser.
 gloo-timers = { version = "0.4", features = ["futures"] }
+# Zero-copy dump upload: the file reader hands back `Bytes`, the signal holds
+# them, and the client streams them into the request body without copying.
+bytes = "1"
 web-sys = { version = "0.3", features = ["Clipboard", "Document", "Element", "EventTarget", "History", "Location", "MediaQueryList", "Navigator", "Storage", "Window"] }
 
 [profile.release]

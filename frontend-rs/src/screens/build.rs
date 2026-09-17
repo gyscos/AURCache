@@ -444,6 +444,15 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
             let mut next_offset: u64 = 0;
 
             loop {
+                // No fetch while hidden: a log page sitting in a background
+                // tab should not emit two requests per interval, same rule as
+                // `use_poll`. The sleep at the loop's end keeps ticking so
+                // the return is noticed, at most one interval late.
+                if crate::poll::hidden() {
+                    gloo_timers::future::TimeoutFuture::new(POLL_INTERVAL_MS).await;
+                    continue;
+                }
+
                 // The build's state first, each cycle: status, worker, start
                 // and end times, and — from the detail route only — the log's
                 // size. The output fetch is gated on this, so a hiccup on the

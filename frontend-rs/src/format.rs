@@ -10,6 +10,7 @@ pub fn now_secs() -> i64 {
 ///
 /// `None` for either end means the build has not finished (or never started),
 /// which is not a zero-length build — so it reads as unknown rather than `0s`.
+/// Validates the endpoints, then the one ladder in [`format_secs`] renders it.
 pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
     let (Some(start), Some(end)) = (start, end) else {
         return "—".to_string();
@@ -20,11 +21,14 @@ pub fn format_duration(start: Option<i64>, end: Option<i64>) -> String {
         // Showing a negative duration is worse than admitting it is unknown.
         return "—".to_string();
     }
-    match secs {
-        0..=59 => format!("{secs}s"),
-        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
-        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    // Zero stays `0s`, not [`format_secs`]' "—": a measured instant build is
+    // known, where a zero average means no builds to average.
+    if secs == 0 {
+        return "0s".to_string();
     }
+    // Saturating: only a >136-year build overflows `u32`, and that formats as
+    // a very large hour count rather than wrapping to seconds.
+    format_secs(u32::try_from(secs).unwrap_or(u32::MAX))
 }
 
 /// A byte count, at the largest unit that leaves a number worth reading.

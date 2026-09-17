@@ -20,12 +20,42 @@ use std::time::Duration;
 
 use crate::listing::ViewParams;
 use aurcache_client::{
-    AddPackageRequest, AddPackagesRequest, BulkAddOutcome, RestoreOutcome, SourceData,
+    AddPackageRequest, AddPackagesRequest, BulkAddOutcome, RestoreOutcome, SourceData, source_label,
 };
 use dioxus::prelude::*;
 
 /// How often to ask a running bulk add what it has done.
 const POLL_INTERVAL: Duration = Duration::from_millis(700);
+/// How many consecutive poll failures to ride out before admitting the job is
+/// lost: a sleeping laptop, a proxy hiccup, a server restart — none of which
+/// says anything about the packages, which may still be landing.
+const MAX_POLL_FAILURES: u32 = 10;
+
+/// Record one failed poll of a running job. Returns whether the follower
+/// should give up: past [`MAX_POLL_FAILURES`] the job is genuinely lost and
+/// the card says so, but below that the caller backs off and retries — a lone
+/// transient must not report running packages as failed.
+fn note_poll_failure(
+    jobs: Signal<Vec<Job>>,
+    id: u64,
+    job: &str,
+    failures: &mut u32,
+    error: String,
+) -> bool {
+    *failures += 1;
+    if *failures > MAX_POLL_FAILURES {
+        // `entry`, not `job`: the closure parameter shadows the job-kind
+        // name above, which is what the message wants.
+        update_job(jobs, id, |entry| {
+            entry
+                .failed
+                .push((String::new(), format!("lost track of the {job}: {error}")));
+            entry.finished = true;
+        });
+        return true;
+    }
+    false
+}
 
 /// What the dialog hands over when it closes.
 #[derive(Clone, PartialEq)]
@@ -262,29 +292,6 @@ fn still_watched(jobs: Signal<Vec<Job>>, id: u64) -> bool {
     jobs.read().iter().any(|job| job.id == id)
 }
 
-/// The label a failure is reported against, matching what the request carried.
-fn source_label(source: &SourceData) -> String {
-    match source {
-        SourceData::Aur { name } => name.clone(),
-        SourceData::Git { spec } => {
-            let mut label = spec.url.clone();
-            if !spec.r#ref.is_empty() {
-                label.push('#');
-                label.push_str(&spec.r#ref);
-            }
-            if !spec.subfolder.is_empty() {
-                label.push('/');
-                label.push_str(&spec.subfolder);
-            }
-            label
-        }
-        // This dialog never builds one -- the upload it belongs to was never
-        // implemented server-side -- but the variant exists, so it gets a label
-        // rather than a panic.
-        SourceData::Upload { .. } => "uploaded archive".to_string(),
-    }
-}
-
 /// Add every source in one batched request, then follow the job.
 ///
 /// Batched because resolving each source to its pkgbase is an AUR request, and
@@ -323,6 +330,7 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
     };
 
     let mut seen = 0_usize;
+    let mut failures = 0_u32;
     loop {
         // Dismissed: stop asking. The job carries on server-side.
         if !still_watched(jobs, id) {
@@ -330,17 +338,19 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
         }
 
         let progress = match client.bulk_add_progress(accepted.job_id, seen).await {
-            Ok(progress) => progress,
+            Ok(progress) => {
+                failures = 0;
+                progress
+            }
             // The job is still running and we have merely lost sight of it, so
             // say that rather than reporting packages as failed, which they
-            // are not.
+            // are not — but only after sustained failure, not one transient.
             Err(e) => {
-                update_job(jobs, id, |job| {
-                    job.failed
-                        .push((String::new(), format!("lost track of the add: {e}")));
-                    job.finished = true;
-                });
-                return;
+                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string()) {
+                    return;
+                }
+                gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
+                continue;
             }
         };
 
@@ -405,20 +415,23 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
     };
 
     let mut seen = 0_usize;
+    let mut failures = 0_u32;
     loop {
         if !still_watched(jobs, id) {
             return;
         }
 
         let progress = match client.bulk_add_progress(operation, seen).await {
-            Ok(progress) => progress,
+            Ok(progress) => {
+                failures = 0;
+                progress
+            }
             Err(e) => {
-                update_job(jobs, id, |job| {
-                    job.failed
-                        .push((String::new(), format!("lost track of the add: {e}")));
-                    job.finished = true;
-                });
-                return;
+                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string()) {
+                    return;
+                }
+                gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
+                continue;
             }
         };
 
@@ -484,20 +497,23 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
     };
 
     let mut seen = 0_usize;
+    let mut failures = 0_u32;
     loop {
         if !still_watched(jobs, id) {
             return;
         }
 
         let progress = match client.restore_progress(operation, seen).await {
-            Ok(progress) => progress,
+            Ok(progress) => {
+                failures = 0;
+                progress
+            }
             Err(e) => {
-                update_job(jobs, id, |job| {
-                    job.failed
-                        .push((String::new(), format!("lost track of the restore: {e}")));
-                    job.finished = true;
-                });
-                return;
+                if note_poll_failure(jobs, id, "restore", &mut failures, e.to_string()) {
+                    return;
+                }
+                gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
+                continue;
             }
         };
 
@@ -652,7 +668,10 @@ fn JobCard(id: u64) -> Element {
         }
     });
 
-    let Some(job) = jobs.read().iter().find(|job| job.id == id).cloned() else {
+    // Borrowed, not cloned: the card re-renders on every poll tick, and the
+    // job carries the whole succeeded/failed history.
+    let jobs_guard = jobs.read();
+    let Some(job) = jobs_guard.iter().find(|job| job.id == id) else {
         return rsx! {};
     };
 
@@ -678,10 +697,10 @@ fn JobCard(id: u64) -> Element {
                         // way there: it already names the thing that was just
                         // added, and reading "Adding hello" and then hunting
                         // for hello in the list is a step nobody wanted.
-                        if let Some(pkgbase) = landed.clone() {
+                        if let Some(pkgbase) = &landed {
                             Link {
                                 class: "font-medium text-sm truncate link link-hover block",
-                                to: crate::routes::Route::Package { pkgbase },
+                                to: crate::routes::Route::Package { pkgbase: pkgbase.clone() },
                                 "{title}"
                             }
                         } else {
@@ -708,7 +727,7 @@ fn JobCard(id: u64) -> Element {
 
                 // Only while there is more to come: the name of the last
                 // package is not interesting once the job is done.
-                if let Some(current) = job.current.clone()
+                if let Some(current) = &job.current
                     && !job.finished
                 {
                     div { class: "text-xs opacity-60 truncate", "{current}" }
@@ -726,7 +745,7 @@ fn JobCard(id: u64) -> Element {
                 // that did not add is something to act on.
                 if failed {
                     div { class: "text-xs space-y-1 max-h-32 overflow-y-auto",
-                        for (name , error) in job.failed.clone() {
+                        for (name , error) in &job.failed {
                             div { class: "text-error break-words",
                                 if name.is_empty() {
                                     "{error}"
@@ -739,7 +758,7 @@ fn JobCard(id: u64) -> Element {
                 }
 
                 if job.finished && !failed {
-                    if let Some(pkgbase) = landed {
+                    if let Some(pkgbase) = &landed {
                         Link {
                             class: "btn btn-ghost btn-xs self-start",
                             to: crate::routes::Route::Package { pkgbase: pkgbase.clone() },
