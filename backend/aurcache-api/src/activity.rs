@@ -1,5 +1,6 @@
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use crate::utils::pagination::clamp_limit;
 use aurcache_activitylog::activity_utils::{ActivityPage, ActivityStore, LogFilter, Severity};
 use rocket::http::Status;
 use rocket::serde::json::Json;
@@ -9,15 +10,6 @@ use utoipa::OpenApi;
 #[derive(OpenApi)]
 #[openapi(paths(activity))]
 pub struct ActivityApi;
-
-/// Largest page the endpoint will return.
-///
-/// A ceiling rather than a default: the log only grows, and an unbounded
-/// `limit` would let one request ask for all of it.
-const MAX_LIMIT: u64 = 500;
-
-/// Page size when the caller does not say.
-const DEFAULT_LIMIT: u64 = 100;
 
 #[utoipa::path(
     responses(
@@ -33,7 +25,7 @@ pub async fn activity(
     severity: Option<String>,
     since_boot: Option<bool>,
 ) -> Result<Json<ActivityPage>, ApiError> {
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = clamp_limit(limit);
     // A severity nobody recognises narrows nothing, the way an unreadable
     // filter in a URL degrades to "any" everywhere else in this app.
     let filter = LogFilter {

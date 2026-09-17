@@ -19,6 +19,7 @@ use utoipa::ToSchema;
 
 use crate::models::authenticated::Authenticated;
 use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, is_user_allowed};
+use crate::utils::error::{ApiError, err};
 
 #[derive(OpenApi)]
 #[openapi(paths(oauth_login, oauth_callback, regenerate_api_token_endpoint))]
@@ -202,19 +203,23 @@ pub async fn oauth_callback(
 #[utoipa::path(
     responses(
         (status = 200, description = "Regenerate the signed-in user's API token", body = ApiTokenResponse),
+        (status = 401, description = "No authenticated user"),
+        (status = 500, description = "Could not mint or store a token"),
     )
 )]
 #[post("/token/regenerate")]
 pub async fn regenerate_api_token_endpoint(
     db: &State<DatabaseConnection>,
     a: Authenticated,
-) -> Result<Json<ApiTokenResponse>, Unauthorized<String>> {
+) -> Result<Json<ApiTokenResponse>, ApiError> {
     let username = a
         .username
-        .ok_or_else(|| Unauthorized("No authenticated user available".to_string()))?;
+        .ok_or_else(|| err(Status::Unauthorized, "No authenticated user available"))?;
+    // A failure here is the server's (database, entropy), not the caller's:
+    // answering 401 would log the user out for a fault on our side.
     let token = regenerate_api_token(db, &username)
         .await
-        .map_err(|e| Unauthorized(e.to_string()))?;
+        .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(Json(ApiTokenResponse { token }))
 }
 

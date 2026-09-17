@@ -89,6 +89,7 @@ async fn package_by_pkgbase(
 #[openapi(paths(
     package_add_endpoint,
     packages_add_endpoint,
+    active_operations,
     bulk_add_progress,
     package_update_entity_endpoint,
     package_update_endpoint,

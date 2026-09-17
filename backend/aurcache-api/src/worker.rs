@@ -213,6 +213,7 @@ impl<'r> FromRequest<'r> for WorkerAuth {
     register_worker,
     register_status,
     get_ca,
+    get_ca_fingerprint,
     list_workers,
     worker_config,
     worker_join_info,

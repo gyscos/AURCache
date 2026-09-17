@@ -225,6 +225,14 @@ pub async fn store_effective_config<C: ConnectionTrait>(
     Ok(())
 }
 
+/// How fresh `last_seen` may be before a touch is skipped.
+///
+/// Liveness resolves at minute granularity (the timeout is 60 s), so
+/// rewriting the row on every log chunk or 5 s heartbeat is write
+/// amplification for no signal. A touch that carries a *changed* version
+/// still writes through immediately — the version is data, not liveness.
+const TOUCH_THROTTLE_SECS: i64 = 10;
+
 /// Update a worker's `last_seen` (and optionally its reported version).
 pub async fn touch_last_seen<C: ConnectionTrait>(
     db: &C,
@@ -234,8 +242,16 @@ pub async fn touch_last_seen<C: ConnectionTrait>(
     let Some(worker) = Workers::find_by_id(id).one(db).await? else {
         return Ok(());
     };
+    let now = now_secs();
+    let version_changed = version.is_some_and(|v| worker.version.as_deref() != Some(v));
+    let fresh = worker
+        .last_seen
+        .is_some_and(|seen| now.saturating_sub(seen) < TOUCH_THROTTLE_SECS);
+    if fresh && !version_changed {
+        return Ok(());
+    }
     let mut active: workers::ActiveModel = worker.into();
-    active.last_seen = Set(Some(now_secs()));
+    active.last_seen = Set(Some(now));
     if let Some(v) = version {
         active.version = Set(Some(v.to_string()));
     }
@@ -527,5 +543,45 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Liveness touches are throttled: a fresh row is not rewritten, so log
+    /// chunks and 5 s heartbeats stop paying a write per request — but a
+    /// stale row still refreshes and a changed version still writes through.
+    #[tokio::test]
+    async fn touch_skips_fresh_rows_but_records_staleness_and_versions() {
+        async fn last_seen(db: &DatabaseConnection, id: i32) -> Option<i64> {
+            Workers::find_by_id(id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_seen
+        }
+
+        let db = setup().await;
+        let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+
+        // A stale row refreshes.
+        let mut stale: workers::ActiveModel = Workers::find_by_id(w.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        stale.last_seen = Set(Some(now_secs() - 30));
+        stale.update(&db).await.unwrap();
+        touch_last_seen(&db, w.id, None).await.unwrap();
+        let touched = last_seen(&db, w.id).await.unwrap();
+        assert!(now_secs() - touched < TOUCH_THROTTLE_SECS);
+
+        // A fresh row is left alone.
+        touch_last_seen(&db, w.id, None).await.unwrap();
+        assert_eq!(last_seen(&db, w.id).await, Some(touched));
+
+        // A changed version writes through even when fresh.
+        touch_last_seen(&db, w.id, Some("9.9.9")).await.unwrap();
+        let bumped = Workers::find_by_id(w.id).one(&db).await.unwrap().unwrap();
+        assert_eq!(bumped.version.as_deref(), Some("9.9.9"));
     }
 }

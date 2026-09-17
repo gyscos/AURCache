@@ -22,6 +22,7 @@ use rocket::fs::NamedFile;
 use rocket::http::{ContentType, Header};
 use rocket::response::Responder;
 use sea_orm::FromQueryResult;
+use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait, Select,
@@ -210,8 +211,12 @@ async fn list_builds_impl(
     limit: Option<u64>,
     page: Option<u64>,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
+    // `COALESCE` rather than a bare column: never-started builds hold NULL
+    // here, and SQLite and Postgres disagree on where NULLs sort. Coalescing
+    // to 0 puts them last on both backends instead of first-on-Postgres.
+    let started = Func::coalesce([Expr::col((Builds, builds::Column::StartTime)), Expr::val(0)]);
     let basequery = build_row_select()
-        .order_by(builds::Column::StartTime, Order::Desc)
+        .order_by(started, Order::Desc)
         .limit(limit)
         .offset(page.zip(limit).map(|(page, limit)| page * limit));
 
@@ -439,8 +444,10 @@ pub async fn cancel_build(
     // Cancellation still travels by row id on the internal queue; only the way
     // the caller names the build has changed.
     let build_id = build_by_number(db.inner(), pkgbase, number).await?.id;
-    tx.send(Action::Cancel(build_id))
-        .map_err(|e| err(Status::InternalServerError, e))?;
+    // A send failure means no receiver, i.e. the coordinator is gone and the
+    // process is shutting down — nothing a 500 could fix, and every other
+    // broadcast send ignores it the same way.
+    let _ = tx.send(Action::Cancel(build_id));
 
     Ok(())
 }
