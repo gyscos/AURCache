@@ -249,9 +249,12 @@ fn resolve(spec: SettingSpec) -> Entry {
     let mut chosen: Option<(String, EffectiveSource)> = None;
     for (raw, source, var) in candidates {
         let Some(raw) = raw else { continue };
-        match spec.kind.validate(raw) {
+        // Validated as stored: the stored form is trimmed, so validating the
+        // raw value rejects entries over insignificant whitespace.
+        let trimmed = raw.trim();
+        match spec.kind.validate(trimmed) {
             Ok(()) => {
-                chosen = Some((raw.trim().to_string(), source));
+                chosen = Some((trimmed.to_string(), source));
                 break;
             }
             Err(why) => {
@@ -267,7 +270,7 @@ fn resolve(spec: SettingSpec) -> Entry {
     // no pin and nothing from the server.
     let fallback = env_default
         .as_deref()
-        .filter(|raw| spec.kind.validate(raw).is_ok())
+        .filter(|raw| spec.kind.validate(raw.trim()).is_ok())
         .map(|raw| raw.trim().to_string())
         .or_else(|| spec.default.as_written());
 
@@ -462,6 +465,24 @@ mod tests {
         assert_eq!(entry.value.as_deref(), Some("1T"));
         assert_eq!(entry.source, EffectiveSource::Env);
         unsafe { std::env::remove_var("AURCACHE_TEST_PIN") };
+    }
+
+    /// Validated as stored: surrounding whitespace must not reject a value
+    /// the trimmed form satisfies.
+    #[test]
+    fn surrounding_whitespace_does_not_reject_a_valid_value() {
+        unsafe { std::env::set_var("AURCACHE_TEST_PADDED", " 4 ") };
+        let entry = resolved(spec(
+            "AURCACHE_TEST_PADDED",
+            ValueKind::Integer {
+                min: Some(1),
+                max: None,
+            },
+            Builtin::Integer(1),
+        ));
+        assert_eq!(entry.value.as_deref(), Some("4"));
+        assert_eq!(entry.status, SettingStatus::Applied);
+        unsafe { std::env::remove_var("AURCACHE_TEST_PADDED") };
     }
 
     /// `_DEFAULT` is used when nothing pins, and is what the declaration

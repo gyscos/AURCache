@@ -135,6 +135,10 @@ pub async fn start(data_dir: &Path, key: &Path, build_user: &str) -> Result<Opti
     // Its own process group, so `Drop` can take down the agent together with
     // the `sudo` that started it.
     spawn.process_group(0);
+    // Backstop for the window before `BuildAgent` (whose `Drop` kills the
+    // group) exists: a socket timeout or a failed key load below must not
+    // orphan the agent.
+    spawn.kill_on_drop(true);
     let child = spawn.spawn().context("starting ssh-agent")?;
 
     wait_for_socket(&socket).await?;
@@ -273,13 +277,27 @@ fn set_group_and_mode(path: &Path, mode: u32) -> Result<()> {
 
 #[cfg(unix)]
 fn group_id(name: &str) -> Option<u32> {
-    // Read from the group database rather than shelling out to `id`, which
-    // would be a process per call for one lookup.
-    let groups = std::fs::read_to_string("/etc/group").ok()?;
-    groups.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        (fields.next()? == name).then(|| fields.nth(1)?.parse().ok())?
-    })
+    // Through the group *database*, like `user_id` above: `/etc/group` is
+    // only one NSS source, and hosts with LDAP/sssd/systemd-homed groups
+    // would otherwise silently skip the chown and leave builds unable to
+    // reach the agent socket.
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::group = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: same shape as `user_id` above — NUL-terminated input that
+    // outlives the call, valid out-parameters, and the `_r` form so
+    // concurrent callers do not race on static storage.
+    let rc = unsafe {
+        libc::getgrnam_r(
+            c_name.as_ptr(),
+            &raw mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut found,
+        )
+    };
+    (rc == 0 && !found.is_null()).then_some(grp.gr_gid)
 }
 
 #[cfg(unix)]
@@ -381,5 +399,28 @@ mod tests {
     #[test]
     fn an_unknown_group_is_not_an_error() {
         assert!(group_id("definitely-not-a-real-group-name").is_none());
+    }
+
+    /// The gid lookup agrees with the group database on a real group, the
+    /// way the uid lookup does for users.
+    #[test]
+    fn the_gid_lookup_reads_the_group_database() {
+        assert_eq!(group_id("root"), Some(0));
+        // This host's own primary group, asked of the system like the user
+        // lookup above.
+        let out = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .expect("`id -gn` names this process's group");
+        let mine = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(group_id(&mine), users_own_gid());
+    }
+
+    /// This process's own gid, for the lookup above to agree with.
+    fn users_own_gid() -> Option<u32> {
+        let out = std::process::Command::new("id").arg("-g").output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().parse().ok())?
     }
 }

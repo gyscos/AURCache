@@ -113,18 +113,31 @@ fn with_base_url(template: &str, base: &str) -> String {
 /// result means "no reconciliation", never a URL nobody wrote.
 #[must_use]
 pub fn repo_db_url(section: &str, arch: &str) -> Option<String> {
-    let name = section
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix('[')
-                .and_then(|rest| rest.split(']').next())
-        })
-        .filter(|n| !n.is_empty())?;
-    let server = section
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix("Server =").map(str::trim))
-        .filter(|s| !s.is_empty())?;
+    // The name and the server line belong together: the DB filename comes
+    // from the header of the section *containing* the `Server =` line, not
+    // from the first header anywhere in the file. Pairing them independently
+    // misresolves the moment another section (e.g. `[options]`) precedes it.
+    let mut name: Option<&str> = None;
+    let mut server: Option<&str> = None;
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.split(']').next())
+            .filter(|n| !n.is_empty())
+        {
+            name = Some(header);
+        } else if let Some(s) = trimmed
+            .strip_prefix("Server =")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Stop here: a header further down belongs to another section.
+            server = Some(s);
+            break;
+        }
+    }
+    let (name, server) = (name?, server?);
     let mut url = url::Url::parse(server).ok()?;
     if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
         return None;
@@ -347,6 +360,25 @@ mod tests {
         assert_eq!(
             repo_db_url(section, "aarch64").as_deref(),
             Some("http://host:8081/aarch64/myrepo.db")
+        );
+    }
+
+    /// The name comes from the section holding the `Server =` line, not the
+    /// first header in the file: a real `pacman.conf` has `[options]` (and
+    /// friends) above the appended `[repo]` section, which used to resolve
+    /// to `options.db` and skip every reconcile with a 404.
+    #[test]
+    fn db_url_pairs_the_server_line_with_its_own_section() {
+        let conf = "[options]\nHoldPkg = pacman\n[repo]\nServer = http://host:8081/$arch\n";
+        assert_eq!(
+            repo_db_url(conf, "x86_64").as_deref(),
+            Some("http://host:8081/x86_64/repo.db")
+        );
+        // Nor from a header that follows it.
+        let conf = "[repo]\nServer = http://host:8081/$arch\n[extra]\nInclude = x\n";
+        assert_eq!(
+            repo_db_url(conf, "x86_64").as_deref(),
+            Some("http://host:8081/x86_64/repo.db")
         );
     }
 

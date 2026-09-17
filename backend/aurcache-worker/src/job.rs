@@ -384,6 +384,10 @@ async fn make_source_writable(pkgdir: &Path) -> Result<()> {
 /// swamp the server, and one request at the end would defeat the purpose.
 const LOG_BATCH_BYTES: usize = 4096;
 const LOG_BATCH_INTERVAL: Duration = Duration::from_millis(500);
+/// Largest single read from the child: a newline-less flood must arrive in
+/// capped chunks, never as one unbounded `read_line` allocation. Chunk
+/// boundaries are invisible downstream — the log is append-only.
+const LOG_LINE_CAP_BYTES: usize = 1024 * 1024;
 
 /// Forward a child stream to the build log, batched.
 ///
@@ -394,19 +398,27 @@ async fn pump_output<R>(reader: R, client: Arc<WorkerClient>, build_id: i32)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     let mut reader = tokio::io::BufReader::new(reader);
     let mut batch = String::new();
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut last_flush = std::time::Instant::now();
 
     loop {
         line.clear();
-        match reader.read_line(&mut line).await {
+        // Bytes, decoded lossily: build output is not always UTF-8 (and a
+        // capped chunk can end mid-character), and `read_line` would treat
+        // either as a read error -- ending the log and leaving the child
+        // writing into a pipe nobody drains.
+        match (&mut reader)
+            .take(LOG_LINE_CAP_BYTES as u64)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => break,
             Ok(_) => {
-                batch.push_str(&line);
+                batch.push_str(&String::from_utf8_lossy(&line));
                 if batch.len() >= LOG_BATCH_BYTES || last_flush.elapsed() >= LOG_BATCH_INTERVAL {
                     log(&client, build_id, &batch).await;
                     batch.clear();

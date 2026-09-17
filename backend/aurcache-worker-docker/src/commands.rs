@@ -10,9 +10,11 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn shell_join_args(args: &[String]) -> String {
+    // Quoted whole: each element is already one argv entry, and splitting on
+    // whitespace mangles exactly the flags that need quoting most (a value
+    // containing a space becomes two shell words with a new meaning).
     args.iter()
-        .flat_map(|a| a.split_whitespace())
-        .map(shell_quote)
+        .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -153,6 +155,21 @@ mod tests {
                 "quoting of {hostile:?} did not round-trip"
             );
         }
+    }
+
+    /// One argv entry stays one shell word: splitting a flag that carries a
+    /// space (e.g. `--opt="a b"`) changes its meaning, which is exactly what
+    /// the quoting is there to prevent.
+    #[test]
+    fn a_flag_with_a_space_survives_as_one_word() {
+        let joined = shell_join_args(&["--opt=a b".to_string(), "--flag".to_string()]);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '<%s>' {joined}"))
+            .output()
+            .expect("sh should run");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "<--opt=a b><--flag>");
     }
 
     /// Only the one sudo path the builder image actually permits may appear.

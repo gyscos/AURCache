@@ -425,30 +425,47 @@ impl Cache {
         let Some(shared) = self.pacman_pkg() else {
             return 0;
         };
+        // Decided under one short hold, then stated outside it: `metadata` is
+        // a syscall per entry and holding the process-global map across the
+        // whole walk serialises every concurrent reconcile for no reason.
+        // A concurrent reconcile can only duplicate a stat or a removal,
+        // both idempotent, never corrupt the map.
+        let todo: Vec<(String, u64, String)> = {
+            let known = verified_lock();
+            repo_db
+                .iter()
+                .filter(|(name, (_, sha))| {
+                    let key = (shared.clone(), (*name).clone());
+                    !known.get(&key).is_some_and(|seen| seen == sha)
+                })
+                .map(|(name, (csize, sha))| (name.clone(), *csize, sha.clone()))
+                .collect()
+        };
         let mut removed = 0;
         let mut suspects: Vec<(String, String)> = Vec::new();
+        let mut absent: Vec<(String, String)> = Vec::new();
+        let mut stale: Vec<String> = Vec::new();
+        for (name, csize, sha) in todo {
+            match std::fs::metadata(shared.join(&name)) {
+                // Nothing cached; nothing to verify until some promote
+                // actually lands the file.
+                Err(_) => absent.push((name, sha)),
+                Ok(meta) if meta.len() != csize => {
+                    if remove_cached(&shared, &name) {
+                        removed += 1;
+                    }
+                    stale.push(name);
+                }
+                Ok(_) => suspects.push((name, sha)),
+            }
+        }
         {
             let mut known = verified_lock();
-            for (name, (csize, sha)) in repo_db {
-                let key = (shared.clone(), name.clone());
-                if known.get(&key).is_some_and(|seen| seen == sha) {
-                    continue;
-                }
-                let path = shared.join(name);
-                match std::fs::metadata(&path) {
-                    Err(_) => {
-                        // Nothing cached; nothing to verify until some promote
-                        // actually lands the file.
-                        known.insert(key, sha.clone());
-                    }
-                    Ok(meta) if meta.len() != *csize => {
-                        if remove_cached(&shared, name) {
-                            removed += 1;
-                        }
-                        known.remove(&key);
-                    }
-                    Ok(_) => suspects.push((name.clone(), sha.clone())),
-                }
+            for (name, sha) in absent {
+                known.insert((shared.clone(), name), sha);
+            }
+            for name in stale {
+                known.remove(&(shared.clone(), name));
             }
             // Files no longer published are not consulted anymore; drop their
             // records so the map tracks the repository instead of growing.

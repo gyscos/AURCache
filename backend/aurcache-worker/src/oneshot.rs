@@ -38,8 +38,6 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .refresh(&pacman_conf)
         .await
         .context("preparing base chroot")?;
-    let lease = chroots.acquire("build-once").await?;
-
     let cache = Cache::new(
         &cfg.cache_dir,
         cfg.cache_max_size,
@@ -53,26 +51,31 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .unwrap_or("local");
     let srcdest = cache.srcdest(pkgbase);
 
-    let argv = build::build_command(
-        lease.chroot_dir(),
-        lease.label(),
-        lease.devtools_owns_copy(),
-        &cfg.bind_mounts,
-        flags,
-        &cfg.build_user,
-    );
-    tracing::info!("$ sudo {}", argv.join(" "));
+    // Through `with_lease` like the polling path: a spawn failure must give
+    // the chroot back too, not just the happy path. The release happens
+    // after the child has exited, never before.
+    let status = chroots
+        .with_lease("build-once", async |lease| {
+            let argv = build::build_command(
+                lease.chroot_dir(),
+                lease.label(),
+                lease.devtools_owns_copy(),
+                &cfg.bind_mounts,
+                flags,
+                &cfg.build_user,
+            );
+            tracing::info!("$ sudo {}", argv.join(" "));
 
-    let mut cmd = chroot::devtools(&argv[0]);
-    cmd.args(&argv[1..]).current_dir(&pkgdir);
-    // devtools binds `$SRCDEST` itself; unset, it falls back to the PKGBUILD
-    // directory and downloads are not cached between runs.
-    if let Some(dir) = srcdest.as_deref() {
-        cmd.env("SRCDEST", dir);
-    }
-    let status = cmd.status().await.context("running build")?;
-    // After the child has exited, never before.
-    lease.release().await;
+            let mut cmd = chroot::devtools(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(&pkgdir);
+            // devtools binds `$SRCDEST` itself; unset, it falls back to the
+            // PKGBUILD directory and downloads are not cached between runs.
+            if let Some(dir) = srcdest.as_deref() {
+                cmd.env("SRCDEST", dir);
+            }
+            cmd.status().await.context("running build")
+        })
+        .await?;
 
     let report = report::classify_exit(status, false);
     if report.success {

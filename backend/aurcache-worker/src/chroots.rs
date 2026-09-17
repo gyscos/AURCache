@@ -596,7 +596,7 @@ impl Chroots {
         ])
         .await
         .context("preparing the overlay directories")?;
-        sudo(&[
+        if let Err(e) = sudo(&[
             "mount".as_ref(),
             "-t".as_ref(),
             "overlay".as_ref(),
@@ -606,7 +606,12 @@ impl Chroots {
             merged.as_os_str(),
         ])
         .await
-        .context("mounting the overlay")?;
+        {
+            // The upper/work dirs were already made above: without this every
+            // failed mount litters them until a restart sweep.
+            let _ = sudo(&["rm".as_ref(), "-rf".as_ref(), layers.as_os_str()]).await;
+            return Err(e).context("mounting the overlay");
+        }
         Ok(lock)
     }
 
@@ -775,7 +780,7 @@ impl Chroots {
             merged.as_os_str(),
         ])
         .await?;
-        sudo(&[
+        if let Err(e) = sudo(&[
             "mount".as_ref(),
             "-t".as_ref(),
             "overlay".as_ref(),
@@ -784,7 +789,19 @@ impl Chroots {
             options.as_ref(),
             merged.as_os_str(),
         ])
-        .await?;
+        .await
+        {
+            // The scratch dirs were already made above: without this every
+            // failed mount litters them until a restart sweep.
+            let _ = sudo(&[
+                "rm".as_ref(),
+                "-rf".as_ref(),
+                work.as_os_str(),
+                merged.as_os_str(),
+            ])
+            .await;
+            return Err(e).context("mounting the upgrade overlay");
+        }
 
         let mut cmd = chroot::devtools("arch-nspawn");
         cmd.arg(&merged).args(["pacman", "-Syu", "--noconfirm"]);

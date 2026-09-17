@@ -13,8 +13,6 @@ use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
     RegisterRequest, RegisterStatus,
 };
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{Body, Certificate, Client, Identity, StatusCode};
 use std::time::Duration;
@@ -124,32 +122,17 @@ fn ca_fingerprint(pem: &str) -> Result<String> {
     Ok(spki_fingerprint(&der))
 }
 
-/// Minimal PEM → DER decoder for a single CERTIFICATE block.
+/// Decode the first CERTIFICATE block with an established PEM parser.
+///
+/// The label matters: the previous hand-rolled scan accepted *any* block, so
+/// a private-key file decoded fine and failed obscurely downstream in
+/// `ca_fingerprint` instead of here.
 fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
-    let mut b64 = String::new();
-    let mut in_block = false;
-    for line in pem.lines() {
-        let line = line.trim();
-        if line.starts_with("-----BEGIN") {
-            in_block = true;
-        } else if line.starts_with("-----END") {
-            break;
-        } else if in_block {
-            b64.push_str(line);
-        }
-    }
-    if b64.is_empty() {
-        bail!("no PEM block found");
-    }
-    base64_decode(&b64)
-}
-
-/// Decode a base64 body, tolerating embedded whitespace/line breaks.
-fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    let cleaned: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    STANDARD
-        .decode(cleaned.as_bytes())
-        .context("invalid base64 in PEM body")
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    let cert = CertificateDer::from_pem_slice(pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("no CERTIFICATE block in the CA PEM: {e}"))?;
+    Ok(cert.to_vec())
 }
 
 impl WorkerClient {
@@ -361,7 +344,10 @@ impl WorkerClient {
             .context("heartbeat request")?
             .error_for_status()
             .context("heartbeat rejected")?;
-        let body = resp.bytes().await.unwrap_or_default();
+        // A transport failure here is not "the server said nothing": an empty
+        // answer from an old server still parses as healthy (see the test),
+        // but a body we failed to read must not refresh the lease watchdog.
+        let body = resp.bytes().await.context("reading heartbeat answer")?;
         Ok(parse_heartbeat_response(&body))
     }
 
@@ -471,21 +457,18 @@ mod tests {
     }
 
     #[test]
-    fn base64_roundtrip_known_vectors() {
-        assert_eq!(base64_decode("").unwrap(), b"");
-        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
-        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
-        assert_eq!(base64_decode("Zm9v").unwrap(), b"foo");
-        assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
-        assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
-        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
-    }
-
-    #[test]
     fn pem_decodes_single_block() {
         // "foobar" base64 wrapped as a fake cert block.
         let pem = "-----BEGIN CERTIFICATE-----\nZm9vYmFy\n-----END CERTIFICATE-----\n";
         assert_eq!(pem_to_der(pem).unwrap(), b"foobar");
+    }
+
+    /// The label is the point: a private-key block must not decode as a
+    /// certificate and fail obscurely downstream.
+    #[test]
+    fn pem_rejects_non_certificate_blocks() {
+        let key = "-----BEGIN PRIVATE KEY-----\nZm9vYmFy\n-----END PRIVATE KEY-----\n";
+        assert!(pem_to_der(key).is_err());
     }
 
     #[test]

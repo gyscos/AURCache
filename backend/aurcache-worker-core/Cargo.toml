@@ -16,7 +16,7 @@ reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 rcgen = { version = "0.14", features = ["pem"] }
 sha2 = "0.11"
 hex = "0.4"
-base64 = "0.23"
+rustls-pki-types = { version = "1.15", features = ["std"] }
 flate2 = { workspace = true }
 tar = { workspace = true }
 percent-encoding = "2.3"

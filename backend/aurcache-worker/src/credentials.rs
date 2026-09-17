@@ -166,8 +166,10 @@ pub fn git_ssh_command(known_hosts: Option<&str>) -> String {
     let mut cmd = String::from("ssh");
     match known_hosts {
         Some(path) => {
+            // Quoted for the shell git runs this through: an unquoted path
+            // with a space would split into two ssh arguments.
             cmd.push_str(" -o UserKnownHostsFile=");
-            cmd.push_str(path);
+            cmd.push_str(&shell_quote(path));
         }
         // Without a known_hosts file ssh would prompt, which hangs a
         // non-interactive build forever; accept-new records on first contact
@@ -219,13 +221,21 @@ pub fn augment_makepkg_conf(
     out.push_str("# otherwise see no agent. Guarded on the socket existing, so a worker\n");
     out.push_str("# without a credential is unaffected.\n");
     out.push_str(&format!(
-        "if [ -S \"{sock}\" ]; then\n    \
-         export SSH_AUTH_SOCK=\"{sock}\"\n    \
-         export GIT_SSH_COMMAND=\"{cmd}\"\nfi\n",
-        sock = socket.display(),
-        cmd = cred.git_ssh_command
+        "if [ -S {sock} ]; then\n    \
+         export SSH_AUTH_SOCK={sock}\n    \
+         export GIT_SSH_COMMAND={cmd}\nfi\n",
+        sock = shell_quote(&socket.display().to_string()),
+        cmd = shell_quote(&cred.git_ssh_command)
     ));
     out
+}
+
+/// Single-quote a value for shell, for the exports below: inside single quotes
+/// everything is literal, so only `'` itself needs escaping. Paths here are
+/// operator-controlled (data dir, known-hosts location) and may contain
+/// spaces, `$` or backticks, all of which break out of double quotes.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Parse `WORKER_BIND_MOUNTS` (`host:chroot,host:chroot`) into pairs.
@@ -370,7 +380,7 @@ mod tests {
         let with_hosts = git_ssh_command(Some("/staged/known_hosts"));
         assert!(!with_hosts.contains("-i "), "must not name a key file");
         assert!(!with_hosts.contains("IdentitiesOnly"));
-        assert!(with_hosts.contains("UserKnownHostsFile=/staged/known_hosts"));
+        assert!(with_hosts.contains("UserKnownHostsFile='/staged/known_hosts'"));
         // No known_hosts must not leave ssh prompting, which would hang a build.
         let without = git_ssh_command(None);
         assert!(without.contains("StrictHostKeyChecking=accept-new"));
@@ -388,8 +398,7 @@ mod tests {
             augment_makepkg_conf(base, Some(&cred), Some(Path::new("/run/a/agent.sock")));
         assert!(augmented.starts_with("PKGDEST=/output\n"));
         assert!(
-            augmented
-                .contains("export GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=accept-new\"")
+            augmented.contains("export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new'")
         );
     }
 
@@ -412,13 +421,11 @@ mod tests {
             Some(Path::new("/var/lib/aurcache-worker/agent/agent.sock")),
         );
 
-        assert!(
-            conf.contains("export SSH_AUTH_SOCK=\"/var/lib/aurcache-worker/agent/agent.sock\"")
-        );
+        assert!(conf.contains("export SSH_AUTH_SOCK='/var/lib/aurcache-worker/agent/agent.sock'"));
         assert!(conf.trim_end().ends_with("fi"));
         // The guard must wrap both exports, not sit beside them.
         let guard = conf
-            .find("if [ -S \"/var/lib/aurcache-worker/agent/agent.sock\" ]")
+            .find("if [ -S '/var/lib/aurcache-worker/agent/agent.sock' ]")
             .expect("guard names the socket");
         let sock = conf.find("export SSH_AUTH_SOCK").expect("socket export");
         let git = conf.find("export GIT_SSH_COMMAND").expect("git export");
@@ -428,6 +435,49 @@ mod tests {
         );
         // The key path must never leak into a config the chroot also reads.
         assert!(!conf.contains("/staged/id_ed25519"));
+    }
+
+    /// Quoting is load-bearing for operator-controlled paths (a data dir with
+    /// a space, `$` or backticks), so it round-trips through a real shell.
+    #[test]
+    fn hostile_paths_survive_a_real_shell_as_one_value() {
+        for hostile in [
+            "/data/my dir/agent.sock",
+            "/data/$x/`id`/agent.sock",
+            "/it's/agent.sock",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "export PROBE={}; printf %s \"$PROBE\"",
+                    shell_quote(hostile)
+                ))
+                .output()
+                .expect("sh should run");
+            assert!(out.status.success(), "shell rejected {hostile:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), hostile);
+        }
+    }
+
+    /// The known-hosts path travels inside `GIT_SSH_COMMAND`, which git
+    /// splits on spaces: it must arrive there as one shell word.
+    #[test]
+    fn a_spaced_known_hosts_path_stays_one_ssh_argument() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '<%s>' {}",
+                git_ssh_command(Some("/my dir/known hosts"))
+            ))
+            .output()
+            .expect("sh should run");
+        assert!(out.status.success());
+        // Three words, path intact: the shell consumed the quotes while
+        // splitting, which is exactly what protects the spaces.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "<ssh><-o><UserKnownHostsFile=/my dir/known hosts>"
+        );
     }
 
     /// No agent means no exports at all, so a worker without a credential

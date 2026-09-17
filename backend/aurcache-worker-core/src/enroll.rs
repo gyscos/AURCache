@@ -83,6 +83,13 @@ pub async fn ensure_enrolled(
             {
                 Ok(status) => {
                     tracing::info!("Re-registered (status: {})", status.status);
+                    // Revocation is terminal, like on the fresh path below: a
+                    // revoked worker that carried on would run forever failing
+                    // every claim, instead of exiting loudly for the operator.
+                    anyhow::ensure!(
+                        status.status != ApprovalStatus::Revoked,
+                        "worker is revoked"
+                    );
                     // Adopt a certificate the server has re-issued instead of
                     // discarding it. The server re-issues when the one it had
                     // on file was signed by a CA it no longer has, and a worker

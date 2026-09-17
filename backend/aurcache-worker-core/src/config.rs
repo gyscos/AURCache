@@ -235,8 +235,10 @@ impl CoreConfig {
             native_arches,
             emulated_arches,
             packages: settings.list(keys::PACKAGES),
-            priority: i32::try_from(settings.integer(keys::PRIORITY).unwrap_or(0))
-                .unwrap_or(i32::MAX),
+            // A malformed value degrades to the neutral default, never to
+            // maximal scheduling privilege: an out-of-range typo must not
+            // outrank the whole fleet.
+            priority: i32::try_from(settings.integer(keys::PRIORITY).unwrap_or(0)).unwrap_or(0),
             concurrency,
             name: env_opt("WORKER_NAME").unwrap_or_else(detect_hostname),
             data_dir: env_opt("WORKER_DATA_DIR")

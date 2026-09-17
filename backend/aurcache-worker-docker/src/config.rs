@@ -69,13 +69,20 @@ impl Config {
     /// Docker's `NanoCpus`, or `None` for unlimited.
     #[must_use]
     pub fn nano_cpus(&self) -> Option<i64> {
-        (self.cpu_limit > 0).then(|| i64::try_from(self.cpu_limit).unwrap_or(i64::MAX) * 1_000_000)
+        // Saturated, not panicking: these are operator-controlled numbers and
+        // the multiplication would otherwise overflow (and panic in debug)
+        // on absurd input — including via the `i64::MAX` fallback itself.
+        (self.cpu_limit > 0).then(|| {
+            i64::try_from(self.cpu_limit)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000)
+        })
     }
 
     /// Docker's `MemorySwap` in bytes, or `None` for unlimited.
     #[must_use]
     pub fn memory_bytes(&self) -> Option<i64> {
-        (self.memory_limit > 0).then(|| self.memory_limit * 1024 * 1024)
+        (self.memory_limit > 0).then(|| self.memory_limit.saturating_mul(1024 * 1024))
     }
 }
 
@@ -109,5 +116,13 @@ mod tests {
     fn limits_convert_to_docker_units() {
         assert_eq!(cfg(2000, 512).nano_cpus(), Some(2_000_000_000));
         assert_eq!(cfg(2000, 512).memory_bytes(), Some(512 * 1024 * 1024));
+    }
+
+    /// Absurd operator input saturates instead of overflowing: the old
+    /// multiplication panicked in debug builds and wrapped in release.
+    #[test]
+    fn absurd_limits_saturate_rather_than_overflow() {
+        assert_eq!(cfg(u64::MAX, 1).nano_cpus(), Some(i64::MAX));
+        assert_eq!(cfg(1, i64::MAX).memory_bytes(), Some(i64::MAX));
     }
 }

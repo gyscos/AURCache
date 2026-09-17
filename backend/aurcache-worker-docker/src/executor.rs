@@ -91,10 +91,12 @@ impl DockerExecutor {
             &format!("[worker] pulling {}\n", self.cfg.builder_image),
         )
         .await;
+        let platform = docker_arch(arch)
+            .with_context(|| format!("unknown architecture {arch:?}: refusing the pull"))?;
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
                 from_image: Some(self.cfg.builder_image.clone()),
-                platform: format!("linux/{}", docker_arch(arch)),
+                platform: format!("linux/{platform}"),
                 ..Default::default()
             }),
             None,
@@ -233,12 +235,19 @@ impl DockerExecutor {
             )
             .await;
 
-        let report = result?;
-        if report.success {
-            upload_artifacts(client, build_id, &local_dir).await?;
+        // Removed on every path, not just the happy one: each `?` below used
+        // to return first, so every failed build (and failed upload) left its
+        // whole directory behind.
+        let outcome = async {
+            let report = result?;
+            if report.success {
+                upload_artifacts(client, build_id, &local_dir).await?;
+            }
+            Ok(report)
         }
+        .await;
         let _ = std::fs::remove_dir_all(&local_dir);
-        Ok(report)
+        outcome
     }
 
     /// Start the container, stream its output, and wait for it while honouring
@@ -272,7 +281,7 @@ impl DockerExecutor {
         // Pump container output into the build log.
         let mut output = attached.output;
         let log_client = Arc::clone(client);
-        let pump = tokio::spawn(async move {
+        let mut pump = tokio::spawn(async move {
             while let Some(Ok(chunk)) = output.next().await {
                 log(&log_client, build_id, &chunk.to_string()).await;
             }
@@ -280,6 +289,12 @@ impl DockerExecutor {
 
         let started = Instant::now();
         let timeout = self.cfg.core.build_timeout;
+        // The server is asked about remote cancellation at most every 30 s:
+        // with N concurrent builds a per-tick round trip is N requests per
+        // 5 s for no extra responsiveness, since cancel latency is already
+        // dominated by build granularity. Same throttle as the chroot path.
+        let remote_poll = Duration::from_secs(30);
+        let mut last_remote_poll = std::time::Instant::now();
         let mut wait = self.docker.wait_container(
             container_id,
             None::<bollard::query_parameters::WaitContainerOptions>,
@@ -297,15 +312,31 @@ impl DockerExecutor {
                         exit_code = Some(code);
                         break;
                     }
-                    Some(Err(e)) => return Err(e).context("waiting for build container"),
+                    Some(Err(e)) => {
+                        // The pump would otherwise stay detached against a
+                        // stream nobody now drains.
+                        pump.abort();
+                        return Err(e).context("waiting for build container");
+                    }
                     None => break,
                 },
                 () = tokio::time::sleep(Duration::from_secs(5)) => {
-                    if cancel.load(Ordering::SeqCst) || remote_cancel(client, build_id).await {
+                    let hit_timeout =
+                        timeout > 0 && started.elapsed().as_secs() > timeout;
+                    if cancel.load(Ordering::SeqCst) {
                         canceled = true;
-                    } else if timeout > 0 && started.elapsed().as_secs() > timeout {
+                    } else if !hit_timeout && last_remote_poll.elapsed() >= remote_poll {
+                        last_remote_poll = std::time::Instant::now();
+                        if remote_cancel(client, build_id).await {
+                            canceled = true;
+                        }
+                    }
+                    // A cancel wins, as it did before the poll was throttled:
+                    // the build is reported as what the user asked for.
+                    if hit_timeout && !canceled {
                         timed_out = true;
-                    } else {
+                    }
+                    if !(canceled || timed_out) {
                         continue;
                     }
                     let _ = self.docker.kill_container(
@@ -317,7 +348,26 @@ impl DockerExecutor {
             }
         }
 
-        pump.abort();
+        // Drained, not aborted: the pump holds whatever the build printed
+        // last, which is exactly what a failure report needs. After a kill
+        // the stream may never close on its own, so a killed build waits a
+        // bounded time — the same shape as the chroot path's
+        // `KILLED_OUTPUT_GRACE`.
+        const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(30);
+        if canceled || timed_out {
+            if tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut pump)
+                .await
+                .is_err()
+            {
+                pump.abort();
+                tracing::warn!(
+                    "build {build_id} was killed but its output is still open after {}s; reporting it ended regardless",
+                    OUTPUT_DRAIN_GRACE.as_secs()
+                );
+            }
+        } else {
+            let _ = pump.await;
+        }
 
         if timed_out {
             return Ok(report::timeout_failure(started.elapsed().as_secs()));
@@ -390,13 +440,18 @@ fn world_writable(path: &Path) {
 }
 
 /// Map an Arch architecture name onto Docker's platform vocabulary.
-fn docker_arch(arch: &str) -> &str {
-    match arch {
+///
+/// `None` for anything unrecognised: pulling the amd64 image for a job that
+/// is not amd64 builds the wrong thing (or fails confusingly), which is
+/// worse than refusing the job with a clear error.
+fn docker_arch(arch: &str) -> Option<&'static str> {
+    Some(match arch {
+        "x86_64" => "amd64",
         "aarch64" => "arm64",
         "armv7h" => "arm/v7",
         "riscv64" => "riscv64",
-        _ => "amd64",
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -405,8 +460,17 @@ mod tests {
 
     #[test]
     fn maps_arch_names_to_docker_platforms() {
-        assert_eq!(docker_arch("x86_64"), "amd64");
-        assert_eq!(docker_arch("aarch64"), "arm64");
-        assert_eq!(docker_arch("armv7h"), "arm/v7");
+        assert_eq!(docker_arch("x86_64"), Some("amd64"));
+        assert_eq!(docker_arch("aarch64"), Some("arm64"));
+        assert_eq!(docker_arch("armv7h"), Some("arm/v7"));
+        assert_eq!(docker_arch("riscv64"), Some("riscv64"));
+    }
+
+    /// An arch nobody taught the mapper must refuse the job, not silently
+    /// pull amd64 and build the wrong thing.
+    #[test]
+    fn unknown_arches_map_to_nothing() {
+        assert_eq!(docker_arch("sparc"), None);
+        assert_eq!(docker_arch(""), None);
     }
 }
