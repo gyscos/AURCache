@@ -296,8 +296,10 @@ fn WorkersTable(
     // Denominator for each worker's share. Finished builds only, and only
     // those a worker owns: builds from before the worker split carry no
     // worker_id, and counting them would shrink everyone's share against work
-    // no worker present did.
-    let fleet_finished: i32 = workers
+    // no worker present did. Over the whole `fleet`, not the filtered rows:
+    // with retired workers hidden (the default) the visible rows would
+    // otherwise divide by a smaller total and every share would read high.
+    let fleet_finished: i32 = fleet
         .iter()
         .map(|w| w.successful_builds + w.failed_builds)
         .sum();

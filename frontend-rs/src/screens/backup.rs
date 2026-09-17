@@ -419,8 +419,11 @@ fn RestoreReport(entries: Vec<RestoreEntry>, blocked: bool) -> Element {
                 }
             }
             ul { class: "menu menu-sm p-0 max-h-64 overflow-y-auto border border-base-300 rounded-box flex-nowrap",
-                for entry in entries {
-                    li { key: "{entry.pkgbase}-{outcome_label(&entry.outcome)}",
+                for (index, entry) in entries.into_iter().enumerate() {
+                    // Indexed as well as named: nothing stops two entries
+                    // sharing a package and an outcome, and duplicate keys
+                    // make the framework reuse the wrong row.
+                    li { key: "{index}-{entry.pkgbase}-{outcome_label(&entry.outcome)}",
                         div { class: "flex flex-col items-start gap-0.5",
                             div { class: "flex items-baseline gap-2",
                                 span { class: "badge badge-xs {outcome_class(&entry.outcome)}",

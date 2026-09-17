@@ -38,14 +38,26 @@ pub fn use_poll<T: 'static>(mut resource: Resource<T>, busy: bool) {
     use_effect(use_reactive(&busy, move |busy| interval.set(pick(busy))));
 
     use_future(move || async move {
+        let mut was_hidden = false;
         loop {
-            let nap = if hidden() { HIDDEN } else { interval() };
-            gloo_timers::future::sleep(nap).await;
-            // Re-check rather than trust the value from before the sleep: the
-            // tab may have been hidden the whole time.
-            if !hidden() {
-                resource.restart();
+            if hidden() {
+                was_hidden = true;
+                gloo_timers::future::sleep(HIDDEN).await;
+                continue;
             }
+            if was_hidden {
+                // Just came back: refetch at once instead of waiting out a
+                // full idle interval on the stale data the hidden tab kept.
+                was_hidden = false;
+            } else {
+                gloo_timers::future::sleep(interval()).await;
+                // Re-check rather than trust the value from before the sleep:
+                // the tab may have been hidden the whole time.
+                if hidden() {
+                    continue;
+                }
+            }
+            resource.restart();
         }
     });
 }

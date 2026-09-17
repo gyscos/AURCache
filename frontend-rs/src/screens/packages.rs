@@ -121,15 +121,20 @@ pub fn Packages(
                         // The toggle narrows first, so `total` is the size of
                         // the list being searched rather than of the fetch.
                         // Otherwise the count beside the search box would
-                        // report packages the page is not showing.
-                        let in_scope: Vec<SimplePackage> = if show_dependencies() {
-                            list.clone()
+                        // report packages the page is not showing. Filtered
+                        // lazily: the old code cloned the whole fetch here on
+                        // every render (every keystroke) before filtering it.
+                        let show_all = show_dependencies();
+                        let in_scope =
+                            list.iter().filter(move |p| show_all || p.directly_requested);
+                        let total = if show_all {
+                            list.len()
                         } else {
-                            list.iter().filter(|p| p.directly_requested).cloned().collect()
+                            in_scope.clone().count()
                         };
-                        let mut shown = filter_packages(&in_scope, &query(), status());
+                        let mut shown = filter_packages(in_scope, &query(), status());
                         sort_packages(&mut shown, sort());
-                        let (found, total) = (shown.len(), in_scope.len());
+                        let found = shown.len();
                         // Sorted first, so a page is a slice of the order on
                         // screen rather than of the order it arrived in.
                         let current = paginate(&shown, page());

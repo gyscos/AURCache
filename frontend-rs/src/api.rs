@@ -27,8 +27,11 @@ pub fn api_base() -> String {
 /// rather than a router navigate: `/api/login` is a server route, and a SPA
 /// navigation to it would render a frontend error screen instead of the login.
 pub fn client() -> Result<AurCacheClient, String> {
-    let login_url = format!("{}/login", api_base());
-    AurCacheClient::new(api_base(), None)
+    // Read once: each call reaches into the DOM, and the two reads below
+    // must agree with each other anyway.
+    let base = api_base();
+    let login_url = format!("{base}/login");
+    AurCacheClient::new(base, None)
         .map(|client| {
             client.on_unauthorized(move || {
                 if let Some(window) = web_sys::window() {

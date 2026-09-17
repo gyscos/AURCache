@@ -115,6 +115,16 @@ impl SearchCache {
         )
     }
 
+    /// Whether a cached search can answer `query`, without materialising the
+    /// narrowed list. For the call sites that only need the boolean -- cloning
+    /// every result twice per keystroke just to ask is the waste.
+    fn has_answer(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        self.0.iter().any(|(cached, results)| {
+            query.starts_with(cached) && results.iter().any(|result| matches_query(result, &query))
+        })
+    }
+
     /// Record a completed substring search.
     ///
     /// Insertion never rewrites an existing entry, so narrowing is
@@ -512,7 +522,7 @@ fn AddPackageDialog(q: String) -> Element {
                                 // the list lag behind the field for no reason.
                                 let answerable = typed.trim().is_empty()
                                     || looks_like_git_url(typed.trim())
-                                    || cache.read().narrow(&typed).is_some();
+                                    || cache.read().has_answer(&typed);
                                 if answerable {
                                     debounced.set(typed);
                                     return;

@@ -177,11 +177,13 @@ impl StatusFilter {
 
 /// Case-insensitive substring match.
 ///
+/// Lowered once per call, not once per row: the filters below run this over
+/// every row on every keystroke.
+///
 /// Substring rather than prefix because package names are compound —
 /// searching `gtk` should find `lib32-gtk3`, which a prefix match would miss.
-fn name_matches(name: &str, query: &str) -> bool {
-    let query = query.trim();
-    query.is_empty() || name.to_lowercase().contains(&query.to_lowercase())
+fn lowered_query(query: &str) -> String {
+    query.trim().to_lowercase()
 }
 
 /// Order two statuses so the ones needing attention come first.
@@ -200,40 +202,51 @@ fn status_rank(status: i32) -> u8 {
     }
 }
 
-pub fn filter_packages(
-    packages: &[SimplePackage],
+pub fn filter_packages<'a>(
+    packages: impl IntoIterator<Item = &'a SimplePackage>,
     query: &str,
     status: StatusFilter,
 ) -> Vec<SimplePackage> {
+    let query = lowered_query(query);
     packages
-        .iter()
-        .filter(|pkg| name_matches(&pkg.name, query) && status.matches(pkg.status, pkg.outofdate))
+        .into_iter()
+        .filter(|pkg| {
+            (query.is_empty() || pkg.name.to_lowercase().contains(&query))
+                && status.matches(pkg.status, pkg.outofdate)
+        })
         .cloned()
         .collect()
 }
 
 pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
+    // Every column but status and size orders by name: a package row carries
+    // no timestamp, worker, duration or peak memory of its own, so those
+    // headers stay interchangeable by falling back to the name rather than
+    // presenting an ordering that has nothing to do with the column. The
+    // lowered name is computed once per row rather than once per comparison,
+    // and `Reverse` keeps ties in place exactly as the old per-comparison
+    // `.reverse()` did.
+    if !matches!(sort.key, SortKey::Status | SortKey::Size) {
+        match sort.dir {
+            SortDir::Asc => packages.sort_by_cached_key(|p| p.name.to_lowercase()),
+            SortDir::Desc => {
+                packages.sort_by_cached_key(|p| std::cmp::Reverse(p.name.to_lowercase()));
+            }
+        }
+        return;
+    }
     packages.sort_by(|a, b| {
         let ordering = match sort.key {
-            SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             // An out-of-date package is a package needing attention, so it
             // ranks with the unhealthy ones rather than with the successes.
             SortKey::Status => (status_rank(a.status), a.outofdate == 0)
                 .cmp(&(status_rank(b.status), b.outofdate == 0)),
-            // A package row carries no timestamp, so the package list does
-            // not offer this column; falling back to name would present an
-            // ordering that has nothing to do with time.
-            // Packages have no worker, duration or peak memory of their own;
-            // all of them fall back to the name so the column headers stay
-            // interchangeable.
-            SortKey::Time | SortKey::Worker | SortKey::Duration | SortKey::Memory => {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
-            }
             // `Option`'s own ordering is what this wants: `None` sorts below
             // every `Some`, so unrecorded sizes group at one end rather than
             // among the small ones, and land last under the descending order a
-            // Size column opens in.
-            SortKey::Size => a.total_size.cmp(&b.total_size),
+            // Size column opens in. (Size is the only other key that reaches
+            // here; the rest returned above.)
+            _ => a.total_size.cmp(&b.total_size),
         };
         match sort.dir {
             SortDir::Asc => ordering,
@@ -243,9 +256,15 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
 }
 
 pub fn filter_builds(builds: &[Build], query: &str, status: StatusFilter) -> Vec<Build> {
+    let query = lowered_query(query);
     builds
         .iter()
-        .filter(|build| name_matches(&build_id(build), query) && status.matches(build.status, 0))
+        .filter(|build| {
+            // The identity string is only built when something is typed: it
+            // allocates per row, and an empty query matches everything anyway.
+            (query.is_empty() || build_id(build).to_lowercase().contains(&query))
+                && status.matches(build.status, 0)
+        })
         .cloned()
         .collect()
 }
@@ -280,28 +299,58 @@ fn duration(build: &Build) -> Option<i64> {
 }
 
 pub fn sort_builds(builds: &mut [Build], sort: Sort) {
-    builds.sort_by(|a, b| {
-        let ordering = match sort.key {
-            SortKey::Name => a
-                .pkg_name
-                .to_lowercase()
-                .cmp(&b.pkg_name.to_lowercase())
+    // The string-keyed columns lower once per row rather than once per
+    // comparison. The cached keys mirror the old comparator arm for arm --
+    // including newest-first ties -- with `Reverse` standing in for the
+    // per-comparison `.reverse()`, so ties keep their order in both
+    // directions exactly as before.
+    match sort.key {
+        SortKey::Name => {
+            match sort.dir {
                 // A package's own builds are then newest-first, so the groups
                 // read as histories rather than as an arbitrary jumble.
-                .then(b.number.cmp(&a.number)),
+                SortDir::Asc => builds.sort_by_cached_key(|b| {
+                    (b.pkg_name.to_lowercase(), std::cmp::Reverse(b.number))
+                }),
+                SortDir::Desc => builds.sort_by_cached_key(|b| {
+                    std::cmp::Reverse((b.pkg_name.to_lowercase(), std::cmp::Reverse(b.number)))
+                }),
+            }
+            return;
+        }
+        // Unclaimed builds have no worker. `None` sorts before `Some`, so
+        // ascending puts the queue first and descending puts it last --
+        // either way they group together rather than scattering.
+        SortKey::Worker => {
+            match sort.dir {
+                // Within one worker, newest first, as the name grouping does.
+                SortDir::Asc => builds.sort_by_cached_key(|b| {
+                    (
+                        b.worker_name.as_deref().map(str::to_lowercase),
+                        std::cmp::Reverse(b.number),
+                    )
+                }),
+                // The whole key reversed, not each part: reversing only the
+                // name inside the `Option` would keep the queue first.
+                SortDir::Desc => builds.sort_by_cached_key(|b| {
+                    std::cmp::Reverse((
+                        b.worker_name.as_deref().map(str::to_lowercase),
+                        std::cmp::Reverse(b.number),
+                    ))
+                }),
+            }
+            return;
+        }
+        _ => {}
+    }
+    builds.sort_by(|a, b| {
+        let ordering = match sort.key {
+            SortKey::Name | SortKey::Worker => {
+                unreachable!("string-keyed columns return above")
+            }
             SortKey::Status => status_rank(a.status).cmp(&status_rank(b.status)),
             SortKey::Time => a.start_time.cmp(&b.start_time),
             SortKey::Size => a.size.cmp(&b.size),
-            // Unclaimed builds have no worker. `None` sorts before `Some`, so
-            // ascending puts the queue first and descending puts it last --
-            // either way they group together rather than scattering.
-            SortKey::Worker => a
-                .worker_name
-                .as_deref()
-                .map(str::to_lowercase)
-                .cmp(&b.worker_name.as_deref().map(str::to_lowercase))
-                // Within one worker, newest first, as the name grouping does.
-                .then(b.number.cmp(&a.number)),
             // A build still running has no end yet, so no duration. `None`
             // sorts before `Some`, which under the descending order a Duration
             // column opens in puts the unfinished builds last, after the
@@ -794,6 +843,42 @@ mod tests {
             [1, 2, 3],
             "highest first, unrecorded last"
         );
+    }
+
+    /// Unclaimed builds group at one end: first ascending, last descending --
+    /// and within a worker, newest first ascending and oldest first
+    /// descending, the exact reverse.
+    #[test]
+    fn sorting_builds_by_worker_keeps_the_queue_at_one_end() {
+        let mut builds = vec![
+            build(1, "a", BuildState::Successful, Some(100)),
+            build(2, "b", BuildState::Successful, Some(100)),
+            build(3, "c", BuildState::Enqueued, None),
+            build(4, "d", BuildState::Successful, Some(100)),
+        ];
+        builds[0].worker_name = Some("Alpha".to_string());
+        builds[1].worker_name = Some("beta".to_string());
+        builds[3].worker_name = Some("alpha".to_string());
+        let numbers = |builds: &[Build]| builds.iter().map(|b| b.number).collect::<Vec<_>>();
+
+        let mut asc = builds.clone();
+        sort_builds(
+            &mut asc,
+            Sort {
+                key: SortKey::Worker,
+                dir: SortDir::Asc,
+            },
+        );
+        assert_eq!(numbers(&asc), [3, 4, 1, 2]);
+
+        sort_builds(
+            &mut builds,
+            Sort {
+                key: SortKey::Worker,
+                dir: SortDir::Desc,
+            },
+        );
+        assert_eq!(numbers(&builds), [2, 1, 4, 3], "the queue goes last");
     }
 
     /// Clicking the active column reverses it; clicking a new one starts from

@@ -51,31 +51,34 @@ pub fn log_tail_cap(width: Option<f64>, coarse_pointer: bool) -> usize {
 ///   valid even though the cut may land a byte or two shy of the cap.
 pub fn append_capped(window: &mut String, chunk: &str, cap: usize) -> bool {
     window.push_str(chunk);
-    let mut trimmed = false;
-    while window.len() > cap {
-        trimmed = true;
-        // Find the first newline and drain up to it (inclusive), so the next
-        // line starts the window. `find` is safe on any string because '\n'
-        // is ASCII: its byte index is always a char boundary.
-        if let Some(end) = window.find('\n') {
-            window.drain(..=end);
-        } else {
-            // One unbreakable line longer than the cap: trim bytes from the
-            // front. `drain` demands a char boundary, and the first boundary
-            // at or past `target` cuts the smallest whole-character window
-            // that fits the cap — it stays within budget and never leaves a
-            // sliced character at the window's start.
-            let target = window.len().saturating_sub(cap);
-            let cut = window
-                .char_indices()
-                .map(|(i, _)| i)
-                .find(|i| *i >= target)
-                .unwrap_or(window.len());
-            window.drain(..cut);
-            break;
-        }
+    if window.len() <= cap {
+        return false;
     }
-    trimmed
+    // One drain, not one per line: each `drain(..)` memmoves the whole tail,
+    // so trimming a window of short lines line-by-line is quadratic in the
+    // window size on every append. Cut once, right after the first newline
+    // that removes at least the excess — the remainder still starts on a
+    // line boundary, so what stays is whole trailing lines.
+    // (`match_indices` only yields char boundaries, and '\n' is ASCII, so
+    // the cut is always safe to drain.)
+    let excess = window.len() - cap;
+    if let Some((nl, _)) = window.match_indices('\n').find(|(i, _)| i + 1 >= excess) {
+        window.drain(..nl + 1);
+    } else {
+        // One unbreakable line longer than the cap: trim bytes from the
+        // front. `drain` demands a char boundary, and the first boundary
+        // at or past `target` cuts the smallest whole-character window
+        // that fits the cap — it stays within budget and never leaves a
+        // sliced character at the window's start.
+        let target = window.len().saturating_sub(cap);
+        let cut = window
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|i| *i >= target)
+            .unwrap_or(window.len());
+        window.drain(..cut);
+    }
+    true
 }
 
 /// Whether the primary pointer is coarse (touch screen), the second half of the
@@ -187,6 +190,22 @@ mod tests {
         assert!(w.len() <= 50);
         // Must remain valid UTF-8 (the char-boundary drain handled it).
         assert!(std::str::from_utf8(w.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn append_capped_keeps_whole_lines_across_appends() {
+        let mut w = String::new();
+        // Many short lines at once: one drain must leave whole trailing
+        // lines within the cap, not fragments.
+        let chunk: String = (0..100).map(|i| format!("line {i:03}\n")).collect();
+        assert!(append_capped(&mut w, &chunk, 100));
+        assert!(w.len() <= 100);
+        assert!(w.ends_with('\n'));
+        assert!(w.starts_with("line "));
+        // And appending again keeps it bounded with whole lines.
+        assert!(append_capped(&mut w, "tail line here\n", 100));
+        assert!(w.len() <= 100);
+        assert!(w.ends_with("tail line here\n"));
     }
 
     #[test]

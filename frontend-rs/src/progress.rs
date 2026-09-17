@@ -178,11 +178,18 @@ pub fn use_jobs() -> Signal<Vec<Job>> {
     use_context()
 }
 
+/// One counter for every card, wherever it is created. Two counters could
+/// hand out the same id twice; one counter cannot.
+static NEXT_JOB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_job_id() -> u64 {
+    NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn start_add(mut jobs: Signal<Vec<Job>>, request: AddRequest) {
     // Monotonic rather than an index: cards are removed as they are dismissed,
     // so positions are not stable identities.
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = next_job_id();
 
     jobs.push(Job {
         id,
@@ -221,8 +228,7 @@ fn watch_operation(mut jobs: Signal<Vec<Job>>, total: i32, work: Work) {
         return;
     }
 
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = next_job_id();
 
     jobs.push(Job {
         id,

@@ -119,30 +119,27 @@ pub fn Logs(view: ViewParams) -> Element {
 fn RunningOperations() -> Element {
     let jobs = crate::progress::use_jobs();
 
-    let mut running = use_resource(|| async move {
-        // Polled rather than fetched once: this page is somewhere to leave open
-        // while something runs, and a list that went stale the moment it loaded
-        // would be worse than not having it.
+    // Polled rather than fetched once: this page is somewhere to leave open
+    // while something runs, and a list that went stale the moment it loaded
+    // would be worse than not having it.
+    //
+    // One loop that sleeps *after* each fetch, not a timer beside it: a
+    // restart timer fires whether or not the previous fetch finished, so on
+    // a slow network it cancels every fetch and the list starves. Here the
+    // next fetch starts one interval after the last one completed.
+    let mut list = use_signal(Vec::new);
+    use_future(move || async move {
         loop {
             if let Ok(client) = crate::api::client()
-                && let Ok(list) = client.active_operations().await
+                && let Ok(running) = client.active_operations().await
             {
-                return list;
+                list.set(running);
             }
             gloo_timers::future::sleep(RUNNING_POLL).await;
         }
     });
 
-    // Re-ask on a timer, so a job that starts or ends while this page is open
-    // appears or goes without a reload.
-    use_future(move || async move {
-        loop {
-            gloo_timers::future::sleep(RUNNING_POLL).await;
-            running.restart();
-        }
-    });
-
-    let list = running.read_unchecked().clone().unwrap_or_default();
+    let list = list.read().clone();
     if list.is_empty() {
         return rsx! {};
     }

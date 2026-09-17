@@ -83,18 +83,22 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         }
     };
 
-    // Open the file named in the URL, if any.
-    use_effect({
-        let pkgbase = pkgbase.clone();
-        move || {
-            if let Some(path) = initial_path.as_ref().cloned()
-                && selected.peek().is_none()
-            {
-                let pkgbase = pkgbase.clone();
+    // Open the file named in the URL, if any, and reset when the page
+    // changes. Navigating between source pages reuses this component, so the
+    // previous file's selection must not suppress the file the URL names --
+    // and the previous file's content must not linger behind the new one.
+    // `use_reactive` like the fetches above, so this follows the route.
+    use_effect(use_reactive(
+        (&pkgbase, &initial_path),
+        move |(pkgbase, initial_path)| {
+            selected.set(None);
+            loaded.set(None);
+            draft.set(String::new());
+            if let Some(path) = initial_path {
                 spawn(async move { open_file(pkgbase, path).await });
             }
-        }
-    });
+        },
+    ));
 
     let edited = loaded.read().as_ref().is_some_and(|c| {
         let shown = c

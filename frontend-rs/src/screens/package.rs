@@ -21,6 +21,7 @@ use aurcache_client::{
 };
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
+use std::collections::{HashMap, HashSet};
 
 /// How many builds to pull for the summary. Enough for a stable typical
 /// duration without fetching a long history the page does not show.
@@ -640,25 +641,29 @@ struct SharedCandidate {
 fn shared_candidates(
     per_dependent: &[(String, Vec<aurcache_client::DependencyCandidate>)],
 ) -> Vec<SharedCandidate> {
+    // Indexed by pkgbase: the merge used to scan the whole Vec per
+    // candidate, quadratic in dependents × candidates.
+    let mut index: HashMap<&str, usize> = HashMap::new();
     let mut merged: Vec<(SharedCandidate, usize)> = Vec::new();
     for (dependent, candidates) in per_dependent {
         for (rank, candidate) in candidates.iter().enumerate() {
-            match merged
-                .iter_mut()
-                .find(|(shared, _)| shared.pkgbase == candidate.pkgbase)
-            {
-                Some((shared, best_rank)) => {
+            match index.get(candidate.pkgbase.as_str()) {
+                Some(&at) => {
+                    let (shared, best_rank) = &mut merged[at];
                     shared.serves.push(dependent.clone());
                     *best_rank = (*best_rank).min(rank);
                 }
-                None => merged.push((
-                    SharedCandidate {
-                        pkgbase: candidate.pkgbase.clone(),
-                        source: candidate.source,
-                        serves: vec![dependent.clone()],
-                    },
-                    rank,
-                )),
+                None => {
+                    index.insert(candidate.pkgbase.as_str(), merged.len());
+                    merged.push((
+                        SharedCandidate {
+                            pkgbase: candidate.pkgbase.clone(),
+                            source: candidate.source,
+                            serves: vec![dependent.clone()],
+                        },
+                        rank,
+                    ));
+                }
             }
         }
     }
@@ -2482,6 +2487,11 @@ fn ReplaceAndRemoveCard(
     }
 }
 
+/// At most this many package fetches in flight per breadth level: the walk
+/// fans out over the dependent graph, and one `join_all` per level fires a
+/// request per dependent at once.
+const CASCADE_FETCH_CONCURRENCY: usize = 8;
+
 /// Every package that would go with `roots`, the roots included.
 ///
 /// Removing a package is not a local act: everything that needs it stops
@@ -2493,23 +2503,33 @@ async fn cascade_closure(
     client: &aurcache_client::AurCacheClient,
     roots: &[String],
 ) -> Result<Vec<String>, String> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut frontier: Vec<String> = roots.to_vec();
+    // `seen` answers membership; `order` keeps the breadth-first order the
+    // old `Vec`-as-a-set version returned. A name is marked seen when it is
+    // queued, so every frontier is already free of duplicates and of anything
+    // an earlier level visited.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = roots
+        .iter()
+        .filter(|root| seen.insert((*root).clone()))
+        .cloned()
+        .collect();
 
     while !frontier.is_empty() {
-        let fetched =
-            futures_util::future::join_all(frontier.iter().map(|name| client.get_package(name)))
-                .await;
+        let mut fetched = Vec::with_capacity(frontier.len());
+        for chunk in frontier.chunks(CASCADE_FETCH_CONCURRENCY) {
+            fetched.extend(
+                futures_util::future::join_all(chunk.iter().map(|name| client.get_package(name)))
+                    .await,
+            );
+        }
 
         let mut next = Vec::new();
         for (name, result) in frontier.iter().zip(fetched) {
-            if seen.contains(name) {
-                continue;
-            }
-            seen.push(name.clone());
+            order.push(name.clone());
             let package = result.map_err(|e| format!("{name}: {e}"))?;
             for dependent in package.dependents {
-                if !seen.contains(&dependent.name) && !next.contains(&dependent.name) {
+                if seen.insert(dependent.name.clone()) {
                     next.push(dependent.name);
                 }
             }
@@ -2517,7 +2537,7 @@ async fn cascade_closure(
         frontier = next;
     }
 
-    Ok(seen)
+    Ok(order)
 }
 
 /// Point every dependent somewhere else, then let the package fall away.
