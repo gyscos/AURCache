@@ -26,10 +26,13 @@ use crate::cache;
 
 /// What we last saw of one DB, kept so the next fetch can be conditional and
 /// a `304` can reuse the work of parsing it.
+///
+/// Shared, not cloned: the steady state is an unchanged DB, and every job
+/// would otherwise deep-clone the whole map on each `304`.
 struct LastSeen {
     etag: Option<String>,
     last_modified: Option<String>,
-    db: cache::RepoDb,
+    db: std::sync::Arc<cache::RepoDb>,
 }
 
 /// Per-URL state. When a fetch/parse fails the entry is left as it was, but a
@@ -57,9 +60,9 @@ pub async fn fetch_repo_db(
     client: &WorkerClient,
     section: &str,
     arch: &str,
-) -> Result<cache::RepoDb> {
+) -> Result<std::sync::Arc<cache::RepoDb>> {
     let Some(url) = repo_db_url(section, arch) else {
-        return Ok(cache::RepoDb::new());
+        return Ok(Default::default());
     };
     let (etag, last_modified) = {
         let last = last_lock();
@@ -73,18 +76,21 @@ pub async fn fetch_repo_db(
         .await
         .with_context(|| format!("fetching {url}"))?;
     let Some(bytes) = got.body else {
+        // The steady-state path: a refcount bump, not a map clone.
         return Ok(last_lock()
             .get(&url)
-            .map(|seen| seen.db.clone())
+            .map(|seen| std::sync::Arc::clone(&seen.db))
             .unwrap_or_default());
     };
-    let db = cache::parse_repo_db(&bytes).with_context(|| format!("parsing {url}"))?;
+    let db = std::sync::Arc::new(
+        cache::parse_repo_db(&bytes).with_context(|| format!("parsing {url}"))?,
+    );
     last_lock().insert(
         url,
         LastSeen {
             etag: got.etag,
             last_modified: got.last_modified,
-            db: db.clone(),
+            db: std::sync::Arc::clone(&db),
         },
     );
     Ok(db)

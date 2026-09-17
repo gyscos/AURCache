@@ -27,9 +27,9 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
     }
     let code = status.code();
     let reason = match code {
-        Some(137) => "build killed (OOM, exit 137)".to_string(),
+        // Process-specific: a bare wait-status code has no timeout convention.
         Some(124) => "build timed out (exit 124)".to_string(),
-        Some(c) => format!("build failed (exit {c})"),
+        Some(c) => exit_code_reason(i64::from(c)),
         None => "build terminated by signal".to_string(),
     };
     CompleteReport {
@@ -39,6 +39,21 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         canceled: false,
         peak_memory_bytes: None,
         vcs_commits: BTreeMap::new(),
+    }
+}
+
+/// The failure reason for a bare non-zero exit code.
+///
+/// Shared by every executor that learns the outcome as a code rather than an
+/// [`ExitStatus`]: the OOM wording and the generic shape are stated once, so a
+/// change to either cannot update one executor and silently miss the other.
+/// (The `None` arms stay per-executor — a signal-killed process and a
+/// status-less container exit mean different things.)
+#[must_use]
+pub fn exit_code_reason(code: i64) -> String {
+    match code {
+        137 => "build killed (OOM, exit 137)".to_string(),
+        c => format!("build failed (exit {c})"),
     }
 }
 

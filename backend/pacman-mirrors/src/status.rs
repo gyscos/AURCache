@@ -55,9 +55,17 @@ impl Status {
         match target_platform {
             Platform::X86_64 => match Self::fetch_status(Self::URL_X86_64, 2).await {
                 Ok(v) => Ok(v),
-                Err(_) => {
+                Err(e) => {
+                    // Only a timeout is a timeout: DNS, TLS and HTTP errors
+                    // misreported as one send the operator after the wrong
+                    // cause.
+                    let what = if is_timeout(&e) {
+                        "timed out"
+                    } else {
+                        "failed"
+                    };
                     warn!(
-                        "<{}> timed out! Using alternative mirrorlist URL: {}",
+                        "<{}> {what} ({e:#})! Using alternative mirrorlist URL: {}",
                         Self::URL_X86_64,
                         Self::URL_X86_64_ALT
                     );
@@ -99,6 +107,16 @@ impl Status {
 
         Self::try_from(raw)
     }
+}
+
+/// Whether any link in the failure chain is a request timeout, as opposed to
+/// a DNS, TLS, HTTP or parse error wearing a timeout's message.
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
 }
 
 impl TryFrom<Raw> for Status {

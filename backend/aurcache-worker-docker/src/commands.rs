@@ -20,8 +20,13 @@ fn shell_join_args(args: &[String]) -> String {
 }
 
 /// Import the `validpgpkeys` a PKGBUILD declares, skipping keys already held.
-fn fetch_required_pgp_keys_cmd() -> &'static str {
-    "pgp_keys=\"$(if [ -f .SRCINFO ]; then \
+///
+/// The keyserver is the shared executor default, not a literal: the chroot
+/// executor reads the same default from its settings, and two spellings of
+/// the URL would drift.
+fn fetch_required_pgp_keys_cmd() -> String {
+    format!(
+        "pgp_keys=\"$(if [ -f .SRCINFO ]; then \
          sed -n 's/^[[:space:]]*validpgpkeys[[:space:]]*=[[:space:]]*//p' .SRCINFO; \
      else \
          makepkg --printsrcinfo | sed -n 's/^[[:space:]]*validpgpkeys[[:space:]]*=[[:space:]]*//p'; \
@@ -30,10 +35,12 @@ fn fetch_required_pgp_keys_cmd() -> &'static str {
          while IFS= read -r key; do \
              [ -n \"$key\" ] || continue; \
              if ! gpg --batch --list-keys \"$key\" >/dev/null 2>&1; then \
-                 gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys \"$key\"; \
+                 gpg --batch --keyserver {} --recv-keys \"$key\"; \
              fi; \
          done <<< \"$pgp_keys\"; \
-     fi"
+     fi",
+        aurcache_worker_core::settings::DEFAULT_KEYSERVER
+    )
 }
 
 /// Build the shell command that runs inside the builder container.

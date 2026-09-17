@@ -33,12 +33,9 @@ pub mod keys {
     pub const TOTAL_BUILD_CPUS: &str = "total_build_cpus";
 }
 
-/// Keyserver `gpg --recv-keys` asks for a PKGBUILD's `validpgpkeys`.
-///
-/// Safe for the server to set, unlike the rest of the signature path: the keys
-/// a build will accept are pinned by the PKGBUILD, so a keyserver can withhold
-/// a key but cannot substitute one.
-pub const DEFAULT_KEYSERVER: &str = "hkps://keyserver.ubuntu.com";
+/// Re-exported from the shared executor settings: the legacy container
+/// executor's build script uses the same default, and two literals would drift.
+pub use aurcache_worker_core::settings::DEFAULT_KEYSERVER;
 /// Total disk the worker's caches may use when nothing is configured.
 pub const DEFAULT_TOTAL_CACHE_SIZE: u64 = 20 * 1024 * 1024 * 1024;
 /// How long a source stays in the cache without being used.

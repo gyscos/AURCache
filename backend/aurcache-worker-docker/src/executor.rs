@@ -102,14 +102,28 @@ impl DockerExecutor {
             None,
             None,
         );
+        let mut pull_error = None;
         while let Some(item) = stream.next().await {
-            // A pull failure is not fatal on its own: the image may already
-            // be present locally, and the build will say so far more clearly
-            // than a pull error would.
             if let Err(e) = item {
                 tracing::warn!("image pull reported: {e}");
+                pull_error = Some(e);
                 break;
             }
+        }
+        // A pull failure is survivable only when the image is already local.
+        // Without the image, the later failure is a bare "No such image" that
+        // hides the real (TLS/auth/registry) cause — so fail here, with it.
+        if let Some(e) = pull_error
+            && self
+                .docker
+                .inspect_image(&self.cfg.builder_image)
+                .await
+                .is_err()
+        {
+            return Err(e).context(format!(
+                "pulling {} failed and the image is not present locally",
+                self.cfg.builder_image
+            ));
         }
         Ok(())
     }
@@ -389,10 +403,7 @@ impl DockerExecutor {
             Some(code) => CompleteReport {
                 success: false,
                 exit_code: i32::try_from(code).ok(),
-                reason: Some(match code {
-                    137 => "build killed (OOM, exit 137)".to_string(),
-                    c => format!("build failed (exit {c})"),
-                }),
+                reason: Some(report::exit_code_reason(code)),
                 canceled: false,
                 // The legacy container builder samples neither the build tree
                 // nor the sources it was made from.

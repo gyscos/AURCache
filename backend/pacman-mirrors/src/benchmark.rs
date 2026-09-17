@@ -7,19 +7,15 @@ use std::time::{Duration, Instant};
 use tracing::info;
 use url::Url;
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum TargetDb {
-    Core,
-    Extra,
-}
-
 trait Benchmark {
     /// Measure how long it takes to connect (from the user's geography) and
-    /// download `[core,extra]/os/x86_64/[core,extra].db` in full.
+    /// download `core/os/x86_64/core.db` in full.
     ///
     /// Every mirror is measured against the same file, so the elapsed time is
-    /// directly comparable between mirrors: lower is better.
-    async fn measure_duration(&self, target_db: TargetDb) -> anyhow::Result<Duration>;
+    /// directly comparable between mirrors: lower is better. The client is the
+    /// rank's, not a fresh one per probe: per-request construction would throw
+    /// away connection pooling and time client setup instead of the mirror.
+    async fn measure_duration(&self, client: &Client) -> anyhow::Result<Duration>;
 }
 
 pub trait Bench {
@@ -51,6 +47,12 @@ pub fn gen_mirrorlist(mirrors: &[Mirror]) -> String {
 
 impl Bench for Mirrors {
     async fn rank(&self) -> anyhow::Result<Vec<Mirror>> {
+        // One client for the whole rank: connection pooling and TLS session
+        // resumption apply across probes, and setup is not timed per mirror.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()?;
         let mut durations = Vec::new();
         for mirror in &self.0 {
             // Skip mirrors that are not active
@@ -65,7 +67,7 @@ impl Bench for Mirrors {
             }
 
             info!("Benchmarking {}", mirror.url);
-            match mirror.measure_duration(TargetDb::Core).await {
+            match mirror.measure_duration(&client).await {
                 Ok(duration) => durations.push((mirror, duration)),
                 Err(err) => {
                     info!("Failed to measure duration for {}: {}", mirror.url, err);
@@ -85,16 +87,8 @@ impl Bench for Mirrors {
 }
 
 impl Benchmark for Mirror {
-    async fn measure_duration(&self, target_db: TargetDb) -> anyhow::Result<Duration> {
-        let url: Url = match target_db {
-            TargetDb::Core => self.url.join("core/os/x86_64/core.db")?,
-            TargetDb::Extra => self.url.join("extra/os/x86_64/extra.db")?,
-        };
-
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()?;
+    async fn measure_duration(&self, client: &Client) -> anyhow::Result<Duration> {
+        let url: Url = self.url.join("core/os/x86_64/core.db")?;
 
         // The measurement spans connect + headers + the whole body: stopping
         // the clock at the response headers would time the handshake only and

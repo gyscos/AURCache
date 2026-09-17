@@ -559,7 +559,8 @@ fn volumes(params: &ComposeParams) -> String {
     }
     // The bundle needs it on both sides; the backend declares it so a worker on
     // this host can be added later without editing the server service.
-    if role.has_server() || role == ComposeRole::Bundle {
+    // (`Bundle` already satisfies `has_server`; no second disjunct.)
+    if role.has_server() {
         out.push_str("  enroll:\n");
     }
     if role.has_worker() {

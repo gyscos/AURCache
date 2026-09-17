@@ -73,6 +73,10 @@ pub struct WorkerClient {
 /// Fetch the server CA (PEM + fingerprint) using a deliberately
 /// unauthenticated transport, verifying the fingerprint against `pin` when
 /// provided (trust-on-first-use otherwise). Returns the CA PEM.
+///
+/// The client is built per call on purpose: it accepts invalid certificates
+/// (pinning replaces the check), so sharing or hoisting it would risk the one
+/// transport that must never validate leaking into requests that must.
 pub async fn fetch_and_pin_ca(base: &str, pin: Option<&str>) -> Result<String> {
     let insecure = Client::builder()
         .danger_accept_invalid_certs(true)
@@ -241,8 +245,14 @@ impl WorkerClient {
             StatusCode::OK => Ok(Some(resp.json().await.context("decoding job")?)),
             StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(None),
             other => {
-                let body = resp.text().await.unwrap_or_default();
-                bail!("claim failed ({other}): {body}");
+                // A body that will not read is its own failure, not an empty
+                // explanation: without this a truncated error renders as
+                // `claim failed (500): ` with no hint that the explanation
+                // itself is what failed.
+                match resp.text().await {
+                    Ok(body) => bail!("claim failed ({other}): {body}"),
+                    Err(e) => bail!("claim failed ({other}); body unreadable: {e:#}"),
+                }
             }
         }
     }

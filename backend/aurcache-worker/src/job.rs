@@ -96,7 +96,13 @@ async fn run_job_inner(
     let in_use = shared.srcdest.in_use();
     {
         let cache = cache.clone();
-        let _ = tokio::task::spawn_blocking(move || cache.evict(&in_use)).await;
+        // Detached, never awaited: awaiting it would make every job start
+        // wait for the full tree scan the comment above promises never blocks
+        // the build. Best-effort either way — the next job's scan retries
+        // whatever this one misses.
+        tokio::task::spawn_blocking(move || {
+            cache.evict(&in_use);
+        });
     }
 
     // 1. Fetch + extract source.
@@ -327,7 +333,7 @@ async fn run_job_inner(
         let cache = cache.clone();
         let label = job_label.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let promoted = cache.promote_job_pkgs(&label, repo_db.as_ref());
+            let promoted = cache.promote_job_pkgs(&label, repo_db.as_deref());
             cache.wipe_pacman_pkg_job(&label);
             cache.wipe_gnupg_job(&label);
             let evicted = cache.evict_pkgs();

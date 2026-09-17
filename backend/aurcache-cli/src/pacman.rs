@@ -51,9 +51,13 @@ pub fn installed_foreign_packages() -> Result<Vec<String>> {
 /// and installed is the expected case, not a mistake.
 #[must_use]
 pub fn merge_unique(wanted: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    // A set alongside the vec: `--from-installed` on a machine with hundreds
+    // of foreign packages is quadratic over a `contains` scan. Owned keys —
+    // borrowing the vec would forbid the pushes below.
+    let mut seen: std::collections::HashSet<String> = wanted.iter().cloned().collect();
     let mut merged = wanted;
     for name in extra {
-        if !merged.contains(&name) {
+        if seen.insert(name.clone()) {
             merged.push(name);
         }
     }

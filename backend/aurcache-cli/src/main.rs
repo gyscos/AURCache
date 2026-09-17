@@ -1422,7 +1422,13 @@ fn prompt_database_kind() -> Result<compose::DatabaseKind> {
 fn generate_password() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| anyhow!("failed to generate a password: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    // One pre-sized `String`, not sixteen transient ones.
+    let mut password = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        write!(password, "{b:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(password)
 }
 
 fn confirm_bulk_add(packages: &[String], yes: bool) -> Result<()> {
@@ -1670,14 +1676,21 @@ async fn restore_command(
     };
 
     if format == OutputFormat::Json {
-        loop {
-            let progress = client.restore_progress(job_id, 0).await?;
-            if progress.finished {
-                println!("{}", serde_json::to_string_pretty(&progress)?);
-                return restore_result(progress.failed);
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Incremental like the bulk-add follower above: the final document
+        // still shows the whole run, without re-transferring it per tick.
+        let mut full = client.restore_progress(job_id, 0).await?;
+        let mut seen = full.entries.len();
+        while !full.finished {
+            tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_POLL_INTERVAL_SECS)).await;
+            let next = client.restore_progress(job_id, seen).await?;
+            seen += next.entries.len();
+            full.entries.extend(next.entries);
+            full.completed = next.completed;
+            full.failed = next.failed;
+            full.finished = next.finished;
         }
+        println!("{}", serde_json::to_string_pretty(&full)?);
+        return restore_result(full.failed);
     }
 
     println!("restoring {} package(s), job {job_id}", accepted.total);
@@ -1698,7 +1711,7 @@ async fn restore_command(
             );
             return restore_result(progress.failed);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_POLL_INTERVAL_SECS)).await;
     }
 }
 
@@ -1800,15 +1813,22 @@ async fn follow_bulk_add(
     if format == OutputFormat::Json {
         // Machine output waits for the end and prints the whole run at once:
         // a stream of partial states is harder to consume than one final
-        // document, and the run is what the caller asked about.
-        loop {
-            let progress = client.bulk_add_progress(accepted.job_id, 0).await?;
-            if progress.finished {
-                println!("{}", serde_json::to_string_pretty(&progress)?);
-                return bulk_add_result(&progress);
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // document, and the run is what the caller asked about. Polled
+        // incrementally and reassembled here — refetching the whole history
+        // per tick would be O(n²) transfer over a long run.
+        let mut full = client.bulk_add_progress(accepted.job_id, 0).await?;
+        let mut seen = full.entries.len();
+        while !full.finished {
+            tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_POLL_INTERVAL_SECS)).await;
+            let next = client.bulk_add_progress(accepted.job_id, seen).await?;
+            seen += next.entries.len();
+            full.entries.extend(next.entries);
+            full.completed = next.completed;
+            full.failed = next.failed;
+            full.finished = next.finished;
         }
+        println!("{}", serde_json::to_string_pretty(&full)?);
+        return bulk_add_result(&full);
     }
 
     println!(
@@ -1848,7 +1868,7 @@ async fn follow_bulk_add(
             println!("done: {}, of {}", parts.join(", "), progress.total);
             return bulk_add_result(&progress);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_POLL_INTERVAL_SECS)).await;
     }
 }
 
@@ -2307,7 +2327,9 @@ fn print_worker_list(workers: &[Worker]) {
             vec![
                 w.id.to_string(),
                 w.name.clone(),
-                format!("{:?}", w.status).to_lowercase(),
+                // `as_str`, not `Debug`-lowercased: the display spelling is a
+                // contract, not a reflection of the variant name.
+                w.status.as_str().to_string(),
                 // Which build strategy: `chroot`, `docker`, or whatever a
                 // future executor calls itself. A dash for a worker that
                 // enrolled before workers reported one.
@@ -2387,8 +2409,22 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// How often the bulk-add/restore followers poll progress: one number so
+/// tuning it tunes every follower, human and machine output alike.
+const PROGRESS_POLL_INTERVAL_SECS: u64 = 1;
+/// How often `watch` re-lists builds.
+const WATCH_POLL_INTERVAL_SECS: u64 = 5;
+
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
-    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    // Sized by the widest row, not just the headers: a row longer than
+    // `headers` must print, not panic the CLI with an index-out-of-bounds.
+    let columns = headers
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let mut widths = vec![0; columns];
+    for (index, header) in headers.iter().enumerate() {
+        widths[index] = header.len();
+    }
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             widths[index] = widths[index].max(cell.len());
@@ -2895,7 +2931,7 @@ async fn follow_builds(
         if start.elapsed() >= Duration::from_secs(args.timeout) {
             bail!("timed out after {}s", args.timeout);
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(WATCH_POLL_INTERVAL_SECS)).await;
     }
 }
 

@@ -118,8 +118,23 @@ pub enum ApiReachability {
     NotApi { detail: String },
 }
 
+/// How long to wait for a TCP+TLS connection to establish before giving up.
+#[cfg(not(target_arch = "wasm32"))]
+const CLIENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one request may take overall. Every call through this client is a
+/// quick API round trip — except the dump-restore upload, which overrides this
+/// per request — so two minutes is a hung socket, not a slow server.
+const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a dump may take to travel either way, the restore upload and the
+/// download alike: up to 64 MiB on a slow link.
+const CLIENT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct AurCacheClient {
     base_url: String,
+    /// The base as a parsed URL (with trailing slash), so per-request paths
+    /// join onto it instead of rebuilding and re-parsing the string on every
+    /// call — including the 1s/5s poll loops.
+    base: reqwest::Url,
     token: Option<String>,
     client: reqwest::Client,
     on_unauthorized: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -131,12 +146,34 @@ impl AurCacheClient {
     /// `base_url` should normally point at the API root, for example
     /// `http://localhost:8080/api`.
     pub fn new(base_url: String, token: Option<String>) -> Result<Self> {
+        // Parsed once, including the trailing slash `Url::join` needs to keep
+        // the `/api` prefix. An unparseable base fails here rather than on
+        // every request.
+        let mut joined = base_url.trim_end_matches('/').to_string();
+        joined.push('/');
+        let base = reqwest::Url::parse(&joined).context("invalid API base URL")?;
+        // A hung socket must not hang the caller forever: without deadlines
+        // one stalled connection stops any CLI command (or browser poll loop)
+        // with no lease watchdog to save it. The total timeout does not cover
+        // a dump -- a tens-of-MB body on a slow link legitimately takes
+        // minutes -- so the dump download and the restore upload override it
+        // per request (the same reason the worker protocol client keeps a
+        // deadline-free upload client).
+        //
+        // Set per request in `send`, which is the only form reqwest's wasm
+        // client offers; natively the builder sets it too, for the few raw
+        // requests (`probe_api`) that do not go through `send`. The browser's
+        // fetch has no separate connect phase to bound.
+        let builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
+            .connect_timeout(CLIENT_CONNECT_TIMEOUT)
+            .timeout(CLIENT_REQUEST_TIMEOUT);
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            base,
             token,
-            client: reqwest::Client::builder()
-                .build()
-                .context("failed to build HTTP client")?,
+            client: builder.build().context("failed to build HTTP client")?,
             on_unauthorized: None,
         })
     }
@@ -795,7 +832,11 @@ impl AurCacheClient {
     where
         B: Serialize + ?Sized,
     {
-        let response = self.send(method, path, query, body).await?;
+        // A binary body is a dump, as large as the restore upload, so it gets
+        // the upload's deadline rather than the one for API round trips.
+        let response = self
+            .send_with_timeout(method, path, query, body, Some(CLIENT_UPLOAD_TIMEOUT))
+            .await?;
         let response = self.success_or_notify(response).await?;
         Ok(response
             .bytes()
@@ -816,8 +857,7 @@ impl AurCacheClient {
         clear: bool,
         secrets: &str,
     ) -> Result<RestoreAccepted> {
-        let mut url = reqwest::Url::parse(&endpoint_url(&self.base_url, "/restore"))
-            .context("invalid restore URL")?;
+        let mut url = self.base.join("restore").context("invalid restore URL")?;
         url.query_pairs_mut()
             .append_pair("dry_run", &dry_run.to_string())
             .append_pair("on_existing", on_existing)
@@ -826,6 +866,7 @@ impl AurCacheClient {
         let response = self
             .client
             .post(url)
+            .timeout(CLIENT_UPLOAD_TIMEOUT)
             .header(reqwest::header::CONTENT_TYPE, "application/gzip")
             .body(archive);
         let response = match &self.token {
@@ -878,8 +919,31 @@ impl AurCacheClient {
     where
         B: Serialize + ?Sized,
     {
-        let mut url = reqwest::Url::parse(&endpoint_url(&self.base_url, path))
-            .with_context(|| format!("invalid URL for path {path}"))?;
+        self.send_with_timeout(method, path, query, body, None)
+            .await
+    }
+
+    /// [`Self::send`], with the default total deadline replaced by `timeout`
+    /// when one is given.
+    async fn send_with_timeout<B>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&B>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Response>
+    where
+        B: Serialize + ?Sized,
+    {
+        // Absolute URLs pass through (as `endpoint_url` also allows); relative
+        // paths join the parsed base instead of re-parsing a rebuilt string.
+        let mut url = if path.starts_with("http://") || path.starts_with("https://") {
+            reqwest::Url::parse(path)
+        } else {
+            self.base.join(path.trim_start_matches('/'))
+        }
+        .with_context(|| format!("invalid URL for path {path}"))?;
         {
             let mut pairs = url.query_pairs_mut();
             for (key, value) in query {
@@ -888,6 +952,7 @@ impl AurCacheClient {
         }
 
         let mut request = self.client.request(method, url);
+        request = request.timeout(timeout.unwrap_or(CLIENT_REQUEST_TIMEOUT));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
@@ -1048,6 +1113,21 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 fn normalize_error_body(body: &str) -> String {
+    /// What enters the error chain: a proxy's error page must not become the
+    /// whole error. Cut on a char boundary, and say so.
+    const MAX_ERROR_BODY_CHARS: usize = 2048;
+    let message = normalize_full_body(body);
+    match message
+        .char_indices()
+        .nth(MAX_ERROR_BODY_CHARS)
+        .map(|(idx, _)| idx)
+    {
+        Some(idx) => format!("{}… [truncated]", &message[..idx]),
+        None => message,
+    }
+}
+
+fn normalize_full_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return String::new();

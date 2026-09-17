@@ -95,9 +95,16 @@ pub struct CoreConfig {
 }
 
 /// Read an environment variable, treating blank values as unset.
+///
+/// The trimmed value: returning the raw string would keep a leading space
+/// that later parsing (e.g. URL handling, which only trims trailing slashes)
+/// does not remove.
 #[must_use]
 pub fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Read and parse an environment variable, treating blank values as unset.

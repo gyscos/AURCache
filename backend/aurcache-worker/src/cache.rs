@@ -198,9 +198,13 @@ impl Cache {
 
         let mut total: u64 = trees.iter().map(|(_, _, size)| size).sum();
 
+        // A set: tested per tree below, which is quadratic over the slice.
+        let in_use: std::collections::HashSet<&str> = in_use.iter().map(String::as_str).collect();
+        // `statvfs` once up front, then only after a removal freed something:
+        // free space cannot change while this loop merely looks.
+        let mut short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
         for (_, path, size) in trees {
             let over_budget = max_bytes > 0 && total > max_bytes;
-            let short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
             if !over_budget && !short_of_free {
                 return;
             }
@@ -209,13 +213,14 @@ impl Cache {
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| in_use.iter().any(|pkgbase| *pkgbase == n))
+                .is_some_and(|n| in_use.contains(n))
             {
                 continue;
             }
             match remove_tree(&path) {
                 Ok(()) => {
                     total = total.saturating_sub(size);
+                    short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         let _ = std::fs::remove_file(self.size_stamp(platform, name));
                     }
@@ -841,13 +846,16 @@ pub fn parse_repo_db(db: &[u8]) -> anyhow::Result<RepoDb> {
 /// one line plus one following value line, so values use the same `i+1` shape
 /// as every other field parser in this repository.
 fn parse_desc(desc: &str) -> Option<(String, u64, String)> {
-    let lines: Vec<&str> = desc.lines().collect();
+    // Peeking, not indexing: the value is the line after the field header,
+    // and collecting every line only to index `i + 1` is one allocation per
+    // package entry in every `repo.db` parse.
+    let mut lines = desc.lines().peekable();
     let mut filename = None;
     let mut size = None;
     let mut sha = None;
-    for (i, line) in lines.iter().enumerate() {
-        let value = lines.get(i + 1).map(|l| l.trim());
-        match *line {
+    while let Some(line) = lines.next() {
+        let value = lines.peek().map(|l| l.trim());
+        match line {
             "%FILENAME%" => filename = value.filter(|v| !v.is_empty()).map(str::to_string),
             "%CSIZE%" => size = value.and_then(|v| v.trim().parse().ok()),
             "%SHA256SUM%" => sha = value.filter(|v| !v.is_empty()).map(str::to_string),
@@ -904,12 +912,15 @@ pub fn plan_eviction(
     now: SystemTime,
     in_use: &[String],
 ) -> Vec<String> {
+    // A set: the passes below test every entry against it, which is quadratic
+    // over the slice.
+    let in_use: std::collections::HashSet<&str> = in_use.iter().map(String::as_str).collect();
     let mut evict = Vec::new();
     let mut kept: Vec<&CacheEntry> = Vec::new();
 
     // Age-based eviction first.
     for e in entries {
-        if in_use.contains(&e.pkgbase) {
+        if in_use.contains(e.pkgbase.as_str()) {
             kept.push(e);
             continue;
         }
@@ -930,7 +941,7 @@ pub fn plan_eviction(
             if total <= max_size {
                 break;
             }
-            if !in_use.contains(&e.pkgbase) {
+            if !in_use.contains(e.pkgbase.as_str()) {
                 evict.push(e.pkgbase.clone());
                 total = total.saturating_sub(e.size);
             }

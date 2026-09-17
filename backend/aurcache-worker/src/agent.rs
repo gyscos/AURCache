@@ -248,13 +248,19 @@ fn user_id(name: &str) -> Option<u32> {
     (rc == 0 && !found.is_null()).then_some(pwd.pw_uid)
 }
 
+/// How long to wait for ssh-agent's socket (100 polls × 50 ms): it creates
+/// the socket a moment after starting, and polling without a bound would hang
+/// the job forever on an agent that never comes up.
+const AGENT_SOCKET_POLLS: u32 = 100;
+const AGENT_SOCKET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// ssh-agent creates its socket a moment after starting.
 async fn wait_for_socket(socket: &Path) -> Result<()> {
-    for _ in 0..100 {
+    for _ in 0..AGENT_SOCKET_POLLS {
         if socket.exists() {
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(AGENT_SOCKET_POLL_INTERVAL).await;
     }
     anyhow::bail!("ssh-agent did not create {} in time", socket.display())
 }
