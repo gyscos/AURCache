@@ -604,7 +604,7 @@ impl Cache {
     }
 
     /// Remove the checkouts in a pkgbase's persistent build trees whose objects
-    /// lived in the `SRCDEST` mirror just wiped.
+    /// lived in the `SRCDEST` mirror just wiped. Returns how many were removed.
     ///
     /// makepkg makes a VCS working copy with `git clone -s`, so the tree's only
     /// object store is the mirror, reached through
@@ -624,12 +624,18 @@ impl Cache {
     /// all necessary objects" -- before the build starts, and identically on
     /// every retry, since nothing was clearing the checkout.
     ///
+    /// Called both when the mirror is wiped (`wipe_srcdest`) and by the worker
+    /// after a build dies with that signature, so a checkout left stale by an
+    /// *earlier* mirror re-creation -- before this existed, say -- cannot hold
+    /// a package's retries hostage either.
+    ///
     /// Only the borrowed checkouts, never the tree around them: a checkout is a
     /// local clone of a mirror and costs seconds to make again, while the
     /// compiled output beside it is the hours a persistent tree exists to save,
     /// and it borrows nothing.
-    fn wipe_borrowed_checkouts(&self, pkgbase: &str) {
+    pub(crate) fn wipe_borrowed_checkouts(&self, pkgbase: &str) -> usize {
         let root = self.root.join("builddir");
+        let mut wiped = 0usize;
         for platform in std::fs::read_dir(&root).into_iter().flatten().flatten() {
             if is_set_aside(&platform.file_name()) {
                 continue;
@@ -639,7 +645,7 @@ impl Cache {
             let Ok(entries) = std::fs::read_dir(&src) else {
                 continue;
             };
-            let mut removed = false;
+            let mut removed = 0usize;
             for checkout in entries.flatten() {
                 let path = checkout.path();
                 if is_set_aside(&checkout.file_name()) || !borrows_from_srcdest(&path) {
@@ -647,7 +653,7 @@ impl Cache {
                 }
                 match remove_tree(&path) {
                     Ok(()) => {
-                        removed = true;
+                        removed += 1;
                         tracing::info!(
                             "wiped {} with the source cache holding its objects",
                             path.display()
@@ -659,10 +665,14 @@ impl Cache {
             // The tree is smaller than its stamp now says. Drop the stamp
             // rather than correct it: reclaim measures a tree without one, and
             // an overstated size makes it evict trees it did not need to.
-            if removed && let Some(name) = platform.file_name().to_str() {
+            if removed > 0
+                && let Some(name) = platform.file_name().to_str()
+            {
                 let _ = std::fs::remove_file(self.size_stamp(name, pkgbase));
             }
+            wiped += removed;
         }
+        wiped
     }
 
     /// Evict LRU source-cache entries above the size/TTL budget, skipping any
@@ -1111,6 +1121,29 @@ mod tests {
         assert!(
             other.join("borrowed").exists(),
             "another package's checkout borrows from its own cache"
+        );
+    }
+
+    /// The wipe says how many checkouts it took, so a caller can report whether
+    /// the next build will re-clone from the mirror at all -- and calling it on
+    /// a clean tree is a no-op, not an error.
+    #[test]
+    fn wiping_borrowed_checkouts_counts_what_it_took() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = Cache::new(tmp.path(), 0, 0, 0, 0);
+        let src = tree_with_checkouts(&c, "x86_64", "fonts-git");
+
+        let n = c.wipe_borrowed_checkouts("fonts-git");
+        assert_eq!(n, 1, "only the checkout borrowing from this SRCDEST goes");
+        assert!(!src.join("borrowed").exists());
+        assert!(
+            src.join("owned").exists() && src.join("build-output").exists(),
+            "the compiled tree beside the checkout is preserved"
+        );
+        assert_eq!(
+            c.wipe_borrowed_checkouts("fonts-git"),
+            0,
+            "nothing left to take is not an error"
         );
     }
 }

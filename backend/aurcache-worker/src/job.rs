@@ -432,8 +432,19 @@ const LOG_LINE_CAP_BYTES: usize = 1024 * 1024;
 /// Batches flush on size or age, whichever comes first, and always on EOF — so
 /// the last lines of a failed build, which are the ones that explain it, are
 /// never left in the buffer.
-async fn pump_output<R>(reader: R, client: Arc<WorkerClient>, build_id: i32)
-where
+///
+/// While forwarding, listens for the one failure a worker can *do* something
+/// about: makepkg dying in `extract_git`'s `git fetch` because a persistent
+/// tree's checkout refs an object the (fresh) `SRCDEST` mirror no longer
+/// holds. git's own messages are the signal — locale-stable where makepkg's
+/// would not be — and the flag set here lets the job wipe that checkout, since
+/// nothing else will. See `design/persistent-build-directory.md`.
+async fn pump_output<R>(
+    reader: R,
+    client: Arc<WorkerClient>,
+    build_id: i32,
+    stale_git_checkout: &AtomicBool,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -456,7 +467,14 @@ where
         {
             Ok(0) => break,
             Ok(_) => {
-                batch.push_str(&String::from_utf8_lossy(&line));
+                let text = String::from_utf8_lossy(&line);
+                if !stale_git_checkout.load(Ordering::Relaxed)
+                    && (text.contains("did not send all necessary objects")
+                        || text.contains("bad object "))
+                {
+                    stale_git_checkout.store(true, Ordering::Relaxed);
+                }
+                batch.push_str(&text);
                 if batch.len() >= LOG_BATCH_BYTES || last_flush.elapsed() >= LOG_BATCH_INTERVAL {
                     log(&client, build_id, &batch).await;
                     batch.clear();
@@ -635,6 +653,13 @@ async fn run_build(
     let started = std::time::Instant::now();
     // Forward both streams to the build log. Held so they can be awaited after
     // the child exits, which is what guarantees the final lines are sent.
+    // A persistent tree's checkout can outlive its mirror and ref an object
+    // the fresh one no longer holds; the pumps watch for git reporting exactly
+    // that, so a failed build can clear the checkout instead of retrying into
+    // the same wall. Watched from both streams, so it does not matter which
+    // one git writes its error to. The stores happen before `drain` finishes,
+    // so the `SeqCst` load after it sees them.
+    let stale_git_checkout = Arc::new(AtomicBool::new(false));
     let pumps = [
         child.stdout.take().map(Either::Out),
         child.stderr.take().map(Either::Err),
@@ -643,10 +668,11 @@ async fn run_build(
     .flatten()
     .map(|stream| {
         let client = Arc::clone(client);
+        let stale_git_checkout = Arc::clone(&stale_git_checkout);
         tokio::spawn(async move {
             match stream {
-                Either::Out(r) => pump_output(r, client, build_id).await,
-                Either::Err(r) => pump_output(r, client, build_id).await,
+                Either::Out(r) => pump_output(r, client, build_id, &stale_git_checkout).await,
+                Either::Err(r) => pump_output(r, client, build_id, &stale_git_checkout).await,
             }
         })
     })
@@ -795,6 +821,41 @@ async fn run_build(
         );
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
         report.reason = Some(reason);
+    }
+    // Self-heal the failure a persistent build tree is prone to: makepkg's
+    // `git fetch` can die in a checkout whose refs point at objects the
+    // (fresh) `SRCDEST` mirror no longer holds — upstream force-pushed the
+    // branch away — and retrying alone fails identically, because nothing
+    // clears the checkout. Only this worker can. Wipe just the borrowed
+    // checkouts, never the tree around them: a checkout is a local clone of
+    // the mirror and costs seconds to make again, while the compiled output
+    // beside it is the hours the tree exists to save. The next retry then
+    // re-clones from the mirror, which the download phase has already
+    // refreshed. See `design/persistent-build-directory.md`.
+    if !report.success
+        && !canceled
+        && !timed_out
+        && job.persistent_builddir
+        && stale_git_checkout.load(Ordering::SeqCst)
+    {
+        let (cache, pkgbase) = (cache.clone(), job.pkgbase.clone());
+        let wiped = join_cache_task(
+            tokio::task::spawn_blocking(move || cache.wipe_borrowed_checkouts(&pkgbase)),
+            "stale-checkout wipe",
+        )
+        .await
+        .unwrap_or_default();
+        if wiped > 0 {
+            log(
+                client,
+                build_id,
+                &format!(
+                    "[worker] wiped {wiped} stale git checkout(s) from the build tree; \
+                     the next retry re-clones them from the source cache\n"
+                ),
+            )
+            .await;
+        }
     }
     Ok(report)
 }

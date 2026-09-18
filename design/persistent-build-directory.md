@@ -254,6 +254,18 @@ it is the hours this whole feature exists to save, and it borrows nothing --
 stamp is dropped rather than corrected, so the next reclaim measures instead of
 over-counting a tree that just shrank.
 
+Wiping on mirror eviction alone is not enough: a checkout can be left stale by
+an *earlier* re-creation that predates this wipe, and then outlive a healthy
+mirror forever, failing every retry from inside makepkg where only the worker
+can reach it. So the worker also watches the build's streams for the failure's
+own signature -- git's "did not send all necessary objects" / "bad object",
+locale-stable where makepkg's message would not be -- and when a build dies
+with it on a package that opted into a persistent tree, wipes just the borrowed
+checkouts (still not the compiled tree). The next retry re-clones them from the
+mirror, which the download phase refreshes at the same time; no manual cleanup
+on a worker is needed, and a failure that had nothing wrong with the checkout
+is untouched, so nothing is lost by misclassifying one.
+
 ## What this does not solve
 
 A retry still re-runs `prepare()` and `build()`. `prepare()` does
