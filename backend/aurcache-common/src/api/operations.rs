@@ -26,7 +26,11 @@ pub mod kind {
 /// a progress bar, and a bulk add's log can be long enough that sending all of
 /// it to every such caller would be the expensive part. The id is what to poll
 /// for the entries themselves.
+///
+/// Read straight off the row by the operations helper: the selected columns
+/// are exactly these fields.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct ActiveOperation {
     pub id: i32,
     /// See [`kind`]. Unrecognised values are reported as they are.

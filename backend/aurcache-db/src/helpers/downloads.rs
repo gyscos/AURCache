@@ -18,8 +18,10 @@
 use crate::download_counts;
 use crate::helpers::time::now_secs;
 use crate::prelude::DownloadCounts;
-use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
+use sea_orm::sea_query::{Condition, Expr, ExprTrait, OnConflict};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QuerySelect,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -94,10 +96,26 @@ impl DownloadCounter {
         let wanted =
             |file_name: &str| pkgname_of(file_name).is_some_and(|name| wanted_set.contains(name));
 
+        // Prefiltered in SQL by filename prefix: a package's files always
+        // start with `<pkgname>-`, so this narrows the read to candidates
+        // instead of scanning the whole table on every package page view.
+        // A prefilter only: lookalikes (`hello-world`'s files for `hello`)
+        // match it and are still excluded by the exact `wanted` check below,
+        // which is what keeps a prefix from claiming another package. That
+        // is also why the pattern needs no LIKE escaping — over-matching is
+        // harmless here, and escaping differs between SQLite (no default
+        // escape) and Postgres (backslash), so an escape could under-match
+        // on one backend and silently drop downloads.
+        let mut prefix_match = Condition::any();
+        for name in pkgnames {
+            prefix_match =
+                prefix_match.add(download_counts::Column::FileName.like(format!("{name}-%")));
+        }
         let stored: i64 = DownloadCounts::find()
             .select_only()
             .column(download_counts::Column::FileName)
             .column(download_counts::Column::Count)
+            .filter(prefix_match)
             .into_tuple::<(String, i64)>()
             .all(db)
             .await?

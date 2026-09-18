@@ -187,10 +187,8 @@ impl<E: Executor> Runner<E> {
     ///
     /// Done here so everything downstream -- the executor, the chroot -- keeps
     /// seeing one field holding the final content, and none of them has to know
-    /// that it may have arrived on an earlier job.
-    ///
-    /// Precedence: this worker's own mirrorlist, then the server's for this
-    /// arch, then nothing at all (the image's `/etc/pacman.d/mirrorlist`).
+    /// that it may have arrived on an earlier job. The precedence lives on
+    /// [`resolve_job_mirrorlist`], which owns the rule.
     async fn apply_mirrorlist(&self, job: &mut JobDescriptor) {
         let mut held = self.mirrorlists.lock().await;
         resolve_job_mirrorlist(self.cfg.mirrorlist.as_deref(), &mut held, job);

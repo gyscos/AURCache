@@ -253,19 +253,7 @@ pub async fn active_operations(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    Ok(Json(
-        running
-            .into_iter()
-            .map(|job| ActiveOperation {
-                id: job.id,
-                kind: job.kind,
-                created_at: job.created_at,
-                total: job.total,
-                completed: job.completed,
-                failed: job.failed,
-            })
-            .collect(),
-    ))
+    Ok(Json(running))
 }
 
 #[utoipa::path(

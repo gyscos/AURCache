@@ -21,6 +21,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{BinOper, Expr, ExprTrait};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -134,13 +135,25 @@ pub async fn close_orphaned<C: ConnectionTrait>(db: &C) -> Result<u64, DbErr> {
 /// any row left open by a process that died (see [`close_orphaned`]), so this
 /// cannot report a job that no longer exists.
 ///
-/// The log is deliberately not returned: a caller listing what is in flight
-/// wants counters, and a bulk add's log can be long enough that sending every
-/// one of them to draw a progress bar would be the expensive part.
-pub async fn active<C: ConnectionTrait>(db: &C) -> Result<Vec<operations::Model>, DbErr> {
+/// Counters without the log: a caller listing what is in flight wants to draw
+/// a progress bar, and a bulk add's log can be long enough that fetching every
+/// one of them to list what is running would be the expensive part. Selected,
+/// not just unmapped: the full rows would still cross the wire otherwise.
+pub async fn active<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<aurcache_common::api::operations::ActiveOperation>, DbErr> {
+    use aurcache_common::api::operations::ActiveOperation;
     Operations::find()
+        .select_only()
+        .column(operations::Column::Id)
+        .column(operations::Column::Kind)
+        .column(operations::Column::CreatedAt)
+        .column(operations::Column::Total)
+        .column(operations::Column::Completed)
+        .column(operations::Column::Failed)
         .filter(operations::Column::FinishedAt.is_null())
         .order_by_asc(operations::Column::CreatedAt)
+        .into_model::<ActiveOperation>()
         .all(db)
         .await
 }
