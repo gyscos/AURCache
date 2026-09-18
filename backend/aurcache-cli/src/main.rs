@@ -16,6 +16,7 @@ use aurcache_client::{
 };
 use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::{BuildState, BuildStates};
+use aurcache_common::repo::host_from_url;
 use chrono::{DateTime, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{
@@ -946,7 +947,7 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
     // cannot, and has to establish trust explicitly.
     let local = match &args.server_url {
         None => true,
-        Some(url) => url::host_from_url(url).is_some_and(setup::is_local_host),
+        Some(url) => host_from_url(url).is_some_and(setup::is_local_host),
     };
 
     let mut env = args.worker.to_env();

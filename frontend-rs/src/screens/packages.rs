@@ -1,9 +1,8 @@
 //! The packages list.
 //!
 //! Shares `aurcache_client::SimplePackage` with the server rather than
-//! redeclaring it, which is the main argument for a Rust frontend: the
-//! hand-maintained models in the Dart tree stop existing, and a change to a
-//! response shape becomes a compile error here.
+//! redeclaring it, so a change to a response shape becomes a compile error
+//! here instead of a silent drift between two hand-maintained models.
 
 use crate::api::client;
 use crate::format::format_bytes;

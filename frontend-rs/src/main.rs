@@ -1,9 +1,8 @@
 //! A Rust frontend for AURCache, in Dioxus.
 //!
 //! Shares the API types with the server through `aurcache-common` rather than
-//! redeclaring them, which is the main argument for the port: the
-//! hand-maintained models in the Dart tree stop existing, and a change to a
-//! response shape becomes a compile error here instead of a runtime surprise.
+//! redeclaring them, so a change to a response shape becomes a compile error
+//! here instead of a silent drift between two hand-maintained models.
 //!
 //! The port is partial. Routes that are not implemented render a "not ported"
 //! card, so the gap is visible rather than hidden.

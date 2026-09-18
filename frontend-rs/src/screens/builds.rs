@@ -13,8 +13,7 @@ use aurcache_client::Build;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
-/// Columns that only appear once there is room for them, matching the Dart
-/// table, which drops the same ones below 700px.
+/// Columns that only appear once there is room for them.
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
 /// Every build, paged in the browser.

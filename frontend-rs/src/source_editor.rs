@@ -14,8 +14,7 @@
 //! differs — a component that did both behind a flag would be two components
 //! wearing one name.
 //!
-//! No syntax highlighting: the Dart original used a plain text field, so a
-//! textarea is like-for-like and needs no JS editor component.
+//! No syntax highlighting: a textarea needs no JS editor component.
 
 use dioxus::prelude::*;
 

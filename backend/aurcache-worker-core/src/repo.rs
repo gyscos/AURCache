@@ -10,24 +10,8 @@
 //! The worker already knows the right answer: it is the host it dialled to
 //! reach the server in the first place.
 
+use aurcache_common::repo::host_from_url;
 use aurcache_common::worker::REPO_HOST_PLACEHOLDER;
-
-/// Extract the host from a base URL such as `https://aurcache:8083`.
-///
-/// Returns `None` when no host can be determined, in which case no `[repo]`
-/// section is produced at all — better than emitting one pointing at a guess.
-#[must_use]
-pub fn host_from_url(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Strip any userinfo, then any port. IPv6 literals keep their brackets.
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
-    let host = match authority.rfind(']') {
-        Some(end) => &authority[..=end],
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    (!host.is_empty()).then(|| host.to_string())
-}
 
 /// Render the server's template for this worker.
 ///
@@ -63,7 +47,7 @@ pub fn render(
     let host = match override_host.map(str::trim).filter(|h| !h.is_empty()) {
         Some(host) => host.to_string(),
         None => match host_from_url(server_url) {
-            Some(host) => host,
+            Some(host) => host.to_owned(),
             None => return String::new(),
         },
     };
@@ -251,36 +235,6 @@ mod tests {
         let rendered = render(template, "https://aurcache:8083", None, Some("   "));
 
         assert!(rendered.contains("Server = http://aurcache:8081/$arch"));
-    }
-
-    #[test]
-    fn extracts_host_from_the_server_url() {
-        assert_eq!(
-            host_from_url("https://aurcache:8083").as_deref(),
-            Some("aurcache")
-        );
-        assert_eq!(
-            host_from_url("https://localhost:8083").as_deref(),
-            Some("localhost")
-        );
-        assert_eq!(
-            host_from_url("https://aur.example.com").as_deref(),
-            Some("aur.example.com")
-        );
-        assert_eq!(
-            host_from_url("https://10.0.0.5:8083/api").as_deref(),
-            Some("10.0.0.5")
-        );
-        assert_eq!(host_from_url("aurcache:8083").as_deref(), Some("aurcache"));
-    }
-
-    /// An IPv6 literal keeps its brackets; splitting on `:` would mangle it.
-    #[test]
-    fn keeps_ipv6_literals_intact() {
-        assert_eq!(
-            host_from_url("https://[fd00::1]:8083").as_deref(),
-            Some("[fd00::1]")
-        );
     }
 
     /// Each worker must get the host *it* uses, which is the entire point of

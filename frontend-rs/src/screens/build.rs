@@ -352,9 +352,7 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
 // incremental rather than streaming — `?offset=N&limit=M` returns a bounded
 // page of raw bytes from byte N on — so this polls aligned pages, appends
 // them to a cap-sized window, and stops once the build reaches a terminal
-// state. That is the same contract the Dart component used, with the raw
-// bytes decoded (and the cap kept) client-side. The point here is to see what
-// it costs to express that in Dioxus.
+// state, with the raw bytes decoded (and the cap kept) client-side.
 // ---------------------------------------------------------------------------
 
 /// How often to ask for more output while a build is running.

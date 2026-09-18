@@ -295,17 +295,6 @@ impl SnapshotStore {
         Ok(content)
     }
 
-    /// Proactively refresh the cache entry for `source_data`: fetch the
-    /// latest state from the remote and, if the resolved ref actually moved
-    /// (or there was no cached entry yet), re-parse/re-tar it. Returns `true`
-    /// if the entry changed (i.e. the source was not up to date with what
-    /// was previously cached), `false` if it was already current.
-    ///
-    /// This is intended to be called from the periodic version-check loop so
-    /// that staleness is detected (and long-lived caches kept honest) without
-    /// unconditionally re-downloading/re-cloning on every check. If a patch
-    /// was previously active for this source it is re-applied on top of the
-    /// freshly fetched raw source, so the cache entry stays consistent.
     /// Metadata about a package read from its checkout: the `.SRCINFO`
     /// fields, the maintainer comment in the PKGBUILD, and the packaging
     /// history from git.
@@ -524,6 +513,17 @@ impl SnapshotStore {
         Ok(removed)
     }
 
+    /// Proactively refresh the cache entry for `source_data`: fetch the
+    /// latest state from the remote and, if the resolved ref actually moved
+    /// (or there was no cached entry yet), re-parse/re-tar it. Returns `true`
+    /// if the entry changed (i.e. the source was not up to date with what
+    /// was previously cached), `false` if it was already current.
+    ///
+    /// This is intended to be called from the periodic version-check loop so
+    /// that staleness is detected (and long-lived caches kept honest) without
+    /// unconditionally re-downloading/re-cloning on every check. If a patch
+    /// was previously active for this source it is re-applied on top of the
+    /// freshly fetched raw source, so the cache entry stays consistent.
     pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<bool> {
         let cache_key = source_data.cache_key();
         let previous = {

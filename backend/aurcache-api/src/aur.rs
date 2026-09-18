@@ -18,6 +18,7 @@ pub struct AURApi;
         ("query", description = "AUR query"),
     )
 )]
+/// Search the AUR, treating short queries as exact package names.
 #[get("/search?<query>")]
 pub async fn search(
     query: &str,

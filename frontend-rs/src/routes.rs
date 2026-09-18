@@ -1,9 +1,9 @@
 //! The route table.
 //!
-//! Paths mirror the Dart app's (`frontend/lib/components/routing/router.dart`)
-//! so existing links keep working. Each variant names a component of the same
-//! name, and the fields are that component's props — a route that does not line
-//! up with its screen is a compile error rather than a blank page.
+//! Paths are stable across rewrites so existing links keep working. Each
+//! variant names a component of the same name, and the fields are that
+//! component's props — a route that does not line up with its screen is a
+//! compile error rather than a blank page.
 
 // `unreachable_code` fires inside the `Routable` expansion rather than on
 // anything written here, and the derive generates an `impl` an attribute on the
@@ -108,8 +108,8 @@ pub enum Route {
 /// A top-level entry in the side menu.
 ///
 /// Separate from [`Route`] because several routes belong to one entry: viewing
-/// a single build keeps "Builds" highlighted, the way the Dart menu matched on
-/// a path prefix.
+/// a single build keeps "Builds" highlighted, so entries match on a path
+/// prefix rather than an exact route.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuEntry {
     Dashboard,

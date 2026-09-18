@@ -333,17 +333,28 @@ impl Chroots {
         self.layers().len() < HARD_MAX_LAYERS
     }
 
-    /// The published update layers, oldest first.
+    /// Every entry in the updates directory, whatever state it is in.
     ///
     /// Read from the directory rather than remembered, because a worker that
-    /// restarts mid-life inherits whatever the last one published.
-    fn layers(&self) -> Vec<PathBuf> {
+    /// restarts mid-life inherits whatever the last one published. A missing
+    /// directory reads as empty: there is simply nothing published yet — and
+    /// the double `flatten` is the two fallible steps (opening the directory,
+    /// then reading each entry) collapsed into "whatever survived".
+    fn update_entries(&self) -> Vec<PathBuf> {
         let dir = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
-        let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        std::fs::read_dir(&dir)
             .into_iter()
             .flatten()
             .flatten()
             .map(|e| e.path())
+            .collect()
+    }
+
+    /// The published update layers, oldest first.
+    fn layers(&self) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = self
+            .update_entries()
+            .into_iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -356,12 +367,8 @@ impl Chroots {
 
     /// Layers a refresh was killed partway through writing.
     fn layers_pending(&self) -> Vec<PathBuf> {
-        let dir = self.dir.join(OVERLAY_DIR).join(UPDATES_DIR);
-        std::fs::read_dir(&dir)
+        self.update_entries()
             .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())

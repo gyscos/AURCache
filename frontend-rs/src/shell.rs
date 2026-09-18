@@ -1,8 +1,7 @@
 //! The app frame: side menu plus the content area every screen renders into.
 //!
 //! Laid out as a daisyUI drawer, which is permanent from `lg` up and slides
-//! over the content below it. That is the same responsive behaviour as the Dart
-//! `MenuShell`, without needing to measure the viewport in Rust.
+//! over the content below it, without needing to measure the viewport in Rust.
 
 use crate::dates::DateStylePicker;
 use crate::listing::ViewParams;
@@ -299,8 +298,7 @@ fn Icon(path: &'static str) -> Element {
     }
 }
 
-/// Stands in for `assets/icons/icon.svg` in the Dart tree: a package glyph,
-/// drawn inline so the prototype needs no asset pipeline.
+/// The app logo: a package glyph, drawn inline so no asset pipeline is needed.
 #[component]
 fn LogoIcon() -> Element {
     rsx! {

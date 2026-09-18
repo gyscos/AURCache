@@ -3,9 +3,7 @@
 use aurcache_client::AurCacheClient;
 
 /// The API is on the same origin the page was served from, so the base URL is
-/// derived at runtime rather than baked in — the same rule the Dart client uses
-/// for release builds. The fallback is the dev server, matching Dart's debug
-/// build.
+/// derived at runtime rather than baked in. The fallback is the dev server.
 pub fn api_base() -> String {
     web_sys::window()
         .and_then(|w| w.location().origin().ok())

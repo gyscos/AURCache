@@ -53,9 +53,36 @@ pub fn server_url_for_host(public_url: &str, host: &str) -> String {
     format!("{scheme}://{host}{port}{path}/$arch")
 }
 
+/// The host in `url`, without scheme, userinfo, port or path.
+///
+/// The one operation worth sharing: the server publishes one template for
+/// every worker and the CLI derives sibling addresses, but the host is the
+/// one part each of them reaches the instance by — so each pulls it back out
+/// of the URL it already knows.
+///
+/// An IPv6 literal keeps its brackets: that is how it has to be written back
+/// into a URL, and dropping them would produce an address that does not parse.
+#[must_use]
+pub fn host_from_url(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo is delimited by the *last* `@`, since a password may contain one.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    let host = if authority.starts_with('[') {
+        &authority[..=authority.find(']')?]
+    } else {
+        authority.split(':').next()?
+    };
+
+    (!host.is_empty()).then_some(host)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::server_url_for_host;
+    use super::{host_from_url, server_url_for_host};
     use crate::ports::AURCACHE_MIRROR_PORT;
 
     /// Only the host changes: the rest describes how the repository is
@@ -131,5 +158,53 @@ mod tests {
             server_url_for_host("http://[fd00::1]/repo", "worker"),
             format!("http://worker:{AURCACHE_MIRROR_PORT}/repo/$arch")
         );
+    }
+
+    #[test]
+    fn a_host_is_read_out_of_the_usual_shapes() {
+        assert_eq!(host_from_url("http://localhost:8080/api"), Some("localhost"));
+        assert_eq!(
+            host_from_url("https://aurcache.example.com"),
+            Some("aurcache.example.com")
+        );
+        assert_eq!(
+            host_from_url("http://192.168.1.10:8080/"),
+            Some("192.168.1.10")
+        );
+        assert_eq!(host_from_url("https://10.0.0.5:8083/api"), Some("10.0.0.5"));
+        // No scheme at all: the whole thing is the authority.
+        assert_eq!(host_from_url("localhost:8080/api"), Some("localhost"));
+        assert_eq!(host_from_url("aurcache:8083"), Some("aurcache"));
+    }
+
+    /// The brackets are part of the address once it goes back into a URL.
+    #[test]
+    fn an_ipv6_literal_keeps_its_brackets() {
+        assert_eq!(host_from_url("http://[::1]:8080/api"), Some("[::1]"));
+        assert_eq!(
+            host_from_url("http://[2001:db8::1]/api"),
+            Some("[2001:db8::1]")
+        );
+        assert_eq!(host_from_url("https://[fd00::1]:8083"), Some("[fd00::1]"));
+    }
+
+    /// An unclosed bracket is no host at all, not a prefix of one: splitting
+    /// `"[::1"` on `:` would otherwise hand back `"["`.
+    #[test]
+    fn an_unclosed_ipv6_literal_has_no_host() {
+        assert_eq!(host_from_url("http://[::1:8080/api"), None);
+    }
+
+    /// A password may itself contain `@`, so the split has to be from the right.
+    #[test]
+    fn userinfo_is_stripped_from_the_last_separator() {
+        assert_eq!(host_from_url("http://user:p@ss@host:8080/api"), Some("host"));
+    }
+
+    #[test]
+    fn a_url_without_a_host_has_none() {
+        assert_eq!(host_from_url(""), None);
+        assert_eq!(host_from_url("http://"), None);
+        assert_eq!(host_from_url("http:///api"), None);
     }
 }

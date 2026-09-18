@@ -22,9 +22,18 @@ pub fn PackageSource(pkgbase: String, path: Vec<String>) -> Element {
 // you change it, and the server derives the patch. Writing the original
 // content back is how a file is un-patched.
 //
-// The Dart original uses a plain text field — no syntax highlighting — so a
-// textarea is a like-for-like replacement and needs no JS editor component.
+// No syntax highlighting: a textarea needs no JS editor component.
 // ---------------------------------------------------------------------------
+
+/// The text the editor shows and measures the draft against: the patched
+/// content when there is some, otherwise the pristine file. One copy — this
+/// selection is wherever the draft is seeded, dirtied, compared or reverted.
+fn shown_content(content: &SourceFileContent) -> &str {
+    content
+        .patched_content
+        .as_deref()
+        .unwrap_or(&content.original_content)
+}
 
 #[component]
 pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
@@ -72,15 +81,9 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         };
         match client.get_source_file(&pkgbase, &path).await {
             Ok(content) => {
-                // Show the patched content when there is some; otherwise the
-                // pristine file. A patch that no longer applies falls back to
-                // pristine and says so, rather than showing nothing.
-                draft.set(
-                    content
-                        .patched_content
-                        .clone()
-                        .unwrap_or_else(|| content.original_content.clone()),
-                );
+                // A patch that no longer applies falls back to pristine and
+                // says so, rather than showing nothing.
+                draft.set(shown_content(&content).to_owned());
                 loaded.set(Some(content));
                 selected.set(Some(path));
                 status.set(None);
@@ -107,13 +110,10 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
         },
     ));
 
-    let edited = loaded.read().as_ref().is_some_and(|c| {
-        let shown = c
-            .patched_content
-            .clone()
-            .unwrap_or_else(|| c.original_content.clone());
-        draft() != shown
-    });
+    let edited = loaded
+        .read()
+        .as_ref()
+        .is_some_and(|c| draft() != shown_content(c));
     let patched = loaded
         .read()
         .as_ref()
@@ -180,9 +180,10 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     }
                     // Read at click time, not captured from the render: the
                     // draft changes with every keystroke.
-                    let unsaved = loaded.peek().as_ref().is_some_and(|c| {
-                        *draft.peek() != c.patched_content.clone().unwrap_or_else(|| c.original_content.clone())
-                    });
+                    let unsaved = loaded
+                        .peek()
+                        .as_ref()
+                        .is_some_and(|c| *draft.peek() != shown_content(c));
                     if unsaved {
                         pending_file.set(Some(path));
                         return;
@@ -234,11 +235,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                     onclick: move |_| {
                                         reset_open.set(false);
                                         if let Some(c) = loaded.read().as_ref() {
-                                            draft.set(
-                                                c.patched_content
-                                                    .clone()
-                                                    .unwrap_or_else(|| c.original_content.clone()),
-                                            );
+                                            draft.set(shown_content(c).to_owned());
                                         }
                                     },
                                     span { class: "flex flex-col items-start",

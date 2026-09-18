@@ -42,7 +42,7 @@ pub fn BuildStatusBadge(status: i32) -> Element {
     rsx! { span { class: "badge {class} badge-sm whitespace-nowrap", "{label}" } }
 }
 
-/// Status as a coloured badge, the way the Flutter table did it with chips.
+/// Status as a coloured badge.
 ///
 /// Matches on [`BuildState`] rather than on the raw integer: the arms are
 /// exhaustive, so adding a state server-side breaks this at compile time

@@ -6,9 +6,10 @@
 //! the same host on the mirror port. So this command prints the finished block
 //! with nothing left to substitute.
 
-use crate::url::{host_from_url, is_loopback, scheme_from_url};
+use crate::url::{is_loopback, scheme_from_url};
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_common::ports::AURCACHE_MIRROR_PORT;
+use aurcache_common::repo::host_from_url;
 use serde::Serialize;
 use std::fs;
 use std::io::{ErrorKind, Write};
