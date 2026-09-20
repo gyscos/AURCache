@@ -1146,6 +1146,54 @@ mod tests {
             "nothing left to take is not an error"
         );
     }
+
+    /// The parent of a borrowed checkout is owned by the build user (builder)
+    /// with 0755, so the worker (aurcache) cannot `rename` the entry out.
+    /// `remove_tree` must fall back to `privileged_rm` rather than leaving
+    /// `wipe_borrowed_checkouts` logging "Permission denied" on every retry.
+    /// This is the `ttf-google-fonts-git` symptom: `gh-pages` force-pushed
+    /// away leaves `git fetch` failing with "bad object" on every build until
+    /// the checkout is gone, and the previous code never removed it.
+    #[test]
+    fn remove_tree_falls_back_to_privileged_rm_when_parent_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Skip when running as root: root bypasses permission checks, so the
+        // rename would succeed without needing the fallback, and the test
+        // would not exercise the branch it is meant to cover.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let child = parent.join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("file"), b"data").unwrap();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = remove_tree(&child);
+
+        // Restore so the tempdir can be cleaned even if the test fails.
+        let _ = std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755));
+
+        // When `sudo -n rm` is available (as on workers and on this host) the
+        // fallback succeeds; otherwise it returns an error that must mention
+        // the sudo attempt so the branch is observable.
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("and with sudo"),
+                "should have tried privileged_rm: {e}"
+            );
+        } else {
+            assert!(
+                !child.exists(),
+                "privileged fallback should have removed the tree"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1821,6 +1869,16 @@ fn remove_tree(path: &Path) -> std::io::Result<()> {
     match std::fs::rename(path, &aside) {
         Ok(()) => remove_set_aside(&aside),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // The parent belongs to the build user (0755), so the worker
+            // cannot rename the entry out of it. Remove it in place with
+            // privilege instead, as `remove_set_aside` already does for the
+            // `rmdir` half -- otherwise a stale checkout in a persistent tree
+            // survives every wipe and fails every retry identically.
+            privileged_rm(path).map_err(|with_sudo| {
+                std::io::Error::new(e.kind(), format!("{e}; and with sudo: {with_sudo}"))
+            })
+        }
         Err(e) => Err(e),
     }
 }
