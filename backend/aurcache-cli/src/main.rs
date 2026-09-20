@@ -572,6 +572,14 @@ struct PatchPackageArgs {
     /// Build flag selection. Repeat to replace with multiple values.
     #[arg(long = "build-flag")]
     build_flags: Vec<String>,
+
+    /// Patch a source file: either `SOURCE_PATH=LOCAL_FILE` (e.g.
+    /// `--patch PKGBUILD=./fixed-PKGBUILD`) or just `LOCAL_FILE`, in which
+    /// case the file's own base name is used as the source path
+    /// (e.g. `--patch ./PKGBUILD` patches `PKGBUILD`). Repeat for multiple
+    /// files.
+    #[arg(long = "patch", value_parser = parse_patch_arg)]
+    patches: Vec<(String, String)>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1974,8 +1982,27 @@ async fn patch_package_command(
     format: OutputFormat,
     args: PatchPackageArgs,
 ) -> Result<()> {
-    let (pkgbase, body) = build_patch_package_request(args)?;
-    client.patch_package(&pkgbase, &body).await?;
+    let has_metadata = !args.platforms.is_empty() || !args.build_flags.is_empty();
+    let has_patches = !args.patches.is_empty();
+    if !has_metadata && !has_patches {
+        bail!("no changes specified");
+    }
+
+    if has_metadata {
+        let (pkgbase, body) = build_patch_package_request(args.clone())?;
+        client.patch_package(&pkgbase, &body).await?;
+    }
+
+    if has_patches {
+        // `read_patch_files` validates duplicates and reads the local files.
+        let files = read_patch_files(&args.patches)?.expect("non-empty patches produce a map");
+        for (path, content) in files {
+            client
+                .put_source_file(&args.pkgbase, &path, &content)
+                .await?;
+        }
+    }
+
     print_done_message(format, "package updated");
     Ok(())
 }
@@ -3473,6 +3500,59 @@ mod tests {
         };
         assert!(args.install);
         assert_eq!(args.pacman_conf, PathBuf::from(repo::PACMAN_CONF));
+    }
+
+    #[test]
+    fn packages_patch_accepts_source_patches() {
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "pkg",
+            "patch",
+            "hello",
+            "--patch",
+            "PKGBUILD=./fixed-PKGBUILD",
+            "--patch",
+            "./other.conf",
+        ]);
+        let Command::Pkg {
+            command: PackagesCommand::Patch(args),
+        } = cli.command
+        else {
+            panic!("expected packages patch");
+        };
+        assert_eq!(args.pkgbase, "hello");
+        assert_eq!(
+            args.patches,
+            vec![
+                ("PKGBUILD".to_string(), "./fixed-PKGBUILD".to_string()),
+                ("other.conf".to_string(), "./other.conf".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn packages_patch_combines_patches_with_other_fields() {
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "pkg",
+            "patch",
+            "hello",
+            "--platform",
+            "x86_64",
+            "--patch",
+            "PKGBUILD=./file",
+        ]);
+        let Command::Pkg {
+            command: PackagesCommand::Patch(args),
+        } = cli.command
+        else {
+            panic!("expected packages patch");
+        };
+        assert_eq!(args.platforms, vec!["x86_64"]);
+        assert_eq!(
+            args.patches,
+            vec![("PKGBUILD".to_string(), "./file".to_string())]
+        );
     }
 }
 
