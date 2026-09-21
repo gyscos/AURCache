@@ -121,7 +121,12 @@ impl CachedResult {
     }
 
     /// How well this result answers what was typed: exact name first, then
-    /// prefix, then substring, then description-only.
+    /// prefix, then substring, then description-only. The single copy of
+    /// this ordering — [`rank_results`] for fresh network results goes
+    /// through here too, so the two cannot drift apart.
+    ///
+    /// Sorted on stably, so the AUR's own order — which does carry some
+    /// popularity signal — survives among equally good matches.
     fn rank(&self, query: &str) -> u8 {
         if self.lowered_name == query {
             0
@@ -211,25 +216,17 @@ impl SearchCache {
 /// `hello` itself appears. The package someone typed the exact name of is the
 /// one they meant, so it goes first, then the ones that start with what they
 /// typed, then everything else.
-///
-/// Stable within each rank, so the AUR's own order — which does carry some
-/// popularity signal — survives among equally good matches.
 fn rank_results(query: &str, results: &mut [SearchResult]) {
     let query = query.trim().to_lowercase();
-    results.sort_by_key(|result| {
-        let name = result.name.to_lowercase();
-        if name == query {
-            0
-        } else if name.starts_with(&query) {
-            1
-        } else if name.contains(&query) {
-            2
-        } else {
-            // Matched on something other than the name — the AUR searches
-            // descriptions too — so it is the least likely to be what was meant.
-            3
-        }
-    });
+    // Through `CachedResult` rather than a second copy of the ordering: each
+    // name is lowered once here, where the old sort key re-lowered it on
+    // every comparison (`sort_by_key` evaluates the key per comparison, not
+    // once per element).
+    let mut cached: Vec<CachedResult> = results.iter().cloned().map(CachedResult::new).collect();
+    cached.sort_by_key(|result| result.rank(&query));
+    for (slot, entry) in results.iter_mut().zip(cached) {
+        *slot = entry.result;
+    }
 }
 
 /// The source the form currently describes, or `None` while it is empty.

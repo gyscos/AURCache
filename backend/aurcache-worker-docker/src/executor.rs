@@ -335,8 +335,11 @@ impl DockerExecutor {
                     None => break,
                 },
                 () = tokio::time::sleep(Duration::from_secs(5)) => {
+                    // `>=`: a timeout of N means N seconds, not N+1. (The
+                    // 5 s poll quantum dominates either way; this is about
+                    // saying what is meant.)
                     let hit_timeout =
-                        timeout > 0 && started.elapsed().as_secs() > timeout;
+                        timeout > 0 && started.elapsed().as_secs() >= timeout;
                     if cancel.load(Ordering::SeqCst) {
                         canceled = true;
                     } else if !hit_timeout && last_remote_poll.elapsed() >= remote_poll {

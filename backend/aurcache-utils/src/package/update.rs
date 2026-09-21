@@ -98,6 +98,26 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
         .await?;
     let activity_log = &services.activity;
 
+    // Which outdated packages track a VCS source, in one query: the loop
+    // below used to count per package, a round trip each for a flag that
+    // only decides forced-vs-unforced.
+    let vcs_tracked: std::collections::HashSet<i32> = match PackageVcsSources::find()
+        .select_only()
+        .column(package_vcs_sources::Column::PackageId)
+        .filter(package_vcs_sources::Column::PackageId.is_in(pkg_models.iter().map(|pkg| pkg.id)))
+        .into_tuple()
+        .all(db)
+        .await
+    {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            warn!(
+                "Auto update could not list VCS-tracked packages, treating all as untracked: {e}"
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
     let mut ids_total = vec![];
     // One package's failure must not starve the rest. A sourceinfo that no
     // longer applies after an upstream bump, a dependency that cannot be
@@ -114,17 +134,7 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
             continue;
         }
         let package_name = pkg.name.clone();
-        let force = match PackageVcsSources::find()
-            .filter(package_vcs_sources::Column::PackageId.eq(pkg.id))
-            .count(db)
-            .await
-        {
-            Ok(tracked) => tracked > 0,
-            Err(e) => {
-                warn!("Auto update skipped {package_name}: {e}");
-                continue;
-            }
-        };
+        let force = vcs_tracked.contains(&pkg.id);
         match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
                 activity_log.record(

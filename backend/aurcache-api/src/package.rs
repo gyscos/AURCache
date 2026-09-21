@@ -1404,11 +1404,17 @@ mod file_tests {
 /// This is what a replacement is measured against. A dependent's edge records
 /// the constraint but not which of these names it declared, so covering all of
 /// them is the only way to know a replacement covers a given dependent.
-fn provided_names(pkg: &packages::Model) -> Vec<String> {
-    let mut names = vec![pkg.name.clone()];
-    names.extend(json_string_list(pkg.split_packages.as_deref()));
+/// The names a package answers to: its own name, its splits, and its provides
+/// (a versioned `provides` contributes the name, not the whole entry).
+///
+/// Fields, not the row: the options dialog matches over a narrowed fetch
+/// that never loads the rest of the columns (source blobs, patches), and
+/// threading a whole `Model` through for three fields would keep it that way.
+fn provided_names(name: &str, split_packages: Option<&str>, provides: Option<&str>) -> Vec<String> {
+    let mut names = vec![name.to_string()];
+    names.extend(json_string_list(split_packages));
     names.extend(
-        json_string_list(pkg.provides.as_deref())
+        json_string_list(provides)
             .into_iter()
             .map(|entry| match entry.split_once('=') {
                 Some((name, _version)) => name.to_string(),
@@ -1486,7 +1492,11 @@ async fn declared_names_for_edge(
     let declared = aurcache_utils::pkg::DependencySet::of(&deps)
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    let answers = provided_names(current);
+    let answers = provided_names(
+        &current.name,
+        current.split_packages.as_deref(),
+        current.provides.as_deref(),
+    );
     Ok(declared
         .names
         .into_iter()
@@ -1534,32 +1544,45 @@ pub async fn package_dependency_options(
     // Tracked first: they are already here, so choosing one builds nothing new.
     // A package carrying a declared name outright leads one that merely
     // provides it, on the same rule resolution ranks by.
+    //
+    // Four narrowed columns, not whole rows: matching needs the id, the
+    // name, and the two JSON name lists, and the rest (source blobs,
+    // patches) would only ride along.
     let mut candidates = Vec::new();
-    let tracked = Packages::find()
+    let tracked: Vec<(i32, String, Option<String>, Option<String>)> = Packages::find()
+        .select_only()
+        .column(packages::Column::Id)
+        .column(packages::Column::Name)
+        .column(packages::Column::SplitPackages)
+        .column(packages::Column::Provides)
+        .into_tuple()
         .all(&services.db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    let mut tracked_matches: Vec<&packages::Model> = tracked
+    let mut tracked_matches: Vec<&(i32, String, Option<String>, Option<String>)> = tracked
         .iter()
-        .filter(|package| package.id != current.id && package.id != dependent.id)
+        .filter(|package| package.0 != current.id && package.0 != dependent.id)
         .filter(|package| {
-            provided_names(package)
+            provided_names(&package.1, package.2.as_deref(), package.3.as_deref())
                 .iter()
                 .any(|name| declared_names.contains(name))
         })
         .collect();
     tracked_matches.sort_by(|a, b| {
-        let carries = |package: &packages::Model| !declared_names.contains(&package.name);
-        carries(a)
-            .cmp(&carries(b))
-            .then_with(|| a.name.cmp(&b.name))
+        let carries = |package: &(i32, String, Option<String>, Option<String>)| {
+            !declared_names.contains(&package.1)
+        };
+        carries(a).cmp(&carries(b)).then_with(|| a.1.cmp(&b.1))
     });
     for package in tracked_matches {
-        let version = latest_successful_version_any_platform(&services.db, package.id)
+        // One indexed point lookup per match, not a batched scan: matches
+        // are a handful of rows, and "latest" means newest end time, which
+        // no GROUP BY over ids reproduces.
+        let version = latest_successful_version_any_platform(&services.db, package.0)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
         candidates.push(DependencyCandidate {
-            pkgbase: package.name.clone(),
+            pkgbase: package.1.clone(),
             source: CandidateSource::Tracked,
             verdict: candidate_verdict(version.as_deref(), &edge.version_constraint),
             version,
@@ -1568,10 +1591,8 @@ pub async fn package_dependency_options(
 
     // Then the AUR, in the order resolution itself would rank them, minus
     // everything already offered above.
-    let tracked_names: std::collections::HashSet<&str> = tracked
-        .iter()
-        .map(|package| package.name.as_str())
-        .collect();
+    let tracked_names: std::collections::HashSet<&str> =
+        tracked.iter().map(|package| package.1.as_str()).collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut aur_error = None;
     for name in &declared_names {
@@ -1676,7 +1697,11 @@ pub async fn package_dependency_replace(
             }
 
             let package = ensure_replacement_exists(services, &dependent, &replacement).await?;
-            let answers = provided_names(&package);
+            let answers = provided_names(
+                &package.name,
+                package.split_packages.as_deref(),
+                package.provides.as_deref(),
+            );
             if !declared_names.iter().any(|name| answers.contains(name)) {
                 return Err(err(
                     Status::BadRequest,
@@ -1856,13 +1881,24 @@ mod dependency_tests {
     #[tokio::test]
     async fn provided_names_covers_the_name_the_splits_and_the_provides() {
         let db = memory_db().await;
-        let mut package = package(&db, "libfoo", true).await;
-        assert_eq!(provided_names(&package), vec!["libfoo"]);
-
-        package.split_packages = Some(json!(["libfoo-docs"]).to_string());
-        package.provides = Some(json!(["libfoo.so=1", "foo-compat"]).to_string());
+        let package = package(&db, "libfoo", true).await;
         assert_eq!(
-            provided_names(&package),
+            provided_names(
+                &package.name,
+                package.split_packages.as_deref(),
+                package.provides.as_deref()
+            ),
+            vec!["libfoo"]
+        );
+
+        let split_packages = Some(json!(["libfoo-docs"]).to_string());
+        let provides = Some(json!(["libfoo.so=1", "foo-compat"]).to_string());
+        assert_eq!(
+            provided_names(
+                &package.name,
+                split_packages.as_deref(),
+                provides.as_deref()
+            ),
             vec!["foo-compat", "libfoo", "libfoo-docs", "libfoo.so"],
             "a versioned `provides` contributes the name, not the whole entry"
         );

@@ -76,9 +76,10 @@ pub fn StatusBadge(status: i32, outofdate: i32) -> Element {
 mod tests {
     use super::*;
 
-    /// Render a component to HTML so its output can be asserted on.
-    fn render(element: fn() -> Element) -> String {
-        let mut dom = VirtualDom::new(element);
+    /// Render the badge to HTML so its output can be asserted on.
+    fn render(status: i32, outofdate: i32) -> String {
+        let mut dom =
+            VirtualDom::new_with_props(StatusBadge, StatusBadgeProps { status, outofdate });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
@@ -101,17 +102,7 @@ mod tests {
             (BuildState::Publishing, "publishing", "badge-info"),
         ] {
             let status = state.as_i32();
-            let html = {
-                let mut dom = VirtualDom::new_with_props(
-                    StatusBadge,
-                    StatusBadgeProps {
-                        status,
-                        outofdate: 0,
-                    },
-                );
-                dom.rebuild_in_place();
-                dioxus_ssr::render(&dom)
-            };
+            let html = render(status, 0);
             assert!(
                 html.contains(label),
                 "{state:?} should render {label:?}: {html}"
@@ -124,15 +115,7 @@ mod tests {
     /// is current, and the distinction is easy to invert.
     #[test]
     fn a_successful_but_outdated_build_is_flagged() {
-        let mut dom = VirtualDom::new_with_props(
-            StatusBadge,
-            StatusBadgeProps {
-                status: BuildState::Successful.as_i32(),
-                outofdate: 1,
-            },
-        );
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
+        let html = render(BuildState::Successful.as_i32(), 1);
         assert!(html.contains("out of date"), "{html}");
         assert!(html.contains("badge-warning"), "{html}");
     }
@@ -141,15 +124,7 @@ mod tests {
     /// understood.
     #[test]
     fn an_unrecognised_state_renders_as_unknown() {
-        let mut dom = VirtualDom::new_with_props(
-            StatusBadge,
-            StatusBadgeProps {
-                status: 99,
-                outofdate: 0,
-            },
-        );
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
+        let html = render(99, 0);
         assert!(html.contains("unknown"), "{html}");
     }
 
@@ -172,22 +147,12 @@ mod tests {
             99,
         ] {
             for outofdate in [0, 1] {
-                let mut dom =
-                    VirtualDom::new_with_props(StatusBadge, StatusBadgeProps { status, outofdate });
-                dom.rebuild_in_place();
-                let html = dioxus_ssr::render(&dom);
+                let html = render(status, outofdate);
                 assert!(
                     !html.contains("badge-ghost"),
                     "status {status} (outofdate {outofdate}) renders invisibly: {html}"
                 );
             }
         }
-    }
-
-    // Silences the unused-fn warning: `render` is kept as the simple form for
-    // components without props.
-    #[allow(dead_code)]
-    fn _unused() {
-        let _ = render;
     }
 }

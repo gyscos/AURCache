@@ -125,9 +125,13 @@ async fn build_secrets(
     db: &DatabaseConnection,
     ca_dir: &std::path::Path,
 ) -> anyhow::Result<DumpSecrets> {
-    let ca_cert_pem = std::fs::read_to_string(ca_dir.join(CA_CERT_FILE))
+    // Async reads: this runs on the API executor, and blocking it on the
+    // filesystem stalls every request sharing the thread.
+    let ca_cert_pem = tokio::fs::read_to_string(ca_dir.join(CA_CERT_FILE))
+        .await
         .with_context(|| format!("reading the CA certificate from {}", ca_dir.display()))?;
-    let ca_key_pem = std::fs::read_to_string(ca_dir.join(CA_KEY_FILE))
+    let ca_key_pem = tokio::fs::read_to_string(ca_dir.join(CA_KEY_FILE))
+        .await
         .with_context(|| format!("reading the CA key from {}", ca_dir.display()))?;
 
     let tokens = ApiTokens::find()

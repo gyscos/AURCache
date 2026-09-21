@@ -779,57 +779,69 @@ async fn insert_row<C: sea_orm::ConnectionTrait>(
 }
 
 /// Settings, keyed back from pkgbase onto row ids.
+///
+/// One read for every row the restore touches, then one batched insert for
+/// the missing keys and one write per changed value: the per-key
+/// select-then-write this replaces needed two round trips per setting
+/// (~50 for a full dump), and rewrote rows whose value already matched.
 async fn write_settings<C: sea_orm::ConnectionTrait>(
     db: &C,
     dump: &LoadedDump,
     ids: &BTreeMap<String, i32>,
 ) -> anyhow::Result<()> {
+    let mut desired: Vec<(i32, &str, &str)> = Vec::new();
     for (key, value) in &dump.settings.global {
-        upsert_setting(db, key, value, crate::settings::general::GLOBAL_PKG_ID).await?;
+        desired.push((crate::settings::general::GLOBAL_PKG_ID, key, value));
     }
     for (pkgbase, values) in &dump.settings.packages {
         // Validation guarantees the package is in the dump; this only skips one
         // that was left alone by `Skip`, whose own settings are already right.
         let Some(id) = ids.get(pkgbase) else { continue };
         for (key, value) in values {
-            upsert_setting(db, key, value, *id).await?;
+            desired.push((*id, key, value));
         }
     }
-    Ok(())
-}
-
-async fn upsert_setting<C: sea_orm::ConnectionTrait>(
-    db: &C,
-    key: &str,
-    value: &str,
-    pkg_id: i32,
-) -> anyhow::Result<()> {
     // A dump from before a setting was retired still carries it; restoring it
     // would bring back a row the migration removed and nothing reads.
-    if aurcache_common::settings::RETIRED_SETTING_KEYS.contains(&key) {
-        return Ok(());
-    }
-    let existing = settings::Entity::find()
-        .filter(settings::Column::Key.eq(key))
-        .filter(settings::Column::PkgId.eq(pkg_id))
-        .one(db)
-        .await?;
-    match existing {
-        Some(row) => {
-            let mut active: settings::ActiveModel = row.into();
-            active.value = Set(Some(value.to_string()));
-            active.update(db).await?;
-        }
-        None => {
-            settings::ActiveModel {
+    desired.retain(|(_, key, _)| !aurcache_common::settings::RETIRED_SETTING_KEYS.contains(key));
+
+    let pkg_ids: Vec<i32> = {
+        let mut seen = HashSet::new();
+        desired
+            .iter()
+            .map(|(pkg_id, _, _)| *pkg_id)
+            .filter(|pkg_id| seen.insert(*pkg_id))
+            .collect()
+    };
+    let mut existing: BTreeMap<(i32, String), settings::Model> = settings::Entity::find()
+        .filter(settings::Column::PkgId.is_in(pkg_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.pkg_id.map(|pkg_id| ((pkg_id, row.key.clone()), row)))
+        .collect();
+
+    let mut missing = Vec::new();
+    for (pkg_id, key, value) in desired {
+        match existing.remove(&(pkg_id, key.to_string())) {
+            // The settings table carries no timestamps, so a row that already
+            // holds the restored value is done: rewriting it changes nothing.
+            Some(row) if row.value.as_deref() == Some(value) => {}
+            Some(row) => {
+                let mut active: settings::ActiveModel = row.into();
+                active.value = Set(Some(value.to_string()));
+                active.update(db).await?;
+            }
+            None => missing.push(settings::ActiveModel {
                 key: Set(key.to_string()),
                 value: Set(Some(value.to_string())),
                 pkg_id: Set(Some(pkg_id)),
                 ..Default::default()
-            }
-            .insert(db)
-            .await?;
+            }),
         }
+    }
+    if !missing.is_empty() {
+        settings::Entity::insert_many(missing).exec(db).await?;
     }
     Ok(())
 }

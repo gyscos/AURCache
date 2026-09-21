@@ -1,6 +1,7 @@
 use crate::repository::Repository;
 use crate::snapshot::SnapshotStore;
 use anyhow::bail;
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Files, PackageVcsSources, Packages, Settings};
 use aurcache_db::{builds, dependencies, files, package_vcs_sources, packages, settings};
 use sea_orm::{
@@ -53,8 +54,21 @@ pub async fn package_delete(
     // A checkout directory is not always one package's alone, so the remaining
     // packages' sources say which ones must stay. Without them the removal is
     // skipped rather than guessed at; the boot-time prune catches it later.
-    let remaining: Option<Vec<_>> = match Packages::find().all(db).await {
-        Ok(rows) => Some(rows.into_iter().map(|pkg| pkg.source_data).collect()),
+    // Only the one column this needs: the full rows carry build logs'
+    // metadata and JSON blobs the checkout comparison never looks at.
+    let remaining: Option<Vec<SourceData>> = match Packages::find()
+        .select_only()
+        .column(packages::Column::SourceData)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|rows| {
+            rows.iter()
+                .map(|raw| raw.parse().map_err(|e| anyhow::anyhow!("{e}")))
+                .collect()
+        }) {
+        Ok(rows) => Some(rows),
         Err(e) => {
             warn!("could not list packages, leaving source checkouts in place: {e}");
             None

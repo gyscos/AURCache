@@ -2415,26 +2415,38 @@ const PROGRESS_POLL_INTERVAL_SECS: u64 = 1;
 /// How often `watch` re-lists builds.
 const WATCH_POLL_INTERVAL_SECS: u64 = 5;
 
+/// Pad `cell` to `width` terminal cells. `format!("{cell:<width$}")` counts
+/// bytes, so a CJK package name would throw every column after it off by one
+/// per wide character.
+fn pad_cell(cell: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut padded = cell.to_string();
+    padded.extend(std::iter::repeat_n(' ', width.saturating_sub(cell.width())));
+    padded
+}
+
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    use unicode_width::UnicodeWidthStr;
     // Sized by the widest row, not just the headers: a row longer than
     // `headers` must print, not panic the CLI with an index-out-of-bounds.
+    // Widths are terminal cells, not bytes, or wide names misalign the table.
     let columns = headers
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
     let mut widths = vec![0; columns];
     for (index, header) in headers.iter().enumerate() {
-        widths[index] = header.len();
+        widths[index] = header.width();
     }
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(cell.len());
+            widths[index] = widths[index].max(cell.width());
         }
     }
 
     let header = headers
         .iter()
         .enumerate()
-        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
+        .map(|(index, value)| pad_cell(value, widths[index]))
         .collect::<Vec<_>>()
         .join("  ");
     println!("{header}");
@@ -2451,7 +2463,7 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
             "{}",
             row.iter()
                 .enumerate()
-                .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+                .map(|(index, cell)| pad_cell(cell, widths[index]))
                 .collect::<Vec<_>>()
                 .join("  ")
         );
@@ -3015,11 +3027,20 @@ mod tests {
     use super::{
         AddPackageArgs, Build, BuildStates, Cli, Command, ComposeArgs, PackagesCommand,
         RepoCommand, SetupCommand, WatchScope, build_status_label, compose, compose_database,
-        parse_key_val, repo,
+        pad_cell, parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
     use std::path::PathBuf;
+
+    /// Table cells pad to terminal cells, not bytes: two CJK characters are
+    /// four cells wide, so padding to six leaves two spaces — a byte count
+    /// would see six bytes already and leave none.
+    #[test]
+    fn pad_cell_counts_cells_not_bytes() {
+        assert_eq!(pad_cell("ab", 4), "ab  ");
+        assert_eq!(pad_cell("日本", 6), "日本  ");
+    }
 
     #[test]
     fn parse_key_val_requires_separator() {

@@ -416,23 +416,31 @@ pub async fn heartbeat<C: ConnectionTrait>(
         .all(db)
         .await?;
 
+    // Renewed in one statement, not one per build: the filters are the same
+    // per row (owner, still active), so an `IN` set is exactly equivalent —
+    // including the old code's not checking `rows_affected` here. A worker
+    // owns a handful of builds, so this is tidiness rather than rescue.
+    let mut renew = Vec::new();
     for build in owned {
         let id = build.id;
         if active_build_ids.contains(&id) {
-            Builds::update_many()
-                .col_expr(
-                    builds::Column::LeaseExpiresAt,
-                    (now + lease_ttl_secs).into(),
-                )
-                .filter(builds::Column::Id.eq(id))
-                .filter(builds::Column::WorkerId.eq(worker_id))
-                .filter(builds::Column::Status.eq(STATUS_ACTIVE))
-                .exec(db)
-                .await?;
-            outcome.renewed.push(id);
+            renew.push(id);
         } else if requeue_or_fail(db, &build, max_attempts).await? != RequeueOutcome::Unchanged {
             outcome.dropped.push(id);
         }
+    }
+    if !renew.is_empty() {
+        outcome.renewed.extend(renew.iter().copied());
+        Builds::update_many()
+            .col_expr(
+                builds::Column::LeaseExpiresAt,
+                (now + lease_ttl_secs).into(),
+            )
+            .filter(builds::Column::Id.is_in(renew))
+            .filter(builds::Column::WorkerId.eq(worker_id))
+            .filter(builds::Column::Status.eq(STATUS_ACTIVE))
+            .exec(db)
+            .await?;
     }
 
     // The abort list: every reported id that is missing, terminal, or owned by

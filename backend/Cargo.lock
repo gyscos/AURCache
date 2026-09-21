@@ -729,6 +729,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "unicode-width",
  "yaml-rust2",
 ]
 

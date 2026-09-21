@@ -339,22 +339,10 @@ fn PackagesIcon() -> Element {
     }
 }
 
-/// Deliberately not the `Icon` sizing: this one sits inside a button next to
-/// text rather than in a menu row, where the 5-unit glyphs would crowd it.
+/// Plus, on the sidebar's add-package button.
 #[component]
 fn PlusIcon() -> Element {
-    rsx! {
-        svg {
-            class: "h-4 w-4 shrink-0",
-            view_box: "0 0 24 24",
-            fill: "none",
-            stroke: "currentColor",
-            stroke_width: "2",
-            stroke_linecap: "round",
-            stroke_linejoin: "round",
-            path { d: "M12 5v14M5 12h14" }
-        }
-    }
+    rsx! { ButtonIcon { path: "M12 5v14M5 12h14" } }
 }
 
 /// Button-sized icon base: the 4-unit glyphs that sit in buttons next to
