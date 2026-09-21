@@ -18,6 +18,7 @@ mod dates;
 mod format;
 mod listing;
 mod log_tail;
+mod notice;
 mod platforms;
 mod poll;
 mod progress;

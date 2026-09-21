@@ -1101,6 +1101,20 @@ impl ApiError {
     pub fn is_unauthorized(&self) -> bool {
         self.status == reqwest::StatusCode::UNAUTHORIZED
     }
+
+    /// Whether the server said the thing asked for does not exist.
+    pub fn is_not_found(&self) -> bool {
+        self.status == reqwest::StatusCode::NOT_FOUND
+    }
+}
+
+/// Whether a failed call failed because the thing it named does not exist:
+/// the server answered 404, wherever in the error's chain that answer sits.
+#[must_use]
+pub fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<ApiError>().is_some_and(ApiError::is_not_found))
 }
 
 impl std::fmt::Display for ApiError {

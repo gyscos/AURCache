@@ -1,6 +1,6 @@
 # Design: Structured operation logs
 
-Status: **Planned, second revision** · Last updated: 2026-09-16
+Status: **In progress, third revision** · Last updated: 2026-09-21
 
 AURCache's logging today is rich in *sites* and poor in *shape*: every binary
 logs through `tracing` with a plain text formatter (`aurcache/src/logger.rs`,
@@ -11,21 +11,21 @@ design wants — severity, and links to entities — but for a small set of
 operator-facing rows.
 
 This design introduces **structured operation logs**: every significant event is
-a Rust type that serializes to a flat JSON payload, stored beside a stable
-`kind`, a `severity` and a rendered `message`.
+a variant of one enum that serializes to a flat JSON payload, stored beside a
+stable `kind`, a `severity` and a rendered `message`.
 
 ```rust
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DepsReplaced {
-    pub dependent: PackageRef,
-    pub old: PackageRef,
-    pub new: PackageRef,
+#[serde(tag = "kind", content = "data")]
+pub enum Event {
+    #[serde(rename = "deps.replaced")]
+    DepsReplaced { dependent: PackageRef, old: PackageRef, new: PackageRef },
+    // ...
 }
 ```
 
 ```json
-// Stored:
+// Stored, and returned by the API as-is:
 {
   "kind": "deps.replaced",
   "severity": "info",
@@ -33,26 +33,13 @@ pub struct DepsReplaced {
   "message": "Replaced package foo with package bar as dependency of baz",
   "data": {"dependent": "pkg:baz", "old": "pkg:foo", "new": "pkg:bar"}
 }
-
-// What the API returns: every reference resolved against the current database,
-// so a package that has since been deleted comes back with no link.
-{
-  "kind": "deps.replaced",
-  "message": "Replaced package foo with package bar as dependency of baz",
-  "data": {"dependent": "pkg:baz", "old": "pkg:foo", "new": "pkg:bar"},
-  "hrefs": {
-    "dependent": "/package/baz",
-    "old": null,
-    "new": "/package/bar"
-  }
-}
 ```
 
 The payload key is a **role** (`old`, `new`, `dependent`); the value carries its
 own type as a namespaced id (`pkg:foo`). Context values that name no entity are
 ordinary scalars (`error`, `reason`, `attempt`). `message` is rendered at emit
-time and stored, and `hrefs` is the read-time answer to "which of these still
-has a page".
+time and stored. Every reference renders as a link; the page it leads to
+decides what to do if its subject has since gone (see "Links").
 
 There is **no primary subject**: every entity a row names is an equal citizen,
 so "everything that relates to package foo" finds this row whether foo is the
@@ -249,7 +236,7 @@ by subsystem. Severity is derived from the kind by an exhaustive match (the
   `auth.oauth_redirect_failed` (E)
 
 That is on the order of 50 kinds from a first pass over ~100 sites — small
-enough to be one type each, large enough to be the app's failure vocabulary
+enough to be one variant each, large enough to be the app's failure vocabulary
 (and due a consolidation pass, below). The existing `ActivityType` kinds (12 of them) map onto this
 catalogue by construction: every activity that records a failure today
 (PublishFailed, VersionCheckFailed, WorkerReaped, WorkerSettingRejected) has a
@@ -299,54 +286,57 @@ they carry no link, and nothing in the UI should try to make one.
 
 ## The emission surface
 
-One type per kind, with a hand-written impl. No derive macro, no enum, no
-`tracing` Layer.
+One enum, `aurcache_common::api::events::Event`, adjacently tagged: serde writes
+`{"kind": .., "data": {..}}`, and the two halves are exactly the two columns a
+row stores. No derive macro of our own, no registry, no `tracing` Layer.
 
 ```rust
-pub trait LogEvent: Serialize {
-    const KIND: &'static str;
-    const SEVERITY: Severity;
+impl Event {
+    pub fn kind(&self) -> &'static str { /* exhaustive match */ }
+    pub fn severity(&self) -> Severity { /* exhaustive match */ }
     /// Rendered now and stored, so the row still reads if its payload can no
     /// longer be parsed.
-    fn message(&self) -> String;
+    pub fn message(&self) -> String { /* exhaustive match */ }
 }
 
-impl LogEvent for DepsReplaced {
-    const KIND: &'static str = "deps.replaced";
-    const SEVERITY: Severity = Severity::Info;
-    fn message(&self) -> String {
-        format!("Replaced {} with {} as dependency of {}", self.old, self.new, self.dependent)
-    }
-}
-
-// The whole call site — it replaces today's `warn!("…", …)` one for one:
-emit(DepsReplaced { dependent, old: current.name.into(), new: replacement.into() });
+// The whole call site -- it replaces today's `warn!("…", …)` one for one:
+log.emit(Event::DepsReplaced { dependent, old: current.name.into(), new: replacement.into() });
 ```
 
-Why this shape rather than the first revision's `#[derive(StructuredEvent)]`
-over one big enum:
+It lives in `aurcache-common` because the browser needs it: rendering an entry
+from its payload means decoding it, and the frontend only builds for wasm
+against the driver-free types.
 
-- **The payload struct is the field set.** Serde produces the flat map on the
-  way out and validates required and unknown keys (`deny_unknown_fields`) on
-  the way back. A separate `fields: Vec<(&'static str, FieldValue)>`
-  representation is not needed, and neither is a generated schema to re-check
-  at the storage boundary what the types already guarantee.
-- **A missing or misspelled field does not compile.** A struct literal cannot
-  omit `new` or invent `nwe`.
-- **Severity cannot be forgotten.** It is a required associated const, so a new
-  event type does not compile without one — the guarantee the first revision
-  wanted an exhaustive match over an enum for.
-- **Nothing is parsed out of doc comments.** The first revision put the kind,
-  the severity and a message template in `///` lines for a macro to read;
-  rustfmt cannot see those, grep handles them badly, and rustdoc renders them
-  as prose.
+Why an enum, after a revision that proposed one type per kind behind a trait:
 
-`emit` writes to the bounded queue the activity log already uses
-(`ActivityLog`, `aurcache-activitylog/src/activity_utils.rs`) and calls
-`tracing::event!` beside it, so the text logger keeps printing its line. One
-source, two consumers. The first revision routed the typed event *through*
-`tracing` and recovered it in a `Layer`, which discarded the types it had just
-established and then needed boundary validation to get them back.
+- **Decoding is serde's job.** `decode(kind, data)` rebuilds the tagged form and
+  lets serde dispatch; a per-type design needs a registry mapping kinds to
+  decoders, kept in step by hand or by a linker-section crate.
+- **Every consumer matches exhaustively.** `kind`, `severity`, `message` and the
+  frontend's renderer are matches over the enum, so a new variant does not
+  compile until each has said what it means. Severity cannot be forgotten.
+- **The fields are the struct.** A struct variant cannot omit `new` or invent
+  `nwe`, and serde refuses a payload missing a field on the way back.
+- **Unknown fields are ignored, not refused.** `deny_unknown_fields` does not
+  apply to enum variants, and for a log that is the right way round: a field
+  added by a later version leaves a row an older reader can still render.
+- **An unknown kind falls back to `message`.** A row from a newer server, or one
+  whose payload no longer fits its variant, decodes to nothing and renders its
+  stored sentence. That fallback is what the stored message is for.
+
+The cost the trait design avoided -- one central list to edit for every new
+event -- is accepted: it is the same list the exhaustive matches need anyway.
+
+A kind that covers several cases keeps the difference as a field rather than as
+a sub-kind column: `source.refresh_failed` carries `target: git | snapshot`, and
+the sentence says which.
+
+`emit` writes to the bounded queue the activity log already uses (`ActivityLog`,
+`aurcache-activitylog/src/activity_utils.rs`) and calls `tracing::event!` beside
+it with target `aurcache::event`, so the text logger keeps printing its line.
+One source, two consumers. A full queue drops the entry rather than blocking
+the caller: the log is a record, not a transaction, and nothing a caller could
+do about a lost entry is worth making every call site handle it.
 
 ### Scope
 
@@ -364,25 +354,39 @@ option that needs the dynamic round trip, and is not planned.
 ## Links, and the deleted-entity case
 
 1. **The record is pure.** An event says `old: PackageRef("foo")` and never says
-   whether `foo` has a page. Baking a link (or a `null`) at emit time would let
-   the row lie within seconds — `live_check` can delete `foo` in the same
-   request that records the replacement (`aurcache-api/src/package.rs:1707`).
-2. **The API resolves at read time, in one batched query.** A page of rows
-   yields its distinct references; one `IN` lookup per namespace returns which
-   still exist; the response annotates each with a route or `null`.
-3. **The UI trusts the annotation.** Non-null renders an anchor, `null` renders
-   plain text, an unknown namespace renders plain text. No existence checks in
-   the browser, no 404 links.
+   whether `foo` has a page. Baking a link (or its absence) in at emit time
+   would let the row lie within seconds -- `live_check` can delete `foo` in the
+   same request that records the replacement (`aurcache-api/src/package.rs`).
+2. **Every reference is a link, and every link lands somewhere useful.** The
+   page a link opens handles its subject being gone, rather than the log
+   deciding in advance which links to draw:
+   - a missing **package** redirects to the add page with its name searched --
+     it may be something you want back;
+   - a missing **build** redirects to its package's builds when the package is
+     here, and to adding the package when it is not;
+   - a missing **worker** redirects to the fleet list. A name several workers
+     share still offers the choice between them.
 
-`message` keeps the name either way, so a row whose `old` has no link still
-reads correctly, and nothing is lost when the UI drops an anchor.
+   Each redirect is a history *replace*, so Back does not bounce off the
+   missing page, and carries a notice explaining where you are. The notice
+   lives in the shell, shown as a toast above any dialog (the add page is one),
+   and expires once you move on from the page it explained.
+3. **Nothing is resolved at read time.** An earlier revision had the API
+   annotate each reference with a route or `null`, one batched existence query
+   per namespace per page. It is gone: the answer was stale the moment it was
+   read, it cost a query per page, and a `null` left the reader with plain text
+   and nowhere to go. A 404 at the destination is the current answer, and the
+   redirect makes it a useful one.
+
+`message` keeps the names either way, so the sentence reads the same whatever
+has happened to what it names.
 
 ## Storage
 
 One log store, not two. The survey is dominated by failure paths, so the volume
 is hundreds of rows a day rather than millions, which makes a second table with
-its own retention unjustified. The curated activity events become `LogEvent`
-types in the same store, and the existing retention sweep and pager apply
+its own retention unjustified. The curated activity events become `Event`
+variants in the same store, and the existing retention sweep and pager apply
 unchanged.
 
 ```
@@ -449,17 +453,17 @@ payload's references.
 
 ## Frontend rendering
 
-The Logs screen renders each row from three inputs, in order:
+The Logs screen renders each row from its payload:
 
-1. `kind` + `data` + `hrefs` → catalogue lookup; a known kind renders its
-   sentence with values substituted, each reference an anchor when `hrefs` gives
-   a route and plain text when it gives `null`.
-2. `message` → the fallback when the kind is unknown (an older row, a newer
-   server) or when the payload no longer parses.
+1. `kind` + `data` decode to an `Event`; a known variant renders its sentence
+   with each reference as a link to its route (`/package/…`,
+   `/package/…/build/…`, `/worker/…`).
+2. `message` is the fallback when the kind is unknown (a newer server) or the
+   payload no longer fits its variant.
 3. The entity filter is the server-side query above; the UI renders the active
    filter but does not re-implement it.
 
-Localization becomes a change to the UI catalogue alone; `message` never
+Localization becomes a change to the frontend's renderer alone; `message` never
 changes, so non-UI consumers are unaffected.
 
 ## Consolidation to do while porting
@@ -491,8 +495,8 @@ so the record needs the actor the activity log already carries as `user`.
 
 ## Verification
 
-- **Round trip**: every `LogEvent` type serializes and deserializes back
-  unchanged; a payload with a missing or unknown key is refused.
+- **Round trip**: every `Event` variant serializes and decodes back unchanged;
+  a payload missing a field is refused, and one with an extra field is not.
 - **Reference typing**: a `PackageRef` field refuses `worker:x` and
   `build:x/1`; `BuildRef` round-trips `build:hello/7`, including a pkgbase
   containing `-` and `+`.
@@ -504,11 +508,12 @@ so the record needs the actor the activity log already carries as `user`.
   the new one, and the dependent; the test asserts the query names no kind.
 - **Extraction**: `log_entity` rows regenerated from a payload match what was
   written, for every event type — the one place a side table can drift.
-- **Hrefs**: a package deleted after emission comes back `null` and renders as
-  plain text; a present one links; one batched query per page.
+- **Links**: a link to a missing package, build or worker lands on the add
+  page, the package's builds, or the fleet, with a notice saying why
+  (`frontend-rs/tests/browser.rs`).
 - **Scope**: events emitted under `log.scoped(build)` carry it, and
   `?build=hello/7` returns both those and the events naming that build.
-- **Severity**: stored from the type's associated const, so a row's severity
+- **Severity**: stored from the variant's exhaustive match, so a row's severity
   cannot disagree with its kind at write time.
 - `scripts/test-frontend.sh` for the Logs screen, which already covers the page,
   both filters and entity links.

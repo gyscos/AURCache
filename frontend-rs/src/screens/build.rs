@@ -1,5 +1,6 @@
 //! A build's log output.
 
+use crate::api::LoadError;
 use crate::dates::AbsoluteDate;
 use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
@@ -276,22 +277,51 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
     let mut build = use_resource(use_reactive(
         &(pkgbase.clone(), number),
         |(pkgbase, number)| async move {
-            crate::api::client()?
-                .get_build(&pkgbase, number)
-                .await
-                .map_err(|e| e.to_string())
+            Ok::<_, LoadError>(crate::api::client()?.get_build(&pkgbase, number).await?)
         },
     ));
 
     // Fetched from the build's package so this page carries the same header
     // as every other package-scoped page, with the trail in the same place.
     let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
-        crate::api::client()?
-            .get_package(&pkgbase)
-            .await
-            .map_err(|e| e.to_string())
-            .map(Some)
+        Ok::<_, LoadError>(Some(crate::api::client()?.get_package(&pkgbase).await?))
     }));
+
+    // A build that is not here leaves for the closest thing that is: its
+    // package's builds, or -- when the package is gone too -- the add page with
+    // the name searched. Waits for both answers, since which it is depends on
+    // the package.
+    let notice = crate::notice::use_notice();
+    use_effect(use_reactive(
+        &(pkgbase.clone(), number),
+        move |(pkgbase, number)| {
+            if !matches!(&*build.read(), Some(Err(LoadError::NotFound))) {
+                return;
+            }
+            match &*package.read() {
+                Some(Err(LoadError::NotFound)) => crate::notice::redirect(
+                    notice,
+                    Route::PackageAdd { q: pkgbase.clone() },
+                    crate::notice::Level::Info,
+                    format!(
+                        "No package called {pkgbase} is tracked here, so there is no build \
+                     #{number} of it. Search the AUR to add it."
+                    ),
+                ),
+                Some(Ok(_)) => crate::notice::redirect(
+                    notice,
+                    Route::PackageBuilds {
+                        pkgbase: pkgbase.clone(),
+                    },
+                    crate::notice::Level::Error,
+                    format!("{pkgbase} has no build #{number}."),
+                ),
+                // Still asking, or the package lookup itself failed: nowhere
+                // better to go.
+                _ => {}
+            }
+        },
+    ));
 
     // The log below polls the build on its own loop, so without this the
     // package badge up top froze at whatever the first lookup returned while
@@ -338,7 +368,10 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
                 // the header rather than the page.
                 _ => rsx! {},
             }
-            BuildLog { pkgbase, number }
+            // Not asked for a build that is not there; see the redirect above.
+            if !matches!(&*build.read_unchecked(), Some(Err(LoadError::NotFound))) {
+                BuildLog { pkgbase, number }
+            }
         }
     }
 }

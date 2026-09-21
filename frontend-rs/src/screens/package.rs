@@ -9,7 +9,7 @@
 //! that one failed — the older build the repository still serves for it. The
 //! full history is a click away.
 
-use crate::api::client;
+use crate::api::{LoadError, client};
 use crate::dates::RelativeDate;
 use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
@@ -116,7 +116,7 @@ fn produced_names(pkg: &ExtendedPackage) -> Vec<String> {
     }
 }
 
-async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), String> {
+async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), LoadError> {
     let client = client()?;
 
     // Issued together rather than one after the other. They share no data, and
@@ -132,10 +132,7 @@ async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), String> 
 
     // A failed build query should not lose the package itself: the build
     // summary is secondary, and the rest of the page is still worth showing.
-    Ok((
-        package.map_err(|e| e.to_string())?,
-        builds.unwrap_or_default(),
-    ))
+    Ok((package?, builds.unwrap_or_default()))
 }
 
 #[component]
@@ -147,6 +144,20 @@ pub fn Package(pkgbase: String) -> Element {
     // screen looking like the one that was clicked.
     let mut data = use_resource(use_reactive(&pkgbase, load));
 
+    // A package that is not here is one you might want to add: a stale link
+    // (a log entry, a bookmark) lands on the add page with the name searched.
+    let notice = crate::notice::use_notice();
+    use_effect(use_reactive(&pkgbase, move |pkgbase| {
+        if matches!(&*data.read(), Some(Err(LoadError::NotFound))) {
+            crate::notice::redirect(
+                notice,
+                Route::PackageAdd { q: pkgbase.clone() },
+                crate::notice::Level::Info,
+                format!("No package called {pkgbase} is tracked here. Search the AUR to add it."),
+            );
+        }
+    }));
+
     // Refresh while this package or one of its recent builds is still in
     // flight, so a build finishing updates the status and the build summary
     // without a reload; a slow tick otherwise as a catch-all.
@@ -157,7 +168,8 @@ pub fn Package(pkgbase: String) -> Element {
 
     rsx! {
         match &*data.read_unchecked() {
-            None => rsx! {
+            // Missing is on its way elsewhere; see the redirect above.
+            None | Some(Err(LoadError::NotFound)) => rsx! {
                 div { class: "flex justify-center p-16",
                     span { class: "loading loading-spinner loading-lg" }
                 }

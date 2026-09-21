@@ -149,6 +149,31 @@ fn WorkerPage(name: String, fingerprint: String) -> Element {
             .map_err(|e| e.to_string())
     });
 
+    // No such worker: back to the fleet, saying which one was asked for. A
+    // name several workers share still offers the choice below.
+    let notice = crate::notice::use_notice();
+    use_effect(use_reactive(
+        &(name.clone(), fingerprint.clone()),
+        move |(name, fingerprint)| {
+            let Some(Ok(list)) = &*workers.read() else {
+                return;
+            };
+            if matches!(resolve(list, &name, &fingerprint), Resolved::None) {
+                let text = if name.is_empty() {
+                    format!("No worker has the certificate {fingerprint}.")
+                } else {
+                    format!("No worker is called {name}.")
+                };
+                crate::notice::redirect(
+                    notice,
+                    Route::Workers {},
+                    crate::notice::Level::Error,
+                    text,
+                );
+            }
+        },
+    ));
+
     rsx! {
         div { class: "flex flex-col gap-4",
             match &*workers.read_unchecked() {
@@ -161,16 +186,9 @@ fn WorkerPage(name: String, fingerprint: String) -> Element {
                 Some(Ok(list)) => match resolve(list, &name, &fingerprint) {
                     // A revoked worker keeps its row, so this is a name that
                     // never enrolled -- or one whose row was removed outright.
+                    // On its way back to the fleet; see the redirect above.
                     Resolved::None => rsx! {
-                        div { class: "alert alert-warning alert-soft",
-                            if name.is_empty() {
-                                "No worker with that certificate."
-                            } else {
-                                "No worker called "
-                                span { class: "font-mono", "{name}" }
-                                "."
-                            }
-                        }
+                        span { class: "loading loading-spinner loading-md" }
                     },
                     Resolved::One(worker) => rsx! {
                         WorkerHeader { worker: worker.clone() }

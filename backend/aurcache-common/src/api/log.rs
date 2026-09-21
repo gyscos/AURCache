@@ -16,7 +16,6 @@
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -299,14 +298,6 @@ pub struct LogEntry {
     /// `None` for anything the server did on its own.
     #[serde(default)]
     pub user: Option<String>,
-    /// Where each referenced entity can be opened, decided when this was read
-    /// rather than when it was written: `None` for one that no longer exists.
-    ///
-    /// Keyed by the same role as `data`, so the UI looks up what it is about to
-    /// render. A role naming several entities has an entry per reference, in the
-    /// order they appear.
-    #[serde(default)]
-    pub hrefs: BTreeMap<String, Vec<Option<String>>>,
 }
 
 /// One page of the log, and how long the filtered log is.

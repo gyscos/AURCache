@@ -13,17 +13,6 @@ pub fn api_base() -> String {
         )
 }
 
-/// A client against the current origin.
-///
-/// No token: the session is a cookie the server set during OAuth, and the
-/// browser attaches it to same-origin requests on its own.
-///
-/// The client is wired to send the page to the login flow when the session is
-/// refused. A server restart turns every API call into a 401 — the cookie can
-/// no longer be decoded — and the only way back in is OAuth again, exactly the
-/// trip the server gives an unauthenticated full-page load. A plain page jump
-/// rather than a router navigate: `/api/login` is a server route, and a SPA
-/// navigation to it would render a frontend error screen instead of the login.
 /// One process-wide client: building one per call would throw away connection
 /// pooling on every poll tick, and re-read the DOM for a base URL that cannot
 /// change without a page load.
@@ -44,6 +33,54 @@ static CLIENT: std::sync::LazyLock<Result<AurCacheClient, String>> =
             .map_err(|e| e.to_string())
     });
 
+/// A client against the current origin.
+///
+/// No token: the session is a cookie the server set during OAuth, and the
+/// browser attaches it to same-origin requests on its own.
+///
+/// The client is wired to send the page to the login flow when the session is
+/// refused. A server restart turns every API call into a 401 — the cookie can
+/// no longer be decoded — and the only way back in is OAuth again, exactly the
+/// trip the server gives an unauthenticated full-page load. A plain page jump
+/// rather than a router navigate: `/api/login` is a server route, and a SPA
+/// navigation to it would render a frontend error screen instead of the login.
 pub fn client() -> Result<AurCacheClient, String> {
     CLIENT.clone()
+}
+
+/// Why a page could not load the thing it is about.
+///
+/// Absence is kept apart from failure: a page for something that is not there
+/// redirects somewhere useful, where a failure is shown in place.
+#[derive(Clone, PartialEq, Debug)]
+pub enum LoadError {
+    /// The server answered 404.
+    NotFound,
+    /// Anything else, as it should be shown.
+    Failed(String),
+}
+
+impl From<anyhow::Error> for LoadError {
+    fn from(e: anyhow::Error) -> Self {
+        if aurcache_client::is_not_found(&e) {
+            Self::NotFound
+        } else {
+            Self::Failed(e.to_string())
+        }
+    }
+}
+
+impl From<String> for LoadError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("not found"),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
 }

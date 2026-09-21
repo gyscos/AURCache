@@ -274,10 +274,85 @@ async fn interactions() {
         a_source_edit_can_be_reset_either_way_and_its_patch_read(&session).await;
     }
     every_row_has_a_cell_for_every_column(&session).await;
+    a_link_to_something_gone_lands_somewhere_useful(&session).await;
     // Last: it deletes a row the others would otherwise still be looking at.
     removing_a_package_takes_it_out_of_the_list(&session).await;
 
     session.stop().await;
+}
+
+/// A link outlives what it names -- a log entry, a bookmark, a pasted URL --
+/// so one to something gone still lands somewhere useful, and says why.
+///
+/// A missing package is offered for adding, with its name already searched.
+/// A missing build of a package that is here falls back to that package's
+/// builds; of a package that is not, to adding it. A missing worker falls back
+/// to the fleet. Each is a redirect a route check cannot see: the page asked
+/// for never renders, and the notice is what explains where you are.
+async fn a_link_to_something_gone_lands_somewhere_useful(session: &Session) {
+    session.open("/package/no-such-package").await;
+    session
+        .wait_until("the add page to explain itself", |t| {
+            t.contains("No package called no-such-package is tracked here")
+        })
+        .await;
+    assert!(
+        session
+            .url()
+            .await
+            .ends_with("/packages/add#no-such-package"),
+        "a missing package should offer adding it: {}",
+        session.url().await
+    );
+
+    session.open("/package/hello/build/999").await;
+    session
+        .wait_until("the builds page to explain itself", |t| {
+            t.contains("hello has no build #999")
+        })
+        .await;
+    assert!(
+        session.url().await.ends_with("/package/hello/builds"),
+        "a missing build should fall back to its package's builds: {}",
+        session.url().await
+    );
+
+    session.open("/package/no-such-package/build/3").await;
+    session
+        .wait_until("the add page to explain itself", |t| {
+            t.contains("so there is no build #3 of it")
+        })
+        .await;
+    assert!(
+        session
+            .url()
+            .await
+            .ends_with("/packages/add#no-such-package"),
+        "a build of a missing package should offer adding the package: {}",
+        session.url().await
+    );
+
+    session.open("/worker/nobody-here").await;
+    session
+        .wait_until("the fleet to explain itself", |t| {
+            t.contains("No worker is called nobody-here")
+        })
+        .await;
+    assert!(
+        session.url().await.ends_with("/workers"),
+        "a missing worker should fall back to the fleet: {}",
+        session.url().await
+    );
+
+    // The notice belongs to the page it explained, not to whatever comes next.
+    session.click_labelled("a", "Packages").await;
+    session
+        .wait_until("the packages list", |t| t.contains("Upstream"))
+        .await;
+    assert!(
+        !session.text().await.contains("No worker is called"),
+        "a notice should not follow you off the page it explained"
+    );
 }
 
 /// The Reset menu's two ways back, and the patch a save leaves behind.

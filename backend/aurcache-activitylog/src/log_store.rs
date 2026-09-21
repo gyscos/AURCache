@@ -1,5 +1,10 @@
-//! Reading the structured log: filtering, paging, and deciding which of the
-//! entities an entry names can still be opened.
+//! Reading the structured log: filtering and paging.
+//!
+//! Nothing here asks whether the entities an entry names still exist. Every
+//! reference links, and the page it links to decides what to do when its
+//! subject is gone -- a missing package offers to add it, a missing build falls
+//! back to its package's builds. Existence answered here would be stale by the
+//! time anyone clicked.
 //!
 //! Every query here is ordinary SQL that sea-orm builds the same way for both
 //! backends. That is deliberate: nothing in this repository is tested against
@@ -11,13 +16,12 @@
 
 use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{EntityRef, LogEntry, LogPage, NS_BUILD, NS_PACKAGE, NS_WORKER};
-use aurcache_db::prelude::{Builds, LogEntities, Logs, Packages, Workers};
-use aurcache_db::{builds, log_entities, logs, packages, workers};
+use aurcache_db::prelude::{LogEntities, Logs};
+use aurcache_db::{log_entities, logs};
 use sea_orm::{
     ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, QueryTrait,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 /// What to narrow the log to. Every field is "show me less".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -79,14 +83,7 @@ impl LogStore {
             .all(&self.db)
             .await?;
 
-        let hrefs = self.resolve(&rows).await?;
-        let entries = rows
-            .into_iter()
-            .map(|row| {
-                let id = row.id;
-                render(row, hrefs.get(&id).cloned().unwrap_or_default())
-            })
-            .collect();
+        let entries = rows.into_iter().map(render).collect();
 
         Ok(LogPage { entries, total })
     }
@@ -147,120 +144,6 @@ impl LogStore {
             .map(|(timestamp,)| timestamp))
     }
 
-    /// Which of the entities this page names can still be opened.
-    ///
-    /// Decided here rather than when an entry was written, because an entry is
-    /// often written by the very request that deletes what it names -- a
-    /// dependency replacement removes the old package -- so a link baked in at
-    /// emission would be wrong within milliseconds.
-    ///
-    /// One query per namespace for the whole page, not one per reference.
-    async fn resolve(
-        &self,
-        rows: &[logs::Model],
-    ) -> anyhow::Result<BTreeMap<i32, BTreeMap<String, Vec<Option<String>>>>> {
-        let per_row: Vec<(i32, Vec<(String, EntityRef)>)> = rows
-            .iter()
-            .map(|row| {
-                let payload = serde_json::from_str(&row.data).unwrap_or(serde_json::Value::Null);
-                (row.id, crate::event::references(&payload))
-            })
-            .collect();
-
-        let alive = self
-            .alive(
-                per_row
-                    .iter()
-                    .flat_map(|(_, refs)| refs.iter().map(|(_, e)| e)),
-            )
-            .await?;
-
-        Ok(per_row
-            .into_iter()
-            .map(|(id, refs)| {
-                let mut by_role: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
-                for (role, entity) in refs {
-                    let href = alive.contains(&entity).then(|| route_of(&entity));
-                    by_role.entry(role).or_default().push(href);
-                }
-                (id, by_role)
-            })
-            .collect())
-    }
-
-    /// Which of these references still have something behind them.
-    async fn alive<'a>(
-        &self,
-        refs: impl Iterator<Item = &'a EntityRef>,
-    ) -> anyhow::Result<BTreeSet<EntityRef>> {
-        let mut packages = BTreeSet::new();
-        let mut workers = BTreeSet::new();
-        let mut build_bases = BTreeSet::new();
-        for entity in refs {
-            match entity {
-                EntityRef::Package(p) => {
-                    packages.insert(p.0.clone());
-                }
-                EntityRef::Worker(w) => {
-                    workers.insert(w.0.clone());
-                }
-                EntityRef::Build(b) => {
-                    build_bases.insert(b.pkgbase.clone());
-                }
-            }
-        }
-
-        let mut alive = BTreeSet::new();
-
-        if !packages.is_empty() {
-            for name in Packages::find()
-                .select_only()
-                .column(packages::Column::Name)
-                .filter(packages::Column::Name.is_in(packages))
-                .into_tuple::<String>()
-                .all(&self.db)
-                .await?
-            {
-                alive.insert(EntityRef::Package(name.into()));
-            }
-        }
-
-        if !workers.is_empty() {
-            for name in Workers::find()
-                .select_only()
-                .column(workers::Column::Name)
-                .filter(workers::Column::Name.is_in(workers))
-                .into_tuple::<String>()
-                .all(&self.db)
-                .await?
-            {
-                alive.insert(EntityRef::Worker(name.into()));
-            }
-        }
-
-        // A build is reached through its package, so both have to exist: the
-        // page is `/package/<pkgbase>/build/<number>`.
-        if !build_bases.is_empty() {
-            for (name, number) in Packages::find()
-                .select_only()
-                .column(packages::Column::Name)
-                .column(builds::Column::Number)
-                .inner_join(Builds)
-                .filter(packages::Column::Name.is_in(build_bases))
-                .into_tuple::<(String, i32)>()
-                .all(&self.db)
-                .await?
-            {
-                alive.insert(EntityRef::Build(aurcache_common::api::log::BuildRef {
-                    pkgbase: name,
-                    number,
-                }));
-            }
-        }
-
-        Ok(alive)
-    }
-
     /// Delete entries older than `keep_secs`, returning how many went.
     ///
     /// The index rows go with them: `log_entity.log_id` cascades.
@@ -281,24 +164,12 @@ impl LogStore {
     }
 }
 
-/// Where an entity's page is.
-///
-/// The one place the reference vocabulary meets the frontend's routes, so a
-/// route change is a change here and nowhere else.
-fn route_of(entity: &EntityRef) -> String {
-    match entity {
-        EntityRef::Package(p) => format!("/package/{}", p.0),
-        EntityRef::Worker(w) => format!("/worker/{}", w.0),
-        EntityRef::Build(b) => format!("/package/{}/build/{}", b.pkgbase, b.number),
-    }
-}
-
 /// A stored row as the API returns it.
 ///
 /// A payload that no longer parses becomes `null` rather than costing the entry:
 /// `message` was rendered when it was written and still reads, which is the
 /// whole reason it is stored.
-fn render(row: logs::Model, hrefs: BTreeMap<String, Vec<Option<String>>>) -> LogEntry {
+fn render(row: logs::Model) -> LogEntry {
     let data = serde_json::from_str(&row.data).unwrap_or_else(|e| {
         tracing::warn!("log entry {} has an unreadable payload: {e}", row.id);
         serde_json::Value::Null
@@ -312,7 +183,6 @@ fn render(row: logs::Model, hrefs: BTreeMap<String, Vec<Option<String>>>) -> Log
         scope: row.scope.and_then(|raw| raw.parse().ok()),
         timestamp: row.timestamp,
         user: row.user,
-        hrefs,
     }
 }
 

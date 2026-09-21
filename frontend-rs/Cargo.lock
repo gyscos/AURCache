@@ -119,6 +119,7 @@ dependencies = [
 name = "aurcache-frontend"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "aurcache-client",
  "aurcache-common",
  "bytes",

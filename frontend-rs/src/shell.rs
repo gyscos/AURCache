@@ -20,7 +20,9 @@ const DRAWER_ID: &str = "menu-drawer";
 
 #[component]
 pub fn MenuShell() -> Element {
+    crate::notice::use_notice_provider();
     rsx! {
+        crate::notice::NoticeToast {}
         div { class: "drawer lg:drawer-open",
             input { id: DRAWER_ID, r#type: "checkbox", class: "drawer-toggle" }
 

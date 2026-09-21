@@ -1,22 +1,17 @@
 //! The structured log end to end: emit through the queue, read it back.
 //!
 //! Against a real (in-memory) database rather than a mock, because what is
-//! being tested is the storage: the entity index written beside each entry, the
-//! filters built on it, and the links resolved when a page is read.
+//! being tested is the storage: the entity index written beside each entry, and
+//! the filters built on it.
 
 use aurcache_activitylog::activity_utils::spawn;
 use aurcache_activitylog::events::{Event, RefreshTarget};
 use aurcache_activitylog::log_store::{LogFilter, LogStore};
 use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{BuildRef, PackageRef};
-use aurcache_common::source::SourceData;
 use aurcache_db::migration::Migrator;
-use aurcache_db::packages::SourceType;
 use aurcache_db::prelude::LogEntities;
-use aurcache_db::{builds, packages};
-use pacman_mirrors::platforms::Platform;
-use sea_orm::ActiveValue::Set;
-use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait};
+use sea_orm::{Database, DatabaseConnection, EntityTrait, PaginatorTrait};
 use sea_orm_migration::MigratorTrait;
 
 // ---------------------------------------------------------------------------
@@ -27,47 +22,11 @@ async fn db() -> DatabaseConnection {
     db
 }
 
-/// Give the entities the log refers to something to resolve against.
-async fn seed_package(db: &DatabaseConnection, name: &str) -> i32 {
-    packages::ActiveModel {
-        name: Set(name.to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
-        upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
-        source_data: Set(SourceData::Aur { name: name.into() }),
-        directly_requested: Set(true),
-        split_packages: Set(None),
-        ..Default::default()
-    }
-    .insert(db)
-    .await
-    .unwrap()
-    .id
-}
-
-async fn seed_build(db: &DatabaseConnection, pkg_id: i32, number: i32) {
-    builds::ActiveModel {
-        pkg_id: Set(pkg_id),
-        number: Set(number),
-        platform: Set(Platform::X86_64),
-        version: Set("1-1".to_string()),
-        ..Default::default()
-    }
-    .insert(db)
-    .await
-    .unwrap();
-}
-
 #[tokio::test]
-async fn an_event_reaches_the_log_with_its_index_and_links() {
+async fn an_event_reaches_the_log_with_its_payload() {
     let db = db().await;
-    seed_package(&db, "baz").await;
-    // `gone` deliberately absent: a package the log named and that is no
-    // longer there.
+    // No package rows at all: an entry names what it names, whether or not
+    // it is still there.
 
     let (log, writer) = spawn(db.clone());
     log.emit_by(
@@ -105,24 +64,14 @@ async fn an_event_reaches_the_log_with_its_index_and_links() {
         "{}",
         compared.message
     );
-    // Resolved when the page was read, not when the row was written.
-    assert_eq!(
-        compared.hrefs["pkg"],
-        vec![Some("/package/baz".to_string())]
-    );
 
     let vanished = page
         .entries
         .iter()
         .find(|e| e.kind == "vcs.sync_failed")
         .expect("the vcs entry");
-    assert_eq!(
-        vanished.hrefs["pkg"],
-        vec![None],
-        "a package that is gone has no page"
-    );
-    // And it still reads, because the sentence was rendered when it was
-    // written.
+    // It reads without the package, because the sentence was rendered when it
+    // was written.
     assert!(
         vanished.message.contains("pkg:gone"),
         "{}",
@@ -318,48 +267,6 @@ async fn since_boot_without_a_marker_shows_everything() {
         .await
         .unwrap();
     assert_eq!(page.total, 1, "no marker means no narrowing");
-}
-
-/// A build links only when its package is still there, since the page is
-/// reached through it.
-#[tokio::test]
-async fn a_build_links_only_while_its_package_exists() {
-    let db = db().await;
-    let hello = seed_package(&db, "hello").await;
-    seed_build(&db, hello, 7).await;
-
-    let (log, writer) = spawn(db.clone());
-    log.emit(Event::BuildMarkFailed {
-        build: BuildRef {
-            pkgbase: "hello".into(),
-            number: 7,
-        },
-        error: "disk full".to_string(),
-    });
-    log.emit(Event::BuildMarkFailed {
-        build: BuildRef {
-            pkgbase: "gone".into(),
-            number: 1,
-        },
-        error: "disk full".to_string(),
-    });
-    drop(log);
-    writer.await.unwrap();
-
-    let page = LogStore::new(db)
-        .page(50, 0, &LogFilter::default())
-        .await
-        .unwrap();
-    let mut links: Vec<_> = page
-        .entries
-        .iter()
-        .map(|e| e.hrefs["build"][0].clone())
-        .collect();
-    links.sort();
-    assert_eq!(
-        links,
-        vec![None, Some("/package/hello/build/7".to_string())]
-    );
 }
 
 /// One kind covering several cases keeps the difference as a field, so the

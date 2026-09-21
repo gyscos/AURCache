@@ -3,7 +3,7 @@
 //! The package page shows only the latest build and the one currently in the
 //! repository; this is where the rest of the history lives.
 
-use crate::api::client;
+use crate::api::{LoadError, client};
 use crate::dates::DateOnly;
 use crate::format::format_duration;
 use crate::listing::{
@@ -42,10 +42,21 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
     // URL changes, no request is made, and the previous package stays on
     // screen looking like the one that was clicked.
     let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
-        crate::api::client()?
-            .get_package(&pkgbase)
-            .await
-            .map_err(|e| e.to_string())
+        Ok::<_, LoadError>(crate::api::client()?.get_package(&pkgbase).await?)
+    }));
+
+    // The same rule as the package page: a package that is not here is one
+    // you might want to add.
+    let notice = crate::notice::use_notice();
+    use_effect(use_reactive(&pkgbase, move |pkgbase| {
+        if matches!(&*package.read(), Some(Err(LoadError::NotFound))) {
+            crate::notice::redirect(
+                notice,
+                Route::PackageAdd { q: pkgbase.clone() },
+                crate::notice::Level::Info,
+                format!("No package called {pkgbase} is tracked here. Search the AUR to add it."),
+            );
+        }
     }));
 
     let mut builds = use_resource(use_reactive(&pkgbase, load));
