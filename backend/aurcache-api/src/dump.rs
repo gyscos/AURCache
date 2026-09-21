@@ -117,6 +117,21 @@ mod tests {
     }
 }
 
+/// The restore route's query string, taken as one parameter.
+///
+/// Four options that arrive together and are consumed together, as
+/// [`RestoreOptions`] -- a `FromForm` keeps them that way instead of spreading
+/// them across the signature.
+// Rocket's request guards, the three query parameters and the body are each an
+// independent input; bundling them into a struct would only move the same list.
+#[derive(FromForm)]
+pub struct RestoreQuery {
+    dry_run: Option<bool>,
+    on_existing: Option<String>,
+    clear: Option<bool>,
+    secrets: Option<String>,
+}
+
 /// Restore a dump, returning before it has finished.
 ///
 /// Not in the OpenAPI document: the body is a raw archive, which utoipa cannot
@@ -130,21 +145,6 @@ mod tests {
 /// Otherwise the rows are written in one transaction and the slow half -- one
 /// source read per package, then the dependency graph -- runs detached, with
 /// progress recorded the way a bulk add's is.
-// Rocket's request guards, the three query parameters and the body are each an
-// independent input; bundling them into a struct would only move the same list.
-/// The restore route's query string, taken as one parameter.
-///
-/// Four options that arrive together and are consumed together, as
-/// [`RestoreOptions`] -- a `FromForm` keeps them that way instead of spreading
-/// them across the signature.
-#[derive(FromForm)]
-pub struct RestoreQuery {
-    dry_run: Option<bool>,
-    on_existing: Option<String>,
-    clear: Option<bool>,
-    secrets: Option<String>,
-}
-
 #[post("/restore?<query..>", data = "<archive>")]
 pub async fn restore(
     services: &State<Services>,

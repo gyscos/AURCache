@@ -27,7 +27,7 @@ use tracing::{info, warn};
 fn env_i64(key: &str, default: i64) -> i64 {
     env::var(key)
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -111,5 +111,30 @@ async fn explain_abandoned(abandoned: &Abandoned) {
             "could not append abandonment log for build {}: {e}",
             abandoned.build_id
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env values with surrounding whitespace still parse: env files and
+    /// container runtimes add it more often than anyone admits, and without
+    /// the trim the value silently falls back to the default.
+    #[test]
+    fn env_i64_tolerates_surrounding_whitespace() {
+        // Unique to this test: nothing else in the process reads it, so the
+        // set/remove cannot race a parallel test.
+        let key = "AURCACHE_TEST_TRIM_PROBE_LEASE_REAPER";
+        // SAFETY: the key is unique to this test (see above).
+        unsafe {
+            std::env::set_var(key, "  42\t");
+        }
+        assert_eq!(env_i64(key, 3), 42);
+        // SAFETY: same key, same reasoning.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(env_i64(key, 3), 3);
     }
 }

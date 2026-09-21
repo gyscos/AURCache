@@ -24,7 +24,7 @@ pub fn start_download_flush(
 ) -> JoinHandle<()> {
     let secs = env::var("DOWNLOAD_FLUSH_INTERVAL")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(60)
         .max(1);
     let interval = Duration::from_secs(secs);

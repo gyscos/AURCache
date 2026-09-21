@@ -264,7 +264,7 @@ pub fn init_worker_api(
 
         let port = env::var("AURCACHE_WORKER_PORT")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.trim().parse().ok())
             .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
 
         let config = Config {

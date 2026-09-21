@@ -85,6 +85,7 @@ async fn setting_reset_impl(
         .map_err(|e| err(Status::InternalServerError, e))
 }
 
+/// Fetch every setting with its effective value and source.
 #[utoipa::path(responses((status = 200, description = "Get all settings", body = ApplicationSettings)))]
 #[get("/settings")]
 pub async fn settings(
@@ -98,6 +99,7 @@ pub async fn settings(
     responses((status = 200, description = "Get all settings for a package", body = ApplicationSettings)),
     params(("pkgbase" = String, Path, description = "pkgbase of the package"))
 )]
+/// Fetch every setting for one package, with effective values and sources.
 #[get("/package/<pkgbase>/settings")]
 pub async fn package_settings(
     db: &State<DatabaseConnection>,
@@ -135,6 +137,7 @@ pub async fn setting_get(
         ("key" = String, Path, description = "Setting key"),
     )
 )]
+/// Fetch a single setting for one package.
 #[get("/package/<pkgbase>/settings/<key>")]
 pub async fn package_setting_get(
     db: &State<DatabaseConnection>,
@@ -154,6 +157,7 @@ pub async fn package_setting_get(
     ),
     params(("key" = String, Path, description = "Setting key"))
 )]
+/// Update a single setting after validating the value.
 #[patch("/settings/<key>", data = "<input>")]
 pub async fn setting_patch(
     db: &State<DatabaseConnection>,
@@ -175,6 +179,7 @@ pub async fn setting_patch(
         ("key" = String, Path, description = "Setting key"),
     )
 )]
+/// Update a single setting for one package after validating the value.
 #[patch("/package/<pkgbase>/settings/<key>", data = "<input>")]
 pub async fn package_setting_patch(
     db: &State<DatabaseConnection>,
@@ -214,6 +219,7 @@ pub async fn setting_reset(
         ("key" = String, Path, description = "Setting key"),
     )
 )]
+/// Reset one package's setting back to its default.
 #[delete("/package/<pkgbase>/settings/<key>")]
 pub async fn package_setting_reset(
     db: &State<DatabaseConnection>,

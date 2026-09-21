@@ -24,7 +24,10 @@ use crate::packages;
 /// Only these three fields are ever consulted when matching, so planned
 /// packages are represented directly rather than as `packages::Model`s with a
 /// placeholder id — a fake id would be a trap for the next reader.
-#[derive(Debug, Clone)]
+///
+/// Read straight off the row: the selected columns below are exactly these
+/// fields, so there is no intermediate shape to keep in sync.
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct PackageCandidate {
     /// The pkgbase, which is what a dependency ultimately resolves to.
     pub name: String,
@@ -76,27 +79,14 @@ impl TrackedPackages {
         // Only the three columns matching consults. The rows also carry the
         // large `source_data` JSON, which a full-model load would haul in for
         // every package on every resolution.
-        #[derive(Debug, Clone, FromQueryResult)]
-        struct Row {
-            name: String,
-            split_packages: Option<String>,
-            provides: Option<String>,
-        }
         let candidates = packages::Entity::find()
             .select_only()
             .column(packages::Column::Name)
             .column(packages::Column::SplitPackages)
             .column(packages::Column::Provides)
-            .into_model::<Row>()
+            .into_model::<PackageCandidate>()
             .all(db)
-            .await?
-            .into_iter()
-            .map(|row: Row| PackageCandidate {
-                name: row.name,
-                split_packages: row.split_packages,
-                provides: row.provides,
-            })
-            .collect();
+            .await?;
         Ok(Self { candidates })
     }
 

@@ -100,7 +100,6 @@ pub struct PatchPackageRequest {
     pub platforms: Option<Vec<String>>,
 }
 
-/// Async HTTP client for the AURCache API.
 /// Where a request for the API actually landed.
 ///
 /// Reaching *something* is not the same as reaching the API. Pointed at the
@@ -129,6 +128,8 @@ const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// download alike: up to 64 MiB on a slow link.
 const CLIENT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Async HTTP client for the AURCache API.
+///
 /// Cheap to clone (the pool is shared): screens hold one per resource, and the
 /// browser frontend keeps a single process-wide client.
 #[derive(Clone)]
@@ -194,7 +195,6 @@ impl AurCacheClient {
         self
     }
 
-    /// Calls the health endpoint and returns success when the instance is healthy.
     /// The API base URL this client was built with.
     ///
     /// Exposed because tooling has to talk about the *deployment* as well as
@@ -211,6 +211,7 @@ impl AurCacheClient {
             .await
     }
 
+    /// Calls the health endpoint and returns success when the instance is healthy.
     pub async fn health(&self) -> Result<()> {
         match self.probe_api().await? {
             ApiReachability::Api => Ok(()),
@@ -776,9 +777,15 @@ impl AurCacheClient {
     {
         let response = self.send(method, path, query, body).await?;
         let response = self.success_or_notify(response).await?;
-        // Read the body first: `json()` consumes the response, leaving nothing
-        // to explain the failure with beyond serde's "expected value at line 1
-        // column 1", which describes the symptom and not the cause.
+        Self::decode_json(response, path).await
+    }
+
+    /// Decode a success response as JSON.
+    ///
+    /// Read the body first: `json()` consumes the response, leaving nothing
+    /// to explain the failure with beyond serde's "expected value at line 1
+    /// column 1", which describes the symptom and not the cause.
+    async fn decode_json<T: DeserializeOwned>(response: Response, path: &str) -> Result<T> {
         let body = response
             .text()
             .await
@@ -879,10 +886,7 @@ impl AurCacheClient {
         let response = self
             .success_or_notify(response.send().await.context("request failed")?)
             .await?;
-        response
-            .json()
-            .await
-            .context("failed to read the restore response")
+        Self::decode_json(response, "/restore").await
     }
 
     /// Read a restore's progress, returning only entries after the first

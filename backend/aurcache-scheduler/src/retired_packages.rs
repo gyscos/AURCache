@@ -26,7 +26,7 @@ fn grace() -> Duration {
     Duration::from_secs(
         env::var("RETIRED_PACKAGE_GRACE")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_GRACE_SECS),
     )
 }

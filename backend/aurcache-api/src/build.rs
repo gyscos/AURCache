@@ -167,6 +167,7 @@ pub async fn download_build_output(
             ("page", description = "Page to fetch")
     )
 )]
+/// Builds across all packages, newest first.
 #[get("/builds?<limit>&<page>")]
 pub async fn list_builds(
     db: &State<DatabaseConnection>,

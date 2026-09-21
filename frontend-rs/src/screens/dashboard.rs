@@ -98,7 +98,9 @@ fn format_rate(rate: Option<f64>) -> String {
 /// The headline numbers.
 #[component]
 fn StatTiles(stats: ListStats) -> Element {
-    let all_packages = stats.requested_packages + stats.dependency_packages;
+    // Added wide, like `success_rate` below: the behaviour on overflow should
+    // not differ between two tiles of the same page.
+    let all_packages = u64::from(stats.requested_packages) + u64::from(stats.dependency_packages);
 
     rsx! {
         div { class: "grid gap-4 grid-cols-2 lg:grid-cols-3 xl:grid-cols-5",

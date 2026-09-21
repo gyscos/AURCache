@@ -95,7 +95,16 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
 
     for package in packages {
         let package_id = package.id;
-        let mut package_model: packages::ActiveModel = package.clone().into();
+        // Only what this sweep sets: the loop does network I/O per package
+        // (AUR RPC, git fetches), so by the time a late package saves, a row
+        // cloned at the top is minutes stale — and a full-row `update()` would
+        // write that staleness back over every column, including ones a
+        // concurrently finishing build just changed (status, latest build).
+        // A partial update touches the sweep's own columns and nothing else.
+        let mut package_model = packages::ActiveModel {
+            id: Set(package_id),
+            ..Default::default()
+        };
 
         // Not scoped to a platform: this is compared against the upstream
         // version to decide whether the package is out of date, which is a
@@ -195,7 +204,8 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         target: RefreshTarget::Git,
                         error: format!("{e:#}"),
                     });
-                    save_package(db, activity, package_model, &package.name).await;
+                    // Nothing set yet, so nothing to save: persisting the
+                    // empty update would write no columns at all.
                     continue;
                 }
                 // A failure here (e.g. a patch that no longer applies
@@ -216,7 +226,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                             purpose: SourceinfoPurpose::Version,
                             error: format!("{e:#}"),
                         });
-                        save_package(db, activity, package_model, &package.name).await;
+                        // As above: no columns set yet, nothing to persist.
                         continue;
                     }
                 };
@@ -245,7 +255,10 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 package_model.out_of_date = Set(i32::from(is_outdated));
             }
             SourceData::Upload { .. } => {
-                // noop since update is only triggered by new upload
+                // noop since update is only triggered by new upload — and in
+                // particular no columns are set, so there is nothing the
+                // save below could write.
+                continue;
             }
         }
 

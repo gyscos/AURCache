@@ -84,7 +84,7 @@ fn worker_cert_validity_days() -> i64 {
 fn env_i64(key: &str, default: i64) -> i64 {
     env::var(key)
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
 }
 

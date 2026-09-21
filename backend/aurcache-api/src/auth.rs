@@ -3,7 +3,6 @@ use aurcache_db::api_tokens;
 use aurcache_db::prelude::ApiTokens;
 use rand::rngs::SysRng;
 use rand_core::TryRng;
-use reqwest::header::AUTHORIZATION;
 use rocket::get;
 use rocket::http::{Cookie, CookieJar, SameSite, Status};
 use rocket::response::Redirect;
@@ -34,8 +33,6 @@ pub struct OauthUserInfo {
     /// allowlist has no use for it. When a list *is* configured, an absent
     /// address is refused -- see [`is_user_allowed`].
     pub email: Option<String>,
-    //pub preferred_username: String,
-    //pub nickname: String,
 }
 
 #[derive(serde::Serialize, ToSchema)]
@@ -161,7 +158,7 @@ pub async fn oauth_callback(
     });
     let user_info: OauthUserInfo = client
         .get(std::env::var("OAUTH_USERINFO_URI").map_err(|e| Unauthorized(e.to_string()))?)
-        .header(AUTHORIZATION, format!("Bearer {}", token.access_token()))
+        .bearer_auth(token.access_token())
         .send()
         .await
         .context("failed to complete request")

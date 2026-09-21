@@ -26,6 +26,25 @@ use crate::credentials;
 use crate::executor::Shared;
 use crate::repo_db;
 
+/// Await a blocking cache task, logging the panic instead of swallowing it.
+///
+/// Every cache task below is best-effort, so a dead one must not fail the
+/// job — but `unwrap_or`/`let _` on the join also buried *which* task died,
+/// leaving a panic with no trace. `Err` here is a panic (or a runtime
+/// shutdown), never a cache miss: the cache fns report those themselves.
+async fn join_cache_task<T>(
+    handle: tokio::task::JoinHandle<T>,
+    task: &'static str,
+) -> Option<T> {
+    match handle.await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!("background cache task '{task}' died: {e}");
+            None
+        }
+    }
+}
+
 /// Run one job to completion and return its terminal report.
 ///
 /// The per-job workspace is removed here rather than at the end of the happy
@@ -99,9 +118,13 @@ async fn run_job_inner(
         // Detached, never awaited: awaiting it would make every job start
         // wait for the full tree scan the comment above promises never blocks
         // the build. Best-effort either way — the next job's scan retries
-        // whatever this one misses.
-        tokio::task::spawn_blocking(move || {
+        // whatever this one misses. The watcher only logs a panic; it holds
+        // no build resource and unblocks nothing.
+        let evict = tokio::task::spawn_blocking(move || {
             cache.evict(&in_use);
+        });
+        tokio::spawn(async move {
+            let _ = join_cache_task(evict, "srcdest eviction").await;
         });
     }
 
@@ -142,9 +165,12 @@ async fn run_job_inner(
     match repo_db::fetch_repo_db(client, client.repo_section(), &job.arch).await {
         Ok(db) => {
             let cache = cache.clone();
-            let removed = tokio::task::spawn_blocking(move || cache.reconcile_pkgs(&db))
-                .await
-                .unwrap_or(0);
+            let removed = join_cache_task(
+                tokio::task::spawn_blocking(move || cache.reconcile_pkgs(&db)),
+                "shared-cache reconcile",
+            )
+            .await
+            .unwrap_or(0);
             if removed > 0 {
                 tracing::info!("reconciled shared package cache: removed {removed} stale file(s)");
             }
@@ -258,9 +284,12 @@ async fn run_job_inner(
         // minutes, and this build waits for it anyway.
         let (reclaim_cache, arch) = (cache.clone(), job.arch.clone());
         let (max_bytes, min_free) = (cfg.core.builddir_max_bytes, cfg.core.builddir_min_free);
-        let _ = tokio::task::spawn_blocking(move || {
-            reclaim_cache.reclaim_builddirs(&arch, &in_use, max_bytes, min_free);
-        })
+        let _ = join_cache_task(
+            tokio::task::spawn_blocking(move || {
+                reclaim_cache.reclaim_builddirs(&arch, &in_use, max_bytes, min_free);
+            }),
+            "builddir reclaim",
+        )
         .await;
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
@@ -332,18 +361,21 @@ async fn run_job_inner(
     {
         let cache = cache.clone();
         let label = job_label.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let promoted = cache.promote_job_pkgs(&label, repo_db.as_deref());
-            cache.wipe_pacman_pkg_job(&label);
-            cache.wipe_gnupg_job(&label);
-            let evicted = cache.evict_pkgs();
-            if promoted > 0 || !evicted.is_empty() {
-                tracing::info!(
-                    "package cache: promoted {promoted}, evicted {}",
-                    evicted.len()
-                );
-            }
-        })
+        let _ = join_cache_task(
+            tokio::task::spawn_blocking(move || {
+                let promoted = cache.promote_job_pkgs(&label, repo_db.as_deref());
+                cache.wipe_pacman_pkg_job(&label);
+                cache.wipe_gnupg_job(&label);
+                let evicted = cache.evict_pkgs();
+                if promoted > 0 || !evicted.is_empty() {
+                    tracing::info!(
+                        "package cache: promoted {promoted}, evicted {}",
+                        evicted.len()
+                    );
+                }
+            }),
+            "package-cache promote",
+        )
         .await;
     }
 
@@ -715,8 +747,11 @@ async fn run_build(
     // on every future build.
     if job.persistent_builddir {
         let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
-        let _ =
-            tokio::task::spawn_blocking(move || cache.record_builddir_size(&arch, &pkgbase)).await;
+        let _ = join_cache_task(
+            tokio::task::spawn_blocking(move || cache.record_builddir_size(&arch, &pkgbase)),
+            "builddir size record",
+        )
+        .await;
     }
 
     let mut report = if timed_out {
@@ -865,6 +900,21 @@ mod tests {
 
         let elsewhere = oom_reason(1, OomCause::Elsewhere, &cfg);
         assert!(!elsewhere.contains("WORKER_"), "{elsewhere}");
+    }
+
+    /// A finished blocking task hands its value through; a panicking one
+    /// comes back as `None` (and logs) rather than failing the job — the
+    /// whole point of routing the joins through one helper.
+    #[tokio::test]
+    async fn join_cache_task_passes_values_and_absorbs_panics() {
+        let ok = join_cache_task(tokio::task::spawn_blocking(|| 40 + 2), "test").await;
+        assert_eq!(ok, Some(42));
+        let dead: Option<i32> = join_cache_task(
+            tokio::task::spawn_blocking(|| panic!("deliberate test panic")),
+            "test",
+        )
+        .await;
+        assert_eq!(dead, None);
     }
 
     #[test]

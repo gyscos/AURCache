@@ -765,6 +765,9 @@ fn hash_suspects<'a>(
     let workers = std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
         .min(suspects.len());
+    // Collected, not lazy: the handles must all exist before the first join,
+    // or each thread is joined (and its chunk hashed) before the next spawns
+    // and the "parallel" hashing is serial.
     #[allow(clippy::needless_collect)]
     std::thread::scope(|scope| {
         let threads: Vec<_> = suspects
