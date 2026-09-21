@@ -61,11 +61,20 @@ pub async fn publish_build(
                 published.packages
             );
             log(
+                Some(activity),
                 pkgbase.as_deref(),
                 build.number,
                 "Published to the repository\n",
             )
             .await;
+            if let Some(pkgbase) = &pkgbase {
+                activity.emit(Event::BuildPublished {
+                    build: BuildRef {
+                        pkgbase: pkgbase.clone(),
+                        number: build.number,
+                    },
+                });
+            }
             if let Err(e) =
                 crate::worker_complete::trigger_dependents(db, build.pkg_id, build.platform).await
             {
@@ -73,6 +82,12 @@ pub async fn publish_build(
                     "Failed to trigger dependents of package {}: {e}",
                     build.pkg_id
                 );
+                if let Some(pkgbase) = &pkgbase {
+                    activity.emit(Event::DependentsTriggerFailed {
+                        pkg: pkgbase.as_str().into(),
+                        error: e.to_string(),
+                    });
+                }
             }
         }
         Err(e) => {
@@ -88,6 +103,7 @@ pub async fn publish_build(
                 error: format!("{e:#}"),
             });
             log(
+                Some(activity),
                 pkgbase.as_deref(),
                 build.number,
                 &format!("Publishing failed: {e:#}\n"),
@@ -95,17 +111,37 @@ pub async fn publish_build(
             .await;
             if let Err(e) = fail(db, &build).await {
                 error!("could not mark build #{build_id} failed: {e}");
+                if let Some(pkgbase) = &pkgbase {
+                    activity.emit(Event::BuildMarkFailed {
+                        build: BuildRef {
+                            pkgbase: pkgbase.clone(),
+                            number: build.number,
+                        },
+                        error: e.to_string(),
+                    });
+                }
             }
         }
     }
     let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
 }
 
-async fn log(pkgbase: Option<&str>, number: i32, text: &str) {
+/// Append to a build's log; a line that does not land is recorded where
+/// someone will come across it, when there is somewhere to record it.
+async fn log(activity: Option<&ActivityLog>, pkgbase: Option<&str>, number: i32, text: &str) {
     if let Some(pkgbase) = pkgbase
         && let Err(e) = append_build_output(pkgbase, number, text).await
     {
-        warn!("could not write to the log of {pkgbase}/{number}: {e}");
+        match activity {
+            Some(activity) => activity.emit(Event::BuildLogAppendFailed {
+                build: BuildRef {
+                    pkgbase: pkgbase.to_string(),
+                    number,
+                },
+                error: e.to_string(),
+            }),
+            None => warn!("could not write to the log of {pkgbase}/{number}: {e}"),
+        }
     }
 }
 
@@ -207,6 +243,7 @@ async fn read_staging(
         }
         if is_debug_artifact(&expected, &filename) {
             log(
+                None,
                 Some(&pkg.name),
                 build.number,
                 &format!("skipping debug package (not published): {filename}\n"),

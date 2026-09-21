@@ -1,4 +1,6 @@
 use crate::sleep_until_next_fire;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_utils::job_config::{
     mirrorlist_dir, mirrorlist_path, native_arch, shared_mirrorlist_path,
 };
@@ -11,9 +13,9 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::fs;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
-pub fn start_mirror_rank_job() -> anyhow::Result<JoinHandle<()>> {
+pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle<()>> {
     let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * 1".to_string());
     // This parses the string following this spec: https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html
     let schedule = Schedule::from_str(cron_str.as_str())?;
@@ -29,11 +31,14 @@ pub fn start_mirror_rank_job() -> anyhow::Result<JoinHandle<()>> {
             info!("No mirrorlist found yet; ranking one immediately at startup");
             match update_mirrorlist().await {
                 Ok(()) => info!("Initial mirror ranking finished"),
-                Err(e) => warn!("Initial mirror ranking failed: {e}"),
+                Err(e) => activity.emit(Event::MirrorRankFailed {
+                    error: format!("{e:#}"),
+                }),
             }
         }
 
         let mut upcoming = schedule.upcoming(Utc);
+        let mut reported = false;
         loop {
             // Get the next occurrence from now, or if the schedule has no
             // future occurrence (unlikely with cron), wait a default duration
@@ -43,12 +48,20 @@ pub fn start_mirror_rank_job() -> anyhow::Result<JoinHandle<()>> {
                     Ok(()) => {
                         info!("Mirror ranking finished");
                     }
-                    Err(e) => {
-                        warn!("Mirror ranking failed: {e}");
-                    }
+                    Err(e) => activity.emit(Event::MirrorRankFailed {
+                        error: format!("{e:#}"),
+                    }),
                 }
             } else {
-                warn!("Your defined cron-job doesn't have a future schedule: '{cron_str}'");
+                // Once: this schedule is fixed at startup, so it will not
+                // start firing later.
+                if !reported {
+                    activity.emit(Event::ScheduleInvalid {
+                        job: "mirror_ranking".to_string(),
+                        error: format!("'{cron_str}' never fires again"),
+                    });
+                    reported = true;
+                }
                 tokio::time::sleep(Duration::from_secs(60 * 30)).await;
             }
         }

@@ -6,9 +6,11 @@ use aurcache_common::builder::BuildStates;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
-    Select,
+    RelationTrait, Select,
 };
 use std::collections::BTreeMap;
+
+use aurcache_common::api::log::BuildRef;
 
 /// The most recent *successful* build row selection, newest by end time with
 /// start time as the tie-break, projecting one column.
@@ -184,6 +186,32 @@ pub fn latest_successful_version_expr() -> Expr {
             .limit(1)
             .to_owned(),
     )
+}
+
+/// Name builds the way everything outside the database does: by package and
+/// number, for row ids that mean nothing to anyone else.
+///
+/// A build whose package is gone cannot be named, and is left out.
+pub async fn build_refs<C: ConnectionTrait>(db: &C, ids: &[i32]) -> Result<Vec<BuildRef>, DbErr> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(Builds::find()
+        .select_only()
+        .column(packages::Column::Name)
+        .column(builds::Column::Number)
+        .join(
+            sea_orm::JoinType::InnerJoin,
+            builds::Relation::Packages.def(),
+        )
+        .filter(builds::Column::Id.is_in(ids.iter().copied()))
+        .order_by_asc(builds::Column::Id)
+        .into_tuple::<(String, i32)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|(pkgbase, number)| BuildRef { pkgbase, number })
+        .collect())
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use crate::repository::Repository;
 use crate::snapshot::SnapshotStore;
 use anyhow::bail;
+use aurcache_activitylog::events::Event;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Files, PackageVcsSources, Packages, Settings};
 use aurcache_db::{builds, dependencies, files, package_vcs_sources, packages, settings};
@@ -79,7 +80,10 @@ pub async fn package_delete(
         if let Some(remaining) = &remaining
             && let Err(e) = store.remove_checkout(&pkg.source_data, remaining).await
         {
-            warn!("could not remove source checkout for {}: {e:#}", pkg.name);
+            repo.log().emit(Event::CheckoutRemoveFailed {
+                pkg: pkg.name.as_str().into(),
+                error: format!("{e:#}"),
+            });
         }
     }
     Ok(())

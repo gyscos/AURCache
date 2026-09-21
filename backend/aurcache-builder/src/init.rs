@@ -10,6 +10,8 @@
 //! `Action::Build` is just a low-latency wakeup hint; workers also poll on an
 //! interval, so there is nothing to do for it here.
 
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
@@ -22,15 +24,21 @@ use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait};
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[must_use]
-pub fn init_build_queue(db: DatabaseConnection, tx: Sender<Action>) -> JoinHandle<()> {
+pub fn init_build_queue(
+    db: DatabaseConnection,
+    tx: Sender<Action>,
+    activity: ActivityLog,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = tx.subscribe();
 
-        if let Err(e) = enqueue_missing_buildable_packages(&db, &tx).await {
-            error!("Failed to enqueue buildable packages during startup: {e}");
+        if let Err(e) = enqueue_missing_buildable_packages(&db, &tx, &activity).await {
+            activity.emit(Event::StartupEnqueueFailed {
+                error: format!("{e:#}"),
+            });
         }
 
         loop {

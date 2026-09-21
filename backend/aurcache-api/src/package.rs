@@ -218,7 +218,10 @@ pub async fn packages_add_endpoint(
         // if it panicked, which is exactly when a job must not be left claiming
         // to be running.
         if let Err(e) = worker.await {
-            warn!("bulk add {job_id} ended abnormally: {e}");
+            al_task.emit(Event::OperationAborted {
+                operation: "bulk_add".to_string(),
+                error: e.to_string(),
+            });
         }
         if let Err(e) =
             operations::append::<_, BulkAddEntry>(&db_task, job_id, completed, failed, &[], true)
@@ -350,13 +353,27 @@ pub async fn package_update_entity_endpoint(
     services: &State<Services>,
     input: Json<PackagePatch>,
     pkgbase: &str,
-    _a: Authenticated,
+    a: Authenticated,
 ) -> Result<(), ApiError> {
     let db = &services.db;
 
     // We cannot move things out of Json<T>, but we can move it out of T.
     let input = input.into_inner();
     let patch_changed = input.patch.is_some();
+    // What the request touched, for the log, named as a reader would.
+    let fields: Vec<String> = [
+        (input.name.is_some(), "name"),
+        (input.status.is_some(), "status"),
+        (input.out_of_date.is_some(), "out-of-date flag"),
+        (input.latest_build.is_some(), "latest build"),
+        (input.build_flags.is_some(), "build flags"),
+        (input.platforms.is_some(), "platforms"),
+        (patch_changed, "source patch"),
+    ]
+    .into_iter()
+    .filter(|(touched, _)| *touched)
+    .map(|(_, field)| field.to_string())
+    .collect();
     let pkg = package_by_pkgbase(db, pkgbase).await?;
 
     // Dependencies are read per architecture — a PKGBUILD can declare
@@ -397,6 +414,15 @@ pub async fn package_update_entity_endpoint(
         .update(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    if !fields.is_empty() {
+        services.activity.emit_by(
+            Event::PackageChanged {
+                pkg: updated.name.as_str().into(),
+                fields,
+            },
+            a.username,
+        );
+    }
 
     // A patch being set or cleared here (e.g. via the "reset patch" action)
     // can change `depends`/`makedepends` without bumping the package's
@@ -489,7 +515,7 @@ pub async fn package_source_file_update(
     services: &State<Services>,
     pkgbase: &str,
     input: Json<SourceFileUpdate>,
-    _a: Authenticated,
+    a: Authenticated,
 ) -> Result<(), ApiError> {
     let db = &services.db;
     let input = input.into_inner();
@@ -535,6 +561,13 @@ pub async fn package_source_file_update(
         .update(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    services.activity.emit_by(
+        Event::SourceEdited {
+            pkg: pkg.name.as_str().into(),
+            path: input.path.clone(),
+        },
+        a.username,
+    );
 
     // A patch can change `depends`/`makedepends` without bumping the
     // package's version, so resync the dependency graph immediately rather
@@ -1637,7 +1670,7 @@ pub async fn package_dependency_replace(
     pkgbase: &str,
     dependency: &str,
     input: Json<ReplaceDependency>,
-    _a: Authenticated,
+    a: Authenticated,
 ) -> Result<(), ApiError> {
     let (dependent, current, edge) = dependency_edge(&services.db, pkgbase, dependency).await?;
     let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
@@ -1661,6 +1694,13 @@ pub async fn package_dependency_replace(
             edge.delete(&services.db)
                 .await
                 .map_err(|e| err(Status::InternalServerError, e))?;
+            services.activity.emit_by(
+                Event::DepsDropped {
+                    dependent: dependent.name.as_str().into(),
+                    dependency: current.name.as_str().into(),
+                },
+                a.username.clone(),
+            );
         }
         Some(replacement) => {
             if replacement == current.name {
@@ -1704,6 +1744,14 @@ pub async fn package_dependency_replace(
             repoint_edge(&services.db, edge, dependent.id, package.id)
                 .await
                 .map_err(|e| err(Status::InternalServerError, e))?;
+            services.activity.emit_by(
+                Event::DepsReplaced {
+                    dependent: dependent.name.as_str().into(),
+                    old: current.name.as_str().into(),
+                    new: package.name.as_str().into(),
+                },
+                a.username.clone(),
+            );
         }
     }
 

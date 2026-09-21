@@ -1,6 +1,8 @@
 use crate::models::authenticated::Authenticated;
 use crate::models::settings::{SettingResponse, SettingValue};
 use crate::utils::error::{ApiError, err};
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_utils::settings::general::SettingsTraits;
 use rocket::http::Status;
@@ -163,9 +165,18 @@ pub async fn setting_patch(
     db: &State<DatabaseConnection>,
     key: &str,
     input: Json<SettingValue>,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    setting_patch_impl(db.inner(), key, None, input.into_inner().value).await
+    setting_patch_impl(db.inner(), key, None, input.into_inner().value).await?;
+    al.emit_by(
+        Event::SettingChanged {
+            key: key.to_string(),
+            pkg: None,
+        },
+        a.username,
+    );
+    Ok(())
 }
 
 #[utoipa::path(
@@ -186,10 +197,19 @@ pub async fn package_setting_patch(
     pkgbase: &str,
     key: &str,
     input: Json<SettingValue>,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
     let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
-    setting_patch_impl(db.inner(), key, pkg_id, input.into_inner().value).await
+    setting_patch_impl(db.inner(), key, pkg_id, input.into_inner().value).await?;
+    al.emit_by(
+        Event::SettingChanged {
+            key: key.to_string(),
+            pkg: Some(pkgbase.into()),
+        },
+        a.username,
+    );
+    Ok(())
 }
 
 /// Reset a setting back to its default by deleting any stored override.
@@ -204,9 +224,18 @@ pub async fn package_setting_patch(
 pub async fn setting_reset(
     db: &State<DatabaseConnection>,
     key: &str,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    setting_reset_impl(db.inner(), key, None).await
+    setting_reset_impl(db.inner(), key, None).await?;
+    al.emit_by(
+        Event::SettingReset {
+            key: key.to_string(),
+            pkg: None,
+        },
+        a.username,
+    );
+    Ok(())
 }
 
 #[utoipa::path(
@@ -225,8 +254,17 @@ pub async fn package_setting_reset(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     key: &str,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
     let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
-    setting_reset_impl(db.inner(), key, pkg_id).await
+    setting_reset_impl(db.inner(), key, pkg_id).await?;
+    al.emit_by(
+        Event::SettingReset {
+            key: key.to_string(),
+            pkg: Some(pkgbase.into()),
+        },
+        a.username,
+    );
+    Ok(())
 }

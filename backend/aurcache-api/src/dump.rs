@@ -3,6 +3,8 @@
 use crate::init::{CaDirectory, ServerVersion};
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_common::api::dump::{
     ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOptions, RestoreOutcome,
     RestoreProgress, SecretsPolicy,
@@ -68,6 +70,7 @@ pub async fn dump(
     ca_dir: &State<CaDirectory>,
     include_secrets: Option<bool>,
     a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<DumpArchive, ApiError> {
     let with_secrets = include_secrets.unwrap_or(false);
     if with_secrets {
@@ -89,6 +92,12 @@ pub async fn dump(
     )
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
+    al.emit_by(
+        Event::DumpExported {
+            secrets: with_secrets,
+        },
+        a.username.clone(),
+    );
     let created_at = dump.manifest.created_at;
     let bytes = aurcache_utils::dump::write_archive(&dump)
         .map_err(|e| err(Status::InternalServerError, e))?;
@@ -151,7 +160,7 @@ pub async fn restore(
     ca_dir: &State<CaDirectory>,
     query: RestoreQuery,
     archive: Data<'_>,
-    _a: Authenticated,
+    a: Authenticated,
 ) -> Result<status::Accepted<Json<RestoreAccepted>>, ApiError> {
     let RestoreQuery {
         dry_run,
@@ -217,6 +226,8 @@ pub async fn restore(
 
     let services_task = services.inner().clone();
     let db_task = services_task.db.clone();
+    let log_task = services_task.activity.clone();
+    let username = a.username.clone();
     let ca_dir_task = ca_dir.inner().clone();
 
     tokio::spawn(async move {
@@ -260,10 +271,19 @@ pub async fn restore(
                 warn!("could not record restore {job_id} progress: {e}");
             }
         }
+        log_task.emit_by(
+            Event::RestoreApplied {
+                packages: succeeded.len(),
+            },
+            username,
+        );
         let completed = i32::try_from(succeeded.len()).unwrap_or(i32::MAX);
         let failed = i32::try_from(failed.len()).unwrap_or(i32::MAX);
         if let Err(e) = worker.await {
-            warn!("restore {job_id} ended abnormally: {e}");
+            log_task.emit(Event::OperationAborted {
+                operation: "restore".to_string(),
+                error: e.to_string(),
+            });
         }
         if let Err(e) =
             operations::append::<_, RestoreEntry>(&db_task, job_id, completed, failed, &[], true)

@@ -11,8 +11,9 @@ use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
+use aurcache_activitylog::events::{Event, WorkerReport};
 use aurcache_ca::Ca;
+use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
 };
@@ -293,9 +294,8 @@ pub async fn register_worker(
         .map_err(|e| err(Status::BadRequest, e))?;
 
     // Asked before registering, because registering is an upsert and would
-    // erase the difference. A worker re-registers on every startup, so only the
-    // first time is an event: logging the rest would turn an ordinary restart
-    // -- or a crash loop -- into a log nobody can read past.
+    // erase the difference: the first time is an enrollment, and every time
+    // after is a worker coming back up.
     let known = worker_store::find_worker_by_fingerprint(db, &fingerprint)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
@@ -307,10 +307,11 @@ pub async fn register_worker(
     let declaration = input.settings.as_ref().and_then(|settings| {
         serde_json::to_string(settings)
             .map_err(|e| {
-                tracing::warn!(
-                    "worker {} sent a declaration that could not be stored: {e}",
-                    input.name
-                );
+                al.emit(Event::WorkerReportFailed {
+                    worker: input.name.as_str().into(),
+                    report: WorkerReport::Declaration,
+                    error: e.to_string(),
+                });
             })
             .ok()
     });
@@ -336,7 +337,12 @@ pub async fn register_worker(
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
 
-    if !known {
+    if known {
+        al.emit(Event::WorkerRegistered {
+            worker: worker.name.clone().into(),
+            version: Some(input.version.clone()).filter(|v| !v.is_empty()),
+        });
+    } else {
         al.emit(Event::WorkerEnrolled {
             worker: worker.name.clone().into(),
         });
@@ -470,6 +476,7 @@ pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, ApiError> {
 pub async fn claim_job(
     db: &State<DatabaseConnection>,
     store: &State<Arc<SnapshotStore>>,
+    al: &State<ActivityLog>,
     auth: WorkerAuth,
     claim: Json<ClaimRequest>,
 ) -> Result<Option<Json<JobDescriptor>>, ApiError> {
@@ -491,6 +498,13 @@ pub async fn claim_job(
     let descriptor = build_descriptor(db, store, &build, &claim.mirrorlist)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.emit(Event::BuildStarted {
+        build: BuildRef {
+            pkgbase: descriptor.pkgbase.clone(),
+            number: build.number,
+        },
+        worker: auth.worker.name.as_str().into(),
+    });
     Ok(Some(Json(descriptor)))
 }
 
@@ -775,6 +789,17 @@ pub async fn complete_job(
             e.0,
             e.1
         );
+        // A build nobody can name any more -- its package deleted -- leaves
+        // only the journal line above.
+        if let Ok(named) = aurcache_db::helpers::builds::build_refs(db.inner(), &[build_id]).await
+            && let Some(build) = named.into_iter().next()
+        {
+            al.emit(Event::BuildCompletionRejected {
+                build,
+                worker: auth.worker.name.as_str().into(),
+                reason: e.1.clone(),
+            });
+        }
     }
     outcome
 }
@@ -825,12 +850,30 @@ async fn complete_job_inner(
     worker_complete::check_owned_active(auth.worker.id, &build)
         .map_err(|e| err(Status::Forbidden, e))?;
 
+    // What the entries below name it by. A package gone from under an active
+    // build is not something to refuse the report over.
+    let pkgbase = build_pkgbase(db, build.pkg_id).await.ok();
+    let named = pkgbase.as_ref().map(|pkgbase| BuildRef {
+        pkgbase: pkgbase.clone(),
+        number: build.number,
+    });
+    let worker = || WorkerRef::from(auth.worker.name.as_str());
+    let record_failed = |what: &str, error: String| {
+        if let Some(build) = &named {
+            activity.emit(Event::BuildRecordFailed {
+                build: build.clone(),
+                what: what.to_string(),
+                error,
+            });
+        }
+    };
+
     // Before the branch below: an OOM-killed build never reaches the success
     // path, and that is the build whose memory figure matters most.
     if let Some(peak) = report.peak_memory_bytes
         && let Err(e) = worker_complete::record_peak_memory(db, build_id, peak).await
     {
-        tracing::warn!("Failed to record peak memory for build {build_id}: {e}");
+        record_failed("peak memory", e.to_string());
     }
 
     if report.success {
@@ -847,30 +890,43 @@ async fn complete_job_inner(
             )
             .await
         {
-            tracing::warn!("Failed to record built VCS sources for build {build_id}: {e}");
+            record_failed("built VCS sources", e.to_string());
         }
         worker_complete::accept_for_publishing(db, build_id, auth.worker.id)
             .await
             .map_err(|e| err(Status::Forbidden, e))?;
+        if let Some(build) = named.clone() {
+            activity.emit(Event::BuildSucceeded {
+                build,
+                worker: worker(),
+            });
+        }
         let (db, repo, activity) = (db.clone(), Arc::clone(repo), activity.clone());
         tokio::spawn(async move { publish_build(&db, &repo, &activity, build_id).await });
         return Ok(());
     }
 
     if let Some(reason) = &report.reason
-        && let Ok(pkgbase) = build_pkgbase(db, build.pkg_id).await
+        && let Some(pkgbase) = &pkgbase
         && let Err(e) = append_build_output(
-            &pkgbase,
+            pkgbase,
             build.number,
             &format!("worker reported failure: {reason}\n"),
         )
         .await
     {
-        tracing::warn!("Failed to record failure reason for build {build_id}: {e}");
+        record_failed("failure reason", e.to_string());
     }
     worker_complete::complete_failure(db, build_id, auth.worker.id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    if let Some(build) = named {
+        activity.emit(Event::BuildFailed {
+            build,
+            worker: worker(),
+            reason: report.reason.clone(),
+        });
+    }
     let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
     Ok(())
 }
@@ -896,18 +952,38 @@ pub async fn heartbeat(
     // cannot be stored must not cost the worker its heartbeat -- the leases
     // this renews are what keep its builds alive.
     if let Some(effective) = &hb.effective {
+        let worker = || WorkerRef::from(auth.worker.name.as_str());
+        let failed = |error: String| Event::WorkerReportFailed {
+            worker: worker(),
+            report: WorkerReport::Configuration,
+            error,
+        };
         match serde_json::to_string(effective) {
             Ok(json) => {
                 if let Err(e) =
                     worker_store::store_effective_config(db, auth.worker.id, &json).await
                 {
-                    tracing::warn!(
-                        "could not store worker {}'s configuration report: {e}",
-                        auth.worker.id
-                    );
+                    al.emit(failed(e.to_string()));
                 }
             }
-            Err(e) => tracing::warn!("unreadable configuration report from a worker: {e}"),
+            Err(e) => al.emit(failed(e.to_string())),
+        }
+
+        // Against what it last reported. The first report has nothing to
+        // differ from, and a restart that comes back the same says nothing.
+        if let Some(before) = auth
+            .worker
+            .effective_config
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<EffectiveConfig>(raw).ok())
+        {
+            let changed = effective.changed_since(&before);
+            if !changed.is_empty() {
+                al.emit(Event::WorkerConfigChanged {
+                    worker: worker(),
+                    settings: changed,
+                });
+            }
         }
 
         // A worker sends this only when it changes, so this is once per worker
@@ -1199,13 +1275,18 @@ pub async fn revoke_worker(
     id: i32,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    let worker = worker_store::revoke_worker(db, id, max_attempts())
+    let revoked = worker_store::revoke_worker(db, id, max_attempts())
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
+    // Named for the entry; a lookup that fails costs the list, not the revoke.
+    let requeued = aurcache_db::helpers::builds::build_refs(db, &revoked.requeued)
+        .await
+        .unwrap_or_default();
     al.emit_by(
         Event::WorkerRevoked {
-            worker: worker.name.into(),
+            worker: revoked.worker.name.into(),
+            requeued,
         },
         a.username,
     );

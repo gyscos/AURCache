@@ -194,12 +194,20 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     db: &C,
     id: i32,
     max_attempts: i32,
-) -> Result<Option<workers::Model>, DbErr> {
+) -> Result<Option<Revoked>, DbErr> {
     let Some(worker) = set_status(db, id, ApprovalStatus::Revoked).await? else {
         return Ok(None);
     };
-    crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
-    Ok(Some(worker))
+    let requeued = crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
+    Ok(Some(Revoked { worker, requeued }))
+}
+
+/// A revoked worker, and the builds taken back from it.
+#[derive(Debug)]
+pub struct Revoked {
+    pub worker: workers::Model,
+    /// Row ids of the builds it held, now requeued or failed.
+    pub requeued: Vec<i32>,
 }
 
 /// List all workers in name order.
@@ -496,7 +504,7 @@ mod tests {
         assert_eq!(re.status, ApprovalStatus::Approved);
 
         let revoked = revoke_worker(&db, w.id, 3).await.unwrap().unwrap();
-        assert_eq!(revoked.status, ApprovalStatus::Revoked);
+        assert_eq!(revoked.worker.status, ApprovalStatus::Revoked);
     }
 
     /// The contract the endpoints rely on: an unknown id is `None`, not a

@@ -41,12 +41,12 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
 use tokio::sync::mpsc::Sender;
-use tracing::warn;
 
 use crate::package::add::{provides_json, split_packages_json};
 use crate::repository::Repository;
 use crate::services::Services;
 use crate::snapshot::SnapshotStore;
+use aurcache_activitylog::events::{Event, RestoreStep};
 
 /// A dump that has been read and checked, ready to apply.
 #[derive(Debug)]
@@ -357,15 +357,21 @@ pub async fn apply(
     // Written after the rows commit, and only then: replacing the CA on disk is
     // not something a rolled-back transaction can take back, so it must not
     // happen while the import might still fail.
-    if let Err(e) = write_secrets(&dump, &options, ca_dir) {
-        let _ = progress
-            .send(RestoreEntry {
-                pkgbase: String::new(),
-                outcome: RestoreOutcome::Failed {
-                    error: format!("the packages were imported, but the secrets were not: {e:#}"),
-                },
-            })
-            .await;
+    match write_secrets(&dump, &options, ca_dir) {
+        Ok(true) => services.activity.emit(Event::RestoreCaReplaced {}),
+        Ok(false) => {}
+        Err(e) => {
+            let _ = progress
+                .send(RestoreEntry {
+                    pkgbase: String::new(),
+                    outcome: RestoreOutcome::Failed {
+                        error: format!(
+                            "the packages were imported, but the secrets were not: {e:#}"
+                        ),
+                    },
+                })
+                .await;
+        }
     }
 
     // PASS 2: sources. Every imported package's `provides` and split package
@@ -377,7 +383,11 @@ pub async fn apply(
     let mut unresolved = HashSet::new();
     for pkgbase in &applied.touched {
         if let Err(e) = fill_source_facts(db, store, pkgbase).await {
-            warn!("restore: could not read the source of {pkgbase}: {e:#}");
+            services.activity.emit(Event::RestorePackageFailed {
+                pkg: pkgbase.as_str().into(),
+                step: RestoreStep::Source,
+                error: format!("{e:#}"),
+            });
             let _ = progress
                 .send(RestoreEntry {
                     pkgbase: pkgbase.clone(),
@@ -405,7 +415,11 @@ pub async fn apply(
             continue;
         };
         if let Err(e) = crate::package::update::package_resync_dependencies(services, &row).await {
-            warn!("restore: could not resolve dependencies for {pkgbase}: {e:#}");
+            services.activity.emit(Event::RestorePackageFailed {
+                pkg: pkgbase.as_str().into(),
+                step: RestoreStep::Dependencies,
+                error: format!("{e:#}"),
+            });
             let _ = progress
                 .send(RestoreEntry {
                     pkgbase: pkgbase.clone(),
@@ -431,16 +445,18 @@ pub async fn apply(
 /// The CA is written to disk rather than the database, which is why it cannot
 /// share the transaction that wrote the rows -- and why it is written after
 /// them, once nothing is left that could still roll back.
+///
+/// Returns whether the CA was replaced.
 fn write_secrets(
     dump: &LoadedDump,
     options: &RestoreOptions,
     ca_dir: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let Some(secrets) = &dump.secrets else {
-        return Ok(());
+        return Ok(false);
     };
     if options.secrets == SecretsPolicy::Ignore && !options.clear {
-        return Ok(());
+        return Ok(false);
     }
 
     std::fs::create_dir_all(ca_dir)?;
@@ -448,13 +464,7 @@ fn write_secrets(
     // has half a CA, and this narrows that window to a single write.
     std::fs::write(ca_dir.join(CA_CERT_FILE), &secrets.ca_cert_pem)?;
     write_private(&ca_dir.join(CA_KEY_FILE), &secrets.ca_key_pem)?;
-    warn!(
-        "restore: replaced the worker CA in {}. Every certificate the current \
-         workers hold was signed by the previous one and is now worthless; they \
-         will re-enrol.",
-        ca_dir.display()
-    );
-    Ok(())
+    Ok(true)
 }
 
 /// Write key material readable only by its owner.

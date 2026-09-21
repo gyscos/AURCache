@@ -20,6 +20,8 @@
 
 use crate::package::source_metadata::SourceMetadata;
 use crate::snapshot::SnapshotStore;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_db::packages;
 use aurcache_db::prelude::Packages;
 use sea_orm::ActiveValue::Set;
@@ -51,8 +53,15 @@ pub fn apply_source_metadata(model: &mut packages::ActiveModel, metadata: &Sourc
 pub async fn refresh_source_metadata(
     store: &SnapshotStore,
     db: &DatabaseConnection,
+    activity: &ActivityLog,
     pkgbases: &[String],
 ) {
+    let failed = |pkgbase: &str, error: String| {
+        activity.emit(Event::SourceMetadataFailed {
+            pkg: pkgbase.into(),
+            error,
+        });
+    };
     for pkgbase in pkgbases {
         let row = match Packages::find()
             .filter(packages::Column::Name.eq(pkgbase))
@@ -73,7 +82,7 @@ pub async fn refresh_source_metadata(
         {
             Ok(metadata) => metadata,
             Err(e) => {
-                tracing::warn!("could not read source metadata for {pkgbase}: {e}");
+                failed(pkgbase, format!("{e:#}"));
                 continue;
             }
         };
@@ -84,7 +93,7 @@ pub async fn refresh_source_metadata(
         };
         apply_source_metadata(&mut model, &metadata);
         if let Err(e) = model.update(db).await {
-            tracing::warn!("could not store source metadata for {pkgbase}: {e}");
+            failed(pkgbase, e.to_string());
         }
     }
 }

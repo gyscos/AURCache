@@ -13,4 +13,5 @@ sea-orm = {workspace = true}
 
 aurcache-db = {path = "../aurcache-db"}
 aurcache-utils = {path = "../aurcache-utils"}
+aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-common = {path = "../aurcache-common"}

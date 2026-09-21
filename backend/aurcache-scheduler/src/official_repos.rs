@@ -1,9 +1,11 @@
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aurcache_deps::AurClient;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 /// How often to ask whether the official repository databases need anything.
 ///
@@ -17,22 +19,33 @@ const TICK: Duration = Duration::from_secs(60);
 
 /// Keep the official repository databases, and the names read from them,
 /// current for as long as the server runs.
-pub fn start_official_repo_refresh(client: Arc<AurClient>) -> JoinHandle<()> {
+pub fn start_official_repo_refresh(
+    client: Arc<AurClient>,
+    activity: ActivityLog,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut first = true;
+        let mut failing = false;
         loop {
             match client.official.refresh().await {
                 // Only worth saying once per outage, and once when it
                 // recovers: this runs every minute and has nothing to report
                 // on almost all of them.
                 Ok(()) => {
+                    failing = false;
                     if first {
                         info!("official repository databases are current");
                         first = false;
                     }
                 }
                 Err(e) => {
-                    warn!("could not refresh the official repository databases: {e}");
+                    // Recorded once per outage: it is retried every minute.
+                    if !failing {
+                        activity.emit(Event::OfficialReposRefreshFailed {
+                            error: e.to_string(),
+                        });
+                        failing = true;
+                    }
                     first = true;
                 }
             }

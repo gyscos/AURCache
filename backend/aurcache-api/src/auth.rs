@@ -1,4 +1,6 @@
 use anyhow::Context;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_db::api_tokens;
 use aurcache_db::prelude::ApiTokens;
 use rand::rngs::SysRng;
@@ -12,12 +14,12 @@ use rocket::{State, post};
 use rocket_oauth2::{OAuth2, TokenResponse};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use utoipa::OpenApi;
 use utoipa::ToSchema;
 
 use crate::models::authenticated::Authenticated;
-use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, is_user_allowed};
+use crate::utils::config::{allowed_users, is_user_allowed};
 use crate::utils::error::{ApiError, err};
 
 #[derive(OpenApi)]
@@ -142,6 +144,7 @@ pub fn oauth_login(
 pub async fn oauth_callback(
     token: TokenResponse<OauthUserInfo>,
     cookies: &CookieJar<'_>,
+    al: &State<ActivityLog>,
 ) -> Result<Redirect, Unauthorized<String>> {
     // Nothing is written to the cookie jar until the user has been identified
     // *and* allowed. Rocket applies jar changes to the response whatever this
@@ -175,11 +178,9 @@ pub async fn oauth_callback(
         // Logged at warn: on a server that restricts sign-in, someone being
         // turned away is worth seeing, and the operator locking themselves out
         // by a typo in the list looks identical from the browser.
-        warn!(
-            "Refused sign-in for {} ({}): not in {ALLOWED_USERS_ENV}",
-            email.unwrap_or("no email reported"),
-            real_name
-        );
+        al.emit(Event::SignInRefused {
+            user: format!("{real_name} ({})", email.unwrap_or("no email reported")),
+        });
         return Err(Unauthorized(
             "This account is not permitted to sign in to this AURCache instance.".to_string(),
         ));
@@ -213,6 +214,7 @@ pub async fn oauth_callback(
 pub async fn regenerate_api_token_endpoint(
     db: &State<DatabaseConnection>,
     a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<Json<ApiTokenResponse>, ApiError> {
     let username = a
         .username
@@ -222,6 +224,7 @@ pub async fn regenerate_api_token_endpoint(
     let token = regenerate_api_token(db, &username)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.emit_by(Event::TokenRegenerated {}, Some(username));
     Ok(Json(ApiTokenResponse { token }))
 }
 

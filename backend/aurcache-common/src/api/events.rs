@@ -188,7 +188,13 @@ pub enum Event {
 
     /// A worker was put out of the fleet, and its builds taken back.
     #[serde(rename = "worker.revoked")]
-    WorkerRevoked { worker: WorkerRef },
+    WorkerRevoked {
+        worker: WorkerRef,
+        /// The builds it was running, handed back to the queue. Absent from
+        /// entries written before it was recorded.
+        #[serde(default)]
+        requeued: Vec<BuildRef>,
+    },
 
     /// Builds taken back from a worker that stopped answering.
     ///
@@ -196,6 +202,10 @@ pub enum Event {
     /// together, and they have one cause.
     #[serde(rename = "worker.reaped")]
     WorkerReaped {
+        /// The workers that stopped answering. Absent from entries written
+        /// before it was recorded.
+        #[serde(default)]
+        workers: Vec<WorkerRef>,
         /// Handed back to the queue for another attempt.
         retried: Vec<BuildRef>,
         /// Out of attempts, and failed outright.
@@ -209,6 +219,314 @@ pub enum Event {
         worker: WorkerRef,
         settings: Vec<String>,
     },
+
+    /// A worker checked in at startup. Every start, not only the first: the
+    /// version it reports is how a fleet upgrade shows up.
+    #[serde(rename = "worker.registered")]
+    WorkerRegistered {
+        worker: WorkerRef,
+        #[serde(default)]
+        version: Option<String>,
+    },
+
+    /// What a worker's settings resolved to changed since it last reported.
+    #[serde(rename = "worker.config_changed")]
+    WorkerConfigChanged {
+        worker: WorkerRef,
+        settings: Vec<String>,
+    },
+
+    /// Something a worker sent about itself could not be stored or read, so
+    /// its page shows less than it reported.
+    #[serde(rename = "worker.report_failed")]
+    WorkerReportFailed {
+        worker: WorkerRef,
+        /// Which report: its setting declaration, or what they resolved to.
+        report: WorkerReport,
+        error: String,
+    },
+
+    // -----------------------------------------------------------------------
+    // Builds
+    // -----------------------------------------------------------------------
+    /// A worker took a build.
+    #[serde(rename = "build.started")]
+    BuildStarted { build: BuildRef, worker: WorkerRef },
+
+    /// A worker finished a build, and it is on its way into the repository.
+    #[serde(rename = "build.succeeded")]
+    BuildSucceeded { build: BuildRef, worker: WorkerRef },
+
+    /// A build failed on its worker.
+    #[serde(rename = "build.failed")]
+    BuildFailed {
+        build: BuildRef,
+        worker: WorkerRef,
+        /// What the worker said, when it said anything.
+        #[serde(default)]
+        reason: Option<String>,
+    },
+
+    /// A finished build reached the repository.
+    #[serde(rename = "build.published")]
+    BuildPublished { build: BuildRef },
+
+    /// A worker reported a build finished, and the report was refused -- which
+    /// is how a build that worked becomes one that failed.
+    #[serde(rename = "build.completion_rejected")]
+    BuildCompletionRejected {
+        build: BuildRef,
+        worker: WorkerRef,
+        reason: String,
+    },
+
+    /// Something a worker reported about a build could not be written down,
+    /// so the build page shows less than happened.
+    ///
+    /// One kind for every such fact; `what` says which, since nobody filters
+    /// peak memory apart from failure reasons.
+    #[serde(rename = "build.record_failed")]
+    BuildRecordFailed {
+        build: BuildRef,
+        what: String,
+        error: String,
+    },
+
+    /// Somebody stopped a build.
+    #[serde(rename = "build.cancelled")]
+    BuildCancelled { build: BuildRef },
+
+    /// Somebody queued a failed build again.
+    #[serde(rename = "build.retried")]
+    BuildRetried { build: BuildRef },
+
+    /// Somebody deleted a build and its log.
+    #[serde(rename = "build.deleted")]
+    BuildDeleted { build: BuildRef },
+
+    /// A package could not be queued at startup, and will not build until it
+    /// is fixed.
+    #[serde(rename = "build.enqueue_skipped")]
+    EnqueueSkipped { pkg: PackageRef, error: String },
+
+    /// Nothing waiting was queued at startup, so builds that should have
+    /// resumed did not.
+    #[serde(rename = "build.startup_enqueue_failed")]
+    StartupEnqueueFailed { error: String },
+
+    // -----------------------------------------------------------------------
+    // Packages and their sources
+    // -----------------------------------------------------------------------
+    /// Somebody changed how a package is built: its platforms or build flags.
+    #[serde(rename = "package.changed")]
+    PackageChanged {
+        pkg: PackageRef,
+        fields: Vec<String>,
+    },
+
+    /// Somebody edited one of a package's source files, which is stored as a
+    /// patch against upstream.
+    #[serde(rename = "source.edited")]
+    SourceEdited { pkg: PackageRef, path: String },
+
+    /// A package's source metadata -- description, maintainer, history --
+    /// could not be refreshed, so its page shows what it last knew.
+    #[serde(rename = "source.metadata_failed")]
+    SourceMetadataFailed { pkg: PackageRef, error: String },
+
+    /// A deleted package's source checkout could not be removed, and is taking
+    /// up space until a later sweep.
+    #[serde(rename = "source.checkout_remove_failed")]
+    CheckoutRemoveFailed { pkg: PackageRef, error: String },
+
+    /// A dependency nothing provides -- not the official repositories, not a
+    /// tracked package, not the AUR -- so the package builds without it and
+    /// will likely fail.
+    #[serde(rename = "deps.unresolved")]
+    DepsUnresolved { pkg: PackageRef, dependency: String },
+
+    /// Somebody pointed a dependency of one package at another package.
+    #[serde(rename = "deps.replaced")]
+    DepsReplaced {
+        dependent: PackageRef,
+        old: PackageRef,
+        new: PackageRef,
+    },
+
+    /// Somebody dropped a dependency the official repositories provide, so it
+    /// is installed from there rather than built here.
+    #[serde(rename = "deps.dropped")]
+    DepsDropped {
+        dependent: PackageRef,
+        dependency: PackageRef,
+    },
+
+    /// An auto-update of one package failed; the rest went ahead.
+    #[serde(rename = "update.skipped")]
+    UpdateSkipped { pkg: PackageRef, error: String },
+
+    /// A bulk add could not resolve its names in one request, and fell back
+    /// to one request per package -- slower, and nothing more.
+    #[serde(rename = "bulk_add.resolve_failed")]
+    BulkAddResolveFailed { error: String },
+
+    /// A bulk add or a restore stopped before its end.
+    #[serde(rename = "operation.aborted")]
+    OperationAborted {
+        /// `bulk_add` or `restore`.
+        operation: String,
+        error: String,
+    },
+
+    // -----------------------------------------------------------------------
+    // Settings, access and backups
+    // -----------------------------------------------------------------------
+    /// Somebody changed a setting -- server-wide, or for one package. The
+    /// value is left out: config files are long, and some settings are
+    /// nobody's business but the instance's.
+    #[serde(rename = "setting.changed")]
+    SettingChanged {
+        key: String,
+        #[serde(default)]
+        pkg: Option<PackageRef>,
+    },
+
+    /// Somebody put a setting back to what it inherits.
+    #[serde(rename = "setting.reset")]
+    SettingReset {
+        key: String,
+        #[serde(default)]
+        pkg: Option<PackageRef>,
+    },
+
+    /// A cron schedule could not be used, so that job is not running on it.
+    #[serde(rename = "schedule.invalid")]
+    ScheduleInvalid {
+        /// Which job: `auto_update` or `mirror_ranking`.
+        job: String,
+        error: String,
+    },
+
+    /// Somebody signed in with an account that is not allowed.
+    #[serde(rename = "auth.sign_in_refused")]
+    SignInRefused { user: String },
+
+    /// Somebody replaced the API token, and every client using the old one
+    /// now needs the new one.
+    #[serde(rename = "auth.token_regenerated")]
+    TokenRegenerated {},
+
+    /// Somebody exported a dump -- with the secrets in it, when `secrets`.
+    #[serde(rename = "dump.exported")]
+    DumpExported { secrets: bool },
+
+    /// Somebody restored a dump.
+    #[serde(rename = "restore.applied")]
+    RestoreApplied { packages: usize },
+
+    /// A restored package came in, but one of the steps after it did not.
+    #[serde(rename = "restore.package_failed")]
+    RestorePackageFailed {
+        pkg: PackageRef,
+        step: RestoreStep,
+        error: String,
+    },
+
+    /// A restore replaced the worker CA: every certificate the current workers
+    /// hold is now worthless, and each has to enroll again.
+    #[serde(rename = "restore.ca_replaced")]
+    RestoreCaReplaced {},
+
+    // -----------------------------------------------------------------------
+    // Mirrors and the repository
+    // -----------------------------------------------------------------------
+    /// The mirrors could not be ranked, so builds keep using the old order.
+    #[serde(rename = "mirrors.rank_failed")]
+    MirrorRankFailed { error: String },
+
+    /// The official repositories' databases could not be refreshed, so
+    /// dependency resolution works from an older copy.
+    #[serde(rename = "official_repos.refresh_failed")]
+    OfficialReposRefreshFailed { error: String },
+
+    /// A change to the repository did not commit, and is being tried again.
+    #[serde(rename = "repo.commit_retry")]
+    RepoCommitRetried { attempt: u32, error: String },
+
+    /// A file in the repository could not be moved or removed.
+    ///
+    /// A move that failed is a package the repository says it has and does
+    /// not serve.
+    #[serde(rename = "repo.file_failed")]
+    RepoFileFailed {
+        path: String,
+        action: FileAction,
+        error: String,
+    },
+
+    /// Retired package files were removed from the repository, once no client
+    /// could still be asking for them.
+    #[serde(rename = "repo.swept")]
+    RepoSwept { files: Vec<String> },
+
+    /// The sweep of retired package files did not run, so they stay on disk.
+    #[serde(rename = "repo.sweep_failed")]
+    RepoSweepFailed { error: String },
+}
+
+/// Which report a worker sent about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReport {
+    /// The settings it accepts.
+    Declaration,
+    /// What each of them resolved to on that machine.
+    Configuration,
+}
+
+impl WorkerReport {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declaration => "setting declaration",
+            Self::Configuration => "configuration report",
+        }
+    }
+}
+
+/// The step of a restore that did not complete for one package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreStep {
+    /// Reading its source, so nothing finds it by its split names or provides.
+    Source,
+    /// Resolving its dependencies, so it will not build until they are.
+    Dependencies,
+}
+
+impl RestoreStep {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "its source could not be read",
+            Self::Dependencies => "its dependencies could not be resolved",
+        }
+    }
+}
+
+/// What was being done to a repository file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAction {
+    Move,
+    Remove,
+}
+
+impl FileAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Remove => "remove",
+        }
+    }
 }
 
 /// A piece of an event's sentence: prose, or something it names.
@@ -314,6 +632,45 @@ impl Event {
             Self::WorkerRevoked { .. } => "worker.revoked",
             Self::WorkerReaped { .. } => "worker.reaped",
             Self::WorkerSettingRejected { .. } => "worker.setting_rejected",
+            Self::WorkerReportFailed { .. } => "worker.report_failed",
+            Self::BuildStarted { .. } => "build.started",
+            Self::BuildSucceeded { .. } => "build.succeeded",
+            Self::WorkerRegistered { .. } => "worker.registered",
+            Self::WorkerConfigChanged { .. } => "worker.config_changed",
+            Self::BuildFailed { .. } => "build.failed",
+            Self::BuildPublished { .. } => "build.published",
+            Self::BuildCompletionRejected { .. } => "build.completion_rejected",
+            Self::BuildRecordFailed { .. } => "build.record_failed",
+            Self::BuildCancelled { .. } => "build.cancelled",
+            Self::BuildRetried { .. } => "build.retried",
+            Self::BuildDeleted { .. } => "build.deleted",
+            Self::EnqueueSkipped { .. } => "build.enqueue_skipped",
+            Self::StartupEnqueueFailed { .. } => "build.startup_enqueue_failed",
+            Self::PackageChanged { .. } => "package.changed",
+            Self::SourceEdited { .. } => "source.edited",
+            Self::SourceMetadataFailed { .. } => "source.metadata_failed",
+            Self::CheckoutRemoveFailed { .. } => "source.checkout_remove_failed",
+            Self::DepsUnresolved { .. } => "deps.unresolved",
+            Self::DepsReplaced { .. } => "deps.replaced",
+            Self::DepsDropped { .. } => "deps.dropped",
+            Self::UpdateSkipped { .. } => "update.skipped",
+            Self::BulkAddResolveFailed { .. } => "bulk_add.resolve_failed",
+            Self::OperationAborted { .. } => "operation.aborted",
+            Self::SettingChanged { .. } => "setting.changed",
+            Self::SettingReset { .. } => "setting.reset",
+            Self::ScheduleInvalid { .. } => "schedule.invalid",
+            Self::SignInRefused { .. } => "auth.sign_in_refused",
+            Self::TokenRegenerated {} => "auth.token_regenerated",
+            Self::DumpExported { .. } => "dump.exported",
+            Self::RestoreApplied { .. } => "restore.applied",
+            Self::RestorePackageFailed { .. } => "restore.package_failed",
+            Self::RestoreCaReplaced {} => "restore.ca_replaced",
+            Self::MirrorRankFailed { .. } => "mirrors.rank_failed",
+            Self::OfficialReposRefreshFailed { .. } => "official_repos.refresh_failed",
+            Self::RepoCommitRetried { .. } => "repo.commit_retry",
+            Self::RepoFileFailed { .. } => "repo.file_failed",
+            Self::RepoSwept { .. } => "repo.swept",
+            Self::RepoSweepFailed { .. } => "repo.sweep_failed",
         }
     }
 
@@ -331,7 +688,25 @@ impl Event {
             | Self::ServerStarted { .. }
             | Self::WorkerEnrolled { .. }
             | Self::WorkerApproved { .. }
-            | Self::WorkerRevoked { .. } => Severity::Info,
+            | Self::WorkerRevoked { .. }
+            | Self::BuildStarted { .. }
+            | Self::BuildSucceeded { .. }
+            | Self::WorkerRegistered { .. }
+            | Self::WorkerConfigChanged { .. }
+            | Self::BuildPublished { .. }
+            | Self::BuildCancelled { .. }
+            | Self::BuildRetried { .. }
+            | Self::BuildDeleted { .. }
+            | Self::PackageChanged { .. }
+            | Self::SourceEdited { .. }
+            | Self::DepsReplaced { .. }
+            | Self::DepsDropped { .. }
+            | Self::SettingChanged { .. }
+            | Self::SettingReset { .. }
+            | Self::TokenRegenerated {}
+            | Self::DumpExported { .. }
+            | Self::RestoreApplied { .. }
+            | Self::RepoSwept { .. } => Severity::Info,
             Self::SourceRefreshFailed { .. }
             | Self::SourceinfoFailed { .. }
             | Self::VcsSyncFailed { .. }
@@ -341,11 +716,32 @@ impl Event {
             | Self::BuildLogAppendFailed { .. }
             | Self::VersionCheckFailed { .. }
             | Self::WorkerReaped { .. }
-            | Self::WorkerSettingRejected { .. } => Severity::Warning,
+            | Self::WorkerSettingRejected { .. }
+            | Self::WorkerReportFailed { .. }
+            | Self::BuildFailed { .. }
+            | Self::BuildCompletionRejected { .. }
+            | Self::BuildRecordFailed { .. }
+            | Self::EnqueueSkipped { .. }
+            | Self::SourceMetadataFailed { .. }
+            | Self::CheckoutRemoveFailed { .. }
+            | Self::DepsUnresolved { .. }
+            | Self::UpdateSkipped { .. }
+            | Self::BulkAddResolveFailed { .. }
+            | Self::ScheduleInvalid { .. }
+            | Self::SignInRefused { .. }
+            | Self::RestorePackageFailed { .. }
+            | Self::RestoreCaReplaced {}
+            | Self::MirrorRankFailed { .. }
+            | Self::OfficialReposRefreshFailed { .. }
+            | Self::RepoCommitRetried { .. }
+            | Self::RepoSweepFailed { .. } => Severity::Warning,
             Self::UpdateQueueFailed { .. }
             | Self::DependentsTriggerFailed { .. }
             | Self::BuildMarkFailed { .. }
-            | Self::PublishFailed { .. } => Severity::Error,
+            | Self::PublishFailed { .. }
+            | Self::StartupEnqueueFailed { .. }
+            | Self::OperationAborted { .. }
+            | Self::RepoFileFailed { .. } => Severity::Error,
         }
     }
 
@@ -433,9 +829,26 @@ impl Event {
                 vec![text("worker "), entity(worker), text(" enrolled")]
             }
             Self::WorkerApproved { worker } => vec![text("approved worker "), entity(worker)],
-            Self::WorkerRevoked { worker } => vec![text("revoked worker "), entity(worker)],
-            Self::WorkerReaped { retried, failed } => {
-                let mut out = vec![text("a worker stopped answering: ")];
+            Self::WorkerRevoked { worker, requeued } => {
+                let mut out = vec![text("revoked worker "), entity(worker)];
+                if !requeued.is_empty() {
+                    out.push(text(" and requeued "));
+                    out.extend(list(requeued));
+                }
+                out
+            }
+            Self::WorkerReaped {
+                workers,
+                retried,
+                failed,
+            } => {
+                let mut out = if workers.is_empty() {
+                    vec![text("a worker stopped answering: ")]
+                } else {
+                    let mut out = list(workers);
+                    out.push(text(" stopped answering: "));
+                    out
+                };
                 if !retried.is_empty() {
                     out.push(text("requeued "));
                     out.extend(list(retried));
@@ -462,6 +875,199 @@ impl Event {
                     settings.join(", ")
                 )),
             ],
+            Self::WorkerReportFailed {
+                worker,
+                report,
+                error,
+            } => vec![
+                text(format!(
+                    "could not store the {} of worker ",
+                    report.as_str()
+                )),
+                entity(worker),
+                text(format!(": {error}")),
+            ],
+            Self::BuildStarted { build, worker } => {
+                vec![entity(worker), text(" started "), entity(build)]
+            }
+            Self::BuildFailed {
+                build,
+                worker,
+                reason,
+            } => {
+                let mut out = vec![entity(build), text(" failed on "), entity(worker)];
+                if let Some(reason) = reason {
+                    out.push(text(format!(": {reason}")));
+                }
+                out
+            }
+            Self::BuildPublished { build } => vec![text("published "), entity(build)],
+            Self::BuildSucceeded { build, worker } => {
+                vec![entity(build), text(" finished on "), entity(worker)]
+            }
+            Self::WorkerRegistered { worker, version } => {
+                let mut out = vec![text("worker "), entity(worker), text(" checked in")];
+                if let Some(version) = version {
+                    out.push(text(format!(", running {version}")));
+                }
+                out
+            }
+            Self::WorkerConfigChanged { worker, settings } => vec![
+                text("the configuration of worker "),
+                entity(worker),
+                text(format!(" changed: {}", settings.join(", "))),
+            ],
+            Self::BuildCompletionRejected {
+                build,
+                worker,
+                reason,
+            } => vec![
+                text("refused "),
+                entity(worker),
+                text("'s report that "),
+                entity(build),
+                text(format!(" finished: {reason}")),
+            ],
+            Self::BuildRecordFailed { build, what, error } => vec![
+                text(format!("could not record the {what} of ")),
+                entity(build),
+                text(format!(": {error}")),
+            ],
+            Self::BuildCancelled { build } => vec![text("stopped "), entity(build)],
+            Self::BuildRetried { build } => vec![text("retried "), entity(build)],
+            Self::BuildDeleted { build } => vec![text("deleted "), entity(build)],
+            Self::EnqueueSkipped { pkg, error } => vec![
+                text("could not queue "),
+                entity(pkg),
+                text(format!(" at startup: {error}")),
+            ],
+            Self::StartupEnqueueFailed { error } => vec![text(format!(
+                "could not queue the waiting builds at startup: {error}"
+            ))],
+            Self::PackageChanged { pkg, fields } => vec![
+                text(format!("changed the {} of ", fields.join(" and "))),
+                entity(pkg),
+            ],
+            Self::SourceEdited { pkg, path } => {
+                vec![text(format!("edited {path} of ")), entity(pkg)]
+            }
+            Self::SourceMetadataFailed { pkg, error } => vec![
+                text("could not refresh the source metadata of "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
+            Self::CheckoutRemoveFailed { pkg, error } => vec![
+                text("could not remove the source checkout of "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
+            Self::DepsUnresolved { pkg, dependency } => vec![
+                text(format!("nothing provides {dependency}, which ")),
+                entity(pkg),
+                text(" depends on"),
+            ],
+            Self::DepsReplaced {
+                dependent,
+                old,
+                new,
+            } => vec![
+                text("replaced "),
+                entity(old),
+                text(" with "),
+                entity(new),
+                text(" as a dependency of "),
+                entity(dependent),
+            ],
+            Self::DepsDropped {
+                dependent,
+                dependency,
+            } => vec![
+                text("dropped "),
+                entity(dependency),
+                text(" as a dependency of "),
+                entity(dependent),
+                text(": the official repositories provide it"),
+            ],
+            Self::UpdateSkipped { pkg, error } => vec![
+                text("the auto-update skipped "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
+            Self::BulkAddResolveFailed { error } => vec![text(format!(
+                "a bulk add could not resolve its names in one request, and asked one by one: \
+                 {error}"
+            ))],
+            Self::OperationAborted { operation, error } => vec![text(format!(
+                "the {} stopped before its end: {error}",
+                operation.replace('_', " ")
+            ))],
+            Self::SettingChanged { key, pkg } => {
+                let mut out = vec![text(format!("changed the setting {key}"))];
+                if let Some(pkg) = pkg {
+                    out.push(text(" of "));
+                    out.push(entity(pkg));
+                }
+                out
+            }
+            Self::SettingReset { key, pkg } => {
+                let mut out = vec![text(format!("reset the setting {key}"))];
+                if let Some(pkg) = pkg {
+                    out.push(text(" of "));
+                    out.push(entity(pkg));
+                }
+                out
+            }
+            Self::ScheduleInvalid { job, error } => vec![text(format!(
+                "the {} schedule cannot be used: {error}",
+                job.replace('_', " ")
+            ))],
+            Self::SignInRefused { user } => {
+                vec![text(format!(
+                    "refused a sign-in by {user}: not an allowed user"
+                ))]
+            }
+            Self::TokenRegenerated {} => vec![text("replaced the API token")],
+            Self::DumpExported { secrets } => vec![text(if *secrets {
+                "exported a dump, with the CA key and credentials in it"
+            } else {
+                "exported a dump"
+            })],
+            Self::RestoreApplied { packages } => {
+                vec![text(format!("restored a dump of {packages} package(s)"))]
+            }
+            Self::RestorePackageFailed { pkg, step, error } => vec![
+                text("restored "),
+                entity(pkg),
+                text(format!(", but {}: {error}", step.as_str())),
+            ],
+            Self::RestoreCaReplaced {} => vec![text(
+                "a restore replaced the worker CA; every worker has to enroll again",
+            )],
+            Self::MirrorRankFailed { error } => {
+                vec![text(format!("could not rank the mirrors: {error}"))]
+            }
+            Self::OfficialReposRefreshFailed { error } => vec![text(format!(
+                "could not refresh the official repository databases: {error}"
+            ))],
+            Self::RepoCommitRetried { attempt, error } => vec![text(format!(
+                "a repository update did not commit (attempt {attempt}), retrying: {error}"
+            ))],
+            Self::RepoFileFailed {
+                path,
+                action,
+                error,
+            } => vec![text(format!(
+                "could not {} {path} in the repository: {error}",
+                action.as_str()
+            ))],
+            Self::RepoSwept { files } => vec![text(format!(
+                "removed {} retired file(s) from the repository: {}",
+                files.len(),
+                files.join(", ")
+            ))],
+            Self::RepoSweepFailed { error } => vec![text(format!(
+                "the sweep of retired repository files failed: {error}"
+            ))],
         }
     }
 
@@ -561,8 +1167,12 @@ mod tests {
             Event::VersionCheckFailed { error: error() },
             Event::WorkerEnrolled { worker: worker() },
             Event::WorkerApproved { worker: worker() },
-            Event::WorkerRevoked { worker: worker() },
+            Event::WorkerRevoked {
+                worker: worker(),
+                requeued: vec![build()],
+            },
             Event::WorkerReaped {
+                workers: vec![worker()],
                 retried: vec![build()],
                 failed: vec![build(), build()],
             },
@@ -570,6 +1180,128 @@ mod tests {
                 worker: worker(),
                 settings: vec!["builddir_max_bytes".to_string()],
             },
+            Event::WorkerReportFailed {
+                worker: worker(),
+                report: WorkerReport::Configuration,
+                error: error(),
+            },
+            Event::BuildStarted {
+                build: build(),
+                worker: worker(),
+            },
+            Event::BuildFailed {
+                build: build(),
+                worker: worker(),
+                reason: Some(error()),
+            },
+            Event::BuildPublished { build: build() },
+            Event::BuildSucceeded {
+                build: build(),
+                worker: worker(),
+            },
+            Event::WorkerRegistered {
+                worker: worker(),
+                version: Some("1.2.3".to_string()),
+            },
+            Event::WorkerConfigChanged {
+                worker: worker(),
+                settings: vec!["concurrency".to_string()],
+            },
+            Event::BuildCompletionRejected {
+                build: build(),
+                worker: worker(),
+                reason: error(),
+            },
+            Event::BuildRecordFailed {
+                build: build(),
+                what: "peak memory".to_string(),
+                error: error(),
+            },
+            Event::BuildCancelled { build: build() },
+            Event::BuildRetried { build: build() },
+            Event::BuildDeleted { build: build() },
+            Event::EnqueueSkipped {
+                pkg: pkg(),
+                error: error(),
+            },
+            Event::StartupEnqueueFailed { error: error() },
+            Event::PackageChanged {
+                pkg: pkg(),
+                fields: vec!["platforms".to_string()],
+            },
+            Event::SourceEdited {
+                pkg: pkg(),
+                path: "PKGBUILD".to_string(),
+            },
+            Event::SourceMetadataFailed {
+                pkg: pkg(),
+                error: error(),
+            },
+            Event::CheckoutRemoveFailed {
+                pkg: pkg(),
+                error: error(),
+            },
+            Event::DepsUnresolved {
+                pkg: pkg(),
+                dependency: "libfoo".to_string(),
+            },
+            Event::DepsReplaced {
+                dependent: pkg(),
+                old: PackageRef::from("foo"),
+                new: PackageRef::from("bar"),
+            },
+            Event::DepsDropped {
+                dependent: pkg(),
+                dependency: PackageRef::from("foo"),
+            },
+            Event::UpdateSkipped {
+                pkg: pkg(),
+                error: error(),
+            },
+            Event::BulkAddResolveFailed { error: error() },
+            Event::OperationAborted {
+                operation: "bulk_add".to_string(),
+                error: error(),
+            },
+            Event::SettingChanged {
+                key: "makepkg_conf".to_string(),
+                pkg: Some(pkg()),
+            },
+            Event::SettingReset {
+                key: "makepkg_conf".to_string(),
+                pkg: None,
+            },
+            Event::ScheduleInvalid {
+                job: "auto_update".to_string(),
+                error: error(),
+            },
+            Event::SignInRefused {
+                user: "mallory@example.com".to_string(),
+            },
+            Event::TokenRegenerated {},
+            Event::DumpExported { secrets: true },
+            Event::RestoreApplied { packages: 3 },
+            Event::RestorePackageFailed {
+                pkg: pkg(),
+                step: RestoreStep::Dependencies,
+                error: error(),
+            },
+            Event::RestoreCaReplaced {},
+            Event::MirrorRankFailed { error: error() },
+            Event::OfficialReposRefreshFailed { error: error() },
+            Event::RepoCommitRetried {
+                attempt: 2,
+                error: error(),
+            },
+            Event::RepoFileFailed {
+                path: "x86_64/hello.pkg.tar.zst".to_string(),
+                action: FileAction::Move,
+                error: error(),
+            },
+            Event::RepoSwept {
+                files: vec!["hello-1-1.pkg.tar.zst".to_string()],
+            },
+            Event::RepoSweepFailed { error: error() },
         ]
     }
 
@@ -694,6 +1426,7 @@ mod tests {
             number,
         };
         let message = Event::WorkerReaped {
+            workers: Vec::new(),
             retried: vec![build(7)],
             failed: vec![build(8), build(9), build(10)],
         }

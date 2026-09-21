@@ -93,12 +93,12 @@ async fn main() {
     // rather than reporting an empty repository -- so the API and the UI come
     // up either way and can report why an add failed.
     let client = Arc::new(AurClient::new());
-    let official_repo_handle = start_official_repo_refresh(Arc::clone(&client));
+    let official_repo_handle = start_official_repo_refresh(Arc::clone(&client), activity.clone());
 
     // The pacman repository. One instance, because its lock is what keeps two
     // changes to it from interleaving: the worker protocol publishing builds,
     // package removals and restores all go through this one.
-    let repo = Arc::new(Repository::new(REPO_ROOT));
+    let repo = Arc::new(Repository::new(REPO_ROOT).with_log(activity.clone()));
 
     // The things a package operation acts through, from here on passed as one.
     // Cloning is a few refcount bumps, so a job or a request handler takes its
@@ -119,14 +119,14 @@ async fn main() {
     // clone in flight from a stranded one.
     startup::prune_source_checkouts(&db, &store).await;
 
-    let build_queue_handle = init_build_queue(db.clone(), tx.clone());
+    let build_queue_handle = init_build_queue(db.clone(), tx.clone(), activity.clone());
     let version_check_handle = start_update_version_checking(services.clone());
     let auto_update_handle = start_auto_update_job(services.clone());
 
     let mirrorlist_override =
         env::var("MIRRORLIST_SERVERS_X86_64").is_ok_and(|s| !s.trim().is_empty());
 
-    if !mirrorlist_override && let Err(e) = start_mirror_rank_job() {
+    if !mirrorlist_override && let Err(e) = start_mirror_rank_job(activity.clone()) {
         warn!("mirror_rank job not properly configured: {e}");
     }
 

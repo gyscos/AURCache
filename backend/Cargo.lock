@@ -690,6 +690,7 @@ name = "aurcache-builder"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "aurcache-activitylog",
  "aurcache-common",
  "aurcache-db",
  "aurcache-utils",

@@ -18,7 +18,7 @@ use aurcache_common::api::package::{BulkAddEntry, BulkAddOutcome};
 use aurcache_db::packages::SourceData;
 use pacman_mirrors::platforms::Platform;
 use tokio::sync::mpsc::Sender;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::package::add::{AddContext, add_resolved_source, build_add_context};
 use crate::services::Services;
@@ -44,6 +44,7 @@ fn source_label(source: &SourceData) -> String {
 /// than by a resolution step guessing.
 pub(crate) async fn resolve_pkgbases(
     client: &aurcache_deps::AurClient,
+    activity: &aurcache_activitylog::activity_utils::ActivityLog,
     sources: &[SourceData],
 ) -> HashMap<String, String> {
     let names: Vec<&str> = sources
@@ -63,7 +64,9 @@ pub(crate) async fn resolve_pkgbases(
             // Not fatal: every source falls back to being treated as its own
             // pkgbase, which is what an unresolvable name does anyway. The run
             // continues and reports per-package failures if that was wrong.
-            warn!("bulk add could not batch-resolve pkgbases, continuing per package: {e}");
+            activity.emit(aurcache_activitylog::events::Event::BulkAddResolveFailed {
+                error: e.to_string(),
+            });
             HashMap::new()
         }
     }
@@ -87,7 +90,7 @@ pub async fn bulk_add(
     progress: Sender<BulkAddEntry>,
 ) {
     let context = build_add_context(platforms, build_flags);
-    let bases = resolve_pkgbases(&services.client, &sources).await;
+    let bases = resolve_pkgbases(&services.client, &services.activity, &sources).await;
 
     info!(
         "bulk add: {} sources, {} pkgbases resolved in batch",
@@ -184,7 +187,12 @@ mod tests {
 
         let client = AurClient::with_urls(format!("{}/rpc/v5", server.uri()));
         let sources = vec![aur("czkawka-cli"), aur("hello"), aur("yay")];
-        let bases = resolve_pkgbases(&client, &sources).await;
+        let bases = resolve_pkgbases(
+            &client,
+            &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
+            &sources,
+        )
+        .await;
 
         assert_eq!(
             server.received_requests().await.unwrap().len(),
@@ -211,7 +219,15 @@ mod tests {
             },
         }];
 
-        assert!(resolve_pkgbases(&client, &sources).await.is_empty());
+        assert!(
+            resolve_pkgbases(
+                &client,
+                &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
+                &sources,
+            )
+            .await
+            .is_empty()
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

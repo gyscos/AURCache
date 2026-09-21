@@ -3,6 +3,8 @@
 //! who publishes what, and the staging area uploads wait in. Every change to it
 //! goes through [`Repository::begin`].
 
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::{Event, FileAction};
 use aurcache_db::files;
 use aurcache_db::prelude::Files;
 use pacman_mirrors::platforms::Platform;
@@ -48,6 +50,10 @@ pub struct Repository {
     /// found it unlisted. Kept in memory only -- after a restart a retired
     /// file's grace period starts again, which can only keep it longer.
     retired: std::sync::Mutex<HashMap<PathBuf, Instant>>,
+    /// Where a file that would not move, a commit that had to be retried, and
+    /// what the sweep removed are recorded. Discarding until the server hands
+    /// it a real one ([`Self::with_log`]).
+    log: ActivityLog,
 }
 
 /// A package file the repository publishes, as its `files` row records it.
@@ -305,7 +311,10 @@ impl Update<'_> {
             match commit().await {
                 Ok(done) => break done,
                 Err(e) if attempt < COMMIT_ATTEMPTS => {
-                    warn!("repository update did not commit (attempt {attempt}): {e:#}");
+                    self.repo.log.emit(Event::RepoCommitRetried {
+                        attempt,
+                        error: format!("{e:#}"),
+                    });
                     tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
                     attempt += 1;
                 }
@@ -319,7 +328,8 @@ impl Update<'_> {
         };
 
         let root = root.to_path_buf();
-        match tokio::task::spawn_blocking(move || publish(&root, &changes, &prepared)).await {
+        let log = self.repo.log.clone();
+        match tokio::task::spawn_blocking(move || publish(&root, &changes, &prepared, &log)).await {
             Ok(retired) => self.repo.note_retired(retired, Instant::now()),
             Err(e) => error!("publishing a committed repository update panicked: {e}"),
         }
@@ -350,7 +360,21 @@ impl Repository {
             lock: tokio::sync::Mutex::new(()),
             updates: AtomicU64::new(0),
             retired: std::sync::Mutex::new(HashMap::new()),
+            log: ActivityLog::discarding(),
         }
+    }
+
+    /// Record what the repository does, and what goes wrong with it, to `log`.
+    #[must_use]
+    pub fn with_log(mut self, log: ActivityLog) -> Self {
+        self.log = log;
+        self
+    }
+
+    /// Where the repository records what it does.
+    #[must_use]
+    pub fn log(&self) -> &ActivityLog {
+        &self.log
     }
 
     #[must_use]
@@ -414,10 +438,17 @@ impl Repository {
         let _lock = self.lock.lock().await;
         let root = self.root.clone();
         let known = std::mem::take(&mut *self.retired_times());
+        let log = self.log.clone();
         let (still_retired, deleted) =
-            tokio::task::spawn_blocking(move || sweep_retired(&root, known, now, grace)).await?;
+            tokio::task::spawn_blocking(move || sweep_retired(&root, known, now, grace, &log))
+                .await?;
         *self.retired_times() = still_retired;
-        Ok(deleted)
+        if !deleted.is_empty() {
+            self.log.emit(Event::RepoSwept {
+                files: deleted.clone(),
+            });
+        }
+        Ok(deleted.len())
     }
 
     fn note_retired(&self, paths: Vec<PathBuf>, when: Instant) {
@@ -495,21 +526,26 @@ fn prepare(root: &Path, changes: &Changes) -> anyhow::Result<Vec<Prepared>> {
 ///
 /// Package files first, so everything the new databases list exists before
 /// they do; the databases next. Retired files are left where they are.
-fn publish(root: &Path, changes: &Changes, prepared: &[Prepared]) -> Vec<PathBuf> {
+fn publish(
+    root: &Path,
+    changes: &Changes,
+    prepared: &[Prepared],
+    log: &ActivityLog,
+) -> Vec<PathBuf> {
     let mut added: HashSet<(Platform, &str)> = HashSet::new();
     for addition in &changes.add {
         let dir = Repository::platform_dir(root, addition.platform);
         let filename = addition.entry.filename.as_str();
         added.insert((addition.platform, filename));
-        rename_logged(&addition.staged, &dir.join(filename));
+        rename_logged(log, &addition.staged, &dir.join(filename));
         let staged_sig = with_suffix(&addition.staged, ".sig");
         if staged_sig.exists() {
-            rename_logged(&staged_sig, &dir.join(format!("{filename}.sig")));
+            rename_logged(log, &staged_sig, &dir.join(format!("{filename}.sig")));
         }
     }
     for p in prepared {
-        rename_logged(&p.db_next, &p.db);
-        rename_logged(&p.files_next, &p.files);
+        rename_logged(log, &p.db_next, &p.db);
+        rename_logged(log, &p.files_next, &p.files);
     }
     let mut retired = Vec::new();
     for (platform, filename) in &changes.retire {
@@ -539,9 +575,10 @@ fn sweep_retired(
     mut known: HashMap<PathBuf, Instant>,
     now: Instant,
     grace: Duration,
-) -> (HashMap<PathBuf, Instant>, usize) {
+    log: &ActivityLog,
+) -> (HashMap<PathBuf, Instant>, Vec<String>) {
     let mut still_retired = HashMap::new();
-    let mut deleted = 0;
+    let mut deleted = Vec::new();
     let Ok(platforms) = std::fs::read_dir(root) else {
         return (still_retired, deleted);
     };
@@ -576,8 +613,9 @@ fn sweep_retired(
             let path = entry.path();
             let since = known.remove(&path).unwrap_or(now);
             if now.saturating_duration_since(since) >= grace {
-                remove_logged(&path);
-                deleted += 1;
+                if remove_logged(log, &path) {
+                    deleted.push(name.clone());
+                }
             } else {
                 still_retired.insert(path, since);
             }
@@ -592,17 +630,30 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn rename_logged(from: &Path, to: &Path) {
+fn rename_logged(log: &ActivityLog, from: &Path, to: &Path) {
     if let Err(e) = std::fs::rename(from, to) {
-        error!("could not move {} to {}: {e}", from.display(), to.display());
+        log.emit(Event::RepoFileFailed {
+            path: to.display().to_string(),
+            action: FileAction::Move,
+            error: format!("from {}: {e}", from.display()),
+        });
     }
 }
 
-fn remove_logged(path: &Path) {
+/// Remove a retired file, returning whether it went -- one already gone did
+/// not, and is nothing to report either.
+fn remove_logged(log: &ActivityLog, path: &Path) -> bool {
     match std::fs::remove_file(path) {
-        Ok(()) => tracing::info!("deleted retired {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("could not remove {}: {e}", path.display()),
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            log.emit(Event::RepoFileFailed {
+                path: path.display().to_string(),
+                action: FileAction::Remove,
+                error: e.to_string(),
+            });
+            false
+        }
     }
 }
 

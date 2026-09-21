@@ -840,6 +840,8 @@ pub struct Abandoned {
     pub pkgbase: Option<String>,
     /// The `EndReasons::*` code recorded on the row.
     pub end_reason: i32,
+    /// The worker that held it, if any did.
+    pub worker_id: Option<i32>,
 }
 
 /// Reaper pass: reclaim `ACTIVE` builds whose owning worker went silent, and
@@ -905,6 +907,7 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
             number: build.number,
             pkgbase: abandoned.pkgbase,
             end_reason,
+            worker_id: build.worker_id,
         });
     }
     Ok(outcome)

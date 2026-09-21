@@ -6,6 +6,8 @@ use crate::services::Services;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::helpers::dependency_resolution::{PackageCandidate, TrackedPackages};
 use aurcache_db::packages;
@@ -64,6 +66,9 @@ struct PlanContext<'a> {
     /// The tracked packages, read once for the whole plan.
     tracked: &'a TrackedPackages,
     context: &'a AddContext,
+    /// Where a dependency nothing provides is recorded; `None` for a caller
+    /// with no log to hand, which leaves it to the journal.
+    activity: Option<&'a ActivityLog>,
 }
 
 /// A dependency edge, held by *name* because planned packages have no id until
@@ -243,7 +248,13 @@ async fn finalize_package_add(
         set_directly_requested(db, &package_spec.pkgbase).await?;
         // It may have been a dependency row that no version check has reached
         // yet, so it can still be missing its metadata.
-        refresh_source_metadata(store, db, std::slice::from_ref(&package_spec.pkgbase)).await;
+        refresh_source_metadata(
+            store,
+            db,
+            &services.activity,
+            std::slice::from_ref(&package_spec.pkgbase),
+        )
+        .await;
         return Ok((package_spec.pkgbase, true));
     }
 
@@ -262,6 +273,7 @@ async fn finalize_package_add(
             db,
             tracked: &tracked,
             context,
+            activity: Some(&services.activity),
         },
         package_spec,
         &mut visited,
@@ -287,7 +299,7 @@ async fn finalize_package_add(
     // no live fallback, so a package added between checks would otherwise show
     // no description or maintainer for up to an hour. Read from the checkouts
     // the plan just resolved, so nothing is fetched again.
-    refresh_source_metadata(store, db, &added_order).await;
+    refresh_source_metadata(store, db, &services.activity, &added_order).await;
     let pkgbase = added_order
         .last()
         .cloned()
@@ -443,6 +455,7 @@ pub async fn ensure_aur_package_exists_recursive(
             db,
             tracked: &tracked,
             context: &context,
+            activity: None,
         },
         pkgbase,
         &mut visited,
@@ -477,7 +490,7 @@ pub async fn add_dependency_package(
         build_flags_str,
     )
     .await?;
-    refresh_source_metadata(&services.store, &services.db, &added).await;
+    refresh_source_metadata(&services.store, &services.db, &services.activity, &added).await;
     trigger_initial_builds(&services.db, &services.tx, &platforms, &added).await
 }
 
@@ -534,11 +547,21 @@ async fn plan_package_with_deps(
         // dependency AURCache has no way to see. Worth saying out loud, though
         // — this used to be where a typo, or a package dropped from the AUR,
         // disappeared without trace and resurfaced as an opaque build failure.
-        tracing::warn!(
-            "{}: nothing provides {}",
-            package_spec.pkgbase,
-            resolved_deps.unresolved.join(", ")
-        );
+        match plan_context.activity {
+            Some(activity) => {
+                for dependency in &resolved_deps.unresolved {
+                    activity.emit(Event::DepsUnresolved {
+                        pkg: package_spec.pkgbase.as_str().into(),
+                        dependency: dependency.clone(),
+                    });
+                }
+            }
+            None => tracing::warn!(
+                "{}: nothing provides {}",
+                package_spec.pkgbase,
+                resolved_deps.unresolved.join(", ")
+            ),
+        }
     }
 
     // Iterate the declared dependency order rather than the resolution map's:

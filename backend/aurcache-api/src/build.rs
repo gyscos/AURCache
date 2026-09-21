@@ -9,6 +9,7 @@ use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
+use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
 use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use aurcache_db::action::Action;
@@ -446,7 +447,8 @@ pub async fn delete_build(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     number: i32,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
     let db = db.inner();
 
@@ -456,6 +458,15 @@ pub async fn delete_build(
         .delete(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    al.emit_by(
+        Event::BuildDeleted {
+            build: BuildRef {
+                pkgbase: pkgbase.to_string(),
+                number,
+            },
+        },
+        a.username,
+    );
 
     Ok(())
 }
@@ -475,7 +486,8 @@ pub async fn cancel_build(
     tx: &State<Sender<Action>>,
     pkgbase: &str,
     number: i32,
-    _a: Authenticated,
+    a: Authenticated,
+    al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
     // Cancellation still travels by row id on the internal queue; only the way
     // the caller names the build has changed.
@@ -484,6 +496,15 @@ pub async fn cancel_build(
     // process is shutting down — nothing a 500 could fix, and every other
     // broadcast send ignores it the same way.
     let _ = tx.send(Action::Cancel(build_id));
+    al.emit_by(
+        Event::BuildCancelled {
+            build: BuildRef {
+                pkgbase: pkgbase.to_string(),
+                number,
+            },
+        },
+        a.username,
+    );
 
     Ok(())
 }
@@ -523,17 +544,18 @@ pub async fn retry_build(
     // the .SRCINFO, resolves AUR dependencies again, and syncs the dependency
     // graph before enqueuing builds, instead of blindly re-enqueuing the old
     // build's stored version with a stale dependency graph.
-    let package_name = package.name.clone();
     // An operator's retry: recorded as theirs on the build rows, and in the
-    // activity log like an Update, so a build nobody remembers queueing can be
-    // traced to whoever did.
+    // log against the build they retried, so a build nobody remembers queueing
+    // can be traced to whoever did.
     let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     al.emit_by(
-        Event::PackageUpdated {
-            pkg: package_name.into(),
-            forced: true,
+        Event::BuildRetried {
+            build: BuildRef {
+                pkgbase: pkgbase.to_string(),
+                number,
+            },
         },
         a.username,
     );

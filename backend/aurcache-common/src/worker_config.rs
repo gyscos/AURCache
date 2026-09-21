@@ -242,9 +242,65 @@ pub struct EffectiveConfig {
     pub settings: BTreeMap<String, EffectiveSetting>,
 }
 
+impl EffectiveConfig {
+    /// The settings whose value or standing differs from `before`, by name --
+    /// including ones only one side has.
+    ///
+    /// The source and the reason are left out: they explain a value, and a
+    /// value that is the same for a different reason has not changed anything
+    /// the machine does.
+    #[must_use]
+    pub fn changed_since(&self, before: &Self) -> Vec<String> {
+        let names: std::collections::BTreeSet<&String> =
+            self.settings.keys().chain(before.settings.keys()).collect();
+        names
+            .into_iter()
+            .filter(|name| {
+                let (now, then) = (self.settings.get(*name), before.settings.get(*name));
+                match (now, then) {
+                    (Some(now), Some(then)) => now.value != then.value || now.status != then.status,
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change is a value or a standing that moved, or a setting that came
+    /// or went; the same value for a different reason is not one.
+    #[test]
+    fn a_change_is_a_value_that_moved() {
+        let setting = |value: &str, source| EffectiveSetting {
+            value: Some(value.to_string()),
+            source,
+            status: SettingStatus::Applied,
+            reason: None,
+        };
+        let config = |pairs: &[(&str, EffectiveSetting)]| EffectiveConfig {
+            received_revision: None,
+            settings: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        };
+        let before = config(&[
+            ("concurrency", setting("2", EffectiveSource::Default)),
+            ("priority", setting("0", EffectiveSource::Default)),
+            ("gone", setting("x", EffectiveSource::Default)),
+        ]);
+        let after = config(&[
+            ("concurrency", setting("4", EffectiveSource::Default)),
+            ("priority", setting("0", EffectiveSource::Env)),
+            ("new", setting("y", EffectiveSource::Default)),
+        ]);
+        assert_eq!(after.changed_since(&before), ["concurrency", "gone", "new"]);
+        assert!(after.changed_since(&after).is_empty());
+    }
 
     #[test]
     fn integers_are_range_checked() {

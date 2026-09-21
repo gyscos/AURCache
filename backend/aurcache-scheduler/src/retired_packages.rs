@@ -7,12 +7,13 @@
 //! such files once they have been unlisted for `RETIRED_PACKAGE_GRACE` seconds
 //! (see [`Repository::sweep`]).
 
+use aurcache_activitylog::events::Event;
 use aurcache_utils::repository::Repository;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 /// How long a retired package file stays downloadable, by default: a day,
 /// comfortably longer than any upgrade takes between syncing and downloading.
@@ -51,8 +52,11 @@ pub fn start_retired_package_sweep(repo: Arc<Repository>) -> JoinHandle<()> {
             tokio::time::sleep(interval).await;
             match repo.sweep(grace).await {
                 Ok(0) => {}
+                // What went is recorded by the sweep itself, by name.
                 Ok(deleted) => info!("deleted {deleted} retired package file(s)"),
-                Err(e) => warn!("retired package sweep failed: {e:#}"),
+                Err(e) => repo.log().emit(Event::RepoSweepFailed {
+                    error: format!("{e:#}"),
+                }),
             }
         }
     })

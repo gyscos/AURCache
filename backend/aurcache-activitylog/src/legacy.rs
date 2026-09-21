@@ -176,6 +176,7 @@ fn convert(typ: ActivityType, data: &str, builds: &HashMap<i32, BuildRef>) -> Op
         },
         ActivityType::WorkerRevoke => Event::WorkerRevoked {
             worker: worker(parse::<Worker>(data)?.worker),
+            requeued: Vec::new(),
         },
         ActivityType::PublishFailed => {
             let failed = parse::<PublishFailed>(data)?;
@@ -190,6 +191,8 @@ fn convert(typ: ActivityType, data: &str, builds: &HashMap<i32, BuildRef>) -> Op
         ActivityType::WorkerReaped => {
             let reaped = parse::<Reaped>(data)?;
             Event::WorkerReaped {
+                // The old entry never said which.
+                workers: Vec::new(),
                 retried: named(reaped.retried),
                 failed: named(reaped.failed),
             }

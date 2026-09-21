@@ -1,4 +1,6 @@
 use anyhow::anyhow;
+use aurcache_activitylog::activity_utils::ActivityLog;
+use aurcache_activitylog::events::Event;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::dependencies;
@@ -14,7 +16,6 @@ use sea_orm::{
 use std::collections::{HashMap, HashSet};
 
 use tokio::sync::broadcast::Sender;
-use tracing::warn;
 
 /// Queue initial builds for a freshly-added set of packages.
 ///
@@ -125,6 +126,7 @@ pub async fn trigger_initial_builds(
 pub async fn enqueue_missing_buildable_packages(
     db: &DatabaseConnection,
     tx: &Sender<Action>,
+    activity: &ActivityLog,
 ) -> anyhow::Result<usize> {
     let packages = Packages::find().all(db).await?;
 
@@ -133,10 +135,10 @@ pub async fn enqueue_missing_buildable_packages(
         let platforms = match parse_platforms(&pkg.platforms) {
             Ok(platforms) => platforms,
             Err(error) => {
-                warn!(
-                    "Skipping package {} during startup enqueue because platforms are invalid: {error}",
-                    pkg.name
-                );
+                activity.emit(Event::EnqueueSkipped {
+                    pkg: pkg.name.as_str().into(),
+                    error: format!("its platforms are invalid: {error}"),
+                });
                 continue;
             }
         };

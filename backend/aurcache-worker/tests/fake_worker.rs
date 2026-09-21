@@ -385,7 +385,8 @@ async fn fake_worker_protocol_roundtrip() {
     let worker_id = workers.first().expect("one enrolled worker").id;
     worker_store::revoke_worker(&db, worker_id, 3)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the worker exists");
     let after_revoke = client.claim(&claim_req).await;
     assert!(
         after_revoke.is_err(),

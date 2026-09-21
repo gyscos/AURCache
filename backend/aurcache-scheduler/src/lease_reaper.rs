@@ -11,14 +11,17 @@
 
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
-use aurcache_common::api::log::BuildRef;
+use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
+use aurcache_db::prelude::Workers;
+use aurcache_db::workers;
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::settings::general::SettingsTraits;
 use sea_orm::DatabaseConnection;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use std::env;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -77,6 +80,7 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
                             .collect()
                         };
                         activity.emit(Event::WorkerReaped {
+                            workers: worker_names(&db, &out.abandoned).await,
                             retried: named(
                                 &mut out.retried.iter().map(|&(abandoned, _)| abandoned),
                             ),
@@ -87,7 +91,7 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
                     // Explain each abandoned build in its own log. The row is
                     // terminal, so this is the last line it ever gets.
                     for abandoned in &out.abandoned {
-                        explain_abandoned(abandoned).await;
+                        explain_abandoned(&activity, abandoned).await;
                     }
                 }
                 Err(e) => warn!("Lease reaper pass failed: {e}"),
@@ -99,7 +103,7 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
 /// Append why a build was abandoned to its log file. Best-effort by design:
 /// the row is already terminal, so nothing downstream depends on this
 /// succeeding, and a deleted package simply yields no line.
-async fn explain_abandoned(abandoned: &Abandoned) {
+async fn explain_abandoned(activity: &ActivityLog, abandoned: &Abandoned) {
     let Some(pkgbase) = &abandoned.pkgbase else {
         return;
     };
@@ -112,11 +116,37 @@ async fn explain_abandoned(abandoned: &Abandoned) {
     };
     let text = format!("Timeout: {reason}.\n");
     if let Err(e) = append_build_output(pkgbase, abandoned.number, &text).await {
-        warn!(
-            "could not append abandonment log for build {}: {e}",
-            abandoned.build_id
-        );
+        activity.emit(Event::BuildLogAppendFailed {
+            build: BuildRef {
+                pkgbase: pkgbase.clone(),
+                number: abandoned.number,
+            },
+            error: e.to_string(),
+        });
     }
+}
+
+/// The names of the workers that held these builds, for the entry that says
+/// they went silent. Best-effort: a worker row that cannot be read is left out
+/// rather than holding the entry back.
+async fn worker_names(db: &DatabaseConnection, abandoned: &[Abandoned]) -> Vec<WorkerRef> {
+    let mut ids: Vec<i32> = abandoned.iter().filter_map(|a| a.worker_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    Workers::find()
+        .select_only()
+        .column(workers::Column::Name)
+        .filter(workers::Column::Id.is_in(ids))
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(WorkerRef::from)
+        .collect()
 }
 
 #[cfg(test)]

@@ -1449,9 +1449,13 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
     .await
     .unwrap();
 
-    let queued = enqueue_missing_buildable_packages(&env.db, &tx)
-        .await
-        .unwrap();
+    let queued = enqueue_missing_buildable_packages(
+        &env.db,
+        &tx,
+        &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(queued, 1, "only leaf dependency packages should be queued");
 
@@ -1581,9 +1585,13 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
     .await
     .unwrap();
 
-    let queued = enqueue_missing_buildable_packages(&env.db, &tx)
-        .await
-        .unwrap();
+    let queued = enqueue_missing_buildable_packages(
+        &env.db,
+        &tx,
+        &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         queued, 1,
@@ -1689,9 +1697,13 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
     .await
     .unwrap();
 
-    let queued = enqueue_missing_buildable_packages(&env.db, &tx)
-        .await
-        .unwrap();
+    let queued = enqueue_missing_buildable_packages(
+        &env.db,
+        &tx,
+        &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         queued, 2,

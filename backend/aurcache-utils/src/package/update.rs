@@ -149,7 +149,10 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
                         .map(|r| r.build_id),
                 );
             }
-            Err(e) => warn!("Auto update skipped {package_name}: {e}"),
+            Err(e) => activity_log.emit(Event::UpdateSkipped {
+                pkg: package_name.into(),
+                error: format!("{e:#}"),
+            }),
         }
     }
     Ok(ids_total)
@@ -283,10 +286,10 @@ async fn package_update_inner(
             }
             // A remote we could not reach is not evidence of anything. Falling
             // through to the build is the safe direction.
-            Err(e) => warn!(
-                "VCS check for {} failed, building anyway: {e}",
-                pkg_model.name
-            ),
+            Err(e) => services.activity.emit(Event::VcsSyncFailed {
+                pkg: pkg_model.name.as_str().into(),
+                error: format!("{e:#}, building anyway"),
+            }),
         }
     }
 
@@ -314,10 +317,14 @@ async fn package_update_inner(
             if let Err(e) =
                 record_queued_vcs_sources(&services.db, result.build_id, &queued_commits).await
             {
-                warn!(
-                    "could not record VCS sources for build {}: {e}",
-                    result.build_id
-                );
+                services.activity.emit(Event::BuildRecordFailed {
+                    build: aurcache_common::api::log::BuildRef {
+                        pkgbase: pkg_model.name.clone(),
+                        number: result.build_number,
+                    },
+                    what: "queued VCS sources".to_string(),
+                    error: e.to_string(),
+                });
             }
         }
     }
@@ -455,11 +462,12 @@ async fn resolve_dependency_edges(
     .await?;
 
     if !resolved_deps.unresolved.is_empty() {
-        tracing::warn!(
-            "{}: nothing provides {}",
-            pkg_model.name,
-            resolved_deps.unresolved.join(", ")
-        );
+        for dependency in &resolved_deps.unresolved {
+            services.activity.emit(Event::DepsUnresolved {
+                pkg: pkg_model.name.as_str().into(),
+                dependency: dependency.clone(),
+            });
+        }
     }
 
     let mut by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> = HashMap::new();
