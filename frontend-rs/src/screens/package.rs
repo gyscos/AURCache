@@ -166,7 +166,11 @@ pub fn Package(pkgbase: String) -> Element {
             },
             Some(Ok((pkg, builds))) => rsx! {
                 div { class: "space-y-4",
-                    PackageHeader { pkg: pkg.clone(), trail: vec![] }
+                    PackageHeader {
+                        pkg: pkg.clone(),
+                        trail: vec![],
+                        on_rebuilt: move |()| data.restart(),
+                    }
                     // The sidebar starts level with the builds card rather than
                     // below it, so the builds card is only as wide as it needs
                     // and the space beside it is used.
@@ -182,7 +186,6 @@ pub fn Package(pkgbase: String) -> Element {
                             BuildSummary {
                                 pkgbase: pkg.name.clone(),
                                 builds: builds.clone(),
-                                on_changed: move |()| data.restart(),
                             }
                             Relations {
                                 pkg: pkg.clone(),
@@ -233,14 +236,26 @@ pub fn Package(pkgbase: String) -> Element {
 }
 
 #[component]
-pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) -> Element {
+pub fn PackageHeader(
+    pkg: ExtendedPackage,
+    trail: Vec<(String, Option<Route>)>,
+    on_rebuilt: EventHandler<()>,
+) -> Element {
     let description = pkg.description.clone();
+    let pkgbase = pkg.name.clone();
+    // The AUR page for this package, when it has one. The header is the one
+    // place every package-scoped page shares, so the link lives here rather
+    // than in the sidebar's Source card.
+    let aur_url = match &pkg.package_source {
+        PackageSource::Aur(aur) => Some(aur.aur_url.clone()),
+        _ => None,
+    };
 
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 div { class: "flex flex-wrap items-start gap-3",
-                    div { class: "min-w-0",
+                    div { class: "min-w-0 flex-1",
                         // The trail *is* the heading, rather than a small copy
                         // of it above: the package name appeared twice
                         // otherwise. Ancestors are muted so the page you are on
@@ -306,11 +321,27 @@ pub fn PackageHeader(pkg: ExtendedPackage, trail: Vec<(String, Option<Route>)>) 
                                     "dependency"
                                 }
                             }
+                            if let Some(url) = aur_url {
+                                a {
+                                    class: "link link-primary text-sm",
+                                    href: "{url}",
+                                    target: "_blank",
+                                    rel: "noopener noreferrer",
+                                    "AUR ↗"
+                                }
+                            }
                         }
                         if let Some(description) = description {
                             p { class: "opacity-70 mt-1", "{description}" }
                         }
                         VersionLine { pkg }
+                    }
+                    // Rebuilding starts a new build rather than describing one,
+                    // so the button sits with the package — in the header every
+                    // package-scoped page shares — instead of beside the builds
+                    // list on one of them.
+                    div { class: "shrink-0",
+                        RebuildButton { pkgbase, on_changed: on_rebuilt }
                     }
                 }
             }
@@ -359,7 +390,7 @@ fn VersionLine(pkg: ExtendedPackage) -> Element {
 /// architecture's most recent build failed, a second line names the older build
 /// its repository still serves.
 #[component]
-fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()>) -> Element {
+fn BuildSummary(pkgbase: String, builds: Vec<Build>) -> Element {
     let now = now_secs();
     let typical = typical_duration(&builds);
 
@@ -387,7 +418,7 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
                 div { class: "flex items-center gap-3 flex-wrap",
                     Link {
                         class: "card-title text-base link-hover",
-                        to: Route::PackageBuilds { pkgbase: pkgbase.clone() },
+                        to: Route::PackageBuilds { pkgbase },
                         "Builds"
                     }
                     if let Some(typical) = typical {
@@ -395,10 +426,6 @@ fn BuildSummary(pkgbase: String, builds: Vec<Build>, on_changed: EventHandler<()
                             "typically {format_duration(Some(0), Some(typical))}"
                         }
                     }
-                    div { class: "flex-1" }
-                    // Rebuilding produces a build, so the button belongs with
-                    // the builds rather than in the page header.
-                    RebuildButton { pkgbase, on_changed }
                 }
 
                 if rows.is_empty() {
@@ -982,12 +1009,9 @@ fn SourceCard(pkg: ExtendedPackage) -> Element {
                 // are read from the checkout, so they are the same for an AUR
                 // package and a git one.
                 match &pkg.package_source {
-                    PackageSource::Aur(aur) => rsx! {
-                        Field { label: "Origin",
-                            a { class: "link link-primary", href: "{aur.aur_url}",
-                                target: "_blank", rel: "noopener noreferrer", "AUR ↗" }
-                        }
-                    },
+                    // No Origin row for AUR packages: the AUR link lives in
+                    // the page header, which every package-scoped page shares.
+                    PackageSource::Aur(_) => rsx! {},
                     PackageSource::AurNotFound(_) => rsx! {
                         div { class: "alert alert-warning text-sm mb-2",
                             span { "No longer found on the AUR." }
@@ -1917,6 +1941,80 @@ mod tests {
             first_submitted: None,
             last_modified: None,
         }
+    }
+
+    fn aur_package() -> ExtendedPackage {
+        let mut pkg = package();
+        pkg.package_source = PackageSource::Aur(aurcache_client::AurPackage {
+            name: "hello".to_string(),
+            aur_flagged_outdated: true,
+            aur_url: "https://aur.archlinux.org/packages/hello".to_string(),
+        });
+        pkg
+    }
+
+    #[component]
+    fn HeaderHarness(pkg: ExtendedPackage) -> Element {
+        rsx! {
+            PackageHeader { pkg, trail: vec![], on_rebuilt: move |_| {} }
+        }
+    }
+
+    fn render_header(pkg: &ExtendedPackage) -> String {
+        let mut dom =
+            VirtualDom::new_with_props(HeaderHarness, HeaderHarnessProps { pkg: pkg.clone() });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[component]
+    fn SourceHarness(pkg: ExtendedPackage) -> Element {
+        rsx! { SourceCard { pkg } }
+    }
+
+    fn render_source(pkg: &ExtendedPackage) -> String {
+        let mut dom =
+            VirtualDom::new_with_props(SourceHarness, SourceHarnessProps { pkg: pkg.clone() });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// The header is the one place every package-scoped page shares, so it
+    /// carries the AUR link — including on the builds list and the build
+    /// detail page, which never had it.
+    #[test]
+    fn the_header_links_to_the_aur_when_there_is_one() {
+        let html = render_header(&aur_package());
+        assert!(
+            html.contains("https://aur.archlinux.org/packages/hello"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_header_has_no_aur_link_for_a_git_package() {
+        let html = render_header(&package());
+        assert!(!html.contains("aur.archlinux.org"), "{html}");
+    }
+
+    /// The rebuild button moved up from the Builds card, so the build detail
+    /// page — which has no Builds card — offers one too.
+    #[test]
+    fn the_rebuild_button_sits_in_the_header() {
+        for pkg in [package(), aur_package()] {
+            assert!(render_header(&pkg).contains("Rebuild"), "{pkg:?}");
+        }
+    }
+
+    /// The link moved, not copied: the Source card keeps everything else it
+    /// knew from the AUR — here the flagged-out-of-date warning — but the
+    /// Origin row is gone.
+    #[test]
+    fn the_source_card_no_longer_links_to_the_aur() {
+        let html = render_source(&aur_package());
+        assert!(!html.contains("aur.archlinux.org"), "{html}");
+        assert!(!html.contains("Origin"), "{html}");
+        assert!(html.contains("Flagged out of date"), "{html}");
     }
 }
 

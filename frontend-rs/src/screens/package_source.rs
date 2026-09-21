@@ -30,7 +30,7 @@ pub fn PackageSource(pkgbase: String, path: Vec<String>) -> Element {
 pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     // `use_reactive` so the fetch follows the route; see the note on the
     // package screen for what a captured name does when the parameter changes.
-    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+    let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
         crate::api::client()?
             .get_package(&pkgbase)
             .await
@@ -142,6 +142,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                 crate::screens::PackageHeader {
                     pkg: pkg.clone(),
                     trail: vec![("Sources".to_string(), None)],
+                    on_rebuilt: move |()| package.restart(),
                 }
             },
             // Its absence must not block the editor: the files are what this

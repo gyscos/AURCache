@@ -22,7 +22,7 @@ pub fn PackageConfigFiles(pkgbase: String) -> Element {
     // a resource whose closure captured the old name simply never re-runs: the
     // URL changes, no request is made, and the previous package stays on
     // screen looking like the one that was clicked.
-    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+    let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
         crate::api::client()?
             .get_package(&pkgbase)
             .await
@@ -39,6 +39,7 @@ pub fn PackageConfigFiles(pkgbase: String) -> Element {
                     PackageHeader {
                         pkg: pkg.clone(),
                         trail: vec![("Config files".to_string(), None)],
+                        on_rebuilt: move |()| package.restart(),
                     }
                 },
                 Some(Err(e)) => rsx! {

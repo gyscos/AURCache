@@ -41,14 +41,14 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
     // a resource whose closure captured the old name simply never re-runs: the
     // URL changes, no request is made, and the previous package stays on
     // screen looking like the one that was clicked.
-    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+    let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
         crate::api::client()?
             .get_package(&pkgbase)
             .await
             .map_err(|e| e.to_string())
     }));
 
-    let builds = use_resource(use_reactive(&pkgbase, load));
+    let mut builds = use_resource(use_reactive(&pkgbase, load));
     let mut page = use_signal(|| 0usize);
     let sort = use_signal(|| DEFAULT_SORT);
 
@@ -62,6 +62,10 @@ pub fn PackageBuilds(pkgbase: String) -> Element {
                 crate::screens::PackageHeader {
                     pkg: pkg.clone(),
                     trail: vec![("Builds".to_string(), None)],
+                    on_rebuilt: move |()| {
+                        package.restart();
+                        builds.restart();
+                    },
                 }
             },
             _ => rsx! {},

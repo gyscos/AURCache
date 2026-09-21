@@ -29,6 +29,21 @@ fn settled(status: i32) -> bool {
     BuildState::from_i32(status).is_some_and(|s| !s.is_in_progress())
 }
 
+/// Whether the build page is still waiting on something, so its header keeps
+/// re-fetching briskly rather than falling back to the idle cadence.
+///
+/// Either side can be the one that is behind: the build's own state comes
+/// from the log's poll loop, while the package badge up top only moves when
+/// its lookup re-runs — without this a finished build read "successful" below
+/// a header that still said "building". Nothing fetched yet counts as idle,
+/// the same as elsewhere: the initial load is already in flight.
+fn build_page_busy(build_status: Option<i32>, package_status: Option<i32>) -> bool {
+    [build_status, package_status]
+        .into_iter()
+        .flatten()
+        .any(|status| !settled(status))
+}
+
 /// What the log area says while it has no text, given whether the poll loop
 /// has finished (its final page is in) and the build's state.
 ///
@@ -62,6 +77,22 @@ mod tests {
         assert!(!settled(BuildState::WaitingForDeps.as_i32()));
         // A state this build of the UI has never heard of keeps it polling.
         assert!(!settled(99));
+    }
+
+    /// The header stays live while either side is still moving: the bug was a
+    /// finished build reading "successful" under a package badge that still
+    /// said "building", because only the log's loop kept polling.
+    #[test]
+    fn the_header_stays_busy_while_either_side_is_still_moving() {
+        let active = Some(BuildState::Active.as_i32());
+        let successful = Some(BuildState::Successful.as_i32());
+        assert!(build_page_busy(active, active));
+        assert!(build_page_busy(successful, active));
+        assert!(build_page_busy(active, successful));
+        assert!(!build_page_busy(successful, successful));
+        // Nothing fetched yet: the initial load is already in flight, so
+        // there is nothing extra to hurry along.
+        assert!(!build_page_busy(None, None));
     }
 
     #[test]
@@ -244,7 +275,7 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
     // a resource whose closure captured the old name simply never re-runs: the
     // URL changes, no request is made, and the previous package stays on
     // screen looking like the one that was clicked.
-    let build = use_resource(use_reactive(
+    let mut build = use_resource(use_reactive(
         &(pkgbase.clone(), number),
         |(pkgbase, number)| async move {
             crate::api::client()?
@@ -256,7 +287,7 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
 
     // Fetched from the build's package so this page carries the same header
     // as every other package-scoped page, with the trail in the same place.
-    let package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
+    let mut package = use_resource(use_reactive(&pkgbase, |pkgbase| async move {
         crate::api::client()?
             .get_package(&pkgbase)
             .await
@@ -264,23 +295,45 @@ pub fn Build(pkgbase: String, number: i32) -> Element {
             .map(Some)
     }));
 
+    // The log below polls the build on its own loop, so without this the
+    // package badge up top froze at whatever the first lookup returned while
+    // the build's own badge moved on to "successful".
+    let build_status = match &*build.read_unchecked() {
+        Some(Ok(b)) => Some(b.status),
+        _ => None,
+    };
+    let package_status = match &*package.read_unchecked() {
+        Some(Ok(Some(p))) => Some(p.status),
+        _ => None,
+    };
+    let busy = build_page_busy(build_status, package_status);
+    crate::poll::use_poll(build, busy);
+    crate::poll::use_poll(package, busy);
+
     rsx! {
         // `h-full` so the log below can flex into what the header leaves,
         // rather than guessing a fraction of the viewport and overshooting it.
         div { class: "space-y-4 h-full flex flex-col min-h-0",
             match (&*package.read_unchecked(), &*build.read_unchecked()) {
-                (Some(Ok(Some(pkg))), Some(Ok(build))) => rsx! {
+                // `done`, not `build`: the resource of that name is what the
+                // rebuild handler below restarts, and the pattern would
+                // otherwise shadow it with this one finished build.
+                (Some(Ok(Some(pkg))), Some(Ok(done))) => rsx! {
                     crate::screens::PackageHeader {
                         pkg: pkg.clone(),
                         trail: vec![
                             (
                                 "Builds".to_string(),
                                 Some(crate::routes::Route::PackageBuilds {
-                                    pkgbase: build.pkg_name.clone(),
+                                    pkgbase: done.pkg_name.clone(),
                                 }),
                             ),
-                            (build.number.to_string(), None),
+                            (done.number.to_string(), None),
                         ],
+                        on_rebuilt: move |()| {
+                            build.restart();
+                            package.restart();
+                        },
                     }
                 },
                 // The log is what this page is for, so a failed lookup costs
