@@ -181,13 +181,13 @@ INSERT INTO log (id, kind, severity, message, data, timestamp, user) VALUES
   -- than a package.
   (1004, 'worker.approved', 0, 'approved worker builder-01', '{"worker":"worker:builder-01"}',
     CAST(strftime('%s','now') AS INTEGER) - 300, 'alice'),
-  (1005, 'package.updated', 0, 'forced update of package yay', '{"pkg":"pkg:yay","forced":true}',
+  (1005, 'build.queued', 0, 'queued a build of yay (rebuild)', '{"pkg":"pkg:yay","cause":"rebuild"}',
     CAST(strftime('%s','now') AS INTEGER) - 900, 'alice'),
   (1006, 'server.start', 0, 'AURCache 0.5.0 started', '{"version":"0.5.0"}',
     CAST(strftime('%s','now') AS INTEGER) - 1000, NULL),
   (1007, 'package.deleted', 0, 'deleted package obsolete-thing', '{"pkg":"pkg:obsolete-thing"}',
     CAST(strftime('%s','now') AS INTEGER) - 4000, 'bob'),
-  (1008, 'package.updated', 0, 'updated package neofetch', '{"pkg":"pkg:neofetch","forced":false}',
+  (1008, 'build.queued', 0, 'queued a build of neofetch (new version 7.1.0-2)', '{"pkg":"pkg:neofetch","cause":"update","version":"7.1.0-2"}',
     CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);
 
 INSERT INTO log_entity (log_id, role, ns, id) VALUES

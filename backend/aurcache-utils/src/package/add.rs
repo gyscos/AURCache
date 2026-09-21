@@ -305,7 +305,7 @@ async fn finalize_package_add(
         .cloned()
         .ok_or_else(|| anyhow!("Package add produced no inserted packages"))?;
 
-    trigger_initial_builds(db, tx, &context.platforms, &added_order).await?;
+    trigger_initial_builds(db, tx, &services.activity, &context.platforms, &added_order).await?;
     Ok((pkgbase, false))
 }
 
@@ -491,7 +491,14 @@ pub async fn add_dependency_package(
     )
     .await?;
     refresh_source_metadata(&services.store, &services.db, &services.activity, &added).await;
-    trigger_initial_builds(&services.db, &services.tx, &platforms, &added).await
+    trigger_initial_builds(
+        &services.db,
+        &services.tx,
+        &services.activity,
+        &platforms,
+        &added,
+    )
+    .await
 }
 
 /// Plan a package and, recursively, every AUR dependency it needs.

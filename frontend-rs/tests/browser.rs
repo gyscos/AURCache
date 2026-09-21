@@ -739,7 +739,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .await;
     let all = session.text().await;
     assert!(all.contains("no space left on device"), "{all}");
-    assert!(all.contains("forced update of package"), "{all}");
+    assert!(all.contains("queued a build of yay (rebuild)"), "{all}");
 
     // Errors only: the failure stays, the ordinary entries go.
     session
@@ -747,7 +747,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .await;
     session
         .wait_until("the ordinary entries to go", |t| {
-            !t.contains("forced update of package")
+            !t.contains("queued a build of yay (rebuild)")
         })
         .await;
     let errors = session.text().await;
@@ -773,7 +773,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         })
         .await;
     assert!(
-        !session.text().await.contains("forced update of package"),
+        !session.text().await.contains("queued a build of yay (rebuild)"),
         "an ordinary entry is neither"
     );
 
@@ -784,7 +784,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .await;
     session
         .wait_until("everything to come back", |t| {
-            t.contains("forced update of package")
+            t.contains("queued a build of yay (rebuild)")
         })
         .await;
     assert!(
@@ -826,7 +826,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
     session.open("/logs?e=pkg:yay").await;
     session
         .wait_until("the log about yay", |t| {
-            t.contains("forced update of package")
+            t.contains("queued a build of yay (rebuild)")
         })
         .await;
     let about = session.text().await;
@@ -869,7 +869,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .await;
     session
         .wait_until("the log narrowed from the row", |t| {
-            t.contains("forced update of package") && !t.contains("added package hello")
+            t.contains("queued a build of yay (rebuild)") && !t.contains("added package hello")
         })
         .await;
     assert!(
@@ -901,7 +901,7 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .await;
     session
         .wait_until("the log about the worker", |t| {
-            t.contains("approved worker") && !t.contains("forced update of package")
+            t.contains("approved worker") && !t.contains("queued a build of yay (rebuild)")
         })
         .await;
     assert!(
@@ -916,9 +916,9 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
     // By kind: from a row's funnel, then back to every kind from the select.
     session
         .wait_for_script(
-            "the forced update's row menu",
+            "the rebuild's row menu",
             "const row = [...document.querySelectorAll('tbody tr')] \
-               .find(r => r.textContent.includes('forced update of package')); \
+               .find(r => r.textContent.includes('queued a build of yay (rebuild)')); \
              const button = row && row.querySelector('button[aria-haspopup=\"menu\"]'); \
              if (!button) return false; button.click(); return true;"
                 .to_string(),
@@ -927,16 +927,16 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
     session
         .click_labelled(
             "button[role=\"menuitem\"]",
-            "Only entries like this: Package updated",
+            "Only entries like this: Build queued",
         )
         .await;
     session
-        .wait_until("only package updates", |t| {
-            t.contains("forced update of package") && !t.contains("approved worker")
+        .wait_until("only queued builds", |t| {
+            t.contains("queued a build of yay (rebuild)") && !t.contains("approved worker")
         })
         .await;
     assert!(
-        session.url().await.contains("k=package.updated"),
+        session.url().await.contains("k=build.queued"),
         "{}",
         session.url().await
     );

@@ -330,7 +330,7 @@ ROUTES=(
     # The sentence is rendered in the browser from the stored payload, so this
     # also proves the payload shapes in the fixture are ones the catalogue
     # parses.
-    "/logs|forced update of package|the log renders each entry type"
+    "/logs|(rebuild)|the log renders each entry type"
     # Nobody asked for this one; a schedule did. The Dart frontend called that
     # "You", which claims work the reader did not do.
     "/logs|AURCache|an unattributed entry is credited to the server"

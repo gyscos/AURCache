@@ -34,6 +34,7 @@ mod m20260917_000001_worker_configuration;
 mod m20260917_000002_activity_timestamp_index;
 mod m20260917_000003_structured_logs;
 mod m20260921_000000_log_query_indexes;
+mod m20260922_000000_build_queued_entries;
 
 pub struct Migrator;
 
@@ -82,6 +83,24 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000002_activity_timestamp_index::Migration),
             Box::new(m20260917_000003_structured_logs::Migration),
             Box::new(m20260921_000000_log_query_indexes::Migration),
+            Box::new(m20260922_000000_build_queued_entries::Migration),
         ]
     }
+}
+
+/// How many steps `Migrator::down` takes to undo `name` and everything after
+/// it, for a test that checks one migration against the schema before it --
+/// counted by name, so a later migration does not shift what it undoes.
+#[cfg(test)]
+pub(crate) fn steps_back_to(name: &str) -> u32 {
+    use sea_orm_migration::MigratorTrait;
+    let names: Vec<String> = Migrator::migrations()
+        .iter()
+        .map(|m| m.name().to_string())
+        .collect();
+    let position = names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("no migration called {name}"));
+    <u32 as TryFrom<usize>>::try_from(names.len() - position).expect("a handful of migrations")
 }

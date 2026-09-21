@@ -429,7 +429,7 @@ mod tests {
             ViewParams::for_logs(Some(Severity::Error), true, None),
             ViewParams::for_logs(None, false, None).with_kind(Some("build.started".to_string())),
             ViewParams::about(aurcache_client::PackageRef::from("hello"))
-                .with_kind(Some("package.updated".to_string())),
+                .with_kind(Some("build.queued".to_string())),
             ViewParams::for_logs(None, true, None),
             ViewParams::about(aurcache_client::PackageRef::from("gtk+")),
             ViewParams::about(aurcache_client::BuildRef {

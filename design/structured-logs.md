@@ -260,6 +260,20 @@ the old table as they land; a row that does not convert stays behind and is
 reported. The reaper had recorded internal build row ids, which are translated
 to `pkgbase #number` where the build still exists and dropped where it does not.
 
+`package.updated` (and the `build.retried` that briefly joined it) later became
+`build.queued`, one kind for every build request with its cause spelled out:
+an *update* attempts a new version, a *rebuild* repeats one that worked, a
+*retry* one that failed, a *dependency* build is queued on behalf of a
+dependent, and a *first* build follows adding a package. The old `forced` flag
+could not say which: the auto-updater forced every VCS package past the
+version check, so its updates read as "forced". Migration
+`m20260922_000000_build_queued_entries` rewrites the old rows, deciding a
+person's forced request by the build before it. Around it, `version.detected`
+records a new upstream version whether or not a build follows (auto-update may
+be off), `build.unblocked` a waiting build freed by a dependency's publish or a
+changed edge, and `build.published` carries the version it put in the
+repository -- so one update reads as detected, queued, picked up, published.
+
 ## References and context values
 
 The payload is one flat JSON object. The **key is the role** the value plays;

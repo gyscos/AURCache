@@ -67,26 +67,37 @@ pub async fn publish_build(
                 "Published to the repository\n",
             )
             .await;
-            if let Some(pkgbase) = &pkgbase {
+            let published = pkgbase.as_ref().map(|pkgbase| BuildRef {
+                pkgbase: pkgbase.clone(),
+                number: build.number,
+            });
+            if let Some(published) = &published {
                 activity.emit(Event::BuildPublished {
-                    build: BuildRef {
-                        pkgbase: pkgbase.clone(),
-                        number: build.number,
-                    },
+                    build: published.clone(),
+                    version: Some(build.version.clone()).filter(|v| !v.is_empty()),
                 });
             }
-            if let Err(e) =
-                crate::worker_complete::trigger_dependents(db, build.pkg_id, build.platform).await
+            match crate::worker_complete::trigger_dependents(db, build.pkg_id, build.platform).await
             {
-                error!(
-                    "Failed to trigger dependents of package {}: {e}",
-                    build.pkg_id
-                );
-                if let Some(pkgbase) = &pkgbase {
-                    activity.emit(Event::DependentsTriggerFailed {
-                        pkg: pkgbase.as_str().into(),
-                        error: e.to_string(),
-                    });
+                Ok(unblocked) => {
+                    for unblocked in unblocked {
+                        activity.emit(Event::BuildUnblocked {
+                            build: unblocked,
+                            by: published.clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to trigger dependents of package {}: {e}",
+                        build.pkg_id
+                    );
+                    if let Some(pkgbase) = &pkgbase {
+                        activity.emit(Event::DependentsTriggerFailed {
+                            pkg: pkgbase.as_str().into(),
+                            error: e.to_string(),
+                        });
+                    }
                 }
             }
         }

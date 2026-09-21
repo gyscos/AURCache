@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
+use aurcache_activitylog::events::{Event, QueueCause};
+use aurcache_common::api::log::BuildRef;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::dependencies;
@@ -27,6 +28,7 @@ use tokio::sync::broadcast::Sender;
 pub async fn trigger_initial_builds(
     db: &DatabaseConnection,
     tx: &Sender<Action>,
+    activity: &ActivityLog,
     platforms: &[Platform],
     pkgbases: &[String],
 ) -> anyhow::Result<()> {
@@ -70,7 +72,15 @@ pub async fn trigger_initial_builds(
 
         if !has_deps.contains(&pkg.id) {
             // Leaf package – no deps, can start right away.
-            trigger_build_for_package(db, tx, platforms, pkg, BuildStates::ENQUEUED_BUILD).await?;
+            trigger_build_for_package(
+                db,
+                tx,
+                activity,
+                platforms,
+                pkg,
+                BuildStates::ENQUEUED_BUILD,
+            )
+            .await?;
         } else {
             // Has AUR dependencies.  Check per-platform whether they are already satisfied.
             let platform_readiness = try_join_all(platforms.iter().map(|platform| async move {
@@ -93,6 +103,7 @@ pub async fn trigger_initial_builds(
                 trigger_build_for_package(
                     db,
                     tx,
+                    activity,
                     &ready_platforms,
                     pkg.clone(),
                     BuildStates::ENQUEUED_BUILD,
@@ -103,6 +114,7 @@ pub async fn trigger_initial_builds(
                 trigger_build_for_package(
                     db,
                     tx,
+                    activity,
                     &waiting_platforms,
                     pkg,
                     BuildStates::WAITING_FOR_DEPS,
@@ -167,6 +179,13 @@ pub async fn enqueue_missing_buildable_packages(
                         .update(&txn)
                         .await?;
                         txn.commit().await?;
+                        activity.emit(Event::BuildUnblocked {
+                            build: BuildRef {
+                                pkgbase: pkg.name.clone(),
+                                number: promoted.number,
+                            },
+                            by: None,
+                        });
                         let _ = tx.send(Action::Build(Box::new(pkg.clone()), Box::new(promoted)));
                         queued += 1;
                     }
@@ -185,6 +204,7 @@ pub async fn enqueue_missing_buildable_packages(
                         queued += trigger_build_for_package(
                             db,
                             tx,
+                            activity,
                             &[platform],
                             pkg.clone(),
                             BuildStates::ENQUEUED_BUILD,
@@ -194,6 +214,7 @@ pub async fn enqueue_missing_buildable_packages(
                         trigger_build_for_package(
                             db,
                             tx,
+                            activity,
                             &[platform],
                             pkg.clone(),
                             BuildStates::WAITING_FOR_DEPS,
@@ -273,16 +294,21 @@ async fn dependencies_satisfied(
 /// `Action::Build` is only dispatched for `ENQUEUED_BUILD` builds, because `WAITING_FOR_DEPS`
 /// builds must not be started until their dependencies are ready.
 ///
+/// Every build it inserts is logged as the package's first, whether it can
+/// start or has to wait.
+///
 /// Returns the number of newly startable (`ENQUEUED`) builds that were inserted.
 async fn trigger_build_for_package(
     db: &DatabaseConnection,
     tx: &Sender<Action>,
+    activity: &ActivityLog,
     platforms: &[Platform],
     pkg: packages::Model,
     initial_status: i32,
 ) -> anyhow::Result<usize> {
     let version = pkg.upstream_version.clone().unwrap_or_default();
     let mut queued = 0;
+    let mut inserted = vec![];
 
     for platform in platforms {
         let txn = db.begin().await?;
@@ -311,6 +337,12 @@ async fn trigger_build_for_package(
         }
 
         txn.commit().await?;
+        if enqueue_result.inserted {
+            inserted.push(BuildRef {
+                pkgbase: pkg.name.clone(),
+                number: enqueue_result.build.number,
+            });
+        }
         if enqueue_result.inserted && initial_status == BuildStates::ENQUEUED_BUILD {
             let _ = tx.send(Action::Build(
                 Box::new(pkg.clone()),
@@ -320,6 +352,16 @@ async fn trigger_build_for_package(
         }
     }
 
+    if !inserted.is_empty() {
+        activity.emit(Event::BuildQueued {
+            pkg: pkg.name.as_str().into(),
+            cause: QueueCause::First,
+            builds: inserted,
+            version: Some(version).filter(|version| !version.is_empty()),
+            retried: None,
+            needed_by: None,
+        });
+    }
     Ok(queued)
 }
 

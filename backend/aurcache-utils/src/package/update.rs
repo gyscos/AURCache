@@ -6,7 +6,7 @@ use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sourc
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
-use aurcache_activitylog::events::Event;
+use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::build_state::BuildTrigger;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
@@ -135,18 +135,20 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
         let package_name = pkg.name.clone();
         // A VCS package's version does not change until it is built, so the
         // "already up to date" check would refuse it: the flag gets it past
-        // that check. It is not a forced update in anyone's sense, and the log
-        // entry says so -- `forced` there means somebody asked for a rebuild
-        // of something current.
+        // that check. It is still an update -- a new version is being
+        // attempted -- and the log entry calls it one.
         let force = vcs_tracked.contains(&pkg.id);
         match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
                 // No actor: the auto-updater is the server acting on its own,
                 // which is what an entry without a user already says.
-                activity_log.emit(Event::PackageUpdated {
-                    pkg: package_name.clone().into(),
-                    forced: false,
-                });
+                activity_log.emit(queued(
+                    &package_name,
+                    QueueCause::Update,
+                    &results,
+                    None,
+                    None,
+                ));
                 ids_total.extend(
                     results
                         .into_iter()
@@ -682,6 +684,7 @@ async fn dependencies_ready_for_platform(
     graph: &DependencyGraph,
     trigger: BuildTrigger,
     visited: &mut HashSet<i32>,
+    needed_by: &str,
 ) -> anyhow::Result<bool> {
     for dep_info in graph.deps.values() {
         if dependency_satisfies_constraint(
@@ -710,8 +713,18 @@ async fn dependencies_ready_for_platform(
 
         // A dependency whose last build failed is not auto-retried.
         if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
-            package_update_inner(services, dep_info.package.clone(), true, trigger, visited)
-                .await?;
+            let results =
+                package_update_inner(services, dep_info.package.clone(), true, trigger, visited)
+                    .await?;
+            if !results.is_empty() {
+                services.activity.emit(queued(
+                    &dep_info.package.name,
+                    QueueCause::Dependency,
+                    &results,
+                    None,
+                    Some(needed_by),
+                ));
+            }
         }
 
         return Ok(false);
@@ -743,6 +756,39 @@ pub struct PlatformUpdateResult {
     /// `false` if it was left `WAITING_FOR_DEPS` pending an unfinished
     /// dependency rebuild.
     pub enqueued: bool,
+    /// The version the build is of.
+    pub version: String,
+}
+
+/// The log entry for builds `results` queued for `pkgbase`, and why.
+///
+/// The version is named for an update only: it is what is new there, where a
+/// rebuild or a retry repeats the version that was already built.
+#[must_use]
+pub fn queued(
+    pkgbase: &str,
+    cause: QueueCause,
+    results: &[PlatformUpdateResult],
+    retried: Option<aurcache_common::api::log::BuildRef>,
+    needed_by: Option<&str>,
+) -> Event {
+    Event::BuildQueued {
+        pkg: pkgbase.into(),
+        cause,
+        builds: results
+            .iter()
+            .map(|result| aurcache_common::api::log::BuildRef {
+                pkgbase: pkgbase.to_string(),
+                number: result.build_number,
+            })
+            .collect(),
+        version: (cause == QueueCause::Update)
+            .then(|| results.first().map(|result| result.version.clone()))
+            .flatten()
+            .filter(|version| !version.is_empty()),
+        retried,
+        needed_by: needed_by.map(Into::into),
+    }
 }
 
 /// For each configured platform, check dep readiness and enqueue builds.
@@ -763,6 +809,7 @@ async fn enqueue_platform_builds(
             request.graph,
             request.trigger,
             visited,
+            &request.pkg_model.name,
         )
         .await?;
 
@@ -781,6 +828,7 @@ async fn enqueue_platform_builds(
                 build_id: result.build.id,
                 build_number: result.build.number,
                 enqueued: result.inserted,
+                version: request.version.to_string(),
             });
         } else {
             let txn = services.db.begin().await?;
@@ -801,6 +849,7 @@ async fn enqueue_platform_builds(
                 build_id: waiting.build.id,
                 build_number: waiting.build.number,
                 enqueued: false,
+                version: request.version.to_string(),
             });
         }
     }

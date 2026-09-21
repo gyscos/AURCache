@@ -8,7 +8,7 @@ use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
+use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
 use aurcache_common::build_state::{BuildStates, BuildTrigger};
@@ -17,7 +17,7 @@ use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
 use aurcache_utils::build_logger::{build_log_path, build_log_size, read_build_output};
-use aurcache_utils::package::update::package_update;
+use aurcache_utils::package::update::{package_update, queued};
 use rocket::fs::NamedFile;
 use rocket::http::{ContentType, Header};
 use rocket::response::Responder;
@@ -550,13 +550,18 @@ pub async fn retry_build(
     let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    // "Retry" on a build that worked asks for it again: a rebuild.
     al.emit_by(
-        Event::BuildRetried {
-            build: BuildRef {
+        queued(
+            pkgbase,
+            QueueCause::after(old_build.status == Some(BuildStates::FAILED_BUILD)),
+            &platform_results,
+            Some(BuildRef {
                 pkgbase: pkgbase.to_string(),
                 number,
-            },
-        },
+            }),
+            None,
+        ),
         a.username,
     );
 

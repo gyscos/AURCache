@@ -149,12 +149,58 @@ pub enum Event {
     #[serde(rename = "package.added")]
     PackageAdded { pkg: PackageRef },
 
-    /// A package's build was queued on request, or by the auto-updater.
+    /// A package's build was queued -- on somebody's request, or by the
+    /// auto-updater.
     ///
-    /// `forced` rebuilds what is already current, which is worth telling apart
-    /// from an update that found something new.
-    #[serde(rename = "package.updated")]
-    PackageUpdated { pkg: PackageRef, forced: bool },
+    /// One kind whatever the reason; `cause` says which, told apart by what
+    /// came before: an update attempts a new version, a rebuild repeats a build
+    /// that worked, a retry repeats one that failed.
+    #[serde(rename = "build.queued")]
+    BuildQueued {
+        pkg: PackageRef,
+        #[serde(default)]
+        cause: QueueCause,
+        /// The builds queued, one per platform. Absent from entries written
+        /// before it was recorded.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        builds: Vec<BuildRef>,
+        /// For an update: the version being built.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        /// For a retry: the failed build it was asked for from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retried: Option<BuildRef>,
+        /// For a dependency: the package that needs it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        needed_by: Option<PackageRef>,
+    },
+
+    /// A build that was waiting on its dependencies can start: a dependency's
+    /// build was published, or the dependencies it was waiting on changed.
+    #[serde(rename = "build.unblocked")]
+    BuildUnblocked {
+        build: BuildRef,
+        /// The published dependency build that freed it; absent when it was a
+        /// change to its dependencies instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<BuildRef>,
+    },
+
+    /// A package's upstream moved on: a newer version, or new commits in its
+    /// VCS sources. Recorded when the package goes out of date, whether or not
+    /// a build follows -- that is the auto-updater's call, and its settings'.
+    #[serde(rename = "version.detected")]
+    VersionDetected {
+        pkg: PackageRef,
+        /// What upstream now says.
+        version: String,
+        /// What was last built, if anything was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        built: Option<String>,
+        /// Only the VCS sources moved; the version string did not.
+        #[serde(default)]
+        vcs: bool,
+    },
 
     /// A package was removed, with its builds and artifacts.
     #[serde(rename = "package.deleted")]
@@ -269,7 +315,13 @@ pub enum Event {
 
     /// A finished build reached the repository.
     #[serde(rename = "build.published")]
-    BuildPublished { build: BuildRef },
+    BuildPublished {
+        build: BuildRef,
+        /// The version it published. Absent from entries written before it
+        /// was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
 
     /// A worker reported a build finished, and the report was refused -- which
     /// is how a build that worked becomes one that failed.
@@ -295,10 +347,6 @@ pub enum Event {
     /// Somebody stopped a build.
     #[serde(rename = "build.cancelled")]
     BuildCancelled { build: BuildRef },
-
-    /// Somebody queued a failed build again.
-    #[serde(rename = "build.retried")]
-    BuildRetried { build: BuildRef },
 
     /// Somebody deleted a build and its log.
     #[serde(rename = "build.deleted")]
@@ -492,9 +540,14 @@ pub struct Kind {
 /// holds it to the catalogue, so a new event cannot be missing from it.
 pub const KINDS: &[Kind] = &[
     Kind {
+        kind: "build.queued",
+        group: "Builds",
+        label: "Build queued",
+    },
+    Kind {
         kind: "build.started",
         group: "Builds",
-        label: "Build started",
+        label: "Build picked up",
     },
     Kind {
         kind: "build.succeeded",
@@ -522,11 +575,6 @@ pub const KINDS: &[Kind] = &[
         label: "Build stopped",
     },
     Kind {
-        kind: "build.retried",
-        group: "Builds",
-        label: "Build retried",
-    },
-    Kind {
         kind: "build.deleted",
         group: "Builds",
         label: "Build deleted",
@@ -552,6 +600,11 @@ pub const KINDS: &[Kind] = &[
         label: "Build log line lost",
     },
     Kind {
+        kind: "build.unblocked",
+        group: "Builds",
+        label: "Build unblocked",
+    },
+    Kind {
         kind: "build.enqueue_skipped",
         group: "Builds",
         label: "Not queued at startup",
@@ -570,11 +623,6 @@ pub const KINDS: &[Kind] = &[
         kind: "package.added",
         group: "Packages",
         label: "Package added",
-    },
-    Kind {
-        kind: "package.updated",
-        group: "Packages",
-        label: "Package updated",
     },
     Kind {
         kind: "package.changed",
@@ -635,6 +683,11 @@ pub const KINDS: &[Kind] = &[
         kind: "vcs.sync_failed",
         group: "Sources and versions",
         label: "VCS sources not synced",
+    },
+    Kind {
+        kind: "version.detected",
+        group: "Sources and versions",
+        label: "New version detected",
     },
     Kind {
         kind: "version_check.pass_failed",
@@ -803,6 +856,37 @@ pub fn kind_label(kind: &str) -> &str {
         .map_or(kind, |known| known.label)
 }
 
+/// Why a package's build was queued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCause {
+    /// A new version was attempted: an upstream release, or VCS sources that
+    /// moved.
+    #[default]
+    Update,
+    /// Built again after a build that succeeded.
+    Rebuild,
+    /// Built again after a build that failed.
+    Retry,
+    /// Built because another package needs it.
+    Dependency,
+    /// A package's first build: it was just added, or restored with none.
+    First,
+}
+
+impl QueueCause {
+    /// How a request made after `previous` is called, when it is not an
+    /// update: a build that worked is rebuilt, one that did not is retried.
+    #[must_use]
+    pub const fn after(previous_failed: bool) -> Self {
+        if previous_failed {
+            Self::Retry
+        } else {
+            Self::Rebuild
+        }
+    }
+}
+
 /// Which report a worker sent about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -952,7 +1036,9 @@ impl Event {
             Self::BuildLogAppendFailed { .. } => "build_log.append_failed",
             Self::PublishFailed { .. } => "publish.failed",
             Self::PackageAdded { .. } => "package.added",
-            Self::PackageUpdated { .. } => "package.updated",
+            Self::BuildQueued { .. } => "build.queued",
+            Self::VersionDetected { .. } => "version.detected",
+            Self::BuildUnblocked { .. } => "build.unblocked",
             Self::PackageDeleted { .. } => "package.deleted",
             Self::ServerStarted { .. } => SERVER_START,
             Self::VersionCheckFailed { .. } => "version_check.pass_failed",
@@ -971,7 +1057,6 @@ impl Event {
             Self::BuildCompletionRejected { .. } => "build.completion_rejected",
             Self::BuildRecordFailed { .. } => "build.record_failed",
             Self::BuildCancelled { .. } => "build.cancelled",
-            Self::BuildRetried { .. } => "build.retried",
             Self::BuildDeleted { .. } => "build.deleted",
             Self::EnqueueSkipped { .. } => "build.enqueue_skipped",
             Self::StartupEnqueueFailed { .. } => "build.startup_enqueue_failed",
@@ -1012,7 +1097,9 @@ impl Event {
     pub const fn severity(&self) -> Severity {
         match self {
             Self::PackageAdded { .. }
-            | Self::PackageUpdated { .. }
+            | Self::BuildQueued { .. }
+            | Self::VersionDetected { .. }
+            | Self::BuildUnblocked { .. }
             | Self::PackageDeleted { .. }
             | Self::ServerStarted { .. }
             | Self::WorkerEnrolled { .. }
@@ -1024,7 +1111,6 @@ impl Event {
             | Self::WorkerConfigChanged { .. }
             | Self::BuildPublished { .. }
             | Self::BuildCancelled { .. }
-            | Self::BuildRetried { .. }
             | Self::BuildDeleted { .. }
             | Self::PackageChanged { .. }
             | Self::SourceEdited { .. }
@@ -1141,14 +1227,76 @@ impl Event {
                 text(format!(" failed: {error}")),
             ],
             Self::PackageAdded { pkg } => vec![text("added package "), entity(pkg)],
-            Self::PackageUpdated { pkg, forced } => vec![
-                text(if *forced {
-                    "forced update of package "
+            Self::BuildQueued {
+                pkg,
+                cause,
+                builds,
+                version,
+                retried,
+                needed_by,
+            } => {
+                let mut out = vec![text("queued ")];
+                if builds.is_empty() {
+                    out.push(text("a build of "));
+                    out.push(entity(pkg));
                 } else {
-                    "updated package "
-                }),
-                entity(pkg),
-            ],
+                    out.extend(list(builds));
+                }
+                match cause {
+                    QueueCause::Update => match version {
+                        Some(version) => out.push(text(format!(" (new version {version})"))),
+                        None => out.push(text(" (update)")),
+                    },
+                    QueueCause::Rebuild => out.push(text(" (rebuild)")),
+                    QueueCause::First => match version {
+                        Some(version) => out.push(text(format!(" (first build: {version})"))),
+                        None => out.push(text(" (first build)")),
+                    },
+                    QueueCause::Retry => match retried {
+                        Some(retried) => {
+                            out.push(text(" (retry of "));
+                            out.push(entity(retried));
+                            out.push(text(")"));
+                        }
+                        None => out.push(text(" (retry)")),
+                    },
+                    QueueCause::Dependency => match needed_by {
+                        Some(needed_by) => {
+                            out.push(text(" (needed by "));
+                            out.push(entity(needed_by));
+                            out.push(text(")"));
+                        }
+                        None => out.push(text(" (needed as a dependency)")),
+                    },
+                }
+                out
+            }
+            Self::BuildUnblocked { build, by } => match by {
+                Some(by) => vec![entity(by), text(" unblocked "), entity(build)],
+                None => vec![entity(build), text(" can start: its dependencies changed")],
+            },
+            Self::VersionDetected {
+                pkg,
+                version,
+                built,
+                vcs,
+            } => {
+                let mut out = if *vcs {
+                    vec![
+                        text("new commits detected in the VCS sources of "),
+                        entity(pkg),
+                    ]
+                } else {
+                    vec![
+                        text(format!("new version {version} detected for ")),
+                        entity(pkg),
+                    ]
+                };
+                if let Some(built) = built.as_ref().filter(|_| !*vcs) {
+                    out.push(text(format!(" (built: {built})")));
+                }
+                out
+            }
             Self::PackageDeleted { pkg } => vec![text("deleted package "), entity(pkg)],
             Self::ServerStarted { version } => vec![text(format!("AURCache {version} started"))],
             Self::VersionCheckFailed { error } => {
@@ -1217,7 +1365,7 @@ impl Event {
                 text(format!(": {error}")),
             ],
             Self::BuildStarted { build, worker } => {
-                vec![entity(worker), text(" started "), entity(build)]
+                vec![entity(worker), text(" picked up "), entity(build)]
             }
             Self::BuildFailed {
                 build,
@@ -1230,7 +1378,13 @@ impl Event {
                 }
                 out
             }
-            Self::BuildPublished { build } => vec![text("published "), entity(build)],
+            Self::BuildPublished { build, version } => {
+                let mut out = vec![text("published "), entity(build)];
+                if let Some(version) = version {
+                    out.push(text(format!(": {version}")));
+                }
+                out
+            }
             Self::BuildSucceeded { build, worker } => {
                 vec![entity(build), text(" finished on "), entity(worker)]
             }
@@ -1263,7 +1417,6 @@ impl Event {
                 text(format!(": {error}")),
             ],
             Self::BuildCancelled { build } => vec![text("stopped "), entity(build)],
-            Self::BuildRetried { build } => vec![text("retried "), entity(build)],
             Self::BuildDeleted { build } => vec![text("deleted "), entity(build)],
             Self::EnqueueSkipped { pkg, error } => vec![
                 text("could not queue "),
@@ -1485,9 +1638,26 @@ mod tests {
                 error: error(),
             },
             Event::PackageAdded { pkg: pkg() },
-            Event::PackageUpdated {
+            Event::BuildQueued {
                 pkg: pkg(),
-                forced: true,
+                cause: QueueCause::Retry,
+                builds: vec![build()],
+                version: None,
+                retried: Some(build()),
+                needed_by: None,
+            },
+            Event::BuildUnblocked {
+                build: build(),
+                by: Some(BuildRef {
+                    pkgbase: "bar".to_string(),
+                    number: 5,
+                }),
+            },
+            Event::VersionDetected {
+                pkg: pkg(),
+                version: "2.0-1".to_string(),
+                built: Some("1.0-1".to_string()),
+                vcs: false,
             },
             Event::PackageDeleted { pkg: pkg() },
             Event::ServerStarted {
@@ -1523,7 +1693,10 @@ mod tests {
                 worker: worker(),
                 reason: Some(error()),
             },
-            Event::BuildPublished { build: build() },
+            Event::BuildPublished {
+                build: build(),
+                version: Some("1.0-1".to_string()),
+            },
             Event::BuildSucceeded {
                 build: build(),
                 worker: worker(),
@@ -1547,7 +1720,6 @@ mod tests {
                 error: error(),
             },
             Event::BuildCancelled { build: build() },
-            Event::BuildRetried { build: build() },
             Event::BuildDeleted { build: build() },
             Event::EnqueueSkipped {
                 pkg: pkg(),
@@ -1646,7 +1818,7 @@ mod tests {
         let mut known: Vec<&str> = one_of_each().iter().map(Event::kind).collect();
         known.sort_unstable();
         assert_eq!(listed, known);
-        assert_eq!(kind_label("build.started"), "Build started");
+        assert_eq!(kind_label("build.started"), "Build picked up");
         assert_eq!(kind_label("from.the.future"), "from.the.future");
     }
 
@@ -1735,12 +1907,23 @@ mod tests {
     #[test]
     fn every_reference_in_a_payload_is_in_its_sentence() {
         for event in one_of_each() {
+            // A build is shown as its package and its number, each a link, so
+            // naming the build names its package too.
             let named: Vec<EntityRef> = event
                 .sentence()
                 .into_iter()
                 .filter_map(|segment| match segment {
                     Segment::Entity(entity) => Some(entity),
                     Segment::Text(_) => None,
+                })
+                .flat_map(|entity| {
+                    let package = match &entity {
+                        EntityRef::Build(build) => {
+                            Some(EntityRef::Package(PackageRef::from(build.pkgbase.as_str())))
+                        }
+                        _ => None,
+                    };
+                    std::iter::once(entity).chain(package)
                 })
                 .collect();
             let wire = serde_json::to_value(&event).unwrap();
@@ -1761,6 +1944,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The chain an update leaves in the log reads as one: detected, queued
+    /// with its version, picked up, published with its version.
+    #[test]
+    fn an_update_reads_from_detection_to_publication() {
+        let build = |number| BuildRef {
+            pkgbase: "foo".to_string(),
+            number,
+        };
+        let worker = WorkerRef::from("workerA");
+        let queued = |cause, retried, needed_by: Option<PackageRef>| {
+            Event::BuildQueued {
+                pkg: "foo".into(),
+                cause,
+                builds: vec![build(2)],
+                version: (cause == QueueCause::Update).then(|| "1.2-1".to_string()),
+                retried,
+                needed_by,
+            }
+            .message()
+        };
+        assert_eq!(
+            Event::VersionDetected {
+                pkg: "foo".into(),
+                version: "1.2-1".to_string(),
+                built: Some("1.1-1".to_string()),
+                vcs: false,
+            }
+            .message(),
+            "new version 1.2-1 detected for foo (built: 1.1-1)"
+        );
+        assert_eq!(
+            queued(QueueCause::Update, None, None),
+            "queued foo #2 (new version 1.2-1)"
+        );
+        assert_eq!(
+            Event::BuildStarted {
+                build: build(2),
+                worker,
+            }
+            .message(),
+            "workerA picked up foo #2"
+        );
+        assert_eq!(
+            Event::BuildPublished {
+                build: build(2),
+                version: Some("1.2-1".to_string()),
+            }
+            .message(),
+            "published foo #2: 1.2-1"
+        );
+
+        // And the other causes.
+        assert_eq!(
+            queued(QueueCause::Rebuild, None, None),
+            "queued foo #2 (rebuild)"
+        );
+        assert_eq!(
+            queued(QueueCause::Retry, Some(build(1)), None),
+            "queued foo #2 (retry of foo #1)"
+        );
+        assert_eq!(
+            queued(QueueCause::Dependency, None, Some("bar".into())),
+            "queued foo #2 (needed by bar)"
+        );
+        // An entry with nothing but its package still reads.
+        let bare =
+            Event::decode("build.queued", &serde_json::json!({"pkg": "pkg:foo"})).expect("decodes");
+        assert_eq!(bare.message(), "queued a build of foo (update)");
     }
 
     /// Lists read as a sentence: `a`, `a and b`, `a, b and c`.

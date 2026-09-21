@@ -170,7 +170,14 @@ mod tests {
             ]
         );
 
-        Migrator::down(&db, Some(1)).await.unwrap();
+        Migrator::down(
+            &db,
+            Some(crate::migration::steps_back_to(
+                "m20260921_000000_log_query_indexes",
+            )),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             indexes(&db).await,
             [

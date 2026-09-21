@@ -6,6 +6,7 @@
 //! Workers poll for enqueued jobs, so promoting a dependent from
 //! `WAITING_FOR_DEPS` to `ENQUEUED` is all that is required to dispatch it.
 
+use aurcache_common::api::log::BuildRef;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
@@ -196,18 +197,23 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
 
 /// After a successful build, promote any dependent whose dependencies are now
 /// all satisfied from `WAITING_FOR_DEPS` to `ENQUEUED` so a worker can claim it.
+///
+/// Returns the builds it promoted, for the caller to log.
 pub async fn trigger_dependents<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
     platform: Platform,
-) -> Result<(), DbErr> {
+) -> Result<Vec<BuildRef>, DbErr> {
     let deps_by_dependent = load_dependencies_for_dependents_of(db, pkg_id).await?;
+    let mut promoted = vec![];
     for (dependent_id, all_deps) in &deps_by_dependent {
-        if dependencies_ready(db, all_deps, platform).await? {
-            promote_dependent(db, *dependent_id, platform).await?;
+        if dependencies_ready(db, all_deps, platform).await?
+            && let Some(build) = promote_dependent(db, *dependent_id, platform).await?
+        {
+            promoted.push(build);
         }
     }
-    Ok(())
+    Ok(promoted)
 }
 
 /// Re-decide whether one package's queued build can still start, after its
@@ -228,7 +234,12 @@ pub async fn trigger_dependents<C: ConnectionTrait>(
 /// Every platform the package has a pending build on, since a dependency may be
 /// satisfied on one and not another. `ACTIVE` builds are left alone: they are
 /// running, and the queue has nothing left to say about them.
-pub async fn resync_pending_builds<C: ConnectionTrait>(db: &C, pkg_id: i32) -> Result<(), DbErr> {
+///
+/// Returns the ids of the builds it let start, for the caller to log.
+pub async fn resync_pending_builds<C: ConnectionTrait>(
+    db: &C,
+    pkg_id: i32,
+) -> Result<Vec<i32>, DbErr> {
     let pending: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Status.is_in([
@@ -238,8 +249,9 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(db: &C, pkg_id: i32) -> R
         .all(db)
         .await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
+    let mut unblocked = vec![];
 
     let deps = Dependencies::find()
         .filter(dependencies::Column::DependentId.eq(pkg_id))
@@ -256,6 +268,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(db: &C, pkg_id: i32) -> R
                         "Build #{} on {platform} can start: its dependencies changed and are now satisfied",
                         promoted.id
                     );
+                    unblocked.push(promoted.id);
                 }
             }
             (Some(BuildStates::ENQUEUED_BUILD), false)
@@ -269,7 +282,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(db: &C, pkg_id: i32) -> R
             _ => {}
         }
     }
-    Ok(())
+    Ok(unblocked)
 }
 
 async fn load_dependencies_for_dependents_of<C: ConnectionTrait>(
@@ -321,24 +334,21 @@ async fn promote_dependent<C: ConnectionTrait>(
     db: &C,
     dependent_id: i32,
     platform: Platform,
-) -> Result<(), DbErr> {
+) -> Result<Option<BuildRef>, DbErr> {
     let Some(pkg) = Packages::find_by_id(dependent_id).one(db).await? else {
-        return Ok(());
+        return Ok(None);
     };
     if !pkg.platforms.trim().is_empty()
         && !Platform::parse_many(&pkg.platforms).any(|r| r.is_ok_and(|p| p == platform))
     {
-        return Ok(());
+        return Ok(None);
     }
-    if let Some(promoted) = promote_waiting_build(db, pkg.id, platform).await? {
-        tracing::info!(
-            "Promoted build #{} for dependent '{}' on {} from waiting to enqueued",
-            promoted.id,
-            pkg.name,
-            platform
-        );
-    }
-    Ok(())
+    Ok(promote_waiting_build(db, pkg.id, platform)
+        .await?
+        .map(|promoted| BuildRef {
+            pkgbase: pkg.name,
+            number: promoted.number,
+        }))
 }
 
 #[cfg(test)]

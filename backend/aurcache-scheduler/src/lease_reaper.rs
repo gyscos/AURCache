@@ -10,7 +10,7 @@
 //! synchronously in the `complete` endpoint and are never seen here.
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
+use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
@@ -86,6 +86,25 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
                             ),
                             failed: named(&mut out.failed.iter().copied()),
                         });
+                        // Each replacement is a build queued like any other,
+                        // and says which one it repeats.
+                        for &(abandoned, replacement) in &out.retried {
+                            let Some(retried) = named(&mut std::iter::once(abandoned)).pop() else {
+                                continue;
+                            };
+                            let builds =
+                                aurcache_db::helpers::builds::build_refs(&db, &[replacement])
+                                    .await
+                                    .unwrap_or_default();
+                            activity.emit(Event::BuildQueued {
+                                pkg: retried.pkgbase.as_str().into(),
+                                cause: QueueCause::Retry,
+                                builds,
+                                version: None,
+                                retried: Some(retried),
+                                needed_by: None,
+                            });
+                        }
                     }
 
                     // Explain each abandoned build in its own log. The row is

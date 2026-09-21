@@ -14,8 +14,8 @@ use crate::models::package::{
 use crate::utils::error::{ApiError, err};
 use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
-use aurcache_common::build_state::BuildTrigger;
+use aurcache_activitylog::events::{Event, QueueCause};
+use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
 };
@@ -27,7 +27,7 @@ use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files, packages};
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::{live_check, package_remove};
-use aurcache_utils::package::update::{package_resync_dependencies, package_update};
+use aurcache_utils::package::update::{package_resync_dependencies, package_update, queued};
 use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::pkg::satisfies_constraint;
 use aurcache_utils::services::Services;
@@ -655,31 +655,33 @@ pub async fn package_update_endpoint(
     let pkg_model: packages::Model = package_by_pkgbase(db, pkgbase).await?;
     let package_name = pkg_model.name.clone();
     let forced = input.force;
+    // What the request was, named by what came before it: without `force` it
+    // is an update, and with it a rebuild of a build that worked or a retry of
+    // one that failed.
+    let cause = if forced {
+        QueueCause::after(pkg_model.status == BuildStates::FAILED_BUILD)
+    } else {
+        QueueCause::Update
+    };
 
     // An operator's Update or Rebuild, from the UI or the CLI.
-    let pkg_update = package_update(services, pkg_model, forced, BuildTrigger::User)
+    let results = package_update(services, pkg_model, forced, BuildTrigger::User)
         .await
-        .map(|results| {
-            Json(
-                results
-                    .into_iter()
-                    .filter(|r| r.enqueued)
-                    .map(|r| r.build_number)
-                    .collect::<Vec<_>>(),
-            )
-        })
         // Same as adding: "already up to date", an unresolvable source, or a
         // patch that no longer applies are all caller-visible conditions.
         .map_err(|e| err(Status::BadRequest, e))?;
 
     al.emit_by(
-        Event::PackageUpdated {
-            pkg: package_name.into(),
-            forced,
-        },
+        queued(&package_name, cause, &results, None, None),
         a.username,
     );
-    Ok(pkg_update)
+    Ok(Json(
+        results
+            .into_iter()
+            .filter(|r| r.enqueued)
+            .map(|r| r.build_number)
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -1760,9 +1762,19 @@ pub async fn package_dependency_replace(
     // held it up is no longer its dependency, or obliged to wait because the
     // replacement has not been built yet. Before `live_check`, which may delete
     // the old dependency and everything that hung off it.
-    aurcache_utils::worker_complete::resync_pending_builds(&services.db, dependent.id)
+    let unblocked =
+        aurcache_utils::worker_complete::resync_pending_builds(&services.db, dependent.id)
+            .await
+            .map_err(|e| err(Status::InternalServerError, e))?;
+    for build in aurcache_db::helpers::builds::build_refs(&services.db, &unblocked)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        .map_err(|e| err(Status::InternalServerError, e))?
+    {
+        services.activity.emit_by(
+            Event::BuildUnblocked { build, by: None },
+            a.username.clone(),
+        );
+    }
 
     // The usual collection, now that the old dependency may be holding nothing
     // up. This is what makes emptying a package's dependents remove it: patch

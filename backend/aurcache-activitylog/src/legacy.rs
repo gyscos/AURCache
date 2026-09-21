@@ -8,7 +8,7 @@
 //! than taking the rest with it.
 
 use crate::activity_utils::{LogRecord, write};
-use crate::events::Event;
+use crate::events::{Event, QueueCause};
 use aurcache_common::api::log::{BuildRef, PackageRef, WorkerRef};
 use aurcache_db::activities::{self, ActivityType};
 use aurcache_db::prelude::{Activities, Builds};
@@ -42,7 +42,10 @@ pub async fn import_activities(db: &DatabaseConnection) -> anyhow::Result<u64> {
 
     let mut moved = 0;
     for row in rows {
-        let Some(event) = convert(row.typ, &row.data, &builds) else {
+        // The old log credited the auto-updater to a user called "Server"; the
+        // server acting on its own is an entry with no user.
+        let user = row.user.clone().filter(|user| user != SERVER_USER);
+        let Some(event) = convert(row.typ, &row.data, user.is_none(), &builds) else {
             tracing::warn!(
                 "activity row {} ({:?}) could not be converted; leaving it in place",
                 row.id,
@@ -50,7 +53,7 @@ pub async fn import_activities(db: &DatabaseConnection) -> anyhow::Result<u64> {
             );
             continue;
         };
-        let record = LogRecord::of(&event, None, row.user.clone(), row.timestamp)?;
+        let record = LogRecord::of(&event, None, user, row.timestamp)?;
         if let Err(e) = write(db, record).await {
             tracing::warn!("could not import activity row {}: {e}", row.id);
             continue;
@@ -139,8 +142,22 @@ struct SettingRejected {
     settings: Vec<String>,
 }
 
+/// The name the old log gave the server when it acted on its own.
+const SERVER_USER: &str = "Server";
+
 /// The event an activity row recorded, in the vocabulary it is now written in.
-fn convert(typ: ActivityType, data: &str, builds: &HashMap<i32, BuildRef>) -> Option<Event> {
+///
+/// `by_server` is whether nobody asked for it, which decides what a forced
+/// update was: the auto-updater forced every VCS package past the version
+/// check, and that was an update; a person forcing one was rebuilding it.
+/// Which of a rebuild and a retry it was is not recorded, and rebuild is the
+/// likelier.
+fn convert(
+    typ: ActivityType,
+    data: &str,
+    by_server: bool,
+    builds: &HashMap<i32, BuildRef>,
+) -> Option<Event> {
     fn parse<'a, T: Deserialize<'a>>(data: &'a str) -> Option<T> {
         serde_json::from_str(data).ok()
     }
@@ -160,9 +177,17 @@ fn convert(typ: ActivityType, data: &str, builds: &HashMap<i32, BuildRef>) -> Op
         },
         ActivityType::UpdatePackage => {
             let update = parse::<Update>(data)?;
-            Event::PackageUpdated {
+            Event::BuildQueued {
                 pkg: pkg(update.package),
-                forced: update.forced,
+                cause: if update.forced && !by_server {
+                    QueueCause::Rebuild
+                } else {
+                    QueueCause::Update
+                },
+                builds: vec![],
+                version: None,
+                retried: None,
+                needed_by: None,
             }
         }
         ActivityType::ServerStart => Event::ServerStarted {
@@ -286,6 +311,28 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == crate::events::SERVER_START)
         );
+    }
+
+    /// A forced update from the auto-updater was an update, and it becomes the
+    /// server's own entry; one a person forced was a rebuild, and stays theirs.
+    #[tokio::test]
+    async fn a_forced_update_is_an_update_or_a_rebuild_by_who_asked() {
+        let db = db().await;
+        let forced = r#"{"package":"hello","forced":true}"#;
+        old_row(&db, ActivityType::UpdatePackage, forced, Some("Server")).await;
+        old_row(&db, ActivityType::UpdatePackage, forced, Some("alice")).await;
+        assert_eq!(import_activities(&db).await.unwrap(), 2);
+
+        let entries = aurcache_db::prelude::Logs::find().all(&db).await.unwrap();
+        let by = |user: Option<&str>| {
+            entries
+                .iter()
+                .find(|e| e.user.as_deref() == user)
+                .map(|e| e.message.as_str())
+        };
+        assert_eq!(by(None), Some("queued a build of hello (update)"));
+        assert_eq!(by(Some("alice")), Some("queued a build of hello (rebuild)"));
+        assert!(entries.iter().all(|e| e.kind == "build.queued"));
     }
 
     /// The reaper recorded row ids; a build that is gone cannot be named, so
