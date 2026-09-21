@@ -348,6 +348,11 @@ ROUTES=(
     "/logs?e=pkg:hello|added package|the log narrows to one package"
     "/logs?e=pkg:hello|About|the log says what it is narrowed to"
     "/package/hello|href=\"/logs?e=pkg:hello\"|a package links to its log"
+    # A package's and a worker's own recent entries, on their pages.
+    "/package/hello|added package|a package page shows its recent activity"
+    "/worker/builder-01|approved worker|a worker page shows its recent activity"
+    # A build names both its package and itself, each a link.
+    "/logs|href=\"/package/yay\"|a build entry links to its package too"
     # The path before Activity became Logs; a bookmark of it still lands.
     "/activities|added package|the old activities path redirects"
     # Filters ride the query, so a narrowed log is linkable. What a filter

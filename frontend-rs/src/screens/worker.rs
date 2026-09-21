@@ -202,6 +202,9 @@ fn WorkerPage(name: String, fingerprint: String) -> Element {
                                 WorkerConfig { id: worker.id }
                             }
                         }
+                        crate::screens::logs::RecentActivity {
+                            about: aurcache_client::WorkerRef::from(worker.name.as_str()).into(),
+                        }
                     },
                     Resolved::Several(matches) => rsx! {
                         WorkerChooser { name: name.clone(), matches: matches.into_iter().cloned().collect::<Vec<_>>() }

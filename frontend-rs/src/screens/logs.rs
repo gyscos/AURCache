@@ -256,8 +256,11 @@ fn RunningRow(operation: ActiveOperation, jobs: Signal<Vec<crate::progress::Job>
 /// Rendered from the payload rather than the stored text, which is what lets
 /// each name be a link without the server laying out a page. The stored text
 /// is the fallback, for an entry this build cannot decode.
+///
+/// A build is two links, the package and the number: "hello #7" is about both,
+/// and the package page is as likely a next step as the build's.
 #[component]
-fn EntryText(entry: LogEntry) -> Element {
+pub(crate) fn EntryText(entry: LogEntry) -> Element {
     let Some(event) = Event::decode(&entry.kind, &entry.data) else {
         return rsx! { "{entry.message}" };
     };
@@ -265,6 +268,19 @@ fn EntryText(entry: LogEntry) -> Element {
         for segment in event.sentence() {
             match segment {
                 Segment::Text(text) => rsx! { "{text}" },
+                Segment::Entity(EntityRef::Build(build)) => rsx! {
+                    Link {
+                        class: "link-hover font-medium",
+                        to: Route::Package { pkgbase: build.pkgbase.clone() },
+                        "{build.pkgbase}"
+                    }
+                    " "
+                    Link {
+                        class: "link-hover font-medium",
+                        to: entity_route(&EntityRef::Build(build.clone())),
+                        "#{build.number}"
+                    }
+                },
                 Segment::Entity(entity) => rsx! {
                     Link {
                         class: "link-hover font-medium",
@@ -272,6 +288,83 @@ fn EntryText(entry: LogEntry) -> Element {
                         "{entity.label()}"
                     }
                 },
+            }
+        }
+    }
+}
+
+/// How many entries a page's own activity panel shows before sending the
+/// reader to the log for the rest.
+const RECENT: u64 = 10;
+
+/// The latest entries about one package or worker, with the way to all of them.
+///
+/// The whole history is the log narrowed to it -- for a package, back to the
+/// entry that added it, within the log's retention -- so the panel shows the
+/// head and links there rather than paging a second copy of the same list.
+#[component]
+pub fn RecentActivity(about: EntityRef) -> Element {
+    let entries = use_resource(use_reactive(&about, |about| async move {
+        let query = LogQuery {
+            entity: Some(about),
+            ..LogQuery::default()
+        };
+        crate::api::client()?
+            .log(Some(RECENT), None, &query)
+            .await
+            .map_err(|e| e.to_string())
+    }));
+    crate::poll::use_poll(entries, false);
+
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body",
+                div { class: "flex items-baseline justify-between gap-2",
+                    h2 { class: "card-title text-base", "Activity" }
+                    Link {
+                        class: "link link-primary text-sm",
+                        to: Route::Logs {
+                            view: ViewParams::about(about),
+                        },
+                        "See all"
+                    }
+                }
+                match &*entries.read_unchecked() {
+                    None => rsx! {
+                        span { class: "loading loading-spinner loading-sm" }
+                    },
+                    Some(Err(e)) => rsx! {
+                        div { class: "text-sm text-error", "Could not load the activity: {e}" }
+                    },
+                    Some(Ok(page)) if page.entries.is_empty() => rsx! {
+                        p { class: "text-sm opacity-60", "Nothing recorded yet." }
+                    },
+                    Some(Ok(page)) => rsx! {
+                        ul { class: "divide-y divide-base-300",
+                            for entry in page.entries.iter() {
+                                li { key: "{entry.id}", class: "py-1.5 text-sm flex gap-3",
+                                    span { class: "whitespace-nowrap opacity-60 shrink-0",
+                                        AbsoluteDate { ts: Some(entry.timestamp) }
+                                    }
+                                    span { class: "min-w-0 break-words",
+                                        SeverityBadge { severity: entry.severity }
+                                        EntryText { entry: entry.clone() }
+                                        if let Some(user) = &entry.user {
+                                            span { class: "opacity-50", " — {user}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if page.total > RECENT {
+                            p { class: "text-xs opacity-60",
+                                "{page.total - RECENT} older "
+                                if page.total - RECENT == 1 { "entry" } else { "entries" }
+                                " in the log."
+                            }
+                        }
+                    },
+                }
             }
         }
     }

@@ -204,6 +204,9 @@ pub fn Package(pkgbase: String) -> Element {
                                 pkg: pkg.clone(),
                                 on_changed: move |()| data.restart(),
                             }
+                            crate::screens::logs::RecentActivity {
+                                about: aurcache_client::PackageRef::from(pkg.name.as_str()).into(),
+                            }
                             // Last in this column rather than full width
                             // under both: it is the one irreversible action
                             // here, and it still has no business sitting
