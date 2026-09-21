@@ -363,6 +363,14 @@ fn ButtonIcon(path: &'static str) -> Element {
     }
 }
 
+/// A funnel, on the log's per-row "narrow to this" menu.
+#[component]
+pub(crate) fn FilterIcon() -> Element {
+    rsx! {
+        ButtonIcon { path: "M3 4h18l-7 8.5V19l-4 2v-8.5L3 4Z" }
+    }
+}
+
 /// Copy-to-clipboard, on the build log's copy button.
 #[component]
 pub(crate) fn CopyIcon() -> Element {

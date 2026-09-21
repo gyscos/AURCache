@@ -18,7 +18,8 @@ use crate::dates::AbsoluteDate;
 use crate::listing::{ListHeader, PAGE_SIZE, Pager, ViewParams, use_url_view};
 use crate::routes::Route;
 use aurcache_client::{
-    ActiveOperation, EntityRef, Event, LogEntry, LogQuery, Segment, Severity, operation_kind,
+    ActiveOperation, EntityRef, Event, LogEntry, LogQuery, PackageRef, Segment, Severity,
+    WorkerRef, operation_kind,
 };
 use dioxus::prelude::*;
 use std::time::Duration;
@@ -41,7 +42,7 @@ pub fn Logs(view: ViewParams) -> Element {
     let mut page = use_signal(|| 0usize);
     let severity = use_signal(|| view.severity);
     let since_boot = use_signal(|| view.since_boot);
-    let about = use_signal(|| view.about.clone());
+    let mut about = use_signal(|| view.about.clone());
 
     // The whole route from live control state, which is what keeps a filtered
     // log linkable and survives a reload. No search box on this screen, so no
@@ -106,7 +107,10 @@ pub fn Logs(view: ViewParams) -> Element {
                         }
                     },
                     Some(Ok(view)) => rsx! {
-                        LogTable { entries: view.entries.clone() }
+                        LogTable {
+                            entries: view.entries.clone(),
+                            on_about: move |entity| about.set(Some(entity)),
+                        }
                         Pager {
                             page,
                             index: page().min(pages_of(view.total).saturating_sub(1)),
@@ -434,18 +438,215 @@ fn LogControls(
                 }
                 span { class: "label-text text-sm", "Since the last restart" }
             }
-            // Arrived at from a package, build or worker: say which, and let
-            // it go. No picker to set one here -- the pages are where you
-            // choose what you are asking about.
+            // Narrowed to one package, build or worker: say which, and let it
+            // go. Otherwise, offer to narrow it.
             if let Some(entity) = about() {
                 span { class: "badge badge-lg gap-1",
-                    "About "
+                    "{kind_of(&entity)} "
                     span { class: "font-mono", "{entity.label()}" }
                     button {
                         class: "btn btn-ghost btn-xs btn-circle",
                         aria_label: "Show the whole log",
                         onclick: move |_| about.set(None),
                         "✕"
+                    }
+                }
+            } else {
+                EntityPicker { about }
+            }
+        }
+    }
+}
+
+/// Narrow the log to one package or worker, by name.
+///
+/// A name typed rather than picked from a long list: the suggestions come from
+/// what the server tracks, but a package that has since been deleted is still
+/// something its old entries are about, so any name is accepted.
+#[component]
+fn EntityPicker(about: Signal<Option<EntityRef>>) -> Element {
+    let mut about = about;
+    let mut workers_chosen = use_signal(|| false);
+    let mut typed = use_signal(String::new);
+    // Fetched once, for suggestions only: nothing breaks if they fail.
+    let names = use_resource(move || async move {
+        let Ok(client) = crate::api::client() else {
+            return (Vec::new(), Vec::new());
+        };
+        let (packages, workers) = futures_util::future::join(
+            client.list_packages(None, None, true),
+            client.list_workers(),
+        )
+        .await;
+        let mut packages: Vec<String> = packages
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let mut workers: Vec<String> = workers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        packages.sort_unstable();
+        packages.dedup();
+        workers.sort_unstable();
+        workers.dedup();
+        (packages, workers)
+    });
+    let suggestions: Vec<String> = match &*names.read_unchecked() {
+        Some((packages, workers)) => {
+            if workers_chosen() {
+                workers.clone()
+            } else {
+                packages.clone()
+            }
+        }
+        None => Vec::new(),
+    };
+    let mut apply = move || {
+        let name = typed.peek().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        about.set(Some(if *workers_chosen.peek() {
+            WorkerRef::from(name).into()
+        } else {
+            PackageRef::from(name).into()
+        }));
+        typed.set(String::new());
+    };
+
+    rsx! {
+        div { class: "join",
+            select {
+                class: "select select-bordered select-sm join-item",
+                aria_label: "Narrow to a package or a worker",
+                onchange: move |e| workers_chosen.set(e.value() == "worker"),
+                option { value: "package", selected: !workers_chosen(), "Package" }
+                option { value: "worker", selected: workers_chosen(), "Worker" }
+            }
+            input {
+                class: "input input-bordered input-sm join-item w-48",
+                r#type: "text",
+                list: "log-entity-names",
+                placeholder: if workers_chosen() { "any worker" } else { "any package" },
+                aria_label: "Name to narrow the log to",
+                value: "{typed}",
+                oninput: move |e| typed.set(e.value()),
+                // Choosing a suggestion commits it, as Enter does.
+                onchange: move |_| apply(),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        apply();
+                    }
+                },
+            }
+            datalist { id: "log-entity-names",
+                for name in suggestions {
+                    option { key: "{name}", value: "{name}" }
+                }
+            }
+        }
+    }
+}
+
+/// What kind of thing a reference is, for the chip that names it.
+fn kind_of(entity: &EntityRef) -> &'static str {
+    match entity {
+        EntityRef::Package(_) => "Package",
+        EntityRef::Worker(_) => "Worker",
+        EntityRef::Build(_) => "Build",
+    }
+}
+
+/// Everything an entry is about, in the order its payload names it, with each
+/// build's package after it: the choices its row menu offers.
+///
+/// Read from the payload rather than the decoded event, so an entry this build
+/// cannot decode still offers them -- the same reading the server indexes by.
+pub(crate) fn entities_of(entry: &LogEntry) -> Vec<EntityRef> {
+    let mut found: Vec<EntityRef> = Vec::new();
+    let mut push = |entity: EntityRef| {
+        if !found.contains(&entity) {
+            found.push(entity);
+        }
+    };
+    let values = entry
+        .data
+        .as_object()
+        .into_iter()
+        .flat_map(|fields| fields.values())
+        .flat_map(|value| match value {
+            serde_json::Value::Array(items) => items.iter().collect::<Vec<_>>(),
+            other => vec![other],
+        });
+    for value in values {
+        let Some(entity) = value.as_str().and_then(|raw| raw.parse::<EntityRef>().ok()) else {
+            continue;
+        };
+        let package = match &entity {
+            EntityRef::Build(build) => Some(PackageRef::from(build.pkgbase.as_str()).into()),
+            _ => None,
+        };
+        push(entity);
+        if let Some(package) = package {
+            push(package);
+        }
+    }
+    if let Some(scope) = &entry.scope {
+        push(scope.clone());
+    }
+    found
+}
+
+/// A row's filter menu: narrow the log to something the entry is about.
+///
+/// Shown when the row is hovered or the button focused, so a page of rows is
+/// not a column of identical icons; always shown where there is no hover to
+/// reveal it (a touch screen), and while its menu is open. Absent on an entry
+/// that names nothing, rather than a menu with nothing in it.
+#[component]
+fn RowMenu(entry: LogEntry, on_about: EventHandler<EntityRef>) -> Element {
+    let mut open = use_signal(|| false);
+    let choices = entities_of(&entry);
+    if choices.is_empty() {
+        return rsx! {};
+    }
+    let trigger = if open() {
+        "btn btn-ghost btn-xs btn-square"
+    } else {
+        "btn btn-ghost btn-xs btn-square [@media(hover:hover)]:opacity-0 \
+         [@media(hover:hover)]:group-hover:opacity-100 focus-visible:opacity-100"
+    };
+    rsx! {
+        div { class: if open() { "dropdown dropdown-end dropdown-open" } else { "dropdown dropdown-end" },
+            button {
+                class: "{trigger}",
+                title: "Narrow the log to what this entry is about",
+                aria_label: "Narrow the log to what this entry is about",
+                aria_haspopup: "menu",
+                aria_expanded: "{open}",
+                onclick: move |_| open.toggle(),
+                crate::shell::FilterIcon {}
+            }
+            if open() {
+                ul { class: "dropdown-content menu menu-sm bg-base-100 rounded-box shadow z-10 w-64",
+                    role: "menu",
+                    for (key, kind, label, entity) in choices.into_iter().map(|entity| {
+                        (entity.to_string(), kind_of(&entity).to_lowercase(), entity.label(), entity)
+                    }) {
+                        li { key: "{key}",
+                            button {
+                                role: "menuitem",
+                                onclick: move |_| {
+                                    open.set(false);
+                                    on_about.call(entity.clone());
+                                },
+                                "Only entries about this {kind}: "
+                                span { class: "font-mono", "{label}" }
+                            }
+                        }
                     }
                 }
             }
@@ -481,7 +682,7 @@ fn pages_of(total: u64) -> usize {
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
 #[component]
-fn LogTable(entries: Vec<LogEntry>) -> Element {
+fn LogTable(entries: Vec<LogEntry>, on_about: EventHandler<EntityRef>) -> Element {
     rsx! {
         div { class: "overflow-x-auto",
             table { class: "table table-zebra",
@@ -493,11 +694,12 @@ fn LogTable(entries: Vec<LogEntry>) -> Element {
                         th { class: "w-px whitespace-nowrap", "When" }
                         th { class: "{WIDE_ONLY} w-px whitespace-nowrap", "Who" }
                         th { "What" }
+                        th { class: "w-px", span { class: "sr-only", "Options" } }
                     }
                 }
                 tbody {
                     for entry in entries.iter() {
-                        tr { key: "{entry.id}",
+                        tr { key: "{entry.id}", class: "group",
                             td { class: "w-px whitespace-nowrap text-sm opacity-70",
                                 AbsoluteDate { ts: Some(entry.timestamp) }
                             }
@@ -507,6 +709,9 @@ fn LogTable(entries: Vec<LogEntry>) -> Element {
                             td { class: "text-sm",
                                 SeverityBadge { severity: entry.severity }
                                 EntryText { entry: entry.clone() }
+                            }
+                            td { class: "w-px text-right",
+                                RowMenu { entry: entry.clone(), on_about }
                             }
                         }
                     }
@@ -529,7 +734,7 @@ fn actor(user: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogTable, LogTableProps, actor, entity_route};
+    use super::{LogTable, actor, entities_of, entity_route};
     use crate::routes::Route;
     use aurcache_client::{BuildRef, EntityRef, Event, LogEntry, PackageRef, WorkerRef};
     use dioxus::prelude::*;
@@ -548,8 +753,15 @@ mod tests {
         }
     }
 
+    /// The table with a handler that goes nowhere: the handler is built
+    /// inside a component, where the runtime it needs exists.
+    #[component]
+    fn Harness(entries: Vec<LogEntry>) -> Element {
+        rsx! { LogTable { entries, on_about: move |_| {} } }
+    }
+
     fn render(entries: Vec<LogEntry>) -> String {
-        let mut dom = VirtualDom::new_with_props(LogTable, LogTableProps { entries });
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { entries });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
@@ -623,6 +835,41 @@ mod tests {
         let html = render(vec![from_the_future, stale]);
         assert!(html.contains("someone arrived from next year"), "{html}");
         assert!(html.contains("an older shape of a start"), "{html}");
+    }
+
+    /// A row's menu offers everything the entry names, a build's package with
+    /// it, each once -- and reads the payload, so an entry this build cannot
+    /// decode still offers them.
+    #[test]
+    fn a_row_offers_everything_it_names() {
+        let build = || BuildRef {
+            pkgbase: "hello".to_string(),
+            number: 7,
+        };
+        let mut reaped = entry(
+            1,
+            &Event::WorkerReaped {
+                workers: vec![WorkerRef::from("builder-01")],
+                retried: vec![build()],
+                failed: vec![build()],
+            },
+            None,
+        );
+        reaped.kind = "from.the.future".to_string();
+        let offered = entities_of(&reaped);
+        assert_eq!(offered.len(), 3, "{offered:?}");
+        assert!(offered.contains(&EntityRef::Build(build())));
+        assert!(offered.contains(&EntityRef::Package(PackageRef::from("hello"))));
+        assert!(offered.contains(&EntityRef::Worker(WorkerRef::from("builder-01"))));
+
+        let quiet = entry(
+            2,
+            &Event::ServerStarted {
+                version: "1".to_string(),
+            },
+            None,
+        );
+        assert!(entities_of(&quiet).is_empty(), "nothing to offer, no menu");
     }
 
     /// Where each kind of reference opens. A worker goes by name, which is how

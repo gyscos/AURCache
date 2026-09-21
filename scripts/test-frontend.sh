@@ -346,8 +346,11 @@ ROUTES=(
     "/logs|href=\"/package/yay/build/7\"|a build entry links to the build"
     # Narrowed to one package, from the link on its page.
     "/logs?e=pkg:hello|added package|the log narrows to one package"
-    "/logs?e=pkg:hello|About|the log says what it is narrowed to"
+    "/logs?e=pkg:hello|Show the whole log|the log says what it is narrowed to, and lets it go"
     "/package/hello|href=\"/logs?e=pkg:hello\"|a package links to its log"
+    # The log can be narrowed from the page, by name or from a row.
+    "/logs|Narrow to a package or a worker|the log offers narrowing by name"
+    "/logs|Narrow the log to what this entry is about|each row offers narrowing to what it names"
     # A package's and a worker's own recent entries, on their pages.
     "/package/hello|added package|a package page shows its recent activity"
     "/worker/builder-01|approved worker|a worker page shows its recent activity"

@@ -848,6 +848,71 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         "{}",
         session.url().await
     );
+
+    // From a row: its filter menu offers what the entry names -- here the
+    // package of the build that failed to publish, beside the build itself.
+    session
+        .wait_for_script(
+            "the publish failure's row menu",
+            "const row = [...document.querySelectorAll('tbody tr')] \
+               .find(r => r.textContent.includes('no space left on device')); \
+             const button = row && row.querySelector('button[aria-haspopup=\"menu\"]'); \
+             if (!button) return false; button.click(); return true;"
+                .to_string(),
+        )
+        .await;
+    session
+        .click_labelled(
+            "button[role=\"menuitem\"]",
+            "Only entries about this package: yay",
+        )
+        .await;
+    session
+        .wait_until("the log narrowed from the row", |t| {
+            t.contains("forced update of package") && !t.contains("added package hello")
+        })
+        .await;
+    assert!(
+        session.url().await.contains("e=pkg:yay"),
+        "{}",
+        session.url().await
+    );
+    session
+        .click("button[aria-label=\"Show the whole log\"]")
+        .await;
+
+    // By name: a worker, typed and committed.
+    session
+        .select_option(
+            "select[aria-label=\"Narrow to a package or a worker\"]",
+            "worker",
+        )
+        .await;
+    session
+        .type_into(
+            "input[aria-label=\"Name to narrow the log to\"]",
+            "builder-01",
+        )
+        .await;
+    session
+        .wait_for_script(
+            "the name to be committed",
+            "const el = document.querySelector('input[aria-label=\"Name to narrow the log to\"]'); \
+             if (!el) return false; \
+             el.dispatchEvent(new Event('change', { bubbles: true })); return true;"
+                .to_string(),
+        )
+        .await;
+    session
+        .wait_until("the log about the worker", |t| {
+            t.contains("approved worker") && !t.contains("forced update of package")
+        })
+        .await;
+    assert!(
+        session.url().await.contains("e=worker:builder-01"),
+        "{}",
+        session.url().await
+    );
 }
 
 /// Queueing two packages and taking one back off again.
