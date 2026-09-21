@@ -427,6 +427,9 @@ mod tests {
             // The log's own dimensions, which share the same query encoding.
             ViewParams::for_logs(Some(Severity::Warning), false, None),
             ViewParams::for_logs(Some(Severity::Error), true, None),
+            ViewParams::for_logs(None, false, None).with_kind(Some("build.started".to_string())),
+            ViewParams::about(aurcache_client::PackageRef::from("hello"))
+                .with_kind(Some("package.updated".to_string())),
             ViewParams::for_logs(None, true, None),
             ViewParams::about(aurcache_client::PackageRef::from("gtk+")),
             ViewParams::about(aurcache_client::BuildRef {
@@ -1319,6 +1322,8 @@ pub struct ViewParams {
     pub since_boot: bool,
     /// Logs only: only entries naming this, in any role.
     pub about: Option<EntityRef>,
+    /// Logs only: only entries of this kind.
+    pub kind: Option<String>,
 }
 
 impl ViewParams {
@@ -1356,6 +1361,13 @@ impl ViewParams {
             about,
             ..Self::default()
         }
+    }
+
+    /// The same view, narrowed to one kind of entry as well.
+    #[must_use]
+    pub fn with_kind(mut self, kind: Option<String>) -> Self {
+        self.kind = kind.filter(|kind| !kind.is_empty());
+        self
     }
 
     /// The log, narrowed to what names `entity`: where a page links to "its"
@@ -1411,6 +1423,11 @@ impl std::fmt::Display for ViewParams {
         }
         if let Some(about) = &self.about {
             write!(f, "{sep}e={about}")?;
+            sep = "&";
+        }
+        // Kinds are `domain.verb_object`: nothing in them needs escaping.
+        if let Some(kind) = &self.kind {
+            write!(f, "{sep}k={kind}")?;
         }
         Ok(())
     }
@@ -1445,6 +1462,7 @@ impl From<&str> for ViewParams {
                 // have turned into a space. No reference can contain a space,
                 // so turning one back is always right.
                 "e" => view.about = value.replace("%2B", "+").replace(' ', "+").parse().ok(),
+                "k" => view.kind = Some(value.to_string()).filter(|kind| !kind.is_empty()),
                 _ => {}
             }
         }

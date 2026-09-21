@@ -349,7 +349,9 @@ ROUTES=(
     "/logs?e=pkg:hello|Show the whole log|the log says what it is narrowed to, and lets it go"
     "/package/hello|href=\"/logs?e=pkg:hello\"|a package links to its log"
     # The log can be narrowed from the page, by name or from a row.
-    "/logs|Narrow to a package or a worker|the log offers narrowing by name"
+    "/logs|Search for a package or worker to filter by|the log offers narrowing by name"
+    "/logs|Filter by kind|the log offers narrowing by kind"
+    "/logs?k=build.started|Every kind|a kind filter in the URL is applied"
     "/logs|Narrow the log to what this entry is about|each row offers narrowing to what it names"
     # A package's and a worker's own recent entries, on their pages.
     "/package/hello|added package|a package page shows its recent activity"

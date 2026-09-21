@@ -881,25 +881,21 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         .click("button[aria-label=\"Show the whole log\"]")
         .await;
 
-    // By name: a worker, typed and committed.
-    session
-        .select_option(
-            "select[aria-label=\"Narrow to a package or a worker\"]",
-            "worker",
-        )
-        .await;
+    // By name: one search box over packages and workers; picking a
+    // suggestion narrows the log to it.
     session
         .type_into(
-            "input[aria-label=\"Name to narrow the log to\"]",
-            "builder-01",
+            "input[aria-label=\"Search for a package or worker to filter by\"]",
+            "builder",
         )
         .await;
     session
         .wait_for_script(
-            "the name to be committed",
-            "const el = document.querySelector('input[aria-label=\"Name to narrow the log to\"]'); \
-             if (!el) return false; \
-             el.dispatchEvent(new Event('change', { bubbles: true })); return true;"
+            "the worker suggestion to be picked",
+            "const option = [...document.querySelectorAll('button[role=\"option\"]')] \
+               .find(o => o.textContent.includes('builder-01') && o.textContent.includes('worker')); \
+             if (!option) return false; \
+             option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); return true;"
                 .to_string(),
         )
         .await;
@@ -913,6 +909,43 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         "{}",
         session.url().await
     );
+    session
+        .click("button[aria-label=\"Show the whole log\"]")
+        .await;
+
+    // By kind: from a row's funnel, then back to every kind from the select.
+    session
+        .wait_for_script(
+            "the forced update's row menu",
+            "const row = [...document.querySelectorAll('tbody tr')] \
+               .find(r => r.textContent.includes('forced update of package')); \
+             const button = row && row.querySelector('button[aria-haspopup=\"menu\"]'); \
+             if (!button) return false; button.click(); return true;"
+                .to_string(),
+        )
+        .await;
+    session
+        .click_labelled(
+            "button[role=\"menuitem\"]",
+            "Only entries like this: Package updated",
+        )
+        .await;
+    session
+        .wait_until("only package updates", |t| {
+            t.contains("forced update of package") && !t.contains("approved worker")
+        })
+        .await;
+    assert!(
+        session.url().await.contains("k=package.updated"),
+        "{}",
+        session.url().await
+    );
+    session
+        .select_option("select[aria-label=\"Filter by kind\"]", "")
+        .await;
+    session
+        .wait_until("every kind back", |t| t.contains("approved worker"))
+        .await;
 }
 
 /// Queueing two packages and taking one back off again.

@@ -18,8 +18,8 @@ use crate::dates::AbsoluteDate;
 use crate::listing::{ListHeader, PAGE_SIZE, Pager, ViewParams, use_url_view};
 use crate::routes::Route;
 use aurcache_client::{
-    ActiveOperation, EntityRef, Event, LogEntry, LogQuery, PackageRef, Segment, Severity,
-    WorkerRef, operation_kind,
+    ActiveOperation, EntityRef, Event, KINDS, LogEntry, LogQuery, PackageRef, Segment, Severity,
+    WorkerRef, kind_label, operation_kind,
 };
 use dioxus::prelude::*;
 use std::time::Duration;
@@ -43,19 +43,20 @@ pub fn Logs(view: ViewParams) -> Element {
     let severity = use_signal(|| view.severity);
     let since_boot = use_signal(|| view.since_boot);
     let mut about = use_signal(|| view.about.clone());
+    let mut kind = use_signal(|| view.kind.clone());
 
     // The whole route from live control state, which is what keeps a filtered
-    // log linkable and survives a reload. No search box on this screen, so no
-    // term signal.
+    // log linkable and survives a reload. The search box picks a filter rather
+    // than holding a term, so there is no term signal.
     let to_route = move |_: String| Route::Logs {
-        view: ViewParams::for_logs(severity(), since_boot(), about()),
+        view: ViewParams::for_logs(severity(), since_boot(), about()).with_kind(kind()),
     };
     use_url_view(None, true, to_route);
 
     // Narrowing the log changes what page 1 even is, so start again from it --
     // otherwise a filter applied on page 4 lands past the end of a shorter log.
     use_effect(use_reactive(
-        &(severity(), since_boot(), about()),
+        &(severity(), since_boot(), about(), kind()),
         move |_| {
             page.set(0);
         },
@@ -67,6 +68,7 @@ pub fn Logs(view: ViewParams) -> Element {
             severity: severity(),
             since_boot: since_boot(),
             entity: about(),
+            kind: kind(),
             ..LogQuery::default()
         };
         crate::api::client()?
@@ -83,7 +85,7 @@ pub fn Logs(view: ViewParams) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 ListHeader { title: "Logs" }
-                LogControls { severity, since_boot, about }
+                LogControls { severity, since_boot, about, kind }
 
                 match &*entries.read_unchecked() {
                     None => rsx! {
@@ -99,7 +101,7 @@ pub fn Logs(view: ViewParams) -> Element {
                             // A filter that matched nothing is a different
                             // answer from an empty log, and the remedy is
                             // different too.
-                            if severity().is_some() || since_boot() || about().is_some() {
+                            if severity().is_some() || since_boot() || about().is_some() || kind().is_some() {
                                 span { "Nothing matches these filters." }
                             } else {
                                 span { "Nothing has happened yet." }
@@ -110,6 +112,7 @@ pub fn Logs(view: ViewParams) -> Element {
                         LogTable {
                             entries: view.entries.clone(),
                             on_about: move |entity| about.set(Some(entity)),
+                            on_kind: move |chosen| kind.set(Some(chosen)),
                         }
                         Pager {
                             page,
@@ -405,10 +408,12 @@ fn LogControls(
     severity: Signal<Option<Severity>>,
     since_boot: Signal<bool>,
     about: Signal<Option<EntityRef>>,
+    kind: Signal<Option<String>>,
 ) -> Element {
     let mut severity = severity;
     let mut since_boot = since_boot;
     let mut about = about;
+    let mut kind = kind;
 
     rsx! {
         div { class: "flex flex-wrap items-center gap-3 mb-2",
@@ -428,6 +433,7 @@ fn LogControls(
                     "Errors only"
                 }
             }
+            KindSelect { kind }
             label { class: "label cursor-pointer gap-2 py-0",
                 input {
                     r#type: "checkbox",
@@ -452,22 +458,100 @@ fn LogControls(
                     }
                 }
             } else {
-                EntityPicker { about }
+                EntitySearch { about }
+            }
+            // A kind from a newer server, or a hand-edited URL, is not in the
+            // select; the chip still says what the log is narrowed to.
+            if let Some(chosen) = kind().filter(|chosen| !KINDS.iter().any(|k| k.kind == chosen)) {
+                span { class: "badge badge-lg gap-1",
+                    span { class: "font-mono", "{chosen}" }
+                    button {
+                        class: "btn btn-ghost btn-xs btn-circle",
+                        aria_label: "Show every kind",
+                        onclick: move |_| kind.set(None),
+                        "✕"
+                    }
+                }
             }
         }
     }
 }
 
-/// Narrow the log to one package or worker, by name.
-///
-/// A name typed rather than picked from a long list: the suggestions come from
-/// what the server tracks, but a package that has since been deleted is still
-/// something its old entries are about, so any name is accepted.
+/// Narrow the log to one kind of entry, from the catalogue grouped by area.
 #[component]
-fn EntityPicker(about: Signal<Option<EntityRef>>) -> Element {
+fn KindSelect(kind: Signal<Option<String>>) -> Element {
+    let mut kind = kind;
+    let mut groups: Vec<&'static str> = Vec::new();
+    for known in KINDS {
+        if !groups.contains(&known.group) {
+            groups.push(known.group);
+        }
+    }
+    rsx! {
+        select {
+            class: "select select-bordered select-sm",
+            aria_label: "Filter by kind",
+            onchange: move |e| kind.set(Some(e.value()).filter(|value| !value.is_empty())),
+            option { value: "", selected: kind().is_none(), "Every kind" }
+            for group in groups {
+                optgroup { key: "{group}", label: "{group}",
+                    for known in KINDS.iter().filter(|known| known.group == group) {
+                        option {
+                            key: "{known.kind}",
+                            value: "{known.kind}",
+                            selected: kind().as_deref() == Some(known.kind),
+                            "{known.label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How many suggestions the search box offers at once.
+const SUGGESTIONS: usize = 8;
+
+/// The packages and workers whose name contains `query`, names that start
+/// with it first, then alphabetically; packages before workers on a tie.
+pub(crate) fn suggest(query: &str, packages: &[String], workers: &[String]) -> Vec<EntityRef> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<(bool, String, u8, EntityRef)> = Vec::new();
+    for (rank, names) in [(0u8, packages), (1u8, workers)] {
+        for name in names {
+            let lowered = name.to_lowercase();
+            if !lowered.contains(&query) {
+                continue;
+            }
+            let entity = if rank == 0 {
+                PackageRef::from(name.as_str()).into()
+            } else {
+                WorkerRef::from(name.as_str()).into()
+            };
+            found.push((!lowered.starts_with(&query), lowered, rank, entity));
+        }
+    }
+    found.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    found
+        .into_iter()
+        .take(SUGGESTIONS)
+        .map(|(_, _, _, entity)| entity)
+        .collect()
+}
+
+/// One search box over packages and workers: type part of a name, pick a
+/// suggestion, and the log narrows to it.
+///
+/// Suggestions come from what the server tracks now; a deleted package's old
+/// entries are reached from their rows' funnel instead.
+#[component]
+fn EntitySearch(about: Signal<Option<EntityRef>>) -> Element {
     let mut about = about;
-    let mut workers_chosen = use_signal(|| false);
     let mut typed = use_signal(String::new);
+    let mut focused = use_signal(|| false);
     // Fetched once, for suggestions only: nothing breaks if they fail.
     let names = use_resource(move || async move {
         let Ok(client) = crate::api::client() else {
@@ -494,57 +578,56 @@ fn EntityPicker(about: Signal<Option<EntityRef>>) -> Element {
         workers.dedup();
         (packages, workers)
     });
-    let suggestions: Vec<String> = match &*names.read_unchecked() {
-        Some((packages, workers)) => {
-            if workers_chosen() {
-                workers.clone()
-            } else {
-                packages.clone()
-            }
-        }
+    let matches = match &*names.read_unchecked() {
+        Some((packages, workers)) => suggest(&typed(), packages, workers),
         None => Vec::new(),
     };
-    let mut apply = move || {
-        let name = typed.peek().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        about.set(Some(if *workers_chosen.peek() {
-            WorkerRef::from(name).into()
-        } else {
-            PackageRef::from(name).into()
-        }));
+    let first = matches.first().cloned();
+    let mut choose = move |entity: EntityRef| {
+        about.set(Some(entity));
         typed.set(String::new());
     };
 
     rsx! {
-        div { class: "join",
-            select {
-                class: "select select-bordered select-sm join-item",
-                aria_label: "Narrow to a package or a worker",
-                onchange: move |e| workers_chosen.set(e.value() == "worker"),
-                option { value: "package", selected: !workers_chosen(), "Package" }
-                option { value: "worker", selected: workers_chosen(), "Worker" }
-            }
+        div { class: "relative",
             input {
-                class: "input input-bordered input-sm join-item w-48",
-                r#type: "text",
-                list: "log-entity-names",
-                placeholder: if workers_chosen() { "any worker" } else { "any package" },
-                aria_label: "Name to narrow the log to",
+                class: "input input-bordered input-sm w-60",
+                r#type: "search",
+                placeholder: "Package or worker…",
+                aria_label: "Search for a package or worker to filter by",
+                autocomplete: "off",
                 value: "{typed}",
                 oninput: move |e| typed.set(e.value()),
-                // Choosing a suggestion commits it, as Enter does.
-                onchange: move |_| apply(),
+                onfocus: move |_| focused.set(true),
+                onblur: move |_| focused.set(false),
                 onkeydown: move |e| {
-                    if e.key() == Key::Enter {
-                        apply();
+                    if e.key() == Key::Enter
+                        && let Some(entity) = first.clone()
+                    {
+                        choose(entity);
+                    } else if e.key() == Key::Escape {
+                        typed.set(String::new());
                     }
                 },
             }
-            datalist { id: "log-entity-names",
-                for name in suggestions {
-                    option { key: "{name}", value: "{name}" }
+            if focused() && !matches.is_empty() {
+                ul {
+                    class: "menu menu-sm absolute z-20 mt-1 w-72 bg-base-100 rounded-box shadow",
+                    role: "listbox",
+                    for (key, label, what, entity) in matches.into_iter().map(|entity| {
+                        (entity.to_string(), entity.label(), kind_of(&entity).to_lowercase(), entity)
+                    }) {
+                        li { key: "{key}",
+                            // `mousedown`, not `click`: it lands before the
+                            // input's blur hides the list.
+                            button {
+                                role: "option",
+                                onmousedown: move |_| choose(entity.clone()),
+                                span { class: "font-mono", "{label}" }
+                                span { class: "badge badge-ghost badge-sm", "{what}" }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -604,15 +687,18 @@ pub(crate) fn entities_of(entry: &LogEntry) -> Vec<EntityRef> {
 ///
 /// Shown when the row is hovered or the button focused, so a page of rows is
 /// not a column of identical icons; always shown where there is no hover to
-/// reveal it (a touch screen), and while its menu is open. Absent on an entry
-/// that names nothing, rather than a menu with nothing in it.
+/// reveal it (a touch screen), and while its menu is open. Every row has one:
+/// its kind is always something to narrow to.
 #[component]
-fn RowMenu(entry: LogEntry, on_about: EventHandler<EntityRef>) -> Element {
+fn RowMenu(
+    entry: LogEntry,
+    on_about: EventHandler<EntityRef>,
+    on_kind: EventHandler<String>,
+) -> Element {
     let mut open = use_signal(|| false);
     let choices = entities_of(&entry);
-    if choices.is_empty() {
-        return rsx! {};
-    }
+    let kind = entry.kind.clone();
+    let kind_name = kind_label(&entry.kind).to_string();
     let trigger = if open() {
         "btn btn-ghost btn-xs btn-square"
     } else {
@@ -631,8 +717,19 @@ fn RowMenu(entry: LogEntry, on_about: EventHandler<EntityRef>) -> Element {
                 crate::shell::FilterIcon {}
             }
             if open() {
-                ul { class: "dropdown-content menu menu-sm bg-base-100 rounded-box shadow z-10 w-64",
+                ul { class: "dropdown-content menu menu-sm bg-base-100 rounded-box shadow z-10 w-72",
                     role: "menu",
+                    li {
+                        button {
+                            role: "menuitem",
+                            onclick: move |_| {
+                                open.set(false);
+                                on_kind.call(kind.clone());
+                            },
+                            "Only entries like this: "
+                            span { class: "font-medium", "{kind_name}" }
+                        }
+                    }
                     for (key, kind, label, entity) in choices.into_iter().map(|entity| {
                         (entity.to_string(), kind_of(&entity).to_lowercase(), entity.label(), entity)
                     }) {
@@ -682,7 +779,11 @@ fn pages_of(total: u64) -> usize {
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
 #[component]
-fn LogTable(entries: Vec<LogEntry>, on_about: EventHandler<EntityRef>) -> Element {
+fn LogTable(
+    entries: Vec<LogEntry>,
+    on_about: EventHandler<EntityRef>,
+    on_kind: EventHandler<String>,
+) -> Element {
     rsx! {
         div { class: "overflow-x-auto",
             table { class: "table table-zebra",
@@ -711,7 +812,7 @@ fn LogTable(entries: Vec<LogEntry>, on_about: EventHandler<EntityRef>) -> Elemen
                                 EntryText { entry: entry.clone() }
                             }
                             td { class: "w-px text-right",
-                                RowMenu { entry: entry.clone(), on_about }
+                                RowMenu { entry: entry.clone(), on_about, on_kind }
                             }
                         }
                     }
@@ -734,7 +835,7 @@ fn actor(user: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogTable, actor, entities_of, entity_route};
+    use super::{LogTable, actor, entities_of, entity_route, suggest};
     use crate::routes::Route;
     use aurcache_client::{BuildRef, EntityRef, Event, LogEntry, PackageRef, WorkerRef};
     use dioxus::prelude::*;
@@ -757,7 +858,7 @@ mod tests {
     /// inside a component, where the runtime it needs exists.
     #[component]
     fn Harness(entries: Vec<LogEntry>) -> Element {
-        rsx! { LogTable { entries, on_about: move |_| {} } }
+        rsx! { LogTable { entries, on_about: move |_| {}, on_kind: move |_| {} } }
     }
 
     fn render(entries: Vec<LogEntry>) -> String {
@@ -870,6 +971,28 @@ mod tests {
             None,
         );
         assert!(entities_of(&quiet).is_empty(), "nothing to offer, no menu");
+    }
+
+    /// Names that start with what was typed come first, then any containing
+    /// it; packages and workers alike, each marked for what it is.
+    #[test]
+    fn suggestions_put_prefixes_first_and_mix_packages_and_workers() {
+        let packages = vec![
+            "hello".to_string(),
+            "othello".to_string(),
+            "yay".to_string(),
+        ];
+        let workers = vec!["hel-builder".to_string(), "builder-01".to_string()];
+        assert_eq!(
+            suggest("HEL", &packages, &workers),
+            vec![
+                EntityRef::Worker(WorkerRef::from("hel-builder")),
+                EntityRef::Package(PackageRef::from("hello")),
+                EntityRef::Package(PackageRef::from("othello")),
+            ]
+        );
+        assert!(suggest("  ", &packages, &workers).is_empty());
+        assert!(suggest("nothing", &packages, &workers).is_empty());
     }
 
     /// Where each kind of reference opens. A worker goes by name, which is how

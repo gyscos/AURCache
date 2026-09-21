@@ -474,6 +474,335 @@ pub enum Event {
     RepoSweepFailed { error: String },
 }
 
+/// One kind, as a person picking it from a list would read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kind {
+    /// What the `kind` column holds.
+    pub kind: &'static str,
+    /// The heading it is listed under.
+    pub group: &'static str,
+    /// What it is called in that list.
+    pub label: &'static str,
+}
+
+/// Every kind this build records, grouped for a picker.
+///
+/// A list rather than something derived from the enum: the enum has no way to
+/// name its variants without an instance, and the labels are prose. A test
+/// holds it to the catalogue, so a new event cannot be missing from it.
+pub const KINDS: &[Kind] = &[
+    Kind {
+        kind: "build.started",
+        group: "Builds",
+        label: "Build started",
+    },
+    Kind {
+        kind: "build.succeeded",
+        group: "Builds",
+        label: "Build finished",
+    },
+    Kind {
+        kind: "build.failed",
+        group: "Builds",
+        label: "Build failed",
+    },
+    Kind {
+        kind: "build.published",
+        group: "Builds",
+        label: "Build published",
+    },
+    Kind {
+        kind: "publish.failed",
+        group: "Builds",
+        label: "Publishing failed",
+    },
+    Kind {
+        kind: "build.cancelled",
+        group: "Builds",
+        label: "Build stopped",
+    },
+    Kind {
+        kind: "build.retried",
+        group: "Builds",
+        label: "Build retried",
+    },
+    Kind {
+        kind: "build.deleted",
+        group: "Builds",
+        label: "Build deleted",
+    },
+    Kind {
+        kind: "build.completion_rejected",
+        group: "Builds",
+        label: "Finish report refused",
+    },
+    Kind {
+        kind: "build.record_failed",
+        group: "Builds",
+        label: "Build detail not recorded",
+    },
+    Kind {
+        kind: "build.mark_failed",
+        group: "Builds",
+        label: "Build not marked failed",
+    },
+    Kind {
+        kind: "build_log.append_failed",
+        group: "Builds",
+        label: "Build log line lost",
+    },
+    Kind {
+        kind: "build.enqueue_skipped",
+        group: "Builds",
+        label: "Not queued at startup",
+    },
+    Kind {
+        kind: "build.startup_enqueue_failed",
+        group: "Builds",
+        label: "Startup queueing failed",
+    },
+    Kind {
+        kind: "dependents.trigger_failed",
+        group: "Builds",
+        label: "Dependents not triggered",
+    },
+    Kind {
+        kind: "package.added",
+        group: "Packages",
+        label: "Package added",
+    },
+    Kind {
+        kind: "package.updated",
+        group: "Packages",
+        label: "Package updated",
+    },
+    Kind {
+        kind: "package.changed",
+        group: "Packages",
+        label: "Package changed",
+    },
+    Kind {
+        kind: "package.deleted",
+        group: "Packages",
+        label: "Package deleted",
+    },
+    Kind {
+        kind: "update.skipped",
+        group: "Packages",
+        label: "Auto-update skipped",
+    },
+    Kind {
+        kind: "update.queue_failed",
+        group: "Packages",
+        label: "Update queueing failed",
+    },
+    Kind {
+        kind: "bulk_add.resolve_failed",
+        group: "Packages",
+        label: "Bulk add slowed",
+    },
+    Kind {
+        kind: "operation.aborted",
+        group: "Packages",
+        label: "Bulk add or restore aborted",
+    },
+    Kind {
+        kind: "source.edited",
+        group: "Sources and versions",
+        label: "Source edited",
+    },
+    Kind {
+        kind: "source.refresh_failed",
+        group: "Sources and versions",
+        label: "Source refresh failed",
+    },
+    Kind {
+        kind: "source.sourceinfo_failed",
+        group: "Sources and versions",
+        label: "Sourceinfo unreadable",
+    },
+    Kind {
+        kind: "source.metadata_failed",
+        group: "Sources and versions",
+        label: "Metadata not refreshed",
+    },
+    Kind {
+        kind: "source.checkout_remove_failed",
+        group: "Sources and versions",
+        label: "Checkout left behind",
+    },
+    Kind {
+        kind: "vcs.sync_failed",
+        group: "Sources and versions",
+        label: "VCS sources not synced",
+    },
+    Kind {
+        kind: "version_check.pass_failed",
+        group: "Sources and versions",
+        label: "Version check failed",
+    },
+    Kind {
+        kind: "version_check.aur_missing",
+        group: "Sources and versions",
+        label: "Gone from the AUR",
+    },
+    Kind {
+        kind: "version_check.store_failed",
+        group: "Sources and versions",
+        label: "Version check not stored",
+    },
+    Kind {
+        kind: "version.compare_fallback",
+        group: "Sources and versions",
+        label: "Versions not comparable",
+    },
+    Kind {
+        kind: "deps.unresolved",
+        group: "Dependencies",
+        label: "Dependency unresolved",
+    },
+    Kind {
+        kind: "deps.replaced",
+        group: "Dependencies",
+        label: "Dependency replaced",
+    },
+    Kind {
+        kind: "deps.dropped",
+        group: "Dependencies",
+        label: "Dependency dropped",
+    },
+    Kind {
+        kind: "worker.enrolled",
+        group: "Workers",
+        label: "Worker enrolled",
+    },
+    Kind {
+        kind: "worker.registered",
+        group: "Workers",
+        label: "Worker checked in",
+    },
+    Kind {
+        kind: "worker.approved",
+        group: "Workers",
+        label: "Worker approved",
+    },
+    Kind {
+        kind: "worker.revoked",
+        group: "Workers",
+        label: "Worker revoked",
+    },
+    Kind {
+        kind: "worker.reaped",
+        group: "Workers",
+        label: "Worker stopped answering",
+    },
+    Kind {
+        kind: "worker.config_changed",
+        group: "Workers",
+        label: "Worker configuration changed",
+    },
+    Kind {
+        kind: "worker.setting_rejected",
+        group: "Workers",
+        label: "Worker setting refused",
+    },
+    Kind {
+        kind: "worker.report_failed",
+        group: "Workers",
+        label: "Worker report not stored",
+    },
+    Kind {
+        kind: "setting.changed",
+        group: "Settings and access",
+        label: "Setting changed",
+    },
+    Kind {
+        kind: "setting.reset",
+        group: "Settings and access",
+        label: "Setting reset",
+    },
+    Kind {
+        kind: "schedule.invalid",
+        group: "Settings and access",
+        label: "Schedule unusable",
+    },
+    Kind {
+        kind: "auth.sign_in_refused",
+        group: "Settings and access",
+        label: "Sign-in refused",
+    },
+    Kind {
+        kind: "auth.token_regenerated",
+        group: "Settings and access",
+        label: "API token replaced",
+    },
+    Kind {
+        kind: "dump.exported",
+        group: "Backups",
+        label: "Dump exported",
+    },
+    Kind {
+        kind: "restore.applied",
+        group: "Backups",
+        label: "Dump restored",
+    },
+    Kind {
+        kind: "restore.package_failed",
+        group: "Backups",
+        label: "Restore step failed",
+    },
+    Kind {
+        kind: "restore.ca_replaced",
+        group: "Backups",
+        label: "Worker CA replaced",
+    },
+    Kind {
+        kind: "server.start",
+        group: "Server and repository",
+        label: "Server started",
+    },
+    Kind {
+        kind: "repo.swept",
+        group: "Server and repository",
+        label: "Retired files removed",
+    },
+    Kind {
+        kind: "repo.sweep_failed",
+        group: "Server and repository",
+        label: "Sweep failed",
+    },
+    Kind {
+        kind: "repo.commit_retry",
+        group: "Server and repository",
+        label: "Repository commit retried",
+    },
+    Kind {
+        kind: "repo.file_failed",
+        group: "Server and repository",
+        label: "Repository file failed",
+    },
+    Kind {
+        kind: "mirrors.rank_failed",
+        group: "Server and repository",
+        label: "Mirror ranking failed",
+    },
+    Kind {
+        kind: "official_repos.refresh_failed",
+        group: "Server and repository",
+        label: "Official repos not refreshed",
+    },
+];
+
+/// The picker's name for `kind`, or the kind itself for one this build does
+/// not know -- a row from a newer server still has something to show.
+#[must_use]
+pub fn kind_label(kind: &str) -> &str {
+    KINDS
+        .iter()
+        .find(|known| known.kind == kind)
+        .map_or(kind, |known| known.label)
+}
+
 /// Which report a worker sent about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1303,6 +1632,22 @@ mod tests {
             },
             Event::RepoSweepFailed { error: error() },
         ]
+    }
+
+    /// The picker's list is the catalogue: every kind an event can have is in
+    /// it once, and nothing else is.
+    #[test]
+    fn the_picker_lists_every_kind_once() {
+        let mut listed: Vec<&str> = KINDS.iter().map(|k| k.kind).collect();
+        listed.sort_unstable();
+        let total = listed.len();
+        listed.dedup();
+        assert_eq!(listed.len(), total, "a kind is listed twice");
+        let mut known: Vec<&str> = one_of_each().iter().map(Event::kind).collect();
+        known.sort_unstable();
+        assert_eq!(listed, known);
+        assert_eq!(kind_label("build.started"), "Build started");
+        assert_eq!(kind_label("from.the.future"), "from.the.future");
     }
 
     /// The kind an event reports and the tag serde writes are two separate
