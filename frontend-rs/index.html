@@ -29,6 +29,21 @@
 
       .series-0 .chart-line { stroke: oklch(var(--p)); }
       .series-1 .chart-line { stroke: oklch(var(--su)); }
+      .dx-grid-label {
+        fill: oklch(var(--bc));
+        font-size: 12px;
+      }
+      .dx-grid-line {
+        stroke: oklch(var(--bc) / 0.15);
+      }
+      /* Months sit on the horizontal axis; with the crate's 6px LABEL_OFFSET
+         and hanging baseline they render on the line in some browsers.
+         Nudge the hanging labels (x-axis, anchor start) 6px further down so
+         the text is clearly below the axis, not on it. The y-axis labels
+         (anchor end, text-bottom) are unaffected. */
+      g.dx-grid-labels text[alignment-baseline="hanging"] {
+        transform: translateY(6px);
+      }
     </style>
   </head>
   <body>
