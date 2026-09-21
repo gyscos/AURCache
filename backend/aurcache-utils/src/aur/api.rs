@@ -53,6 +53,15 @@ pub async fn query_aur(query: &str) -> anyhow::Result<Vec<aurcache_deps::Package
     Ok(results)
 }
 
+/// Retrieve AUR package information by its name.
+/// Returns `None` if the package is not found.
+pub async fn get_package_info(pkg_name: &str) -> anyhow::Result<Option<aurcache_deps::Package>> {
+    client()
+        .info_of(pkg_name)
+        .await
+        .map_err(|e| anyhow!("failed to get package info: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::package_matches_terms;
@@ -63,7 +72,7 @@ mod tests {
             description,
             &query_terms
                 .iter()
-                .map(|t| t.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
         )
     }
@@ -96,13 +105,4 @@ mod tests {
     fn matching_ignores_case() {
         assert!(matches("Hello", None, &["hello"]));
     }
-}
-
-/// Retrieve AUR package information by its name.
-/// Returns `None` if the package is not found.
-pub async fn get_package_info(pkg_name: &str) -> anyhow::Result<Option<aurcache_deps::Package>> {
-    client()
-        .info_of(pkg_name)
-        .await
-        .map_err(|e| anyhow!("failed to get package info: {e}"))
 }
