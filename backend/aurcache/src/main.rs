@@ -1,11 +1,10 @@
 use crate::logger::init_logger;
 use crate::startup::{post_startup_tasks, pre_startup_tasks};
 use aurcache_activitylog::activity_utils as activitylog;
-use aurcache_activitylog::server_start_activity::ServerStartActivity;
+use aurcache_activitylog::events::Event;
 use aurcache_api::init::{CaDirectory, ServerVersion, init_api, init_repo, init_worker_api};
 use aurcache_builder::init::init_build_queue;
 use aurcache_db::action::Action;
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::init::init_db;
 use aurcache_deps::AurClient;
@@ -42,6 +41,14 @@ async fn main() {
         warn!("Startup cleanup did not complete: {e}");
     }
 
+    // What the curated activity log recorded, carried into the structured log
+    // it became. Once, in practice: rows leave the old table as they land.
+    match aurcache_activitylog::legacy::import_activities(&db).await {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!("Moved {moved} activity log entries into the log"),
+        Err(e) => warn!("Could not move the activity log into the log: {e}"),
+    }
+
     // The one task that writes the log. Everything else records through a
     // handle to it and never touches the table, so no call site has to decide
     // what to do about a write that did not land.
@@ -50,13 +57,9 @@ async fn main() {
     // A line for the process starting. It says which version came up, which is
     // what lines a deploy up against whatever happened after it -- and it is
     // the marker the "since the last restart" view counts back to.
-    activity.record(
-        ServerStartActivity {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        },
-        ActivityType::ServerStart,
-        None,
-    );
+    activity.emit(Event::ServerStarted {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
 
     // Load (or create on first run) the internal CA used to authenticate remote
     // build workers over mutual TLS. Persisted under the data directory.

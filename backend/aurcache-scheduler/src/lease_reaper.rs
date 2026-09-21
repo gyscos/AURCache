@@ -10,10 +10,10 @@
 //! synchronously in the `complete` endpoint and are never seen here.
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::failure_activity::WorkerReapedActivity;
+use aurcache_activitylog::events::Event;
+use aurcache_common::api::log::BuildRef;
 use aurcache_common::build_state::EndReasons;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
 use aurcache_utils::build_logger::append_build_output;
@@ -61,22 +61,27 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
                         );
                         // One entry for the pass, not one per build: the reaper
                         // finds them together and they have one cause.
-                        activity.record(
-                            WorkerReapedActivity {
-                                // The build the operator was watching, not
-                                // the fresh row standing in for it: the
-                                // replacement is a number they have never
-                                // seen.
-                                retried: out
-                                    .retried
-                                    .iter()
-                                    .map(|&(abandoned, _replacement)| abandoned)
-                                    .collect(),
-                                failed: out.failed.clone(),
-                            },
-                            ActivityType::WorkerReaped,
-                            None,
-                        );
+                        // Named as the operator knows them, package and
+                        // number. The build they were watching, not the fresh
+                        // row standing in for it: the replacement is a number
+                        // they have never seen. A build whose package is gone
+                        // cannot be named, and is left out.
+                        let named = |ids: &mut dyn Iterator<Item = i32>| -> Vec<BuildRef> {
+                            ids.filter_map(|id| {
+                                let abandoned = out.abandoned.iter().find(|a| a.build_id == id)?;
+                                Some(BuildRef {
+                                    pkgbase: abandoned.pkgbase.clone()?,
+                                    number: abandoned.number,
+                                })
+                            })
+                            .collect()
+                        };
+                        activity.emit(Event::WorkerReaped {
+                            retried: named(
+                                &mut out.retried.iter().map(|&(abandoned, _)| abandoned),
+                            ),
+                            failed: named(&mut out.failed.iter().copied()),
+                        });
                     }
 
                     // Explain each abandoned build in its own log. The row is

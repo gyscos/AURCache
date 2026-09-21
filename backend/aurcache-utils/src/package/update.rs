@@ -6,11 +6,10 @@ use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sourc
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
-use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_activitylog::events::Event;
 use aurcache_common::build_state::BuildTrigger;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
 use aurcache_db::prelude::{Builds, Dependencies, PackageVcsSources, Packages};
 use aurcache_db::{builds, dependencies, package_vcs_sources, packages};
@@ -137,14 +136,12 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
         let force = vcs_tracked.contains(&pkg.id);
         match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
-                activity_log.record(
-                    PackageUpdateActivity {
-                        package: package_name.clone(),
-                        forced: force,
-                    },
-                    ActivityType::UpdatePackage,
-                    Some("Server".to_string()),
-                );
+                // No actor: the auto-updater is the server acting on its own,
+                // which is what an entry without a user already says.
+                activity_log.emit(Event::PackageUpdated {
+                    pkg: package_name.clone().into(),
+                    forced: force,
+                });
                 ids_total.extend(
                     results
                         .into_iter()

@@ -1,4 +1,3 @@
-use crate::activity::activity;
 use crate::aur::search;
 use crate::auth::regenerate_api_token_endpoint;
 use crate::build::{
@@ -6,6 +5,7 @@ use crate::build::{
     list_package_builds, retry_build,
 };
 use crate::health::health;
+use crate::log::log;
 use crate::package::{
     active_operations, bulk_add_progress, get_package, package_add_endpoint, package_del,
     package_dependency_options, package_dependency_replace, package_list, package_source_file,
@@ -57,7 +57,7 @@ pub fn build_api() -> Vec<Route> {
         cancel_build,
         health,
         crate::repo::repo_info,
-        activity,
+        log,
         settings,
         package_settings,
         package_setting_get,

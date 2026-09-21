@@ -2,6 +2,15 @@
 
 Status: **In progress, third revision** · Last updated: 2026-09-21
 
+Built: the catalogue, storage and its entity index, the `/log` endpoint and the
+Logs page reading from it, always-valid links, and the curated activity log
+folded in. Still to do: porting the remaining `warn!`/`error!` sites
+subsystem by subsystem (the version check is done), and recording what nothing
+records yet -- builds, restores, settings changes, source edits, dependency
+edges, build cancel/retry/delete, token regeneration, package `PATCH`es, revoke
+requeues, the repository sweep. Once no deployment has rows left in the
+`activity` table, a migration can drop it.
+
 AURCache's logging today is rich in *sites* and poor in *shape*: every binary
 logs through `tracing` with a plain text formatter (`aurcache/src/logger.rs`,
 `aurcache-worker/src/main.rs`, `aurcache-worker-docker/src/main.rs` — all
@@ -237,11 +246,17 @@ by subsystem. Severity is derived from the kind by an exhaustive match (the
 
 That is on the order of 50 kinds from a first pass over ~100 sites — small
 enough to be one variant each, large enough to be the app's failure vocabulary
-(and due a consolidation pass, below). The existing `ActivityType` kinds (12 of them) map onto this
-catalogue by construction: every activity that records a failure today
-(PublishFailed, VersionCheckFailed, WorkerReaped, WorkerSettingRejected) has a
-structured counterpart above, and the activity row's `data` JSON is precisely
-the payload this design wants.
+(and due a consolidation pass, below).
+
+The curated activity log's eleven written kinds are variants too, and the log
+replaced it: `package.added`, `package.updated`, `package.deleted`,
+`server.start`, `worker.enrolled`, `worker.approved`, `worker.revoked`,
+`publish.failed`, `worker.reaped`, `version_check.pass_failed` and
+`worker.setting_rejected`. Its rows are carried across at startup
+(`aurcache_activitylog::legacy`) with their original time and actor, and leave
+the old table as they land; a row that does not convert stays behind and is
+reported. The reaper had recorded internal build row ids, which are translated
+to `pkgbase #number` where the build still exists and dropped where it does not.
 
 ## References and context values
 
@@ -398,6 +413,11 @@ log_entity(log_id -> log(id) ON DELETE CASCADE, role, ns, id)
 At insert, walk the serialized payload (and `scope`) for every `namespace:id`
 and write the rows in the same transaction, keeping the payload key as `role`.
 
+A build is also filed under its package, in the same role. A build is part of
+its package's story: "everything about yay" that left out "publishing yay #7
+failed" -- or what was recorded during that build -- would answer a narrower
+question than the one asked.
+
 Carrying `role` is what keeps **every** query off JSON: a role-scoped filter is
 a column comparison rather than `data->>'dependent'`, which sea-query only
 exposes as a Postgres operator (`PgBinOper::CastJsonField`). `data` is then
@@ -460,8 +480,10 @@ The Logs screen renders each row from its payload:
    `/package/…/build/…`, `/worker/…`).
 2. `message` is the fallback when the kind is unknown (a newer server) or the
    payload no longer fits its variant.
-3. The entity filter is the server-side query above; the UI renders the active
-   filter but does not re-implement it.
+3. The entity filter is the server-side query above, carried in the URL as
+   `/logs?e=pkg:hello`. A package's and a worker's page link to their own; the
+   Logs page shows the active filter and lets it go, but does not
+   re-implement it.
 
 Localization becomes a change to the frontend's renderer alone; `message` never
 changes, so non-UI consumers are unaffected.

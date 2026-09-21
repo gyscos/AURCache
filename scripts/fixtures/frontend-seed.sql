@@ -152,11 +152,14 @@ SET latest_build = (SELECT b.id FROM builds b WHERE b.pkg_id = packages.id ORDER
 -- Reset. `-1` is the global scope; a real package id would make it per-package.
 INSERT INTO settings (key, value, pkg_id) VALUES ('auto_update_interval', '4', -1);
 
--- A few lines of activity log. The text is not stored: the server renders it
--- from `typ` and the JSON in `data`, so these have to be shapes the serializers
--- actually parse (see aurcache-activitylog/src/*_activity.rs). Types are
--- 0=add, 1=remove, 2=update, 5=server start, 7=worker approved, 9=publish
--- failed, 10=worker reaped.
+-- A few lines of the log. Each is what the server would have written: the
+-- kind, the severity it implies (0 info, 1 warning, 2 error), the sentence it
+-- renders, and the payload the browser renders it from -- so the payloads have
+-- to be shapes the catalogue parses (aurcache-common/src/api/events.rs). The
+-- index rows below are what the entity filter reads.
+--
+-- Explicit ids, well clear of the server's own start entry, which it writes
+-- before this runs.
 --
 -- One row has no user, which is the case the screen renders differently: nobody
 -- asked for it, a schedule did.
@@ -165,18 +168,40 @@ INSERT INTO settings (key, value, pkg_id) VALUES ('auto_update_interval', '4', -
 -- "since the last restart" counts back to: two entries are older than it and
 -- must drop out when that filter is on. The two failures give the severity
 -- filter something to find, one of each level.
-INSERT INTO activity (typ, data, timestamp, user) VALUES
-  (0, '{"package":"hello"}',                    CAST(strftime('%s','now') AS INTEGER) - 30,    'alice'),
-  (9, '{"package":"yay","build":7,"reason":"no space left on device"}',
-                                                CAST(strftime('%s','now') AS INTEGER) - 100,   NULL),
-  (10, '{"retried":[12],"failed":[11]}',        CAST(strftime('%s','now') AS INTEGER) - 200,   NULL),
-  -- A worker entry, so the log has a subject that opens a worker rather than a
-  -- package.
-  (7, '{"worker":"builder-01"}',                CAST(strftime('%s','now') AS INTEGER) - 300,   'alice'),
-  (2, '{"package":"yay","forced":true}',        CAST(strftime('%s','now') AS INTEGER) - 900,   'alice'),
-  (5, '{"version":"0.5.0"}',                    CAST(strftime('%s','now') AS INTEGER) - 1000,  NULL),
-  (1, '{"package":"obsolete-thing"}',           CAST(strftime('%s','now') AS INTEGER) - 4000,  'bob'),
-  (2, '{"package":"neofetch","forced":false}',  CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);
+INSERT INTO log (id, kind, severity, message, data, timestamp, user) VALUES
+  (1001, 'package.added', 0, 'added package hello', '{"pkg":"pkg:hello"}',
+    CAST(strftime('%s','now') AS INTEGER) - 30, 'alice'),
+  (1002, 'publish.failed', 2, 'publishing yay #7 failed: no space left on device',
+    '{"build":"build:yay/7","error":"no space left on device"}',
+    CAST(strftime('%s','now') AS INTEGER) - 100, NULL),
+  (1003, 'worker.reaped', 1, 'a worker stopped answering: requeued hello #12, gave up on hello #11',
+    '{"retried":["build:hello/12"],"failed":["build:hello/11"]}',
+    CAST(strftime('%s','now') AS INTEGER) - 200, NULL),
+  -- A worker entry, so the log has a reference that opens a worker rather
+  -- than a package.
+  (1004, 'worker.approved', 0, 'approved worker builder-01', '{"worker":"worker:builder-01"}',
+    CAST(strftime('%s','now') AS INTEGER) - 300, 'alice'),
+  (1005, 'package.updated', 0, 'forced update of package yay', '{"pkg":"pkg:yay","forced":true}',
+    CAST(strftime('%s','now') AS INTEGER) - 900, 'alice'),
+  (1006, 'server.start', 0, 'AURCache 0.5.0 started', '{"version":"0.5.0"}',
+    CAST(strftime('%s','now') AS INTEGER) - 1000, NULL),
+  (1007, 'package.deleted', 0, 'deleted package obsolete-thing', '{"pkg":"pkg:obsolete-thing"}',
+    CAST(strftime('%s','now') AS INTEGER) - 4000, 'bob'),
+  (1008, 'package.updated', 0, 'updated package neofetch', '{"pkg":"pkg:neofetch","forced":false}',
+    CAST(strftime('%s','now') AS INTEGER) - 86000, NULL);
+
+INSERT INTO log_entity (log_id, role, ns, id) VALUES
+  (1001, 'pkg', 'pkg', 'hello'),
+  (1002, 'build', 'pkg', 'yay'),
+  (1002, 'build', 'build', 'yay/7'),
+  (1003, 'retried', 'pkg', 'hello'),
+  (1003, 'retried', 'build', 'hello/12'),
+  (1003, 'failed', 'pkg', 'hello'),
+  (1003, 'failed', 'build', 'hello/11'),
+  (1004, 'worker', 'worker', 'builder-01'),
+  (1005, 'pkg', 'pkg', 'yay'),
+  (1007, 'pkg', 'pkg', 'obsolete-thing'),
+  (1008, 'pkg', 'pkg', 'neofetch');
 
 -- One config file stored, one left unset, so the page shows both states it
 -- renders differently: "stored" with a Reset, and "builder default" without.

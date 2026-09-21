@@ -5,6 +5,10 @@
 //! stopped answering -- so the page you read to see what has been going on is
 //! also the page that tells you something is off.
 //!
+//! Each entry is a typed event, rendered here from its payload so that what it
+//! names links to its page; an entry this build cannot decode -- written by a
+//! newer server -- shows the sentence stored with it instead.
+//!
 //! The one list in this app filtered *server-side*. Everything else fetches
 //! its rows and filters them in the browser (see `crate::listing`); the log
 //! cannot be fetched whole, because it only grows, and a filter applied to one
@@ -13,7 +17,9 @@
 use crate::dates::AbsoluteDate;
 use crate::listing::{ListHeader, PAGE_SIZE, Pager, ViewParams, use_url_view};
 use crate::routes::Route;
-use aurcache_client::{ActiveOperation, Activity, ActivitySubject, Severity, operation_kind};
+use aurcache_client::{
+    ActiveOperation, EntityRef, Event, LogEntry, LogQuery, Segment, Severity, operation_kind,
+};
 use dioxus::prelude::*;
 use std::time::Duration;
 
@@ -35,25 +41,35 @@ pub fn Logs(view: ViewParams) -> Element {
     let mut page = use_signal(|| 0usize);
     let severity = use_signal(|| view.severity);
     let since_boot = use_signal(|| view.since_boot);
+    let about = use_signal(|| view.about.clone());
 
     // The whole route from live control state, which is what keeps a filtered
     // log linkable and survives a reload. No search box on this screen, so no
     // term signal.
     let to_route = move |_: String| Route::Logs {
-        view: ViewParams::for_logs(severity(), since_boot()),
+        view: ViewParams::for_logs(severity(), since_boot(), about()),
     };
     use_url_view(None, true, to_route);
 
     // Narrowing the log changes what page 1 even is, so start again from it --
     // otherwise a filter applied on page 4 lands past the end of a shorter log.
-    use_effect(use_reactive(&(severity(), since_boot()), move |_| {
-        page.set(0);
-    }));
+    use_effect(use_reactive(
+        &(severity(), since_boot(), about()),
+        move |_| {
+            page.set(0);
+        },
+    ));
 
     let entries = use_resource(move || async move {
         let offset = page() as u64 * PAGE;
+        let query = LogQuery {
+            severity: severity(),
+            since_boot: since_boot(),
+            entity: about(),
+            ..LogQuery::default()
+        };
         crate::api::client()?
-            .activities(Some(PAGE), Some(offset), severity(), since_boot())
+            .log(Some(PAGE), Some(offset), &query)
             .await
             .map_err(|e| e.to_string())
     });
@@ -66,7 +82,7 @@ pub fn Logs(view: ViewParams) -> Element {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
                 ListHeader { title: "Logs" }
-                LogControls { severity, since_boot }
+                LogControls { severity, since_boot, about }
 
                 match &*entries.read_unchecked() {
                     None => rsx! {
@@ -82,7 +98,7 @@ pub fn Logs(view: ViewParams) -> Element {
                             // A filter that matched nothing is a different
                             // answer from an empty log, and the remedy is
                             // different too.
-                            if severity().is_some() || since_boot() {
+                            if severity().is_some() || since_boot() || about().is_some() {
                                 span { "Nothing matches these filters." }
                             } else {
                                 span { "Nothing has happened yet." }
@@ -90,7 +106,7 @@ pub fn Logs(view: ViewParams) -> Element {
                         }
                     },
                     Some(Ok(view)) => rsx! {
-                        ActivityTable { entries: view.entries.clone() }
+                        LogTable { entries: view.entries.clone() }
                         Pager {
                             page,
                             index: page().min(pages_of(view.total).saturating_sub(1)),
@@ -235,81 +251,51 @@ fn RunningRow(operation: ActiveOperation, jobs: Signal<Vec<crate::progress::Job>
     }
 }
 
-/// An entry's text, with the thing it is about turned into a link.
+/// An entry's sentence, with everything it names linked to its page.
 ///
-/// The server sends prose and, separately, what the entry is about. Splitting
-/// here rather than sending markup keeps the server out of the business of
-/// laying out a page, and keeps an entry readable if this ever renders
-/// somewhere without links.
-///
-/// Only the first occurrence is linked: the name usually appears once, and
-/// three links to the same page in one sentence is noise.
+/// Rendered from the payload rather than the stored text, which is what lets
+/// each name be a link without the server laying out a page. The stored text
+/// is the fallback, for an entry this build cannot decode.
 #[component]
-fn EntryText(entry: Activity) -> Element {
-    let Some((before, name, after)) = entry
-        .subject
-        .as_ref()
-        .and_then(|subject| split_on(&entry.text, &subject.label()))
-    else {
-        return rsx! { "{entry.text}" };
+fn EntryText(entry: LogEntry) -> Element {
+    let Some(event) = Event::decode(&entry.kind, &entry.data) else {
+        return rsx! { "{entry.message}" };
     };
-
-    // Unreachable otherwise: `split_on` only matched because there was a
-    // subject to match on.
-    let Some(to) = entry.subject.as_ref().map(subject_route) else {
-        return rsx! { "{entry.text}" };
-    };
-
     rsx! {
-        "{before}"
-        Link { class: "link-hover font-medium", to, "{name}" }
-        "{after}"
-    }
-}
-
-/// Where an entry's subject opens.
-///
-/// A worker by name, which is how its page is addressed -- and which lands on
-/// the chooser if two machines have answered to that name, rather than guessing
-/// at one of them.
-fn subject_route(subject: &ActivitySubject) -> Route {
-    match subject {
-        ActivitySubject::Package { name } => Route::Package {
-            pkgbase: name.clone(),
-        },
-        ActivitySubject::Worker { name } => Route::Worker {
-            name: crate::screens::worker::name_segments(name),
-        },
-        ActivitySubject::Build { pkgbase, number } => Route::Build {
-            pkgbase: pkgbase.clone(),
-            number: *number,
-        },
-    }
-}
-
-/// The text either side of `name`'s first occurrence, or `None` if it does not
-/// appear.
-///
-/// Whole-word: a package called `hello` must not light up the `hello` inside
-/// `hello-world`, which would link to a page that is not what the entry is
-/// about.
-fn split_on<'a>(text: &'a str, name: &str) -> Option<(&'a str, &'a str, &'a str)> {
-    if name.is_empty() {
-        return None;
-    }
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(name) {
-        let start = from + offset;
-        let end = start + name.len();
-        let bounded = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '-');
-        if bounded(text[..start].chars().next_back()) && bounded(text[end..].chars().next()) {
-            return Some((&text[..start], &text[start..end], &text[end..]));
+        for segment in event.sentence() {
+            match segment {
+                Segment::Text(text) => rsx! { "{text}" },
+                Segment::Entity(entity) => rsx! {
+                    Link {
+                        class: "link-hover font-medium",
+                        to: entity_route(&entity),
+                        "{entity.label()}"
+                    }
+                },
+            }
         }
-        // Advance past this occurrence rather than past the whole prefix, so a
-        // later, properly bounded one is still found.
-        from = end;
     }
-    None
+}
+
+/// Where a reference opens.
+///
+/// Every reference links, whether or not what it names is still there: the
+/// page it opens handles that, offering to add a missing package or falling
+/// back to its builds for a missing build. A worker goes by name, which is how
+/// its page is addressed and which offers a choice if two machines share it.
+pub(crate) fn entity_route(entity: &EntityRef) -> Route {
+    match entity {
+        EntityRef::Package(pkg) => Route::Package {
+            pkgbase: pkg.0.clone(),
+        },
+        EntityRef::Worker(worker) => Route::Worker {
+            name: crate::screens::worker::name_segments(&worker.0),
+        },
+        EntityRef::Build(build) => Route::Build {
+            pkgbase: build.pkgbase.clone(),
+            number: build.number,
+        },
+    }
 }
 
 /// What to narrow the log to.
@@ -318,9 +304,14 @@ fn split_on<'a>(text: &'a str, name: &str) -> Option<(&'a str, &'a str, &'a str)
 /// that pair is a name search and a build status, and the log has neither. A
 /// search box that did nothing would be worse than no search box.
 #[component]
-fn LogControls(severity: Signal<Option<Severity>>, since_boot: Signal<bool>) -> Element {
+fn LogControls(
+    severity: Signal<Option<Severity>>,
+    since_boot: Signal<bool>,
+    about: Signal<Option<EntityRef>>,
+) -> Element {
     let mut severity = severity;
     let mut since_boot = since_boot;
+    let mut about = about;
 
     rsx! {
         div { class: "flex flex-wrap items-center gap-3 mb-2",
@@ -349,6 +340,21 @@ fn LogControls(severity: Signal<Option<Severity>>, since_boot: Signal<bool>) -> 
                     onchange: move |e| since_boot.set(e.checked()),
                 }
                 span { class: "label-text text-sm", "Since the last restart" }
+            }
+            // Arrived at from a package, build or worker: say which, and let
+            // it go. No picker to set one here -- the pages are where you
+            // choose what you are asking about.
+            if let Some(entity) = about() {
+                span { class: "badge badge-lg gap-1",
+                    "About "
+                    span { class: "font-mono", "{entity.label()}" }
+                    button {
+                        class: "btn btn-ghost btn-xs btn-circle",
+                        aria_label: "Show the whole log",
+                        onclick: move |_| about.set(None),
+                        "✕"
+                    }
+                }
             }
         }
     }
@@ -382,7 +388,7 @@ fn pages_of(total: u64) -> usize {
 const WIDE_ONLY: &str = "hidden md:table-cell";
 
 #[component]
-fn ActivityTable(entries: Vec<Activity>) -> Element {
+fn LogTable(entries: Vec<LogEntry>) -> Element {
     rsx! {
         div { class: "overflow-x-auto",
             table { class: "table table-zebra",
@@ -397,11 +403,8 @@ fn ActivityTable(entries: Vec<Activity>) -> Element {
                     }
                 }
                 tbody {
-                    for (index, entry) in entries.iter().enumerate() {
-                        // The log has no ids and entries are not unique — the
-                        // same package updated twice a second apart is two
-                        // identical rows — so position is the only key.
-                        tr { key: "{index}",
+                    for entry in entries.iter() {
+                        tr { key: "{entry.id}",
                             td { class: "w-px whitespace-nowrap text-sm opacity-70",
                                 AbsoluteDate { ts: Some(entry.timestamp) }
                             }
@@ -433,48 +436,29 @@ fn actor(user: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityTable, ActivityTableProps, actor, split_on, subject_route};
+    use super::{LogTable, LogTableProps, actor, entity_route};
     use crate::routes::Route;
-    use aurcache_client::{Activity, ActivitySubject, Severity};
+    use aurcache_client::{BuildRef, EntityRef, Event, LogEntry, PackageRef, WorkerRef};
     use dioxus::prelude::*;
 
-    /// A package named in an entry has to be picked out exactly, or the link
-    /// goes to a package the entry is not about.
-    #[test]
-    fn a_name_is_matched_whole() {
-        assert_eq!(
-            split_on("added package hello", "hello"),
-            Some(("added package ", "hello", ""))
-        );
-        assert_eq!(
-            split_on("added package hello-world", "hello-world"),
-            Some(("added package ", "hello-world", ""))
-        );
-        // `hello` inside `hello-world` is a different package.
-        assert_eq!(split_on("added package hello-world", "hello"), None);
-        assert_eq!(split_on("added package neofetch", "hello"), None);
-        assert_eq!(split_on("added package hello", ""), None);
+    fn entry(id: i32, event: &Event, user: Option<&str>) -> LogEntry {
+        let wire = serde_json::to_value(event).unwrap();
+        LogEntry {
+            id,
+            kind: event.kind().to_string(),
+            severity: event.severity(),
+            message: event.message(),
+            data: wire["data"].clone(),
+            scope: None,
+            timestamp: 1_756_000_000 + i64::from(id),
+            user: user.map(str::to_string),
+        }
     }
 
-    /// The first *bounded* occurrence, not the first substring match: a name
-    /// that appears inside a longer word before it appears on its own must not
-    /// swallow the real one.
-    #[test]
-    fn a_later_whole_match_is_still_found() {
-        assert_eq!(
-            split_on("hello-world depends on hello", "hello"),
-            Some(("hello-world depends on ", "hello", ""))
-        );
-    }
-
-    /// Only the first occurrence is linked; three links to one page in a
-    /// sentence is noise.
-    #[test]
-    fn only_the_first_occurrence_is_split_out() {
-        let (before, name, after) = split_on("hello needs hello", "hello").unwrap();
-        assert_eq!(before, "");
-        assert_eq!(name, "hello");
-        assert_eq!(after, " needs hello");
+    fn render(entries: Vec<LogEntry>) -> String {
+        let mut dom = VirtualDom::new_with_props(LogTable, LogTableProps { entries });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
     }
 
     #[test]
@@ -485,46 +469,32 @@ mod tests {
 
     /// The three columns are the whole screen, so a row that drops one is the
     /// only defect worth guarding here.
+    ///
+    /// Only events that name nothing: a `Link` needs a router context that a
+    /// bare render test has none of. That the names link is asserted by the
+    /// browser suite, and where they go by `entity_route` below.
     #[test]
     fn a_row_shows_when_who_and_what() {
-        let mut dom = VirtualDom::new_with_props(
-            ActivityTable,
-            ActivityTableProps {
-                entries: vec![
-                    Activity {
-                        timestamp: 1_756_000_000,
-                        text: "added package hello".to_string(),
-                        user: Some("alice".to_string()),
-                        severity: Severity::Info,
-                        // No subject in this fixture: a `Link` needs a router
-                        // context that a bare render test has none of, so what
-                        // the link points at is asserted by `subject_route`
-                        // below and that it works by the browser suite.
-                        subject: None,
-                    },
-                    Activity {
-                        timestamp: 1_756_000_100,
-                        text: "rebuilt yay".to_string(),
-                        user: None,
-                        severity: Severity::Info,
-                        subject: None,
-                    },
-                    Activity {
-                        timestamp: 1_756_000_200,
-                        text: "publishing build #3 of hello failed: disk full".to_string(),
-                        user: None,
-                        severity: Severity::Error,
-                        subject: None,
-                    },
-                ],
-            },
-        );
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
+        let html = render(vec![
+            entry(
+                1,
+                &Event::ServerStarted {
+                    version: "1.2.3".to_string(),
+                },
+                Some("alice"),
+            ),
+            entry(
+                2,
+                &Event::UpdateQueueFailed {
+                    error: "disk full".to_string(),
+                },
+                None,
+            ),
+        ]);
 
-        assert!(html.contains("added package hello"), "{html}");
+        assert!(html.contains("AURCache 1.2.3 started"), "{html}");
         assert!(html.contains("alice"), "{html}");
-        assert!(html.contains("rebuilt yay"), "{html}");
+        assert!(html.contains("disk full"), "{html}");
         assert!(html.contains("AURCache"), "unattributed entry: {html}");
 
         // A failure is marked; ordinary news is not, or the badge would be on
@@ -533,54 +503,60 @@ mod tests {
         assert!(!html.contains("badge-info"), "{html}");
     }
 
-    /// Where a subject opens. A worker goes by name, which is how its page is
-    /// addressed and which copes with two machines sharing one.
+    /// An entry this build cannot decode -- a kind from a newer server, or a
+    /// payload that no longer fits -- still reads, from the sentence stored
+    /// with it.
     #[test]
-    fn a_subject_opens_its_own_page() {
+    fn an_unknown_entry_shows_its_stored_sentence() {
+        let mut from_the_future = entry(
+            1,
+            &Event::ServerStarted {
+                version: "9".to_string(),
+            },
+            None,
+        );
+        from_the_future.kind = "time.travelled".to_string();
+        from_the_future.message = "someone arrived from next year".to_string();
+        let mut stale = entry(
+            2,
+            &Event::ServerStarted {
+                version: "9".to_string(),
+            },
+            None,
+        );
+        stale.data = serde_json::json!({"release": "9"});
+        stale.message = "an older shape of a start".to_string();
+
+        let html = render(vec![from_the_future, stale]);
+        assert!(html.contains("someone arrived from next year"), "{html}");
+        assert!(html.contains("an older shape of a start"), "{html}");
+    }
+
+    /// Where each kind of reference opens. A worker goes by name, which is how
+    /// its page is addressed and which copes with two machines sharing one.
+    #[test]
+    fn a_reference_opens_its_own_page() {
         assert_eq!(
-            subject_route(&ActivitySubject::Package {
-                name: "hello".to_string()
-            }),
+            entity_route(&EntityRef::Package(PackageRef::from("hello"))),
             Route::Package {
                 pkgbase: "hello".to_string()
             }
         );
         assert_eq!(
-            subject_route(&ActivitySubject::Worker {
-                name: "builder-01".to_string()
-            }),
+            entity_route(&EntityRef::Worker(WorkerRef::from("ci/runner"))),
             Route::Worker {
-                name: vec!["builder-01".to_string()]
+                name: vec!["ci".to_string(), "runner".to_string()]
             }
         );
         assert_eq!(
-            subject_route(&ActivitySubject::Build {
+            entity_route(&EntityRef::Build(BuildRef {
                 pkgbase: "hello".to_string(),
                 number: 7,
-            }),
+            })),
             Route::Build {
                 pkgbase: "hello".to_string(),
                 number: 7
             }
-        );
-    }
-
-    /// A build is referred to in the text by its number, so that is what the
-    /// link is on -- the package name is in the same sentence and must not be
-    /// what sends a reader to a build page.
-    #[test]
-    fn a_build_is_labelled_by_its_number() {
-        let subject = ActivitySubject::Build {
-            pkgbase: "yay".to_string(),
-            number: 7,
-        };
-        assert_eq!(subject.label(), "#7");
-        assert_eq!(
-            split_on(
-                "publishing build #7 of yay failed: disk full",
-                &subject.label()
-            ),
-            Some(("publishing build ", "#7", " of yay failed: disk full"))
         );
     }
 }

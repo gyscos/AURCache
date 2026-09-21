@@ -1,9 +1,7 @@
 use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, RefreshTarget, SourceinfoPurpose};
-use aurcache_activitylog::failure_activity::VersionCheckFailedActivity;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
@@ -29,13 +27,9 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
                 error!("Failed to perform aur version check: {e}");
                 // Nothing was found to be out of date this pass, which looks
                 // exactly like nothing *being* out of date unless it says so.
-                services.activity.record(
-                    VersionCheckFailedActivity {
-                        reason: format!("{e:#}"),
-                    },
-                    ActivityType::VersionCheckFailed,
-                    None,
-                );
+                services.activity.emit(Event::VersionCheckFailed {
+                    error: format!("{e:#}"),
+                });
             }
 
             let check_interval: SettingsEntry<u64> =

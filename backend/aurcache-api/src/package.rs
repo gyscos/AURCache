@@ -14,11 +14,8 @@ use crate::models::package::{
 use crate::utils::error::{ApiError, err};
 use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::package_add_activity::PackageAddActivity;
-use aurcache_activitylog::package_delete_activity::PackageDeleteActivity;
-use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_activitylog::events::Event;
 use aurcache_common::build_state::BuildTrigger;
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
 };
@@ -197,11 +194,16 @@ pub async fn packages_add_endpoint(
                 _ => completed += 1,
             }
             if matches!(entry.outcome, BulkAddOutcome::Added) {
-                al_task.record(
-                    PackageAddActivity {
-                        package: entry.name.clone(),
+                // The pkgbase it landed under, which is what the link opens;
+                // the name as typed where there is none.
+                al_task.emit_by(
+                    Event::PackageAdded {
+                        pkg: entry
+                            .pkgbase
+                            .clone()
+                            .unwrap_or_else(|| entry.name.clone())
+                            .into(),
                     },
-                    ActivityType::AddPackage,
                     username.clone(),
                 );
             }
@@ -326,11 +328,10 @@ pub async fn package_add_endpoint(
     // untyped `anyhow` error we cannot tell apart from an internal one.
     .map_err(|e| err(Status::BadRequest, e))?;
 
-    al.record(
-        PackageAddActivity {
-            package: new_pkg_name,
+    al.emit_by(
+        Event::PackageAdded {
+            pkg: new_pkg_name.into(),
         },
-        ActivityType::AddPackage,
         a.username,
     );
     Ok(())
@@ -638,12 +639,11 @@ pub async fn package_update_endpoint(
         // patch that no longer applies are all caller-visible conditions.
         .map_err(|e| err(Status::BadRequest, e))?;
 
-    al.record(
-        PackageUpdateActivity {
-            package: package_name,
+    al.emit_by(
+        Event::PackageUpdated {
+            pkg: package_name.into(),
             forced,
         },
-        ActivityType::UpdatePackage,
         a.username,
     );
     Ok(pkg_update)
@@ -675,9 +675,10 @@ pub async fn package_del(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    al.record(
-        PackageDeleteActivity { package: pkg.name },
-        ActivityType::RemovePackage,
+    al.emit_by(
+        Event::PackageDeleted {
+            pkg: pkg.name.into(),
+        },
         a.username,
     );
 

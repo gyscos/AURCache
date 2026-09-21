@@ -1,4 +1,4 @@
-//! Keeping the activity log from growing for ever.
+//! Keeping the log from growing for ever.
 //!
 //! Nothing has ever deleted an entry, and the log only grows -- faster now that
 //! the server records its own restarts and the failures it notices. Every
@@ -8,9 +8,10 @@
 //! Age rather than row count, because that is how people talk about a log: "the
 //! last three months", not "the last fifty thousand things". Set
 //! `ACTIVITY_RETENTION=0` for a deployment that would rather the log were
-//! complete than bounded.
+//! complete than bounded. (Named for the activity log the structured log
+//! replaced, so existing deployments keep their setting.)
 
-use aurcache_activitylog::activity_utils::ActivityStore;
+use aurcache_activitylog::log_store::LogStore;
 use aurcache_db::helpers::time::now_secs;
 use sea_orm::DatabaseConnection;
 use std::env;
@@ -39,19 +40,19 @@ pub fn start_activity_retention(db: DatabaseConnection) -> JoinHandle<()> {
     tokio::spawn(async move {
         let keep = retention_secs();
         if keep == 0 {
-            info!("Activity log retention disabled; entries are kept for ever");
+            info!("Log retention disabled; entries are kept for ever");
             return;
         }
-        info!("Activity log retention: keeping {keep}s of entries");
+        info!("Log retention: keeping {keep}s of entries");
 
-        let log = ActivityStore::new(db);
+        let log = LogStore::new(db);
         loop {
             // Swept before the first sleep as well, so an instance that is
             // restarted more often than the interval still prunes.
             match log.prune(keep, now_secs()).await {
                 Ok(0) => {}
-                Ok(deleted) => info!("Pruned {deleted} activity log entries"),
-                Err(e) => warn!("Activity log retention pass failed: {e}"),
+                Ok(deleted) => info!("Pruned {deleted} log entries"),
+                Err(e) => warn!("Log retention pass failed: {e}"),
             }
             tokio::time::sleep(INTERVAL).await;
         }

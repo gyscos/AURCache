@@ -8,11 +8,10 @@ use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::package_update_activity::PackageUpdateActivity;
+use aurcache_activitylog::events::Event;
 use aurcache_common::api::waiting::WaitingReason;
 use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use aurcache_db::action::Action;
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
@@ -531,12 +530,11 @@ pub async fn retry_build(
     let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    al.record(
-        PackageUpdateActivity {
-            package: package_name,
+    al.emit_by(
+        Event::PackageUpdated {
+            pkg: package_name.into(),
             forced: true,
         },
-        ActivityType::UpdatePackage,
         a.username,
     );
 

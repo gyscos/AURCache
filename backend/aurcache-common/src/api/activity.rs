@@ -1,16 +1,13 @@
-//! One line of the activity log.
+//! How much attention a log entry deserves.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// How much attention an entry deserves.
 ///
-/// A property of *what happened*, so it is derived from the kind of entry rather
-/// than stored beside it: every row already in the table gets a severity the
-/// moment the server knows about it, with no column and no backfill. Two events
-/// of one kind therefore cannot differ in severity, which is the right shape --
-/// "publishing failed" and "package added" are not one event with a field.
-/// Stored as the number its variants are ordered by, so "this severity and
+/// A property of *what happened*: each event's kind decides it, so two events
+/// of one kind cannot differ in severity -- "publishing failed" and "package
+/// added" are not one event with a field. Stored as the number its variants are ordered by, so "this severity and
 /// worse" is `severity >= n` -- one indexable comparison rather than a list of
 /// kinds the query would have to know.
 #[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,76 +56,15 @@ impl Default for Severity {
     }
 }
 
-/// What an entry is about, when it is about something the UI can open.
-///
-/// Carried beside the text rather than as markup inside it: the server renders
-/// prose, and prose with links in it would be the server deciding how the
-/// browser lays a page out.
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum ActivitySubject {
-    Package {
-        name: String,
-    },
-    Worker {
-        name: String,
-    },
-    /// One build of a package, which is addressed by both.
-    Build {
-        pkgbase: String,
-        number: i32,
-    },
-}
+#[cfg(test)]
+mod tests {
+    use super::Severity;
 
-impl ActivitySubject {
-    /// The token in the entry's text that stands for this subject.
-    ///
-    /// What the reader clicks, so it is the words the entry actually uses: a
-    /// package or a worker goes by name, while a build goes by the `#7` it is
-    /// called in the sentence -- the package name is in there too, and linking
-    /// that to a build page would send a reader somewhere they did not point.
-    #[must_use]
-    pub fn label(&self) -> String {
-        match self {
-            Self::Package { name } | Self::Worker { name } => name.clone(),
-            Self::Build { number, .. } => format!("#{number}"),
+    #[test]
+    fn severities_round_trip_through_their_slug() {
+        for severity in [Severity::Info, Severity::Warning, Severity::Error] {
+            assert_eq!(Severity::from_slug(severity.slug()), Some(severity));
         }
+        assert_eq!(Severity::from_slug("catastrophe"), None);
     }
-}
-
-/// One page of the log, and how long the whole log is.
-///
-/// The total travels with the page because the log only grows: unlike the
-/// package and build lists, there is no "fetch it all and count" that stays
-/// cheap, so the pager is told rather than working it out.
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct ActivityPage {
-    pub entries: Vec<Activity>,
-    pub total: u64,
-}
-
-/// Something that happened, and who did it.
-///
-/// The text is rendered server-side rather than being a code the frontend has
-/// to interpret: the log is prose, and an entry written last year should still
-/// read the same after the vocabulary around it changes.
-#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct Activity {
-    /// Unix seconds.
-    pub timestamp: i64,
-    pub text: String,
-    /// `None` for anything the server did on its own — a schedule firing, or a
-    /// version check — as opposed to a person asking for it.
-    pub user: Option<String>,
-    /// How much attention this deserves. Absent from an older server's answer,
-    /// which reads as [`Severity::Info`] rather than failing the whole listing.
-    #[serde(default)]
-    pub severity: Severity,
-    /// What the entry is about, when that is something with a page of its own.
-    ///
-    /// `None` for an entry about nothing openable -- and deliberately for a
-    /// package that was *removed*, where the only thing to link to is a page
-    /// that no longer exists.
-    #[serde(default)]
-    pub subject: Option<ActivitySubject>,
 }

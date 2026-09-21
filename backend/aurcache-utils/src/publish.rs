@@ -12,9 +12,9 @@ use crate::build_logger::append_build_output;
 use crate::repository::{PublishedFile, Repository, Update};
 use anyhow::{anyhow, bail};
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::failure_activity::PublishFailedActivity;
+use aurcache_activitylog::events::Event;
+use aurcache_common::api::log::BuildRef;
 use aurcache_common::builder::BuildStates;
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Files, Packages};
 use aurcache_db::{builds, dependencies, files, packages};
@@ -80,15 +80,13 @@ pub async fn publish_build(
             // The build worked and the package exists; it is the last step that
             // did not. That is worth an entry someone will come across, rather
             // than only a line in this process's journal.
-            activity.record(
-                PublishFailedActivity {
-                    package: pkgbase.clone().unwrap_or_else(|| "?".to_string()),
-                    build: build.number,
-                    reason: format!("{e:#}"),
+            activity.emit(Event::PublishFailed {
+                build: BuildRef {
+                    pkgbase: pkgbase.clone().unwrap_or_else(|| "?".to_string()),
+                    number: build.number,
                 },
-                ActivityType::PublishFailed,
-                None,
-            );
+                error: format!("{e:#}"),
+            });
             log(
                 pkgbase.as_deref(),
                 build.number,

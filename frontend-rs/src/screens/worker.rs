@@ -282,6 +282,13 @@ fn WorkerHeader(worker: WorkerRow) -> Element {
                     StatusBadge { status: worker.status }
                     KindBadge { worker: worker.clone() }
                     Liveness { worker: worker.clone() }
+                    Link {
+                        class: "link link-primary text-sm",
+                        to: Route::Logs {
+                            view: crate::listing::ViewParams::about(aurcache_client::WorkerRef::from(worker.name.as_str())),
+                        },
+                        "Log"
+                    }
                 }
                 dl { class: "grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm mt-2",
                     dt { class: "opacity-60", "Architectures" }

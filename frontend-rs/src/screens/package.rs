@@ -343,6 +343,15 @@ pub fn PackageHeader(
                                     "AUR ↗"
                                 }
                             }
+                            // Everything the log says about this package, in
+                            // whatever role -- dependency, dependent, subject.
+                            Link {
+                                class: "link link-primary text-sm",
+                                to: Route::Logs {
+                                    view: ViewParams::about(aurcache_client::PackageRef::from(pkg.name.as_str())),
+                                },
+                                "Log"
+                            }
                         }
                         if let Some(description) = description {
                             p { class: "opacity-70 mt-1", "{description}" }

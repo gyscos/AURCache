@@ -71,9 +71,9 @@ async fn an_event_reaches_the_log_with_its_payload() {
         .find(|e| e.kind == "vcs.sync_failed")
         .expect("the vcs entry");
     // It reads without the package, because the sentence was rendered when it
-    // was written.
+    // was written -- naming it as people do, without the namespace.
     assert!(
-        vanished.message.contains("pkg:gone"),
+        vanished.message.contains("sources of gone:"),
         "{}",
         vanished.message
     );
@@ -241,10 +241,6 @@ async fn a_scope_is_indexed_like_any_other_reference() {
 
 /// With no start entry to count back to, "since the last restart" shows
 /// everything rather than nothing.
-///
-/// That is all that can be tested today: the marker is `kinds::SERVER_START`,
-/// and the server still records its start as a curated activity row. The
-/// filter becomes live when that event is ported.
 #[tokio::test]
 async fn since_boot_without_a_marker_shows_everything() {
     let db = db().await;
@@ -336,4 +332,135 @@ async fn pruning_removes_the_index_too() {
 
     let orphans = LogEntities::find().count(&db).await.unwrap();
     assert_eq!(orphans, 0, "the cascade should have taken the index rows");
+}
+
+/// A row written straight to the table, at a chosen time: the queue stamps
+/// entries with the clock, and these tests are about when things happened.
+async fn at(db: &DatabaseConnection, timestamp: i64, event: Event) {
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    let wire = serde_json::to_value(&event).unwrap();
+    aurcache_db::logs::ActiveModel {
+        kind: Set(event.kind().to_string()),
+        severity: Set(event.severity()),
+        message: Set(event.message()),
+        data: Set(wire["data"].to_string()),
+        timestamp: Set(timestamp),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .unwrap();
+}
+
+/// "Since the last restart" counts back to the newest start entry, so what
+/// happened under an earlier run drops out.
+#[tokio::test]
+async fn since_boot_cuts_at_the_last_start() {
+    let db = db().await;
+    let started = |version: &str| Event::ServerStarted {
+        version: version.to_string(),
+    };
+    at(&db, 100, started("1.0")).await;
+    at(&db, 150, Event::AurMissing { pkg: "old".into() }).await;
+    at(&db, 200, started("1.1")).await;
+    at(&db, 250, Event::AurMissing { pkg: "new".into() }).await;
+
+    let page = LogStore::new(db)
+        .page(
+            50,
+            0,
+            &LogFilter {
+                since_boot: true,
+                ..LogFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    let messages: Vec<_> = page.entries.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["new is no longer in the AUR", "AURCache 1.1 started"]
+    );
+}
+
+/// Pruning takes what has aged out and leaves the rest; zero keeps
+/// everything, for a deployment that would rather the log were complete.
+#[tokio::test]
+async fn pruning_keeps_what_is_still_within_the_window() {
+    let db = db().await;
+    let now = aurcache_db::helpers::time::now_secs();
+    at(&db, now - 7200, Event::AurMissing { pkg: "old".into() }).await;
+    at(&db, now, Event::AurMissing { pkg: "new".into() }).await;
+
+    let store = LogStore::new(db);
+    assert_eq!(store.prune(0, now).await.unwrap(), 0);
+    assert_eq!(store.prune(3600, now).await.unwrap(), 1);
+    let left = store.page(50, 0, &LogFilter::default()).await.unwrap();
+    assert_eq!(left.total, 1);
+    assert!(left.entries[0].message.starts_with("new"));
+}
+
+/// Paging has to be stable across entries written in the same second, which
+/// is the ordinary case for a bulk add.
+#[tokio::test]
+async fn pages_do_not_drop_or_repeat_an_entry() {
+    let db = db().await;
+    for n in 0..5 {
+        at(
+            &db,
+            100,
+            Event::AurMissing {
+                pkg: format!("p{n}").into(),
+            },
+        )
+        .await;
+    }
+    let store = LogStore::new(db);
+    let mut seen = Vec::new();
+    for offset in [0, 2, 4] {
+        let page = store.page(2, offset, &LogFilter::default()).await.unwrap();
+        assert_eq!(page.total, 5);
+        seen.extend(page.entries.into_iter().map(|e| e.id));
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 5);
+}
+
+/// Everything about a package includes its builds: an entry naming only a
+/// build of it -- or recorded during one -- is still about the package.
+#[tokio::test]
+async fn a_package_filter_finds_entries_about_its_builds() {
+    let db = db().await;
+    let (log, writer) = spawn(db.clone());
+    let build = BuildRef {
+        pkgbase: "yay".into(),
+        number: 7,
+    };
+    log.emit(Event::PublishFailed {
+        build: build.clone(),
+        error: "disk full".to_string(),
+    });
+    log.scoped(build)
+        .emit(Event::AurMissing { pkg: "dep".into() });
+    log.emit(Event::PackageAdded {
+        pkg: "hello".into(),
+    });
+    drop(log);
+    writer.await.unwrap();
+
+    let page = LogStore::new(db)
+        .page(
+            50,
+            0,
+            &LogFilter {
+                entity: Some(PackageRef::from("yay").into()),
+                ..LogFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut kinds: Vec<_> = page.entries.iter().map(|e| e.kind.as_str()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["publish.failed", "version_check.aur_missing"]);
 }

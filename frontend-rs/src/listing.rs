@@ -7,7 +7,7 @@
 //! already on. If the fetch itself ever becomes the problem, the pure functions
 //! here are what would move.
 
-use aurcache_client::{Build, Severity, SimplePackage};
+use aurcache_client::{Build, EntityRef, Severity, SimplePackage};
 use aurcache_common::build_state::BuildState;
 
 /// Which column a list is ordered by.
@@ -425,9 +425,19 @@ mod tests {
                 ..ViewParams::default()
             },
             // The log's own dimensions, which share the same query encoding.
-            ViewParams::for_logs(Some(Severity::Warning), false),
-            ViewParams::for_logs(Some(Severity::Error), true),
-            ViewParams::for_logs(None, true),
+            ViewParams::for_logs(Some(Severity::Warning), false, None),
+            ViewParams::for_logs(Some(Severity::Error), true, None),
+            ViewParams::for_logs(None, true, None),
+            ViewParams::about(aurcache_client::PackageRef::from("gtk+")),
+            ViewParams::about(aurcache_client::BuildRef {
+                pkgbase: "hello".to_string(),
+                number: 7,
+            }),
+            ViewParams::for_logs(
+                Some(Severity::Error),
+                true,
+                Some(aurcache_client::WorkerRef::from("builder-01").into()),
+            ),
             ViewParams {
                 status: Some(StatusFilter::State(BuildState::Failed)),
                 sort: Some(Sort {
@@ -441,6 +451,18 @@ mod tests {
             let encoded = view.to_string();
             assert_eq!(ViewParams::from(encoded.as_str()), view, "{encoded:?}");
         }
+    }
+
+    /// A pkgbase may contain `+`, which some query parsers read as a space;
+    /// no reference contains a space, so one is always a `+`.
+    #[test]
+    fn a_plus_read_back_as_a_space_is_still_a_plus() {
+        let view = ViewParams::from("e=pkg:gtk 3");
+        assert_eq!(
+            view.about,
+            Some(aurcache_client::PackageRef::from("gtk+3").into())
+        );
+        assert_eq!(ViewParams::from("e=nonsense").about, None);
     }
 
     /// A hand-edited or outdated URL shows a list rather than an error: unknown
@@ -1295,6 +1317,8 @@ pub struct ViewParams {
     pub severity: Option<Severity>,
     /// Logs only: only what happened since the server last started.
     pub since_boot: bool,
+    /// Logs only: only entries naming this, in any role.
+    pub about: Option<EntityRef>,
 }
 
 impl ViewParams {
@@ -1319,14 +1343,26 @@ impl ViewParams {
     /// log shares none of the other lists' dimensions -- it has no status and
     /// no sort, and its filters are applied by the server rather than here.
     #[must_use]
-    pub fn for_logs(severity: Option<Severity>, since_boot: bool) -> Self {
+    pub fn for_logs(
+        severity: Option<Severity>,
+        since_boot: bool,
+        about: Option<EntityRef>,
+    ) -> Self {
         Self {
             // `Info` is every severity there is, so it is not a filter; keeping
             // it out of the URL is what stops an untouched log carrying one.
             severity: severity.filter(|&s| s != Severity::Info),
             since_boot,
+            about,
             ..Self::default()
         }
+    }
+
+    /// The log, narrowed to what names `entity`: where a page links to "its"
+    /// entries.
+    #[must_use]
+    pub fn about(entity: impl Into<EntityRef>) -> Self {
+        Self::for_logs(None, false, Some(entity.into()))
     }
 
     /// The sort to apply, given what this list would use by default.
@@ -1371,6 +1407,10 @@ impl std::fmt::Display for ViewParams {
         }
         if self.since_boot {
             write!(f, "{sep}b=1")?;
+            sep = "&";
+        }
+        if let Some(about) = &self.about {
+            write!(f, "{sep}e={about}")?;
         }
         Ok(())
     }
@@ -1401,6 +1441,10 @@ impl From<&str> for ViewParams {
                     view.severity = Severity::from_slug(value).filter(|&s| s != Severity::Info);
                 }
                 "b" => view.since_boot = value == "1",
+                // A pkgbase may hold `+`, which a query parser may already
+                // have turned into a space. No reference can contain a space,
+                // so turning one back is always right.
+                "e" => view.about = value.replace("%2B", "+").replace(' ', "+").parse().ok(),
                 _ => {}
             }
         }

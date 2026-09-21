@@ -820,6 +820,34 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         "{}",
         session.url().await
     );
+
+    // About one package: what names it stays, whatever else goes -- and
+    // letting the filter go brings the rest back.
+    session.open("/logs?e=pkg:yay").await;
+    session
+        .wait_until("the log about yay", |t| {
+            t.contains("forced update of package")
+        })
+        .await;
+    let about = session.text().await;
+    assert!(about.contains("publishing yay #7 failed"), "{about}");
+    assert!(
+        !about.contains("added package hello"),
+        "an entry about another package is not about this one: {about}"
+    );
+    session
+        .click("button[aria-label=\"Show the whole log\"]")
+        .await;
+    session
+        .wait_until("the whole log to come back", |t| {
+            t.contains("added package hello")
+        })
+        .await;
+    assert!(
+        !session.url().await.contains("e="),
+        "{}",
+        session.url().await
+    );
 }
 
 /// Queueing two packages and taking one back off again.

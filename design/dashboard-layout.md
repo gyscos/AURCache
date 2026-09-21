@@ -11,7 +11,7 @@ Give the dashboard a glanceable, action-oriented layout that answers "is the ins
 ## Context And Current Facts
 - **Current landing page** `frontend-rs/src/screens/dashboard.rs:10-78` (`Dashboard`): fetches two resources - `client.stats()` (`aurcache_common::api::stats::ListStats` `stats.rs:6-33`: `total_builds`, `successful/failed`, `recent_*` (7-day `RECENT_DAYS:7`), `avg_build_time`, `repo_size`, `requested/dependency_packages`, trends) rendered as `StatTiles` `dashboard.rs:100-165` (5 cards in `grid gap-4 grid-cols-2 lg:grid-cols-3 xl:grid-cols-5`, two linked), and `client.graph()` (`GraphDataPoint` `stats.rs:43-52`: `year/month/count/successful`) rendered as `BuildsChart` `dashboard.rs:172-238` (`LineChart` 900x260, `padding 20/50/30/45`, two series `started` vs `succeeded`, legend, `chart-box h-64` fix in `index.html:28`).
 - **Polling:** `poll::use_poll(stats, false)` / `graph` - slow tick, not busy. Cards already use `bg-base-100 shadow-xl` and `Chart` uses `oklch(var(--bc))` CSS overrides added for `dx-grid-label`/`dx-grid-line` plus `translateY(6px)` for hanging month labels, all in `index.html`.
-- **Available read APIs without new migration** `backend/aurcache-client/src/lib.rs:268-455`: `list_packages(limit, page, dependencies: bool) -> Vec<SimplePackage>` (`/packages/list`), `list_builds(pkgbase: Option<&str>, limit, page) -> Vec<Build>` (`/builds` or `/package/{pkgbase}/builds`), `list_activity` via `ActivityPage` `activity.rs:104-108` (`/activity` - paged, `total` travels with page, `Severity` `Info/Warning/Error`, `ActivitySubject::Package/Worker/Build` with `label()`), `stats`/`graph` already used. `SimplePackage` carries `name`, `status`, `out_of_date`, `latest_build` refs; `Build` (`BuildSummary`) carries `pkgbase`, `number`, `status`, `version`, `start_time`.
+- **Available read APIs without new migration** `backend/aurcache-client/src/lib.rs:268-455`: `list_packages(limit, page, dependencies: bool) -> Vec<SimplePackage>` (`/packages/list`), `list_builds(pkgbase: Option<&str>, limit, page) -> Vec<Build>` (`/builds` or `/package/{pkgbase}/builds`), `log(limit, offset, &LogQuery)` -> `LogPage` (`/log` - paged and filtered server-side, `total` travels with the page, `Severity` `Info/Warning/Error`; each `LogEntry` decodes to an `Event` whose `sentence()` names its entities), `stats`/`graph` already used. `SimplePackage` carries `name`, `status`, `out_of_date`, `latest_build` refs; `Build` (`BuildSummary`) carries `pkgbase`, `number`, `status`, `version`, `start_time`.
 - **What we don't have today:** dedicated "recent packages" ordering - `list_packages` has no `sort=created_at` param; current ordering is insertion order (check `aurcache-api/src/package/list.rs`). `list_builds` without `pkgbase` is globally recent by `start_time desc` (check `aurcache-api/src/builds/list.rs`). Activity is already time-ordered.
 - **Design system:** `daisyUI 4.12.14` + `Tailwind CDN`, `index.html:11-38` theme variables (`--p`, `--su`, `--bc`), cards `card bg-base-100`, titles `card-title text-base`, muted `opacity-60/70` legends already used in chart header `dashboard.rs:48-61`.
 
@@ -34,7 +34,7 @@ Give the dashboard a glanceable, action-oriented layout that answers "is the ins
 - **Recent packages rows:** `SimplePackage` name via `PackageBadge` pattern (`screens/packages.rs`), status dot via `BuildStatusBadge`, row is `Link` to `Route::Package { pkgbase }`. Uses `list_packages?sort=recent&limit=5&dependencies=false`. Empty: "No packages yet. Add one →".
 - **Recent builds rows:** `Build` `pkgbase`, `#number`, `BuildStatusBadge`, `version`, `AbsoluteDate` (`start_time`), row links to `Route::Build { pkgbase, number }` (`status::BuildStatusBadge` in `screens/builds.rs`). Uses `list_builds?sort=recent&limit=5`.
 - **Attention rows:** `Failed` (`list_packages?status=failed`), `OutOfDate` (`?status=out_of_date`), `Largest` (`?sort=size`, `SimplePackage.total_size` via `total_artifact_size_expr()` in `package.rs:750`), `Longest` (`list_builds?sort=duration`, `duration = end_time - start_time` where `end_time` not null, `builds.rs:22-36`), `Stuck` (`list_builds?status=enqueued|waiting_for_deps&sort=queued_since`). Each shows the natural secondary value (size `format_bytes`, duration `format_secs`, queued `AbsoluteDate`).
-- **Recent activity rows:** `ActivityPage.entries` first 5, each row `flex gap-2` with `Severity` badge (`badge badge-info` etc.), `AbsoluteDate`, `text` where `subject` is `Link` to `subject.route()` (`ActivitySubject::label()`), otherwise plain span. Prose is server-rendered.
+- **Recent activity rows:** `log(Some(5), None, ..)`, each row `flex gap-2` with `Severity` badge (`badge badge-info` etc.), `AbsoluteDate`, and the entry rendered as the Logs page renders it (`EntryText` in `screens/logs.rs`): each entity its sentence names is a `Link`, and an entry that does not decode falls back to its stored `message`.
 - **Styling:** muted `opacity-60`, dividers `divide-y divide-base-200`, rows `py-2 flex justify-between`, cards `shadow-xl`. Chart stays `chart-box h-64` with existing themed CSS.
 
 ## Work Plan
@@ -58,12 +58,11 @@ Give the dashboard a glanceable, action-oriented layout that answers "is the ins
 
 ## Open Questions
 - None - `?sort`/`?status` for packages/builds is now in scope for v1 per your call, so "recent" and "largest"/"longest"/"failed" are server-side.
-- The activity feed is moving to the structured log (`design/structured-logs.md`); the Recent activity card should read from whichever store the Logs page reads by then.
 - `N` for the attention cards: `5` matches the recents, `3` keeps the `Largest`/`Longest` row denser - default to `5` for consistency, easy to change one constant.
 
 ## Sources
 - `frontend-rs/src/screens/dashboard.rs:10-78` (current `Dashboard` + `StatTiles` + `BuildsChart`)
 - `frontend-rs/index.html:11-38` (chart theming + `chart-box` height fix)
 - `backend/aurcache-common/src/api/stats.rs:6-52` (`ListStats`, `GraphDataPoint`, `RECENT_DAYS:7`)
-- `backend/aurcache-common/src/api/activity.rs:15-134` (`Severity`, `ActivitySubject`, `ActivityPage`)
-- `backend/aurcache-client/src/lib.rs:268-455` (`stats`, `graph`, `list_packages`, `list_builds`, `ActivityPage` re-exports)
+- `backend/aurcache-common/src/api/log.rs` and `events.rs` (`LogEntry`, `LogPage`, `Event`, `Segment`)
+- `backend/aurcache-client/src/lib.rs` (`stats`, `graph`, `list_packages`, `list_builds`, `log`)

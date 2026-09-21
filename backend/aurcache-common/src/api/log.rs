@@ -78,6 +78,15 @@ impl EntityRef {
             Self::Build(build) => format!("{}/{}", build.pkgbase, build.number),
         }
     }
+    /// How the reference reads in a sentence: the name a person knows it by,
+    /// with no namespace -- the sentence around it already says what it is.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Package(PackageRef(name)) | Self::Worker(WorkerRef(name)) => name.clone(),
+            Self::Build(build) => format!("{} #{}", build.pkgbase, build.number),
+        }
+    }
 }
 
 impl From<PackageRef> for EntityRef {

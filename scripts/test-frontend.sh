@@ -327,8 +327,9 @@ ROUTES=(
     # DOM: the prose and the link are checked separately rather than as one
     # contiguous string.
     "/logs|added package|logs"
-    # The text is rendered server-side from the stored JSON, so this also
-    # proves the payload shapes in the fixture are ones the server can parse.
+    # The sentence is rendered in the browser from the stored payload, so this
+    # also proves the payload shapes in the fixture are ones the catalogue
+    # parses.
     "/logs|forced update of package|the log renders each entry type"
     # Nobody asked for this one; a schedule did. The Dart frontend called that
     # "You", which claims work the reader did not do.
@@ -341,6 +342,12 @@ ROUTES=(
     # A package an entry is about opens from the log.
     "/logs|href=\"/package/hello\"|an entry links to the package it is about"
     "/logs|href=\"/worker/|a worker entry links to the worker"
+    # A build is named by package and number, and opens the build.
+    "/logs|href=\"/package/yay/build/7\"|a build entry links to the build"
+    # Narrowed to one package, from the link on its page.
+    "/logs?e=pkg:hello|added package|the log narrows to one package"
+    "/logs?e=pkg:hello|About|the log says what it is narrowed to"
+    "/package/hello|href=\"/logs?e=pkg:hello\"|a package links to its log"
     # The path before Activity became Logs; a bookmark of it still lands.
     "/activities|added package|the old activities path redirects"
     # Filters ride the query, so a narrowed log is linkable. What a filter

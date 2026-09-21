@@ -9,11 +9,15 @@ use reqwest::Url;
 // this client, and the browser frontend alike. Types still declared below are
 // ones whose server-side counterpart has a different shape or name; converging
 // those is the remaining half of the job.
-pub use aurcache_common::api::activity::{Activity, ActivityPage, ActivitySubject, Severity};
+pub use aurcache_common::api::activity::Severity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::dump::{
     RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
+};
+pub use aurcache_common::api::events::{Event, Segment};
+pub use aurcache_common::api::log::{
+    BuildRef, EntityRef, LogEntry, LogPage, PackageRef, WorkerRef,
 };
 pub use aurcache_common::api::operations::{ActiveOperation, kind as operation_kind};
 pub use aurcache_common::api::package::{
@@ -127,6 +131,23 @@ const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// How long a dump may take to travel either way, the restore upload and the
 /// download alike: up to 64 MiB on a slow link.
 const CLIENT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What to narrow the log to. Every field is "show me less"; the default is
+/// the whole log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogQuery {
+    /// This severity and worse.
+    pub severity: Option<Severity>,
+    /// Only what happened since the server last started.
+    pub since_boot: bool,
+    /// Only entries of this kind.
+    pub kind: Option<String>,
+    /// Only entries naming this entity, in any role -- or, for a build, also
+    /// recorded during it.
+    pub entity: Option<EntityRef>,
+    /// With `entity`: only where it played this role.
+    pub role: Option<String>,
+}
 
 /// Async HTTP client for the AURCache API.
 ///
@@ -698,27 +719,26 @@ impl AurCacheClient {
         path
     }
 
-    /// One page of the activity log, newest first, with how long the log is.
+    /// One page of the log, newest first, with how long the filtered log is.
     ///
     /// Paged *and filtered* on the server because the log only grows: there is
     /// no point at which fetching all of it is the cheap option, and a filter
     /// applied after the fact would only search the page it was given.
-    ///
-    /// `severity` shows that level and worse; `since_boot` limits it to what
-    /// happened since the server last started. Both omitted means the whole log.
-    pub async fn activities(
+    pub async fn log(
         &self,
         limit: Option<u64>,
         offset: Option<u64>,
-        severity: Option<Severity>,
-        since_boot: bool,
-    ) -> Result<ActivityPage> {
+        filter: &LogQuery,
+    ) -> Result<LogPage> {
         let query = Query::default()
             .opt("limit", limit)
             .opt("offset", offset)
-            .opt("severity", severity.map(|s| s.slug().to_string()))
-            .opt("since_boot", since_boot.then_some(true));
-        self.request_json::<ActivityPage, Value>(Method::GET, "/activity", query.pairs(), None)
+            .opt("severity", filter.severity.map(|s| s.slug().to_string()))
+            .opt("since_boot", filter.since_boot.then_some(true))
+            .opt("kind", filter.kind.clone())
+            .opt("entity", filter.entity.as_ref().map(ToString::to_string))
+            .opt("role", filter.role.clone());
+        self.request_json::<LogPage, Value>(Method::GET, "/log", query.pairs(), None)
             .await
     }
 
@@ -1112,9 +1132,11 @@ impl ApiError {
 /// the server answered 404, wherever in the error's chain that answer sits.
 #[must_use]
 pub fn is_not_found(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<ApiError>().is_some_and(ApiError::is_not_found))
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiError>()
+            .is_some_and(ApiError::is_not_found)
+    })
 }
 
 impl std::fmt::Display for ApiError {

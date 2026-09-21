@@ -36,7 +36,7 @@
 //! See `design/structured-logs.md`.
 
 use crate::api::activity::Severity;
-use crate::api::log::{BuildRef, PackageRef};
+use crate::api::log::{BuildRef, EntityRef, PackageRef, WorkerRef};
 use serde::{Deserialize, Serialize};
 
 /// Anything worth recording, tagged by its kind.
@@ -134,6 +134,117 @@ pub enum Event {
     /// somebody would look for it.
     #[serde(rename = "build_log.append_failed")]
     BuildLogAppendFailed { build: BuildRef, error: String },
+
+    /// A build produced a package that never reached the repository.
+    ///
+    /// Distinct from a build that failed: this one worked, and the artifact
+    /// exists.
+    #[serde(rename = "publish.failed")]
+    PublishFailed { build: BuildRef, error: String },
+
+    // -----------------------------------------------------------------------
+    // What people did to packages
+    // -----------------------------------------------------------------------
+    /// A package was added, with whatever it depends on.
+    #[serde(rename = "package.added")]
+    PackageAdded { pkg: PackageRef },
+
+    /// A package's build was queued on request, or by the auto-updater.
+    ///
+    /// `forced` rebuilds what is already current, which is worth telling apart
+    /// from an update that found something new.
+    #[serde(rename = "package.updated")]
+    PackageUpdated { pkg: PackageRef, forced: bool },
+
+    /// A package was removed, with its builds and artifacts.
+    #[serde(rename = "package.deleted")]
+    PackageDeleted { pkg: PackageRef },
+
+    // -----------------------------------------------------------------------
+    // The server and its fleet
+    // -----------------------------------------------------------------------
+    /// The server process started: a deploy, a restart, or a crash loop -- all
+    /// three worth lining up against what else happened.
+    ///
+    /// The marker "since the last restart" counts back to.
+    #[serde(rename = "server.start")]
+    ServerStarted { version: String },
+
+    /// A pass of the version check did not finish, so nothing was found to be
+    /// out of date that pass.
+    #[serde(rename = "version_check.pass_failed")]
+    VersionCheckFailed { error: String },
+
+    /// A machine asked to join the fleet for the first time.
+    ///
+    /// Only the first time: a worker registers on every startup, so recording
+    /// each one would turn an ordinary restart into a log nobody can read past.
+    #[serde(rename = "worker.enrolled")]
+    WorkerEnrolled { worker: WorkerRef },
+
+    /// A worker was let into the fleet, by someone or by the enrollment rules.
+    #[serde(rename = "worker.approved")]
+    WorkerApproved { worker: WorkerRef },
+
+    /// A worker was put out of the fleet, and its builds taken back.
+    #[serde(rename = "worker.revoked")]
+    WorkerRevoked { worker: WorkerRef },
+
+    /// Builds taken back from a worker that stopped answering.
+    ///
+    /// One entry per pass rather than per build: the reaper finds them
+    /// together, and they have one cause.
+    #[serde(rename = "worker.reaped")]
+    WorkerReaped {
+        /// Handed back to the queue for another attempt.
+        retried: Vec<BuildRef>,
+        /// Out of attempts, and failed outright.
+        failed: Vec<BuildRef>,
+    },
+
+    /// A worker refused values its machine was configured with, and is running
+    /// something else.
+    #[serde(rename = "worker.setting_rejected")]
+    WorkerSettingRejected {
+        worker: WorkerRef,
+        settings: Vec<String>,
+    },
+}
+
+/// A piece of an event's sentence: prose, or something it names.
+///
+/// Kept apart so one sentence serves both readers: [`Event::message`] joins
+/// the pieces into the text that is stored, and the browser renders each
+/// reference as a link to its page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    Text(String),
+    Entity(EntityRef),
+}
+
+fn text(text: impl Into<String>) -> Segment {
+    Segment::Text(text.into())
+}
+
+fn entity(entity: &(impl Clone + Into<EntityRef>)) -> Segment {
+    Segment::Entity(entity.clone().into())
+}
+
+/// `a`, `a and b`, `a, b and c`: a list reads as a sentence, and each item
+/// still links.
+fn list<T: Clone + Into<EntityRef>>(items: &[T]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(text(if index + 1 == items.len() {
+                " and "
+            } else {
+                ", "
+            }));
+        }
+        out.push(entity(item));
+    }
+    out
 }
 
 /// Which store a refresh was against.
@@ -192,6 +303,17 @@ impl Event {
             Self::DependentsTriggerFailed { .. } => "dependents.trigger_failed",
             Self::BuildMarkFailed { .. } => "build.mark_failed",
             Self::BuildLogAppendFailed { .. } => "build_log.append_failed",
+            Self::PublishFailed { .. } => "publish.failed",
+            Self::PackageAdded { .. } => "package.added",
+            Self::PackageUpdated { .. } => "package.updated",
+            Self::PackageDeleted { .. } => "package.deleted",
+            Self::ServerStarted { .. } => SERVER_START,
+            Self::VersionCheckFailed { .. } => "version_check.pass_failed",
+            Self::WorkerEnrolled { .. } => "worker.enrolled",
+            Self::WorkerApproved { .. } => "worker.approved",
+            Self::WorkerRevoked { .. } => "worker.revoked",
+            Self::WorkerReaped { .. } => "worker.reaped",
+            Self::WorkerSettingRejected { .. } => "worker.setting_rejected",
         }
     }
 
@@ -203,66 +325,173 @@ impl Event {
     #[must_use]
     pub const fn severity(&self) -> Severity {
         match self {
+            Self::PackageAdded { .. }
+            | Self::PackageUpdated { .. }
+            | Self::PackageDeleted { .. }
+            | Self::ServerStarted { .. }
+            | Self::WorkerEnrolled { .. }
+            | Self::WorkerApproved { .. }
+            | Self::WorkerRevoked { .. } => Severity::Info,
             Self::SourceRefreshFailed { .. }
             | Self::SourceinfoFailed { .. }
             | Self::VcsSyncFailed { .. }
             | Self::AurMissing { .. }
             | Self::VersionCheckStoreFailed { .. }
             | Self::VersionCompareFallback { .. }
-            | Self::BuildLogAppendFailed { .. } => Severity::Warning,
+            | Self::BuildLogAppendFailed { .. }
+            | Self::VersionCheckFailed { .. }
+            | Self::WorkerReaped { .. }
+            | Self::WorkerSettingRejected { .. } => Severity::Warning,
             Self::UpdateQueueFailed { .. }
             | Self::DependentsTriggerFailed { .. }
-            | Self::BuildMarkFailed { .. } => Severity::Error,
+            | Self::BuildMarkFailed { .. }
+            | Self::PublishFailed { .. } => Severity::Error,
         }
     }
 
-    /// The sentence, rendered now and stored, so a row still reads when its
-    /// payload can no longer be parsed into this enum.
+    /// The sentence, as prose and the things it names.
     #[must_use]
-    pub fn message(&self) -> String {
+    pub fn sentence(&self) -> Vec<Segment> {
         match self {
-            Self::SourceRefreshFailed { pkg, target, error } => format!(
-                "could not refresh the {} source of {pkg}: {error}",
-                target.as_str()
-            ),
+            Self::SourceRefreshFailed { pkg, target, error } => vec![
+                text(format!(
+                    "could not refresh the {} source of ",
+                    target.as_str()
+                )),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
             Self::SourceinfoFailed {
                 pkg,
                 purpose,
                 error,
-            } => format!(
-                "could not read the sourceinfo of {pkg} for its {}: {error}",
-                purpose.as_str()
-            ),
-            Self::VcsSyncFailed { pkg, error } => {
-                format!("could not sync the VCS sources of {pkg}: {error}")
-            }
-            Self::AurMissing { pkg } => format!("{pkg} is no longer in the AUR"),
-            Self::VersionCheckStoreFailed { pkg, error } => {
-                format!("could not store the version check result for {pkg}: {error}")
-            }
+            } => vec![
+                text("could not read the sourceinfo of "),
+                entity(pkg),
+                text(format!(" for its {}: {error}", purpose.as_str())),
+            ],
+            Self::VcsSyncFailed { pkg, error } => vec![
+                text("could not sync the VCS sources of "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
+            Self::AurMissing { pkg } => vec![entity(pkg), text(" is no longer in the AUR")],
+            Self::VersionCheckStoreFailed { pkg, error } => vec![
+                text("could not store the version check result for "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
             Self::VersionCompareFallback {
                 pkg,
                 upstream_version,
                 built_version,
-            } => format!(
-                "cannot compare versions for {pkg}: upstream {upstream_version:?} vs built \
-                 {built_version:?}"
-            ),
-            Self::UpdateQueueFailed { error } => {
-                format!("found packages out of date but could not queue their builds: {error}")
+            } => vec![
+                text("cannot compare versions for "),
+                entity(pkg),
+                text(format!(
+                    ": upstream {upstream_version:?} vs built {built_version:?}"
+                )),
+            ],
+            Self::UpdateQueueFailed { error } => vec![text(format!(
+                "found packages out of date but could not queue their builds: {error}"
+            ))],
+            Self::DependentsTriggerFailed { pkg, error } => vec![
+                text("could not trigger what depends on "),
+                entity(pkg),
+                text(format!(": {error}")),
+            ],
+            Self::BuildMarkFailed { build, error } => vec![
+                text("could not mark "),
+                entity(build),
+                text(format!(" failed: {error}")),
+            ],
+            Self::BuildLogAppendFailed { build, error } => vec![
+                text("could not write to the log of "),
+                entity(build),
+                text(format!(": {error}")),
+            ],
+            Self::PublishFailed { build, error } => vec![
+                text("publishing "),
+                entity(build),
+                text(format!(" failed: {error}")),
+            ],
+            Self::PackageAdded { pkg } => vec![text("added package "), entity(pkg)],
+            Self::PackageUpdated { pkg, forced } => vec![
+                text(if *forced {
+                    "forced update of package "
+                } else {
+                    "updated package "
+                }),
+                entity(pkg),
+            ],
+            Self::PackageDeleted { pkg } => vec![text("deleted package "), entity(pkg)],
+            Self::ServerStarted { version } => vec![text(format!("AURCache {version} started"))],
+            Self::VersionCheckFailed { error } => {
+                vec![text(format!("the version check did not finish: {error}"))]
             }
-            Self::DependentsTriggerFailed { pkg, error } => {
-                format!("could not trigger what depends on {pkg}: {error}")
+            Self::WorkerEnrolled { worker } => {
+                vec![text("worker "), entity(worker), text(" enrolled")]
             }
-            Self::BuildMarkFailed { build, error } => {
-                format!("could not mark {build} failed: {error}")
+            Self::WorkerApproved { worker } => vec![text("approved worker "), entity(worker)],
+            Self::WorkerRevoked { worker } => vec![text("revoked worker "), entity(worker)],
+            Self::WorkerReaped { retried, failed } => {
+                let mut out = vec![text("a worker stopped answering: ")];
+                if !retried.is_empty() {
+                    out.push(text("requeued "));
+                    out.extend(list(retried));
+                }
+                if !failed.is_empty() {
+                    if !retried.is_empty() {
+                        out.push(text(", "));
+                    }
+                    out.push(text("gave up on "));
+                    out.extend(list(failed));
+                }
+                out
             }
-            Self::BuildLogAppendFailed { build, error } => {
-                format!("could not write to the log of {build}: {error}")
-            }
+            Self::WorkerSettingRejected { worker, settings } => vec![
+                text("worker "),
+                entity(worker),
+                text(format!(
+                    " refused {} it was configured with: {}",
+                    if settings.len() == 1 {
+                        "a value"
+                    } else {
+                        "values"
+                    },
+                    settings.join(", ")
+                )),
+            ],
         }
     }
+
+    /// The sentence as text, rendered now and stored, so a row still reads
+    /// when its payload can no longer be parsed into this enum.
+    #[must_use]
+    pub fn message(&self) -> String {
+        self.sentence()
+            .into_iter()
+            .map(|segment| match segment {
+                Segment::Text(text) => text,
+                Segment::Entity(entity) => entity.label(),
+            })
+            .collect()
+    }
+
+    /// Rebuild an event from the two columns a row stores it in.
+    ///
+    /// `None` for a kind this build does not know -- a row from a newer server
+    /// -- or a payload that no longer fits its variant: the cases the stored
+    /// message exists for.
+    #[must_use]
+    pub fn decode(kind: &str, data: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(serde_json::json!({ "kind": kind, "data": data })).ok()
+    }
 }
+
+/// The kind of [`Event::ServerStarted`]: the boot marker the server itself has
+/// to recognise, for "since the last restart".
+pub const SERVER_START: &str = "server.start";
 
 #[cfg(test)]
 mod tests {
@@ -277,6 +506,7 @@ mod tests {
             number: 7,
         };
         let error = || "boom".to_string();
+        let worker = || WorkerRef::from("builder-01");
         vec![
             Event::SourceRefreshFailed {
                 pkg: pkg(),
@@ -314,6 +544,31 @@ mod tests {
             Event::BuildLogAppendFailed {
                 build: build(),
                 error: error(),
+            },
+            Event::PublishFailed {
+                build: build(),
+                error: error(),
+            },
+            Event::PackageAdded { pkg: pkg() },
+            Event::PackageUpdated {
+                pkg: pkg(),
+                forced: true,
+            },
+            Event::PackageDeleted { pkg: pkg() },
+            Event::ServerStarted {
+                version: "1.2.3".to_string(),
+            },
+            Event::VersionCheckFailed { error: error() },
+            Event::WorkerEnrolled { worker: worker() },
+            Event::WorkerApproved { worker: worker() },
+            Event::WorkerRevoked { worker: worker() },
+            Event::WorkerReaped {
+                retried: vec![build()],
+                failed: vec![build(), build()],
+            },
+            Event::WorkerSettingRejected {
+                worker: worker(),
+                settings: vec!["builddir_max_bytes".to_string()],
             },
         ]
     }
@@ -381,5 +636,85 @@ mod tests {
                 "{event:?} did not survive"
             );
         }
+    }
+
+    /// The stored sentence names things by what people call them, not by
+    /// their namespaced ids.
+    #[test]
+    fn a_message_names_entities_by_their_labels() {
+        let message = Event::PublishFailed {
+            build: BuildRef {
+                pkgbase: "hello".to_string(),
+                number: 7,
+            },
+            error: "disk full".to_string(),
+        }
+        .message();
+        assert_eq!(message, "publishing hello #7 failed: disk full");
+    }
+
+    /// Every entity a payload names appears in its sentence, so the browser can
+    /// link each one and none goes unmentioned.
+    #[test]
+    fn every_reference_in_a_payload_is_in_its_sentence() {
+        for event in one_of_each() {
+            let named: Vec<EntityRef> = event
+                .sentence()
+                .into_iter()
+                .filter_map(|segment| match segment {
+                    Segment::Entity(entity) => Some(entity),
+                    Segment::Text(_) => None,
+                })
+                .collect();
+            let wire = serde_json::to_value(&event).unwrap();
+            for value in wire["data"].as_object().unwrap().values() {
+                let items = match value {
+                    serde_json::Value::Array(items) => items.clone(),
+                    other => vec![other.clone()],
+                };
+                for item in items {
+                    if let Some(entity) =
+                        item.as_str().and_then(|raw| raw.parse::<EntityRef>().ok())
+                    {
+                        assert!(
+                            named.contains(&entity),
+                            "{event:?} does not mention {entity:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lists read as a sentence: `a`, `a and b`, `a, b and c`.
+    #[test]
+    fn a_reaped_worker_lists_its_builds_as_a_sentence() {
+        let build = |number| BuildRef {
+            pkgbase: "hello".to_string(),
+            number,
+        };
+        let message = Event::WorkerReaped {
+            retried: vec![build(7)],
+            failed: vec![build(8), build(9), build(10)],
+        }
+        .message();
+        assert_eq!(
+            message,
+            "a worker stopped answering: requeued hello #7, gave up on hello #8, hello #9 and hello #10"
+        );
+    }
+
+    /// A stored row comes back as the event it was written from, and an unknown
+    /// kind or a stale payload comes back as nothing.
+    #[test]
+    fn decoding_rebuilds_known_rows_and_refuses_the_rest() {
+        let event = Event::PackageAdded {
+            pkg: "hello".into(),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        let back = Event::decode(event.kind(), &wire["data"]).expect("decodes");
+        assert_eq!(back.message(), event.message());
+        assert!(Event::decode("from.the.future", &serde_json::json!({})).is_none());
+        assert!(Event::decode("package.added", &serde_json::json!({"nope": 1})).is_none());
     }
 }

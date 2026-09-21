@@ -268,7 +268,7 @@ mod tests {
         );
 
         let filtered = Route::Logs {
-            view: ViewParams::for_logs(Some(Severity::Warning), true),
+            view: ViewParams::for_logs(Some(Severity::Warning), true, None),
         }
         .to_string();
         assert!(filtered.contains("v=warning"), "{filtered}");
@@ -366,7 +366,7 @@ mod tests {
                 view: ViewParams::default(),
             },
             Route::Logs {
-                view: ViewParams::for_logs(Some(Severity::Warning), true),
+                view: ViewParams::for_logs(Some(Severity::Warning), true, None),
             },
             Route::Settings {},
             Route::ConfigFiles {},

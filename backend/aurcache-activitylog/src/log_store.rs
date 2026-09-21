@@ -135,7 +135,7 @@ impl LogStore {
         Ok(Logs::find()
             .select_only()
             .column(logs::Column::Timestamp)
-            .filter(logs::Column::Kind.eq(crate::kinds::SERVER_START))
+            .filter(logs::Column::Kind.eq(crate::events::SERVER_START))
             .order_by(logs::Column::Timestamp, Order::Desc)
             .order_by(logs::Column::Id, Order::Desc)
             .into_tuple::<(i64,)>()

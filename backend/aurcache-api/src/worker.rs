@@ -11,10 +11,7 @@ use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
 use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::failure_activity::WorkerSettingRejectedActivity;
-use aurcache_activitylog::worker_activity::{
-    WorkerApproveActivity, WorkerEnrollActivity, WorkerRevokeActivity,
-};
+use aurcache_activitylog::events::Event;
 use aurcache_ca::Ca;
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
@@ -26,7 +23,6 @@ use aurcache_common::worker::{
     MirrorlistPreference, RegisterRequest, RegisterStatus,
 };
 use aurcache_common::worker_config::{EffectiveConfig, SettingStatus};
-use aurcache_db::activities::ActivityType;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
@@ -341,13 +337,9 @@ pub async fn register_worker(
     .map_err(|e| err(Status::InternalServerError, e))?;
 
     if !known {
-        al.record(
-            WorkerEnrollActivity {
-                worker: worker.name.clone(),
-            },
-            ActivityType::WorkerEnroll,
-            None,
-        );
+        al.emit(Event::WorkerEnrolled {
+            worker: worker.name.clone().into(),
+        });
     }
 
     // Issue the leaf certificate, or re-issue one this CA did not sign.
@@ -399,13 +391,9 @@ pub async fn register_worker(
             })?;
         tracing::info!("Auto-approved worker '{}' ({fingerprint})", worker.name);
         // No user: nobody clicked this. The log says the server did it.
-        al.record(
-            WorkerApproveActivity {
-                worker: worker.name.clone(),
-            },
-            ActivityType::WorkerApprove,
-            None,
-        );
+        al.emit(Event::WorkerApproved {
+            worker: worker.name.clone().into(),
+        });
     }
 
     register_status_for(db, ca, &fingerprint).await
@@ -932,14 +920,10 @@ pub async fn heartbeat(
             .map(|(key, _)| key.clone())
             .collect();
         if !refused.is_empty() {
-            al.record(
-                WorkerSettingRejectedActivity {
-                    worker: auth.worker.name.clone(),
-                    settings: refused,
-                },
-                ActivityType::WorkerSettingRejected,
-                None,
-            );
+            al.emit(Event::WorkerSettingRejected {
+                worker: auth.worker.name.clone().into(),
+                settings: refused,
+            });
         }
     }
     let outcome = worker_jobs::heartbeat(
@@ -1197,11 +1181,10 @@ pub async fn approve_worker(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
-    al.record(
-        WorkerApproveActivity {
-            worker: worker.name,
+    al.emit_by(
+        Event::WorkerApproved {
+            worker: worker.name.into(),
         },
-        ActivityType::WorkerApprove,
         a.username,
     );
     Ok(())
@@ -1220,11 +1203,10 @@ pub async fn revoke_worker(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
-    al.record(
-        WorkerRevokeActivity {
-            worker: worker.name,
+    al.emit_by(
+        Event::WorkerRevoked {
+            worker: worker.name.into(),
         },
-        ActivityType::WorkerRevoke,
         a.username,
     );
     Ok(())

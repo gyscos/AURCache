@@ -120,7 +120,7 @@ pub fn init_api(
                 (path = "/api", api = crate::package::PackageApi, tags = ["Package"]),
                 (path = "/api", api = crate::stats::StatsApi, tags = ["Stats"]),
                 (path = "/api", api = crate::dump::DumpApi, tags = ["Dump"]),
-                (path = "/api", api = crate::activity::ActivityApi, tags = ["Activity"]),
+                (path = "/api", api = crate::log::LogApi, tags = ["Log"]),
                 (path = "/api", api = crate::settings::SettingsApi, tags = ["Settings"]),
                 (path = "/api", api = crate::worker::WorkerApi, tags = ["Worker"]),
             ),

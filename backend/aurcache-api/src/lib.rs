@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-mod activity;
 mod aur;
 mod auth;
 pub mod backend;
@@ -11,6 +10,7 @@ mod dump;
 pub mod embed;
 mod health;
 pub mod init;
+mod log;
 // Public so the HTTP client can be type-checked against the exact shapes
 // the server serialises, instead of a hand-mirrored copy.
 pub mod models;

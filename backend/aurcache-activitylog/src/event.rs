@@ -10,7 +10,7 @@
 
 use crate::events::Event;
 use aurcache_common::api::activity::Severity;
-use aurcache_common::api::log::EntityRef;
+use aurcache_common::api::log::{EntityRef, PackageRef};
 
 /// Every entity a serialized payload refers to, with the role it played.
 ///
@@ -21,6 +21,10 @@ use aurcache_common::api::log::EntityRef;
 ///
 /// A role naming several entities (a `Vec<BuildRef>`) yields one entry per
 /// element, all under the same role.
+///
+/// A build is also filed under its package, in the same role: a build is part
+/// of its package's story, and "everything about yay" that left out "publishing
+/// yay #7 failed" would be answering a narrower question than the one asked.
 ///
 /// Only values that are *entirely* a known reference are taken, so context
 /// values are left alone: `"connection refused: timeout"` has a colon but
@@ -35,20 +39,22 @@ pub fn references(payload: &serde_json::Value) -> Vec<(String, EntityRef)> {
     };
     let mut found = Vec::new();
     for (role, value) in fields {
-        match value {
-            serde_json::Value::String(raw) => {
-                if let Ok(entity) = raw.parse::<EntityRef>() {
-                    found.push((role.clone(), entity));
-                }
+        let items = match value {
+            serde_json::Value::String(_) => std::slice::from_ref(value),
+            serde_json::Value::Array(items) => items.as_slice(),
+            _ => continue,
+        };
+        for item in items {
+            let Some(entity) = item.as_str().and_then(|raw| raw.parse::<EntityRef>().ok()) else {
+                continue;
+            };
+            if let EntityRef::Build(build) = &entity {
+                found.push((
+                    role.clone(),
+                    PackageRef::from(build.pkgbase.as_str()).into(),
+                ));
             }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    if let Some(entity) = item.as_str().and_then(|raw| raw.parse().ok()) {
-                        found.push((role.clone(), entity));
-                    }
-                }
-            }
-            _ => {}
+            found.push((role.clone(), entity));
         }
     }
     found
@@ -67,8 +73,7 @@ pub struct Rendered {
     pub references: Vec<(String, EntityRef)>,
 }
 
-/// The two columns a row is stored in, as serde writes them.
-const TAG: &str = "kind";
+/// The column the payload is stored in, as serde writes it.
 const CONTENT: &str = "data";
 
 /// Render an event into what the store writes.
@@ -98,15 +103,12 @@ pub fn render(event: &Event) -> Result<Rendered, serde_json::Error> {
 
 /// Turn a stored row back into the event it was written from.
 ///
-/// The inverse of [`render`]: the `kind` column is the tag and `data` is the
-/// content, so serde dispatches with no table to keep in step. `None` for a
-/// kind this build does not know -- a row from a newer server -- or a payload
-/// that no longer matches its type, which is the case the stored message
-/// exists for.
+/// The inverse of [`render`]; see [`Event::decode`]. `None` for a kind this
+/// build does not know, a payload that no longer fits, or `data` that is not
+/// JSON at all.
 #[must_use]
 pub fn decode(kind: &str, data: &str) -> Option<Event> {
-    let content: serde_json::Value = serde_json::from_str(data).ok()?;
-    serde_json::from_value(serde_json::json!({ TAG: kind, CONTENT: content })).ok()
+    Event::decode(kind, &serde_json::from_str(data).ok()?)
 }
 
 #[cfg(test)]
@@ -209,8 +211,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rendered.payload["build"], "build:hello/7");
-        assert_eq!(rendered.references.len(), 1);
-        assert_eq!(rendered.references[0].0, "build");
+        // The build, and its package: a build is part of its package's story.
+        assert_eq!(
+            rendered.references,
+            vec![
+                ("build".to_string(), PackageRef::from("hello").into()),
+                (
+                    "build".to_string(),
+                    BuildRef {
+                        pkgbase: "hello".to_string(),
+                        number: 7
+                    }
+                    .into()
+                ),
+            ]
+        );
     }
 
     /// A role naming several entities yields one index entry per entity.
@@ -218,7 +233,8 @@ mod tests {
     fn a_list_role_yields_an_entry_each() {
         let payload = json!({"builds": ["build:hello/7", "build:yay/3"], "count": 2});
         let found = references(&payload);
-        assert_eq!(found.len(), 2);
+        // Each build, and each build's package.
+        assert_eq!(found.len(), 4);
         assert!(found.iter().all(|(role, _)| role == "builds"));
     }
 
