@@ -129,6 +129,58 @@ fn make_srcinfo(pkgbase: &str, version: &str, depends: &[&str]) -> String {
     )
 }
 
+fn create_aur_git_repo_with_provides(
+    aur_root: &Path,
+    pkgbase: &str,
+    version: &str,
+    depends: &[&str],
+    provides: &[&str],
+) {
+    let repo_path = aur_root.join(format!("{pkgbase}.git"));
+    let repo = git2::Repository::init(&repo_path).expect("failed to init aur git repo");
+
+    let mut srcinfo = format!(
+        "pkgbase = {pkgbase}\n\
+         pkgver = {version}\n\
+         pkgrel = 1\n\
+         arch = x86_64\n"
+    );
+    for dep in depends {
+        srcinfo.push_str(&format!("    depends = {dep}\n"));
+    }
+    for prov in provides {
+        srcinfo.push_str(&format!("    provides = {prov}\n"));
+    }
+    srcinfo.push_str(&format!("    pkgname = {pkgbase}\n"));
+
+    let depends_arr = depends
+        .iter()
+        .map(|dep| format!("'{dep}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let provides_arr = provides
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pkgbuild = format!(
+        "pkgname={pkgbase}\npkgver={version}\npkgrel=1\narch=('x86_64')\ndepends=({depends_arr})\nprovides=({provides_arr})\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n"
+    );
+
+    fs::write(repo_path.join("PKGBUILD"), pkgbuild).unwrap();
+    fs::write(repo_path.join(".SRCINFO"), srcinfo).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("PKGBUILD")).unwrap();
+    index.add_path(Path::new(".SRCINFO")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+}
+
 fn create_aur_git_repo(aur_root: &Path, pkgbase: &str, version: &str, depends: &[&str]) {
     let repo_path = aur_root.join(format!("{pkgbase}.git"));
     let repo = git2::Repository::init(&repo_path).expect("failed to init aur git repo");
@@ -1152,6 +1204,159 @@ async fn scenario_k_self_resolved_dependency_is_ignored() {
     assert_eq!(
         pkg_count, 1,
         "self-resolved dependencies should not duplicate the package"
+    );
+}
+
+#[tokio::test]
+async fn scenario_k2_self_provides_dependency_is_ignored() {
+    let env = setup_env().await;
+
+    // Package provides virtual-dep (e.g. flutter's dart) and also depends on it.
+    // Without checking own provides first, this would be resolved against
+    // another provider (e.g. flutter-bin or extra/dart) and create an edge.
+    mock_rpc_info(
+        &env.server,
+        "self-provide-base",
+        rpc_deps_json(
+            "self-provide-base",
+            "self-provide-base",
+            &["virtual-dep"],
+            &[],
+            "1.0.0",
+        ),
+    )
+    .await;
+    create_aur_git_repo_with_provides(
+        env.aur_root.path(),
+        "self-provide-base",
+        "1.0.0",
+        &["virtual-dep"],
+        &["virtual-dep"],
+    );
+    // Another package provides the same virtual name — the brittle path would
+    // pick it when own provides are not checked first.
+    Mock::given(method("GET"))
+        .and(path("/rpc/v5/info"))
+        .and(query_param("arg[]", "virtual-dep"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(multiinfo_json(&[rpc_deps_json(
+                "virtual-dep",
+                "other-provider",
+                &[],
+                &[],
+                "1.0.0",
+            )])),
+        )
+        .mount(&env.server)
+        .await;
+    // Search path for provides — would return other-provider if self is skipped.
+    Mock::given(method("GET"))
+        .and(path("/rpc/v5/search/virtual-dep"))
+        .and(query_param("by", "provides"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(multiinfo_json(&[rpc_deps_json(
+                "virtual-dep",
+                "other-provider",
+                &[],
+                &[],
+                "1.0.0",
+            )])),
+        )
+        .mount(&env.server)
+        .await;
+
+    let result = add_pkg_via_rpc(&env, "self-provide-base").await;
+    assert!(result.is_ok(), "{result:?}");
+
+    let pkg = Packages::find()
+        .filter(packages::Column::Name.eq("self-provide-base"))
+        .one(&env.db)
+        .await
+        .unwrap()
+        .expect("package should exist");
+
+    let dep_count = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(pkg.id))
+        .count(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        dep_count, 0,
+        "self-provided dependencies via provides should be ignored"
+    );
+}
+
+#[tokio::test]
+async fn scenario_k3_self_split_via_provides_with_version_is_ignored() {
+    let env = setup_env().await;
+
+    // Provides with version suffix, as in dart=3.13.4 — dependency is unversioned.
+    mock_rpc_info(
+        &env.server,
+        "self-versioned-provide",
+        rpc_deps_json(
+            "self-versioned-provide",
+            "self-versioned-provide",
+            &["virtual-dep"],
+            &[],
+            "1.0.0",
+        ),
+    )
+    .await;
+    create_aur_git_repo_with_provides(
+        env.aur_root.path(),
+        "self-versioned-provide",
+        "1.0.0",
+        &["virtual-dep"],
+        &["virtual-dep=1.0.0"],
+    );
+    Mock::given(method("GET"))
+        .and(path("/rpc/v5/info"))
+        .and(query_param("arg[]", "virtual-dep"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(multiinfo_json(&[rpc_deps_json(
+                "virtual-dep",
+                "other-provider",
+                &[],
+                &[],
+                "1.0.0",
+            )])),
+        )
+        .mount(&env.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rpc/v5/search/virtual-dep"))
+        .and(query_param("by", "provides"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(multiinfo_json(&[rpc_deps_json(
+                "virtual-dep",
+                "other-provider",
+                &[],
+                &[],
+                "1.0.0",
+            )])),
+        )
+        .mount(&env.server)
+        .await;
+
+    let result = add_pkg_via_rpc(&env, "self-versioned-provide").await;
+    assert!(result.is_ok(), "{result:?}");
+
+    let pkg = Packages::find()
+        .filter(packages::Column::Name.eq("self-versioned-provide"))
+        .one(&env.db)
+        .await
+        .unwrap()
+        .expect("package should exist");
+
+    let dep_count = Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(pkg.id))
+        .count(&env.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        dep_count, 0,
+        "versioned self-provides should satisfy unversioned self-dep"
     );
 }
 

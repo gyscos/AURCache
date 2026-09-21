@@ -13,6 +13,7 @@
 #![allow(clippy::useless_format)]
 
 mod api;
+mod clipboard;
 mod dates;
 mod format;
 mod listing;

@@ -225,6 +225,31 @@ pub fn join_constraints(bounds: &[Constraint]) -> String {
         .join(",")
 }
 
+/// Every name a package answers to itself: its pkgbase, its split packages,
+/// and what it provides (a versioned `provides` contributes the name).
+///
+/// A dependency on one of these is satisfied by the package's own artifacts,
+/// so the add and resync paths leave it out before resolution -- asked
+/// elsewhere, a co-provider would win and the package would grow an edge to
+/// it.
+#[must_use]
+pub fn self_provided_names(
+    pkgbase: &str,
+    pkgnames: &[String],
+    provides: &[String],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::from([pkgbase.to_string()]);
+    names.extend(pkgnames.iter().cloned());
+    names.extend(
+        provides
+            .iter()
+            .map(|provide| parse_dep(provide).0)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+    );
+    names
+}
+
 /// The dependencies a package declares.
 ///
 /// The single answer to "what does this pkgbase need?". Both the add path and

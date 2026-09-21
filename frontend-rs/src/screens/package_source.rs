@@ -61,6 +61,8 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
     let mut draft = use_signal(String::new);
     let mut status = use_signal(|| Option::<(String, bool)>::None);
     let mut show_patch = use_signal(|| false);
+    let mut patch_copied = use_signal(|| false);
+    let mut patch_copy_error = use_signal(|| Option::<String>::None);
     // The Reset menu is open. Closed again whenever another file is opened.
     let mut reset_open = use_signal(|| false);
     // A file asked for while the open one has unsaved edits: opening it would
@@ -430,6 +432,11 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                     div { class: "modal-box max-w-3xl",
                         h3 { class: "font-bold text-lg", "Stored patch" }
                         p { class: "text-xs opacity-60 font-mono break-all", "{c.path}" }
+                        if let Some(err) = patch_copy_error() {
+                            div { class: "alert alert-error text-sm mt-2",
+                                span { "{err}" }
+                            }
+                        }
                         pre { class: "max-h-[60vh] overflow-auto text-xs font-mono mt-3",
                             for (index, line) in patch.lines().enumerate() {
                                 div {
@@ -440,16 +447,46 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                             }
                         }
                         div { class: "modal-action",
+                            {
+                                let patch_for_copy = patch;
+                                rsx! {
+                                    button {
+                                        class: "btn btn-sm",
+                                        disabled: patch_copied(),
+                                        onclick: move |_| {
+                                            let patch = patch_for_copy.clone();
+                                            async move {
+                                                match crate::clipboard::copy_text(&patch).await {
+                                                    Ok(()) => {
+                                                        patch_copied.set(true);
+                                                        patch_copy_error.set(None);
+                                                        gloo_timers::future::TimeoutFuture::new(2000).await;
+                                                        patch_copied.set(false);
+                                                    }
+                                                    Err(e) => patch_copy_error.set(Some(e.message("the patch"))),
+                                                }
+                                            }
+                                        },
+                                        if patch_copied() { "Copied" } else { "Copy" }
+                                    }
+                                }
+                            }
                             button {
                                 class: "btn btn-sm",
-                                onclick: move |_| show_patch.set(false),
+                                onclick: move |_| {
+                                    show_patch.set(false);
+                                    patch_copy_error.set(None);
+                                },
                                 "Close"
                             }
                         }
                     }
                     button {
                         class: "modal-backdrop",
-                        onclick: move |_| show_patch.set(false),
+                        onclick: move |_| {
+                            show_patch.set(false);
+                            patch_copy_error.set(None);
+                        },
                         aria_label: "Close stored patch",
                         "Close"
                     }

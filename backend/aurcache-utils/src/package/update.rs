@@ -436,7 +436,14 @@ async fn resolve_dependency_edges(
         return Ok(HashMap::new());
     }
 
-    let pairs = declared.to_pairs();
+    // As on the add path: what the package answers to itself is never an edge.
+    let self_provided =
+        crate::pkg::self_provided_names(&pkg_model.name, &deps.pkgnames, &deps.provides);
+    let pairs: Vec<(String, String)> = declared
+        .to_pairs()
+        .into_iter()
+        .filter(|(name, _)| !self_provided.contains(name))
+        .collect();
     // One package, one resolution, so the snapshot lives no longer than this
     // call.
     let tracked =

@@ -494,7 +494,19 @@ async fn plan_package_with_deps(
     let &PlanContext {
         client, tracked, ..
     } = plan_context;
-    let pairs = package_spec.deps.to_pairs();
+    // What the package answers to itself is never an edge: resolving it
+    // would let a co-provider (`flutter-bin` for `flutter`'s own `dart`) win.
+    let self_provided = crate::pkg::self_provided_names(
+        &package_spec.pkgbase,
+        &package_spec.pkgnames,
+        &package_spec.provides,
+    );
+    let pairs: Vec<(String, String)> = package_spec
+        .deps
+        .to_pairs()
+        .into_iter()
+        .filter(|(name, _)| !self_provided.contains(name))
+        .collect();
     let resolved_deps = if pairs.is_empty() {
         aurcache_deps::Resolutions::default()
     } else {

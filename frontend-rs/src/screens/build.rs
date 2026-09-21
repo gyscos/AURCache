@@ -12,8 +12,6 @@ use crate::status::BuildStatusBadge;
 use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
 
 /// Whether the build has stopped changing, so the poll loop can stop with it.
 ///
@@ -867,35 +865,15 @@ fn LogCopyButton(
                     // fetched — the button copies everything written so far.
                     // For a tail the marker says "and no more": the rest of
                     // the file is only reachable through the Download link.
-                    let text = log();
-                    let Some(clipboard) = web_sys::window()
-                        .map(|w| w.navigator().clipboard())
-                        // Outside a secure context `navigator.clipboard` is
-                        // undefined, and web-sys hands that straight back as a
-                        // `Clipboard` rather than `None`. Calling `write_text` on
-                        // it throws through the wasm boundary, which takes the page
-                        // down instead of showing the message below — and http on a
-                        // LAN address is an ordinary way to reach this UI.
-                        .filter(|c| !AsRef::<JsValue>::as_ref(c).is_undefined())
-                    else {
-                        error.set(Some(
-                            "Clipboard is unavailable on this connection \
-                             (it needs a secure context, like https or localhost)."
-                                .to_string(),
-                        ));
-                        return;
-                    };
-                    match JsFuture::from(clipboard.write_text(&text)).await {
-                        Ok(_) => {
+                    match crate::clipboard::copy_text(&log()).await {
+                        Ok(()) => {
                             copied.set(true);
                             // Let the checkmark say its piece, then give the button
                             // back its job.
                             gloo_timers::future::TimeoutFuture::new(2000).await;
                             copied.set(false);
                         }
-                        Err(_) => error.set(Some(
-                            "Could not copy the build log to the clipboard.".to_string(),
-                        )),
+                        Err(e) => error.set(Some(e.message("the build log"))),
                     }
                 },
                 if copied() {
