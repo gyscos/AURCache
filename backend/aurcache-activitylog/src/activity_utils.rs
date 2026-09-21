@@ -127,6 +127,10 @@ impl ActivityLog {
     /// failed after the fact is a lie about the instance. So there is nothing
     /// useful for a caller to do about a write that did not land, and nothing
     /// is asked of them.
+    ///
+    /// Scope is ignored here, unlike in [`Self::emit_by`]: the curated table
+    /// has no scope column, so a scoped handle must emit rather than record
+    /// anything it wants filed against its entity.
     pub fn record<T: Serialize + ActivitySerializer>(
         &self,
         activity: T,

@@ -646,7 +646,10 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
         tempfile::tempdir().unwrap().keep(),
     ));
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Drained only after `apply` returns, so the bound must exceed the
+    // dump's entries; production recorders drain live on the smaller
+    // shared bound.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
@@ -939,7 +942,10 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
         tempfile::tempdir().unwrap().keep(),
     ));
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Drained only after `apply` returns, so the bound must exceed the
+    // dump's entries; production recorders drain live on the smaller
+    // shared bound.
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1024);
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
@@ -1006,7 +1012,10 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
         tempfile::tempdir().unwrap().keep(),
     ));
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Drained only after `apply` returns, so the bound must exceed the
+    // dump's entries; production recorders drain live on the smaller
+    // shared bound.
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1024);
 
     let (client, _official) = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(

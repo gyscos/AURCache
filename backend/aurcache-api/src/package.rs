@@ -170,7 +170,7 @@ pub async fn packages_add_endpoint(
     let username = a.username.clone();
 
     tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::channel(crate::utils::PROGRESS_CHANNEL_CAPACITY);
         let worker = {
             tokio::spawn(async move {
                 aurcache_utils::package::bulk_add::bulk_add(

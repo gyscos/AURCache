@@ -501,7 +501,13 @@ pub enum BaseLock {
 /// cannot have the chroot right now simply happens later; being a few minutes
 /// out of date is a smaller problem than a worker that starts no builds.
 pub async fn try_lock_base(root: &Path) -> BaseLock {
-    let path = root.with_extension("lock");
+    // Same rule as every other lock path here (`lock_beside`): append, never
+    // `with_extension`, which would replace an extension instead. All three
+    // must name the same file or the exclusion silently stops excluding.
+    let Some(path) = lock_beside(root) else {
+        tracing::warn!("could not form a lock path for {}", root.display());
+        return BaseLock::Unavailable;
+    };
     let taken = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         match file.try_lock() {
@@ -551,7 +557,8 @@ pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
 /// happened before this existed, and refusing to build over it would be a
 /// worse trade.
 async fn open_base_lock(root: &Path) -> Option<std::fs::File> {
-    let path = root.with_extension("lock");
+    // See `try_lock_base`: one rule for every lock path.
+    let path = lock_beside(root)?;
     let taken = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
         file.lock_shared()?;
@@ -714,8 +721,11 @@ async fn remove_copy(path: &Path) -> Result<()> {
             tracing::warn!("could not remove {}:\n{log}", lock.display());
         }
     }
-    // devtools keeps the copy's lock beside it, not inside it.
-    std::fs::remove_file(path.with_extension("lock")).ok();
+    // The lock beside the copy went out with the `sudo rm` above, which names
+    // the same `lock_beside` path: devtools keeps it beside the copy, not
+    // inside it, and it is root's. (A second computation of the path used to
+    // live here with `with_extension` instead of the append rule — same file
+    // for every real copy name, a different one the moment a dot appears.)
     Ok(())
 }
 

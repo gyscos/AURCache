@@ -57,19 +57,19 @@ fn lease_ttl_secs() -> i64 {
     env_i64("LEASE_TTL", 60)
 }
 fn max_attempts() -> i32 {
-    env_i64("MAX_ATTEMPTS", 3) as i32
+    *MAX_ATTEMPTS
 }
 /// How long a build must sit `ENQUEUED` before worker priority stops holding it
 /// back. A backstop: `available()` is inferred from heartbeats and lease state,
 /// so a worker can look healthy while never actually claiming (full disk, a bug).
 /// This bounds the damage at one delay per job.
 fn spill_delay_secs() -> i64 {
-    env_i64("WORKER_SPILL_DELAY", 60)
+    *SPILL_DELAY_SECS
 }
 /// How stale `last_seen` may be before a worker stops counting as available and
 /// therefore stops holding jobs back. ~4x the 15s default heartbeat.
 pub(crate) fn liveness_timeout_secs() -> i64 {
-    env_i64("WORKER_LIVENESS_TIMEOUT", 60)
+    *LIVENESS_TIMEOUT_SECS
 }
 /// Worker certificates are transport plumbing, not a credential: authorization
 /// is the `workers` row, so holding a valid certificate grants nothing on its
@@ -87,6 +87,19 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
+
+/// Read-once copies of the settings above: they back per-claim and
+/// per-heartbeat paths, and re-reading plus re-parsing the environment on
+/// every one is pure overhead. Process env is fixed at start in every
+/// deployment, so a change needs a restart like any other setting.
+static MAX_ATTEMPTS: std::sync::LazyLock<i32> =
+    std::sync::LazyLock::new(|| env_i64("MAX_ATTEMPTS", 3) as i32);
+static SPILL_DELAY_SECS: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| env_i64("WORKER_SPILL_DELAY", 60));
+static LIVENESS_TIMEOUT_SECS: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| env_i64("WORKER_LIVENESS_TIMEOUT", 60));
+static REPO_TEMPLATE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| render_repo_template(&public_repo_url()));
 
 /// Base URL workers should use for the public pacman repo (`[repo] Server`).
 pub(crate) fn public_repo_url() -> String {
@@ -106,7 +119,7 @@ pub(crate) fn public_repo_url() -> String {
 /// the compose network, one on the LAN and one embedded in this very container
 /// all reach the same repository by different names.
 fn repo_template() -> String {
-    render_repo_template(&public_repo_url())
+    REPO_TEMPLATE.clone()
 }
 
 /// Pure form of [`repo_template`].
@@ -720,7 +733,10 @@ pub async fn job_artifact(
     // also flushes, so the file is fully written by the time ingest reads it.
     let stored = data.open(limit.bytes()).into_file(&dest).await;
     let problem = match &stored {
-        Err(e) => Some(err(Status::BadRequest, e)),
+        // The request parsed: a write failure is the server's disk, not the
+        // worker's artifact, so it is a 500. Size and emptiness rejections
+        // below stay 400s — those describe the upload.
+        Err(e) => Some(err(Status::InternalServerError, e)),
         Ok(file) if !file.is_complete() => Some(too_large()),
         Ok(file) if file.n.written == 0 => Some(err(Status::BadRequest, "empty artifact")),
         Ok(_) => None,

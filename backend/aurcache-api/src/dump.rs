@@ -220,7 +220,7 @@ pub async fn restore(
     let ca_dir_task = ca_dir.inner().clone();
 
     tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (progress_tx, mut progress_rx) = mpsc::channel(crate::utils::PROGRESS_CHANNEL_CAPACITY);
         let worker = {
             tokio::spawn(async move {
                 aurcache_utils::restore::apply(

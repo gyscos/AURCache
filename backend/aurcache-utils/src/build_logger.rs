@@ -149,19 +149,30 @@ impl Shared {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Write out everything buffered so far. On a write error the buffer is
-    /// deliberately left intact so the next flush retries it.
+    /// Write out everything buffered so far.
+    ///
+    /// The buffer is swapped out under one short hold and written without
+    /// the lock: holding it across the write serialises every logging handle
+    /// behind a slow disk. On a write error the swapped lines go back at the
+    /// front — lines logged during the write are newer — so the next flush
+    /// still retries them, as before.
     async fn flush(&self) -> anyhow::Result<()> {
-        let mut buffer = self.buffer.lock().await;
-        if buffer.is_empty() {
+        let pending: Vec<String> = {
+            let mut buffer = self.buffer.lock().await;
+            std::mem::take(&mut *buffer)
+        };
+        if pending.is_empty() {
             return Ok(());
         }
 
-        append_build_output(&self.pkgbase, self.number, &buffer.concat()).await?;
-
-        buffer.clear();
-        debug!("Log buffer flushed!");
-        Ok(())
+        let result = append_build_output(&self.pkgbase, self.number, &pending.concat()).await;
+        if result.is_err() {
+            let mut buffer = self.buffer.lock().await;
+            buffer.splice(..0, pending);
+        } else {
+            debug!("Log buffer flushed!");
+        }
+        result
     }
 
     async fn flush_or_log(&self) {

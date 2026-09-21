@@ -40,7 +40,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, TransactionTrait,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
 use crate::package::add::{provides_json, split_packages_json};
@@ -321,7 +321,7 @@ pub async fn apply(
     ca_dir: &std::path::Path,
     dump: LoadedDump,
     options: RestoreOptions,
-    progress: UnboundedSender<RestoreEntry>,
+    progress: Sender<RestoreEntry>,
 ) {
     let Services {
         client: _,
@@ -338,30 +338,34 @@ pub async fn apply(
         Err(e) => {
             // The transaction rolled back, so nothing was written; say so
             // against the dump as a whole rather than blaming one package.
-            let _ = progress.send(RestoreEntry {
-                pkgbase: String::new(),
-                outcome: RestoreOutcome::Failed {
-                    error: format!("nothing was imported: {e:#}"),
-                },
-            });
+            let _ = progress
+                .send(RestoreEntry {
+                    pkgbase: String::new(),
+                    outcome: RestoreOutcome::Failed {
+                        error: format!("nothing was imported: {e:#}"),
+                    },
+                })
+                .await;
             return;
         }
     };
 
     for entry in &applied.entries {
-        let _ = progress.send(entry.clone());
+        let _ = progress.send(entry.clone()).await;
     }
 
     // Written after the rows commit, and only then: replacing the CA on disk is
     // not something a rolled-back transaction can take back, so it must not
     // happen while the import might still fail.
     if let Err(e) = write_secrets(&dump, &options, ca_dir) {
-        let _ = progress.send(RestoreEntry {
-            pkgbase: String::new(),
-            outcome: RestoreOutcome::Failed {
-                error: format!("the packages were imported, but the secrets were not: {e:#}"),
-            },
-        });
+        let _ = progress
+            .send(RestoreEntry {
+                pkgbase: String::new(),
+                outcome: RestoreOutcome::Failed {
+                    error: format!("the packages were imported, but the secrets were not: {e:#}"),
+                },
+            })
+            .await;
     }
 
     // PASS 2: sources. Every imported package's `provides` and split package
@@ -374,16 +378,18 @@ pub async fn apply(
     for pkgbase in &applied.touched {
         if let Err(e) = fill_source_facts(db, store, pkgbase).await {
             warn!("restore: could not read the source of {pkgbase}: {e:#}");
-            let _ = progress.send(RestoreEntry {
-                pkgbase: pkgbase.clone(),
-                outcome: RestoreOutcome::Failed {
-                    error: format!(
-                        "imported, but its source could not be read, so other packages \
+            let _ = progress
+                .send(RestoreEntry {
+                    pkgbase: pkgbase.clone(),
+                    outcome: RestoreOutcome::Failed {
+                        error: format!(
+                            "imported, but its source could not be read, so other packages \
                          will not find it by its split package names or what it provides: {e:#}. \
                          Fix the source and restore again with --on-existing overwrite."
-                    ),
-                },
-            });
+                        ),
+                    },
+                })
+                .await;
             unresolved.insert(pkgbase.clone());
         }
     }
@@ -400,15 +406,17 @@ pub async fn apply(
         };
         if let Err(e) = crate::package::update::package_resync_dependencies(services, &row).await {
             warn!("restore: could not resolve dependencies for {pkgbase}: {e:#}");
-            let _ = progress.send(RestoreEntry {
-                pkgbase: pkgbase.clone(),
-                outcome: RestoreOutcome::Failed {
-                    error: format!(
-                        "imported, but its dependencies could not be resolved, so it will not \
+            let _ = progress
+                .send(RestoreEntry {
+                    pkgbase: pkgbase.clone(),
+                    outcome: RestoreOutcome::Failed {
+                        error: format!(
+                            "imported, but its dependencies could not be resolved, so it will not \
                          build until they are: {e:#}"
-                    ),
-                },
-            });
+                        ),
+                    },
+                })
+                .await;
         }
     }
 }

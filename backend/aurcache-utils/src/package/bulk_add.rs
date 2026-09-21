@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use aurcache_common::api::package::{BulkAddEntry, BulkAddOutcome};
 use aurcache_db::packages::SourceData;
 use pacman_mirrors::platforms::Platform;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 use crate::package::add::{AddContext, add_resolved_source, build_add_context};
@@ -84,7 +84,7 @@ pub async fn bulk_add(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
     sources: Vec<SourceData>,
-    progress: UnboundedSender<BulkAddEntry>,
+    progress: Sender<BulkAddEntry>,
 ) {
     let context = build_add_context(platforms, build_flags);
     let bases = resolve_pkgbases(&services.client, &sources).await;
@@ -100,11 +100,15 @@ pub async fn bulk_add(
         let resolved = apply_resolved_base(source, &bases);
         let (outcome, pkgbase) = add_one(services, &context, resolved).await;
         // Ignore a closed channel: the observer left, the work has not.
-        let _ = progress.send(BulkAddEntry {
-            name,
-            pkgbase,
-            outcome,
-        });
+        // Awaiting the send is the backpressure: with a bounded channel the
+        // producer waits for the recorder rather than queueing without limit.
+        let _ = progress
+            .send(BulkAddEntry {
+                name,
+                pkgbase,
+                outcome,
+            })
+            .await;
     }
 }
 

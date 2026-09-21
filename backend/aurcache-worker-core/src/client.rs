@@ -317,8 +317,13 @@ impl WorkerClient {
         let response = request.send().await.context("artifact request")?;
         let status = response.status();
         if !status.is_success() {
-            let reason = response.text().await.unwrap_or_default();
-            anyhow::bail!("artifact rejected: {status}: {}", reason.trim());
+            // The body read can fail too (connection dropped mid-error);
+            // say that instead of blaming the server with an empty reason.
+            let reason = match response.text().await {
+                Ok(body) => body.trim().to_string(),
+                Err(e) => format!("<error body unreadable: {e}>"),
+            };
+            anyhow::bail!("artifact rejected: {status}: {reason}");
         }
         Ok(())
     }
