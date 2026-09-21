@@ -1,5 +1,5 @@
 use crate::activity_serializer::ActivitySerializer;
-use crate::event::LogEvent;
+use crate::events::Event;
 use crate::failure_activity::{
     PublishFailedActivity, VersionCheckFailedActivity, WorkerReapedActivity,
     WorkerSettingRejectedActivity,
@@ -59,7 +59,6 @@ struct Record {
 #[derive(Debug, Clone)]
 struct LogRecord {
     kind: &'static str,
-    subkind: Option<&'static str>,
     severity: Severity,
     message: String,
     data: String,
@@ -153,7 +152,7 @@ impl ActivityLog {
     /// Record a structured event.
     ///
     /// Like [`Self::record`]: synchronous, infallible, and never blocking.
-    pub fn emit<E: LogEvent>(&self, event: E) {
+    pub fn emit(&self, event: impl Into<Event>) {
         self.emit_by(event, None);
     }
 
@@ -162,11 +161,12 @@ impl ActivityLog {
     /// The actor matters for anything a person set in motion -- a dependency
     /// repointed through the API is not the same entry as the scheduler doing
     /// it -- and is `None` for everything the server does on its own.
-    pub fn emit_by<E: LogEvent>(&self, event: E, user: Option<String>) {
+    pub fn emit_by(&self, event: impl Into<Event>, user: Option<String>) {
+        let event = event.into();
         let rendered = match crate::event::render(&event) {
             Ok(rendered) => rendered,
             Err(e) => {
-                tracing::warn!("could not render a {} log event: {e}", E::KIND);
+                tracing::warn!("could not render a {} log event: {e}", event.kind());
                 return;
             }
         };
@@ -190,7 +190,6 @@ impl ActivityLog {
 
         self.send(Queued::Log(Box::new(LogRecord {
             kind: rendered.kind,
-            subkind: rendered.subkind,
             severity: rendered.severity,
             message: rendered.message,
             data: rendered.payload.to_string(),
@@ -320,7 +319,6 @@ impl ActivityStore {
         let txn = self.db.begin().await?;
         let entry = logs::ActiveModel {
             kind: Set(record.kind.to_string()),
-            subkind: Set(record.subkind.map(str::to_string)),
             severity: Set(record.severity),
             message: Set(record.message),
             data: Set(record.data),

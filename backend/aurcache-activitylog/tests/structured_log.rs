@@ -5,10 +5,10 @@
 //! filters built on it, and the links resolved when a page is read.
 
 use aurcache_activitylog::activity_utils::spawn;
-use aurcache_activitylog::event::LogEvent;
+use aurcache_activitylog::events::{Event, RefreshTarget};
 use aurcache_activitylog::log_store::{LogFilter, LogStore};
 use aurcache_common::api::activity::Severity;
-use aurcache_common::api::log::{BuildRef, EntityRef, PackageRef, WorkerRef};
+use aurcache_common::api::log::{BuildRef, PackageRef};
 use aurcache_common::source::SourceData;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::SourceType;
@@ -18,74 +18,6 @@ use pacman_mirrors::platforms::Platform;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait};
 use sea_orm_migration::MigratorTrait;
-use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// A few events to log
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DepsReplaced {
-    dependent: PackageRef,
-    old: PackageRef,
-    new: PackageRef,
-}
-
-impl LogEvent for DepsReplaced {
-    const KIND: &'static str = "deps.replaced";
-    const SEVERITY: Severity = Severity::Info;
-    fn message(&self) -> String {
-        format!(
-            "Replaced {} with {} as dependency of {}",
-            self.old, self.new, self.dependent
-        )
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublishFailed {
-    build: BuildRef,
-    error: String,
-}
-
-impl LogEvent for PublishFailed {
-    const KIND: &'static str = "publish.failed";
-    const SEVERITY: Severity = Severity::Error;
-    fn message(&self) -> String {
-        format!("publishing {} failed: {}", self.build, self.error)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkerReaped {
-    worker: WorkerRef,
-    builds: Vec<BuildRef>,
-}
-
-impl LogEvent for WorkerReaped {
-    const KIND: &'static str = "worker.reaped";
-    const SEVERITY: Severity = Severity::Warning;
-    fn message(&self) -> String {
-        format!("{} stopped answering", self.worker)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServerStart {
-    version: String,
-}
-
-impl LogEvent for ServerStart {
-    const KIND: &'static str = aurcache_activitylog::kinds::SERVER_START;
-    const SEVERITY: Severity = Severity::Info;
-    fn message(&self) -> String {
-        format!("AURCache {} started", self.version)
-    }
-}
 
 // ---------------------------------------------------------------------------
 
@@ -134,18 +66,22 @@ async fn seed_build(db: &DatabaseConnection, pkg_id: i32, number: i32) {
 async fn an_event_reaches_the_log_with_its_index_and_links() {
     let db = db().await;
     seed_package(&db, "baz").await;
-    seed_package(&db, "bar").await;
-    // `foo` deliberately absent: the package a replacement removes.
+    // `gone` deliberately absent: a package the log named and that is no
+    // longer there.
 
     let (log, writer) = spawn(db.clone());
     log.emit_by(
-        DepsReplaced {
-            dependent: "baz".into(),
-            old: "foo".into(),
-            new: "bar".into(),
+        Event::VersionCompareFallback {
+            pkg: "baz".into(),
+            upstream_version: "2.0".to_string(),
+            built_version: "1.0".to_string(),
         },
         Some("alice".to_string()),
     );
+    log.emit(Event::VcsSyncFailed {
+        pkg: "gone".into(),
+        error: "boom".to_string(),
+    });
     drop(log);
     writer.await.unwrap();
 
@@ -153,47 +89,71 @@ async fn an_event_reaches_the_log_with_its_index_and_links() {
         .page(50, 0, &LogFilter::default())
         .await
         .unwrap();
+    assert_eq!(page.total, 2);
 
-    assert_eq!(page.total, 1);
-    let entry = &page.entries[0];
-    assert_eq!(entry.kind, "deps.replaced");
-    assert_eq!(entry.severity, Severity::Info);
-    assert_eq!(entry.user.as_deref(), Some("alice"));
-    assert_eq!(
-        entry.message,
-        "Replaced pkg:foo with pkg:bar as dependency of pkg:baz"
+    let compared = page
+        .entries
+        .iter()
+        .find(|e| e.kind == "version.compare_fallback")
+        .expect("the comparison entry");
+    assert_eq!(compared.severity, Severity::Warning);
+    assert_eq!(compared.user.as_deref(), Some("alice"));
+    assert_eq!(compared.data["pkg"], "pkg:baz");
+    assert_eq!(compared.data["upstream_version"], "2.0");
+    assert!(
+        compared.message.contains("cannot compare"),
+        "{}",
+        compared.message
     );
-    assert_eq!(entry.data["old"], "pkg:foo");
+    // Resolved when the page was read, not when the row was written.
+    assert_eq!(
+        compared.hrefs["pkg"],
+        vec![Some("/package/baz".to_string())]
+    );
 
-    // The whole point of resolving at read time: `foo` was removed by the very
-    // request that recorded this, so it has no page, while the other two do.
-    assert_eq!(entry.hrefs["dependent"], vec![Some("/package/baz".into())]);
-    assert_eq!(entry.hrefs["new"], vec![Some("/package/bar".into())]);
-    assert_eq!(entry.hrefs["old"], vec![None]);
+    let vanished = page
+        .entries
+        .iter()
+        .find(|e| e.kind == "vcs.sync_failed")
+        .expect("the vcs entry");
+    assert_eq!(
+        vanished.hrefs["pkg"],
+        vec![None],
+        "a package that is gone has no page"
+    );
+    // And it still reads, because the sentence was rendered when it was
+    // written.
+    assert!(
+        vanished.message.contains("pkg:gone"),
+        "{}",
+        vanished.message
+    );
 }
 
-/// "Everything about foo" finds the row whatever role foo played, and the
-/// query names no kind -- it works for kinds that did not exist when it was
-/// written.
+/// The entity filter finds a row by what it names, and the query names no
+/// kind -- so it works for kinds that did not exist when it was written.
+///
+/// Every event in the catalogue today names one entity, so the "whatever role
+/// it played" half is covered by the role-scoped case below and by
+/// `event::tests`; it gets its full demonstration once a multi-reference event
+/// (a dependency replacement) is ported.
 #[tokio::test]
 async fn the_entity_filter_finds_a_row_in_any_role() {
     let db = db().await;
     let (log, writer) = spawn(db.clone());
-    log.emit(DepsReplaced {
-        dependent: "baz".into(),
-        old: "foo".into(),
-        new: "bar".into(),
+    log.emit(Event::VcsSyncFailed {
+        pkg: "baz".into(),
+        error: "boom".to_string(),
     });
-    log.emit(DepsReplaced {
-        dependent: "unrelated".into(),
-        old: "other".into(),
-        new: "another".into(),
+    log.emit(Event::VcsSyncFailed {
+        pkg: "unrelated".into(),
+        error: "boom".to_string(),
     });
     drop(log);
     writer.await.unwrap();
 
     let store = LogStore::new(db);
-    for role_played in ["baz", "foo", "bar"] {
+    for role_played in ["baz", "unrelated"] {
         let page = store
             .page(
                 50,
@@ -208,13 +168,28 @@ async fn the_entity_filter_finds_a_row_in_any_role() {
         assert_eq!(page.total, 1, "{role_played}");
     }
 
-    // And narrowed to one role, only that role matches.
+    // Narrowed to the role it actually played, it matches; narrowed to another,
+    // it does not.
+    let as_pkg = store
+        .page(
+            50,
+            0,
+            &LogFilter {
+                entity: Some(PackageRef::from("baz").into()),
+                role: Some("pkg".to_string()),
+                ..LogFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(as_pkg.total, 1);
+
     let as_dependent = store
         .page(
             50,
             0,
             &LogFilter {
-                entity: Some(PackageRef::from("foo").into()),
+                entity: Some(PackageRef::from("baz").into()),
                 role: Some("dependent".to_string()),
                 ..LogFilter::default()
             },
@@ -224,74 +199,18 @@ async fn the_entity_filter_finds_a_row_in_any_role() {
     assert_eq!(as_dependent.total, 0);
 }
 
-/// A role naming several entities is indexed once per entity.
-#[tokio::test]
-async fn a_list_role_is_indexed_for_each_entity() {
-    let db = db().await;
-    let (log, writer) = spawn(db.clone());
-    log.emit(WorkerReaped {
-        worker: "builder-01".into(),
-        builds: vec![
-            BuildRef {
-                pkgbase: "hello".into(),
-                number: 7,
-            },
-            BuildRef {
-                pkgbase: "yay".into(),
-                number: 3,
-            },
-        ],
-    });
-    drop(log);
-    writer.await.unwrap();
-
-    let store = LogStore::new(db);
-    for entity in [
-        EntityRef::from(WorkerRef::from("builder-01")),
-        EntityRef::from(BuildRef {
-            pkgbase: "hello".into(),
-            number: 7,
-        }),
-        EntityRef::from(BuildRef {
-            pkgbase: "yay".into(),
-            number: 3,
-        }),
-    ] {
-        let page = store
-            .page(
-                50,
-                0,
-                &LogFilter {
-                    entity: Some(entity.clone()),
-                    ..LogFilter::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.total, 1, "{entity}");
-    }
-}
-
 /// Severity is stored as an ordered number, so the filter is "this and worse"
 /// without knowing which kinds exist.
 #[tokio::test]
 async fn severity_narrows_to_this_and_worse() {
     let db = db().await;
     let (log, writer) = spawn(db.clone());
-    log.emit(DepsReplaced {
-        dependent: "baz".into(),
-        old: "foo".into(),
-        new: "bar".into(),
+    log.emit(Event::AurMissing { pkg: "baz".into() });
+    log.emit(Event::VcsSyncFailed {
+        pkg: "hello".into(),
+        error: "boom".to_string(),
     });
-    log.emit(WorkerReaped {
-        worker: "builder-01".into(),
-        builds: vec![],
-    });
-    log.emit(PublishFailed {
-        build: BuildRef {
-            pkgbase: "hello".into(),
-            number: 7,
-        },
+    log.emit(Event::UpdateQueueFailed {
         error: "no space left on device".to_string(),
     });
     drop(log);
@@ -312,7 +231,10 @@ async fn severity_narrows_to_this_and_worse() {
         )
         .await
         .unwrap();
-    assert_eq!(warnings.total, 2);
+    assert_eq!(
+        warnings.total, 3,
+        "every catalogue event today is a warning or worse"
+    );
     assert!(
         warnings
             .entries
@@ -332,7 +254,7 @@ async fn severity_narrows_to_this_and_worse() {
         .await
         .unwrap();
     assert_eq!(errors.total, 1);
-    assert_eq!(errors.entries[0].kind, "publish.failed");
+    assert_eq!(errors.entries[0].kind, "update.queue_failed");
 }
 
 /// A scoped handle files everything it records under one entity, so a build's
@@ -347,11 +269,8 @@ async fn a_scope_is_indexed_like_any_other_reference() {
 
     let (log, writer) = spawn(db.clone());
     // Emitted *during* the build: the payload names it nowhere.
-    log.scoped(build.clone()).emit(DepsReplaced {
-        dependent: "baz".into(),
-        old: "foo".into(),
-        new: "bar".into(),
-    });
+    log.scoped(build.clone())
+        .emit(Event::AurMissing { pkg: "baz".into() });
     drop(log);
     writer.await.unwrap();
 
@@ -371,21 +290,23 @@ async fn a_scope_is_indexed_like_any_other_reference() {
     assert_eq!(page.entries[0].scope, Some(build.into()));
 }
 
-/// "Since the last restart" counts back to the newest start entry, and a log
-/// with no start entry yet shows everything rather than nothing.
+/// With no start entry to count back to, "since the last restart" shows
+/// everything rather than nothing.
+///
+/// That is all that can be tested today: the marker is `kinds::SERVER_START`,
+/// and the server still records its start as a curated activity row. The
+/// filter becomes live when that event is ported.
 #[tokio::test]
-async fn since_boot_cuts_at_the_last_start() {
+async fn since_boot_without_a_marker_shows_everything() {
     let db = db().await;
     let (log, writer) = spawn(db.clone());
-    log.emit(WorkerReaped {
-        worker: "builder-01".into(),
-        builds: vec![],
+    log.emit(Event::AurMissing {
+        pkg: "hello".into(),
     });
     drop(log);
     writer.await.unwrap();
 
-    let store = LogStore::new(db.clone());
-    let no_marker = store
+    let page = LogStore::new(db)
         .page(
             50,
             0,
@@ -396,38 +317,7 @@ async fn since_boot_cuts_at_the_last_start() {
         )
         .await
         .unwrap();
-    assert_eq!(no_marker.total, 1, "no marker means no narrowing");
-
-    // Now a restart, and something after it.
-    let (log, writer) = spawn(db.clone());
-    log.emit(ServerStart {
-        version: "0.5.0".to_string(),
-    });
-    drop(log);
-    writer.await.unwrap();
-
-    let since = store
-        .page(
-            50,
-            0,
-            &LogFilter {
-                since_boot: true,
-                ..LogFilter::default()
-            },
-        )
-        .await
-        .unwrap();
-    // The restart itself belongs to the boot it starts. The earlier entry may
-    // share its whole-second timestamp, so this asserts the marker is included
-    // rather than counting rows.
-    assert!(
-        since
-            .entries
-            .iter()
-            .any(|e| e.kind == aurcache_activitylog::kinds::SERVER_START),
-        "{:?}",
-        since.entries
-    );
+    assert_eq!(page.total, 1, "no marker means no narrowing");
 }
 
 /// A build links only when its package is still there, since the page is
@@ -439,14 +329,14 @@ async fn a_build_links_only_while_its_package_exists() {
     seed_build(&db, hello, 7).await;
 
     let (log, writer) = spawn(db.clone());
-    log.emit(PublishFailed {
+    log.emit(Event::BuildMarkFailed {
         build: BuildRef {
             pkgbase: "hello".into(),
             number: 7,
         },
         error: "disk full".to_string(),
     });
-    log.emit(PublishFailed {
+    log.emit(Event::BuildMarkFailed {
         build: BuildRef {
             pkgbase: "gone".into(),
             number: 1,
@@ -472,21 +362,18 @@ async fn a_build_links_only_while_its_package_exists() {
     );
 }
 
-/// One kind covering several cases keeps the difference in a column, so it can
-/// be filtered on without splitting into kinds nobody would ask apart -- and
-/// without reading into the payload.
+/// One kind covering several cases keeps the difference as a field, so the
+/// consolidation loses nothing: the case is in the payload and in the sentence.
 #[tokio::test]
-async fn a_subkind_narrows_within_a_kind() {
-    use aurcache_activitylog::events::source::{RefreshFailed, RefreshTarget};
-
+async fn a_consolidated_kind_keeps_which_case_it_was() {
     let db = db().await;
     let (log, writer) = spawn(db.clone());
-    log.emit(RefreshFailed {
+    log.emit(Event::SourceRefreshFailed {
         pkg: "hello".into(),
         target: RefreshTarget::Git,
         error: "host is unreachable".to_string(),
     });
-    log.emit(RefreshFailed {
+    log.emit(Event::SourceRefreshFailed {
         pkg: "yay".into(),
         target: RefreshTarget::Snapshot,
         error: "checksum mismatch".to_string(),
@@ -494,41 +381,35 @@ async fn a_subkind_narrows_within_a_kind() {
     drop(log);
     writer.await.unwrap();
 
-    let store = LogStore::new(db);
-    let kind = RefreshFailed::KIND_STR.to_string();
-
-    let both = store
+    let both = LogStore::new(db)
         .page(
             50,
             0,
             &LogFilter {
-                kind: Some(kind.clone()),
+                kind: Some("source.refresh_failed".to_string()),
                 ..LogFilter::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(both.total, 2);
+    assert_eq!(both.total, 2, "one kind covers both");
 
-    let git = store
-        .page(
-            50,
-            0,
-            &LogFilter {
-                kind: Some(kind),
-                subkind: Some("git".to_string()),
-                ..LogFilter::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(git.total, 1);
-    assert_eq!(git.entries[0].subkind.as_deref(), Some("git"));
-    // And the message says which, so the row reads without the column.
+    let mut cases: Vec<_> = both
+        .entries
+        .iter()
+        .map(|e| e.data["target"].as_str().unwrap().to_string())
+        .collect();
+    cases.sort();
+    assert_eq!(cases, ["git", "snapshot"]);
+
+    // And the sentence says which, so a reader needs neither the payload nor a
+    // catalogue.
     assert!(
-        git.entries[0].message.contains("git source"),
+        both.entries
+            .iter()
+            .any(|e| e.message.contains("git source")),
         "{:?}",
-        git.entries[0].message
+        both.entries
     );
 }
 
@@ -538,11 +419,7 @@ async fn a_subkind_narrows_within_a_kind() {
 async fn pruning_removes_the_index_too() {
     let db = db().await;
     let (log, writer) = spawn(db.clone());
-    log.emit(DepsReplaced {
-        dependent: "baz".into(),
-        old: "foo".into(),
-        new: "bar".into(),
-    });
+    log.emit(Event::AurMissing { pkg: "baz".into() });
     drop(log);
     writer.await.unwrap();
 

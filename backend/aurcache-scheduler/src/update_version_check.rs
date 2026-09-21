@@ -1,11 +1,6 @@
 use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::source::{
-    RefreshFailed, RefreshTarget, SourceinfoFailed, SourceinfoPurpose, VcsSyncFailed,
-};
-use aurcache_activitylog::events::version_check::{
-    AurMissing, CompareFallback, QueueFailed, StoreFailed,
-};
+use aurcache_activitylog::events::{Event, RefreshTarget, SourceinfoPurpose};
 use aurcache_activitylog::failure_activity::VersionCheckFailedActivity;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::activities::ActivityType;
@@ -111,7 +106,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // can say so: its metadata still comes from the
                         // checkout, which continues to exist, so absent
                         // metadata no longer implies absence from the AUR.
-                        activity.emit(AurMissing {
+                        activity.emit(Event::AurMissing {
                             pkg: package.name.as_str().into(),
                         });
                         package_model.aur_missing = Set(Some(true));
@@ -151,13 +146,13 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                                     .await
                                 {
                                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
-                                    Err(e) => activity.emit(VcsSyncFailed {
+                                    Err(e) => activity.emit(Event::VcsSyncFailed {
                                         pkg: package.name.as_str().into(),
                                         error: format!("{e:#}"),
                                     }),
                                 }
                             }
-                            Err(e) => activity.emit(SourceinfoFailed {
+                            Err(e) => activity.emit(Event::SourceinfoFailed {
                                 pkg: package.name.as_str().into(),
                                 purpose: SourceinfoPurpose::Vcs,
                                 error: format!("{e:#}"),
@@ -174,7 +169,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // instead of unconditionally re-fetching every package
                         // on every check.
                         if is_outdated && let Err(e) = store.refresh(&source_data).await {
-                            activity.emit(RefreshFailed {
+                            activity.emit(Event::SourceRefreshFailed {
                                 pkg: package.name.as_str().into(),
                                 target: RefreshTarget::Snapshot,
                                 error: format!("{e:#}"),
@@ -188,7 +183,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // so always refresh: this is an incremental `git fetch`
                 // against the persistent checkout, not a full re-clone.
                 if let Err(e) = store.refresh(&source_data).await {
-                    activity.emit(RefreshFailed {
+                    activity.emit(Event::SourceRefreshFailed {
                         pkg: package.name.as_str().into(),
                         target: RefreshTarget::Git,
                         error: format!("{e:#}"),
@@ -209,7 +204,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 {
                     Ok(resolved) => resolved,
                     Err(e) => {
-                        activity.emit(SourceinfoFailed {
+                        activity.emit(Event::SourceinfoFailed {
                             pkg: package.name.as_str().into(),
                             purpose: SourceinfoPurpose::Version,
                             error: format!("{e:#}"),
@@ -234,7 +229,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
 
                 match sync_vcs_sources(db, package_id, &sourceinfo, &mut round).await {
                     Ok(vcs_changed) => is_outdated = is_outdated || vcs_changed,
-                    Err(e) => activity.emit(VcsSyncFailed {
+                    Err(e) => activity.emit(Event::VcsSyncFailed {
                         pkg: package.name.as_str().into(),
                         error: format!("{e:#}"),
                     }),
@@ -263,7 +258,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     if build_now.value
         && let Err(e) = package_update_all_outdated(services).await
     {
-        activity.emit(QueueFailed {
+        activity.emit(Event::UpdateQueueFailed {
             error: format!("{e:#}"),
         });
     }
@@ -290,7 +285,7 @@ fn upstream_is_newer(
     match vercmp(upstream, built) {
         Some(ordering) => ordering == std::cmp::Ordering::Greater,
         None => {
-            activity.emit(CompareFallback {
+            activity.emit(Event::VersionCompareFallback {
                 pkg: package.into(),
                 upstream_version: upstream.to_string(),
                 built_version: built.to_string(),
@@ -309,7 +304,7 @@ async fn save_package(
     name: &str,
 ) {
     if let Err(e) = model.update(db).await {
-        activity.emit(StoreFailed {
+        activity.emit(Event::VersionCheckStoreFailed {
             pkg: name.into(),
             error: format!("{e:#}"),
         });

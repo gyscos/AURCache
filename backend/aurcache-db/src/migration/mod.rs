@@ -33,7 +33,6 @@ mod m20260917_000000_retire_server_build_settings;
 mod m20260917_000001_worker_configuration;
 mod m20260917_000002_activity_timestamp_index;
 mod m20260917_000003_structured_logs;
-mod m20260917_000004_log_subkind;
 
 pub struct Migrator;
 
@@ -81,7 +80,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000001_worker_configuration::Migration),
             Box::new(m20260917_000002_activity_timestamp_index::Migration),
             Box::new(m20260917_000003_structured_logs::Migration),
-            Box::new(m20260917_000004_log_subkind::Migration),
         ]
     }
 }

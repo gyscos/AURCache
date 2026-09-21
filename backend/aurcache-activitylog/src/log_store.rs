@@ -29,9 +29,6 @@ pub struct LogFilter {
     pub since_boot: bool,
     /// Only this kind of entry.
     pub kind: Option<String>,
-    /// Only this case of that kind, for a kind that covers several. Meaningless
-    /// on its own, so it narrows nothing unless [`Self::kind`] is set too.
-    pub subkind: Option<String>,
     /// Only entries naming this entity, in any role.
     pub entity: Option<EntityRef>,
     /// Narrow [`Self::entity`] to one role: the dependent, rather than any of
@@ -112,9 +109,6 @@ impl LogStore {
 
         if let Some(kind) = &filter.kind {
             condition = condition.add(logs::Column::Kind.eq(kind.as_str()));
-            if let Some(subkind) = &filter.subkind {
-                condition = condition.add(logs::Column::Subkind.eq(subkind.as_str()));
-            }
         }
 
         if let Some(entity) = &filter.entity {
@@ -308,7 +302,6 @@ fn render(row: logs::Model, hrefs: BTreeMap<String, Vec<Option<String>>>) -> Log
     LogEntry {
         id: row.id,
         kind: row.kind,
-        subkind: row.subkind,
         severity: row.severity,
         message: row.message,
         data,

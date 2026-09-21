@@ -10,6 +10,7 @@ pub mod aur;
 pub mod build_log;
 pub mod builds;
 pub mod dump;
+pub mod events;
 pub mod log;
 pub mod operations;
 pub mod package;
