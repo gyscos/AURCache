@@ -2,14 +2,16 @@
 
 Status: **In progress, third revision** · Last updated: 2026-09-21
 
-Built: the catalogue, storage and its entity index, the `/log` endpoint and the
-Logs page reading from it, always-valid links, and the curated activity log
-folded in. Still to do: porting the remaining `warn!`/`error!` sites
-subsystem by subsystem (the version check is done), and recording what nothing
-records yet -- builds, restores, settings changes, source edits, dependency
-edges, build cancel/retry/delete, token regeneration, package `PATCH`es, revoke
-requeues, the repository sweep. Once no deployment has rows left in the
-`activity` table, a migration can drop it.
+Built: the catalogue, storage and its entity index, the `/log` endpoint, the
+Logs page and the per-package and per-worker Activity cards reading from it,
+always-valid links, the curated activity log folded in, and the server-side
+sites ported -- builds (started, finished, failed, published, cancelled,
+retried, deleted), worker registrations, configuration changes and timeouts,
+settings, source edits, dependency changes, access, backups and the repository.
+Left in the journal on purpose: startup and configuration messages, and
+failures of the database itself. Workers log to their own journal; what the
+server learns from them is recorded here. Once no deployment has rows left in
+the `activity` table, a migration can drop it.
 
 AURCache's logging today is rich in *sites* and poor in *shape*: every binary
 logs through `tracing` with a plain text formatter (`aurcache/src/logger.rs`,
