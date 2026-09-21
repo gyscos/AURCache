@@ -31,3 +31,6 @@ backend/aurcache-api/web/
 
 # Compiler crash dumps, written into the working directory by rustc itself.
 rustc-ice-*.txt
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
