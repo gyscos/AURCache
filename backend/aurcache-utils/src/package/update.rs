@@ -133,6 +133,11 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
             continue;
         }
         let package_name = pkg.name.clone();
+        // A VCS package's version does not change until it is built, so the
+        // "already up to date" check would refuse it: the flag gets it past
+        // that check. It is not a forced update in anyone's sense, and the log
+        // entry says so -- `forced` there means somebody asked for a rebuild
+        // of something current.
         let force = vcs_tracked.contains(&pkg.id);
         match package_update(services, pkg, force, BuildTrigger::AutoUpdate).await {
             Ok(results) => {
@@ -140,7 +145,7 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
                 // which is what an entry without a user already says.
                 activity_log.emit(Event::PackageUpdated {
                     pkg: package_name.clone().into(),
-                    forced: force,
+                    forced: false,
                 });
                 ids_total.extend(
                     results
