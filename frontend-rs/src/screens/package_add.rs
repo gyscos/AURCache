@@ -111,17 +111,24 @@ impl CachedResult {
 
     /// Whether this result matches `query` the way the AUR's `by=name-desc`
     /// does: `query` arrives already lowered, once per keystroke rather than
-    /// once per result.
+    /// once per result. Every whitespace-separated term has to match
+    /// somewhere — a multi-word query is one question per word.
     fn matches(&self, query: &str) -> bool {
-        self.lowered_name.contains(query)
-            || self
-                .lowered_description
-                .as_deref()
-                .is_some_and(|d| d.contains(query))
+        let terms = query_terms(query);
+        if terms.is_empty() {
+            return false;
+        }
+        let description = self.lowered_description.as_deref().unwrap_or("");
+        terms
+            .iter()
+            .all(|term| self.lowered_name.contains(term) || description.contains(term))
     }
 
     /// How well this result answers what was typed: exact name first, then
-    /// prefix, then substring, then description-only. The single copy of
+    /// prefix, then fewest missed query terms, with description-only matches
+    /// last. For a single term that is exactly the old substring split; for
+    /// several it is what puts the package holding every word in its name
+    /// ahead of one holding only some of them there. The single copy of
     /// this ordering — [`rank_results`] for fresh network results goes
     /// through here too, so the two cannot drift apart.
     ///
@@ -132,12 +139,12 @@ impl CachedResult {
             0
         } else if self.lowered_name.starts_with(query) {
             1
-        } else if self.lowered_name.contains(query) {
-            2
         } else {
-            // Matched on something other than the name — the AUR searches
-            // descriptions too.
-            3
+            let missing = query_terms(query)
+                .iter()
+                .filter(|term| !self.lowered_name.contains(term.as_str()))
+                .count();
+            2u8.saturating_add(missing.min(u8::MAX as usize) as u8)
         }
     }
 }
@@ -207,6 +214,20 @@ impl SearchCache {
         );
         self.0.truncate(SEARCH_CACHE_ENTRIES);
     }
+}
+
+/// The whitespace-separated terms of a query, lowercased.
+///
+/// A multi-word query is one question per word: `gnome system monitor` asks
+/// for packages matching `gnome` *and* `system` *and* `monitor`, because no
+/// package name contains the phrase with its spaces — they use hyphens.
+/// Matching itself lives on [`CachedResult`], against the keys it precomputed.
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect()
 }
 
 /// Orders search results by how well they answer what was typed.
@@ -1000,6 +1021,57 @@ mod tests {
         let mut cache = SearchCache::default();
         cache.insert("Hel", &[result("Hello", None)]);
         assert_eq!(cache.narrow("hELLo").unwrap().len(), 1);
+    }
+
+    /// Words are separate questions: every one has to match somewhere, so
+    /// `gnome system monitor` finds the package whose hyphenated name holds
+    /// all three even though it holds the phrase with its spaces nowhere.
+    #[test]
+    fn narrowing_matches_every_word_separately() {
+        let mut cache = SearchCache::default();
+        cache.insert(
+            "gnome",
+            &[
+                result("gnome-shell-extension-system-monitor-next-git", None),
+                result("gnome-shell", None),
+            ],
+        );
+
+        let narrowed = cache
+            .narrow("gnome system monitor")
+            .expect("gnome can answer gnome system monitor");
+        assert_eq!(
+            narrowed.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["gnome-shell-extension-system-monitor-next-git"],
+        );
+    }
+
+    /// One word may match the name while another matches the description.
+    #[test]
+    fn narrowing_matches_words_across_name_and_description() {
+        let mut cache = SearchCache::default();
+        cache.insert(
+            "alacritty",
+            &[result("alacritty", Some("A fast terminal emulator"))],
+        );
+
+        assert_eq!(cache.narrow("alacritty terminal").unwrap().len(), 1);
+        assert!(cache.narrow("alacritty browser").unwrap().is_empty());
+    }
+
+    /// The package holding every word in its name comes before one holding
+    /// only some of them there.
+    #[test]
+    fn ranking_prefers_the_result_matching_every_word_in_its_name() {
+        let mut results = vec![
+            result("gnome-shell", None),
+            result("gnome-shell-extension-system-monitor-next-git", None),
+        ];
+        rank_results("gnome system monitor", &mut results);
+        assert_eq!(
+            results[0].name,
+            "gnome-shell-extension-system-monitor-next-git"
+        );
     }
 
     fn render(query: &str, results: Option<Result<Vec<SearchResult>, String>>) -> String {
