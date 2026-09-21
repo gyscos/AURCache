@@ -442,7 +442,7 @@ fn SettingRow(decl: SettingDecl, effective: Option<EffectiveSetting>) -> Element
                     },
                 }
             }
-            td { class: "align-top text-xs",
+            td { class: "align-top text-xs w-64 text-right",
                 if let Some(effective) = effective.as_ref() {
                     SourceNote { decl, effective: effective.clone() }
                 } else {
@@ -477,7 +477,7 @@ fn SourceNote(decl: SettingDecl, effective: EffectiveSetting) -> Element {
         EffectiveSource::Default => ("built-in default".to_string(), "badge-ghost"),
     };
     rsx! {
-        div { class: "flex flex-col gap-1 items-start",
+        div { class: "flex flex-col gap-1 items-end text-right",
             span { class: "badge {class} badge-sm font-mono whitespace-nowrap", "{label}" }
             // Only worth saying where it differs from what is running: repeating
             // the value as its own fallback is noise on most rows.
