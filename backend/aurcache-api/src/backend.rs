@@ -17,7 +17,7 @@ use crate::settings::{
     package_setting_get, package_setting_patch, package_setting_reset, package_settings,
     setting_get, setting_patch, setting_reset, settings,
 };
-use crate::stats::{dashboard_graph_data, stats, user_info};
+use crate::stats::{dashboard, dashboard_graph_data, stats, user_info};
 use rocket::{Route, routes};
 
 #[must_use]
@@ -43,6 +43,7 @@ pub fn build_api() -> Vec<Route> {
         list_builds,
         list_package_builds,
         stats,
+        dashboard,
         dashboard_graph_data,
         user_info,
         get_build,

@@ -4,6 +4,7 @@ use aurcache_common::settings::{
 };
 use aurcache_db::settings;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use std::collections::HashMap;
 use std::future::Future;
 
 /// `pkg_id` standing for "applies to the whole server".
@@ -163,6 +164,97 @@ where
     }
 }
 
+/// Resolve one setting for many packages in two queries, whatever the count.
+///
+/// The dashboard polls, so per-package lookups would repeat every tick, and a
+/// release wave can put dozens of packages out of date at once. Package
+/// overrides come back in one `pkg_id IN (…)` query, the env and global value
+/// once each — keeping the `Package -> Env -> Global -> Default` order in one
+/// place rather than re-deriving it at the call site.
+async fn get_settings_many<T>(
+    setting_type: Setting,
+    pkg_ids: &[i32],
+    db: &DatabaseConnection,
+) -> anyhow::Result<Vec<SettingsEntry<T>>>
+where
+    T: ParseSetting,
+{
+    if pkg_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let setting = setting_type.meta();
+
+    let parse_or_default = |val: &str, context: &str| -> T {
+        match T::parse_setting(val) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to parse {context}: {e}. Using default '{}'.",
+                    setting.default
+                );
+                parse_default(&setting)
+            }
+        }
+    };
+
+    let overrides: HashMap<i32, String> = settings::Entity::find()
+        .filter(settings::Column::Key.eq(setting.key))
+        .filter(settings::Column::PkgId.is_in(pkg_ids.to_vec()))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            let pkg_id = row.pkg_id?;
+            let value = row.value?;
+            Some((pkg_id, value))
+        })
+        .collect();
+
+    let env_value = setting
+        .env_name
+        .and_then(|env_name| std::env::var(env_name).ok());
+
+    let global_value: Option<String> = settings::Entity::find()
+        .filter(settings::Column::Key.eq(setting.key))
+        .filter(settings::Column::PkgId.eq(GLOBAL_PKG_ID))
+        .one(db)
+        .await?
+        .and_then(|row| row.value);
+
+    Ok(pkg_ids
+        .iter()
+        .map(|pkg_id| {
+            if let Some(v) = overrides.get(pkg_id) {
+                return SettingsEntry {
+                    value: parse_or_default(
+                        v,
+                        &format!("pkg setting {} pkg={pkg_id}", setting.key),
+                    ),
+                    source: SettingSource::Package,
+                };
+            }
+            if let Some(env_value) = &env_value
+                && let Some(env_name) = setting.env_name
+            {
+                return SettingsEntry {
+                    value: parse_or_default(env_value, &format!("ENV {env_name}")),
+                    source: SettingSource::Env,
+                };
+            }
+            if let Some(v) = &global_value {
+                return SettingsEntry {
+                    value: parse_or_default(v, &format!("global setting {}", setting.key)),
+                    source: SettingSource::Global,
+                };
+            }
+            SettingsEntry {
+                value: parse_default(&setting),
+                source: SettingSource::Default,
+            }
+        })
+        .collect())
+}
+
 /// Parse a setting's built-in default. The defaults are compile-time constants
 /// chosen to match each setting's type, so a failure here is a programming bug.
 fn parse_default<T: ParseSetting>(setting: &SettingsMeta) -> T {
@@ -184,6 +276,14 @@ pub trait SettingsTraits {
         pkgid: Option<i32>,
         db: &DatabaseConnection,
     ) -> impl Future<Output = SettingsEntry<T>> + Send;
+    /// Resolve one setting for a set of packages in two queries, whatever the
+    /// count — package overrides in one `pkg_id IN (…)` query, env and global
+    /// once — preserving `Package -> Env -> Global -> Default` order.
+    fn get_many<T: ParseSetting>(
+        setting: Setting,
+        pkg_ids: &[i32],
+        db: &DatabaseConnection,
+    ) -> impl Future<Output = anyhow::Result<Vec<SettingsEntry<T>>>> + Send;
     fn patch<I>(
         db: &DatabaseConnection,
         settings: I,
@@ -244,5 +344,13 @@ impl SettingsTraits for ApplicationSettings {
         I: IntoIterator<Item = (Setting, Option<i32>, Option<String>)> + Send,
     {
         set_settings_bulk(settings, db).await
+    }
+
+    async fn get_many<T: ParseSetting>(
+        setting: Setting,
+        pkg_ids: &[i32],
+        db: &DatabaseConnection,
+    ) -> anyhow::Result<Vec<SettingsEntry<T>>> {
+        get_settings_many(setting, pkg_ids, db).await
     }
 }

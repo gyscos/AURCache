@@ -173,6 +173,20 @@ ROUTES=(
     "/|this week|the weekly reading sits beside the lifetime one"
     # The chart is SVG, so a real element proves it drew rather than errored.
     "/|<svg|the build graph renders"
+    # The eight dashboard cards below the chart. With the fixture's mix of
+    # failed, out-of-date, queued and warning rows, every card renders full
+    # rather than collapsed.
+    "/|Recent packages|the dashboard shows recent packages"
+    "/|Recent builds|the dashboard shows recent builds"
+    "/|Failed packages|the dashboard shows failed packages"
+    "/|Out of date|the dashboard shows out-of-date packages"
+    "/|Stuck queue|the dashboard shows the stuck queue"
+    "/|Recent problems|the dashboard shows recent problems"
+    "/|Largest packages|the dashboard shows largest packages"
+    "/|Longest builds|the dashboard shows longest builds"
+    # The stuck queue's "View all" lands on Builds with both queued states in
+    # the URL; the interaction suite asserts it arrives applied.
+    "/|s=enqueued|the stuck queue links to both queued states"
     "/builds|Duration|builds list"
     "/settings|Max artifact size|the artifact size limit is a setting"
     "/builds|6.4 GiB|a build's peak memory is reported"

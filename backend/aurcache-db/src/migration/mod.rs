@@ -35,6 +35,7 @@ mod m20260917_000002_activity_timestamp_index;
 mod m20260917_000003_structured_logs;
 mod m20260921_000000_log_query_indexes;
 mod m20260922_000000_build_queued_entries;
+mod m20260923_000000_build_dashboard_indexes;
 
 pub struct Migrator;
 
@@ -84,6 +85,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000003_structured_logs::Migration),
             Box::new(m20260921_000000_log_query_indexes::Migration),
             Box::new(m20260922_000000_build_queued_entries::Migration),
+            Box::new(m20260923_000000_build_dashboard_indexes::Migration),
         ]
     }
 }

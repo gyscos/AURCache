@@ -1,3 +1,6 @@
+use crate::api::builds::BuildSummary;
+use crate::api::log::LogEntry;
+use crate::api::package::SimplePackage;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -56,4 +59,63 @@ pub struct GraphDataPoint {
 pub struct UserInfo {
     pub username: Option<String>,
     pub has_api_token: bool,
+}
+
+/// How many days of successful builds the longest-builds card ranks.
+///
+/// A window, not all time: an all-time list barely changes and prompts
+/// nothing, while a 30-day window surfaces regressions worth looking at.
+pub const LONGEST_WINDOW_DAYS: i64 = 30;
+
+/// Every dashboard card in one response, beside the existing `stats`/`graph`.
+///
+/// Each section is `Option`: `None` when its query failed, so one bad query
+/// never blanks the page — the card renders its own inline error and the rest
+/// render normally.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq)]
+pub struct DashboardView {
+    /// Directly requested packages, newest first.
+    pub recent_packages: Option<Vec<SimplePackage>>,
+    /// Builds, newest first by start time.
+    pub recent_builds: Option<Vec<BuildSummary>>,
+    /// Packages whose latest build state is failed.
+    pub failed: Option<Vec<SimplePackage>>,
+    /// Out-of-date packages split into those needing a hand and a count of
+    /// those rebuilding on their own.
+    pub out_of_date: Option<OutOfDateSlice>,
+    /// The stuck queue: its total depth plus the oldest entries.
+    pub queue: Option<QueueSlice>,
+    /// Log entries at warning severity and worse, newest first.
+    pub problems: Option<Vec<LogEntry>>,
+    /// Packages by total artifact size, largest first.
+    pub largest: Option<Vec<SimplePackage>>,
+    /// Longest successful builds in the window, with the previous run beside
+    /// each.
+    pub longest: Option<Vec<LongBuild>>,
+}
+
+/// Out-of-date packages that nothing will rebuild on its own, plus how many
+/// others are out of date but already handled (queued or auto-rebuilding).
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct OutOfDateSlice {
+    pub needs_hand: Vec<SimplePackage>,
+    pub handled: u64,
+}
+
+/// The stuck queue: how deep it is in total, and the oldest entries oldest
+/// first (capped — the depth counts past the cap).
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct QueueSlice {
+    pub depth: u64,
+    pub oldest: Vec<BuildSummary>,
+}
+
+/// One long build plus its previous successful duration on the same platform.
+///
+/// `previous_secs` is `None` when there is no earlier successful build on
+/// that platform, never `0`.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct LongBuild {
+    pub build: BuildSummary,
+    pub previous_secs: Option<i64>,
 }

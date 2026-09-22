@@ -255,6 +255,7 @@ async fn interactions() {
     filtering_narrows_the_list_and_updates_the_url(&session).await;
     a_stored_config_file_is_loaded_into_the_editor(&session).await;
     a_linked_search_arrives_applied(&session).await;
+    a_linked_status_filter_arrives_applied(&session).await;
     one_queued_package_can_be_taken_back(&session).await;
     a_queue_is_added_as_one_job(&session).await;
     the_export_dialog_warns_only_when_secrets_are_asked_for(&session).await;
@@ -603,6 +604,25 @@ async fn a_linked_search_arrives_applied(session: &Session) {
         .await;
 }
 
+/// A status set in the URL is applied on arrival, which is what makes the
+/// dashboard's stuck-queue card land on Builds with both queued states
+/// ticked. The counterpart to the search scenario above.
+async fn a_linked_status_filter_arrives_applied(session: &Session) {
+    session.open("/builds?s=enqueued,waiting").await;
+    session
+        .wait_until("the queue filter to apply", |t| {
+            t.contains("2 statuses")
+                && t.contains("visual-studio-code-bin")
+                && !t.contains("aewm++")
+        })
+        .await;
+    assert!(
+        session.url().await.contains("s=enqueued"),
+        "URL lost the filter: {}",
+        session.url().await
+    );
+}
+
 /// Approving a worker moves it out of the queue of machines waiting.
 ///
 /// The approval gate is what the workers page is for, and it is the one flow
@@ -773,7 +793,10 @@ async fn the_log_filters_narrow_what_it_shows(session: &Session) {
         })
         .await;
     assert!(
-        !session.text().await.contains("queued a build of yay (rebuild)"),
+        !session
+            .text()
+            .await
+            .contains("queued a build of yay (rebuild)"),
         "an ordinary entry is neither"
     );
 

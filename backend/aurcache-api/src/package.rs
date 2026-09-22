@@ -42,7 +42,7 @@ use tracing::warn;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
-use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order};
+use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order, Select};
 use sea_orm::{
     ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
     RelationTrait,
@@ -745,6 +745,26 @@ pub async fn package_list(
         .map_err(|e| err(Status::InternalServerError, e))
 }
 
+/// The package-list projection shared by the list and dashboard routes.
+///
+/// Every listed package has the same fields, so there is one place the shape
+/// of a [`SimplePackage`] is described.
+pub(crate) fn package_row_select() -> Select<Packages> {
+    Packages::find()
+        .select_only()
+        .column(packages::Column::Name)
+        .column(packages::Column::Id)
+        .column(packages::Column::Status)
+        .column_as(packages::Column::OutOfDate, "outofdate")
+        .column_as(packages::Column::UpstreamVersion, "upstream_version")
+        .column(packages::Column::DirectlyRequested)
+        // No COALESCE to an empty string: a package with no build has no
+        // version, and `null` says that where `""` is indistinguishable from a
+        // build that produced a blank one.
+        .column_as(latest_successful_version_expr(), "latest_version")
+        .column_as(total_artifact_size_expr(), "total_size")
+}
+
 /// List packages, by default only the ones somebody asked for.
 ///
 /// `dependencies` opts into the rest. It defaults to off because that is what
@@ -757,32 +777,18 @@ async fn list_packages(
     page: Option<u64>,
     dependencies: bool,
 ) -> Result<Vec<SimplePackage>, sea_orm::DbErr> {
-    // Both of these are correlated subqueries over the package row, so they
-    // report per row without a query per package. The "successful builds only"
-    // rule matters: taking the newest attempt regardless of outcome meant a
-    // failed build of a new version reported that version as built, and the
-    // version check then compared upstream against it and cleared the
-    // out-of-date flag — so an upstream release whose first build failed
-    // stopped being flagged at all.
+    // Both correlated subqueries live in `package_row_select`, so they report
+    // per row without a query per package. The "successful builds only" rule
+    // matters: taking the newest attempt regardless of outcome meant a failed
+    // build of a new version reported that version as built, and the version
+    // check then compared upstream against it and cleared the out-of-date
+    // flag — so an upstream release whose first build failed stopped being
+    // flagged at all.
 
-    let all: Vec<SimplePackage> = Packages::find()
-        .select_only()
-        .column(packages::Column::Name)
-        .column(packages::Column::Id)
-        .column(packages::Column::Status)
-        .column_as(packages::Column::OutOfDate, "outofdate")
-        .column_as(packages::Column::UpstreamVersion, "upstream_version")
-        .column(packages::Column::DirectlyRequested)
+    let all: Vec<SimplePackage> = package_row_select()
         .apply_if((!dependencies).then_some(()), |query, ()| {
             query.filter(packages::Column::DirectlyRequested.eq(true))
         })
-        // No COALESCE to an empty string: a package with no build has no
-        // version, and `null` says that where `""` is indistinguishable from a
-        // build that produced a blank one. The detail endpoint below already
-        // reported it this way, so coercing here made one field mean two
-        // different things depending on which route you asked.
-        .column_as(latest_successful_version_expr(), "latest_version")
-        .column_as(total_artifact_size_expr(), "total_size")
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)

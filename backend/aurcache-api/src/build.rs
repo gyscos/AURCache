@@ -22,7 +22,6 @@ use rocket::fs::NamedFile;
 use rocket::http::{ContentType, Header};
 use rocket::response::Responder;
 use sea_orm::FromQueryResult;
-use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait, Select,
@@ -209,12 +208,11 @@ async fn list_builds_impl(
     limit: Option<u64>,
     page: Option<u64>,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
-    // `COALESCE` rather than a bare column: never-started builds hold NULL
-    // here, and SQLite and Postgres disagree on where NULLs sort. Coalescing
-    // to 0 puts them last on both backends instead of first-on-Postgres.
-    let started = Func::coalesce([Expr::col((Builds, builds::Column::StartTime)), Expr::val(0)]);
+    // Every row has a start time since the dashboard-indexes migration
+    // backfilled legacy NULLs, so the bare column orders identically on both
+    // backends and the `start_time` index serves it.
     let basequery = build_row_select()
-        .order_by(started, Order::Desc)
+        .order_by(builds::Column::StartTime, Order::Desc)
         .limit(limit)
         // Saturating: user input must never reach unchecked arithmetic — a
         // huge `page` would wrap the offset in release or panic in debug.
@@ -236,11 +234,11 @@ async fn list_builds_impl(
     Ok(Json(annotate_waiting(db, rows).await))
 }
 
-/// The build-list projection shared by the list and single-build routes.
+/// The build-list projection shared by the list, single-build and dashboard routes.
 ///
 /// Every listed build has the same fields, so there is one place the shape of a
 /// [`BuildRow`] is described.
-fn build_row_select() -> Select<Builds> {
+pub(crate) fn build_row_select() -> Select<Builds> {
     Builds::find()
         .join_rev(JoinType::InnerJoin, packages::Relation::Builds.def())
         .select_only()
@@ -264,7 +262,7 @@ fn build_row_select() -> Select<Builds> {
 /// Waiting reasons are keyed by row id internally, so the id has to survive as
 /// far as the annotation — but no further.
 #[derive(FromQueryResult)]
-struct BuildRow {
+pub(crate) struct BuildRow {
     id: i32,
     number: i32,
     pkg_name: String,
@@ -305,7 +303,10 @@ impl BuildRow {
 ///
 /// Best-effort by design: this is diagnostic decoration, and failing to compute
 /// it must never turn a working build list into an error page.
-async fn annotate_waiting(db: &DatabaseConnection, rows: Vec<BuildRow>) -> Vec<BuildSummary> {
+pub(crate) async fn annotate_waiting(
+    db: &DatabaseConnection,
+    rows: Vec<BuildRow>,
+) -> Vec<BuildSummary> {
     if rows.is_empty() {
         return Vec::new();
     }

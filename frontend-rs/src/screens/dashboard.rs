@@ -1,9 +1,17 @@
 //! The landing page: how the instance is doing, at a glance.
 
+use super::logs::EntryText;
+use crate::dates::AbsoluteDate;
 use crate::format::{format_bytes, format_secs};
 use crate::listing::ViewParams;
 use crate::routes::Route;
-use aurcache_client::{GraphDataPoint, ListStats};
+use crate::status::{BuildStatusBadge, StatusBadge};
+use aurcache_client::{
+    Build, GraphDataPoint, ListStats, LogEntry, LongBuild, OutOfDateSlice, QueueSlice, Severity,
+    SimplePackage,
+};
+use aurcache_common::api::stats::LONGEST_WINDOW_DAYS;
+use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 use dioxus_charts::LineChart;
 
@@ -21,12 +29,19 @@ pub fn Dashboard() -> Element {
             .await
             .map_err(|e| e.to_string())
     });
+    let dashboard = use_resource(|| async move {
+        crate::api::client()?
+            .dashboard()
+            .await
+            .map_err(|e| e.to_string())
+    });
 
     // The landing page is somewhere to leave open; a slow tick keeps the
     // totals and the chart roughly current without a reload. No "busy" input —
     // nothing here is worth a fast poll.
     crate::poll::use_poll(stats, false);
     crate::poll::use_poll(graph, false);
+    crate::poll::use_poll(dashboard, false);
 
     rsx! {
         div { class: "space-y-4",
@@ -74,7 +89,538 @@ pub fn Dashboard() -> Element {
                     }
                 }
             }
+
+            match &*dashboard.read_unchecked() {
+                // Skeletons in the cards' full shape, so the page does not
+                // jump when the first response lands; the chart above loads
+                // on its own request, so nothing above them moves.
+                None => rsx! {
+                    DashboardGrid {
+                        left_top: rsx! { SkeletonCard { title: "Recent packages" } },
+                        right_top: rsx! { SkeletonCard { title: "Recent builds" } },
+                        left_attention: rsx! { SkeletonCard { title: "Failed packages" } },
+                        right_attention: rsx! { SkeletonCard { title: "Out of date" } },
+                        left_doing: rsx! { SkeletonCard { title: "Stuck queue" } },
+                        right_doing: rsx! { SkeletonCard { title: "Recent problems" } },
+                        left_slow: rsx! { SkeletonCard { title: "Largest packages" } },
+                        right_slow: rsx! { SkeletonCard { title: "Longest builds" } },
+                    }
+                },
+                Some(Err(e)) => rsx! {
+                    div { class: "alert alert-error",
+                        span { "Could not load the dashboard: {e}" }
+                    }
+                },
+                Some(Ok(view)) => rsx! {
+                    DashboardGrid {
+                        left_top: rsx! {
+                            RecentPackagesCard { packages: view.recent_packages.clone() }
+                        },
+                        right_top: rsx! {
+                            RecentBuildsCard { builds: view.recent_builds.clone() }
+                        },
+                        left_attention: rsx! {
+                            FailedPackagesCard { packages: view.failed.clone() }
+                        },
+                        right_attention: rsx! {
+                            OutOfDateCard { slice: view.out_of_date.clone() }
+                        },
+                        left_doing: rsx! {
+                            StuckQueueCard { queue: view.queue.clone() }
+                        },
+                        right_doing: rsx! {
+                            RecentProblemsCard { problems: view.problems.clone() }
+                        },
+                        left_slow: rsx! {
+                            LargestPackagesCard { packages: view.largest.clone() }
+                        },
+                        right_slow: rsx! {
+                            LongestBuildsCard { builds: view.longest.clone() }
+                        },
+                    }
+                },
+            }
         }
+    }
+}
+
+/// One card's chrome: title on the left, a "View all" link on the right.
+#[component]
+fn Card(title: String, to: Route, children: Element) -> Element {
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body",
+                div { class: "flex justify-between items-baseline",
+                    h2 { class: "card-title text-base", "{title}" }
+                    Link {
+                        class: "link link-primary text-xs",
+                        to: to,
+                        "View all →"
+                    }
+                }
+                {children}
+            }
+        }
+    }
+}
+
+/// A healthy attention card, collapsed to one line: a success-toned check
+/// and what is not happening.
+#[component]
+fn CollapsedCard(text: String) -> Element {
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body py-3 flex-row items-center gap-2",
+                span { class: "text-success font-bold", "✓" }
+                span { class: "text-sm", "{text}" }
+            }
+        }
+    }
+}
+
+/// A card's full shape in skeleton blocks, shown while its section loads.
+/// The title stays as screen-reader text so the loading region is named.
+#[component]
+fn SkeletonCard(title: String) -> Element {
+    rsx! {
+        div { class: "card bg-base-100 shadow-xl",
+            div { class: "card-body",
+                span { class: "sr-only", "{title} loading" }
+                div { class: "skeleton h-5 w-32" }
+                for _ in 0..5 {
+                    div { class: "skeleton h-4 w-full mt-2" }
+                }
+            }
+        }
+    }
+}
+
+/// One failed dashboard section: an inline error, while the rest of the page
+/// renders normally.
+#[component]
+fn SectionError(section: String) -> Element {
+    rsx! {
+        div { class: "alert alert-error",
+            span { "Could not load {section}" }
+        }
+    }
+}
+
+/// "Stuck queue · 7 queued".
+fn queue_title(depth: u64) -> String {
+    format!("Stuck queue · {depth} queued")
+}
+
+/// "Longest builds · 30 days".
+fn longest_title() -> String {
+    format!("Longest builds · {LONGEST_WINDOW_DAYS} days")
+}
+
+/// The out-of-date footer when something rebuilds on its own, if anything.
+fn handled_text(handled: u64) -> Option<String> {
+    if handled > 0 {
+        Some(format!("{handled} rebuilding on their own"))
+    } else {
+        None
+    }
+}
+
+/// Why a queued build is still waiting: its worker reason, or — for a build
+/// held on dependencies, which has no worker reason — the dependency hold.
+fn queue_reason(build: &Build) -> Option<String> {
+    if let Some(reason) = &build.waiting_reason {
+        Some(reason.to_string())
+    } else if build.status == BuildState::WaitingForDeps.as_i32() {
+        Some("waiting for dependencies".to_string())
+    } else {
+        None
+    }
+}
+
+fn format_total_size(total_size: Option<i64>) -> String {
+    total_size
+        .and_then(|size| u64::try_from(size).ok())
+        .map_or_else(|| "—".to_string(), format_bytes)
+}
+
+#[component]
+fn RecentPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
+    let Some(packages) = packages else {
+        return rsx! { SectionError { section: "recent packages" } };
+    };
+    if packages.is_empty() {
+        return rsx! {
+            Card {
+                title: "Recent packages",
+                to: Route::Packages { view: ViewParams::default(), q: String::new() },
+                div {
+                    "No packages yet. "
+                    Link {
+                        class: "link link-primary",
+                        to: Route::PackageAdd { q: String::new() },
+                        "Add one →"
+                    }
+                }
+            }
+        };
+    }
+    rsx! {
+        Card {
+            title: "Recent packages",
+            to: Route::Packages { view: ViewParams::default(), q: String::new() },
+            div { class: "divide-y divide-base-200",
+                for pkg in packages {
+                    Link {
+                        key: "{pkg.id}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Package { pkgbase: pkg.name.clone() },
+                        span { class: "font-medium truncate", "{pkg.name}" }
+                        StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RecentBuildsCard(builds: Option<Vec<Build>>) -> Element {
+    let Some(builds) = builds else {
+        return rsx! { SectionError { section: "recent builds" } };
+    };
+    if builds.is_empty() {
+        return rsx! {
+            Card {
+                title: "Recent builds",
+                to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                div {
+                    "No builds yet. "
+                    Link {
+                        class: "link link-primary",
+                        to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                        "View builds →"
+                    }
+                }
+            }
+        };
+    }
+    rsx! {
+        Card {
+            title: "Recent builds",
+            to: Route::Builds { view: ViewParams::default(), q: String::new() },
+            div { class: "divide-y divide-base-200",
+                for build in builds {
+                    Link {
+                        key: "{build.pkg_name} #{build.number}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Build {
+                            pkgbase: build.pkg_name.clone(),
+                            number: build.number,
+                        },
+                        span { class: "truncate",
+                            span { class: "font-medium", "{build.pkg_name}" }
+                            span { class: "opacity-60", " #{build.number} · {build.version}" }
+                        }
+                        span { class: "flex items-center gap-2 shrink-0",
+                            BuildStatusBadge { status: build.status }
+                            AbsoluteDate { ts: build.start_time }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn FailedPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
+    let Some(packages) = packages else {
+        return rsx! { SectionError { section: "failed packages" } };
+    };
+    if packages.is_empty() {
+        return rsx! { CollapsedCard { text: "No failed packages" } };
+    }
+    rsx! {
+        Card {
+            title: "Failed packages",
+            to: Route::Packages {
+                view: ViewParams::with_status(BuildState::Failed),
+                q: String::new(),
+            },
+            div { class: "divide-y divide-base-200",
+                for pkg in packages {
+                    Link {
+                        key: "{pkg.id}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Package { pkgbase: pkg.name.clone() },
+                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm opacity-60 truncate",
+                            "{pkg.latest_version.as_deref().unwrap_or(\"—\")}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn OutOfDateCard(slice: Option<OutOfDateSlice>) -> Element {
+    let Some(slice) = slice else {
+        return rsx! { SectionError { section: "out-of-date packages" } };
+    };
+    if slice.needs_hand.is_empty() {
+        let text = match handled_text(slice.handled) {
+            Some(count) => format!("Nothing needs a hand · {count}"),
+            None => "Nothing needs a hand".to_string(),
+        };
+        return rsx! { CollapsedCard { text: text } };
+    }
+    rsx! {
+        Card {
+            title: "Out of date",
+            to: Route::Packages {
+                view: ViewParams::with_out_of_date(),
+                q: String::new(),
+            },
+            div { class: "divide-y divide-base-200",
+                for pkg in slice.needs_hand {
+                    Link {
+                        key: "{pkg.id}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Package { pkgbase: pkg.name.clone() },
+                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm opacity-60 truncate",
+                            "{pkg.latest_version.as_deref().unwrap_or(\"—\")} → {pkg.upstream_version.as_deref().unwrap_or(\"—\")}"
+                        }
+                    }
+                }
+            }
+            if let Some(count) = handled_text(slice.handled) {
+                div { class: "text-sm opacity-60 pt-2", "{count}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn StuckQueueCard(queue: Option<QueueSlice>) -> Element {
+    let Some(queue) = queue else {
+        return rsx! { SectionError { section: "the build queue" } };
+    };
+    if queue.depth == 0 {
+        return rsx! { CollapsedCard { text: "Nothing queued" } };
+    }
+    rsx! {
+        Card {
+            title: queue_title(queue.depth),
+            to: Route::Builds {
+                view: ViewParams::with_states(&[
+                    BuildState::Enqueued,
+                    BuildState::WaitingForDeps,
+                ]),
+                q: String::new(),
+            },
+            div { class: "divide-y divide-base-200",
+                for build in queue.oldest {
+                    Link {
+                        key: "{build.pkg_name} #{build.number}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Build {
+                            pkgbase: build.pkg_name.clone(),
+                            number: build.number,
+                        },
+                        span { class: "truncate",
+                            span { class: "font-medium", "{build.pkg_name}" }
+                            span { class: "opacity-60", " #{build.number} · {build.platform}" }
+                            if let Some(reason) = queue_reason(&build) {
+                                span { class: "opacity-60", " · {reason}" }
+                            }
+                        }
+                        span { class: "ml-auto text-sm opacity-60 shrink-0",
+                            AbsoluteDate { ts: build.start_time }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn RecentProblemsCard(problems: Option<Vec<LogEntry>>) -> Element {
+    let Some(problems) = problems else {
+        return rsx! { SectionError { section: "recent problems" } };
+    };
+    if problems.is_empty() {
+        return rsx! {
+            Card {
+                title: "Recent problems",
+                to: Route::Logs { view: ViewParams::for_logs(None, false, None) },
+                div { class: "opacity-60", "No warnings or errors" }
+            }
+        };
+    }
+    rsx! {
+        Card {
+            title: "Recent problems",
+            to: Route::Logs {
+                view: ViewParams::for_logs(Some(Severity::Warning), false, None),
+            },
+            div { class: "divide-y divide-base-200",
+                for entry in problems {
+                    div { key: "{entry.id}", class: "py-2 flex gap-2 items-baseline",
+                        match entry.severity {
+                            Severity::Warning => rsx! {
+                                span { class: "badge badge-warning badge-sm shrink-0", "warning" }
+                            },
+                            Severity::Error => rsx! {
+                                span { class: "badge badge-error badge-sm shrink-0", "error" }
+                            },
+                            Severity::Info => rsx! {},
+                        }
+                        span { class: "text-sm opacity-60 shrink-0",
+                            AbsoluteDate { ts: Some(entry.timestamp) }
+                        }
+                        span { class: "line-clamp-2 min-w-0",
+                            EntryText { entry: entry }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LargestPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
+    let Some(packages) = packages else {
+        return rsx! { SectionError { section: "largest packages" } };
+    };
+    if packages.is_empty() {
+        return rsx! {
+            Card {
+                title: "Largest packages",
+                to: Route::Packages { view: ViewParams::default(), q: String::new() },
+                div {
+                    "No packages with artifacts yet. "
+                    Link {
+                        class: "link link-primary",
+                        to: Route::Packages { view: ViewParams::default(), q: String::new() },
+                        "View packages →"
+                    }
+                }
+            }
+        };
+    }
+    rsx! {
+        Card {
+            title: "Largest packages",
+            to: Route::Packages { view: ViewParams::default(), q: String::new() },
+            div { class: "divide-y divide-base-200",
+                for pkg in packages {
+                    Link {
+                        key: "{pkg.id}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Package { pkgbase: pkg.name.clone() },
+                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm opacity-60 shrink-0",
+                            "{format_total_size(pkg.total_size)}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
+    let Some(builds) = builds else {
+        return rsx! { SectionError { section: "longest builds" } };
+    };
+    if builds.is_empty() {
+        return rsx! {
+            Card {
+                title: longest_title(),
+                to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                div {
+                    "No successful builds yet. "
+                    Link {
+                        class: "link link-primary",
+                        to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                        "View builds →"
+                    }
+                }
+            }
+        };
+    }
+    rsx! {
+        Card {
+            title: longest_title(),
+            to: Route::Builds { view: ViewParams::default(), q: String::new() },
+            div { class: "divide-y divide-base-200",
+                for item in builds {
+                    Link {
+                        key: "{item.build.pkg_name} #{item.build.number}",
+                        class: "py-2 flex justify-between items-center gap-2",
+                        to: Route::Build {
+                            pkgbase: item.build.pkg_name.clone(),
+                            number: item.build.number,
+                        },
+                        span { class: "truncate",
+                            span { class: "font-medium", "{item.build.pkg_name}" }
+                            span { class: "opacity-60", " #{item.build.number}" }
+                            span { class: "badge badge-neutral badge-sm mx-2",
+                                "{item.build.platform}"
+                            }
+                            span { class: "opacity-60",
+                                "{format_duration_secs(item.build.start_time, item.build.end_time)}"
+                            }
+                            if let Some(previous) = item.previous_secs {
+                                span { class: "opacity-60", ", was {format_duration_secs_raw(previous)}" }
+                            }
+                        }
+                        span { class: "ml-auto text-sm opacity-60 shrink-0",
+                            AbsoluteDate { ts: item.build.start_time }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A finished build's duration from its timestamps.
+fn format_duration_secs(start_time: Option<i64>, end_time: Option<i64>) -> String {
+    match (start_time, end_time) {
+        (Some(start), Some(end)) => format_duration_secs_raw(end.saturating_sub(start).max(0)),
+        _ => "—".to_string(),
+    }
+}
+
+/// A raw second count as a duration, never negative.
+fn format_duration_secs_raw(secs: i64) -> String {
+    u32::try_from(secs).map_or_else(|_| "—".to_string(), format_secs)
+}
+
+/// The four two-card rows the dashboard stacks below the chart.
+#[component]
+fn DashboardGrid(
+    left_top: Element,
+    right_top: Element,
+    left_attention: Element,
+    right_attention: Element,
+    left_doing: Element,
+    right_doing: Element,
+    left_slow: Element,
+    right_slow: Element,
+) -> Element {
+    rsx! {
+        div { class: "grid gap-4 lg:grid-cols-2", {left_top} {right_top} }
+        div { class: "grid gap-4 lg:grid-cols-2", {left_attention} {right_attention} }
+        div { class: "grid gap-4 lg:grid-cols-2", {left_doing} {right_doing} }
+        div { class: "grid gap-4 lg:grid-cols-2", {left_slow} {right_slow} }
     }
 }
 
@@ -255,7 +801,15 @@ fn month_label(month: i32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{StatTiles, StatTilesProps, format_rate, month_label, success_rate};
+    use super::{
+        Build, BuildState, LONGEST_WINDOW_DAYS, OutOfDateSlice, QueueSlice, Severity, ViewParams,
+    };
+    use super::{
+        FailedPackagesCard, FailedPackagesCardProps, OutOfDateCard, OutOfDateCardProps,
+        RecentProblemsCard, RecentProblemsCardProps, SkeletonCard, SkeletonCardProps, StatTiles,
+        StatTilesProps, StuckQueueCard, StuckQueueCardProps, format_rate, handled_text,
+        longest_title, month_label, queue_reason, queue_title, success_rate,
+    };
     use aurcache_client::ListStats;
     use dioxus::prelude::*;
 
@@ -330,5 +884,212 @@ mod tests {
         let html = tiles(8, 1, 10);
         assert!(html.contains("1m 30s"), "average build: {html}");
         assert!(html.contains("3.0 GiB"), "repository size: {html}");
+    }
+
+    /// A failed section renders an inline error while the rest would render.
+    ///
+    /// Only router-free states are asserted here: rows and "View all" links
+    /// need a `Router` above them, which panics outside the browser in a
+    /// debug build — the browser suite covers those, like the logs list's.
+    #[test]
+    fn a_failed_section_is_an_inline_error() {
+        let mut dom = VirtualDom::new_with_props(
+            FailedPackagesCard,
+            FailedPackagesCardProps { packages: None },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Could not load failed packages"), "{html}");
+        assert!(!html.contains("No failed packages"), "{html}");
+    }
+
+    /// Healthy attention cards collapse to one line instead of an empty card.
+    #[test]
+    fn empty_attention_cards_collapse() {
+        let mut dom = VirtualDom::new_with_props(
+            FailedPackagesCard,
+            FailedPackagesCardProps {
+                packages: Some(Vec::new()),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("No failed packages"), "{html}");
+        assert!(!html.contains("View all"), "{html}");
+
+        let mut dom = VirtualDom::new_with_props(
+            StuckQueueCard,
+            StuckQueueCardProps {
+                queue: Some(QueueSlice {
+                    depth: 0,
+                    oldest: Vec::new(),
+                }),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Nothing queued"), "{html}");
+    }
+
+    /// An empty out-of-date section keeps its handled count.
+    #[test]
+    fn an_empty_out_of_date_section_keeps_its_count() {
+        let mut dom = VirtualDom::new_with_props(
+            OutOfDateCard,
+            OutOfDateCardProps {
+                slice: Some(OutOfDateSlice {
+                    needs_hand: Vec::new(),
+                    handled: 4,
+                }),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Nothing needs a hand"), "{html}");
+        assert!(html.contains("4 rebuilding on their own"), "{html}");
+
+        let mut dom = VirtualDom::new_with_props(
+            OutOfDateCard,
+            OutOfDateCardProps {
+                slice: Some(OutOfDateSlice {
+                    needs_hand: Vec::new(),
+                    handled: 0,
+                }),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Nothing needs a hand"), "{html}");
+        assert!(!html.contains("rebuilding"), "{html}");
+    }
+
+    /// The problems empty state is link-free text.
+    #[test]
+    fn no_problems_says_so() {
+        let mut dom = VirtualDom::new_with_props(
+            RecentProblemsCard,
+            RecentProblemsCardProps {
+                problems: Some(Vec::new()),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Recent problems"), "{html}");
+        assert!(html.contains("No warnings or errors"), "{html}");
+    }
+
+    /// Skeletons hold the card's shape before the first response: a title
+    /// bar and five row bars, no text yet.
+    #[test]
+    fn a_skeleton_holds_the_cards_shape() {
+        let mut dom = VirtualDom::new_with_props(
+            SkeletonCard,
+            SkeletonCardProps {
+                title: "Recent packages".to_string(),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert_eq!(html.matches("skeleton h-").count(), 6, "{html}");
+        assert!(html.contains("Recent packages loading"), "{html}");
+    }
+
+    #[test]
+    fn a_queued_build_names_what_holds_it() {
+        use aurcache_client::WaitingReason;
+
+        let reasoned = Build {
+            number: 1,
+            pkg_name: "hello".to_string(),
+            version: "1.0".to_string(),
+            status: BuildState::Enqueued.as_i32(),
+            start_time: Some(100),
+            end_time: None,
+            platform: "x86_64".to_string(),
+            size: None,
+            peak_memory: None,
+            worker_name: None,
+            log_size: None,
+            waiting_reason: Some(WaitingReason::Arch {
+                arch: "x86_64".to_string(),
+            }),
+        };
+        let reason = queue_reason(&reasoned).expect("a reason");
+        assert!(reason.contains("x86_64"), "{reason}");
+
+        // Held on dependencies, with no worker reason of its own.
+        let held = Build {
+            status: BuildState::WaitingForDeps.as_i32(),
+            waiting_reason: None,
+            ..reasoned.clone()
+        };
+        assert_eq!(
+            queue_reason(&held),
+            Some("waiting for dependencies".to_string())
+        );
+
+        // Running normally, with nothing to explain.
+        let plain = Build {
+            status: BuildState::Active.as_i32(),
+            waiting_reason: None,
+            ..reasoned
+        };
+        assert_eq!(queue_reason(&plain), None);
+    }
+
+    #[test]
+    fn card_titles_and_counts_read_plainly() {
+        assert_eq!(queue_title(7), "Stuck queue · 7 queued");
+        assert_eq!(
+            longest_title(),
+            format!("Longest builds · {LONGEST_WINDOW_DAYS} days")
+        );
+        assert_eq!(handled_text(0), None);
+        assert_eq!(
+            handled_text(4),
+            Some("4 rebuilding on their own".to_string())
+        );
+    }
+
+    /// Each card's "View all" target, as a URL: the mapping SSR cannot render
+    /// (links need a router) but the browser suite navigates.
+    #[test]
+    fn each_card_links_to_its_list() {
+        use crate::routes::Route;
+
+        let failed = Route::Packages {
+            view: ViewParams::with_status(BuildState::Failed),
+            q: String::new(),
+        }
+        .to_string();
+        assert!(failed.contains("s=failed"), "{failed}");
+
+        let outdated = Route::Packages {
+            view: ViewParams::with_out_of_date(),
+            q: String::new(),
+        }
+        .to_string();
+        assert!(outdated.contains("s=outdated"), "{outdated}");
+
+        let queued = Route::Builds {
+            view: ViewParams::with_states(&[BuildState::Enqueued, BuildState::WaitingForDeps]),
+            q: String::new(),
+        }
+        .to_string();
+        assert!(queued.contains("s=enqueued,waiting"), "{queued}");
+
+        let problems = Route::Logs {
+            view: ViewParams::for_logs(Some(Severity::Warning), false, None),
+        }
+        .to_string();
+        assert!(problems.contains("v=warning"), "{problems}");
+
+        // Unfiltered cards link to the plain lists.
+        let plain = Route::Packages {
+            view: ViewParams::default(),
+            q: String::new(),
+        }
+        .to_string();
+        assert!(!plain.contains("s="), "{plain}");
     }
 }

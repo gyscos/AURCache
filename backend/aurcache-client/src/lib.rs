@@ -39,7 +39,9 @@ pub use aurcache_common::api::package::{
 pub use aurcache_common::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
 pub use aurcache_common::api::repo::RepoInfo;
 pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
-pub use aurcache_common::api::stats::{GraphDataPoint, ListStats, UserInfo};
+pub use aurcache_common::api::stats::{
+    DashboardView, GraphDataPoint, ListStats, LongBuild, OutOfDateSlice, QueueSlice, UserInfo,
+};
 pub use aurcache_common::api::waiting::WaitingReason;
 pub use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary as Worker,
@@ -289,6 +291,12 @@ impl AurCacheClient {
     /// Fetches monthly dashboard graph datapoints.
     pub async fn graph(&self) -> Result<Vec<GraphDataPoint>> {
         self.request_json::<Vec<GraphDataPoint>, Value>(Method::GET, "/graph", &[], None)
+            .await
+    }
+
+    /// Fetches every dashboard card in one response, beside `stats`/`graph`.
+    pub async fn dashboard(&self) -> Result<DashboardView> {
+        self.request_json::<DashboardView, Value>(Method::GET, "/stats/dashboard", &[], None)
             .await
     }
 
