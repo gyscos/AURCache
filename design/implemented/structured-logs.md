@@ -1,6 +1,6 @@
 # Design: Structured operation logs
 
-Status: **In progress, third revision** · Last updated: 2026-09-21
+Status: **Implemented** · Last updated: 2026-09-21
 
 Built: the catalogue, storage and its entity index, the `/log` endpoint, the
 Logs page and the per-package and per-worker Activity cards reading from it,
@@ -527,7 +527,7 @@ so the record needs the actor the activity log already carries as `user`.
 - Structured *build logs*. Per-line instrumentation of a makepkg build is out of
   scope; what gets structured here is the events *about* builds, not the bytes
   of their output. The build log stays a bounded byte stream
-  (`design/build-log-capping.md`).
+  (`design/implemented/build-log-capping.md`).
 - OTel/metrics export, full-text search, or log shipping. The shape is chosen to
   be export-friendly, but export is a later step.
 

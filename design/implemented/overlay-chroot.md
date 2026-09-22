@@ -4,9 +4,9 @@ Plan for making a build's chroot cost nothing to create on filesystems that
 cannot snapshot, and for refreshing the base without waiting for the builds
 using it.
 
-Status: **partly implemented.** The overlay strategy and its startup detection
-are in (`aurcache-worker/src/chroots.rs`). Update layers -- the part that makes
-refreshing free of the builds in flight -- are designed here and not built.
+Status: **implemented.** The overlay strategy, its startup detection and update
+layers (`refresh_by_layer`, flattened past `MAX_LAYERS`) are all in
+`aurcache-worker/src/chroots.rs`.
 
 ---
 

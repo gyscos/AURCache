@@ -7,14 +7,14 @@ protocol helper on the worker side, and seven call sites in `aurcache-worker`
 instrumented as a first slice -- four in `job.rs`, three reached by threading
 `report_to` through `Chroots::refresh`/`refresh_by_layer` into
 `chroot::ensure_base_chroot`. Not done: the rest of the survey in
-`design/structured-logs.md`'s worker section (`worker.claim_failed`,
+`design/implemented/structured-logs.md`'s worker section (`worker.claim_failed`,
 `worker.heartbeat_failed`, `worker.lease_expired`, `worker.complete_report_*`)
 -- see "Why the network-failure sites are not forwarded" below for why those
 are deliberately left alone.
 
 ## The gap
 
-`design/structured-logs.md` shipped structured, linkable server-side events,
+`design/implemented/structured-logs.md` shipped structured, linkable server-side events,
 but said at the top: "Workers log to their own journal; what the server learns
 from them is recorded here." That was accurate at the time -- a worker's own
 `tracing::warn!`/`error!` sites (in `aurcache-worker-core/src/runner.rs`,

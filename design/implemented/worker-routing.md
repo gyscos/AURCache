@@ -1,6 +1,6 @@
 # Design: Worker Affinity and Priority Routing
 
-Status: **Proposed** · Last updated: 2026-08-23
+Status: **Implemented** · Last updated: 2026-09-22
 
 Extends [`remote-workers.md`](remote-workers.md). That design routes jobs by
 architecture only: `claim_job` prefers native arches and reserves a foreign arch
@@ -521,7 +521,7 @@ worker restarted"* and the first row fails too: **revocation would hold only
 until the machine reboots**, while still appearing to work at the time it was
 clicked.
 
-> **Proposed:** narrow the gate to `status == PENDING`. Auto-approval answers
+> **Implemented:** narrow the gate to `status == PENDING` (`eval_auto_approve`). Auto-approval answers
 > "should I trust a machine I have never seen?"; it must never answer "should I
 > re-trust a machine an operator explicitly denied?". A returning retired machine then re-registers, refreshes
 > `last_seen`, and waits as `revoked` until someone clicks Approve — one click,
@@ -726,7 +726,7 @@ Implemented (2026-08-24):
   the worker image (for `ssh-keygen`) and to the base chroot package set (for
   `git+ssh` fetches, which `base-devel` alone cannot do).
 
-Not yet implemented: user-facing docs (step 7).
+User-facing docs (step 7) are in `docs/docs/workers/routing.md`.
 
 **Step 6 is validated end-to-end** by `scripts/test-e2e-ssh.sh`, which stands up
 a throwaway git server, authorises a per-run keypair, and builds a fixture whose

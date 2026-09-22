@@ -1,6 +1,6 @@
 # Review: Configuring workers from the server
 
-Review of [`design/worker-configuration.md`](worker-configuration.md).
+Review of [`design/in-progress/worker-configuration.md`](worker-configuration.md).
 
 ## Summary and Verdict
 
@@ -269,14 +269,14 @@ a few missing keys and edge cases:
 | `WORKER_CHROOT_OVERLAY` (`chroot_mode`) | *Unlisted* | **No (Machine fact)** | Determined by filesystem capabilities (e.g. btrfs snapshotting vs ext4 rsync). Forcing overlay mode from the server on unsupported filesystems will cause builds to fail. |
 | `WORKER_HEARTBEAT_INTERVAL`, `LEASE_TTL` | *Unlisted* | **No (Protocol bootstrap)** | Must match server's internal `lease_ttl_secs()` and `liveness_timeout_secs()`. Asymmetry between worker and server leads to premature build reaping or zombie builds. |
 | `WORKER_POLL_INTERVAL` | *Unlisted* | **Yes (Policy/tuning)** | Safe claim backoff interval. Server may tune this to reduce idle claim load. |
-| `mirrorlist` | Listed as policy | **Needs clarification** | `design/mirrorlist-configuration.md` already implements dynamic per-arch mirrorlists delivered per build. A single worker-level mirrorlist string in `WorkerSetting` conflicts with multi-arch workers (`x86_64` + `aarch64`). Recommend relying on the existing mirrorlist system instead. |
+| `mirrorlist` | Listed as policy | **Needs clarification** | `design/implemented/mirrorlist-configuration.md` already implements dynamic per-arch mirrorlists delivered per build. A single worker-level mirrorlist string in `WorkerSetting` conflicts with multi-arch workers (`x86_64` + `aarch64`). Recommend relying on the existing mirrorlist system instead. |
 
 ---
 
 ## Evaluation of Open Questions
 
 ### 1. Package Affinity from the Server
-> *"`WORKER_PACKAGES` is policy, but `design/worker-routing.md` chose worker-declared affinity deliberately: the capability (a key, a toolchain) is on the machine. Should the server be allowed to add a package to a worker's list, or only to show it?"*
+> *"`WORKER_PACKAGES` is policy, but `design/implemented/worker-routing.md` chose worker-declared affinity deliberately: the capability (a key, a toolchain) is on the machine. Should the server be allowed to add a package to a worker's list, or only to show it?"*
 
 **Recommendation:** Allow the server to set affinity per-worker, but **exclude `packages` from fleet defaults**.
 - **Why exclude from fleet defaults:** If `packages` were set in fleet defaults, every worker

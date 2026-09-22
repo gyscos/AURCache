@@ -175,7 +175,7 @@ is 300 adds, each paying:
 
 That is roughly **900–1000 RPC requests to seed 300 packages** — a quarter of
 the 4000/day budget in one sitting, before the instance has built anything.
-The same shape applies to restoring a dump (`design/db-export.md`), which
+The same shape applies to restoring a dump (`design/implemented/db-export.md`), which
 replays adds.
 
 Of those ~1000 requests, ~98% are `/info` name lookups that a warm index

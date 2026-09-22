@@ -1,6 +1,6 @@
 # Design: Capping the build-log view
 
-Status: **Planned** · Last updated: 2026-09-13
+Status: **Implemented** · Last updated: 2026-09-22
 
 On mobile Chrome the build page for a log that decompresses to ~40 MB dies with
 "Aw, Snap!" — the renderer process is killed. The transfer isn't the problem

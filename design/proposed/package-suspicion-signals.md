@@ -14,7 +14,7 @@ tools cannot both reach:
 Both are counters and rule hits, never verdicts and never gates. They surface as
 a persisted JSON blob on the build row and a chip in the UI, and they **fail no
 build and publish no gate by default** — the same "report is observation, not
-interruption" posture as `design/sandbox-attempt-awareness.md`.
+interruption" posture as `design/proposed/sandbox-attempt-awareness.md`.
 
 Status: **Proposed** · Last updated: 2026-09-15
 

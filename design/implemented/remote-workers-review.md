@@ -3,7 +3,7 @@
 Scope: commits `28ff601` (Phase 1: DB changes) through `42c29c0` (Address
 review comments) on `feature/abury/rewote-worker`, diffed against `4c4d672`
 (base, before Phase 1). ~7,300 lines changed across 92 files, implementing the
-architecture described in `design/remote-workers.md`.
+architecture described in `design/implemented/remote-workers.md`.
 
 This document records concrete, high-confidence issues found during review:
 bugs, race conditions, resource leaks, and simplification opportunities.

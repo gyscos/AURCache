@@ -1,3 +1,7 @@
+# Design: Dashboard layout
+
+Status: **Implemented** · Last updated: 2026-09-22
+
 ## Goal
 Give the dashboard a glanceable, action-oriented layout that answers "is the instance healthy and what happened lately?" without leaving the page, while keeping the existing `StatTiles` and `Builds per month` chart that already work.
 

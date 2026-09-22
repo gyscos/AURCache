@@ -1,6 +1,6 @@
 # Design: Aborting a running build
 
-Status: **Planned** · Last updated: 2026-09-11
+Status: **Implemented** · Last updated: 2026-09-22
 
 Extends [`remote-workers.md`](remote-workers.md). The worker is pull-only; it
 connects out to the server and the server never reaches into a worker. This

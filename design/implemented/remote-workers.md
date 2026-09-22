@@ -1,6 +1,6 @@
 # Design: Remote Build Workers
 
-Status: **Proposed** · Last updated: 2026-08-18
+Status: **Implemented** · Last updated: 2026-09-22
 
 ## Summary
 
