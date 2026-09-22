@@ -292,6 +292,30 @@ pub enum Event {
         error: String,
     },
 
+    /// A worker noticed something worth a look, and recovered from it: a build
+    /// it could not run the intended way but got through some other way, or
+    /// maintenance it could not finish cleanly.
+    ///
+    /// `build` is absent for a report that is not about any one job -- chroot
+    /// or cache maintenance runs independently of any single build.
+    #[serde(rename = "worker.warning")]
+    WorkerWarning {
+        worker: WorkerRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<BuildRef>,
+        message: String,
+    },
+
+    /// As [`Self::WorkerWarning`], for something the worker could not recover
+    /// from.
+    #[serde(rename = "worker.error")]
+    WorkerError {
+        worker: WorkerRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<BuildRef>,
+        message: String,
+    },
+
     // -----------------------------------------------------------------------
     // Builds
     // -----------------------------------------------------------------------
@@ -765,6 +789,16 @@ pub const KINDS: &[Kind] = &[
         label: "Worker report not stored",
     },
     Kind {
+        kind: "worker.warning",
+        group: "Workers",
+        label: "Worker warning",
+    },
+    Kind {
+        kind: "worker.error",
+        group: "Workers",
+        label: "Worker error",
+    },
+    Kind {
         kind: "setting.changed",
         group: "Settings and access",
         label: "Setting changed",
@@ -1048,6 +1082,8 @@ impl Event {
             Self::WorkerReaped { .. } => "worker.reaped",
             Self::WorkerSettingRejected { .. } => "worker.setting_rejected",
             Self::WorkerReportFailed { .. } => "worker.report_failed",
+            Self::WorkerWarning { .. } => "worker.warning",
+            Self::WorkerError { .. } => "worker.error",
             Self::BuildStarted { .. } => "build.started",
             Self::BuildSucceeded { .. } => "build.succeeded",
             Self::WorkerRegistered { .. } => "worker.registered",
@@ -1133,6 +1169,7 @@ impl Event {
             | Self::WorkerReaped { .. }
             | Self::WorkerSettingRejected { .. }
             | Self::WorkerReportFailed { .. }
+            | Self::WorkerWarning { .. }
             | Self::BuildFailed { .. }
             | Self::BuildCompletionRejected { .. }
             | Self::BuildRecordFailed { .. }
@@ -1156,7 +1193,8 @@ impl Event {
             | Self::PublishFailed { .. }
             | Self::StartupEnqueueFailed { .. }
             | Self::OperationAborted { .. }
-            | Self::RepoFileFailed { .. } => Severity::Error,
+            | Self::RepoFileFailed { .. }
+            | Self::WorkerError { .. } => Severity::Error,
         }
     }
 
@@ -1364,6 +1402,25 @@ impl Event {
                 entity(worker),
                 text(format!(": {error}")),
             ],
+            Self::WorkerWarning {
+                worker,
+                build,
+                message,
+            }
+            | Self::WorkerError {
+                worker,
+                build,
+                message,
+            } => {
+                let mut out = vec![entity(worker)];
+                if let Some(build) = build {
+                    out.push(text(" ("));
+                    out.push(entity(build));
+                    out.push(text(")"));
+                }
+                out.push(text(format!(": {message}")));
+                out
+            }
             Self::BuildStarted { build, worker } => {
                 vec![entity(worker), text(" picked up "), entity(build)]
             }
@@ -1683,6 +1740,16 @@ mod tests {
                 worker: worker(),
                 report: WorkerReport::Configuration,
                 error: error(),
+            },
+            Event::WorkerWarning {
+                worker: worker(),
+                build: Some(build()),
+                message: "retrying cold after a spawn failure".to_string(),
+            },
+            Event::WorkerError {
+                worker: worker(),
+                build: None,
+                message: "chroot refresh returned non-zero".to_string(),
             },
             Event::BuildStarted {
                 build: build(),

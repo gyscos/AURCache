@@ -35,7 +35,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     );
     chroots.detect().await;
     chroots
-        .refresh(&pacman_conf)
+        .refresh(&pacman_conf, None)
         .await
         .context("preparing base chroot")?;
     let cache = Cache::new(

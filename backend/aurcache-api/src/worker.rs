@@ -13,6 +13,7 @@ use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, WorkerReport};
 use aurcache_ca::Ca;
+use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
@@ -21,7 +22,7 @@ use aurcache_common::builder::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
-    MirrorlistPreference, RegisterRequest, RegisterStatus,
+    MirrorlistPreference, RegisterRequest, RegisterStatus, WorkerLogReport,
 };
 use aurcache_common::worker_config::{EffectiveConfig, SettingStatus};
 use aurcache_db::helpers::time::now_secs;
@@ -247,6 +248,7 @@ pub fn worker_protocol_routes() -> Vec<rocket::Route> {
         claim_job,
         job_source,
         job_logs,
+        worker_log,
         job_artifact,
         complete_job,
         heartbeat,
@@ -648,6 +650,58 @@ pub async fn job_logs(
     append_build_output(&pkgbase, build.number, &text)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    Ok(())
+}
+
+/// A problem a worker noticed on its own account -- not a protocol failure
+/// the server already tracks (a lost claim, a missed heartbeat: the server
+/// finds those out for itself, from the same silence that would swallow a
+/// report about them), but something local: a build that needed a fallback to
+/// finish, or maintenance that could not complete cleanly.
+///
+/// `Severity::Info` is not expected on this channel and is filed as a warning
+/// rather than refused, so an older or misconfigured worker cannot fail a
+/// build over what is, at worst, a noisy log line.
+#[post("/worker/log", data = "<input>")]
+pub async fn worker_log(
+    db: &State<DatabaseConnection>,
+    al: &State<ActivityLog>,
+    auth: WorkerAuth,
+    input: Json<WorkerLogReport>,
+) -> Result<(), ApiError> {
+    let db = db.inner();
+    let input = input.into_inner();
+    let worker = WorkerRef::from(auth.worker.name.as_str());
+
+    // Ownership only, not `assert_owned_active`: the report is a comment on
+    // the build, not a claim on its state, and one can arrive just after the
+    // build's terminal state lands (cleanup, an upload still finishing).
+    let build = match input.build_id {
+        Some(build_id) => {
+            let build = worker_complete::assert_owned(db, auth.worker.id, build_id)
+                .await
+                .map_err(|e| err(Status::Forbidden, e))?;
+            let pkgbase = build_pkgbase(db, build.pkg_id).await?;
+            Some(BuildRef {
+                pkgbase,
+                number: build.number,
+            })
+        }
+        None => None,
+    };
+
+    al.emit(match input.severity {
+        Severity::Error => Event::WorkerError {
+            worker,
+            build,
+            message: input.message,
+        },
+        Severity::Warning | Severity::Info => Event::WorkerWarning {
+            worker,
+            build,
+            message: input.message,
+        },
+    });
     Ok(())
 }
 

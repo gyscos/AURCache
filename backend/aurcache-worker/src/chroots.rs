@@ -17,6 +17,8 @@
 
 use crate::chroot;
 use anyhow::{Context, Result, bail};
+use aurcache_worker_core::client::WorkerClient;
+use aurcache_worker_core::protocol::report_warning;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,9 +496,17 @@ impl Chroots {
     ///
     /// A chroot that does not exist yet is always made, whatever the interval
     /// says -- there is nothing to be stale.
-    pub async fn refresh(&self, pacman_conf: &Path) -> Result<PathBuf> {
+    ///
+    /// `report_to` names who to tell about a problem preparing the chroot, and
+    /// the build to file it under -- `None` for `build-once`, which has
+    /// neither a server nor a build id.
+    pub async fn refresh(
+        &self,
+        pacman_conf: &Path,
+        report_to: Option<(&WorkerClient, i32)>,
+    ) -> Result<PathBuf> {
         if matches!(self.strategy(), Strategy::Overlay) {
-            return self.refresh_by_layer(pacman_conf).await;
+            return self.refresh_by_layer(pacman_conf, report_to).await;
         }
         let root = self.dir.join("root");
         let mut last = self.last_refresh.lock().await;
@@ -514,7 +524,8 @@ impl Chroots {
         if root.exists() {
             match chroot::try_lock_base(&root).await {
                 chroot::BaseLock::Held(lock) => {
-                    let root = chroot::ensure_base_chroot(&self.dir, pacman_conf).await?;
+                    let root =
+                        chroot::ensure_base_chroot(&self.dir, pacman_conf, report_to).await?;
                     drop(lock);
                     *last = Some(Instant::now());
                     return Ok(root);
@@ -528,7 +539,7 @@ impl Chroots {
                 chroot::BaseLock::Unavailable => {}
             }
         }
-        let root = chroot::ensure_base_chroot(&self.dir, pacman_conf).await?;
+        let root = chroot::ensure_base_chroot(&self.dir, pacman_conf, report_to).await?;
         *last = Some(Instant::now());
         Ok(root)
     }
@@ -642,7 +653,11 @@ impl Chroots {
     /// refresh there is no lock to take and nothing to wait for -- a busy
     /// worker refreshes on schedule rather than never. See
     /// `design/overlay-chroot.md`.
-    async fn refresh_by_layer(&self, pacman_conf: &Path) -> Result<PathBuf> {
+    async fn refresh_by_layer(
+        &self,
+        pacman_conf: &Path,
+        report_to: Option<(&WorkerClient, i32)>,
+    ) -> Result<PathBuf> {
         let root = chroot::create_base_chroot(&self.dir, pacman_conf).await?;
         // Before anything else, and whether or not a refresh is due. A worker
         // at the hard cap has stopped stacking and needs this more than it
@@ -677,7 +692,7 @@ impl Chroots {
             Plan::NotDue => tracing::debug!("base chroot is current; leaving it alone"),
             Plan::InPlace => {
                 let updated = if published.is_empty() {
-                    chroot::ensure_base_chroot(&self.dir, pacman_conf)
+                    chroot::ensure_base_chroot(&self.dir, pacman_conf, report_to)
                         .await
                         .map(|_| ())
                 } else {
@@ -696,7 +711,17 @@ impl Chroots {
                         );
                         *last = Some(Instant::now());
                     }
-                    Err(e) => tracing::warn!("could not update the chroot in place: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("could not update the chroot in place: {e:#}");
+                        if let Some((client, build_id)) = report_to {
+                            report_warning(
+                                client,
+                                Some(build_id),
+                                &format!("could not update the chroot in place: {e:#}"),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Plan::NewLayer => {
@@ -705,7 +730,17 @@ impl Chroots {
                     // Stamped only on success, so a failure is retried by the
                     // next build rather than waiting out the interval.
                     Ok(()) => *last = Some(Instant::now()),
-                    Err(e) => tracing::warn!("could not update the chroot: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("could not update the chroot: {e:#}");
+                        if let Some((client, build_id)) = report_to {
+                            report_warning(
+                                client,
+                                Some(build_id),
+                                &format!("could not update the chroot: {e:#}"),
+                            )
+                            .await;
+                        }
+                    }
                 }
                 drop(last);
                 self.flatten_when_deep(&root).await;

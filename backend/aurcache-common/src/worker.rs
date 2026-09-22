@@ -271,6 +271,24 @@ pub struct JobStatus {
     pub cancel_requested: bool,
 }
 
+/// A problem the worker noticed on its own account, sent best-effort alongside
+/// whatever it already wrote to its own journal.
+///
+/// Free text rather than a kind of its own: the worker's call sites are not a
+/// catalogue the server can be expected to keep in step with release for
+/// release, so the server files every one under one of two kinds
+/// (`worker.warning`, `worker.error`) and keeps this as the sentence.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+pub struct WorkerLogReport {
+    pub severity: crate::api::activity::Severity,
+    /// The build this happened during, when there is one -- absent for
+    /// something that is not about any single job, such as chroot or cache
+    /// maintenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<i32>,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

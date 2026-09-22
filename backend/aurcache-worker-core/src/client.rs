@@ -9,9 +9,10 @@
 //!   for all job endpoints.
 
 use anyhow::{Context, Result, bail};
+use aurcache_common::api::activity::Severity;
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
-    RegisterRequest, RegisterStatus,
+    RegisterRequest, RegisterStatus, WorkerLogReport,
 };
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{Body, Certificate, Client, Identity, StatusCode};
@@ -280,6 +281,33 @@ impl WorkerClient {
             .context("log request")?
             .error_for_status()
             .context("log rejected")?;
+        Ok(())
+    }
+
+    /// Report a problem the worker noticed on its own account -- not sent for
+    /// a protocol failure the server already finds out about from the same
+    /// silence that would swallow this too (a lost claim, a missed
+    /// heartbeat), but for something local the server otherwise never learns:
+    /// a build that needed a fallback to finish, or maintenance that could
+    /// not complete cleanly.
+    pub async fn report_problem(
+        &self,
+        severity: Severity,
+        build_id: Option<i32>,
+        message: &str,
+    ) -> Result<()> {
+        self.http
+            .post(self.url("/log"))
+            .json(&WorkerLogReport {
+                severity,
+                build_id,
+                message: message.to_string(),
+            })
+            .send()
+            .await
+            .context("worker log request")?
+            .error_for_status()
+            .context("worker log rejected")?;
         Ok(())
     }
 

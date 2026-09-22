@@ -37,6 +37,29 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
     Ok(build)
 }
 
+/// As [`assert_owned_active`], without requiring the build still be `ACTIVE`.
+///
+/// For reports that are not a claim on the build's state, only a comment
+/// about it: a worker's problem report can arrive just after the build's
+/// terminal state lands (cleanup, an upload still finishing), and discarding
+/// it there would lose exactly the report an operator most wants to see.
+pub async fn assert_owned<C: ConnectionTrait>(
+    db: &C,
+    worker_id: i32,
+    build_id: i32,
+) -> Result<builds::Model, DbErr> {
+    let build = Builds::find_by_id(build_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
+    if build.worker_id != Some(worker_id) {
+        return Err(DbErr::Custom(format!(
+            "build {build_id} is not owned by worker {worker_id}"
+        )));
+    }
+    Ok(build)
+}
+
 /// The ownership half of [`assert_owned_active`], for callers that already
 /// hold the row: completions fetch the build first for their idempotency
 /// checks, and re-querying it here would pay a second point lookup on the

@@ -3,6 +3,8 @@
 //! the pure argument/parse helpers they rely on live in [`crate::build`].
 
 use anyhow::{Context, Result, bail};
+use aurcache_worker_core::client::WorkerClient;
+use aurcache_worker_core::protocol::report_warning;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -62,7 +64,15 @@ pub fn devtools(program: &str) -> Command {
 /// change -- but `arch-nspawn`, which is how the chroot gets updated, takes no
 /// lock at all, so devtools' care only ever covered devtools' own writers.
 /// [`crate::chroots::Chroots::refresh`] is what decides that here.
-pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
+///
+/// `report_to` names who to tell about a refresh problem, and the build to
+/// file it under -- `None` for `build-once`, which runs this same machinery
+/// with no server and no build id to name.
+pub async fn ensure_base_chroot(
+    chroot_dir: &Path,
+    pacman_conf: &Path,
+    report_to: Option<(&WorkerClient, i32)>,
+) -> Result<PathBuf> {
     // Serialize base-chroot creation/refresh: concurrent jobs must not race to
     // build or `-Syu` the same shared root.
     let _guard = BASE_CHROOT_LOCK.lock().await;
@@ -76,6 +86,14 @@ pub async fn ensure_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result
             && !status.success()
         {
             tracing::warn!("chroot refresh returned non-zero:\n{log}");
+            if let Some((client, build_id)) = report_to {
+                report_warning(
+                    client,
+                    Some(build_id),
+                    &format!("chroot refresh returned non-zero:\n{log}"),
+                )
+                .await;
+            }
         }
         // Existing chroots too: this arrived after the first ones were built,
         // and a chroot is long-lived.

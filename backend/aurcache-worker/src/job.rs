@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use aurcache_worker_core::client::WorkerClient;
-use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};
+use aurcache_worker_core::protocol::{log, remote_cancel, report_warning, upload_artifacts};
 use aurcache_worker_core::{artifacts, report};
 
 use crate::build;
@@ -219,7 +219,7 @@ async fn run_job_inner(
     log(client, build_id, "[worker] preparing chroot\n").await;
     shared
         .chroots
-        .refresh(&pacman_conf)
+        .refresh(&pacman_conf, Some((client, build_id)))
         .await
         .context("preparing base chroot")?;
 
@@ -294,11 +294,13 @@ async fn run_job_inner(
         if let Some(dir) = cache.builddir(&job.arch) {
             binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
         } else {
-            tracing::warn!(
+            let msg = format!(
                 "{} asked for a persistent build directory but one could not be \
                  prepared; building in the chroot's own /build instead",
                 job.pkgbase
             );
+            tracing::warn!("{msg}");
+            report_warning(client, Some(build_id), &msg).await;
         }
     }
     // The ssh-agent socket, so a PKGBUILD that fetches from a private
@@ -355,6 +357,12 @@ async fn run_job_inner(
             // artifacts), but record the promotions as unverified so the next
             // reconcile re-hashes them instead of trusting them.
             tracing::warn!(error = %e, "promoting without a repository DB to validate against");
+            report_warning(
+                client,
+                Some(build_id),
+                &format!("promoting without a repository DB to validate against: {e}"),
+            )
+            .await;
             None
         }
     };
@@ -641,6 +649,12 @@ async fn run_build(
             // retry once cold.
             cache.wipe_srcdest(&job.pkgbase);
             tracing::warn!("build spawn failed ({e}); retrying cold");
+            report_warning(
+                client,
+                Some(build_id),
+                &format!("build spawn failed ({e}); retrying cold"),
+            )
+            .await;
             spawn(&argv).context("spawning build")?
         }
     };
@@ -710,10 +724,12 @@ async fn run_build(
                         match cg.kill() {
                             Ok(()) => true,
                             Err(e) => {
-                                tracing::warn!(
+                                let msg = format!(
                                     "cgroup.kill failed for build {build_id}: {e:#}; \
                                      falling back to the process group"
                                 );
+                                tracing::warn!("{msg}");
+                                report_warning(client, Some(build_id), &msg).await;
                                 false
                             }
                         }
@@ -721,10 +737,12 @@ async fn run_build(
                         false
                     };
                     if !killed && let Err(e) = kill_process_group(&mut child).await {
-                        tracing::warn!(
+                        let msg = format!(
                             "process-group kill failed for build {build_id}: {e}; \
                              falling back to start_kill"
                         );
+                        tracing::warn!("{msg}");
+                        report_warning(client, Some(build_id), &msg).await;
                         let _ = child.start_kill();
                     }
                     let status = child.wait().await.context("awaiting killed build")?;

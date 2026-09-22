@@ -2,6 +2,7 @@
 //! observing a remote cancel request, and uploading the results.
 
 use anyhow::{Context, Result};
+use aurcache_common::api::activity::Severity;
 use std::path::Path;
 
 use crate::artifacts;
@@ -15,6 +16,29 @@ use crate::client::WorkerClient;
 pub async fn log(client: &WorkerClient, build_id: i32, text: &str) {
     if let Err(e) = client.append_log(build_id, text).await {
         tracing::debug!("log append failed: {e}");
+    }
+}
+
+/// Tell the server about a problem, same best-effort delivery as [`log`]: this
+/// is what lets it show up on the Logs page and the worker's own page instead
+/// of only in this process's own journal, but it is never worth failing a
+/// build over losing one.
+pub async fn report_warning(client: &WorkerClient, build_id: Option<i32>, message: &str) {
+    if let Err(e) = client
+        .report_problem(Severity::Warning, build_id, message)
+        .await
+    {
+        tracing::debug!("worker warning report failed: {e}");
+    }
+}
+
+/// As [`report_warning`], for something the worker could not recover from.
+pub async fn report_error(client: &WorkerClient, build_id: Option<i32>, message: &str) {
+    if let Err(e) = client
+        .report_problem(Severity::Error, build_id, message)
+        .await
+    {
+        tracing::debug!("worker error report failed: {e}");
     }
 }
 
