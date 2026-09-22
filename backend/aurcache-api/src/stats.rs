@@ -354,7 +354,7 @@ const DASHBOARD_LIMIT: u64 = 5;
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Dashboard slices for the landing page", body = [DashboardView]),
+            (status = 200, description = "Dashboard slices for the landing page", body = DashboardView),
     )
 )]
 #[get("/stats/dashboard")]
@@ -428,8 +428,16 @@ async fn failed_packages(db: &DatabaseConnection) -> anyhow::Result<Vec<SimplePa
 }
 
 async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateSlice> {
+    // Matches what the rest of the UI calls "out of date": a package whose
+    // last build succeeded but that upstream has moved past
+    // (`StatusFilter::matches` on the frontend). `out_of_date` is only ever
+    // cleared on a successful build (`worker_complete.rs`, `publish.rs`), not
+    // on a failed one, so a package whose rebuild attempt just failed can
+    // still carry the flag -- that package belongs on the Failed card, whose
+    // "View all" this card's link would otherwise fail to reproduce.
     let outdated: Vec<SimplePackage> = package_row_select()
         .filter(packages::Column::OutOfDate.ne(0))
+        .filter(packages::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
         .order_by(packages::Column::Id, Order::Desc)
         .into_model::<SimplePackage>()
         .all(db)
@@ -442,12 +450,22 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     }
     let pkg_ids: Vec<i32> = outdated.iter().map(|pkg| pkg.id).collect();
 
-    let auto: Vec<bool> =
-        ApplicationSettings::get_many::<bool>(Setting::BuildOnNewVersion, &pkg_ids, db)
-            .await?
-            .into_iter()
-            .map(|entry| entry.value)
-            .collect();
+    // Both auto-rebuild paths -- the version checker's immediate rebuild and
+    // the scheduled auto-update job -- call `package_update_all_outdated`,
+    // which reads these two settings globally, never per package, and skips
+    // any package whose last build did not succeed (it "stays flagged for a
+    // human", `update.rs`). A per-package override is never consulted by
+    // either job, so resolving it here would disagree with what the server
+    // actually does.
+    let (build_on_new_version, auto_update_interval) = tokio::join!(
+        ApplicationSettings::get::<bool>(Setting::BuildOnNewVersion, None, db),
+        ApplicationSettings::get::<Option<String>>(Setting::AutoUpdateInterval, None, db),
+    );
+    // Whether the cron string itself parses is not re-checked here: an
+    // invalid one already surfaces as a `ScheduleInvalid` warning, which the
+    // Recent problems card shows.
+    let auto_rebuild_configured =
+        build_on_new_version.value || auto_update_interval.value.is_some();
 
     let active: HashSet<i32> = if pkg_ids.is_empty() {
         HashSet::new()
@@ -472,8 +490,12 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
 
     let mut needs_hand = Vec::new();
     let mut handled = 0u64;
-    for (pkg, auto_on) in outdated.into_iter().zip(auto) {
-        if !auto_on && !active.contains(&pkg.id) {
+    for pkg in outdated {
+        // Every row here already has a successful last build (the query
+        // above), so whether either auto-rebuild job will pick it up comes
+        // down to the settings alone -- unless one already has, which the
+        // active-build check catches.
+        if !auto_rebuild_configured && !active.contains(&pkg.id) {
             if needs_hand.len() < DASHBOARD_LIMIT as usize {
                 needs_hand.push(pkg);
             }
@@ -521,7 +543,14 @@ async fn problem_entries(db: &DatabaseConnection) -> anyhow::Result<Vec<LogEntry
 }
 
 async fn largest_packages(db: &DatabaseConnection) -> anyhow::Result<Vec<SimplePackage>> {
+    // `total_artifact_size_expr()` is NULL for a package with no files or an
+    // unknown size -- "nothing recorded", not "zero bytes" (see the size
+    // convention in the crate docs). Excluded rather than sorted: SQLite puts
+    // NULL last in `DESC`, Postgres puts it first, so leaving it in would fill
+    // this card with unbuilt packages ahead of the real largest ones on one
+    // of the two backends.
     Ok(package_row_select()
+        .filter(total_artifact_size_expr().is_not_null())
         .order_by(total_artifact_size_expr(), Order::Desc)
         .limit(DASHBOARD_LIMIT)
         .into_model::<SimplePackage>()
@@ -631,7 +660,7 @@ mod tests {
     use aurcache_db::helpers::time::now_secs;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::{self, SourceData};
-    use aurcache_db::{builds, logs};
+    use aurcache_db::{builds, files, logs};
     use aurcache_utils::settings::general::SettingsTraits;
     use pacman_mirrors::platforms::Platform;
     use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
@@ -798,39 +827,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_date_splits_on_setting_and_queued_build() {
+    async fn out_of_date_splits_on_global_setting_and_queued_build() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
         let pkg_a = insert_package(&db, "needs-hand", 1, true).await;
-        insert_package(&db, "auto-rebuild", 1, true).await;
         let pkg_c = insert_package(&db, "queued-anyway", 1, true).await;
-
-        // Global on, with per-package overrides off for A and C: the override
-        // wins over the global, so A and C resolve off and B resolves on.
-        ApplicationSettings::patch(
-            &db,
-            [(Setting::BuildOnNewVersion, None, Some("true".to_string()))],
-        )
-        .await
-        .unwrap();
-        ApplicationSettings::patch(
-            &db,
-            [
-                (
-                    Setting::BuildOnNewVersion,
-                    Some(pkg_a),
-                    Some("false".to_string()),
-                ),
-                (
-                    Setting::BuildOnNewVersion,
-                    Some(pkg_c),
-                    Some("false".to_string()),
-                ),
-            ],
-        )
-        .await
-        .unwrap();
         insert_build(
             &db,
             pkg_c,
@@ -841,12 +843,111 @@ mod tests {
         )
         .await;
 
+        // Auto-rebuild off globally: A needs a hand, C is handled by its
+        // queued build regardless of the setting.
         let slice = out_of_date_slice(&db).await.unwrap();
         assert_eq!(slice.needs_hand.len(), 1);
         assert_eq!(slice.needs_hand[0].name, "needs-hand");
-        // B rebuilds on its own via the global setting, C via its queued
-        // build despite resolving off.
+        assert_eq!(slice.handled, 1);
+
+        // A per-package override does not change anything: neither
+        // auto-rebuild job (`update_version_check.rs`, `auto_update.rs`)
+        // consults one, only the global value, so this dashboard card must
+        // not either -- an override here would show A as handled while
+        // nothing actually rebuilds it.
+        ApplicationSettings::patch(
+            &db,
+            [(
+                Setting::BuildOnNewVersion,
+                Some(pkg_a),
+                Some("true".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let slice = out_of_date_slice(&db).await.unwrap();
+        assert_eq!(slice.needs_hand.len(), 1);
+        assert_eq!(slice.handled, 1);
+
+        // Global on: A is handled too.
+        ApplicationSettings::patch(
+            &db,
+            [(Setting::BuildOnNewVersion, None, Some("true".to_string()))],
+        )
+        .await
+        .unwrap();
+        let slice = out_of_date_slice(&db).await.unwrap();
+        assert_eq!(slice.needs_hand.len(), 0);
         assert_eq!(slice.handled, 2);
+    }
+
+    /// A package whose rebuild attempt just failed still carries the
+    /// out-of-date flag (`worker_complete.rs`/`publish.rs` only clear it on
+    /// success), but it belongs on the Failed card: the frontend's own
+    /// out-of-date badge only ever describes a successful build that upstream
+    /// has moved past, and this card's "View all" link relies on the same
+    /// rule to show the packages it counted.
+    #[tokio::test]
+    async fn out_of_date_excludes_a_failed_build() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        packages::ActiveModel {
+            name: Set("stale-and-broken".to_string()),
+            status: Set(BuildStates::FAILED_BUILD),
+            out_of_date: Set(1),
+            upstream_version: Set(Some("1.0-1".to_string())),
+            latest_build: Set(None),
+            build_flags: Set(String::new()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(packages::SourceType::Aur),
+            source_data: Set(SourceData::Aur {
+                name: "stale-and-broken".to_string(),
+            }),
+            directly_requested: Set(true),
+            split_packages: Set(None),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert package");
+
+        let slice = out_of_date_slice(&db).await.unwrap();
+        assert!(slice.needs_hand.is_empty());
+        assert_eq!(slice.handled, 0);
+    }
+
+    /// A package with no files sums to a NULL size (`total_artifact_size_expr`,
+    /// `SUM` over zero rows), and SQLite and Postgres disagree on where NULL
+    /// sorts in `ORDER BY … DESC` -- last on one, first on the other. The card
+    /// excludes those rows rather than relying on the sort to place them
+    /// correctly on both.
+    #[tokio::test]
+    async fn largest_excludes_a_package_with_no_recorded_size() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        let sized = insert_package(&db, "has-files", 0, true).await;
+        insert_package(&db, "no-files", 0, true).await;
+        files::ActiveModel {
+            filename: Set("has-files-1.0-1-x86_64.pkg.tar.zst".to_string()),
+            platform: Set(Platform::X86_64),
+            package_id: Set(sized),
+            size: Set(Some(1024)),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert file");
+
+        let largest = largest_packages(&db).await.unwrap();
+        assert_eq!(
+            largest
+                .iter()
+                .map(|pkg| pkg.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["has-files"]
+        );
     }
 
     #[tokio::test]

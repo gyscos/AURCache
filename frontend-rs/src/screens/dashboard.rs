@@ -166,10 +166,15 @@ fn Card(title: String, to: Route, children: Element) -> Element {
 
 /// A healthy attention card, collapsed to one line: a success-toned check
 /// and what is not happening.
+///
+/// `self-start`: a grid row stretches every item to the tallest one by
+/// default, and this card's neighbour is often the full-height kind -- without
+/// it, "collapsed" would still occupy the row's whole height, just with empty
+/// padding below the line.
 #[component]
 fn CollapsedCard(text: String) -> Element {
     rsx! {
-        div { class: "card bg-base-100 shadow-xl",
+        div { class: "card bg-base-100 shadow-xl self-start",
             div { class: "card-body py-3 flex-row items-center gap-2",
                 span { class: "text-success font-bold", "✓" }
                 span { class: "text-sm", "{text}" }

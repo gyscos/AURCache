@@ -1707,10 +1707,18 @@ impl ViewParams {
     }
 
     /// A view filtered to one status and nothing else, for links into a list.
+    ///
+    /// `dependencies: true`: ignored by the Builds list, which has no such
+    /// toggle, but load-bearing for the Packages list -- a dashboard card can
+    /// include a dependency package (a failed build blocks its parent
+    /// regardless of who asked for it), and the link this builds has to show
+    /// the same rows the card counted, or "View all" lands on a list missing
+    /// the very package that sent the reader there.
     #[must_use]
     pub fn with_status(status: BuildState) -> Self {
         Self {
             status: Some(StatusFilter::with_state(status)),
+            dependencies: true,
             ..Self::default()
         }
     }
@@ -1726,10 +1734,14 @@ impl ViewParams {
     }
 
     /// A view filtered to out-of-date packages and nothing else.
+    ///
+    /// `dependencies: true`, for the same reason as [`Self::with_status`]: a
+    /// dependency package can be out of date too.
     #[must_use]
     pub fn with_out_of_date() -> Self {
         Self {
             status: Some(StatusFilter::OUTDATED),
+            dependencies: true,
             ..Self::default()
         }
     }
