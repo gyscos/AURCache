@@ -14,3 +14,5 @@ pub mod commands;
 pub mod config;
 pub mod executor;
 pub mod network;
+/// What this executor declares it can be configured with.
+pub mod settings;

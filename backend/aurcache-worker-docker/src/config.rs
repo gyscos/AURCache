@@ -2,9 +2,13 @@
 //!
 //! These are the pre-worker environment variables, read under their original
 //! names and with their original meanings, because the whole point of this
-//! executor is that an existing deployment keeps behaving as it did.
+//! executor is that an existing deployment keeps behaving as it did. The two
+//! limits are declared settings as well (see [`crate::settings`]), so they can
+//! also be set from the server -- `CPU_LIMIT` still pins, as it always did.
 
-use aurcache_worker_core::config::{CoreConfig, env_opt, env_parse};
+use crate::settings::keys;
+use aurcache_worker_core::config::{CoreConfig, env_opt};
+use aurcache_worker_core::settings::WorkerSettings;
 use std::path::PathBuf;
 
 /// Where a build directory lives, from two points of view.
@@ -56,14 +60,50 @@ impl Config {
                     .join("builds")
             });
 
-        Some(Self {
-            core: CoreConfig::from_env(),
+        let mut core = CoreConfig::from_env();
+        // Declared beside the protocol settings, so registration reports one
+        // table and the limits below read from the values the server is shown.
+        let settings =
+            std::mem::take(&mut core.settings).extended(crate::settings::docker_settings());
+        let mut cfg = Self {
+            core: core.with_settings(settings),
             builder_image: env_opt("BUILDER_IMAGE")
                 .unwrap_or_else(|| DEFAULT_BUILDER_IMAGE.to_string()),
             dirs: BuildDirs { host, local },
-            cpu_limit: env_parse("CPU_LIMIT").unwrap_or(0),
-            memory_limit: env_parse("MEMORY_LIMIT").unwrap_or(-1),
-        })
+            // Filled in from the settings just below, by the same code that
+            // fills them in again whenever the server delivers new values.
+            cpu_limit: 0,
+            memory_limit: 0,
+        };
+        cfg.read_settings();
+        Some(cfg)
+    }
+
+    /// The same configuration with `settings` in force: the protocol's
+    /// declared fields and the two limits read again from them, and nothing
+    /// else touched -- the image and the build directory are the machine's.
+    #[must_use]
+    pub fn with_settings(&self, settings: WorkerSettings) -> Self {
+        let mut cfg = Self {
+            core: self.core.with_settings(settings),
+            ..self.clone()
+        };
+        cfg.read_settings();
+        cfg
+    }
+
+    /// Read the limits from `core.settings`.
+    fn read_settings(&mut self) {
+        let settings = &self.core.settings;
+        // Negative is unlimited for memory, as it always was; the declared
+        // minimum of 0 keeps a negative CPU limit from ever getting here.
+        self.cpu_limit = settings
+            .integer(keys::CPU_LIMIT)
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+        self.memory_limit = settings
+            .integer(keys::MEMORY_LIMIT)
+            .unwrap_or(crate::settings::DEFAULT_MEMORY_LIMIT);
     }
 
     /// Docker's `NanoCpus`, or `None` for unlimited.
@@ -116,6 +156,47 @@ mod tests {
     fn limits_convert_to_docker_units() {
         assert_eq!(cfg(2000, 512).nano_cpus(), Some(2_000_000_000));
         assert_eq!(cfg(2000, 512).memory_bytes(), Some(512 * 1024 * 1024));
+    }
+
+    /// A limit set on the server reaches the next container in Docker's units,
+    /// and removing it goes back to the old default of unlimited.
+    ///
+    /// Reads the process environment, as the worker does, so it asserts nothing
+    /// on a machine that pins either limit -- a pin outranks the server, which
+    /// is the point of one.
+    #[test]
+    fn a_delivered_limit_reaches_the_next_container() {
+        use aurcache_common::worker_config::ConfigSnapshot;
+        let pinned: Vec<_> = ["CPU_LIMIT", "MEMORY_LIMIT"]
+            .into_iter()
+            .filter(|var| std::env::var_os(var).is_some())
+            .collect();
+        if !pinned.is_empty() {
+            eprintln!("skipped: {pinned:?} set in this environment");
+            return;
+        }
+        let snapshot = |pairs: &[(&str, &str)]| ConfigSnapshot {
+            revision: format!("{pairs:?}"),
+            settings: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+        let declared =
+            WorkerSettings::from_env(aurcache_worker_core::settings::protocol_settings())
+                .extended(crate::settings::docker_settings());
+        let base = cfg(0, -1).with_settings(declared);
+
+        let set = base.with_settings(base.core.settings.with_snapshot(&snapshot(&[
+            ("cpu_limit", "1500"),
+            ("memory_limit", "2048"),
+        ])));
+        assert_eq!(set.nano_cpus(), Some(1_500_000_000));
+        assert_eq!(set.memory_bytes(), Some(2048 * 1024 * 1024));
+
+        let removed = set.with_settings(set.core.settings.with_snapshot(&snapshot(&[])));
+        assert_eq!(removed.nano_cpus(), None);
+        assert_eq!(removed.memory_bytes(), None);
     }
 
     /// Absurd operator input saturates instead of overflowing: the old

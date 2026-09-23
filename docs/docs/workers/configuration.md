@@ -262,7 +262,11 @@ but cannot enforce them **refuses every build** and says so at startup, rather
 than running builds without the limits it was given.
 
 The legacy container builder keeps its own `CPU_LIMIT` (milli-CPUs) and
-`MEMORY_LIMIT` (MB).
+`MEMORY_LIMIT` (MB, negative for unlimited). Like the settings above, they are
+listed on the worker's page and can be set there, and read `CPU_LIMIT_DEFAULT`
+and `MEMORY_LIMIT_DEFAULT` as defaults AURCache may override; the plain names
+still pin. Its builder image and build directory are not settable from
+AURCache.
 
 ## Locations
 

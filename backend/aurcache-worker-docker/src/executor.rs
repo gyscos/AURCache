@@ -25,8 +25,8 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::commands;
@@ -45,11 +45,10 @@ const BUILD_USER: &str = "ab";
 
 /// Builds each package in a container spawned from the builder image.
 pub struct DockerExecutor {
-    cfg: Arc<Config>,
-    /// The build timeout in force, in seconds: the one setting this executor
-    /// reads per build that the server may change while it runs. Everything
-    /// else it declares is the runner's.
-    build_timeout: AtomicU64,
+    /// The configuration in force, replaced whole when the server delivers
+    /// values. Each build takes the one current when it starts and keeps it,
+    /// so a container is never created under one limit and timed by another.
+    cfg: RwLock<Arc<Config>>,
     docker: Docker,
     /// How spawned build containers are attached to the network, so the repo
     /// URL in the job's pacman.conf resolves from inside them.
@@ -74,34 +73,48 @@ impl DockerExecutor {
         );
         tracing::info!("build containers will use network: {network:?}");
         Ok(Self {
-            build_timeout: AtomicU64::new(cfg.core.build_timeout),
-            cfg,
+            cfg: RwLock::new(cfg),
             docker,
             network,
         })
     }
 
-    /// Local and container-visible paths for one build's shared directory.
-    fn job_dirs(&self, build_id: i32) -> (PathBuf, PathBuf) {
-        let name = build_id.to_string();
-        (
-            self.cfg.dirs.local.join(&name),
-            self.cfg.dirs.host.join(&name),
+    /// The configuration in force now.
+    fn current(&self) -> Arc<Config> {
+        // Poisoned only by a panic mid-assignment of an `Arc`, which leaves
+        // either the old value or the new one -- both usable.
+        Arc::clone(
+            &self
+                .cfg
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
 
-    async fn pull_image(&self, client: &WorkerClient, build_id: i32, arch: &str) -> Result<()> {
+    /// Local and container-visible paths for one build's shared directory.
+    fn job_dirs(&self, cfg: &Config, build_id: i32) -> (PathBuf, PathBuf) {
+        let name = build_id.to_string();
+        (cfg.dirs.local.join(&name), cfg.dirs.host.join(&name))
+    }
+
+    async fn pull_image(
+        &self,
+        cfg: &Config,
+        client: &WorkerClient,
+        build_id: i32,
+        arch: &str,
+    ) -> Result<()> {
         log(
             client,
             build_id,
-            &format!("[worker] pulling {}\n", self.cfg.builder_image),
+            &format!("[worker] pulling {}\n", cfg.builder_image),
         )
         .await;
         let platform = docker_arch(arch)
             .with_context(|| format!("unknown architecture {arch:?}: refusing the pull"))?;
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(self.cfg.builder_image.clone()),
+                from_image: Some(cfg.builder_image.clone()),
                 platform: format!("linux/{platform}"),
                 ..Default::default()
             }),
@@ -120,15 +133,11 @@ impl DockerExecutor {
         // Without the image, the later failure is a bare "No such image" that
         // hides the real (TLS/auth/registry) cause — so fail here, with it.
         if let Some(e) = pull_error
-            && self
-                .docker
-                .inspect_image(&self.cfg.builder_image)
-                .await
-                .is_err()
+            && self.docker.inspect_image(&cfg.builder_image).await.is_err()
         {
             return Err(e).context(format!(
                 "pulling {} failed and the image is not present locally",
-                self.cfg.builder_image
+                cfg.builder_image
             ));
         }
         Ok(())
@@ -136,12 +145,13 @@ impl DockerExecutor {
 
     async fn build(
         &self,
+        cfg: &Config,
         client: &Arc<WorkerClient>,
         job: &JobDescriptor,
         cancel: &AtomicBool,
     ) -> Result<CompleteReport> {
         let build_id = job.build_id;
-        let (local_dir, host_dir) = self.job_dirs(build_id);
+        let (local_dir, host_dir) = self.job_dirs(cfg, build_id);
 
         // A crash mid-job could have left a tree behind under this id.
         let _ = std::fs::remove_dir_all(&local_dir);
@@ -162,7 +172,7 @@ impl DockerExecutor {
             .context("downloading source")?;
         artifacts::extract_source(&source, &src_dir).context("extracting source")?;
 
-        self.pull_image(client, build_id, &job.arch).await?;
+        self.pull_image(cfg, client, build_id, &job.arch).await?;
 
         // Bind-mounted rather than written in: see wrap_with_config.
         let mut binds = vec![format!("{}:{CONTAINER_PKGDEST}", host_dir.display())];
@@ -196,7 +206,7 @@ impl DockerExecutor {
 
         let container_name = format!("aurcache_build_{build_id}");
         let body = ContainerCreateBody {
-            image: Some(self.cfg.builder_image.clone()),
+            image: Some(cfg.builder_image.clone()),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             open_stdin: Some(false),
@@ -209,8 +219,8 @@ impl DockerExecutor {
             ]),
             host_config: Some(HostConfig {
                 auto_remove: Some(false),
-                nano_cpus: self.cfg.nano_cpus(),
-                memory_swap: self.cfg.memory_bytes(),
+                nano_cpus: cfg.nano_cpus(),
+                memory_swap: cfg.memory_bytes(),
                 binds: Some(binds),
                 network_mode: self.network.network_mode(),
                 ..Default::default()
@@ -240,7 +250,7 @@ impl DockerExecutor {
             .context("creating build container")?;
 
         let result = self
-            .run_container(client, build_id, &created.id, cancel)
+            .run_container(cfg, client, build_id, &created.id, cancel)
             .await;
 
         // Always remove the container, whatever happened to the build.
@@ -274,6 +284,7 @@ impl DockerExecutor {
     /// cancellation and the build timeout.
     async fn run_container(
         &self,
+        cfg: &Config,
         client: &Arc<WorkerClient>,
         build_id: i32,
         container_id: &str,
@@ -308,7 +319,7 @@ impl DockerExecutor {
         });
 
         let started = Instant::now();
-        let timeout = self.build_timeout.load(Ordering::Relaxed);
+        let timeout = cfg.core.build_timeout;
         // The server is asked about remote cancellation at most every 30 s:
         // with N concurrent builds a per-tick round trip is N requests per
         // 5 s for no extra responsiveness, since cancel latency is already
@@ -433,7 +444,9 @@ impl Executor for DockerExecutor {
         job: JobDescriptor,
         cancel: Arc<AtomicBool>,
     ) -> CompleteReport {
-        match self.build(&client, &job, &cancel).await {
+        // Once, here: everything this build does reads this copy.
+        let cfg = self.current();
+        match self.build(&cfg, &client, &job, &cancel).await {
             Ok(report) => report,
             Err(e) => {
                 let msg = format!("build setup failed: {e:#}");
@@ -444,14 +457,23 @@ impl Executor for DockerExecutor {
     }
 
     fn describe_self(&self) -> String {
-        format!("legacy container ({}) [deprecated]", self.cfg.builder_image)
+        format!(
+            "legacy container ({}) [deprecated]",
+            self.current().builder_image
+        )
     }
 
+    /// Nothing here needs the machine's say beyond what the declaration
+    /// already checks: Docker enforces whatever limit it is given. So every
+    /// value is taken, for the next build.
     async fn reconfigure(&self, settings: WorkerSettings) -> WorkerSettings {
-        let core = self.cfg.core.with_settings(settings);
-        self.build_timeout
-            .store(core.build_timeout, Ordering::Relaxed);
-        core.settings
+        let next = self.current().with_settings(settings);
+        let settings = next.core.settings.clone();
+        *self
+            .cfg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+        settings
     }
 }
 

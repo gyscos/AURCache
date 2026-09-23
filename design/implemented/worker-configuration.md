@@ -11,9 +11,9 @@ transaction, delivered over the heartbeat and applied without a restart. Two
 deliberate divergences from the text below are recorded where they apply: the
 snapshot is not returned at registration ([Recommended](#compared)), and the
 concurrency gate is a target and a count rather than a semaphore with a deficit
-([Concurrency](#concurrency)). [Drain](#drain) is built as described, named pause and resume. Not built,
-and not part of phase 1: fleet defaults, declarations for the legacy container
-worker, and phase 2 (SSE).
+([Concurrency](#concurrency)). [Drain](#drain) is built as described, named pause and resume, and the legacy
+container worker declares its own settings (see [Recommendation](#recommendation)).
+Not built: fleet defaults, and phase 2 (SSE).
 
 - The first draft had a server-side allowlist of worker settings and a fleet
   default. Two reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
@@ -635,8 +635,18 @@ that the server can stop itself.
    the same from a terminal.
 
 **Later, if wanted:** fleet defaults, on the terms in
-[Per worker only, for now](#per-worker-only-for-now); declarations for the legacy
-container worker.
+[Per worker only, for now](#per-worker-only-for-now); ~~declarations for the
+legacy container worker~~ **done**.
+
+> **As built** (`aurcache_worker_docker::settings`): `cpu_limit` and
+> `memory_limit`, in the executor's own units -- `CPU_LIMIT` in milli-CPUs and
+> `MEMORY_LIMIT` in MB, read under their pre-worker names -- rather than the
+> chroot executor's `build_cpus` and `build_memory_max` translated onto it.
+> `BUILDER_IMAGE` and `BUILD_ARTIFACT_DIR` are deliberately not declared: the
+> image decides the user and privileges a build runs with, and the directory is
+> a host path bound into every container. The executor holds its configuration
+> the way the chroot one does, one copy per build, and refuses nothing on
+> delivery: Docker enforces whatever limit it is given.
 
 **Phase 2, only if latency is felt -- SSE (D) for server-to-worker events.** Stop
 and "configuration changed" become events; the heartbeat stays exactly as it is
