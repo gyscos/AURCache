@@ -314,7 +314,7 @@ fn WorkersTable(
                 }
                 tbody {
                     for worker in workers.iter() {
-                        // Computed once per row and used by both links, from
+                        // Computed once per row for the name link, from
                         // the table-wide shared set above rather than a fresh
                         // fleet scan per row.
                         {
@@ -336,7 +336,7 @@ fn WorkersTable(
                                     Link {
                                         class: "link-hover",
                                         title: "{worker.cert_fingerprint}",
-                                        to: route.clone(),
+                                        to: route,
                                         "{worker.name}"
                                     }
                                     // Something this machine was configured
@@ -418,7 +418,6 @@ fn WorkersTable(
                                     worker: worker.clone(),
                                     busy: busy == Some(worker.id),
                                     act,
-                                    route,
                                 }
                             }
                         }
@@ -438,24 +437,12 @@ fn WorkersTable(
 /// first time. Revoke disappears once revoked, because there is nothing left to
 /// take away.
 #[component]
-fn WorkerActions(
-    worker: Worker,
-    busy: bool,
-    act: EventHandler<(i32, WorkerAction)>,
-    /// Where this worker's own page is.
-    route: Route,
-) -> Element {
+fn WorkerActions(worker: Worker, busy: bool, act: EventHandler<(i32, WorkerAction)>) -> Element {
     let id = worker.id;
     rsx! {
         div { class: "flex gap-2 justify-end",
             if busy {
                 span { class: "loading loading-spinner loading-xs" }
-            }
-            Link {
-                class: "btn btn-ghost btn-xs",
-                title: "What this worker can be configured with, and what it is running",
-                to: route,
-                "Settings"
             }
             if !worker.status.can_build() {
                 button {
@@ -779,7 +766,6 @@ mod tests {
                     worker,
                     busy: false,
                     act: move |_| {},
-                    route: crate::routes::Route::Workers {},
                 }
             }
         }
