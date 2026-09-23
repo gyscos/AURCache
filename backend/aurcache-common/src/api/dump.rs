@@ -101,6 +101,13 @@ pub struct DumpWorker {
     pub package_affinity: Vec<String>,
     pub priority: i32,
     pub concurrency: i32,
+    /// The values set for this worker's settings on the server, by key.
+    ///
+    /// Configuration someone chose, which is what a dump is for. Absent from a
+    /// dump written before workers could be configured here, which restores as
+    /// none set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, String>,
     /// The certificate this worker holds, present only in a dump taken with
     /// secrets.
     ///

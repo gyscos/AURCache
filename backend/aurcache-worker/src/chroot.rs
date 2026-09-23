@@ -107,7 +107,7 @@ pub async fn ensure_base_chroot(
 ///
 /// What an overlay worker calls instead of [`ensure_base_chroot`]: its base is
 /// frozen, and a refresh there is a new layer on top rather than a change to
-/// the thing every running build is reading. See `design/overlay-chroot.md`.
+/// the thing every running build is reading. See `design/implemented/overlay-chroot.md`.
 pub async fn create_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
     let _guard = BASE_CHROOT_LOCK.lock().await;
 

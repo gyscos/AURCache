@@ -5,7 +5,7 @@
 //! in `aurcache-worker-core`; this crate is only the executor plus the
 //! chroot-specific configuration, caches and credential handling.
 //!
-//! See `design/remote-workers.md`.
+//! See `design/implemented/remote-workers.md`.
 
 pub mod agent;
 pub mod build;

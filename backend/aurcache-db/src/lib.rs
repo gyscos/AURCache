@@ -18,4 +18,5 @@ pub mod operations;
 pub mod package_vcs_sources;
 pub mod packages;
 pub mod settings;
+pub mod worker_settings;
 pub mod workers;

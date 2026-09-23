@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::identity::Identity;
-use aurcache_worker_core::runner::Runner;
+use aurcache_worker_core::runner::{Registration, Runner};
 use aurcache_worker_core::{config::CoreConfig, enroll};
 use aurcache_worker_docker::config::Config;
 use aurcache_worker_docker::executor::DockerExecutor;
@@ -58,5 +58,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    Runner::new(core, Arc::new(client), executor).run().await
+    let registration = Registration {
+        csr_pem: identity.generate_csr(&core.name)?,
+        kind: DockerExecutor::KIND,
+    };
+    Runner::new(core, Arc::new(client), executor, registration)
+        .run()
+        .await
 }

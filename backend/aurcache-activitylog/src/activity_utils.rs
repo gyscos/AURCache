@@ -1,7 +1,7 @@
 //! Recording to the structured log: the handle callers hold, and the one task
 //! that writes.
 //!
-//! See `design/structured-logs.md`.
+//! See `design/implemented/structured-logs.md`.
 
 use crate::events::Event;
 use aurcache_db::prelude::LogEntities;

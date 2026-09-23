@@ -12,7 +12,7 @@
 //! branch is not the branch that runs in production. It is also why the entity
 //! filter reads a side table instead of reaching into the payload JSON.
 //!
-//! See `design/structured-logs.md`.
+//! See `design/implemented/structured-logs.md`.
 
 use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{EntityRef, LogEntry, LogPage, NS_BUILD, NS_PACKAGE, NS_WORKER};

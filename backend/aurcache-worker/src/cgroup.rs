@@ -112,10 +112,11 @@ impl Hierarchy {
 
     /// Apply the limits for all builds together, on `builds/`.
     ///
-    /// At startup, once; the files keep their values while the worker runs and
-    /// are rewritten by the next start, so a changed or removed variable takes
-    /// effect then. Unset limits are written as `max`, so removing one really
-    /// removes it rather than leaving the previous run's value in place.
+    /// At startup, and again whenever the server delivers different totals:
+    /// they bound what the builds already running use between them, so a
+    /// change takes effect at once. Unset limits are written as `max`, so
+    /// removing one really removes it rather than leaving the previous value
+    /// in place.
     pub fn apply_total(&self, limits: &BuildLimits) -> Result<()> {
         write_limits(&self.builds, limits, true)
     }
@@ -142,6 +143,12 @@ impl Hierarchy {
         // A cgroup left by a previous attempt at the same build is empty by
         // now; removing it is what keeps `memory.peak` about this attempt.
         let _ = remove_cgroup_tree(&dir);
+        // On demand rather than only at startup: a CPU limit can arrive from
+        // the server long after the worker started without one, and `cpu.max`
+        // cannot be written until the controller is on. A no-op once it is.
+        if limits.cpus.is_some() {
+            self.enable_cpu()?;
+        }
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let cgroup = BuildCgroup { dir };
         write_limits(&cgroup.dir, limits, false)?;

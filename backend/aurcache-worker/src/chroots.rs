@@ -21,7 +21,7 @@ use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::protocol::report_warning;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -261,8 +261,10 @@ pub struct Chroots {
     /// it current" have to be one decision or two builds starting together
     /// both find it due.
     last_refresh: Mutex<Option<Instant>>,
-    /// How long a refresh counts as current.
-    interval: Duration,
+    /// How long a refresh counts as current, in seconds. Atomic because it is
+    /// a setting the server may change while builds run; the next refresh
+    /// decision reads the new one.
+    interval: AtomicU64,
     /// Whether the worker is currently refusing jobs to drain for a flatten.
     /// Only so the transition is logged once rather than at every poll.
     draining: AtomicBool,
@@ -289,11 +291,21 @@ impl Chroots {
             strategy: std::sync::OnceLock::new(),
             mode,
             last_refresh: Mutex::new(None),
-            interval,
+            interval: AtomicU64::new(interval.as_secs()),
             draining: AtomicBool::new(false),
             layout: tokio::sync::RwLock::new(()),
             flattening: Mutex::new(()),
         }
+    }
+
+    /// How long a refresh counts as current.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval.load(Ordering::Relaxed))
+    }
+
+    /// Change how long a refresh counts as current, from the next decision on.
+    pub fn set_interval(&self, interval: Duration) {
+        self.interval.store(interval.as_secs(), Ordering::Relaxed);
     }
 
     /// Whether a build can start, or the worker should drain first.
@@ -510,7 +522,7 @@ impl Chroots {
         }
         let root = self.dir.join("root");
         let mut last = self.last_refresh.lock().await;
-        if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval) {
+        if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval()) {
             tracing::debug!("base chroot is current; not refreshing");
             return Ok(root);
         }
@@ -652,7 +664,7 @@ impl Chroots {
     /// it mounted, and this only ever adds to the end. So unlike the in-place
     /// refresh there is no lock to take and nothing to wait for -- a busy
     /// worker refreshes on schedule rather than never. See
-    /// `design/overlay-chroot.md`.
+    /// `design/implemented/overlay-chroot.md`.
     async fn refresh_by_layer(
         &self,
         pacman_conf: &Path,
@@ -670,7 +682,7 @@ impl Chroots {
         // start a second one.
         let mut last = self.last_refresh.lock().await;
 
-        let due = refresh_due(last.map(|at| at.elapsed()), self.interval);
+        let due = refresh_due(last.map(|at| at.elapsed()), self.interval());
         let published = self.layers();
         let idle = due && self.mounted_copies().is_empty();
         // Taken before the decision so it can be held *through* the update. A

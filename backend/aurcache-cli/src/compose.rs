@@ -145,12 +145,19 @@ impl WorkerEnv {
         push("WORKER_NAME", self.name.clone());
         push("WORKER_ARCHES", join_list(&self.arches));
         push("WORKER_EMULATED_ARCHES", join_list(&self.emulated_arches));
-        push("WORKER_PACKAGES", join_list(&self.packages));
+        // Policy is written as the machine's starting point, not a pin, so it
+        // can be changed from the worker's page afterwards without anyone
+        // editing this file. The plain names would lock these values to the
+        // machine; the worker this generates is new enough to read either.
+        push("WORKER_PACKAGES_DEFAULT", join_list(&self.packages));
         push(
-            "WORKER_CONCURRENCY",
+            "WORKER_CONCURRENCY_DEFAULT",
             self.concurrency.map(|v| v.to_string()),
         );
-        push("WORKER_PRIORITY", self.priority.map(|v| v.to_string()));
+        push(
+            "WORKER_PRIORITY_DEFAULT",
+            self.priority.map(|v| v.to_string()),
+        );
         pairs
     }
 }
@@ -275,7 +282,8 @@ fn header(params: &ComposeParams) -> String {
              # volume that the server reads — presence in that volume is proof of trust, so\n\
              # no token and no manual approval are needed.\n\
              #\n\
-             # To scale local build throughput, raise WORKER_CONCURRENCY or run more workers:\n\
+             # To scale local build throughput, raise the worker's concurrency on its page\n\
+             # in AURCache (or WORKER_CONCURRENCY_DEFAULT here), or run more workers:\n\
              #     docker compose up -d --scale builder=3\n"
         }
         ComposeRole::Backend => {
@@ -904,7 +912,11 @@ mod tests {
         p.worker.name = Some("arm-box".to_string());
         p.worker.arches = vec!["aarch64".to_string()];
         let rendered = render_compose(&p);
-        assert!(rendered.contains("WORKER_CONCURRENCY=4"), "{rendered}");
+        // A default the server may take over, not a pin.
+        assert!(
+            rendered.contains("WORKER_CONCURRENCY_DEFAULT=4"),
+            "{rendered}"
+        );
         assert!(rendered.contains("WORKER_NAME=arm-box"), "{rendered}");
         assert!(rendered.contains("WORKER_ARCHES=aarch64"), "{rendered}");
     }

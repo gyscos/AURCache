@@ -150,7 +150,7 @@ async fn run_job_inner(
         .context("making source writable")?;
 
     // 1.5. Reconcile the shared package cache against what the served
-    // repository publishes *now* (see design/stale-shared-pacman-cache.md).
+    // repository publishes *now* (see design/implemented/stale-shared-pacman-cache.md).
     // The stale bytes live in the shared cache, the second, read-only
     // `CacheDir`: pacman finds them there, fails the integrity check at
     // install, and — being on a read-only mount — cannot delete them, so the
@@ -274,7 +274,7 @@ async fn run_job_inner(
     // an existing tree is kept and sources are re-extracted over it.
     //
     // Only when the package opted in: reuse trades away the clean tree a chroot
-    // build otherwise guarantees. See `design/persistent-build-directory.md`.
+    // build otherwise guarantees. See `design/implemented/persistent-build-directory.md`.
     if job.persistent_builddir {
         // Before the build, so the reserve is what bounds usage going in
         // rather than a post-hoc tidy. Never drops a tree a build is using:
@@ -446,7 +446,7 @@ const LOG_LINE_CAP_BYTES: usize = 1024 * 1024;
 /// tree's checkout refs an object the (fresh) `SRCDEST` mirror no longer
 /// holds. git's own messages are the signal — locale-stable where makepkg's
 /// would not be — and the flag set here lets the job wipe that checkout, since
-/// nothing else will. See `design/persistent-build-directory.md`.
+/// nothing else will. See `design/implemented/persistent-build-directory.md`.
 async fn pump_output<R>(
     reader: R,
     client: Arc<WorkerClient>,
@@ -849,7 +849,7 @@ async fn run_build(
     // the mirror and costs seconds to make again, while the compiled output
     // beside it is the hours the tree exists to save. The next retry then
     // re-clones from the mirror, which the download phase has already
-    // refreshed. See `design/persistent-build-directory.md`.
+    // refreshed. See `design/implemented/persistent-build-directory.md`.
     if !report.success
         && !canceled
         && !timed_out

@@ -16,21 +16,22 @@
 //!
 //! Each declared setting reads **two** variables, which say different things:
 //! `WORKER_CONCURRENCY=4` pins the value on this machine, while
-//! `WORKER_CONCURRENCY_DEFAULT=4` is a default the server may override once it
-//! can set values at all. Until then the two behave identically, which is why
-//! the `_DEFAULT` spelling can ship before anything can override it.
+//! `WORKER_CONCURRENCY_DEFAULT=4` is a default the server may override. The
+//! server's values arrive as a [`ConfigSnapshot`] and are layered between the
+//! two ([`WorkerSettings::with_snapshot`]): pin, then server, then environment
+//! default, then built-in default.
 //!
 //! What must *not* be declared is as deliberate as what is: a worker runs
 //! devtools as root, so the variables that decide what a build may reach
 //! (`WORKER_BIND_MOUNTS`, `WORKER_BUILD_USER`, `WORKER_MAKECHROOTPKG`) and the
 //! ones needed before the server can be trusted at all (`AURCACHE_URL`, the
 //! enrollment settings) are not in any spec table. See
-//! `design/worker-configuration.md`.
+//! `design/implemented/worker-configuration.md`.
 
 use aurcache_common::units::{format_duration, format_size, parse_duration, parse_size};
 use aurcache_common::worker_config::{
-    Applies, EffectiveConfig, EffectiveSetting, EffectiveSource, SettingDecl, SettingStatus,
-    ValueKind,
+    Applies, ConfigSnapshot, EffectiveConfig, EffectiveSetting, EffectiveSource, SettingDecl,
+    SettingStatus, ValueKind,
 };
 use std::collections::BTreeMap;
 
@@ -89,15 +90,30 @@ pub struct SettingSpec {
     pub default: Builtin,
 }
 
-/// A declared setting together with what it resolved to on this machine.
-#[derive(Clone, Debug)]
-struct Entry {
-    spec: SettingSpec,
+/// What one setting resolved to: the value, and where it came from.
+#[derive(Clone, Debug, PartialEq)]
+struct Resolution {
     /// The value in effect, written as configuration writes it.
     value: Option<String>,
     source: EffectiveSource,
     status: SettingStatus,
     reason: Option<String>,
+}
+
+/// A declared setting together with what it resolved to on this machine.
+#[derive(Clone, Debug)]
+struct Entry {
+    spec: SettingSpec,
+    /// What it is running now.
+    current: Resolution,
+    /// What the environment alone resolved it to at startup: the pin, the
+    /// environment default, or the built-in one. What a setting returns to
+    /// when the server's value for it is removed.
+    from_env: Resolution,
+    /// The pin, when it was set and usable. Beats anything the server sends,
+    /// which is what lets a machine keep a value -- its memory limit, say --
+    /// out of the server's hands.
+    pin: Option<String>,
     /// What this setting falls back to without a pin: the `_DEFAULT` the worker
     /// was started with when it has a usable one, else the built-in default.
     ///
@@ -106,10 +122,17 @@ struct Entry {
     fallback: Option<String>,
 }
 
-/// Every setting a worker declares, resolved against its environment.
+/// Every setting a worker declares, resolved against its environment and
+/// whatever the server has set.
 #[derive(Clone, Debug, Default)]
 pub struct WorkerSettings {
     entries: Vec<Entry>,
+    /// The revision of the last snapshot this was resolved against, or `None`
+    /// before the server has sent one.
+    revision: Option<String>,
+    /// Keys the server sent a value for that this worker does not declare, so
+    /// the report can say they were not used rather than leave them out.
+    unsupported: Vec<String>,
 }
 
 impl WorkerSettings {
@@ -130,6 +153,99 @@ impl WorkerSettings {
         self
     }
 
+    /// Resolve again with the server's values layered in: the pin, then the
+    /// server's value, then the environment default, then the built-in one.
+    ///
+    /// Always against the whole snapshot -- it is the complete set, so a key
+    /// missing from it is a value the server no longer sets. A server value
+    /// that does not parse is refused and the setting keeps what it is running
+    /// now: a refusal must never loosen a limit by dropping to a default.
+    #[must_use]
+    pub fn with_snapshot(&self, snapshot: &ConfigSnapshot) -> Self {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let current = match (&entry.pin, snapshot.settings.get(entry.spec.key)) {
+                    (Some(_), Some(server)) => Resolution {
+                        status: SettingStatus::Overridden,
+                        reason: Some(format!(
+                            "set to {server} in AURCache, but {var} pins it on this \
+                             machine; rename it to {var}{DEFAULT_SUFFIX} to manage it from \
+                             AURCache",
+                            var = entry.spec.env_var,
+                        )),
+                        ..entry.from_env.clone()
+                    },
+                    (Some(_), None) | (None, None) => entry.from_env.clone(),
+                    (None, Some(server)) => match entry.spec.kind.validate(server) {
+                        Ok(()) => Resolution {
+                            value: Some(server.trim().to_string()),
+                            source: EffectiveSource::Server,
+                            // A pin that did not parse is still worth hearing
+                            // about while the server's value stands in for it.
+                            status: entry.from_env.status,
+                            reason: entry.from_env.reason.clone(),
+                        },
+                        Err(why) => Resolution {
+                            status: SettingStatus::Rejected,
+                            reason: Some(format!("the server's value was refused: {why}")),
+                            ..entry.current.clone()
+                        },
+                    },
+                };
+                Entry {
+                    current,
+                    ..entry.clone()
+                }
+            })
+            .collect();
+        let unsupported = snapshot
+            .settings
+            .keys()
+            .filter(|key| !self.entries.iter().any(|entry| entry.spec.key == *key))
+            .cloned()
+            .collect();
+        Self {
+            entries,
+            revision: Some(snapshot.revision.clone()),
+            unsupported,
+        }
+    }
+
+    /// Refuse the values an executor could not use, each keeping what
+    /// `previous` was running for it.
+    ///
+    /// For what only the machine can find out -- a CPU limit on a host whose
+    /// cgroup cannot take one. The previous value, not a default: a limit
+    /// the host refused must not leave the builds with none.
+    #[must_use]
+    pub fn refused(mut self, refusals: &BTreeMap<String, String>, previous: &Self) -> Self {
+        for entry in &mut self.entries {
+            let Some(why) = refusals.get(entry.spec.key) else {
+                continue;
+            };
+            let before = previous
+                .entries
+                .iter()
+                .find(|old| old.spec.key == entry.spec.key)
+                .map_or_else(|| entry.from_env.clone(), |old| old.current.clone());
+            entry.current = Resolution {
+                status: SettingStatus::Rejected,
+                reason: Some(why.clone()),
+                ..before
+            };
+        }
+        self
+    }
+
+    /// Where the value in effect came from, for an executor deciding which
+    /// values are the server's to refuse.
+    #[must_use]
+    pub fn source(&self, key: &str) -> Option<EffectiveSource> {
+        Some(self.entry(key)?.current.source)
+    }
+
     fn entry(&self, key: &str) -> Option<&Entry> {
         let found = self.entries.iter().find(|entry| entry.spec.key == key);
         if found.is_none() {
@@ -144,7 +260,7 @@ impl WorkerSettings {
     /// The value in effect, as written. `None` for a setting that is unset.
     #[must_use]
     pub fn raw(&self, key: &str) -> Option<&str> {
-        self.entry(key)?.value.as_deref()
+        self.entry(key)?.current.value.as_deref()
     }
 
     /// The value in effect as a byte count.
@@ -199,25 +315,34 @@ impl WorkerSettings {
     /// What this worker is running, for the server to store and render.
     #[must_use]
     pub fn effective(&self) -> EffectiveConfig {
+        let declared = self.entries.iter().map(|entry| {
+            let current = &entry.current;
+            (
+                entry.spec.key.to_string(),
+                EffectiveSetting {
+                    value: current.value.clone(),
+                    source: current.source,
+                    status: current.status,
+                    reason: current.reason.clone(),
+                },
+            )
+        });
+        let unsupported = self.unsupported.iter().map(|key| {
+            (
+                key.clone(),
+                EffectiveSetting {
+                    value: None,
+                    source: EffectiveSource::Server,
+                    status: SettingStatus::Unsupported,
+                    reason: Some(format!(
+                        "this worker does not accept a setting called {key}"
+                    )),
+                },
+            )
+        });
         EffectiveConfig {
-            // Nothing is delivered to a worker yet, so there is no snapshot for
-            // this to be the revision of.
-            received_revision: None,
-            settings: self
-                .entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.spec.key.to_string(),
-                        EffectiveSetting {
-                            value: entry.value.clone(),
-                            source: entry.source,
-                            status: entry.status,
-                            reason: entry.reason.clone(),
-                        },
-                    )
-                })
-                .collect::<BTreeMap<_, _>>(),
+            received_revision: self.revision.clone(),
+            settings: declared.chain(unsupported).collect::<BTreeMap<_, _>>(),
         }
     }
 }
@@ -274,6 +399,10 @@ fn resolve(spec: SettingSpec) -> Entry {
         .map(|raw| raw.trim().to_string())
         .or_else(|| spec.default.as_written());
 
+    let pin_value = chosen
+        .as_ref()
+        .filter(|(_, source)| *source == EffectiveSource::Env)
+        .map(|(value, _)| value.clone());
     let (value, source) = chosen.map_or_else(
         || (spec.default.as_written(), EffectiveSource::Default),
         |(value, source)| (Some(value), source),
@@ -291,12 +420,17 @@ fn resolve(spec: SettingSpec) -> Entry {
         SettingStatus::Applied
     };
 
-    Entry {
-        spec,
+    let resolved = Resolution {
         value,
         source,
         status,
         reason: rejected.or(shadowed),
+    };
+    Entry {
+        spec,
+        current: resolved.clone(),
+        from_env: resolved,
+        pin: pin_value,
         fallback,
     }
 }
@@ -357,7 +491,9 @@ pub fn protocol_settings() -> Vec<SettingSpec> {
                           parallel, so raising this multiplies compiler processes, chroot \
                           copies and cache pressure together.",
             category: "Scheduling",
-            applies: Applies::NextJob,
+            // Through the concurrency gate: lowering it lets running builds
+            // finish, raising it lets the next claim through at once.
+            applies: Applies::Immediately,
             default: Builtin::Integer(DEFAULT_CONCURRENCY),
         },
         SettingSpec {
@@ -456,9 +592,9 @@ mod tests {
             ValueKind::Size,
             Builtin::Size(200 * 1024 * 1024 * 1024),
         ));
-        assert_eq!(entry.value.as_deref(), Some("200G"));
-        assert_eq!(entry.source, EffectiveSource::Default);
-        assert_eq!(entry.status, SettingStatus::Applied);
+        assert_eq!(entry.current.value.as_deref(), Some("200G"));
+        assert_eq!(entry.current.source, EffectiveSource::Default);
+        assert_eq!(entry.current.status, SettingStatus::Applied);
         assert_eq!(entry.fallback.as_deref(), Some("200G"));
     }
 
@@ -470,8 +606,8 @@ mod tests {
             ValueKind::Size,
             Builtin::Size(1024),
         ));
-        assert_eq!(entry.value.as_deref(), Some("1T"));
-        assert_eq!(entry.source, EffectiveSource::Env);
+        assert_eq!(entry.current.value.as_deref(), Some("1T"));
+        assert_eq!(entry.current.source, EffectiveSource::Env);
         unsafe { std::env::remove_var("AURCACHE_TEST_PIN") };
     }
 
@@ -488,8 +624,8 @@ mod tests {
             },
             Builtin::Integer(1),
         ));
-        assert_eq!(entry.value.as_deref(), Some("4"));
-        assert_eq!(entry.status, SettingStatus::Applied);
+        assert_eq!(entry.current.value.as_deref(), Some("4"));
+        assert_eq!(entry.current.status, SettingStatus::Applied);
         unsafe { std::env::remove_var("AURCACHE_TEST_PADDED") };
     }
 
@@ -507,8 +643,8 @@ mod tests {
             },
             Builtin::Integer(1),
         ));
-        assert_eq!(entry.value.as_deref(), Some("4"));
-        assert_eq!(entry.source, EffectiveSource::EnvDefault);
+        assert_eq!(entry.current.value.as_deref(), Some("4"));
+        assert_eq!(entry.current.source, EffectiveSource::EnvDefault);
         assert_eq!(entry.fallback.as_deref(), Some("4"));
         unsafe { std::env::remove_var("AURCACHE_TEST_DEF_DEFAULT") };
     }
@@ -529,16 +665,17 @@ mod tests {
             },
             Builtin::Integer(1),
         ));
-        assert_eq!(entry.value.as_deref(), Some("2"));
-        assert_eq!(entry.source, EffectiveSource::Env);
-        assert_eq!(entry.status, SettingStatus::Applied);
+        assert_eq!(entry.current.value.as_deref(), Some("2"));
+        assert_eq!(entry.current.source, EffectiveSource::Env);
+        assert_eq!(entry.current.status, SettingStatus::Applied);
         assert!(
             entry
+                .current
                 .reason
                 .as_deref()
                 .is_some_and(|r| r.contains("AURCACHE_TEST_BOTH_DEFAULT")),
             "{:?}",
-            entry.reason
+            entry.current.reason
         );
         unsafe {
             std::env::remove_var("AURCACHE_TEST_BOTH");
@@ -557,10 +694,10 @@ mod tests {
             ValueKind::Size,
             Builtin::Size(200 * 1024 * 1024 * 1024),
         ));
-        assert_eq!(entry.value.as_deref(), Some("200G"));
-        assert_eq!(entry.source, EffectiveSource::Default);
-        assert_eq!(entry.status, SettingStatus::Rejected);
-        let reason = entry.reason.expect("a rejection says why");
+        assert_eq!(entry.current.value.as_deref(), Some("200G"));
+        assert_eq!(entry.current.source, EffectiveSource::Default);
+        assert_eq!(entry.current.status, SettingStatus::Rejected);
+        let reason = entry.current.reason.expect("a rejection says why");
         assert!(reason.contains("AURCACHE_TEST_BAD"), "{reason}");
         assert!(reason.contains("450 giraffes"), "{reason}");
         unsafe { std::env::remove_var("AURCACHE_TEST_BAD") };
@@ -582,9 +719,9 @@ mod tests {
             },
             Builtin::Integer(1),
         ));
-        assert_eq!(entry.value.as_deref(), Some("8"));
-        assert_eq!(entry.source, EffectiveSource::EnvDefault);
-        assert_eq!(entry.status, SettingStatus::Rejected);
+        assert_eq!(entry.current.value.as_deref(), Some("8"));
+        assert_eq!(entry.current.source, EffectiveSource::EnvDefault);
+        assert_eq!(entry.current.status, SettingStatus::Rejected);
         unsafe {
             std::env::remove_var("AURCACHE_TEST_LADDER");
             std::env::remove_var("AURCACHE_TEST_LADDER_DEFAULT");
@@ -601,9 +738,116 @@ mod tests {
             ValueKind::Size,
             Builtin::Unset,
         ));
-        assert_eq!(entry.value, None);
+        assert_eq!(entry.current.value, None);
         assert_eq!(entry.fallback, None);
-        assert_eq!(entry.source, EffectiveSource::Default);
+        assert_eq!(entry.current.source, EffectiveSource::Default);
+    }
+
+    fn snapshot(revision: &str, pairs: &[(&str, &str)]) -> ConfigSnapshot {
+        ConfigSnapshot {
+            revision: revision.to_string(),
+            settings: pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    fn integer(env_var: &'static str, key: &'static str) -> SettingSpec {
+        SettingSpec {
+            key,
+            ..spec(
+                env_var,
+                ValueKind::Integer {
+                    min: Some(1),
+                    max: None,
+                },
+                Builtin::Integer(1),
+            )
+        }
+    }
+
+    /// The server's value beats the machine's `_DEFAULT` and the built-in
+    /// default, and removing it returns the setting to exactly what the
+    /// environment resolved it to.
+    #[test]
+    fn a_server_value_beats_an_environment_default_and_can_be_taken_back() {
+        unsafe { std::env::set_var("AURCACHE_TEST_SRV_DEFAULT", "4") };
+        let settings = WorkerSettings::from_env(vec![integer("AURCACHE_TEST_SRV", "srv")]);
+        assert_eq!(settings.raw("srv"), Some("4"));
+
+        let delivered = settings.with_snapshot(&snapshot("r1", &[("srv", "7")]));
+        assert_eq!(delivered.raw("srv"), Some("7"));
+        assert_eq!(delivered.source("srv"), Some(EffectiveSource::Server));
+        assert_eq!(
+            delivered.effective().received_revision.as_deref(),
+            Some("r1")
+        );
+
+        let removed = delivered.with_snapshot(&snapshot("r2", &[]));
+        assert_eq!(removed.raw("srv"), Some("4"));
+        assert_eq!(removed.source("srv"), Some(EffectiveSource::EnvDefault));
+        unsafe { std::env::remove_var("AURCACHE_TEST_SRV_DEFAULT") };
+    }
+
+    /// A pin is the machine's veto: the server's value is received, reported
+    /// as not in effect, and the report names the rename that hands it over.
+    #[test]
+    fn a_pin_overrides_the_server_and_says_how_to_hand_it_over() {
+        unsafe { std::env::set_var("AURCACHE_TEST_PINNED", "2") };
+        let settings = WorkerSettings::from_env(vec![integer("AURCACHE_TEST_PINNED", "pinned")]);
+        let delivered = settings.with_snapshot(&snapshot("r1", &[("pinned", "9")]));
+        assert_eq!(delivered.raw("pinned"), Some("2"));
+        let report = &delivered.effective().settings["pinned"];
+        assert_eq!(report.status, SettingStatus::Overridden);
+        assert_eq!(report.source, EffectiveSource::Env);
+        let reason = report.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("AURCACHE_TEST_PINNED_DEFAULT"), "{reason}");
+        unsafe { std::env::remove_var("AURCACHE_TEST_PINNED") };
+    }
+
+    /// A server value that does not fit is refused, and the setting keeps what
+    /// it was running -- the previous server value, not a looser default.
+    #[test]
+    fn a_refused_server_value_keeps_the_previous_one() {
+        let settings = WorkerSettings::from_env(vec![integer("AURCACHE_TEST_KEEP", "keep")]);
+        let first = settings.with_snapshot(&snapshot("r1", &[("keep", "3")]));
+        let second = first.with_snapshot(&snapshot("r2", &[("keep", "0")]));
+        assert_eq!(second.raw("keep"), Some("3"));
+        let report = &second.effective().settings["keep"];
+        assert_eq!(report.status, SettingStatus::Rejected);
+        assert_eq!(report.source, EffectiveSource::Server);
+        // Received all the same: resending it would not change the answer.
+        assert_eq!(second.effective().received_revision.as_deref(), Some("r2"));
+    }
+
+    /// A key the worker does not declare is reported as not used rather than
+    /// dropped, and never becomes a setting it runs.
+    #[test]
+    fn an_undeclared_key_is_reported_unsupported() {
+        let settings = WorkerSettings::from_env(vec![integer("AURCACHE_TEST_DECL", "decl")]);
+        let delivered = settings.with_snapshot(&snapshot("r1", &[("build_user", "root")]));
+        let report = &delivered.effective().settings["build_user"];
+        assert_eq!(report.status, SettingStatus::Unsupported);
+        assert_eq!(report.value, None);
+        // Gone again once the server stops sending it.
+        let later = delivered.with_snapshot(&snapshot("r2", &[]));
+        assert!(!later.effective().settings.contains_key("build_user"));
+    }
+
+    /// What an executor refuses goes back to what was running before, with
+    /// the executor's reason.
+    #[test]
+    fn an_executor_refusal_restores_the_previous_value() {
+        let settings = WorkerSettings::from_env(vec![integer("AURCACHE_TEST_EXEC", "exec")]);
+        let before = settings.with_snapshot(&snapshot("r1", &[("exec", "2")]));
+        let candidate = before.with_snapshot(&snapshot("r2", &[("exec", "5")]));
+        let refusals = BTreeMap::from([("exec".to_string(), "no cgroup".to_string())]);
+        let after = candidate.refused(&refusals, &before);
+        assert_eq!(after.raw("exec"), Some("2"));
+        let report = &after.effective().settings["exec"];
+        assert_eq!(report.status, SettingStatus::Rejected);
+        assert_eq!(report.reason.as_deref(), Some("no cgroup"));
     }
 
     /// Every built-in default must be readable back as its own kind, since it

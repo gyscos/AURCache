@@ -2,7 +2,7 @@
 //! ended.
 //!
 //! `builds.trigger` powers the derived retry budget for abandoned builds (see
-//! `design/abort-builds.md`): rather than a mutable `attempt_count` that
+//! `design/implemented/abort-builds.md`): rather than a mutable `attempt_count` that
 //! survives a row that is never reused, the reaper counts the trailing
 //! consecutive `timeout_retry` rows in a package's history. `User` (0) is the
 //! meaning of every build that predates the column, and the default for new

@@ -30,9 +30,10 @@ pub fn publish_csr_to_enrollment_dir(cfg: &CoreConfig, fingerprint: &str, csr_pe
 /// Assemble the registration payload from the current configuration.
 ///
 /// Registration is how a worker reports its configuration, and *all* of it can
-/// have changed since the machine last booted, so this is rebuilt from `cfg`
-/// every time rather than cached.
-fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> RegisterRequest {
+/// have changed since the machine last booted -- or since the server last
+/// delivered values -- so this is rebuilt from `cfg` every time rather than
+/// cached.
+pub fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> RegisterRequest {
     RegisterRequest {
         name: cfg.name.clone(),
         native_arches: cfg.native_arches.clone(),

@@ -69,7 +69,7 @@ impl Cache {
     /// package from sharing a tree on the same worker.
     ///
     /// Only ever populated for packages that opted in, because the bind only
-    /// happens for those; see `design/persistent-build-directory.md`.
+    /// happens for those; see `design/implemented/persistent-build-directory.md`.
     pub fn builddir(&self, platform: &str) -> Option<PathBuf> {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
     }

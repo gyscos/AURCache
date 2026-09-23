@@ -36,11 +36,42 @@ Auto-approval only ever applies to a worker that has never been approved. It
 will not re-approve one you revoked — an explicit decision outranks a
 convenience setting.
 
+## Stopping a worker's intake
+
+To reboot, upgrade or retire a machine without cutting a build short, **stop
+its intake** first — the **Stop intake** button on the Workers list or on the
+worker's page, or:
+
+```bash
+aurcache-cli worker pause 3
+```
+
+The worker is given no new builds from its next claim on; they go to other
+workers instead, and the ones it is running carry on and finish normally. It
+stays approved and keeps checking in, so its page shows how many builds are
+still running there and says when it is empty. Nothing is sent to the worker
+and nothing changes on the machine: the server simply stops offering it jobs.
+A lower-priority worker that would have waited for it stops waiting straight
+away.
+
+When the machine is ready again, **Resume intake** (`aurcache-cli worker resume
+3`) and it takes new builds from its next claim. A stopped intake survives the
+worker restarting, so it will not start building the moment it comes back up.
+
+Stopping intake does not change which jobs are its to take. A package reserved
+to it through `WORKER_PACKAGES`, or an architecture only it builds natively,
+waits for it rather than going elsewhere, and the Builds page says so. To hand
+that work to others for good, revoke the worker instead.
+
 ## Retiring a worker
 
 **Revoke it.** Revoking refuses the worker's certificate from that moment,
 releases any packages it had reserved through `WORKER_PACKAGES`, and requeues
 whatever it was building so another worker picks the job up.
+
+Stop its intake first if it is building something you want to keep: revoking
+takes its builds back and requeues them from the start. Revoking also resumes
+intake, so a machine approved again later builds straight away.
 
 There is no delete. Worker rows are kept so a build from two years ago still
 shows which machine produced it, with what architectures and what version.
@@ -170,6 +201,7 @@ An enqueued build that no worker can claim is flagged with the reason:
 | Reserved for *worker* (offline) | Package affinity ties it to a worker that is not online | Start that worker, or revoke it to release the reservation |
 | No worker builds *arch* | No approved worker handles that architecture | Enroll one, or remove the architecture from the package |
 | All capable workers are offline | Workers exist for the job but none is online | Start one |
+| Intake is stopped on every capable worker (*workers*) | The workers that could take it are online but were asked to take nothing new | Resume intake on one of them when it is ready |
 
 A build without a reason is simply queued behind other work — that is normal and
 needs nothing.

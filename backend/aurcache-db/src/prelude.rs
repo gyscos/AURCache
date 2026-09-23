@@ -12,4 +12,5 @@ pub use super::operations::Entity as Operations;
 pub use super::package_vcs_sources::Entity as PackageVcsSources;
 pub use super::packages::Entity as Packages;
 pub use super::settings::Entity as Settings;
+pub use super::worker_settings::Entity as WorkerSettings;
 pub use super::workers::Entity as Workers;

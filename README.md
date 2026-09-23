@@ -38,7 +38,7 @@ docker compose up -d
 
 The bundled worker auto-enrolls via a shared volume and starts polling for jobs
 within seconds. Scale local build throughput with `docker compose up -d --scale
-builder=3` or raise `WORKER_CONCURRENCY`. To attach a worker on separate
+builder=3` or raise the worker's concurrency on its page in the web UI. To attach a worker on separate
 hardware or a foreign architecture (e.g. aarch64), see
 [`docker-compose.remote-worker.yaml`](docker-compose.remote-worker.yaml).
 

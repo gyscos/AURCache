@@ -59,6 +59,12 @@ pub struct Model {
     /// (`aurcache_common::worker_config::EffectiveConfig`), as last reported
     /// over the heartbeat. `None` until a worker has reported one.
     pub effective_config: Option<String>,
+    /// An operator asked this worker to take no new builds and let the ones it
+    /// holds finish, so the machine can be rebooted, upgraded or retired
+    /// without cutting a build short. Unlike revoking, the worker stays
+    /// trusted and keeps its builds; unlike a setting, it needs nothing from
+    /// the worker -- the claim query simply stops offering it jobs.
+    pub paused: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

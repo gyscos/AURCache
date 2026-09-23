@@ -24,7 +24,7 @@
 //! sharing an upstream URL keep separate mirrors and cannot collide. Pooling
 //! the mirrors by URL would move the key to the source and make a build take
 //! several of these at once, in a fixed order -- see
-//! `design/remote-workers.md`.
+//! `design/implemented/remote-workers.md`.
 //!
 //! What makes the exclusion necessary is the *plain* sources, not the git ones:
 //! a tarball is fetched as `<file>.part` and renamed, keyed by filename, so two

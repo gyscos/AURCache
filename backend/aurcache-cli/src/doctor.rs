@@ -219,6 +219,10 @@ fn hint_for_reason(reason: &WaitingReason) -> String {
             "reserved for {} — bring those back, or revoke them to release the reservation",
             workers.join(", ")
         ),
+        WaitingReason::Paused { workers } => format!(
+            "intake is stopped on {} — resume one with `aurcache-cli worker resume <id>` once it is ready",
+            workers.join(", ")
+        ),
     }
 }
 
@@ -376,6 +380,7 @@ mod tests {
             successful_builds: 0,
             failed_builds: 0,
             settings_rejected: None,
+            paused: false,
         }
     }
 

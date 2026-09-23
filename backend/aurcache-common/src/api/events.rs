@@ -33,7 +33,7 @@
 //! crate reaches the database and can never compile to wasm. Rendering to the
 //! stored columns, decoding them back, and the write queue stay there.
 //!
-//! See `design/structured-logs.md`.
+//! See `design/implemented/structured-logs.md`.
 
 use crate::api::activity::Severity;
 use crate::api::log::{BuildRef, EntityRef, PackageRef, WorkerRef};
@@ -232,6 +232,15 @@ pub enum Event {
     #[serde(rename = "worker.approved")]
     WorkerApproved { worker: WorkerRef },
 
+    /// Somebody asked a worker to take no new builds and let the ones it holds
+    /// finish.
+    #[serde(rename = "worker.paused")]
+    WorkerPaused { worker: WorkerRef },
+
+    /// Somebody let a paused worker take builds again.
+    #[serde(rename = "worker.resumed")]
+    WorkerResumed { worker: WorkerRef },
+
     /// A worker was put out of the fleet, and its builds taken back.
     #[serde(rename = "worker.revoked")]
     WorkerRevoked {
@@ -280,6 +289,20 @@ pub enum Event {
     WorkerConfigChanged {
         worker: WorkerRef,
         settings: Vec<String>,
+    },
+
+    /// Somebody saved values for a worker's settings here. Like
+    /// [`Self::SettingChanged`], the values are left out; what the worker then
+    /// ran is [`Self::WorkerConfigChanged`], once it has picked the save up.
+    #[serde(rename = "worker.settings_saved")]
+    WorkerSettingsSaved {
+        worker: WorkerRef,
+        /// Keys given a value.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        set: Vec<String>,
+        /// Keys whose value was removed, so the worker falls back to its own.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reset: Vec<String>,
     },
 
     /// Something a worker sent about itself could not be stored or read, so
@@ -764,6 +787,16 @@ pub const KINDS: &[Kind] = &[
         label: "Worker approved",
     },
     Kind {
+        kind: "worker.paused",
+        group: "Workers",
+        label: "Worker intake stopped",
+    },
+    Kind {
+        kind: "worker.resumed",
+        group: "Workers",
+        label: "Worker intake resumed",
+    },
+    Kind {
         kind: "worker.revoked",
         group: "Workers",
         label: "Worker revoked",
@@ -777,6 +810,11 @@ pub const KINDS: &[Kind] = &[
         kind: "worker.config_changed",
         group: "Workers",
         label: "Worker configuration changed",
+    },
+    Kind {
+        kind: "worker.settings_saved",
+        group: "Workers",
+        label: "Worker settings saved",
     },
     Kind {
         kind: "worker.setting_rejected",
@@ -1078,6 +1116,8 @@ impl Event {
             Self::VersionCheckFailed { .. } => "version_check.pass_failed",
             Self::WorkerEnrolled { .. } => "worker.enrolled",
             Self::WorkerApproved { .. } => "worker.approved",
+            Self::WorkerPaused { .. } => "worker.paused",
+            Self::WorkerResumed { .. } => "worker.resumed",
             Self::WorkerRevoked { .. } => "worker.revoked",
             Self::WorkerReaped { .. } => "worker.reaped",
             Self::WorkerSettingRejected { .. } => "worker.setting_rejected",
@@ -1088,6 +1128,7 @@ impl Event {
             Self::BuildSucceeded { .. } => "build.succeeded",
             Self::WorkerRegistered { .. } => "worker.registered",
             Self::WorkerConfigChanged { .. } => "worker.config_changed",
+            Self::WorkerSettingsSaved { .. } => "worker.settings_saved",
             Self::BuildFailed { .. } => "build.failed",
             Self::BuildPublished { .. } => "build.published",
             Self::BuildCompletionRejected { .. } => "build.completion_rejected",
@@ -1140,11 +1181,14 @@ impl Event {
             | Self::ServerStarted { .. }
             | Self::WorkerEnrolled { .. }
             | Self::WorkerApproved { .. }
+            | Self::WorkerPaused { .. }
+            | Self::WorkerResumed { .. }
             | Self::WorkerRevoked { .. }
             | Self::BuildStarted { .. }
             | Self::BuildSucceeded { .. }
             | Self::WorkerRegistered { .. }
             | Self::WorkerConfigChanged { .. }
+            | Self::WorkerSettingsSaved { .. }
             | Self::BuildPublished { .. }
             | Self::BuildCancelled { .. }
             | Self::BuildDeleted { .. }
@@ -1344,6 +1388,14 @@ impl Event {
                 vec![text("worker "), entity(worker), text(" enrolled")]
             }
             Self::WorkerApproved { worker } => vec![text("approved worker "), entity(worker)],
+            Self::WorkerPaused { worker } => vec![
+                text("stopped intake on worker "),
+                entity(worker),
+                text(": new builds go to other workers"),
+            ],
+            Self::WorkerResumed { worker } => {
+                vec![text("resumed intake on worker "), entity(worker)]
+            }
             Self::WorkerRevoked { worker, requeued } => {
                 let mut out = vec![text("revoked worker "), entity(worker)];
                 if !requeued.is_empty() {
@@ -1457,6 +1509,20 @@ impl Event {
                 entity(worker),
                 text(format!(" changed: {}", settings.join(", "))),
             ],
+            Self::WorkerSettingsSaved { worker, set, reset } => {
+                let mut out = vec![text("saved the settings of worker "), entity(worker)];
+                let mut parts = Vec::new();
+                if !set.is_empty() {
+                    parts.push(format!("set {}", set.join(", ")));
+                }
+                if !reset.is_empty() {
+                    parts.push(format!("reset {}", reset.join(", ")));
+                }
+                if !parts.is_empty() {
+                    out.push(text(format!(": {}", parts.join("; "))));
+                }
+                out
+            }
             Self::BuildCompletionRejected {
                 build,
                 worker,
@@ -1723,6 +1789,8 @@ mod tests {
             Event::VersionCheckFailed { error: error() },
             Event::WorkerEnrolled { worker: worker() },
             Event::WorkerApproved { worker: worker() },
+            Event::WorkerPaused { worker: worker() },
+            Event::WorkerResumed { worker: worker() },
             Event::WorkerRevoked {
                 worker: worker(),
                 requeued: vec![build()],
@@ -1775,6 +1843,11 @@ mod tests {
             Event::WorkerConfigChanged {
                 worker: worker(),
                 settings: vec!["concurrency".to_string()],
+            },
+            Event::WorkerSettingsSaved {
+                worker: worker(),
+                set: vec!["concurrency".to_string()],
+                reset: vec!["build_timeout".to_string()],
             },
             Event::BuildCompletionRejected {
                 build: build(),

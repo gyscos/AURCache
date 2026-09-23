@@ -38,7 +38,9 @@ services:
       - AURCACHE_SERVER_CA_FINGERPRINT=REPLACE_WITH_SERVER_CA_SHA256
       # Native architecture(s) of this machine; foreign-arch jobs route here.
       - WORKER_ARCHES=aarch64
-      - WORKER_CONCURRENCY=2
+      # A starting point AURCache can change from this worker's page. The
+      # plain WORKER_CONCURRENCY would pin it to this file instead.
+      - WORKER_CONCURRENCY_DEFAULT=2
       # Where this worker fetches AURCache-built dependencies from, when that
       # is not simply the server's own address on the repository port. The
       # server sends one template to every worker and varies only the host, so

@@ -11,13 +11,15 @@
 //! behaviour of spawning a build container, and exists only so single-container
 //! deployments keep working across the upgrade.
 //!
-//! See `design/remote-workers.md`.
+//! See `design/implemented/remote-workers.md`.
 
 pub mod artifacts;
 pub mod client;
 pub mod config;
 pub mod enroll;
 pub mod executor;
+/// A limit on builds running at once that can change while they run.
+pub mod gate;
 pub mod identity;
 pub mod protocol;
 pub mod repo;

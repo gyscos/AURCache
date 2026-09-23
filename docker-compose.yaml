@@ -14,7 +14,8 @@
 # Web UI / API : http://localhost:8080   (plain HTTP; put a reverse proxy in front for TLS)
 # Pacman repo  : http://localhost:8081   (add as a [repo] Server in pacman.conf)
 #
-# To scale local build throughput, raise WORKER_CONCURRENCY or run more workers:
+# To scale local build throughput, raise the worker's concurrency on its page in
+# AURCache (or WORKER_CONCURRENCY_DEFAULT below), or run more workers:
 #     docker compose up -d --scale builder=3
 #
 # For a worker on separate hardware / a foreign architecture (e.g. aarch64), see
@@ -85,8 +86,10 @@ services:
       # Same shared volume as the server -> this worker is auto-approved. This is
       # also the worker's default path, shown here for clarity.
       - AURCACHE_ENROLLMENT_DIR=/enroll
-      # How many packages this worker builds in parallel.
-      - WORKER_CONCURRENCY=2
+      # How many packages this worker builds in parallel. `_DEFAULT` makes it a
+      # starting point you can change from the worker's page in AURCache; the
+      # plain WORKER_CONCURRENCY would pin it here.
+      - WORKER_CONCURRENCY_DEFAULT=2
       # Native architectures this worker builds (default: auto = host arch).
       # - WORKER_ARCHES=x86_64
     volumes:
@@ -141,7 +144,7 @@ services:
       # This worker builds aarch64 natively (from the emulated container's POV).
       - WORKER_ARCHES=aarch64
       # Emulated builds are slow; keep concurrency low.
-      - WORKER_CONCURRENCY=1
+      - WORKER_CONCURRENCY_DEFAULT=1
     volumes:
       - enroll:/enroll
       - worker_data_arm:/var/lib/aurcache-worker

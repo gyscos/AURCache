@@ -4,11 +4,16 @@ How a worker's settings could be seen and changed through AURCache's API and UI,
 instead of only through each machine's environment, and how the change would
 reach a running worker.
 
-Status: **third revision; phase 1 steps 1-2 implemented**. The worker declares
-its settings, reads `<env_var>_DEFAULT` for each, reports what each resolved to,
-and the Workers page shows all of it with refused values flagged. Nothing is
-*set* from the server yet: the `worker_settings` table, the `PATCH`, snapshot
-delivery and application (steps 3-6) are still proposal.
+Status: **implemented** (phase 1, steps 1-6). The worker declares its settings,
+reads `<env_var>_DEFAULT` for each and reports what each resolved to; values are
+set per worker on its page or with `aurcache-cli worker config`, saved in one
+transaction, delivered over the heartbeat and applied without a restart. Two
+deliberate divergences from the text below are recorded where they apply: the
+snapshot is not returned at registration ([Recommended](#compared)), and the
+concurrency gate is a target and a count rather than a semaphore with a deficit
+([Concurrency](#concurrency)). [Drain](#drain) is built as described, named pause and resume. Not built,
+and not part of phase 1: fleet defaults, declarations for the legacy container
+worker, and phase 2 (SSE).
 
 - The first draft had a server-side allowlist of worker settings and a fleet
   default. Two reviews ([`worker-configuration-review.md`](worker-configuration-review.md),
@@ -360,6 +365,13 @@ not remove the heartbeat; it adds a second path beside it.
 that restarts has its server values before it claims anything rather than one
 heartbeat later.
 
+> **As built:** not at registration. Registration runs on the enrollment client,
+> before the worker holds a certificate, and `register_status` answers anyone who
+> knows a fingerprint -- so a snapshot there would hand a worker's configuration
+> to whoever asked. Instead the runner sends one heartbeat before its first
+> claim (`Runner::run`), which is authenticated and gets the same result: a
+> restarted worker has its server values before it builds anything.
+
 ---
 
 ## 3. The protocol
@@ -444,7 +456,8 @@ stale value there is bounded by the re-registration, well within the existing
 ```text
 Worker                                   Server
   |-- register {settings:[decl...]} ----->  |   stores the declaration
-  |<- {config: rev a1b2, {...}} ---------  |   worker applies, gives each key a status
+  |-- heartbeat {received: none} -------->  |   (first heartbeat, before any claim)
+  |<- {cancel:[], config: rev a1b2} ------  |   worker applies, gives each key a status
   |-- heartbeat {received a1b2, effective}->|   stores the effective config
   |<- {cancel:[]} -----------------------  |
   |                                        |   operator saves concurrency=3: one transaction
@@ -498,6 +511,13 @@ running builds finish; raising releases permits at once. The worker adjusts the
 gate *before* re-registering, so the server never records more capacity than
 the worker has.
 
+> **As built** (`aurcache_worker_core::gate`): no semaphore underneath at all,
+> just the target and the running count behind a mutex, with a `Notify` woken
+> when a build finishes or the target rises. A claim waits while the count is
+> at or over the target. That behaves as described -- lowering lets running
+> builds finish, raising lets the waiting claim through at once -- with no
+> deficit to keep consistent with a permit count.
+
 ### CPU limits need the controller first
 
 The worker writes `+cpu` to `cgroup.subtree_control` once, at startup, and only
@@ -517,6 +537,24 @@ running builds finish; the worker needs no message and no new code. As a worker
 setting it would be wrong twice over -- a worker could boot drained from its
 environment, and it would take a heartbeat and a re-registration to stop claims
 that the server can stop itself.
+
+> **As built, as pause and resume:** "drain" names something else wherever an
+> operator has met it -- Kubernetes and Nomad both *evict or migrate* running
+> work on a drain, and call "take nothing new" cordoning or ineligibility --
+> so it would read as cutting builds short, the opposite of what this does.
+> Pause is what GitLab calls exactly this for its runners.
+>
+> `workers.paused` (`m20260925_000000_worker_paused`), set with
+> `POST /workers/<id>/pause` and `/resume`, and `aurcache-cli worker
+> pause|resume`. What an operator reads is **Stop intake** and **Resume
+> intake**: about the worker rather than the builds, since new builds are not
+> stopped, only sent to other workers. The claim query gives a paused worker
+> nothing, and a paused worker no longer counts as available for priority
+> hold-back, so a lower-priority worker does not wait on one that will never
+> claim. The hard routing rules are unchanged: a package reserved to a paused
+> worker, or an arch only it builds natively, waits for it, and the waiting
+> reason says so (`WaitingReason::Paused`). Revoking clears the flag, so a
+> machine approved again later builds straight away; restarting does not.
 
 ---
 
@@ -552,17 +590,49 @@ that the server can stop itself.
    ordinary case. So a shared name resolves to a choice rather than a guess, and
    `/workers/by-cert/<fingerprint>` is the way past it -- the fingerprint being
    the identity the whole protocol is already keyed on.
-3. `worker_settings` table, dump/restore, transactional `PATCH` per worker, one
-   activity entry per save.
-4. Snapshot delivery: `config` in the registration and heartbeat responses,
-   `received_revision` back.
-5. Worker application: per-job snapshots, the concurrency gate, on-demand cgroup
+3. ~~`worker_settings` table, dump/restore, transactional `PATCH` per worker, one
+   activity entry per save.~~ **Done.**
+
+   As built: `worker_settings (worker_id, key, value)` with `UNIQUE (worker_id,
+   key)` and a cascading foreign key (`m20260924_000000_worker_settings`).
+   `PATCH /workers/<id>/config` takes `{settings: {key: value | null}}`, checks
+   every value against the stored declaration before writing any, and writes
+   the set in one transaction (`worker_store::save_worker_settings`); `null`
+   removes a value and needs no declaration, so one for a key a worker has
+   dropped can still be cleared. One `worker.settings_saved` entry per save
+   names the keys set and reset, not the values. Dumps carry the values on each
+   worker (`DumpWorker::settings`); restore writes them for a worker it creates,
+   keyed to its new row, and leaves an already-trusted worker's alone.
+4. ~~Snapshot delivery: `config` in the registration and heartbeat responses,
+   `received_revision` back.~~ **Done**, over the heartbeat only (see
+   [Recommended](#compared)). The revision is a SHA-256 of the values as a
+   key-ordered JSON map, computed only on the server.
+5. ~~Worker application: per-job snapshots, the concurrency gate, on-demand cgroup
    controllers, per-key status with rejected values keeping the previous one,
-   re-registration when the registration request changes.
-6. UI: the worker detail page (now read-only) grows the editing half -- a field
+   re-registration when the registration request changes.~~ **Done.**
+
+   As built: `WorkerSettings::with_snapshot` layers the values between the pin
+   and `_DEFAULT`; the runner hands the result to `Executor::reconfigure`, which
+   may refuse what the machine cannot honour (`WorkerSettings::refused` keeps the
+   previous value) and returns what is in force. The runner and the chroot
+   executor each hold their configuration behind a lock and swap it whole; a job
+   takes the current one when it starts. Only values from the server are refused
+   by the executor: a limit pinned in the environment that cannot be enforced
+   keeps its startup behaviour of refusing builds. `Hierarchy::for_build` enables
+   the `cpu` controller when a build's limits need it, and new totals are
+   written to `builds/` as soon as they arrive. Re-registration is checked on
+   every heartbeat and retried until the server takes it.
+6. ~~UI: the worker detail page (now read-only) grows the editing half -- a field
    per setting, per-key status, and env-pinned rows naming the variable and the
    way to unpin them. The shipped compose files and the CLI's generated ones
-   write policy as `_DEFAULT` variables.
+   write policy as `_DEFAULT` variables.~~ **Done.**
+
+   As built: edits are staged and saved together; a pinned row's field is
+   disabled; a staged change says when it takes effect, including the warning
+   for settings applied to running builds; values for keys no longer declared
+   are listed to be cleared; and the page says when the worker has not yet taken
+   the latest save. `aurcache-cli worker config <id> [--set k=v] [--reset k]` does
+   the same from a terminal.
 
 **Later, if wanted:** fleet defaults, on the terms in
 [Per worker only, for now](#per-worker-only-for-now); declarations for the legacy
@@ -632,3 +702,11 @@ allows them too.
   pins. Handing a setting to the server became a rename that keeps the machine's
   value, instead of a deletion that dropped it to the built-in default, and
   shipped templates write defaults instead of commenting policy out.
+
+### Implementation
+
+Steps 3-6 built as described above, with the two divergences noted where they
+apply: no snapshot at registration, and a gate without a semaphore. The
+`concurrency` and `WORKER_TOTAL_BUILD_*` declarations now say they apply
+immediately, which is what the table in [Snapshots per job](#snapshots-per-job)
+always said they would.

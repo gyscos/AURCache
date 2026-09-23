@@ -60,32 +60,16 @@ pub fn Workers() -> Element {
     let mut busy = use_signal(|| Option::<i32>::None);
     let mut status = use_signal(|| Option::<(String, bool)>::None);
 
-    // Both actions are the same shape, and both must refetch: the server
+    // Every action is the same shape, and every one must refetch: the server
     // decides what a worker becomes, and the row has to show what it decided.
-    let act = move |(id, approve): (i32, bool)| async move {
+    let act = move |(id, action): (i32, WorkerAction)| async move {
         busy.set(Some(id));
         status.set(None);
-        let outcome = match crate::api::client() {
-            Err(e) => Err(e),
-            Ok(client) => if approve {
-                client.approve_worker(id).await
-            } else {
-                client.revoke_worker(id).await
-            }
-            .map_err(|e| e.to_string()),
-        };
+        let outcome = action.perform(id).await;
         busy.set(None);
         match outcome {
             Ok(()) => {
-                status.set(Some((
-                    if approve {
-                        "Worker approved. It can claim jobs once it checks in."
-                    } else {
-                        "Worker revoked. Its builds have been requeued."
-                    }
-                    .to_string(),
-                    true,
-                )));
+                status.set(Some((action.done().to_string(), true)));
                 reload += 1;
             }
             Err(e) => status.set(Some((e, false))),
@@ -285,8 +269,7 @@ fn WorkersTable(
     fleet: Vec<Worker>,
     /// The worker with an action in flight, if any.
     busy: Option<i32>,
-    /// `(id, approve)` — true approves, false revokes.
-    act: EventHandler<(i32, bool)>,
+    act: EventHandler<(i32, WorkerAction)>,
     /// Package names that resolve to a real package. A reservation naming one
     /// is a link; any other reservation stays plain text. `None` while the
     /// package list is still loading or failed — plain text is the fallback
@@ -370,7 +353,14 @@ fn WorkersTable(
                                     }
                                 }
                             }
-                            td { StatusBadge { status: worker.status } }
+                            td {
+                                div { class: "flex flex-wrap gap-1",
+                                    StatusBadge { status: worker.status }
+                                    if worker.paused {
+                                        PausedBadge {}
+                                    }
+                                }
+                            }
                             td { Liveness { worker: worker.clone() } }
                             td { class: "{WIDE_ONLY}",
                                 Record { worker: worker.clone(), fleet_finished }
@@ -451,8 +441,7 @@ fn WorkersTable(
 fn WorkerActions(
     worker: Worker,
     busy: bool,
-    /// `(id, approve)` -- true approves, false revokes.
-    act: EventHandler<(i32, bool)>,
+    act: EventHandler<(i32, WorkerAction)>,
     /// Where this worker's own page is.
     route: Route,
 ) -> Element {
@@ -472,19 +461,99 @@ fn WorkerActions(
                 button {
                     class: "btn btn-primary btn-xs",
                     disabled: busy,
-                    onclick: move |_| act.call((id, true)),
+                    onclick: move |_| act.call((id, WorkerAction::Approve)),
                     if worker.status.is_retired() { "Reinstate" } else { "Approve" }
+                }
+            }
+            if worker.status.can_build() {
+                if worker.paused {
+                    button {
+                        class: "btn btn-ghost btn-xs",
+                        disabled: busy,
+                        title: WorkerAction::Resume.hint(),
+                        onclick: move |_| act.call((id, WorkerAction::Resume)),
+                        "Resume intake"
+                    }
+                } else {
+                    button {
+                        class: "btn btn-ghost btn-xs",
+                        disabled: busy,
+                        title: WorkerAction::Pause.hint(),
+                        onclick: move |_| act.call((id, WorkerAction::Pause)),
+                        "Stop intake"
+                    }
                 }
             }
             if !worker.status.is_retired() {
                 button {
                     class: "btn btn-ghost btn-xs",
                     disabled: busy,
-                    title: "Refuse this worker's certificate and requeue its builds",
-                    onclick: move |_| act.call((id, false)),
+                    title: WorkerAction::Revoke.hint(),
+                    onclick: move |_| act.call((id, WorkerAction::Revoke)),
                     "Revoke"
                 }
             }
+        }
+    }
+}
+
+/// Something an operator does to a worker from the fleet list or its page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerAction {
+    Approve,
+    Revoke,
+    /// Take no new builds; let the ones it holds finish.
+    Pause,
+    Resume,
+}
+
+impl WorkerAction {
+    pub(crate) async fn perform(self, id: i32) -> Result<(), String> {
+        let client = crate::api::client()?;
+        match self {
+            Self::Approve => client.approve_worker(id).await,
+            Self::Revoke => client.revoke_worker(id).await,
+            Self::Pause => client.pause_worker(id).await,
+            Self::Resume => client.resume_worker(id).await,
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    /// What has happened, once the server has done it.
+    pub(crate) const fn done(self) -> &'static str {
+        match self {
+            Self::Approve => "Worker approved. It can claim jobs once it checks in.",
+            Self::Revoke => "Worker revoked. Its builds have been requeued.",
+            Self::Pause => {
+                "Intake stopped. New builds go to other workers; the ones it is running \
+                 finish."
+            }
+            Self::Resume => "Intake resumed. The worker takes new builds from its next claim.",
+        }
+    }
+
+    /// What the button does, for its tooltip.
+    pub(crate) const fn hint(self) -> &'static str {
+        match self {
+            Self::Approve => "Let this worker claim builds",
+            Self::Revoke => "Refuse this worker's certificate and requeue its builds",
+            Self::Pause => {
+                "Stop giving this worker new builds; they go to other workers. Builds it is \
+                 running finish -- for a reboot, an upgrade or retiring the machine"
+            }
+            Self::Resume => "Give this worker new builds again",
+        }
+    }
+}
+
+/// An approved worker that has been asked to take nothing new.
+#[component]
+pub(crate) fn PausedBadge() -> Element {
+    rsx! {
+        span {
+            class: "badge badge-info badge-soft badge-sm whitespace-nowrap",
+            title: "New builds go to other workers; the ones it is running finish",
+            "intake stopped"
         }
     }
 }
@@ -608,6 +677,7 @@ mod tests {
             successful_builds: 0,
             failed_builds: 0,
             settings_rejected: None,
+            paused: false,
         }
     }
 
@@ -699,6 +769,49 @@ mod tests {
         let cmd = join_command("localhost", &info);
         assert!(cmd.contains("--network host"), "{cmd}");
         assert!(cmd.contains("AURCACHE_URL=https://localhost:8083"), "{cmd}");
+    }
+
+    fn actions_for(status: ApprovalStatus, paused: bool) -> String {
+        #[component]
+        fn Harness(worker: Worker) -> Element {
+            rsx! {
+                super::WorkerActions {
+                    worker,
+                    busy: false,
+                    act: move |_| {},
+                    route: crate::routes::Route::Workers {},
+                }
+            }
+        }
+        let mut w = worker(&["x86_64"], &[]);
+        w.status = status;
+        w.paused = paused;
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { worker: w });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// Pause is offered to an approved worker, Resume to a paused one, and
+    /// neither to a worker that claims nothing anyway.
+    #[test]
+    fn drain_and_resume_follow_the_workers_state() {
+        let approved = actions_for(ApprovalStatus::Approved, false);
+        assert!(
+            approved.contains(">Stop intake<") && !approved.contains(">Resume intake<"),
+            "{approved}"
+        );
+        let paused = actions_for(ApprovalStatus::Approved, true);
+        assert!(
+            paused.contains(">Resume intake<") && !paused.contains(">Stop intake<"),
+            "{paused}"
+        );
+        for status in [ApprovalStatus::Pending, ApprovalStatus::Revoked] {
+            let html = actions_for(status, false);
+            assert!(
+                !html.contains(">Stop intake<") && !html.contains(">Resume intake<"),
+                "{status:?}: {html}"
+            );
+        }
     }
 
     /// The three states have to be distinguishable at a glance; pending is the

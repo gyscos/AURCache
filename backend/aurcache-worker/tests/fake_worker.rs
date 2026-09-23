@@ -203,11 +203,12 @@ async fn fake_worker_protocol_roundtrip() {
             "nothing is reported until the first heartbeat"
         );
 
-        client
+        let first = client
             .heartbeat(&aurcache_common::worker::Heartbeat {
                 active_build_ids: vec![],
                 version: "test".to_string(),
                 effective: Some(cfg.settings.effective()),
+                received_revision: None,
             })
             .await
             .expect("heartbeat should be accepted");
@@ -226,6 +227,95 @@ async fn fake_worker_protocol_roundtrip() {
         assert!(
             report.settings.contains_key("concurrency"),
             "the report should cover the declared settings: {report:?}"
+        );
+
+        // --- Values set on the server reach the worker over the heartbeat.
+        //
+        // A worker holding nothing is sent the snapshot even when nothing is
+        // set: "no values" is a statement it has to have received to know.
+        let empty = first
+            .config
+            .expect("a worker that declares settings holds no snapshot yet");
+        assert!(empty.settings.is_empty());
+
+        // What the PATCH endpoint does once it has checked the values.
+        worker_store::save_worker_settings(
+            &db,
+            stored.id,
+            &std::collections::BTreeMap::from([
+                ("concurrency".to_string(), Some("3".to_string())),
+                ("build_timeout".to_string(), Some("6h".to_string())),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        // Still holding the empty one, so the new one is sent.
+        let delivered = client
+            .heartbeat(&aurcache_common::worker::Heartbeat {
+                active_build_ids: vec![],
+                version: "test".to_string(),
+                effective: None,
+                received_revision: Some(empty.revision.clone()),
+            })
+            .await
+            .unwrap()
+            .config
+            .expect("a save should be delivered on the next heartbeat");
+        assert_ne!(delivered.revision, empty.revision);
+        assert_eq!(delivered.settings["concurrency"], "3");
+
+        // Taken in the way the runner takes it, and reported back.
+        let next = cfg.with_settings(cfg.settings.with_snapshot(&delivered));
+        assert_eq!(next.concurrency, 3);
+        assert_eq!(next.build_timeout, 6 * 60 * 60);
+        let held = client
+            .heartbeat(&aurcache_common::worker::Heartbeat {
+                active_build_ids: vec![],
+                version: "test".to_string(),
+                effective: Some(next.settings.effective()),
+                received_revision: Some(delivered.revision.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            held.config.is_none(),
+            "a snapshot the worker holds was resent"
+        );
+        let stored = worker_store::find_worker(&db, stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let report: aurcache_common::worker_config::EffectiveConfig =
+            serde_json::from_str(stored.effective_config.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            report.received_revision.as_deref(),
+            Some(delivered.revision.as_str())
+        );
+        assert_eq!(
+            report.settings["concurrency"].source,
+            aurcache_common::worker_config::EffectiveSource::Server
+        );
+
+        // Concurrency is also what the server schedules by, so the worker
+        // registers again with it -- and the row the scheduler reads follows.
+        client
+            .register(&aurcache_worker_core::enroll::register_request(
+                &next,
+                identity.generate_csr(&next.name).unwrap(),
+                "chroot",
+            ))
+            .await
+            .expect("registering again while enrolled should be accepted");
+        let stored = worker_store::find_worker(&db, stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.concurrency, 3);
+        assert_eq!(
+            stored.status,
+            aurcache_common::api::worker::ApprovalStatus::Approved,
+            "registering again must not touch approval"
         );
     }
 

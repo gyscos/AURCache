@@ -34,7 +34,7 @@ use std::path::PathBuf;
 /// the shared token in its own environment. Workers re-register on startup, so
 /// without this gate revoking a worker would be undone by its next restart.
 /// Authorization is the `workers` row (the certificate itself proves nothing —
-/// see `design/worker-routing.md`), which makes any write of `approved` an
+/// see `design/implemented/worker-routing.md`), which makes any write of `approved` an
 /// immediate, complete re-grant.
 #[must_use]
 pub fn eval_auto_approve(

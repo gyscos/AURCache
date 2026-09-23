@@ -2,14 +2,16 @@
 //! and fingerprint lookup used by the mTLS auth guard.
 
 use crate::helpers::time::now_secs;
-use crate::prelude::Workers;
-use crate::workers;
+use crate::prelude::{WorkerSettings, Workers};
+use crate::{worker_settings, workers};
 use aurcache_common::api::worker::ApprovalStatus;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    TransactionSession, TransactionTrait,
 };
+use std::collections::BTreeMap;
 
 /// Everything a worker reports about itself at registration.
 ///
@@ -195,11 +197,34 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     id: i32,
     max_attempts: i32,
 ) -> Result<Option<Revoked>, DbErr> {
-    let Some(worker) = set_status(db, id, ApprovalStatus::Revoked).await? else {
+    let Some(mut active) = load_for_update(db, id).await? else {
         return Ok(None);
     };
+    active.status = Set(ApprovalStatus::Revoked);
+    // Pausing is how a machine is emptied before it is retired, and it
+    // belongs to that retirement: a machine approved again later is expected
+    // to build, not to come back still refusing work.
+    active.paused = Set(false);
+    let worker = active.update(db).await?;
     let requeued = crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
     Ok(Some(Revoked { worker, requeued }))
+}
+
+/// Ask a worker to take no new builds (`true`), or to take them again.
+///
+/// Nothing else changes: its builds keep running, its approval stands, and it
+/// keeps heartbeating. The claim query reads this on every claim, so it takes
+/// effect at the worker's next one. `None` when there is no such worker.
+pub async fn set_paused<C: ConnectionTrait>(
+    db: &C,
+    id: i32,
+    paused: bool,
+) -> Result<Option<workers::Model>, DbErr> {
+    let Some(mut active) = load_for_update(db, id).await? else {
+        return Ok(None);
+    };
+    active.paused = Set(paused);
+    Ok(Some(active.update(db).await?))
 }
 
 /// A revoked worker, and the builds taken back from it.
@@ -240,6 +265,108 @@ pub async fn store_effective_config<C: ConnectionTrait>(
     let mut active: workers::ActiveModel = worker.into();
     active.effective_config = Set(Some(effective.to_string()));
     active.update(db).await?;
+    Ok(())
+}
+
+/// The values set for a worker on the server, by key.
+///
+/// A map ordered by key, because that order is also the snapshot's canonical
+/// form: the revision a worker is sent is computed over exactly this.
+pub async fn worker_setting_values<C: ConnectionTrait>(
+    db: &C,
+    worker_id: i32,
+) -> Result<BTreeMap<String, String>, DbErr> {
+    Ok(WorkerSettings::find()
+        .filter(worker_settings::Column::WorkerId.eq(worker_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.key, row.value))
+        .collect())
+}
+
+/// What a save actually changed, for the one log entry it gets.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SavedSettings {
+    /// Keys given a value they did not already have.
+    pub set: Vec<String>,
+    /// Keys whose stored value was removed.
+    pub reset: Vec<String>,
+}
+
+impl SavedSettings {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.reset.is_empty()
+    }
+}
+
+/// Save several of a worker's settings as one change: every row is written in
+/// one transaction or none is.
+///
+/// One transaction because the snapshot a heartbeat delivers is read from
+/// committed rows, so a worker can never be sent half of a save -- fewer builds
+/// with more memory each, say, arriving as more builds with more memory each.
+///
+/// `Some` stores the value, `None` removes it. The caller has already checked
+/// each value against the worker's declaration; nothing here interprets them.
+/// A value equal to the stored one, or the removal of one that is not stored,
+/// is not counted as a change.
+pub async fn save_worker_settings<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    worker_id: i32,
+    changes: &BTreeMap<String, Option<String>>,
+) -> Result<SavedSettings, DbErr> {
+    let txn = db.begin().await?;
+    let before = worker_setting_values(&txn, worker_id).await?;
+    let mut saved = SavedSettings::default();
+    for (key, value) in changes {
+        match value {
+            Some(value) if before.get(key) != Some(value) => {
+                upsert_worker_setting(&txn, worker_id, key, value).await?;
+                saved.set.push(key.clone());
+            }
+            None if before.contains_key(key) => {
+                WorkerSettings::delete_many()
+                    .filter(worker_settings::Column::WorkerId.eq(worker_id))
+                    .filter(worker_settings::Column::Key.eq(key))
+                    .exec(&txn)
+                    .await?;
+                saved.reset.push(key.clone());
+            }
+            _ => {}
+        }
+    }
+    txn.commit().await?;
+    Ok(saved)
+}
+
+/// Write one value, replacing whatever the worker had under that key.
+///
+/// Public for restore, which writes a restored worker's values inside the
+/// transaction that restores the worker itself.
+pub async fn upsert_worker_setting<C: ConnectionTrait>(
+    db: &C,
+    worker_id: i32,
+    key: &str,
+    value: &str,
+) -> Result<(), DbErr> {
+    WorkerSettings::insert(worker_settings::ActiveModel {
+        worker_id: Set(worker_id),
+        key: Set(key.to_string()),
+        value: Set(value.to_string()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            worker_settings::Column::WorkerId,
+            worker_settings::Column::Key,
+        ])
+        .update_column(worker_settings::Column::Value)
+        .to_owned(),
+    )
+    .exec(db)
+    .await?;
     Ok(())
 }
 
@@ -616,5 +743,113 @@ mod tests {
         touch_last_seen(&db, w.id, Some("9.9.9")).await.unwrap();
         let bumped = Workers::find_by_id(w.id).one(&db).await.unwrap().unwrap();
         assert_eq!(bumped.version.as_deref(), Some("9.9.9"));
+    }
+
+    fn changes(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    /// A save writes values, replaces them and removes them in one go, and
+    /// reports only what it actually changed -- re-saving a value that is
+    /// already stored, or resetting one that is not, is not a change.
+    #[tokio::test]
+    async fn a_save_sets_replaces_and_removes_values() {
+        let db = setup().await;
+        let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+
+        let saved = save_worker_settings(
+            &db,
+            w.id,
+            &changes(&[("concurrency", Some("2")), ("build_timeout", Some("6h"))]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.set, ["build_timeout", "concurrency"]);
+        assert!(saved.reset.is_empty());
+
+        let saved = save_worker_settings(
+            &db,
+            w.id,
+            &changes(&[
+                ("concurrency", Some("3")),
+                ("build_timeout", None),
+                ("never_set", None),
+                ("unchanged", None),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.set, ["concurrency"]);
+        assert_eq!(saved.reset, ["build_timeout"]);
+
+        let values = worker_setting_values(&db, w.id).await.unwrap();
+        assert_eq!(
+            values,
+            BTreeMap::from([("concurrency".to_string(), "3".to_string())])
+        );
+
+        let again = save_worker_settings(&db, w.id, &changes(&[("concurrency", Some("3"))]))
+            .await
+            .unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// Pausing touches nothing but the flag, and a retirement clears it: a
+    /// machine approved again later is expected to build.
+    #[tokio::test]
+    async fn pausing_is_a_flag_that_retirement_clears() {
+        let db = setup().await;
+        let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+        approve_worker(&db, w.id).await.unwrap();
+
+        let paused = set_paused(&db, w.id, true).await.unwrap().unwrap();
+        assert!(paused.paused);
+        assert_eq!(paused.status, ApprovalStatus::Approved);
+
+        // Re-registering -- a worker restarting while paused -- keeps it.
+        let back = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+        assert!(back.paused, "a restart undid the pause");
+
+        revoke_worker(&db, w.id, 3).await.unwrap().unwrap();
+        approve_worker(&db, w.id).await.unwrap();
+        let again = find_worker(&db, w.id).await.unwrap().unwrap();
+        assert!(!again.paused, "a re-approved machine came back paused");
+
+        assert!(set_paused(&db, 9999, true).await.unwrap().is_none());
+    }
+
+    /// Values belong to one worker: another's are neither read nor touched.
+    #[tokio::test]
+    async fn values_are_per_worker() {
+        let db = setup().await;
+        let a = register_worker(&db, &reg("a", "fp-a")).await.unwrap();
+        let b = register_worker(&db, &reg("b", "fp-b")).await.unwrap();
+        save_worker_settings(&db, a.id, &changes(&[("concurrency", Some("4"))]))
+            .await
+            .unwrap();
+        save_worker_settings(&db, b.id, &changes(&[("concurrency", None)]))
+            .await
+            .unwrap();
+        assert!(worker_setting_values(&db, b.id).await.unwrap().is_empty());
+        assert_eq!(
+            worker_setting_values(&db, a.id).await.unwrap()["concurrency"],
+            "4"
+        );
+    }
+
+    /// The values go with their worker: foreign keys are enforced, and a
+    /// worker's settings are nobody else's to keep.
+    #[tokio::test]
+    async fn values_go_with_their_worker() {
+        let db = setup().await;
+        let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
+        save_worker_settings(&db, w.id, &changes(&[("concurrency", Some("2"))]))
+            .await
+            .unwrap();
+        Workers::delete_by_id(w.id).exec(&db).await.unwrap();
+        assert_eq!(WorkerSettings::find().all(&db).await.unwrap().len(), 0);
     }
 }

@@ -19,7 +19,8 @@ docker compose up -d
 
 The worker enrolls itself and starts polling for jobs within a few seconds — no
 token and no approval click. Add build capacity with `docker compose up -d
---scale builder=3`, or raise `WORKER_CONCURRENCY` on the worker.
+--scale builder=3`, or raise the worker's concurrency on its page in the web
+UI.
 
 ## With PostgreSQL
 
@@ -57,7 +58,7 @@ services:
     environment:
       - AURCACHE_URL=https://aurcache:8083
       - AURCACHE_ENROLLMENT_DIR=/enroll
-      - WORKER_CONCURRENCY=2
+      - WORKER_CONCURRENCY_DEFAULT=2
     volumes:
       - enroll:/enroll
       - worker_data:/var/lib/aurcache-worker

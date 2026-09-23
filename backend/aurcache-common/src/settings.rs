@@ -36,7 +36,7 @@ pub struct ApplicationSettings {
     pub date_format: SettingsEntry<String>,
     pub build_on_new_version: SettingsEntry<bool>,
     /// Keep this package's build tree between builds instead of starting from
-    /// an empty one. See `design/persistent-build-directory.md`.
+    /// an empty one. See `design/implemented/persistent-build-directory.md`.
     pub persistent_builddir: SettingsEntry<bool>,
     /// Let a PKGBUILD reach the network while the server parses it.
     /// See [`Setting::ParseNetwork`].

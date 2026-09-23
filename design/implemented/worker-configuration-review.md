@@ -1,6 +1,6 @@
 # Review: Configuring workers from the server
 
-Review of [`design/in-progress/worker-configuration.md`](worker-configuration.md).
+Review of [`design/implemented/worker-configuration.md`](worker-configuration.md).
 
 ## Summary and Verdict
 

@@ -9,7 +9,7 @@
 //! JSON text rather than a table of rows: neither is queried, and the server
 //! deliberately does not interpret a worker's settings -- it stores what the
 //! worker said and renders it. Values the *server* sets get a table of their
-//! own when they arrive (`design/worker-configuration.md`).
+//! own when they arrive (`design/implemented/worker-configuration.md`).
 //!
 //! NULL for a worker that has not reported one, which the Workers page shows as
 //! a worker version that does not report its configuration -- different from a

@@ -64,6 +64,9 @@ struct WorkerCap {
     last_seen: Option<i64>,
     /// Builds this worker currently holds in the ACTIVE state.
     active: i32,
+    /// Asked by an operator to take nothing new. Still approved, so it keeps
+    /// its builds and its place in the routing rules; it just claims nothing.
+    paused: bool,
 }
 
 /// A snapshot of the approved fleet, taken once per claim.
@@ -100,6 +103,7 @@ struct WorkerRow {
     emulated_arches: String,
     package_affinity: String,
     last_seen: Option<i64>,
+    paused: bool,
 }
 
 /// Split a stored comma-separated list column into its entries.
@@ -124,6 +128,7 @@ impl Fleet {
             .column(workers::Column::EmulatedArches)
             .column(workers::Column::PackageAffinity)
             .column(workers::Column::LastSeen)
+            .column(workers::Column::Paused)
             .filter(workers::Column::Status.eq(ApprovalStatus::Approved))
             .into_model()
             .all(db)
@@ -159,6 +164,7 @@ impl Fleet {
                 emulated: split_list(&row.emulated_arches),
                 last_seen: row.last_seen,
                 active: active.get(&row.id).copied().unwrap_or(0),
+                paused: row.paused,
             });
         }
         Ok(fleet)
@@ -210,10 +216,19 @@ impl Fleet {
         self.arch_ok(w, platform) && (!self.reserved(pkg) || self.affine(w.id, pkg))
     }
 
-    /// Whether this worker could pick a job up *right now*: recently seen and
-    /// not already at its concurrency limit.
+    /// Whether this worker was seen recently enough to count as up.
+    fn live(w: &WorkerCap, now: i64, liveness_timeout: i64) -> bool {
+        w.last_seen.is_some_and(|t| t >= now - liveness_timeout)
+    }
+
+    /// Whether this worker could pick a job up *right now*: up, not paused,
+    /// and not already at its concurrency limit.
+    ///
+    /// Being paused counts here, because this is what priority hold-back asks: a
+    /// paused worker will never take the job, so a lower-priority one must
+    /// not wait for it.
     fn available(w: &WorkerCap, now: i64, liveness_timeout: i64) -> bool {
-        w.last_seen.is_some_and(|t| t >= now - liveness_timeout) && w.active < w.concurrency
+        Self::live(w, now, liveness_timeout) && !w.paused && w.active < w.concurrency
     }
 
     /// Whether a strictly higher-priority worker could take this job right now.
@@ -239,7 +254,7 @@ impl Fleet {
 
 /// Atomically claim the next buildable job for `worker_id`.
 ///
-/// Routing has three layers (see `design/worker-routing.md`):
+/// Routing has three layers (see `design/implemented/worker-routing.md`):
 ///
 /// 1. **Affinity** (hard) — a package named by any approved worker may only be
 ///    built by workers that name it. Ignores liveness: handing an affine job to
@@ -273,8 +288,9 @@ pub async fn claim_job<C: ConnectionTrait>(
     liveness_timeout_secs: i64,
 ) -> Result<Option<builds::Model>, DbErr> {
     let fleet = Fleet::load(db).await?;
-    // Not approved (or vanished mid-request): nothing is claimable.
-    let Some(me) = fleet.worker(worker_id) else {
+    // Not approved (or vanished mid-request): nothing is claimable. Paused:
+    // nothing new, by the operator's request -- which is the whole of pause.
+    let Some(me) = fleet.worker(worker_id).filter(|me| !me.paused) else {
         return Ok(None);
     };
 
@@ -769,12 +785,25 @@ pub async fn waiting_reasons<C: ConnectionTrait>(
                     arch: platform.to_string(),
                 }
             }
-        } else if capable.iter().any(|w| {
-            w.last_seen
-                .is_some_and(|t| t >= now - liveness_timeout_secs)
-        }) {
-            // Someone capable is alive; this is just a queue.
+        } else if capable
+            .iter()
+            .any(|w| Fleet::live(w, now, liveness_timeout_secs) && !w.paused)
+        {
+            // Someone capable is alive and taking work; this is just a queue.
             continue;
+        } else if capable
+            .iter()
+            .any(|w| Fleet::live(w, now, liveness_timeout_secs))
+        {
+            // Up, but every one of them was asked to take nothing new. Named,
+            // because resuming one of them is the remedy.
+            let mut workers: Vec<String> = capable
+                .iter()
+                .filter(|w| Fleet::live(w, now, liveness_timeout_secs))
+                .map(|w| w.name.clone())
+                .collect();
+            workers.sort();
+            WaitingReason::Paused { workers }
         } else if fleet.reserved(pkg) {
             WaitingReason::Affinity {
                 workers: fleet.affinity_holders(pkg),
@@ -1770,6 +1799,99 @@ mod tests {
 
         let reasons = waiting_reasons(&db, LIVENESS).await.unwrap();
         assert_eq!(reasons.get(&103), Some(&WaitingReason::Offline));
+    }
+
+    // ------------------------------------------------------------- pause
+
+    async fn pause(db: &DatabaseConnection, id: i32, paused: bool) {
+        crate::helpers::worker_store::set_paused(db, id, paused)
+            .await
+            .unwrap()
+            .expect("the worker exists");
+    }
+
+    /// A paused worker claims nothing, and takes work again once resumed.
+    #[tokio::test]
+    async fn a_paused_worker_claims_nothing_until_resumed() {
+        let db = setup().await;
+        worker(&db, W::default()).await;
+        enqueue(&db, 200, "x86_64", now_secs()).await;
+
+        pause(&db, 1, true).await;
+        assert!(
+            claim(&db, 1).await.is_none(),
+            "a paused worker was handed a job"
+        );
+        pause(&db, 1, false).await;
+        assert_eq!(claim(&db, 1).await.unwrap().id, 200);
+    }
+
+    /// Pausing the fast worker must not leave the fallback waiting for it: it
+    /// will never take the job, so it does not count as available.
+    #[tokio::test]
+    async fn a_paused_worker_does_not_hold_back_a_lower_priority_one() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                priority: 10,
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        pause(&db, 1, true).await;
+        enqueue(&db, 201, "x86_64", now_secs()).await;
+
+        assert_eq!(
+            claim(&db, 2).await.map(|b| b.id),
+            Some(201),
+            "the fallback waited on a paused worker"
+        );
+    }
+
+    /// A build only paused workers could take says so, naming them -- and a
+    /// build someone else can take is just queued.
+    #[tokio::test]
+    async fn explains_a_build_only_paused_workers_could_take() {
+        let db = setup().await;
+        worker(
+            &db,
+            W {
+                id: 1,
+                affinity: "reserved",
+                ..W::default()
+            },
+        )
+        .await;
+        worker(
+            &db,
+            W {
+                id: 2,
+                ..W::default()
+            },
+        )
+        .await;
+        pause(&db, 1, true).await;
+        enqueue_pkg(&db, 202, "reserved", "x86_64", now_secs()).await;
+        enqueue(&db, 203, "x86_64", now_secs()).await;
+
+        let reasons = waiting_reasons(&db, LIVENESS).await.unwrap();
+        assert_eq!(
+            reasons.get(&202),
+            Some(&WaitingReason::Paused {
+                workers: vec!["w1".to_string()]
+            })
+        );
+        assert_eq!(reasons.get(&203), None, "w2 can take it; that is a queue");
     }
 
     // ------------------------------------------------- leases and reaping

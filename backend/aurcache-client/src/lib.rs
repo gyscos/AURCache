@@ -44,7 +44,7 @@ pub use aurcache_common::api::stats::{
 };
 pub use aurcache_common::api::waiting::WaitingReason;
 pub use aurcache_common::api::worker::{
-    ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary as Worker,
+    ApprovalStatus, WorkerConfigUpdate, WorkerConfigView, WorkerJoinInfo, WorkerSummary as Worker,
 };
 pub use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
@@ -771,6 +771,23 @@ impl AurCacheClient {
         .await
     }
 
+    /// Saves values for several of a worker's settings as one change, and
+    /// returns the configuration as it stands afterwards. `None` removes a
+    /// value so the worker falls back to its own.
+    pub async fn update_worker_config(
+        &self,
+        id: i32,
+        update: &WorkerConfigUpdate,
+    ) -> Result<WorkerConfigView> {
+        self.request_json(
+            Method::PATCH,
+            &format!("/workers/{id}/config"),
+            &[],
+            Some(update),
+        )
+        .await
+    }
+
     /// The image and worker-protocol port a new worker's `docker run` needs.
     pub async fn worker_join_info(&self) -> Result<WorkerJoinInfo> {
         self.request_json::<WorkerJoinInfo, Value>(Method::GET, "/workers/join-info", &[], None)
@@ -780,6 +797,18 @@ impl AurCacheClient {
     /// Approves a pending worker, signing its CSR so it can build.
     pub async fn approve_worker(&self, id: i32) -> Result<()> {
         self.request_empty::<Value>(Method::POST, &format!("/workers/{id}/approve"), &[], None)
+            .await
+    }
+
+    /// Asks a worker to take no new builds and let the ones it holds finish.
+    pub async fn pause_worker(&self, id: i32) -> Result<()> {
+        self.request_empty::<Value>(Method::POST, &format!("/workers/{id}/pause"), &[], None)
+            .await
+    }
+
+    /// Lets a paused worker take builds again.
+    pub async fn resume_worker(&self, id: i32) -> Result<()> {
+        self.request_empty::<Value>(Method::POST, &format!("/workers/{id}/resume"), &[], None)
             .await
     }
 

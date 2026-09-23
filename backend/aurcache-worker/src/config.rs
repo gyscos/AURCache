@@ -91,15 +91,9 @@ impl Config {
         // The executor's settings are declared beside the protocol ones, so
         // registration reports one table and the fields below read from the
         // same resolved values the server is shown.
-        core.settings =
+        let settings =
             std::mem::take(&mut core.settings).extended(crate::settings::chroot_settings());
-        let settings = &core.settings;
-
-        let (src_budget, pkg_budget) = split_cache_budgets(
-            settings.size(keys::CACHE_MAX_SIZE),
-            settings.size(keys::SRCCACHE_MAX_SIZE),
-            settings.size(keys::PKGCACHE_MAX_SIZE),
-        );
+        let core = core.with_settings(settings);
 
         // The chroot lives under the data dir by default so that persisting one
         // volume persists the identity *and* the expensive base chroot; a
@@ -109,7 +103,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| core.data_dir.join("chroot"));
 
-        Self {
+        let mut cfg = Self {
             git_ssh_key: env_opt("WORKER_GIT_SSH_KEY").map(PathBuf::from),
             ssh_known_hosts: env_opt("WORKER_SSH_KNOWN_HOSTS").map(PathBuf::from),
             bind_mounts: env_opt("WORKER_BIND_MOUNTS")
@@ -119,37 +113,73 @@ impl Config {
             cache_dir: env_opt("WORKER_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/cache/aurcache-worker")),
-            keyserver: settings
-                .raw(keys::KEYSERVER)
-                .unwrap_or(crate::settings::DEFAULT_KEYSERVER)
-                .to_string(),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
-            cache_max_size: src_budget,
-            cache_ttl: settings
-                .duration(keys::CACHE_TTL)
-                .unwrap_or(crate::settings::DEFAULT_CACHE_TTL),
-            pkgcache_max_size: pkg_budget,
-            pkgcache_ttl: settings.duration(keys::PKGCACHE_TTL).unwrap_or(0),
-            chroot_refresh_interval: settings
-                .duration(keys::CHROOT_REFRESH_INTERVAL)
-                .unwrap_or(crate::settings::DEFAULT_CHROOT_REFRESH_INTERVAL),
             chroot_mode: crate::chroots::ChrootMode::parse(
                 env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
             ),
-            build_limits: limits_from_settings(
-                settings,
-                keys::BUILD_MEMORY_MAX,
-                keys::BUILD_SWAP_MAX,
-                keys::BUILD_CPUS,
-            ),
-            total_build_limits: limits_from_settings(
-                settings,
-                keys::TOTAL_BUILD_MEMORY_MAX,
-                keys::TOTAL_BUILD_SWAP_MAX,
-                keys::TOTAL_BUILD_CPUS,
-            ),
+            // Filled in from the settings just below, by the same code that
+            // fills them in again whenever the server delivers new values.
+            keyserver: String::new(),
+            cache_max_size: 0,
+            cache_ttl: 0,
+            pkgcache_max_size: 0,
+            pkgcache_ttl: 0,
+            chroot_refresh_interval: 0,
+            build_limits: crate::cgroup::BuildLimits::default(),
+            total_build_limits: crate::cgroup::BuildLimits::default(),
             core,
-        }
+        };
+        cfg.read_settings();
+        cfg
+    }
+
+    /// The same configuration with `settings` in force: the protocol's
+    /// declared fields and this executor's read again from them, and nothing
+    /// else touched -- the paths, the build user and the bind mounts are the
+    /// machine's alone.
+    #[must_use]
+    pub fn with_settings(&self, settings: WorkerSettings) -> Self {
+        let mut cfg = Self {
+            core: self.core.with_settings(settings),
+            ..self.clone()
+        };
+        cfg.read_settings();
+        cfg
+    }
+
+    /// Read this executor's declared fields from `core.settings`.
+    fn read_settings(&mut self) {
+        let settings = &self.core.settings;
+        let (src_budget, pkg_budget) = split_cache_budgets(
+            settings.size(keys::CACHE_MAX_SIZE),
+            settings.size(keys::SRCCACHE_MAX_SIZE),
+            settings.size(keys::PKGCACHE_MAX_SIZE),
+        );
+        self.keyserver = settings
+            .raw(keys::KEYSERVER)
+            .unwrap_or(crate::settings::DEFAULT_KEYSERVER)
+            .to_string();
+        self.cache_max_size = src_budget;
+        self.cache_ttl = settings
+            .duration(keys::CACHE_TTL)
+            .unwrap_or(crate::settings::DEFAULT_CACHE_TTL);
+        self.pkgcache_max_size = pkg_budget;
+        self.pkgcache_ttl = settings.duration(keys::PKGCACHE_TTL).unwrap_or(0);
+        self.chroot_refresh_interval = settings
+            .duration(keys::CHROOT_REFRESH_INTERVAL)
+            .unwrap_or(crate::settings::DEFAULT_CHROOT_REFRESH_INTERVAL);
+        self.build_limits = limits_from_settings(
+            settings,
+            keys::BUILD_MEMORY_MAX,
+            keys::BUILD_SWAP_MAX,
+            keys::BUILD_CPUS,
+        );
+        self.total_build_limits = limits_from_settings(
+            settings,
+            keys::TOTAL_BUILD_MEMORY_MAX,
+            keys::TOTAL_BUILD_SWAP_MAX,
+            keys::TOTAL_BUILD_CPUS,
+        );
     }
 }
 

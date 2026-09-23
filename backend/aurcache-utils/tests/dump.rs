@@ -762,6 +762,20 @@ async fn workers_are_restored_by_fingerprint() {
     .insert(&source)
     .await
     .unwrap();
+    // Configuration someone chose for this machine travels with it.
+    let source_id = workers::Entity::find()
+        .one(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    aurcache_db::helpers::worker_store::save_worker_settings(
+        &source,
+        source_id,
+        &std::collections::BTreeMap::from([("build_timeout".to_string(), Some("6h".to_string()))]),
+    )
+    .await
+    .unwrap();
     let bytes = dump_bytes(&source).await;
 
     let target = db().await;
@@ -778,6 +792,11 @@ async fn workers_are_restored_by_fingerprint() {
     // No certificate travels: one signed by another instance's CA would mean
     // nothing here, so the worker re-enrols and is approved on its fingerprint.
     assert_eq!(restored[0].signed_cert, None);
+    // Its values follow it, keyed to the row it has here.
+    let values = aurcache_db::helpers::worker_store::worker_setting_values(&target, restored[0].id)
+        .await
+        .unwrap();
+    assert_eq!(values.get("build_timeout").map(String::as_str), Some("6h"));
 }
 
 /// A worker already trusted here keeps the routing this instance gave it. The

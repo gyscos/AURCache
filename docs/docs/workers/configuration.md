@@ -14,9 +14,10 @@ yourself.
 
 A build worker is a long-lived process that enrolls with AURCache, claims build
 jobs, builds each package in its own `devtools` chroot, and uploads the result.
-Workers are configured entirely through environment variables — AURCache's
-Settings pages do not override them, and a worker reports its configuration
-every time it starts, so changing a value means restarting that worker.
+A worker starts from its environment variables. Its policy and tuning settings —
+concurrency, build limits, cache budgets, timeouts — can then be set for it from
+AURCache, on the worker's own page, and reach it without a restart. Everything
+else (its identity, its paths, what a build may reach) stays on the machine.
 
 ## Seeing what a worker is running
 
@@ -37,7 +38,45 @@ and carries on — but the page then says the value was refused and names what i
 running instead, and the worker's row is flagged in the list. Before, the only
 trace was a line in that machine's journal.
 
-The page is read-only. Values are still the worker's own.
+## Setting values from AURCache
+
+Each setting on a worker's page has a field. Change as many as you need, then
+**Save**: the whole set is saved as one change, so a worker never picks up half
+of it — fewer builds with more memory each cannot arrive as more builds with
+more memory each. The CLI does the same:
+
+```bash
+aurcache-cli worker config 3                                  # show
+aurcache-cli worker config 3 --set concurrency=2 --set build_memory_max=48G
+aurcache-cli worker config 3 --reset build_timeout            # back to the worker's own
+```
+
+A value is checked against what that worker says it accepts before it is saved,
+so `1.5 bananas` for a size is refused where you typed it. The worker picks the
+save up on its next heartbeat (every 15 seconds), or when it next checks in if
+it is offline, and its page then shows the value as *set here*. When it takes
+effect depends on the setting, and the page says which:
+
+| Takes effect | Settings |
+|---|---|
+| At once | concurrency (running builds finish; nothing new starts over the new limit), priority and package affinity, the `WORKER_TOTAL_BUILD_*` totals |
+| From the next build | per-build limits, build timeout, keyserver — builds already running keep what they started with |
+| At its next pass | cache budgets and TTLs, build-tree budgets, chroot refresh and poll intervals |
+
+The totals apply to builds already running: lowering the total memory below
+what they are using makes the kernel reclaim and then kill one of them.
+
+A worker can still refuse a value AURCache accepted — a CPU limit on a host
+whose cgroup cannot take one, say. It then keeps the value it was running (a
+refusal never loosens a limit), and the page shows the refusal and why.
+
+Removing a value (**Reset**) returns the setting to the worker's own: its
+`_DEFAULT` variable if it has one, otherwise its built-in default. A value set
+for a setting the worker no longer offers — renamed or removed in an upgrade —
+is kept and listed separately rather than deleted, so you can clear it.
+
+Values set here are included in a backup (**Settings → Backup**), with the
+worker they belong to, and restored with it.
 
 ### `_DEFAULT`: a value the server may take over
 
@@ -48,11 +87,18 @@ Every setting that page lists reads two variables:
 | `WORKER_CONCURRENCY=4` | **Pin.** This machine runs 4, whatever anything else says. |
 | `WORKER_CONCURRENCY_DEFAULT=4` | **Default.** This machine runs 4 until a value is set for it on the server. |
 
-Today the two behave identically, because nothing can set a value on the server
-yet. The difference is what happens when that arrives: a pinned setting stays the
-machine's to decide, and a `_DEFAULT` one becomes manageable from AURCache
-without the machine losing the value it starts from. Renaming a variable is the
-whole of the handover.
+A value set in AURCache beats `_DEFAULT` but not the pin: the order is pin, then
+AURCache, then `_DEFAULT`, then the built-in default. So a machine can keep a
+value out of AURCache's hands — its memory limit, say — while leaving its
+concurrency to be managed centrally. A pinned setting's field is disabled, and
+the page names the variable doing the pinning.
+
+Renaming a variable is the whole of the handover: `WORKER_CONCURRENCY=2`
+becomes `WORKER_CONCURRENCY_DEFAULT=2`, and the machine keeps running 2 until a
+value is set for it. The compose files AURCache ships, and those `aurcache-cli
+setup` writes, use the `_DEFAULT` names. A worker older than this feature ignores
+`_DEFAULT` and runs its built-in default instead, so upgrade workers before
+renaming their variables.
 
 Only the settings that page lists read `_DEFAULT`. The ones that decide what a
 build can reach — the chroot directory, the bind mounts, the build user — are

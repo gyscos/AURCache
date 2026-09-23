@@ -6,17 +6,37 @@
 //! at once.
 
 use aurcache_common::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker_config::EffectiveSource;
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
-use std::sync::Arc;
+use aurcache_worker_core::settings::WorkerSettings;
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::cgroup::Hierarchy;
 use crate::chroots::Chroots;
 use crate::config::Config;
 use crate::job;
+use crate::settings::keys;
 use crate::srcdest_lock::SrcdestLocks;
+
+/// Every limit key, per build and in total.
+const LIMIT_KEYS: [&str; 6] = [
+    keys::BUILD_MEMORY_MAX,
+    keys::BUILD_SWAP_MAX,
+    keys::BUILD_CPUS,
+    keys::TOTAL_BUILD_MEMORY_MAX,
+    keys::TOTAL_BUILD_SWAP_MAX,
+    keys::TOTAL_BUILD_CPUS,
+];
+const CPU_KEYS: [&str; 2] = [keys::BUILD_CPUS, keys::TOTAL_BUILD_CPUS];
+const TOTAL_KEYS: [&str; 3] = [
+    keys::TOTAL_BUILD_MEMORY_MAX,
+    keys::TOTAL_BUILD_SWAP_MAX,
+    keys::TOTAL_BUILD_CPUS,
+];
 
 /// State that spans the concurrent builds on this worker.
 ///
@@ -34,7 +54,11 @@ pub struct Shared {
 
 /// Builds each package in its own `devtools` chroot copy.
 pub struct ChrootExecutor {
-    cfg: Arc<Config>,
+    /// The configuration in force, replaced whole when the server delivers
+    /// values. Each job takes the one current when it starts and keeps it:
+    /// a build keeps the limits it started with, because a build sized for one
+    /// limit and killed by another is worse than waiting for the next build.
+    cfg: RwLock<Arc<Config>>,
     shared: Arc<Shared>,
     /// The prepared cgroup subtree each build's cgroup is created under, so
     /// `memory.peak` reports one build rather than the worker and its siblings.
@@ -135,10 +159,58 @@ impl ChrootExecutor {
         });
         shared.chroots.detect().await;
         Self {
-            cfg,
+            cfg: RwLock::new(cfg),
             shared,
             cgroups,
         }
+    }
+
+    /// The configuration in force now.
+    fn current(&self) -> Arc<Config> {
+        // Poisoned only by a panic mid-assignment of an `Arc`, which leaves
+        // either the old value or the new one -- both usable.
+        Arc::clone(
+            &self
+                .cfg
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The limits in `settings` this machine cannot enforce, with why.
+    ///
+    /// Only the server's values are refused. A limit pinned in the machine's
+    /// own environment that cannot be enforced keeps its startup behaviour --
+    /// builds are refused rather than run without it -- because that is the
+    /// operator of that machine saying the limit matters more than building.
+    /// A value from the server that could not be enforced would instead fail
+    /// every build until someone noticed, so it is refused and the previous
+    /// value stands.
+    fn unenforceable(&self, settings: &WorkerSettings, next: &Config) -> BTreeMap<String, String> {
+        let from_server = |keys: &[&str], why: &str| -> BTreeMap<String, String> {
+            keys.iter()
+                .filter(|key| {
+                    settings.source(key) == Some(EffectiveSource::Server)
+                        && settings.raw(key).is_some()
+                })
+                .map(|key| ((*key).to_string(), why.to_string()))
+                .collect()
+        };
+        let Some(hierarchy) = &self.cgroups else {
+            return from_server(
+                &LIMIT_KEYS,
+                "this worker has no cgroup to enforce build limits in (see its startup log)",
+            );
+        };
+        if (next.build_limits.cpus.is_some() || next.total_build_limits.cpus.is_some())
+            && let Err(e) = hierarchy.enable_cpu()
+        {
+            return from_server(
+                &CPU_KEYS,
+                &format!("the cpu controller cannot be enabled on this worker: {e:#}"),
+            );
+        }
+        BTreeMap::new()
     }
 }
 
@@ -160,8 +232,10 @@ impl Executor for ChrootExecutor {
         // what they said.
         let _srcdest = self.shared.srcdest.acquire(&job.pkgbase).await;
 
+        // Once, here: everything this build does reads this copy.
+        let cfg = self.current();
         job::run_job(
-            &self.cfg,
+            &cfg,
             self.cgroups.as_ref(),
             &client,
             job,
@@ -176,6 +250,53 @@ impl Executor for ChrootExecutor {
     }
 
     fn describe_self(&self) -> String {
-        format!("devtools chroot ({})", self.cfg.chroot_dir.display())
+        format!("devtools chroot ({})", self.current().chroot_dir.display())
+    }
+
+    /// Take delivered values: refuse the limits this machine cannot enforce,
+    /// put new totals on the builds' cgroup at once, and keep the rest for the
+    /// next build.
+    async fn reconfigure(&self, settings: WorkerSettings) -> WorkerSettings {
+        let current = self.current();
+        let previous = &current.core.settings;
+        let mut settings = settings;
+        let mut next = current.with_settings(settings.clone());
+
+        let refused = self.unenforceable(&settings, &next);
+        if !refused.is_empty() {
+            tracing::warn!("refusing build limits from the server: {refused:?}");
+            settings = settings.refused(&refused, previous);
+            next = current.with_settings(settings.clone());
+        }
+
+        // Totals bound what the builds already running use between them, so
+        // they go on now rather than with the next build -- including a lower
+        // one, which is what an operator asked for even when the running
+        // builds are over it.
+        if next.total_build_limits != current.total_build_limits
+            && let Some(hierarchy) = &self.cgroups
+            && let Err(e) = hierarchy.apply_total(&next.total_build_limits)
+        {
+            tracing::warn!("could not apply the delivered total build limits ({e:#})");
+            let why = format!("the total could not be applied on this worker: {e:#}");
+            let refused: BTreeMap<String, String> = TOTAL_KEYS
+                .iter()
+                .filter(|key| settings.source(key) == Some(EffectiveSource::Server))
+                .map(|key| ((*key).to_string(), why.clone()))
+                .collect();
+            settings = settings.refused(&refused, previous);
+            next = current.with_settings(settings.clone());
+            // Best-effort: a partial write must not leave a mix of the two.
+            let _ = hierarchy.apply_total(&next.total_build_limits);
+        }
+
+        self.shared
+            .chroots
+            .set_interval(Duration::from_secs(next.chroot_refresh_interval));
+        *self
+            .cfg
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+        settings
     }
 }

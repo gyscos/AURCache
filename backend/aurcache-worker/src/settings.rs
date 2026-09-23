@@ -11,7 +11,7 @@
 //! directory, the bind mounts, the build user, the `makechrootpkg` wrapper --
 //! is not declared, because a worker runs devtools as root and the set of keys
 //! the server may name is the boundary that keeps a compromised server from
-//! choosing what runs where. See `design/worker-configuration.md`.
+//! choosing what runs where. See `design/implemented/worker-configuration.md`.
 
 use aurcache_common::worker_config::{Applies, ValueKind};
 use aurcache_worker_core::settings::{Builtin, SettingSpec, WorkerSettings};
@@ -161,9 +161,10 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             env_var: "WORKER_TOTAL_BUILD_MEMORY_MAX",
             kind: ValueKind::Size,
             description: "Memory all builds on this worker may use between them. Unset is \
-                          unlimited.",
+                          unlimited. Applies to builds already running: lowering it below what \
+                          they use makes the kernel reclaim, then kill.",
             category: "Build limits",
-            applies: Applies::NextJob,
+            applies: Applies::Immediately,
             default: Builtin::Unset,
         },
         SettingSpec {
@@ -173,7 +174,7 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             description: "Swap all builds may use between them. Unset means none beyond their \
                           shared memory limit.",
             category: "Build limits",
-            applies: Applies::NextJob,
+            applies: Applies::Immediately,
             default: Builtin::Unset,
         },
         SettingSpec {
@@ -185,7 +186,7 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             },
             description: "CPUs all builds may use between them. Unset, or 0, is unlimited.",
             category: "Build limits",
-            applies: Applies::NextJob,
+            applies: Applies::Immediately,
             default: Builtin::Unset,
         },
     ]

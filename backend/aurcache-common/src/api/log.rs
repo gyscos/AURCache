@@ -12,7 +12,7 @@
 //! declared [`PackageRef`] refuses a worker or a build on the way in and on the
 //! way out, so a role cannot end up holding the wrong kind of thing.
 //!
-//! See `design/structured-logs.md`.
+//! See `design/implemented/structured-logs.md`.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

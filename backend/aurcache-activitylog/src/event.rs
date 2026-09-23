@@ -6,7 +6,7 @@
 //! so the storage layout and the wire form are the same arrangement, and serde
 //! does the dispatch rather than a table somebody maintains.
 //!
-//! See `design/structured-logs.md`.
+//! See `design/implemented/structured-logs.md`.
 
 use crate::events::Event;
 use aurcache_common::api::activity::Severity;

@@ -2,15 +2,16 @@
 //!
 //! A worker *declares* its settings at registration ([`SettingDecl`]) and
 //! reports what each one resolved to ([`EffectiveConfig`]). The server stores
-//! both and renders them; it does not know what `build_memory_max` or
-//! `concurrency` *mean*, only their [`ValueKind`].
+//! both, validates the values an operator sets against the declaration, and
+//! delivers them as a [`ConfigSnapshot`]; it does not know what
+//! `build_memory_max` or `concurrency` *mean*, only their [`ValueKind`].
 //!
 //! That is the whole reason the declaration travels rather than living on the
 //! server: the server and its workers are upgraded separately, and different
 //! worker implementations have different settings. A server-side list would
 //! need a server release before a new worker setting could be seen at all.
 //!
-//! See `design/worker-configuration.md`.
+//! See `design/implemented/worker-configuration.md`.
 
 use crate::units::{parse_duration, parse_size};
 use serde::{Deserialize, Serialize};
@@ -232,14 +233,53 @@ pub struct EffectiveSetting {
 /// Everything a worker is running, keyed by setting.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct EffectiveConfig {
-    /// The snapshot revision this reflects.
+    /// The revision of the last [`ConfigSnapshot`] this reflects.
     ///
-    /// `None` until the server delivers snapshots: a worker that has been sent
-    /// nothing is running its environment and its defaults, which is a complete
-    /// answer and not a missing one.
+    /// `None` from a worker that has been sent nothing: it is running its
+    /// environment and its defaults, which is a complete answer and not a
+    /// missing one.
     #[serde(default)]
     pub received_revision: Option<String>,
     pub settings: BTreeMap<String, EffectiveSetting>,
+}
+
+/// The values set for one worker on the server, as delivered to it.
+///
+/// Always the whole set, never a change: a worker that missed a delivery needs
+/// nothing from the one it missed. A string map rather than typed values,
+/// because the server does not know what any of them mean -- a key the worker
+/// does not declare is reported back as unsupported rather than failing to
+/// deserialize.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ConfigSnapshot {
+    /// Identifies this exact set of values, so a worker's heartbeat can say
+    /// which one it holds and the server resends only when that differs.
+    ///
+    /// Computed by the server from the values alone, so it changes exactly when
+    /// they do and needs no counter kept consistent across restarts. A worker
+    /// only ever compares it.
+    pub revision: String,
+    pub settings: BTreeMap<String, String>,
+}
+
+/// Check a value an operator is saving for a worker against what that worker
+/// declared.
+///
+/// The worker checks again on delivery, and can still refuse what passes here
+/// -- a limit its host cannot enforce -- but a value that is not even of the
+/// right kind is refused where the operator typed it.
+///
+/// # Errors
+///
+/// Returns why the value cannot be saved: the worker does not accept the key,
+/// or the value is not of its kind.
+pub fn validate_value(declared: &[SettingDecl], key: &str, value: &str) -> Result<(), String> {
+    declared
+        .iter()
+        .find(|decl| decl.key == key)
+        .ok_or_else(|| format!("this worker does not accept a setting called {key:?}"))?
+        .kind
+        .validate(value)
 }
 
 impl EffectiveConfig {
@@ -358,6 +398,29 @@ mod tests {
         assert_eq!(decl.kind, ValueKind::Unknown);
         assert_eq!(decl.key, "future_thing");
         assert!(decl.kind.validate("anything").is_ok());
+    }
+
+    /// A value is checked against the declaration of the worker it is for:
+    /// a key that worker does not accept is refused outright, and one it does
+    /// is checked against its kind.
+    #[test]
+    fn a_saved_value_is_checked_against_the_workers_declaration() {
+        let declared = [SettingDecl {
+            key: "concurrency".to_string(),
+            kind: ValueKind::Integer {
+                min: Some(1),
+                max: None,
+            },
+            description: String::new(),
+            category: String::new(),
+            default: None,
+            env_var: None,
+            applies: Applies::Immediately,
+        }];
+        assert!(validate_value(&declared, "concurrency", "3").is_ok());
+        assert!(validate_value(&declared, "concurrency", "0").is_err());
+        let unknown = validate_value(&declared, "build_user", "root").unwrap_err();
+        assert!(unknown.contains("build_user"), "{unknown}");
     }
 
     #[test]

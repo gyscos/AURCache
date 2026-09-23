@@ -64,6 +64,10 @@ pub struct WorkerSummary {
     /// same answer as a worker that reports no problems.
     #[serde(default)]
     pub settings_rejected: Option<i32>,
+    /// Asked to take no new builds and let the ones it holds finish. Still
+    /// approved and still heartbeating; resuming it is one click.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// A worker's configurable surface, as the Workers page shows it.
@@ -85,6 +89,34 @@ pub struct WorkerConfigView {
     /// `None` until a worker has been up long enough to send one heartbeat, so
     /// a freshly enrolled worker shows its declaration before its values.
     pub effective: Option<crate::worker_config::EffectiveConfig>,
+    /// The values set for this worker here, by key.
+    ///
+    /// Beside `effective` rather than folded into it: a value saved here is not
+    /// necessarily the one running -- the machine may pin that setting, or not
+    /// have picked the save up yet -- and the page has to be able to show both.
+    /// Includes values for keys the worker no longer declares, which are kept
+    /// rather than dropped when a worker is upgraded.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+    /// The revision of those values as the worker is sent them.
+    ///
+    /// Compared with `effective.received_revision` to tell a save the worker has
+    /// taken from one it has not been reached with yet.
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+/// A save of several of one worker's settings at once.
+///
+/// One request rather than one per key, because related settings are changed
+/// together -- fewer builds each with more memory -- and a worker that picked
+/// up half of such a change would run a combination nobody chose. The server
+/// writes the whole set in one transaction or none of it.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct WorkerConfigUpdate {
+    /// By key: `Some` sets the value, `None` removes it so the worker falls
+    /// back to its own environment or built-in default.
+    pub settings: std::collections::BTreeMap<String, Option<String>>,
 }
 
 /// The deployment-specific pieces the Workers page needs to show a

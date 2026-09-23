@@ -221,14 +221,7 @@ impl CoreConfig {
 
         let settings = WorkerSettings::from_env(protocol_settings());
 
-        // Clamped rather than refused: a worker that ran no builds at all would
-        // be a machine silently doing nothing, and the declared minimum of 1 is
-        // what the value is checked against before it ever gets here.
-        let concurrency = usize::try_from(settings.integer(keys::CONCURRENCY).unwrap_or(1))
-            .unwrap_or(1)
-            .max(1);
-
-        Self {
+        let mut cfg = Self {
             aurcache_url: env_opt("AURCACHE_URL")
                 .unwrap_or_else(|| "https://localhost:8080".to_string())
                 .trim_end_matches('/')
@@ -241,38 +234,75 @@ impl CoreConfig {
             enrollment_token: env_opt("AURCACHE_ENROLLMENT_TOKEN"),
             native_arches,
             emulated_arches,
-            packages: settings.list(keys::PACKAGES),
-            // A malformed value degrades to the neutral default, never to
-            // maximal scheduling privilege: an out-of-range typo must not
-            // outrank the whole fleet.
-            priority: i32::try_from(settings.integer(keys::PRIORITY).unwrap_or(0)).unwrap_or(0),
-            concurrency,
             name: env_opt("WORKER_NAME").unwrap_or_else(detect_hostname),
             data_dir: env_opt("WORKER_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/aurcache-worker")),
             heartbeat_interval: env_duration("WORKER_HEARTBEAT_INTERVAL").unwrap_or(15),
             lease_ttl: env_duration("LEASE_TTL").unwrap_or(60),
-            poll_interval: settings
-                .duration(keys::POLL_INTERVAL)
-                .unwrap_or(crate::settings::DEFAULT_POLL_INTERVAL),
-            // What bounds the persistent build cache. A cap rather than only
-            // a free-space floor, because a floor does nothing on a large pool:
-            // trees would grow into the terabytes before it ever triggered.
-            builddir_max_bytes: settings
-                .size(keys::BUILDDIR_MAX_BYTES)
-                .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MAX_BYTES),
-            builddir_min_free: settings
-                .size(keys::BUILDDIR_MIN_FREE)
-                .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MIN_FREE),
-            build_timeout: settings
-                .duration(keys::BUILD_TIMEOUT)
-                .unwrap_or(crate::settings::DEFAULT_BUILD_TIMEOUT),
             repo_host: env_opt("AURCACHE_REPO_HOST"),
             repo_url: env_opt("AURCACHE_REPO_URL"),
             mirrorlist: local_mirrorlist(),
+            // Filled in from `settings` just below, by the same code that
+            // fills them in again whenever the server delivers new values.
+            packages: Vec::new(),
+            priority: 0,
+            concurrency: 1,
+            poll_interval: crate::settings::DEFAULT_POLL_INTERVAL,
+            build_timeout: crate::settings::DEFAULT_BUILD_TIMEOUT,
+            builddir_max_bytes: crate::settings::DEFAULT_BUILDDIR_MAX_BYTES,
+            builddir_min_free: crate::settings::DEFAULT_BUILDDIR_MIN_FREE,
             settings,
-        }
+        };
+        cfg.read_settings();
+        cfg
+    }
+
+    /// The same configuration with `settings` in force: every field that is
+    /// a declared setting read again from them, and nothing else touched.
+    ///
+    /// What the server delivering new values comes down to. Identity, the
+    /// enrollment settings and everything else the server may not set stay
+    /// exactly as the machine configured them.
+    #[must_use]
+    pub fn with_settings(&self, settings: WorkerSettings) -> Self {
+        let mut cfg = Self {
+            settings,
+            ..self.clone()
+        };
+        cfg.read_settings();
+        cfg
+    }
+
+    /// Read every declared field from [`Self::settings`].
+    fn read_settings(&mut self) {
+        let settings = &self.settings;
+        // Clamped rather than refused: a worker that ran no builds at all would
+        // be a machine silently doing nothing, and the declared minimum of 1 is
+        // what the value is checked against before it ever gets here.
+        self.concurrency = usize::try_from(settings.integer(keys::CONCURRENCY).unwrap_or(1))
+            .unwrap_or(1)
+            .max(1);
+        self.packages = settings.list(keys::PACKAGES);
+        // A malformed value degrades to the neutral default, never to maximal
+        // scheduling privilege: an out-of-range typo must not outrank the
+        // whole fleet.
+        self.priority = i32::try_from(settings.integer(keys::PRIORITY).unwrap_or(0)).unwrap_or(0);
+        self.poll_interval = settings
+            .duration(keys::POLL_INTERVAL)
+            .unwrap_or(crate::settings::DEFAULT_POLL_INTERVAL);
+        // What bounds the persistent build cache. A cap rather than only a
+        // free-space floor, because a floor does nothing on a large pool: trees
+        // would grow into the terabytes before it ever triggered.
+        self.builddir_max_bytes = settings
+            .size(keys::BUILDDIR_MAX_BYTES)
+            .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MAX_BYTES);
+        self.builddir_min_free = settings
+            .size(keys::BUILDDIR_MIN_FREE)
+            .unwrap_or(crate::settings::DEFAULT_BUILDDIR_MIN_FREE);
+        self.build_timeout = settings
+            .duration(keys::BUILD_TIMEOUT)
+            .unwrap_or(crate::settings::DEFAULT_BUILD_TIMEOUT);
     }
 }
 

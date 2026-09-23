@@ -17,7 +17,7 @@ use aurcache_common::api::dump::{
 use aurcache_common::api::worker::ApprovalStatus;
 use aurcache_db::api_tokens;
 use aurcache_db::helpers::time::now_secs;
-use aurcache_db::prelude::{ApiTokens, Packages, Settings, Workers};
+use aurcache_db::prelude::{ApiTokens, Packages, Settings, WorkerSettings, Workers};
 use aurcache_db::{packages, settings, workers};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -204,9 +204,19 @@ async fn build_workers(
         .all(db)
         .await?;
 
+    // One query for the whole fleet rather than one per worker.
+    let mut values: BTreeMap<i32, BTreeMap<String, String>> = BTreeMap::new();
+    for row in WorkerSettings::find().all(db).await? {
+        values
+            .entry(row.worker_id)
+            .or_default()
+            .insert(row.key, row.value);
+    }
+
     Ok(rows
         .into_iter()
         .map(|row| DumpWorker {
+            settings: values.remove(&row.id).unwrap_or_default(),
             name: row.name,
             cert_fingerprint: row.cert_fingerprint,
             status: row.status.to_string(),

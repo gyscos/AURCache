@@ -670,12 +670,12 @@ async fn write_workers<C: sea_orm::ConnectionTrait>(
             .filter(aurcache_db::workers::Column::CertFingerprint.eq(&worker.cert_fingerprint))
             .one(txn)
             .await?;
-        // Already trusted here. Its routing is this instance's decision, not
-        // the dump's, so it is left as it is.
+        // Already trusted here. Its routing and its settings are this
+        // instance's decision, not the dump's, so it is left as it is.
         if existing.is_some() {
             continue;
         }
-        aurcache_db::workers::ActiveModel {
+        let restored = aurcache_db::workers::ActiveModel {
             name: Set(worker.name.clone()),
             status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
             cert_fingerprint: Set(worker.cert_fingerprint.clone()),
@@ -692,6 +692,14 @@ async fn write_workers<C: sea_orm::ConnectionTrait>(
         }
         .insert(txn)
         .await?;
+        // Keyed to the row just made, so values follow the fingerprint rather
+        // than whatever id the worker had where the dump was taken. Written
+        // unchecked: there is no declaration to check them against until the
+        // worker registers, and it refuses what it does not accept on delivery.
+        for (key, value) in &worker.settings {
+            aurcache_db::helpers::worker_store::upsert_worker_setting(txn, restored.id, key, value)
+                .await?;
+        }
     }
     Ok(())
 }

@@ -2,7 +2,7 @@
 //!
 //! A long-lived process that enrolls with an AURCache backend over mTLS, polls
 //! for build jobs, builds each package in its own `devtools` chroot, and uploads
-//! the results. See `design/remote-workers.md`.
+//! the results. See `design/implemented/remote-workers.md`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -15,7 +15,7 @@ use aurcache_worker::executor::ChrootExecutor;
 use aurcache_worker::{credentials, oneshot};
 use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::identity::Identity;
-use aurcache_worker_core::runner::Runner;
+use aurcache_worker_core::runner::{Registration, Runner};
 use aurcache_worker_core::{config::CoreConfig, enroll};
 
 #[derive(Parser)]
@@ -157,6 +157,12 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     };
 
     let executor = Arc::new(ChrootExecutor::new(cfg).await);
-    let runner = Runner::new(core, Arc::new(client), executor);
+    // What the runner registers again with when delivered values change what
+    // the server schedules this worker by.
+    let registration = Registration {
+        csr_pem: identity.generate_csr(&core.name)?,
+        kind: ChrootExecutor::KIND,
+    };
+    let runner = Runner::new(core, Arc::new(client), executor, registration);
     runner.run().await
 }

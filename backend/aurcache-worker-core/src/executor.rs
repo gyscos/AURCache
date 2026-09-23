@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::client::WorkerClient;
+use crate::settings::WorkerSettings;
 
 /// Builds one claimed job to completion.
 pub trait Executor: Send + Sync + 'static {
@@ -62,4 +63,17 @@ pub trait Executor: Send + Sync + 'static {
     /// One-line summary of the executor, logged when the worker comes online,
     /// so a worker's logs say which build strategy produced its packages.
     fn describe_self(&self) -> String;
+
+    /// Take a new resolution of this worker's settings -- the server delivered
+    /// values -- and return the one actually in force.
+    ///
+    /// An executor keeps what it reads per job for its next one (a build
+    /// already running keeps the limits it started with), applies at once
+    /// what takes effect at once, and refuses what the machine cannot honour
+    /// with [`WorkerSettings::refused`], so the value it runs and the value it
+    /// reports cannot differ. The default keeps nothing and refuses nothing,
+    /// for an executor whose settings are all the runner's own.
+    fn reconfigure(&self, settings: WorkerSettings) -> impl Future<Output = WorkerSettings> + Send {
+        async { settings }
+    }
 }

@@ -16,7 +16,7 @@ use aurcache_ca::Ca;
 use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::api::worker::{
-    ApprovalStatus, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
+    ApprovalStatus, WorkerConfigUpdate, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
 };
 use aurcache_common::builder::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
@@ -24,7 +24,9 @@ use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
     MirrorlistPreference, RegisterRequest, RegisterStatus, WorkerLogReport,
 };
-use aurcache_common::worker_config::{EffectiveConfig, SettingStatus};
+use aurcache_common::worker_config::{
+    ConfigSnapshot, EffectiveConfig, SettingDecl, SettingStatus, validate_value,
+};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
@@ -42,9 +44,9 @@ use rocket::http::Status;
 use rocket::mtls::Certificate;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::serde::json::Json;
-use rocket::{Data, State, get, post};
+use rocket::{Data, State, get, patch, post};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,7 +77,7 @@ pub(crate) fn liveness_timeout_secs() -> i64 {
 /// path exists (`ensure_enrolled` reuses a persisted certificate and the server
 /// only signs when it has none) — so a short lifetime would simply brick the
 /// worker. Match the server certificate's 10 years. See
-/// `design/worker-routing.md` (Appendix).
+/// `design/implemented/worker-routing.md` (Appendix).
 fn worker_cert_validity_days() -> i64 {
     env_i64("WORKER_CERT_VALIDITY_DAYS", 3650)
 }
@@ -145,6 +147,18 @@ fn mirrorlist_dir() -> PathBuf {
 fn mirrorlist_checksum(content: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+/// The revision of a worker's server-set values, as its snapshot carries it.
+///
+/// A digest of the values themselves, keys in order (a `BTreeMap` serializes
+/// that way), so it changes exactly when they do and needs no counter kept in
+/// step across restarts. Like [`mirrorlist_checksum`], only ever computed here:
+/// a worker echoes it back and never digests anything.
+fn config_revision(values: &BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(values).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
 /// Decide what to put in a job descriptor for the mirrorlist.
@@ -228,8 +242,11 @@ impl<'r> FromRequest<'r> for WorkerAuth {
     get_ca_fingerprint,
     list_workers,
     worker_config,
+    update_worker_config,
     worker_join_info,
     approve_worker,
+    pause_worker,
+    resume_worker,
     revoke_worker
 ))]
 pub struct WorkerApi;
@@ -264,8 +281,11 @@ pub fn worker_admin_routes() -> Vec<rocket::Route> {
     rocket::routes![
         list_workers,
         worker_config,
+        update_worker_config,
         worker_join_info,
         approve_worker,
+        pause_worker,
+        resume_worker,
         revoke_worker,
     ]
 }
@@ -1067,7 +1087,31 @@ pub async fn heartbeat(
     .map_err(|e| err(Status::InternalServerError, e))?;
     Ok(Json(HeartbeatResponse {
         cancel: outcome.cancel_requested,
+        config: snapshot_for(db, &auth.worker, hb.received_revision.as_deref()).await,
     }))
+}
+
+/// The values set for this worker, when it does not hold them yet.
+///
+/// Only for a worker that declared its settings -- an older one could do
+/// nothing with them. Read after the leases are renewed and never allowed to
+/// fail the heartbeat: a snapshot that cannot be read this time is sent on the
+/// next one, while a heartbeat that failed would cost the worker its builds.
+async fn snapshot_for(
+    db: &DatabaseConnection,
+    worker: &workers::Model,
+    received: Option<&str>,
+) -> Option<ConfigSnapshot> {
+    worker.settings_declaration.as_ref()?;
+    let values = worker_store::worker_setting_values(db, worker.id)
+        .await
+        .map_err(|e| tracing::warn!("reading worker {}'s settings: {e}", worker.id))
+        .ok()?;
+    let revision = config_revision(&values);
+    (received != Some(revision.as_str())).then_some(ConfigSnapshot {
+        revision,
+        settings: values,
+    })
 }
 
 /// Poll whether a cancel was requested for a specific job.
@@ -1185,6 +1229,7 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         successful_builds: tally.successful,
         failed_builds: tally.failed,
         settings_rejected: rejected_settings(worker.effective_config.as_deref(), worker.id),
+        paused: worker.paused,
     }
 }
 
@@ -1270,22 +1315,141 @@ pub async fn worker_config(
     id: i32,
 ) -> Result<Json<WorkerConfigView>, ApiError> {
     let db = db.inner();
-    let worker = worker_store::find_worker(db, id)
+    let worker = find_or_404(db, id).await?;
+    config_view(db, worker).await.map(Json)
+}
+
+/// Save values for several of a worker's settings at once.
+///
+/// Every value is checked against what the worker declared before anything is
+/// written, and the whole set is written in one transaction: a save is either
+/// taken whole or refused whole, never half-delivered. Removing a value needs
+/// no check, so one the worker no longer declares can still be cleared.
+///
+/// The worker picks the change up on its next heartbeat. It may still refuse a
+/// value this accepted -- a limit its host cannot enforce -- and says so in its
+/// next report, which is what the page then shows.
+#[utoipa::path(
+    patch,
+    path = "/workers/{id}/config",
+    request_body = WorkerConfigUpdate,
+    responses((status = 200, body = WorkerConfigView))
+)]
+#[patch("/workers/<id>/config", data = "<input>")]
+pub async fn update_worker_config(
+    db: &State<DatabaseConnection>,
+    a: Authenticated,
+    al: &State<ActivityLog>,
+    id: i32,
+    input: Json<WorkerConfigUpdate>,
+) -> Result<Json<WorkerConfigView>, ApiError> {
+    let db = db.inner();
+    let worker = find_or_404(db, id).await?;
+    let declared: Option<Vec<SettingDecl>> = worker
+        .settings_declaration
+        .as_deref()
+        .and_then(|json| parse_stored(json, id, "declaration"));
+    let changes = checked_changes(declared.as_deref(), input.into_inner().settings)
+        .map_err(|e| err(Status::BadRequest, e))?;
+
+    let saved = worker_store::save_worker_settings(db, id, &changes)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+    if !saved.is_empty() {
+        al.emit_by(
+            Event::WorkerSettingsSaved {
+                worker: worker.name.as_str().into(),
+                set: saved.set,
+                reset: saved.reset,
+            },
+            a.username,
+        );
+    }
+    config_view(db, worker).await.map(Json)
+}
+
+/// Check a save against the worker's declaration, and put each value in the
+/// form it is stored in.
+///
+/// All of it or none: every refusal is collected, so an operator who got two
+/// fields wrong hears about both rather than fixing them one round trip at a
+/// time.
+fn checked_changes(
+    declared: Option<&[SettingDecl]>,
+    changes: BTreeMap<String, Option<String>>,
+) -> Result<BTreeMap<String, Option<String>>, String> {
+    let mut refused = Vec::new();
+    let mut checked = BTreeMap::new();
+    for (key, value) in changes {
+        let value = match value {
+            // Removing needs no declaration: a value for a key the worker has
+            // since dropped is exactly the one worth being able to clear.
+            None => None,
+            Some(raw) => {
+                let value = raw.trim().to_string();
+                let problem = match declared {
+                    None => Some(
+                        "this worker's version does not accept settings from the server"
+                            .to_string(),
+                    ),
+                    // Blank is how a worker's environment spells "unset", so a
+                    // stored blank would read as nothing at all.
+                    Some(_) if value.is_empty() => Some(format!(
+                        "{key}: remove the value rather than saving it empty"
+                    )),
+                    Some(declared) => validate_value(declared, &key, &value)
+                        .err()
+                        .map(|why| format!("{key}: {why}")),
+                };
+                if let Some(problem) = problem {
+                    refused.push(problem);
+                    continue;
+                }
+                Some(value)
+            }
+        };
+        checked.insert(key, value);
+    }
+    if refused.is_empty() {
+        Ok(checked)
+    } else {
+        refused.dedup();
+        Err(refused.join("; "))
+    }
+}
+
+async fn find_or_404(db: &DatabaseConnection, id: i32) -> Result<workers::Model, ApiError> {
+    worker_store::find_worker(db, id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
+        .ok_or_else(|| err(Status::NotFound, "no such worker"))
+}
 
-    Ok(Json(WorkerConfigView {
-        worker_id: worker.id,
-        settings: worker
-            .settings_declaration
-            .as_deref()
-            .and_then(|json| parse_stored(json, id, "declaration")),
+/// A worker's configuration as the page shows it: what it accepts, what it
+/// runs, and what is set for it here.
+async fn config_view(
+    db: &DatabaseConnection,
+    worker: workers::Model,
+) -> Result<WorkerConfigView, ApiError> {
+    let id = worker.id;
+    let values = worker_store::worker_setting_values(db, id)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
+    let settings: Option<Vec<SettingDecl>> = worker
+        .settings_declaration
+        .as_deref()
+        .and_then(|json| parse_stored(json, id, "declaration"));
+    Ok(WorkerConfigView {
+        worker_id: id,
+        // Only a worker that takes snapshots has a revision worth comparing.
+        revision: settings.as_ref().map(|_| config_revision(&values)),
+        settings,
         effective: worker
             .effective_config
             .as_deref()
             .and_then(|json| parse_stored(json, id, "configuration report")),
-    }))
+        values,
+    })
 }
 
 /// Read one of the stored worker-configuration blobs, saying so rather than
@@ -1317,6 +1481,68 @@ pub async fn approve_worker(
         },
         a.username,
     );
+    Ok(())
+}
+
+/// Ask a worker to take no new builds and let the ones it holds finish.
+///
+/// For emptying a machine before a reboot, an upgrade or retirement without
+/// cutting a build short. Takes effect at its next claim; it needs nothing
+/// from the worker. Its builds keep running, it stays approved, and a
+/// lower-priority worker stops waiting for it at once.
+#[utoipa::path(post, path = "/workers/{id}/pause", responses((status = 200)))]
+#[post("/workers/<id>/pause")]
+pub async fn pause_worker(
+    db: &State<DatabaseConnection>,
+    a: Authenticated,
+    al: &State<ActivityLog>,
+    id: i32,
+) -> Result<(), ApiError> {
+    set_paused(db.inner(), a, al, id, true).await
+}
+
+/// Let a paused worker take builds again.
+#[utoipa::path(post, path = "/workers/{id}/resume", responses((status = 200)))]
+#[post("/workers/<id>/resume")]
+pub async fn resume_worker(
+    db: &State<DatabaseConnection>,
+    a: Authenticated,
+    al: &State<ActivityLog>,
+    id: i32,
+) -> Result<(), ApiError> {
+    set_paused(db.inner(), a, al, id, false).await
+}
+
+async fn set_paused(
+    db: &DatabaseConnection,
+    a: Authenticated,
+    al: &ActivityLog,
+    id: i32,
+    paused: bool,
+) -> Result<(), ApiError> {
+    let before = find_or_404(db, id).await?;
+    // Only an approved worker claims anything to stop claiming. Pausing a
+    // pending or revoked one would be a flag nobody could see take effect.
+    if before.status != ApprovalStatus::Approved {
+        return Err(err(
+            Status::Conflict,
+            format!("worker {} is {}, not approved", before.name, before.status),
+        ));
+    }
+    let worker = worker_store::set_paused(db, id, paused)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+        .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
+    // Asking for what already holds changes nothing, and logs nothing.
+    if before.paused != paused {
+        let worker = worker.name.into();
+        let event = if paused {
+            Event::WorkerPaused { worker }
+        } else {
+            Event::WorkerResumed { worker }
+        };
+        al.emit_by(event, a.username);
+    }
     Ok(())
 }
 
@@ -1464,5 +1690,100 @@ mod repo_template_tests {
         assert!(t.contains(&format!(
             "Server = https://{REPO_HOST_PLACEHOLDER}:8081/$arch"
         )));
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::{checked_changes, config_revision};
+    use aurcache_common::worker_config::{Applies, SettingDecl, ValueKind};
+    use std::collections::BTreeMap;
+
+    fn declared() -> Vec<SettingDecl> {
+        vec![SettingDecl {
+            key: "build_memory_max".to_string(),
+            kind: ValueKind::Size,
+            description: String::new(),
+            category: String::new(),
+            default: None,
+            env_var: Some("WORKER_BUILD_MEMORY_MAX".to_string()),
+            applies: Applies::NextJob,
+        }]
+    }
+
+    fn save(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    /// A value is stored the way it will be compared: trimmed, so a stray
+    /// space does not make the same value a different revision.
+    #[test]
+    fn a_valid_value_is_stored_trimmed() {
+        let checked = checked_changes(
+            Some(&declared()),
+            save(&[("build_memory_max", Some(" 32G "))]),
+        )
+        .unwrap();
+        assert_eq!(checked["build_memory_max"].as_deref(), Some("32G"));
+    }
+
+    /// Every refusal is reported at once, and nothing is taken: a save is
+    /// whole or not at all.
+    #[test]
+    fn every_refusal_is_reported_together() {
+        let why = checked_changes(
+            Some(&declared()),
+            save(&[
+                ("build_memory_max", Some("lots")),
+                ("build_user", Some("root")),
+            ]),
+        )
+        .unwrap_err();
+        assert!(why.contains("build_memory_max"), "{why}");
+        assert!(why.contains("build_user"), "{why}");
+    }
+
+    /// A blank value would read as unset on the worker, so it is refused
+    /// rather than stored as a value that does nothing.
+    #[test]
+    fn a_blank_value_is_refused() {
+        assert!(
+            checked_changes(Some(&declared()), save(&[("build_memory_max", Some("  "))])).is_err()
+        );
+    }
+
+    /// Removing needs no declaration: a value for a key the worker has since
+    /// dropped, or one set before it was upgraded away, must stay clearable.
+    #[test]
+    fn a_removal_needs_no_declaration() {
+        let checked = checked_changes(None, save(&[("gone", None)])).unwrap();
+        assert_eq!(checked["gone"], None);
+        let refused = checked_changes(None, save(&[("build_memory_max", Some("32G"))]));
+        assert!(
+            refused.is_err(),
+            "a worker that declares nothing cannot take a value"
+        );
+    }
+
+    /// The revision follows the values alone: equal sets agree whatever order
+    /// they were built in, and any change moves it.
+    #[test]
+    fn the_revision_follows_the_values() {
+        let a = BTreeMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let b = BTreeMap::from([
+            ("b".to_string(), "2".to_string()),
+            ("a".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(config_revision(&a), config_revision(&b));
+        let mut c = a.clone();
+        c.insert("a".to_string(), "3".to_string());
+        assert_ne!(config_revision(&a), config_revision(&c));
+        assert_ne!(config_revision(&a), config_revision(&BTreeMap::new()));
     }
 }

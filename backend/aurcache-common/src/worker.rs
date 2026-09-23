@@ -3,7 +3,7 @@
 //! These are shared between the backend API and the `aurcache-worker` binary,
 //! so their JSON representation is a stable contract. Keep field names stable.
 
-use crate::worker_config::{EffectiveConfig, SettingDecl};
+use crate::worker_config::{ConfigSnapshot, EffectiveConfig, SettingDecl};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -211,13 +211,22 @@ pub struct Heartbeat {
     pub active_build_ids: Vec<i32>,
     pub version: String,
     /// What each declared setting resolved to, sent when it differs from what
-    /// this worker last got the server to store — which, until the server
-    /// delivers values of its own, means once per worker process.
+    /// this worker last got the server to store: once per worker process, and
+    /// again after each delivery of new values.
     ///
     /// Rides the heartbeat rather than registration so a value that changes
     /// without re-registering still reaches the server.
     #[serde(default)]
     pub effective: Option<EffectiveConfig>,
+    /// The revision of the last [`ConfigSnapshot`] this worker took, sent on
+    /// every heartbeat so the server can tell whether it holds the current one.
+    ///
+    /// Separate from `effective` on purpose. Receiving a snapshot and running
+    /// its values are different things -- a value pinned on the machine is
+    /// received and deliberately not run -- and a single "applied" marker
+    /// would make the server resend such a snapshot for ever.
+    #[serde(default)]
+    pub received_revision: Option<String>,
 }
 
 /// The server's answer to a heartbeat.
@@ -231,6 +240,14 @@ pub struct HeartbeatResponse {
     /// Build ids this worker should stop running.
     #[serde(default)]
     pub cancel: Vec<i32>,
+    /// The values set for this worker on the server, when the worker does not
+    /// hold them yet.
+    ///
+    /// Only ever sent to a worker that declared its settings: an older worker
+    /// could not use it. Optional with a default, because a worker reads an
+    /// answer it cannot parse as an empty one, which would also drop `cancel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ConfigSnapshot>,
 }
 
 /// Terminal report for a single build.
@@ -390,8 +407,11 @@ mod tests {
             active_build_ids: vec![1, 2, 3],
             version: "0.1.0".into(),
             effective: None,
+            received_revision: Some("abc".into()),
         };
-        assert_eq!(round_trip(&hb).active_build_ids, hb.active_build_ids);
+        let back = round_trip(&hb);
+        assert_eq!(back.active_build_ids, hb.active_build_ids);
+        assert_eq!(back.received_revision, hb.received_revision);
     }
 
     /// A worker that predates the configuration report sends neither field, and
@@ -403,6 +423,7 @@ mod tests {
         let hb: Heartbeat =
             serde_json::from_str(r#"{"active_build_ids":[],"version":"0.1.0"}"#).expect("parse");
         assert!(hb.effective.is_none());
+        assert!(hb.received_revision.is_none());
     }
 
     /// An empty cancel list must deserialize — a server that has nothing to
@@ -412,8 +433,32 @@ mod tests {
     fn an_empty_cancel_list_deserializes() {
         let parsed: HeartbeatResponse = serde_json::from_str(r#"{"cancel":[]}"#).expect("parse");
         assert!(parsed.cancel.is_empty());
+        assert!(parsed.config.is_none());
         let bare: HeartbeatResponse = serde_json::from_str(r#"{}"#).expect("parse");
         assert!(bare.cancel.is_empty());
+    }
+
+    /// A worker predating snapshots must still read `cancel` from an answer
+    /// that carries one -- losing the abort list to an unknown field would be
+    /// a Stop that silently never arrives. The server does not send it to such
+    /// a worker, but the answer must not depend on that alone.
+    #[test]
+    fn a_snapshot_does_not_cost_an_older_reader_its_cancel_list() {
+        #[derive(Deserialize)]
+        struct OlderResponse {
+            cancel: Vec<i32>,
+        }
+        let answer = HeartbeatResponse {
+            cancel: vec![7],
+            config: Some(ConfigSnapshot {
+                revision: "r".into(),
+                settings: BTreeMap::from([("concurrency".to_string(), "3".to_string())]),
+            }),
+        };
+        let json = serde_json::to_string(&answer).expect("serialize");
+        let older: OlderResponse = serde_json::from_str(&json).expect("an older worker reads it");
+        assert_eq!(older.cancel, [7]);
+        assert_eq!(round_trip(&answer).config, answer.config);
     }
 
     #[test]

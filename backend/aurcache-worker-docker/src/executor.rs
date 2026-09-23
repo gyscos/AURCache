@@ -14,6 +14,7 @@ use aurcache_common::worker::{CompleteReport, JobDescriptor};
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
 use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};
+use aurcache_worker_core::settings::WorkerSettings;
 use aurcache_worker_core::{artifacts, report};
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig};
@@ -25,7 +26,7 @@ use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::commands;
@@ -45,6 +46,10 @@ const BUILD_USER: &str = "ab";
 /// Builds each package in a container spawned from the builder image.
 pub struct DockerExecutor {
     cfg: Arc<Config>,
+    /// The build timeout in force, in seconds: the one setting this executor
+    /// reads per build that the server may change while it runs. Everything
+    /// else it declares is the runner's.
+    build_timeout: AtomicU64,
     docker: Docker,
     /// How spawned build containers are attached to the network, so the repo
     /// URL in the job's pacman.conf resolves from inside them.
@@ -69,6 +74,7 @@ impl DockerExecutor {
         );
         tracing::info!("build containers will use network: {network:?}");
         Ok(Self {
+            build_timeout: AtomicU64::new(cfg.core.build_timeout),
             cfg,
             docker,
             network,
@@ -302,7 +308,7 @@ impl DockerExecutor {
         });
 
         let started = Instant::now();
-        let timeout = self.cfg.core.build_timeout;
+        let timeout = self.build_timeout.load(Ordering::Relaxed);
         // The server is asked about remote cancellation at most every 30 s:
         // with N concurrent builds a per-tick round trip is N requests per
         // 5 s for no extra responsiveness, since cancel latency is already
@@ -439,6 +445,13 @@ impl Executor for DockerExecutor {
 
     fn describe_self(&self) -> String {
         format!("legacy container ({}) [deprecated]", self.cfg.builder_image)
+    }
+
+    async fn reconfigure(&self, settings: WorkerSettings) -> WorkerSettings {
+        let core = self.cfg.core.with_settings(settings);
+        self.build_timeout
+            .store(core.build_timeout, Ordering::Relaxed);
+        core.settings
     }
 }
 

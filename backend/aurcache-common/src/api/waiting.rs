@@ -16,6 +16,9 @@ pub enum WaitingReason {
     Arch { arch: String },
     /// A capable worker exists but none has been seen recently.
     Offline,
+    /// Every capable worker that is up has been asked to pause. They take no
+    /// new builds until resumed; resuming one of these picks the build up.
+    Paused { workers: Vec<String> },
 }
 
 impl std::fmt::Display for WaitingReason {
@@ -26,6 +29,13 @@ impl std::fmt::Display for WaitingReason {
             }
             Self::Arch { arch } => write!(f, "no worker builds {arch}"),
             Self::Offline => write!(f, "all capable workers are offline"),
+            Self::Paused { workers } => {
+                write!(
+                    f,
+                    "intake is stopped on every capable worker ({})",
+                    workers.join(", ")
+                )
+            }
         }
     }
 }

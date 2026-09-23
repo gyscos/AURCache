@@ -61,7 +61,7 @@ services:
       # port. The server's template varies only by host, so the port has to be
       # set here or the worker is pointed at a port nothing listens on.
       - AURCACHE_REPO_URL=http://aurcache:8081
-      - WORKER_CONCURRENCY=2
+      - WORKER_CONCURRENCY_DEFAULT=2
     volumes:
       - enroll:/enroll           # writable: the CSR it drops here is its enrollment
       - worker_data:/var/lib/aurcache-worker   # persisted base chroot

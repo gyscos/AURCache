@@ -15,7 +15,7 @@
 //! this way the filter is one ordinary query that sea-orm builds the same for
 //! both backends. Everything here is tested against SQLite and nothing is
 //! against Postgres, so a backend-specific query would be one whose tested
-//! branch is not the branch that ships. See `design/structured-logs.md`.
+//! branch is not the branch that ships. See `design/implemented/structured-logs.md`.
 //!
 //! `severity` is the number its variants are ordered by, so "this severity and
 //! worse" is `severity >= n`.

@@ -710,6 +710,46 @@ async fn a_workers_settings_say_where_each_value_came_from(session: &Session) {
         "{panel}"
     );
 
+    // A value set here goes through the real save, and the page then says the
+    // worker has not taken it yet -- the fixture's worker never checks in.
+    // A pinned setting offers no field to type into: a save would not take.
+    assert_eq!(
+        session.count("input[name=\"concurrency\"]:disabled").await,
+        1,
+        "a pinned setting should not be editable here"
+    );
+    session
+        .type_into("input[name=\"build_memory_max\"]", "32G")
+        .await;
+    session.click_labelled("button", "Save 1 change").await;
+    session
+        .wait_until("the save to land", |t| t.contains("Saved."))
+        .await;
+    assert_eq!(
+        session.value_of("input[name=\"build_memory_max\"]").await,
+        "32G",
+        "the saved value should be what the field shows"
+    );
+    session
+        .wait_until("the page to say the worker has not taken it", |t| {
+            t.contains("has not taken any values from here yet")
+        })
+        .await;
+
+    // Paused from its page, the worker says so and offers the way back.
+    session.click_labelled("button", "Stop intake").await;
+    session
+        .wait_until("the pause to land", |t| {
+            t.contains("Intake stopped.") && t.contains("intake stopped")
+        })
+        .await;
+    session.click_labelled("button", "Resume intake").await;
+    session
+        .wait_until("the worker to take builds again", |t| {
+            t.contains("Intake resumed.")
+        })
+        .await;
+
     // A name two machines answer to cannot be a page. Nothing here guesses
     // which one was meant -- the retired row and the live one differ in exactly
     // what the reader is trying to tell apart.
