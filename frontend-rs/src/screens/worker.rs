@@ -323,13 +323,8 @@ fn WorkerHeader(
                     }
                     KindBadge { worker: worker.clone() }
                     Liveness { worker: worker.clone() }
-                    Link {
-                        class: "link link-primary text-sm",
-                        to: Route::Logs {
-                            view: crate::listing::ViewParams::about(aurcache_client::WorkerRef::from(worker.name.as_str())),
-                        },
-                        "Log"
-                    }
+                    // No "Log" link here: the Activity card below already
+                    // links to the log narrowed to this worker.
                     // Only an approved worker claims anything to stop claiming.
                     if worker.status.can_build() {
                         div { class: "ml-auto",

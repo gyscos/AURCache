@@ -717,7 +717,16 @@ fn RowMenu(
                 crate::shell::FilterIcon {}
             }
             if open() {
-                ul { class: "dropdown-content menu menu-sm bg-base-100 rounded-box shadow z-10 w-72",
+                // Clicking anywhere else closes the menu: a transparent
+                // backdrop catches the click, the same trick as a modal
+                // backdrop. The menu itself sits above it.
+                button {
+                    class: "fixed inset-0 z-10 cursor-default",
+                    aria_label: "Close menu",
+                    tabindex: "-1",
+                    onclick: move |_| open.set(false),
+                }
+                ul { class: "dropdown-content menu menu-sm bg-base-100 rounded-box shadow z-20 w-max max-w-[calc(100vw-2rem)] whitespace-nowrap",
                     role: "menu",
                     li {
                         button {
