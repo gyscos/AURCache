@@ -162,7 +162,10 @@ mod tests {
 
     #[test]
     fn a_host_is_read_out_of_the_usual_shapes() {
-        assert_eq!(host_from_url("http://localhost:8080/api"), Some("localhost"));
+        assert_eq!(
+            host_from_url("http://localhost:8080/api"),
+            Some("localhost")
+        );
         assert_eq!(
             host_from_url("https://aurcache.example.com"),
             Some("aurcache.example.com")
@@ -198,7 +201,10 @@ mod tests {
     /// A password may itself contain `@`, so the split has to be from the right.
     #[test]
     fn userinfo_is_stripped_from_the_last_separator() {
-        assert_eq!(host_from_url("http://user:p@ss@host:8080/api"), Some("host"));
+        assert_eq!(
+            host_from_url("http://user:p@ss@host:8080/api"),
+            Some("host")
+        );
     }
 
     #[test]

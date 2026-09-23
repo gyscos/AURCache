@@ -32,10 +32,7 @@ use crate::repo_db;
 /// job — but `unwrap_or`/`let _` on the join also buried *which* task died,
 /// leaving a panic with no trace. `Err` here is a panic (or a runtime
 /// shutdown), never a cache miss: the cache fns report those themselves.
-async fn join_cache_task<T>(
-    handle: tokio::task::JoinHandle<T>,
-    task: &'static str,
-) -> Option<T> {
+async fn join_cache_task<T>(handle: tokio::task::JoinHandle<T>, task: &'static str) -> Option<T> {
     match handle.await {
         Ok(value) => Some(value),
         Err(e) => {
