@@ -144,19 +144,17 @@ pub fn Dashboard() -> Element {
     }
 }
 
-/// One card's chrome: title on the left, a "View all" link on the right.
+/// One card's chrome: the title itself links to the full list, like the
+/// "Builds" title on the package page.
 #[component]
 fn Card(title: String, to: Route, children: Element) -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                div { class: "flex justify-between items-baseline",
-                    h2 { class: "card-title text-base", "{title}" }
-                    Link {
-                        class: "link link-primary text-xs",
-                        to: to,
-                        "View all →"
-                    }
+                Link {
+                    class: "card-title text-base link-hover w-fit",
+                    to: to,
+                    "{title}"
                 }
                 {children}
             }
@@ -166,15 +164,10 @@ fn Card(title: String, to: Route, children: Element) -> Element {
 
 /// A healthy attention card, collapsed to one line: a success-toned check
 /// and what is not happening.
-///
-/// `self-start`: a grid row stretches every item to the tallest one by
-/// default, and this card's neighbour is often the full-height kind -- without
-/// it, "collapsed" would still occupy the row's whole height, just with empty
-/// padding below the line.
 #[component]
 fn CollapsedCard(text: String) -> Element {
     rsx! {
-        div { class: "card bg-base-100 shadow-xl self-start",
+        div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body py-3 flex-row items-center gap-2",
                 span { class: "text-success font-bold", "✓" }
                 span { class: "text-sm", "{text}" }
@@ -273,13 +266,13 @@ fn RecentPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
         Card {
             title: "Recent packages",
             to: Route::Packages { view: ViewParams::default(), q: String::new() },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
                         class: "py-2 flex justify-between items-center gap-2",
                         to: Route::Package { pkgbase: pkg.name.clone() },
-                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
                     }
                 }
@@ -313,7 +306,7 @@ fn RecentBuildsCard(builds: Option<Vec<Build>>) -> Element {
         Card {
             title: "Recent builds",
             to: Route::Builds { view: ViewParams::default(), q: String::new() },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for build in builds {
                     Link {
                         key: "{build.pkg_name} #{build.number}",
@@ -322,7 +315,7 @@ fn RecentBuildsCard(builds: Option<Vec<Build>>) -> Element {
                             pkgbase: build.pkg_name.clone(),
                             number: build.number,
                         },
-                        span { class: "truncate",
+                        span { class: "text-sm truncate",
                             span { class: "font-medium", "{build.pkg_name}" }
                             span { class: "opacity-60", " #{build.number} · {build.version}" }
                         }
@@ -352,13 +345,13 @@ fn FailedPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
                 view: ViewParams::with_status(BuildState::Failed),
                 q: String::new(),
             },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
                         class: "py-2 flex justify-between items-center gap-2",
                         to: Route::Package { pkgbase: pkg.name.clone() },
-                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
                             "{pkg.latest_version.as_deref().unwrap_or(\"—\")}"
                         }
@@ -388,13 +381,13 @@ fn OutOfDateCard(slice: Option<OutOfDateSlice>) -> Element {
                 view: ViewParams::with_out_of_date(),
                 q: String::new(),
             },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for pkg in slice.needs_hand {
                     Link {
                         key: "{pkg.id}",
                         class: "py-2 flex justify-between items-center gap-2",
                         to: Route::Package { pkgbase: pkg.name.clone() },
-                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
                             "{pkg.latest_version.as_deref().unwrap_or(\"—\")} → {pkg.upstream_version.as_deref().unwrap_or(\"—\")}"
                         }
@@ -426,7 +419,7 @@ fn StuckQueueCard(queue: Option<QueueSlice>) -> Element {
                 ]),
                 q: String::new(),
             },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for build in queue.oldest {
                     Link {
                         key: "{build.pkg_name} #{build.number}",
@@ -435,7 +428,7 @@ fn StuckQueueCard(queue: Option<QueueSlice>) -> Element {
                             pkgbase: build.pkg_name.clone(),
                             number: build.number,
                         },
-                        span { class: "truncate",
+                        span { class: "text-sm truncate",
                             span { class: "font-medium", "{build.pkg_name}" }
                             span { class: "opacity-60", " #{build.number} · {build.platform}" }
                             if let Some(reason) = queue_reason(&build) {
@@ -472,7 +465,7 @@ fn RecentProblemsCard(problems: Option<Vec<LogEntry>>) -> Element {
             to: Route::Logs {
                 view: ViewParams::for_logs(Some(Severity::Warning), false, None),
             },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for entry in problems {
                     div { key: "{entry.id}", class: "py-2 flex gap-2 items-baseline",
                         match entry.severity {
@@ -487,7 +480,7 @@ fn RecentProblemsCard(problems: Option<Vec<LogEntry>>) -> Element {
                         span { class: "text-sm opacity-60 shrink-0",
                             AbsoluteDate { ts: Some(entry.timestamp) }
                         }
-                        span { class: "line-clamp-2 min-w-0",
+                        span { class: "text-sm line-clamp-2 min-w-0",
                             EntryText { entry: entry }
                         }
                     }
@@ -522,13 +515,13 @@ fn LargestPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
         Card {
             title: "Largest packages",
             to: Route::Packages { view: ViewParams::default(), q: String::new() },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
                         class: "py-2 flex justify-between items-center gap-2",
                         to: Route::Package { pkgbase: pkg.name.clone() },
-                        span { class: "font-medium truncate", "{pkg.name}" }
+                        span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 shrink-0",
                             "{format_total_size(pkg.total_size)}"
                         }
@@ -564,7 +557,7 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
         Card {
             title: longest_title(),
             to: Route::Builds { view: ViewParams::default(), q: String::new() },
-            div { class: "divide-y divide-base-200",
+            div { class: "divide-y divide-base-300",
                 for item in builds {
                     Link {
                         key: "{item.build.pkg_name} #{item.build.number}",
@@ -573,7 +566,7 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
                             pkgbase: item.build.pkg_name.clone(),
                             number: item.build.number,
                         },
-                        span { class: "truncate",
+                        span { class: "text-sm truncate",
                             span { class: "font-medium", "{item.build.pkg_name}" }
                             span { class: "opacity-60", " #{item.build.number}" }
                             span { class: "badge badge-neutral badge-sm mx-2",
@@ -609,7 +602,11 @@ fn format_duration_secs_raw(secs: i64) -> String {
     u32::try_from(secs).map_or_else(|_| "—".to_string(), format_secs)
 }
 
-/// The four two-card rows the dashboard stacks below the chart.
+/// The two columns of cards the dashboard stacks below the chart.
+///
+/// Each column is its own vertical stack, so a collapsed one-line card pulls
+/// the card below it up instead of leaving its row's height behind, as paired
+/// rows did.
 #[component]
 fn DashboardGrid(
     left_top: Element,
@@ -622,10 +619,20 @@ fn DashboardGrid(
     right_slow: Element,
 ) -> Element {
     rsx! {
-        div { class: "grid gap-4 lg:grid-cols-2", {left_top} {right_top} }
-        div { class: "grid gap-4 lg:grid-cols-2", {left_attention} {right_attention} }
-        div { class: "grid gap-4 lg:grid-cols-2", {left_doing} {right_doing} }
-        div { class: "grid gap-4 lg:grid-cols-2", {left_slow} {right_slow} }
+        div { class: "grid gap-4 lg:grid-cols-2 items-start",
+            div { class: "space-y-4 min-w-0",
+                {left_top}
+                {left_attention}
+                {left_doing}
+                {left_slow}
+            }
+            div { class: "space-y-4 min-w-0",
+                {right_top}
+                {right_attention}
+                {right_doing}
+                {right_slow}
+            }
+        }
     }
 }
 
@@ -810,10 +817,11 @@ mod tests {
         Build, BuildState, LONGEST_WINDOW_DAYS, OutOfDateSlice, QueueSlice, Severity, ViewParams,
     };
     use super::{
-        FailedPackagesCard, FailedPackagesCardProps, OutOfDateCard, OutOfDateCardProps,
-        RecentProblemsCard, RecentProblemsCardProps, SkeletonCard, SkeletonCardProps, StatTiles,
-        StatTilesProps, StuckQueueCard, StuckQueueCardProps, format_rate, handled_text,
-        longest_title, month_label, queue_reason, queue_title, success_rate,
+        DashboardGrid, DashboardGridProps, FailedPackagesCard, FailedPackagesCardProps,
+        OutOfDateCard, OutOfDateCardProps, RecentProblemsCard, RecentProblemsCardProps,
+        SkeletonCard, SkeletonCardProps, StatTiles, StatTilesProps, StuckQueueCard,
+        StuckQueueCardProps, format_rate, handled_text, longest_title, month_label, queue_reason,
+        queue_title, success_rate,
     };
     use aurcache_client::ListStats;
     use dioxus::prelude::*;
@@ -893,7 +901,7 @@ mod tests {
 
     /// A failed section renders an inline error while the rest would render.
     ///
-    /// Only router-free states are asserted here: rows and "View all" links
+    /// Only router-free states are asserted here: rows and title links
     /// need a `Router` above them, which panics outside the browser in a
     /// debug build — the browser suite covers those, like the logs list's.
     #[test]
@@ -920,6 +928,7 @@ mod tests {
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("No failed packages"), "{html}");
+        // Collapsed cards carry no title link to a list.
         assert!(!html.contains("View all"), "{html}");
 
         let mut dom = VirtualDom::new_with_props(
@@ -968,7 +977,11 @@ mod tests {
         assert!(!html.contains("rebuilding"), "{html}");
     }
 
-    /// The problems empty state is link-free text.
+    /// The problems empty state is a quiet line, not an empty card.
+    ///
+    /// Only the body is asserted here: the title is a link, which renders
+    /// nothing without a `Router` above it — the browser suite covers the
+    /// titles, like the rows.
     #[test]
     fn no_problems_says_so() {
         let mut dom = VirtualDom::new_with_props(
@@ -979,8 +992,52 @@ mod tests {
         );
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
-        assert!(html.contains("Recent problems"), "{html}");
         assert!(html.contains("No warnings or errors"), "{html}");
+    }
+
+    /// The grid is two independent columns, not paired rows: a collapsed
+    /// one-line card pulls the card below it up instead of leaving its
+    /// row's height behind.
+    #[test]
+    fn the_grid_stacks_two_independent_columns() {
+        let mut dom = VirtualDom::new_with_props(
+            DashboardGrid,
+            DashboardGridProps {
+                left_top: rsx! { span { "left-top" } },
+                right_top: rsx! { span { "right-top" } },
+                left_attention: rsx! { span { "left-attention" } },
+                right_attention: rsx! { span { "right-attention" } },
+                left_doing: rsx! { span { "left-doing" } },
+                right_doing: rsx! { span { "right-doing" } },
+                left_slow: rsx! { span { "left-slow" } },
+                right_slow: rsx! { span { "right-slow" } },
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("lg:grid-cols-2 items-start"), "{html}");
+        assert_eq!(html.matches("space-y-4").count(), 2, "{html}");
+        // One column holds the left cards in order, the other the right ones.
+        let mut positions = [
+            "left-top",
+            "left-attention",
+            "left-doing",
+            "left-slow",
+            "right-top",
+            "right-attention",
+            "right-doing",
+            "right-slow",
+        ]
+        .iter()
+        .map(|marker| {
+            html.find(marker)
+                .unwrap_or_else(|| panic!("{marker} renders: {html}"))
+        });
+        let mut previous = positions.next().expect("a first card");
+        for position in positions {
+            assert!(previous < position, "{html}");
+            previous = position;
+        }
     }
 
     /// Skeletons hold the card's shape before the first response: a title
@@ -1056,7 +1113,7 @@ mod tests {
         );
     }
 
-    /// Each card's "View all" target, as a URL: the mapping SSR cannot render
+    /// Each card's title-link target, as a URL: the mapping SSR cannot render
     /// (links need a router) but the browser suite navigates.
     #[test]
     fn each_card_links_to_its_list() {

@@ -184,7 +184,7 @@ ROUTES=(
     "/|Recent problems|the dashboard shows recent problems"
     "/|Largest packages|the dashboard shows largest packages"
     "/|Longest builds|the dashboard shows longest builds"
-    # The stuck queue's "View all" lands on Builds with both queued states in
+    # The stuck queue's title lands on Builds with both queued states in
     # the URL; the interaction suite asserts it arrives applied.
     "/|s=enqueued|the stuck queue links to both queued states"
     "/builds|Duration|builds list"
