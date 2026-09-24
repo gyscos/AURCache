@@ -28,8 +28,15 @@ pub fn fix_source_urls(content: &str) -> String {
 /// Four defences, because Landlock's filesystem policy alone closes only one of
 /// them:
 ///
-///   1. The working directory is the PKGBUILD's own, and it is the only place
-///      the parse may write.
+///   1. Nothing is writable but `/dev/null`. The working directory is the
+///      PKGBUILD's own, readable and no more: sourcing a recipe writes nothing,
+///      and anything writable would be space a PKGBUILD could fill -- the
+///      server's disk, with the database and the repository on it. For a git
+///      source that directory is also the checkout that is archived and sent
+///      to the workers, which a writable parse could rewrite after its
+///      metadata was read. The one casualty is a top-level heredoc too large
+///      for a pipe, which bash spills to `$TMPDIR`; that statement fails and
+///      the parse goes on.
 ///   2. `protected` is unreadable: the server's working directory, which holds
 ///      `./db`, `./repo` and `./data/ca`, and `/etc/aurcache`, which holds the
 ///      environment file the database password and OAuth secret come from.
@@ -124,7 +131,7 @@ impl Bridge {
 
     /// The confined invocation that parses the PKGBUILD at `pkgbuild`.
     fn command(&self, pkgbuild: &Path) -> anyhow::Result<Command> {
-        // Absolute, because the sandbox resolves `--allow` after the working
+        // Absolute, because the sandbox resolves `--read` after the working
         // directory has already moved there.
         let pkgbuild = std::path::absolute(pkgbuild)
             .with_context(|| format!("cannot resolve {}", pkgbuild.display()))?;
@@ -144,7 +151,10 @@ impl Bridge {
             } else {
                 &EXTRAS[..]
             })
-            .arg("--allow")
+            // Read-only: see the first defence above. Granted explicitly because
+            // the directory may sit under a protected one -- the server's own
+            // working directory holds the checkouts.
+            .arg("--read")
             .arg(dir);
         for protected in &self.protected {
             command.arg("--read-except").arg(protected);
@@ -311,7 +321,7 @@ pub(crate) mod tests {
     }
 
     /// The invocation carries the policy: every protected directory, the
-    /// PKGBUILD's own directory as the only writable one, the kernel
+    /// PKGBUILD's own directory readable and nothing writable, the kernel
     /// restrictions, and the script by absolute path rather than whatever
     /// `PATH` finds.
     #[test]
@@ -328,7 +338,7 @@ pub(crate) mod tests {
             [
                 "--no-net",
                 "--isolate-ipc",
-                "--allow",
+                "--read",
                 "/work/demo",
                 "--read-except",
                 "/srv/aurcache",
@@ -343,7 +353,7 @@ pub(crate) mod tests {
         assert_eq!(envs, ["HOME", "LANG", "PATH"]);
     }
 
-    /// A relative path must not reach the sandbox as-is: it resolves `--allow`
+    /// A relative path must not reach the sandbox as-is: it resolves `--read`
     /// from the PKGBUILD's directory, where `demo` would name something else.
     #[test]
     fn command_makes_the_pkgbuild_directory_absolute() {
@@ -387,9 +397,11 @@ pub(crate) mod tests {
     }
 
     /// End to end against the real sandbox: a PKGBUILD can neither read the
-    /// protected directory nor write outside its own.
+    /// protected directory nor write anywhere, its own directory included --
+    /// and it still parses from inside a protected directory, which is where
+    /// the server keeps its checkouts.
     #[test]
-    fn a_parse_cannot_read_protected_files_or_write_elsewhere() {
+    fn a_parse_cannot_read_protected_files_or_write_anywhere() {
         if !bridge_available() {
             eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
@@ -398,8 +410,10 @@ pub(crate) mod tests {
         std::fs::write(protected.path().join("secret"), "2").unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let marker = elsewhere.path().join("marker");
-        let work = tempfile::tempdir().unwrap();
-        let pkgbuild = work.path().join("PKGBUILD");
+        let work = protected.path().join("checkout");
+        std::fs::create_dir(&work).unwrap();
+        let own_marker = work.join("marker");
+        let pkgbuild = work.join("PKGBUILD");
         std::fs::write(
             &pkgbuild,
             format!(
@@ -408,9 +422,11 @@ pub(crate) mod tests {
                  pkgrel=1\n\
                  arch=(any)\n\
                  $(echo touched > {marker} 2>/dev/null)\n\
+                 $(echo touched > {own_marker} 2>/dev/null)\n\
                  package() {{ :; }}\n",
                 secret = protected.path().join("secret").display(),
                 marker = marker.display(),
+                own_marker = own_marker.display(),
             ),
         )
         .unwrap();
@@ -421,7 +437,9 @@ pub(crate) mod tests {
             "fixture proves nothing: it did not read the secret unconfined: {unconfined}"
         );
         assert!(marker.exists(), "fixture did not write the marker either");
+        assert!(own_marker.exists(), "fixture did not write beside itself");
         std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(&own_marker).unwrap();
 
         let info = bridge_protecting(protected.path())
             .parse(&pkgbuild)
@@ -433,11 +451,12 @@ pub(crate) mod tests {
             "read the protected file"
         );
         assert!(!marker.exists(), "wrote outside the PKGBUILD's directory");
+        assert!(!own_marker.exists(), "wrote in the PKGBUILD's directory");
     }
 
     /// With `parse_network` on, the TCP denial is dropped -- and only that:
-    /// the parse stays confined to its own directory and isolated from the
-    /// processes around it.
+    /// the parse still writes nothing and stays isolated from the processes
+    /// around it.
     #[test]
     fn allowing_the_network_drops_only_the_tcp_denial() {
         let bridge = Bridge {
