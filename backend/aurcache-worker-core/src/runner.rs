@@ -496,6 +496,8 @@ mod mirrorlist_tests {
             mirrorlist: mirrorlist.map(ToString::to_string),
             mirrorlist_checksum: checksum.map(ToString::to_string),
             mirrorlist_unchanged: unchanged,
+            packages: vec![],
+            version: String::new(),
             pgp_keys: vec![],
             vcs_sources: vec![],
         }

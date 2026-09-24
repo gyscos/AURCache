@@ -190,6 +190,17 @@ pub struct JobDescriptor {
     /// `source_url` nobody compares against -- silently.
     #[serde(default)]
     pub vcs_sources: Vec<JobVcsSource>,
+    /// Package names this build is expected to produce: the pkgbase plus any
+    /// split-package names recorded for it.
+    ///
+    /// Empty from a server predating the field, which means "just the
+    /// pkgbase".
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Full version (`pkgver-pkgrel`) the produced archives must carry in
+    /// their filenames. Empty from a server predating the field.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// One `git+` source of a build, as the worker needs to find it.
@@ -331,6 +342,8 @@ mod tests {
             mirrorlist: Some("Server = https://example/\\$repo".into()),
             mirrorlist_checksum: Some("abc123".into()),
             mirrorlist_unchanged: false,
+            packages: vec!["hello".into(), "hello-docs".into()],
+            version: "1.0-1".into(),
             pgp_keys: vec!["ABCDEF".into()],
             vcs_sources: vec![JobVcsSource {
                 source_url: "git+https://example.test/repo.git".into(),
@@ -344,6 +357,8 @@ mod tests {
         assert_eq!(job.pgp_keys, back.pgp_keys);
         assert_eq!(job.mirrorlist, back.mirrorlist);
         assert_eq!(job.mirrorlist_checksum, back.mirrorlist_checksum);
+        assert_eq!(job.packages, back.packages);
+        assert_eq!(job.version, back.version);
     }
 
     /// A worker predating the kind field sends none, which must deserialize

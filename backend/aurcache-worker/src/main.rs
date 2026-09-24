@@ -106,6 +106,19 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     .sweep()
     .await;
 
+    // Before enrollment or any build: a crafted PKGBUILD can reach the
+    // worker-protocol port from inside a build (shared network namespace) and
+    // submit a rogue registration, so the build user is firewalled off it
+    // first. Best-effort like the credential announcement below: a worker
+    // that cannot set the rule still builds, but says so loudly.
+    match aurcache_worker::build_firewall::ensure(&cfg.core.aurcache_url, &cfg.build_user) {
+        Ok(()) => tracing::info!("Build user firewalled off the worker-protocol port"),
+        Err(e) => tracing::warn!(
+            "Build-user worker-port rule not installed ({e:#}); builds can reach \
+             the worker protocol port"
+        ),
+    }
+
     let identity = Identity::load_or_create(&cfg.core.data_dir)?;
     announce_build_credential(&cfg).await;
 

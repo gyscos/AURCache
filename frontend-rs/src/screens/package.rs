@@ -557,17 +557,21 @@ fn RelationList(
                 if items.is_empty() {
                     p { class: "opacity-60 text-sm", "{empty}" }
                 } else {
-                    ul { class: "divide-y divide-base-300",
-                        for item in items.iter() {
-                            RelationRow {
-                                // On the loop child, where the diff needs it:
-                                // the key inside `RelationRow`'s own template
-                                // cannot tell sibling rows apart.
-                                key: "{item.id}",
-                                item: item.clone(),
-                                show_blocking,
-                                replace_for: replace_for.clone(),
-                                on_changed,
+                    div { class: "overflow-x-auto",
+                        table { class: "table table-zebra",
+                            tbody {
+                                for item in items.iter() {
+                                    RelationRow {
+                                        // On the loop child, where the diff needs it:
+                                        // the key inside `RelationRow`'s own template
+                                        // cannot tell sibling rows apart.
+                                        key: "{item.id}",
+                                        item: item.clone(),
+                                        show_blocking,
+                                        replace_for: replace_for.clone(),
+                                        on_changed,
+                                    }
+                                }
                             }
                         }
                     }
@@ -587,55 +591,85 @@ fn RelationRow(
 ) -> Element {
     let blocking = show_blocking && !item.satisfied;
     let mut replacing = use_signal(|| false);
+    let pkgbase = item.name.clone();
+    let replace_target = replace_for;
+    // The row handler's own copy: it has to move something in, while the
+    // name below still needs the original.
+    let nav_pkgbase = pkgbase.clone();
 
     rsx! {
-        li { key: "{item.id}", class: "py-2 flex items-center gap-2 flex-wrap",
-            // Inside the row rather than beside it: the key has to sit on the
-            // first node of the block for list diffing, and the modal is
-            // positioned against the viewport regardless of where it is
-            // mounted.
-            if let Some(dependent) = replace_for.clone() {
-                if replacing() {
-                    ReplaceDependencyDialog {
-                        dependent,
-                        dependency: item.name.clone(),
-                        on_close: move |()| replacing.set(false),
-                        on_changed,
+        tr { key: "{item.id}", class: "hover cursor-pointer",
+            // The whole row is the target, but the name stays a real link so
+            // the address is copyable, middle-click opens a tab, and keyboard
+            // users have something to focus — none of which a bare row
+            // handler gives.
+            onclick: move |_| {
+                navigator().push(Route::Package { pkgbase: nav_pkgbase.clone() });
+            },
+            td {
+                Link {
+                    // Monospace, matching the package page's heading: a pkgbase
+                    // is an identifier and reads as one.
+                    //
+                    // Not `link link-primary`: when everything in the row
+                    // navigates, underlining one cell implies the rest does
+                    // not.
+                    class: "font-mono",
+                    to: Route::Package { pkgbase: pkgbase.clone() },
+                    // Otherwise the click reaches the row too and pushes the
+                    // same route twice, leaving a duplicate history entry.
+                    onclick: move |e: MouseEvent| e.stop_propagation(),
+                    "{pkgbase}"
+                }
+                if !item.version_constraint.is_empty() {
+                    span { class: "font-mono text-xs opacity-60 ml-2", "{item.version_constraint}" }
+                }
+            }
+            td {
+                if blocking {
+                    // Say what is actually wrong. "failed" alone does not
+                    // distinguish a dependency that never built from one that built
+                    // to a version too old to satisfy the constraint — and the
+                    // second looks healthy everywhere else.
+                    match item.built_version.clone() {
+                        Some(built) => rsx! {
+                            span { class: "font-mono text-xs opacity-70", "has {built}" }
+                            span { class: "badge badge-warning badge-sm ml-2", "too old" }
+                        },
+                        None => rsx! {
+                            span { class: "badge badge-warning badge-sm", "never built" }
+                        },
+                    }
+                } else if let Some(built) = item.built_version.clone() {
+                    span { class: "font-mono text-xs opacity-50", "{built}" }
+                }
+            }
+            td { BuildStatusBadge { status: item.status } }
+            if replace_target.is_some() {
+                td { class: "text-right",
+                    button {
+                        class: "btn btn-ghost btn-xs",
+                        // A button inside a clickable row has to claim its own
+                        // click, or pressing it also navigates away.
+                        onclick: move |e: MouseEvent| {
+                            e.stop_propagation();
+                            replacing.set(true);
+                        },
+                        "Replace"
                     }
                 }
             }
-            Link {
-                class: "link link-primary font-mono text-sm break-all",
-                to: Route::Package { pkgbase: item.name.clone() },
-                "{item.name}"
-            }
-            if !item.version_constraint.is_empty() {
-                span { class: "font-mono text-xs opacity-60", "{item.version_constraint}" }
-            }
-            div { class: "flex-1" }
-            if blocking {
-                // Say what is actually wrong. "failed" alone does not
-                // distinguish a dependency that never built from one that built
-                // to a version too old to satisfy the constraint — and the
-                // second looks healthy everywhere else.
-                match item.built_version.clone() {
-                    Some(built) => rsx! {
-                        span { class: "font-mono text-xs opacity-70", "has {built}" }
-                        span { class: "badge badge-warning badge-sm", "too old" }
-                    },
-                    None => rsx! {
-                        span { class: "badge badge-warning badge-sm", "never built" }
-                    },
-                }
-            } else if let Some(built) = item.built_version.clone() {
-                span { class: "font-mono text-xs opacity-50", "{built}" }
-            }
-            BuildStatusBadge { status: item.status }
-            if replace_for.is_some() {
-                button {
-                    class: "btn btn-ghost btn-xs",
-                    onclick: move |_| replacing.set(true),
-                    "Replace"
+        }
+        // Beside the row rather than inside it: a modal is positioned against
+        // the viewport regardless of where it is mounted, and a div inside a
+        // tr would be invalid table markup.
+        if let Some(dependent) = replace_target {
+            if replacing() {
+                ReplaceDependencyDialog {
+                    dependent,
+                    dependency: pkgbase,
+                    on_close: move |()| replacing.set(false),
+                    on_changed,
                 }
             }
         }

@@ -459,7 +459,7 @@ pub async fn interrupted(db: &DatabaseConnection) -> anyhow::Result<Vec<i32>> {
 
 /// The package names a build of `pkg` may produce: its pkgbase plus any
 /// split-package names recorded on the package row.
-fn expected_pkgnames(pkg: &packages::Model) -> Vec<String> {
+pub fn expected_pkgnames(pkg: &packages::Model) -> Vec<String> {
     let mut names = vec![pkg.name.clone()];
     if let Some(json) = pkg.split_packages.as_deref()
         && let Ok(split) = serde_json::from_str::<Vec<String>>(json)

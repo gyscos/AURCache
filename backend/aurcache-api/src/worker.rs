@@ -583,9 +583,13 @@ async fn build_descriptor(
             .await
             .value;
 
+    // Before `pkg.name` moves into the descriptor below.
+    let packages = aurcache_utils::publish::expected_pkgnames(&pkg);
     Ok(JobDescriptor {
         build_id: build.id,
         pkgbase: pkg.name,
+        packages,
+        version: build.version.clone(),
         arch,
         build_flags,
         persistent_builddir,

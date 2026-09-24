@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Build the multi-architecture server, worker and hybrid images.
+# Build the multi-architecture server, worker, hybrid and demo-worker images.
 #
 # The same thing the publish workflow does, runnable by hand.
 #
 #   aurcache-server  the backend alone -- what a split deployment runs.
 #   aurcache-worker  a build worker, for a split deployment.
 #   aurcache         the hybrid (server + embedded worker) compatibility image.
+#   aurcache-demo-worker  the dummy worker for demo instances: synthetic
+#                    packages, no build. Debian, like the server.
 #
 # The worker and hybrid images install AURCache as Arch packages, which the
 # packager stage cross-compiles on the build host; only their runtime stages are
 # per-architecture, so an emulated build spends its time on `pacman -U` rather
-# than on cargo. The server image is Debian and cross-compiles the same way.
+# than on cargo. The server image is Debian and cross-compiles through
+# build-rust.sh. The demo-worker image is Debian too but builds natively per
+# platform, which under emulation is slow rather than wrong (see
+# docker/demo-worker.Dockerfile).
 #
 #   scripts/build-images.sh docker.example.com
 #   scripts/build-images.sh --push --tag v0.5.0 docker.example.com
@@ -40,8 +45,8 @@ usage() {
     cat <<'EOF'
 Options:
   -t, --tag TAG             Image tag (default: latest)
-  -i, --images LIST         Comma-separated: server, worker, hybrid
-                            (default: all three)
+  -i, --images LIST         Comma-separated: server, worker, hybrid, demo-worker
+                            (default: server, worker, hybrid)
   -p, --platforms LIST      Target platforms (default: linux/amd64,linux/arm64,linux/arm/v7)
       --push                Push to the registry; without it the images are
                             built and discarded (see the note below)
@@ -228,11 +233,13 @@ declare -A DOCKERFILES=(
     [server]=docker/server.Dockerfile
     [worker]=docker/worker.Dockerfile
     [hybrid]=docker/hybrid.Dockerfile
+    [demo-worker]=docker/demo-worker.Dockerfile
 )
 declare -A IMAGE_NAMES=(
     [server]=aurcache-server
     [worker]=aurcache-worker
     [hybrid]=aurcache
+    [demo-worker]=aurcache-demo-worker
 )
 
 # The worker and hybrid images build these as Arch packages; the server image
@@ -245,19 +252,20 @@ IFS=',' read -r -a selected <<<"$images"
 for image in "${selected[@]}"; do
     dockerfile=${DOCKERFILES[$image]:-}
     if [[ -z $dockerfile ]]; then
-        echo "error: unknown image '$image' (expected server, worker or hybrid)" >&2
+        echo "error: unknown image '$image' (expected server, worker, hybrid or demo-worker)" >&2
         exit 2
     fi
 
     ref="$registry/${IMAGE_NAMES[$image]}:$tag"
     echo
     echo "==> $image -> $ref  [$platforms]"
-    # The cross-toolchain args belong to the Arch packager stages. The server
-    # image is Debian and declares neither, and buildkit warns about a build arg
-    # no stage consumes, so it is built without them. The version args go to
-    # every image: the server consumes them in its builder stage.
+    # The cross-toolchain args belong to the Arch packager stages. The Debian
+    # images (server, demo-worker) declare neither, and buildkit warns about
+    # a build arg no stage consumes, so they are built without them. The
+    # version args go to every image: the Debian images consume them in their
+    # builder stages.
     image_build_args=("${build_args[@]}")
-    [[ $image == server ]] && image_build_args=()
+    [[ $image == server || $image == demo-worker ]] && image_build_args=()
     image_build_args+=("${version_args[@]}")
     docker buildx build "${builder_args[@]}" \
         --platform "$platforms" \
@@ -294,7 +302,7 @@ if [[ -n $packages_dir ]]; then
         done
     else
         echo "note: --packages-dir given but no worker or hybrid image selected;" >&2
-        echo "      the server image installs no packages to export." >&2
+        echo "      the server and demo-worker images install no packages to export." >&2
     fi
 fi
 
