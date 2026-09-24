@@ -1,4 +1,10 @@
 # syntax=docker/dockerfile:1
+# What the worker binary reports as its version: the commit it was built
+# from (see aurcache-common's build script). The tag stays empty except for
+# release builds, so ordinary images name their commit instead.
+ARG LATEST_COMMIT_SHA=dev
+ARG AURCACHE_GIT_TAG=
+ARG AURCACHE_GIT_DIRTY=
 #
 # AURCache remote build worker image (multi-arch).
 #
@@ -87,6 +93,12 @@ ARG TARGETVARIANT
 FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
 ARG TARGETARCH
 ARG TARGETVARIANT
+ARG LATEST_COMMIT_SHA
+ARG AURCACHE_GIT_TAG
+ARG AURCACHE_GIT_DIRTY
+ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA} \
+    AURCACHE_GIT_TAG=${AURCACHE_GIT_TAG} \
+    AURCACHE_GIT_DIRTY=${AURCACHE_GIT_DIRTY}
 
 # The scripts need no source, so they are copied ahead of the tree and a code
 # change does not invalidate them.

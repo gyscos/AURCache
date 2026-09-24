@@ -197,6 +197,25 @@ fi
 if [[ -n $toolchain_repo_name ]]; then
     build_args+=(--build-arg "AURCACHE_TOOLCHAIN_REPO_NAME=$toolchain_repo_name")
 fi
+# What the image's binaries report as their version. `.git` never reaches the
+# image (see .dockerignore), so the commit, the release tag when this tree is
+# exactly one, and the dirty state go in explicitly rather than being probed
+# inside (see aurcache-common's build script). Outside a checkout there is
+# simply nothing to pass, and the binaries report their bare release.
+#
+# Apart from the toolchain args: every image consumes these (the server in its
+# builder stage, the others in their packager stages), so unlike those they
+# are never cleared per image below.
+version_args=()
+if sha=$(git rev-parse HEAD 2>/dev/null); then
+    version_args+=(--build-arg "LATEST_COMMIT_SHA=$sha")
+    if git_tag=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+        version_args+=(--build-arg "AURCACHE_GIT_TAG=$git_tag")
+    fi
+    if [[ -n $(git status --porcelain --untracked-files=no 2>/dev/null) ]]; then
+        version_args+=(--build-arg "AURCACHE_GIT_DIRTY=1")
+    fi
+fi
 if [[ $platforms == *arm/v7* ]] && [[ -z $toolchain_repo ]]; then
     echo "note: building armv7 without --toolchain-repo; the cross toolchain is"
     echo "      built from the AUR and takes roughly an hour the first time."
@@ -235,9 +254,11 @@ for image in "${selected[@]}"; do
     echo "==> $image -> $ref  [$platforms]"
     # The cross-toolchain args belong to the Arch packager stages. The server
     # image is Debian and declares neither, and buildkit warns about a build arg
-    # no stage consumes, so it is built without them.
+    # no stage consumes, so it is built without them. The version args go to
+    # every image: the server consumes them in its builder stage.
     image_build_args=("${build_args[@]}")
     [[ $image == server ]] && image_build_args=()
+    image_build_args+=("${version_args[@]}")
     docker buildx build "${builder_args[@]}" \
         --platform "$platforms" \
         --file "$REPO_ROOT/$dockerfile" \
@@ -266,6 +287,7 @@ if [[ -n $packages_dir ]]; then
                 --platform linux/amd64 \
                 --file "$REPO_ROOT/$dockerfile" \
                 --target export-pkgs \
+                "${version_args[@]}" \
                 --output "type=local,dest=$packages_dir" \
                 "$REPO_ROOT"
             exported_dockerfiles[$dockerfile]=1

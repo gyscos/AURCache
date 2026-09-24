@@ -71,6 +71,10 @@ jobs:
           emit worker_tags "$REPO/aurcache-worker"
           emit hybrid_tags "$REPO/aurcache"
           emit builder_tags "$REPO/aurcache-builder"
+          # The release tag for the binaries to report, if this is one (see
+          # aurcache-common's build script): empty on the weekly cron refresh,
+          # which builds master rather than a release and names its commit.
+          echo "git_tag=$VERSION" >> "$GITHUB_OUTPUT"
       -
         name: Build worker container
         uses: docker/build-push-action@v7
@@ -89,6 +93,11 @@ jobs:
           context: .
           file: ./docker/worker.Dockerfile
           tags: ${{ steps.vars.outputs.worker_tags }}
+          # What the worker binary reports as its version (see
+          # aurcache-common's build script).
+          build-args: |
+            LATEST_COMMIT_SHA=${{ github.sha }}
+            AURCACHE_GIT_TAG=${{ steps.vars.outputs.git_tag }}
       -
         name: Build hybrid compatibility container
         uses: docker/build-push-action@v7
@@ -107,6 +116,11 @@ jobs:
           context: .
           file: ./docker/hybrid.Dockerfile
           tags: ${{ steps.vars.outputs.hybrid_tags }}
+          # What the bundled binaries report as their version (see
+          # aurcache-common's build script).
+          build-args: |
+            LATEST_COMMIT_SHA=${{ github.sha }}
+            AURCACHE_GIT_TAG=${{ steps.vars.outputs.git_tag }}
       -
         # Spawned per build by the hybrid image's compatibility executor.
         name: Build legacy builder container

@@ -70,6 +70,14 @@ jobs:
           else
             echo "tag=unknown" >> $GITHUB_OUTPUT
           fi
+          # The release tag for the binaries to report, if this is one: empty
+          # otherwise, so ordinary images name their commit instead (see
+          # aurcache-common's build script).
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "git_tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "git_tag=" >> $GITHUB_OUTPUT
+          fi
 
       - name: Build and push aurcache-server (${{ matrix.tag_suffix }})
         if: steps.vars.outputs.tag != 'unknown'
@@ -77,6 +85,7 @@ jobs:
           docker buildx build \
             --platform linux/${{ matrix.arch }} \
             --build-arg LATEST_COMMIT_SHA=${{ github.event.head_commit.id }} \
+            --build-arg AURCACHE_GIT_TAG=${{ steps.vars.outputs.git_tag }} \
             --build-arg TARGET_ARCH=linux/${{ matrix.arch }} \
             -f ./docker/server.Dockerfile \
             -t ghcr.io/${{ steps.repo_name_lc.outputs.lowercase }}-server:${{ steps.vars.outputs.tag }}${{ matrix.tag_suffix }} \

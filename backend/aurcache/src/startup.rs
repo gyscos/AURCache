@@ -31,11 +31,9 @@ const START_BANNER: &str = r"
 
 pub fn pre_startup_tasks() {
     info!("{START_BANNER}");
-    let latest_commit_sha = option_env!("LATEST_COMMIT_SHA").unwrap_or("dev");
     info!(
-        "Version: {}#{}",
-        env!("CARGO_PKG_VERSION"),
-        latest_commit_sha
+        "Version: {}",
+        aurcache_common::version::full_version(env!("CARGO_PKG_VERSION"))
     );
 
     #[cfg(debug_assertions)]

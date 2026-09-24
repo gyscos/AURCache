@@ -1,12 +1,20 @@
 # syntax=docker/dockerfile:1
+# What the server binary reports as its version (see aurcache-common's build
+# script): the commit, except on release builds, which name the tag instead.
 ARG LATEST_COMMIT_SHA=dev
+ARG AURCACHE_GIT_TAG=
+ARG AURCACHE_GIT_DIRTY=
 # Must stay on the same Debian release as the runtime stage below: the default
 # `rust:1.98.1` tag is trixie (glibc 2.41) and produces a binary the bookworm
 # runtime (glibc 2.36) cannot load - it dies at startup with
 # "GLIBC_2.38 not found".
 FROM --platform=linux/amd64 rust:1.98.1-bookworm AS builder
 ARG LATEST_COMMIT_SHA
-ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
+ARG AURCACHE_GIT_TAG
+ARG AURCACHE_GIT_DIRTY
+ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA} \
+    AURCACHE_GIT_TAG=${AURCACHE_GIT_TAG} \
+    AURCACHE_GIT_DIRTY=${AURCACHE_GIT_DIRTY}
 # Install necessary tools and dependencies
 
 # The official rust image keeps cargo and the toolchain under /usr/local/cargo,

@@ -15,7 +15,11 @@
 # amd64, arm64 and armv7. armv7's cross toolchain is AUR-only, so it is built
 # in a stage of its own that the other two never reach.
 
+# What the bundled binaries report as their version (see aurcache-common's
+# build script): the commit, except on release builds, which name the tag.
 ARG LATEST_COMMIT_SHA=dev
+ARG AURCACHE_GIT_TAG=
+ARG AURCACHE_GIT_DIRTY=
 
 ########## Stage 1: build every package ##########
 # One stage, on the native build host, cross-compiling for the target — cargo
@@ -78,7 +82,11 @@ FROM toolchain-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS packager
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG LATEST_COMMIT_SHA
-ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA}
+ARG AURCACHE_GIT_TAG
+ARG AURCACHE_GIT_DIRTY
+ENV LATEST_COMMIT_SHA=${LATEST_COMMIT_SHA} \
+    AURCACHE_GIT_TAG=${AURCACHE_GIT_TAG} \
+    AURCACHE_GIT_DIRTY=${AURCACHE_GIT_DIRTY}
 
 USER packager
 ENV PATH="/home/packager/bin:/home/packager/.cargo/bin:${PATH}"

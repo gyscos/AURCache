@@ -38,7 +38,7 @@ pub fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> Regist
         name: cfg.name.clone(),
         native_arches: cfg.native_arches.clone(),
         emulated_arches: cfg.emulated_arches.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: aurcache_common::version::full_version(env!("CARGO_PKG_VERSION")),
         kind: kind.to_string(),
         csr_pem,
         enrollment_token: cfg.enrollment_token.clone(),

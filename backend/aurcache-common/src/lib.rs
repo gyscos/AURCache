@@ -20,6 +20,9 @@ pub mod settings;
 pub mod source;
 /// Sizes and durations as configuration writes them (`40G`, `3h`).
 pub mod units;
+/// The version string binaries report: their crate release, plus the commit
+/// when the build is not exactly that release.
+pub mod version;
 pub mod worker;
 /// What a worker declares it can be configured with, and what it is running.
 pub mod worker_config;

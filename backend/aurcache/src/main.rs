@@ -56,7 +56,7 @@ async fn main() {
     // what lines a deploy up against whatever happened after it -- and it is
     // the marker the "since the last restart" view counts back to.
     activity.emit(Event::ServerStarted {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: aurcache_common::version::full_version(env!("CARGO_PKG_VERSION")),
     });
 
     // Load (or create on first run) the internal CA used to authenticate remote
@@ -141,7 +141,9 @@ async fn main() {
 
     let api_handle = init_api(
         services.clone(),
-        ServerVersion(env!("CARGO_PKG_VERSION").to_string()),
+        ServerVersion(aurcache_common::version::full_version(env!(
+            "CARGO_PKG_VERSION"
+        ))),
         CaDirectory(ca_dir.clone()),
     );
     let worker_api_handle = init_worker_api(db, ca, store, Arc::clone(&repo), activity);
