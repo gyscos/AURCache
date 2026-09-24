@@ -21,9 +21,9 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        // Signed for the same reason as `download_counts.count`: both backends'
-        // integers are signed, and a bad value is better read as negative than
-        // wrapped into a plausible-looking huge one.
+        // Signed because both backends' integers are signed, and a bad value
+        // is better read as negative than wrapped into a plausible-looking
+        // huge one.
         let sql = match database_type() {
             DbBackend::Sqlite => "alter table files add size BIGINT;",
             DbBackend::Postgres => "ALTER TABLE files ADD COLUMN size BIGINT;",

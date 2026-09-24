@@ -7,7 +7,6 @@ pub mod activities;
 pub mod api_tokens;
 pub mod builds;
 pub mod dependencies;
-pub mod download_counts;
 pub mod files;
 pub mod helpers;
 pub mod init;

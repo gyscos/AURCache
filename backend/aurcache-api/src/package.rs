@@ -19,7 +19,6 @@ use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
 };
-use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::helpers::operations;
 use aurcache_db::packages::SourceData;
@@ -876,26 +875,6 @@ enum RelationDirection {
     Dependents,
 }
 
-/// Downloads for a package, over the file names it produces.
-///
-/// A package with no split list produces one file named after itself; one with
-/// a split list produces those and nothing named after the pkgbase.
-async fn download_total(
-    db: &DatabaseConnection,
-    buffer: &Arc<DownloadCounter>,
-    name: &str,
-    split: Option<&[String]>,
-) -> Result<i64, ApiError> {
-    let names: Vec<String> = match split {
-        Some(names) if !names.is_empty() => names.to_vec(),
-        _ => vec![name.to_string()],
-    };
-    buffer
-        .total_for_packages(db, &names)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))
-}
-
 #[utoipa::path(
     responses(
             (status = 200, description = "Get package details
@@ -909,7 +888,6 @@ https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackage),
 #[get("/package/<pkgbase>")]
 pub async fn get_package(
     db: &State<DatabaseConnection>,
-    downloads: &State<Arc<DownloadCounter>>,
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<ExtendedPackage>, ApiError> {
@@ -944,10 +922,6 @@ pub async fn get_package(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
 
-    // Read before the struct below consumes `pkg.name`.
-    let download_count =
-        download_total(db, downloads, &pkg.name, split_packages.as_deref()).await?;
-
     let ext_pkg = ExtendedPackage {
         // Mirrored from the package's checkout, so a git-sourced package
         // describes itself as fully as an AUR one.
@@ -972,10 +946,6 @@ pub async fn get_package(
         dependencies,
         dependents,
         has_patch,
-        // Over the names this package actually produces: a split package's
-        // downloads are its subpackages' downloads, and there is no file named
-        // after the pkgbase to count.
-        downloads: download_count,
     };
 
     Ok(Json(ext_pkg))

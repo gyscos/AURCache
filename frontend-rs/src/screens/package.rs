@@ -1461,19 +1461,6 @@ fn ArtifactSizeField(pkgbase: String) -> Element {
     }
 }
 
-/// A download count, or nothing at all.
-///
-/// Zero is rendered as "not downloaded yet" rather than "0": for a package
-/// built minutes ago the number is uninformative, and a bare 0 next to a
-/// healthy build reads as something being broken.
-fn downloads_label(downloads: i64) -> String {
-    match downloads {
-        ..=0 => "not downloaded yet".to_string(),
-        1 => "1 download".to_string(),
-        n => format!("{n} downloads"),
-    }
-}
-
 /// What lands in the repository when this package builds.
 #[component]
 fn ArtifactsCard(pkg: ExtendedPackage) -> Element {
@@ -1536,20 +1523,6 @@ fn ArtifactsCard(pkg: ExtendedPackage) -> Element {
                     div { class: "flex items-baseline gap-2 pt-2 text-sm",
                         span { class: "opacity-60", "Total" }
                         span { class: "font-mono", {format_bytes(total)} }
-                    }
-                }
-                // Counted across every version and architecture this package
-                // has produced -- the question is how often it has been
-                // installed, not how often one particular build was fetched.
-                div { class: "flex items-baseline gap-2 pt-2",
-                    span { class: "text-sm", {downloads_label(pkg.downloads)} }
-                    span {
-                        class: "cursor-help text-xs opacity-40 hover:opacity-80 transition-opacity",
-                        title: "Fetches of this package from the repository, across every version \
-                                and architecture. Up to date on every load — counts still buffered \
-                                in the server are included. Resumed (partial) downloads are not \
-                                counted.",
-                        "?"
                     }
                 }
                 if !built {
@@ -1993,7 +1966,6 @@ mod tests {
             }),
             split_packages: None,
             files: vec![],
-            downloads: 0,
             dependencies: vec![],
             dependents: vec![],
             has_patch: false,

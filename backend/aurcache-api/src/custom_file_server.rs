@@ -1,4 +1,3 @@
-use aurcache_db::helpers::downloads::DownloadCounter;
 use rocket::fs::NamedFile;
 use rocket::http::uri::Segments;
 use rocket::http::{Header, Method, Status};
@@ -7,7 +6,6 @@ use rocket::route::{Handler, Outcome};
 use rocket::{Data, Request, Response, Route, async_trait, figment};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncSeekExt;
 
@@ -76,15 +74,6 @@ impl Handler for CustomFileServer {
             datetime.to_rfc2822()
         });
 
-        // Counted before the response is built, and only for a whole file.
-        // A `Range` request is pacman resuming an interrupted download, and
-        // counting each range as a download would inflate a popular package by
-        // however many pieces its downloads happened to arrive in. Undercounting
-        // resumed downloads is the smaller error of the two.
-        if req.method() == Method::Get && req.headers().get_one("Range").is_none() {
-            count_download(req, &file_path);
-        }
-
         // A range starting past the end is 416 with `Content-Range: bytes */size`,
         // which resuming clients (pacman) expect, rather than a silent 200. A
         // header that is not a single byte range is ignored, as HTTP says, and
@@ -134,34 +123,6 @@ impl Handler for CustomFileServer {
 
         Outcome::Success(builder.finalize())
     }
-}
-
-/// Record a download of `path`, if it is a package and anyone is counting.
-///
-/// Every step is optional and silent. This runs inside a static file handler,
-/// where the only thing that matters is that the file is served: a missing
-/// counter, an unreadable name or a file that is not a package are all reasons
-/// to count nothing, and none of them is a reason to fail the request.
-fn count_download(req: &Request<'_>, path: &Path) {
-    let Some(buffer) = req.rocket().state::<Arc<DownloadCounter>>() else {
-        return;
-    };
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return;
-    };
-    if is_package_file(name) {
-        buffer.record(name);
-    }
-}
-
-/// Whether a repository file is a built package.
-///
-/// The repository also serves `repo.db`, `repo.files` and the mirrorlist, and
-/// those are fetched on every `pacman -Sy` by every client -- counting them
-/// would swamp the figure this exists to report. The compression suffix is left
-/// open because it is makepkg's choice, not ours.
-fn is_package_file(name: &str) -> bool {
-    name.contains(".pkg.tar")
 }
 
 /// Open the requested byte range as a streaming body.
@@ -236,31 +197,7 @@ fn parse_range_header(header: &str, file_size: u64) -> RangeRequest {
 
 #[cfg(test)]
 mod download_tests {
-    use super::{RangeRequest, is_package_file, parse_range_header};
-
-    /// The repository index is fetched by every client on every `pacman -Sy`.
-    /// Counting it would bury the figure this exists to report under traffic
-    /// that has nothing to do with any one package.
-    #[test]
-    fn only_package_files_are_counted() {
-        for name in [
-            "hello-2.12.1-2-x86_64.pkg.tar.zst",
-            "hello-2.12.1-2-x86_64.pkg.tar.xz",
-            "lib32-glibc-2.39-1-x86_64.pkg.tar.zst.sig",
-        ] {
-            assert!(is_package_file(name), "{name} should count");
-        }
-
-        for name in [
-            "repo.db",
-            "repo.db.tar.gz",
-            "repo.files",
-            "repo.files.tar.gz",
-            "mirrorlist.x86_64",
-        ] {
-            assert!(!is_package_file(name), "{name} should not count");
-        }
-    }
+    use super::{RangeRequest, parse_range_header};
 
     /// The parser speaks exclusive ends: HTTP ranges are inclusive, and an
     /// omitted end means "to the end of the file".

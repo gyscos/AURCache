@@ -7,7 +7,6 @@ use crate::embed::CustomHandler;
 use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, oauth_config_from_env};
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_utils::repository::Repository;
 use aurcache_utils::services::Services;
 use aurcache_utils::snapshot::SnapshotStore;
@@ -95,12 +94,7 @@ pub struct CaDirectory(pub std::path::PathBuf);
 #[derive(Debug, Clone)]
 pub struct ServerVersion(pub String);
 
-pub fn init_api(
-    services: Services,
-    downloads: Arc<DownloadCounter>,
-    version: ServerVersion,
-    ca_dir: CaDirectory,
-) -> JoinHandle<()> {
+pub fn init_api(services: Services, version: ServerVersion, ca_dir: CaDirectory) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
@@ -204,7 +198,6 @@ pub fn init_api(
             // so, rather than asking for the bundle and using a field.
             .manage(Arc::clone(&services.store))
             .manage(services)
-            .manage(downloads)
             .manage(version)
             .manage(ca_dir)
             .mount("/api/", build_api())
@@ -295,7 +288,7 @@ pub fn init_worker_api(
 }
 
 #[must_use]
-pub fn init_repo(downloads: Arc<DownloadCounter>, repo: Arc<Repository>) -> JoinHandle<()> {
+pub fn init_repo(repo: Arc<Repository>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
@@ -305,9 +298,6 @@ pub fn init_repo(downloads: Arc<DownloadCounter>, repo: Arc<Repository>) -> Join
         };
 
         let launch_result = rocket::custom(config)
-            // The file server counts what it serves through this; without it
-            // in state it simply counts nothing.
-            .manage(downloads)
             .mount("/", CustomFileServer::new(repo.root()))
             .launch()
             .await;

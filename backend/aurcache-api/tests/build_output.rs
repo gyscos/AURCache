@@ -11,7 +11,6 @@ use std::sync::Arc;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::builds;
-use aurcache_db::helpers::downloads::DownloadCounter;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::{SourceData, SourceType};
@@ -41,7 +40,6 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
     let checkouts = tempfile::tempdir().expect("tempdir");
     let rocket = rocket::build()
         .manage(db.clone())
-        .manage(Arc::new(DownloadCounter::new()))
         .manage(ActivityLog::discarding())
         .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
