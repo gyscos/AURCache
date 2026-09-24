@@ -54,6 +54,25 @@ and nothing changes on the machine: the server simply stops offering it jobs.
 A lower-priority worker that would have waited for it stops waiting straight
 away.
 
+To wait for it to empty from a script -- before restarting it, say -- add
+`--wait`. The command then returns once the worker is running no builds,
+printing what it is still running whenever that changes, and exits non-zero
+after `--wait-timeout` seconds if one is given (by default it waits as long as
+the builds take). Pausing is idempotent, so a worker paused earlier can be
+waited on the same way:
+
+```bash
+aurcache-cli worker pause 3 --wait --wait-timeout 7200 && systemctl restart aurcache-worker
+```
+
+A build counts as finished for the worker once it is `publishing`: the worker
+has handed its packages over, and the server puts them in the repository on
+its own. To see what a worker ran, or is running, filter the builds list:
+
+```bash
+aurcache-cli builds list --worker freyja --status active,publishing
+```
+
 When the machine is ready again, **Resume intake** (`aurcache-cli worker resume
 3`) and it takes new builds from its next claim. A stopped intake survives the
 worker restarting, so it will not start building the moment it comes back up.

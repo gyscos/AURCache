@@ -475,15 +475,38 @@ impl AurCacheClient {
         limit: Option<u64>,
         page: Option<u64>,
     ) -> Result<Vec<Build>> {
-        let query = Query::default().opt("limit", limit).opt("page", page);
+        self.list_builds_matching(&BuildQuery {
+            pkgbase: pkgbase.map(str::to_string),
+            limit,
+            page,
+            ..BuildQuery::default()
+        })
+        .await
+    }
+
+    /// Lists builds, newest first, narrowed by `query`.
+    pub async fn list_builds_matching(&self, query: &BuildQuery) -> Result<Vec<Build>> {
+        let states = (!query.states.is_empty()).then(|| {
+            query
+                .states
+                .iter()
+                .map(|state| state.key())
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let params = Query::default()
+            .opt("limit", query.limit)
+            .opt("page", query.page)
+            .opt("worker", query.worker)
+            .opt("status", states);
         // Builds for one package are a sub-resource, not a query filter: a
         // pkgbase may contain `+`, which is literal in a path but decodes to a
         // space in a query value.
-        let path = match pkgbase {
+        let path = match &query.pkgbase {
             Some(pkgbase) => format!("/package/{pkgbase}/builds"),
             None => "/builds".to_string(),
         };
-        self.request_json::<Vec<Build>, Value>(Method::GET, &path, query.pairs(), None)
+        self.request_json::<Vec<Build>, Value>(Method::GET, &path, params.pairs(), None)
             .await
     }
 
@@ -1111,6 +1134,20 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
             path.trim_start_matches('/')
         )
     }
+}
+
+/// Which builds [`AurCacheClient::list_builds_matching`] returns. Every field
+/// left unset matches everything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildQuery {
+    /// Builds of this package only.
+    pub pkgbase: Option<String>,
+    /// Builds this worker (by id) ran, or is running.
+    pub worker: Option<i32>,
+    /// Builds in one of these states. Empty is every state.
+    pub states: Vec<aurcache_common::build_state::BuildState>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
 }
 
 /// Accumulates the `?key=value` pairs of a request, skipping absent values.

@@ -11,7 +11,7 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
-use aurcache_common::build_state::{BuildStates, BuildTrigger};
+use aurcache_common::build_state::{BuildState, BuildStates, BuildTrigger};
 use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
@@ -163,18 +163,24 @@ pub async fn download_build_output(
     ),
     params(
             ("limit", description = "Limit of items to fetch"),
-            ("page", description = "Page to fetch")
+            ("page", description = "Page to fetch"),
+            ("worker", description = "Only builds this worker (by id) ran or is running"),
+            ("status", description = "Only builds in these states, comma-separated keys: \
+                active, successful, failed, enqueued, waiting-for-deps, publishing"),
     )
 )]
 /// Builds across all packages, newest first.
-#[get("/builds?<limit>&<page>")]
+#[get("/builds?<limit>&<page>&<worker>&<status>")]
 pub async fn list_builds(
     db: &State<DatabaseConnection>,
     limit: Option<u64>,
     page: Option<u64>,
+    worker: Option<i32>,
+    status: Option<&str>,
     _a: Authenticated,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
-    list_builds_impl(db.inner(), None, limit, page).await
+    let filter = BuildFilter::new(None, worker, status)?;
+    list_builds_impl(db.inner(), &filter, limit, page).await
 }
 
 /// Builds for one package.
@@ -188,23 +194,57 @@ pub async fn list_builds(
         ("pkgbase" = String, Path, description = "pkgbase of the package"),
         ("limit", description = "Limit of items to fetch"),
         ("page", description = "Page to fetch"),
+        ("worker", description = "Only builds this worker (by id) ran or is running"),
+        ("status", description = "Only builds in these states, comma-separated keys"),
     )
 )]
-#[get("/package/<pkgbase>/builds?<limit>&<page>")]
+#[get("/package/<pkgbase>/builds?<limit>&<page>&<worker>&<status>")]
 pub async fn list_package_builds(
     db: &State<DatabaseConnection>,
     pkgbase: &str,
     limit: Option<u64>,
     page: Option<u64>,
+    worker: Option<i32>,
+    status: Option<&str>,
     _a: Authenticated,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
     let pkg = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
-    list_builds_impl(db.inner(), pkg, limit, page).await
+    let filter = BuildFilter::new(pkg, worker, status)?;
+    list_builds_impl(db.inner(), &filter, limit, page).await
+}
+
+/// Which builds a list is narrowed to.
+struct BuildFilter {
+    pkg_id: Option<i32>,
+    /// The worker that ran the build, or holds its lease now. A requeued
+    /// build loses it, so it lists under whoever runs it next.
+    worker: Option<i32>,
+    /// Empty means every state.
+    states: Vec<BuildState>,
+}
+
+impl BuildFilter {
+    fn new(
+        pkg_id: Option<i32>,
+        worker: Option<i32>,
+        status: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        let states = status
+            .map(BuildState::parse_keys)
+            .transpose()
+            .map_err(|e| err(Status::BadRequest, e))?
+            .unwrap_or_default();
+        Ok(Self {
+            pkg_id,
+            worker,
+            states,
+        })
+    }
 }
 
 async fn list_builds_impl(
     db: &DatabaseConnection,
-    pkg_id: Option<i32>,
+    filter: &BuildFilter,
     limit: Option<u64>,
     page: Option<u64>,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
@@ -221,15 +261,22 @@ async fn list_builds_impl(
                 .map(|(page, limit)| page.saturating_mul(limit)),
         );
 
-    let rows = match pkg_id {
-        None => basequery.into_model::<BuildRow>().all(db),
-        Some(pkg_id) => basequery
-            .filter(builds::Column::PkgId.eq(pkg_id))
-            .into_model::<BuildRow>()
-            .all(db),
+    let mut query = basequery;
+    if let Some(pkg_id) = filter.pkg_id {
+        query = query.filter(builds::Column::PkgId.eq(pkg_id));
     }
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
+    if let Some(worker) = filter.worker {
+        query = query.filter(builds::Column::WorkerId.eq(worker));
+    }
+    if !filter.states.is_empty() {
+        query = query
+            .filter(builds::Column::Status.is_in(filter.states.iter().map(|state| state.as_i32())));
+    }
+    let rows = query
+        .into_model::<BuildRow>()
+        .all(db)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(Json(annotate_waiting(db, rows).await))
 }

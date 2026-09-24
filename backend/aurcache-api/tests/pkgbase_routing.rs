@@ -700,3 +700,98 @@ async fn a_package_the_aur_no_longer_lists_reads_as_not_found() {
         .expect("body");
     assert!(body.contains(r#""package_type":"AurNotFound""#), "{body}");
 }
+
+// ------------------------------------------------------------ build filters
+
+/// A build of `pkg_id`, numbered `number`, in `status`, run by `worker`.
+async fn insert_worker_build(
+    db: &DatabaseConnection,
+    pkg_id: i32,
+    number: i32,
+    status: i32,
+    worker: Option<i32>,
+) {
+    use sea_orm::ConnectionTrait;
+    let worker = worker.map_or_else(|| "NULL".to_string(), |w| w.to_string());
+    db.execute_unprepared(&format!(
+        "INSERT INTO builds (pkg_id, number, status, start_time, platform, version, \
+         attempt_count, worker_id) \
+         VALUES ({pkg_id}, {number}, {status}, {number}, 'x86_64', '1.0-1', 0, {worker})"
+    ))
+    .await
+    .expect("insert build");
+}
+
+async fn insert_worker(db: &DatabaseConnection, id: i32) {
+    use sea_orm::ConnectionTrait;
+    db.execute_unprepared(&format!(
+        "INSERT INTO workers (id, name, status, cert_fingerprint, native_arches, \
+         emulated_arches, package_affinity, priority, concurrency) \
+         VALUES ({id}, 'w{id}', 'approved', 'fp{id}', 'x86_64', '', '', 0, 1)"
+    ))
+    .await
+    .expect("insert worker");
+}
+
+/// `(pkg_name, number)` of what a list route returned.
+async fn listed(client: &Client, path: &str) -> Vec<(String, i32)> {
+    let response = client.get(path).dispatch().await;
+    assert_eq!(response.status(), Status::Ok, "{path}");
+    let builds: Vec<aurcache_api::models::builds::BuildSummary> =
+        response.into_json().await.expect("a build list");
+    let mut out: Vec<_> = builds.into_iter().map(|b| (b.pkg_name, b.number)).collect();
+    out.sort();
+    out
+}
+
+/// What `aurcache-cli builds list --worker/--status` and `worker pause --wait`
+/// ask: which builds one worker ran, and which it is running now. A finished
+/// build keeps its worker, so the history lists too.
+#[rocket::async_test]
+async fn builds_filter_by_worker_and_state() {
+    let (client, db) = test_client().await;
+    let hello = seed(&db, "hello").await;
+    let world = seed(&db, "world").await;
+    // Its own package: at most one pending build per package and platform.
+    let queued = seed(&db, "queued").await;
+    insert_worker(&db, 1).await;
+    insert_worker(&db, 2).await;
+    insert_worker_build(&db, hello, 1, BuildStates::SUCCESSFUL_BUILD, Some(1)).await;
+    insert_worker_build(&db, hello, 2, BuildStates::ACTIVE_BUILD, Some(1)).await;
+    insert_worker_build(&db, world, 1, BuildStates::PUBLISHING, Some(2)).await;
+    insert_worker_build(&db, queued, 1, BuildStates::ENQUEUED_BUILD, None).await;
+
+    let h = |n| ("hello".to_string(), n);
+    let w = |n| ("world".to_string(), n);
+    let q = |n| ("queued".to_string(), n);
+    assert_eq!(listed(&client, "/api/builds?worker=1").await, [h(1), h(2)]);
+    assert_eq!(
+        listed(&client, "/api/builds?worker=1&status=active").await,
+        [h(2)]
+    );
+    assert_eq!(
+        listed(&client, "/api/builds?worker=2&status=active").await,
+        []
+    );
+    assert_eq!(
+        listed(&client, "/api/builds?status=active,publishing").await,
+        [h(2), w(1)]
+    );
+    assert_eq!(listed(&client, "/api/builds?status=enqueued").await, [q(1)]);
+    assert_eq!(
+        listed(&client, "/api/package/hello/builds?worker=2").await,
+        []
+    );
+    assert_eq!(
+        listed(&client, "/api/package/world/builds?status=publishing").await,
+        [w(1)]
+    );
+
+    let response = client.get("/api/builds?status=running").dispatch().await;
+    assert_eq!(response.status(), Status::BadRequest);
+    let body = response.into_string().await.unwrap_or_default();
+    assert!(
+        body.contains("waiting-for-deps"),
+        "names the valid states: {body}"
+    );
+}

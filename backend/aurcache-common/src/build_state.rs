@@ -64,6 +64,57 @@ impl BuildState {
         }
     }
 
+    /// Every state, in discriminant order.
+    pub const ALL: [Self; 6] = [
+        Self::Active,
+        Self::Successful,
+        Self::Failed,
+        Self::Enqueued,
+        Self::WaitingForDeps,
+        Self::Publishing,
+    ];
+
+    /// The state's name where one is written by hand: a filter on the builds
+    /// list (`?status=active,publishing`), a CLI flag. Stable, lowercase and
+    /// free of spaces, unlike a label meant for reading.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Successful => "successful",
+            Self::Failed => "failed",
+            Self::Enqueued => "enqueued",
+            Self::WaitingForDeps => "waiting-for-deps",
+            Self::Publishing => "publishing",
+        }
+    }
+
+    /// The state a [`Self::key`] names.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.key() == key)
+    }
+
+    /// Parse a comma-separated list of keys, as the builds list takes them.
+    ///
+    /// # Errors
+    /// A message naming the key that is not a state, and the ones that are.
+    pub fn parse_keys(list: &str) -> Result<Vec<Self>, String> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                Self::from_key(key).ok_or_else(|| {
+                    let known: Vec<_> = Self::ALL.iter().map(|s| s.key()).collect();
+                    format!(
+                        "{key:?} is not a build state (one of: {})",
+                        known.join(", ")
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Whether the build has not settled yet — it is running, queued, or held
     /// behind a dependency. `Successful` and `Failed` are the terminal states.
     ///
@@ -209,6 +260,24 @@ mod tests {
             assert_eq!(BuildState::from_i32(value), Some(state));
             assert_eq!(state.as_i32(), value);
         }
+    }
+
+    /// Keys are what people type, so every state has one, they round-trip,
+    /// and a list of them parses with or without spaces.
+    #[test]
+    fn keys_round_trip_and_lists_of_them_parse() {
+        for state in BuildState::ALL {
+            assert_eq!(BuildState::from_key(state.key()), Some(state));
+            assert!(!state.key().contains(' '), "{state:?}");
+        }
+        assert_eq!(
+            BuildState::parse_keys("active, publishing"),
+            Ok(vec![BuildState::Active, BuildState::Publishing])
+        );
+        assert_eq!(BuildState::parse_keys(""), Ok(vec![]));
+        let error = BuildState::parse_keys("active,running").unwrap_err();
+        assert!(error.contains("\"running\""), "{error}");
+        assert!(error.contains("waiting-for-deps"), "{error}");
     }
 
     #[test]

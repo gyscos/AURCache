@@ -8,11 +8,11 @@ mod url;
 
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
-    AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BulkAddAccepted, BulkAddOutcome,
-    BulkAddProgress, CandidateSource, DependencyOptions, ExtendedPackage, GitSourceSpec,
-    GraphDataPoint, ListStats, Method, PackageDependency, PackageSource, PatchPackageRequest,
-    ReplacementVerdict, RestoreOutcome, SearchResult, SimplePackage, SourceData,
-    UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate, WorkerConfigView,
+    AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BuildQuery, BulkAddAccepted,
+    BulkAddOutcome, BulkAddProgress, CandidateSource, DependencyOptions, ExtendedPackage,
+    GitSourceSpec, GraphDataPoint, ListStats, Method, PackageDependency, PackageSource,
+    PatchPackageRequest, ReplacementVerdict, RestoreOutcome, SearchResult, SimplePackage,
+    SourceData, UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate, WorkerConfigView,
     looks_like_git_url,
 };
 use aurcache_common::api::build_log::align;
@@ -173,9 +173,22 @@ enum WorkerCommand {
     /// Stop intake: give this worker no new builds -- they go to other
     /// workers -- and let the ones it is running finish. For emptying a
     /// machine before a reboot, an upgrade or retirement.
+    ///
+    /// Pausing a worker that is already paused changes nothing, so running
+    /// it again with `--wait` is how to wait for a worker paused earlier.
     Pause {
         /// Worker id.
         id: i32,
+        /// Then wait until the worker is running no builds, printing what it
+        /// is still running as that changes. A build that has handed its
+        /// packages over (`publishing`) no longer counts: the worker is done
+        /// with it.
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this many seconds, and exit non-zero. Waits
+        /// as long as it takes when unset: some builds run for hours.
+        #[arg(long = "wait-timeout", requires = "wait")]
+        wait_timeout: Option<u64>,
     },
     /// Resume intake on a worker whose intake was stopped.
     Resume {
@@ -726,6 +739,15 @@ struct ListBuildsArgs {
     #[arg(long = "package")]
     pkgbase: Option<String>,
 
+    /// Only builds this worker ran or is running, by id or name.
+    #[arg(long)]
+    worker: Option<String>,
+
+    /// Only builds in these states, comma-separated or repeated: active,
+    /// successful, failed, enqueued, waiting-for-deps, publishing.
+    #[arg(long, value_delimiter = ',', value_parser = parse_build_state)]
+    status: Vec<BuildState>,
+
     /// Maximum number of builds to return.
     #[arg(long)]
     limit: Option<u64>,
@@ -1257,14 +1279,26 @@ async fn run_worker_command(
         WorkerCommand::List => render_workers_list(client, format).await,
         WorkerCommand::Approve { id } => approve_worker_command(client, format, id).await,
         WorkerCommand::Revoke { id } => revoke_worker_command(client, format, id).await,
-        WorkerCommand::Pause { id } => {
+        WorkerCommand::Pause {
+            id,
+            wait,
+            wait_timeout,
+        } => {
             client.pause_worker(id).await?;
+            if !wait {
+                print_done_message(
+                    format,
+                    &format!(
+                        "intake stopped on worker {id}: new builds go to other workers, the ones \
+                         it is running finish"
+                    ),
+                );
+                return Ok(());
+            }
+            wait_for_drain(client, id, wait_timeout.map(std::time::Duration::from_secs)).await?;
             print_done_message(
                 format,
-                &format!(
-                    "intake stopped on worker {id}: new builds go to other workers, the ones it \
-                     is running finish"
-                ),
+                &format!("worker {id} is paused and running no builds"),
             );
             Ok(())
         }
@@ -2220,8 +2254,18 @@ async fn render_builds_list(
     format: OutputFormat,
     args: ListBuildsArgs,
 ) -> Result<()> {
+    let worker = match args.worker.as_deref() {
+        Some(worker) => Some(resolve_worker(client, worker).await?),
+        None => None,
+    };
     let builds = client
-        .list_builds(args.pkgbase.as_deref(), args.limit, args.page)
+        .list_builds_matching(&BuildQuery {
+            pkgbase: args.pkgbase,
+            worker,
+            states: args.status,
+            limit: args.limit,
+            page: args.page,
+        })
         .await?;
     render(format, &builds, |builds| print_build_list(builds))
 }
@@ -2343,6 +2387,107 @@ async fn delete_build_command(
     client.delete_build(&build.pkgbase, build.number).await?;
     print_done_message(format, "build deleted");
     Ok(())
+}
+
+/// How often a drain is checked. Builds that drain take minutes to hours, so
+/// there is nothing to gain from asking the server more often than this.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait until worker `id` holds no running build, reporting on stderr what it
+/// still runs whenever that changes.
+///
+/// Running means `active`: a worker holds a lease on those. Once a build is
+/// `publishing` the worker has handed its packages over and let it go.
+async fn wait_for_drain(
+    client: &AurCacheClient,
+    id: i32,
+    timeout: Option<std::time::Duration>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let query = BuildQuery {
+        worker: Some(id),
+        states: vec![BuildState::Active],
+        ..BuildQuery::default()
+    };
+    // Checked again here, by the name the list carries: a server older than
+    // these filters ignores them and lists every build, and waiting on other
+    // workers' builds would never end.
+    let name = client
+        .list_workers()
+        .await?
+        .into_iter()
+        .find(|w| w.id == id)
+        .map(|w| w.name)
+        .with_context(|| format!("no worker {id}"))?;
+    let mut last = None;
+    loop {
+        let mut running = client.list_builds_matching(&query).await?;
+        running.retain(|b| {
+            b.status == BuildStates::ACTIVE_BUILD && b.worker_name.as_deref() == Some(&name)
+        });
+        if running.is_empty() {
+            return Ok(());
+        }
+        let progress = drain_progress(id, &running);
+        if last.as_ref() != Some(&progress) {
+            eprintln!("{progress}");
+            last = Some(progress);
+        }
+        if let Some(timeout) = timeout
+            && started.elapsed() >= timeout
+        {
+            bail!(
+                "worker {id} is still running {} after {}s",
+                build_refs(&running),
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// What a worker is still running, as one line.
+fn drain_progress(id: i32, running: &[Build]) -> String {
+    let count = running.len();
+    let builds = if count == 1 { "build" } else { "builds" };
+    format!(
+        "waiting for worker {id} to finish {count} {builds}: {}",
+        build_refs(running)
+    )
+}
+
+/// `hello/3, world/1`, sorted so that the line only changes when the builds do.
+fn build_refs(builds: &[Build]) -> String {
+    let mut refs: Vec<_> = builds
+        .iter()
+        .map(|b| format!("{}/{}", b.pkg_name, b.number))
+        .collect();
+    refs.sort();
+    refs.join(", ")
+}
+
+/// A worker named on the command line: its id, or its name.
+async fn resolve_worker(client: &AurCacheClient, worker: &str) -> Result<i32> {
+    if let Ok(id) = worker.parse() {
+        return Ok(id);
+    }
+    let workers = client.list_workers().await?;
+    workers
+        .iter()
+        .find(|w| w.name == worker)
+        .map(|w| w.id)
+        .with_context(|| {
+            let names: Vec<_> = workers.iter().map(|w| w.name.as_str()).collect();
+            format!("no worker named {worker:?} (workers: {})", names.join(", "))
+        })
+}
+
+fn parse_build_state(key: &str) -> Result<BuildState, String> {
+    let mut states = BuildState::parse_keys(key)?;
+    match (states.pop(), states.is_empty()) {
+        (Some(state), true) => Ok(state),
+        _ => Err(format!("{key:?} is not one build state")),
+    }
 }
 
 fn print_done_message(format: OutputFormat, message: &str) {
@@ -3193,9 +3338,9 @@ fn format_timestamp(timestamp: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddPackageArgs, Build, BuildStates, Cli, Command, ComposeArgs, PackagesCommand,
-        RepoCommand, SetupCommand, WatchScope, build_status_label, compose, compose_database,
-        pad_cell, parse_key_val, repo,
+        AddPackageArgs, Build, BuildState, BuildStates, BuildsCommand, Cli, Command, ComposeArgs,
+        PackagesCommand, RepoCommand, SetupCommand, WatchScope, WorkerCommand, build_status_label,
+        compose, compose_database, drain_progress, pad_cell, parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
@@ -3414,6 +3559,95 @@ mod tests {
             panic!("expected pkg rm");
         };
         assert_eq!(pkgbases, vec!["paru", "yay"]);
+    }
+
+    /// `pause --wait` takes an optional timeout, which means nothing without
+    /// `--wait`; a plain `pause` is unchanged.
+    #[test]
+    fn pause_waits_only_when_asked() {
+        let cli = Cli::parse_from(["aurcache-cli", "worker", "pause", "4", "--wait"]);
+        let Command::Worker {
+            command:
+                WorkerCommand::Pause {
+                    id: 4,
+                    wait: true,
+                    wait_timeout: None,
+                },
+        } = cli.command
+        else {
+            panic!("parsed as {:?}", cli.command);
+        };
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "worker",
+            "pause",
+            "4",
+            "--wait",
+            "--wait-timeout",
+            "600",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Worker {
+                command: WorkerCommand::Pause {
+                    wait_timeout: Some(600),
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "aurcache-cli",
+                "worker",
+                "pause",
+                "4",
+                "--wait-timeout",
+                "600"
+            ])
+            .is_err(),
+            "a timeout without --wait is a mistake worth saying"
+        );
+    }
+
+    /// States are named by key, comma-separated; a misspelled one is refused
+    /// before anything is asked of the server.
+    #[test]
+    fn builds_list_filters_by_worker_and_state() {
+        let cli = Cli::parse_from([
+            "aurcache-cli",
+            "builds",
+            "list",
+            "--worker",
+            "freyja",
+            "--status",
+            "active,publishing",
+        ]);
+        let Command::Builds {
+            command: BuildsCommand::List(args),
+        } = cli.command
+        else {
+            panic!("parsed as {:?}", cli.command);
+        };
+        assert_eq!(args.worker.as_deref(), Some("freyja"));
+        assert_eq!(args.status, [BuildState::Active, BuildState::Publishing]);
+        assert!(
+            Cli::try_parse_from(["aurcache-cli", "builds", "list", "--status", "running"]).is_err()
+        );
+    }
+
+    /// The progress line only changes when the set of builds does, whatever
+    /// order the server lists them in.
+    #[test]
+    fn drain_progress_names_what_is_still_running() {
+        let one = [build("hello", 3, ACTIVE)];
+        assert_eq!(
+            drain_progress(4, &one),
+            "waiting for worker 4 to finish 1 build: hello/3"
+        );
+        let two = [build("world", 1, ACTIVE), build("hello", 3, ACTIVE)];
+        let swapped = [build("hello", 3, ACTIVE), build("world", 1, ACTIVE)];
+        assert_eq!(drain_progress(4, &two), drain_progress(4, &swapped));
+        assert!(drain_progress(4, &two).contains("2 builds: hello/3, world/1"));
     }
 
     /// Naming nothing is a usage error, not a silent no-op.
