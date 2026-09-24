@@ -10,7 +10,7 @@ workers**, which build packages and upload the results. The bundled compose file
 starts one of each on a single host.
 
 ```bash
-curl -O https://raw.githubusercontent.com/Lukas-Heiligenbrunner/AURCache/master/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -30,7 +30,7 @@ anything you intend to keep:
 ```yaml
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
+    image: ghcr.io/gyscos/aurcache-server:latest
     ports:
       - "8080:8080"   # Web UI + API
       - "8081:8081"   # Pacman repository
@@ -52,7 +52,7 @@ services:
     restart: unless-stopped
 
   builder:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+    image: ghcr.io/gyscos/aurcache-worker:latest
     depends_on:
       - aurcache
     environment:

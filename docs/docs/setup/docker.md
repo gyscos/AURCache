@@ -24,15 +24,15 @@ stack, on another machine, or on another architecture.
 | `aurcache-builder` | Spawned per build by the hybrid image's legacy builder. Not used by the split setup. |
 
 Each is published as `:latest`, `:<version>` for a release tag, and the server
-also as `:git` for the current master branch.
+also as `:git` for the current main branch.
 
 ## Single host
 
-The bundled [`docker-compose.yaml`](https://github.com/Lukas-Heiligenbrunner/AURCache/blob/master/docker-compose.yaml)
+The bundled [`docker-compose.yaml`](https://github.com/gyscos/AURCache/blob/main/docker-compose.yaml)
 starts a server plus one local worker and needs no edits:
 
 ```bash
-curl -O https://raw.githubusercontent.com/Lukas-Heiligenbrunner/AURCache/master/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -110,7 +110,7 @@ docker compose up -d --scale builder=3
 
 Workers on separate hardware, or on a foreign architecture, are covered in
 [Build Workers](../workers/configuration.md) and
-[`docker-compose.remote-worker.yaml`](https://github.com/Lukas-Heiligenbrunner/AURCache/blob/master/docker-compose.remote-worker.yaml).
+[`docker-compose.remote-worker.yaml`](https://github.com/gyscos/AURCache/blob/main/docker-compose.remote-worker.yaml).
 
 ## Backward compatibility: the hybrid image
 

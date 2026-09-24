@@ -292,7 +292,7 @@ pub fn worker_admin_routes() -> Vec<rocket::Route> {
 
 /// Default worker image, published alongside every release. Overridden per
 /// deployment with `AURCACHE_WORKER_IMAGE` (a private registry, a pinned tag).
-const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest";
+const DEFAULT_WORKER_IMAGE: &str = "ghcr.io/gyscos/aurcache-worker:latest";
 
 // ----------------------------------------------------------------------------
 // Enrollment (no client certificate required)

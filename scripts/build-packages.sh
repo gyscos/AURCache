@@ -22,7 +22,7 @@ readonly SCRIPT_DIR REPO_ROOT
 # `aurcache-worker` depends on `aurcache-sandbox`, so the default builds both:
 # installing the worker alone would ask pacman for a sandbox it cannot find.
 readonly DEFAULT_PACKAGES="aurcache-sandbox aurcache-worker"
-readonly ALL_PACKAGES="aurcache-sandbox aurcache-worker aurcache-server aurcache-worker-docker"
+readonly ALL_PACKAGES="aurcache-sandbox aurcache-worker aurcache-server aurcache-worker-docker aurcache-cli"
 
 usage() {
     sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//; $d'

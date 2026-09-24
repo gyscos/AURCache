@@ -12,11 +12,11 @@ permissions a chroot build requires:
 version: '3.8'
 services:
   aurcache:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache-server:latest
+    image: ghcr.io/gyscos/aurcache-server:latest
     ...
 
   builder:
-    image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+    image: ghcr.io/gyscos/aurcache-worker:latest
     privileged: true
     security_opt:
       - seccomp=unconfined

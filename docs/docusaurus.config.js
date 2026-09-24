@@ -13,15 +13,15 @@ const config = {
   favicon: '../assets/icons/icon.svg',
 
   // Set the production url of your site here
-  url: 'https://lukas-heiligenbrunner.github.io',
+  url: 'https://gyscos.github.io',
   // Set the /<baseUrl>/ pathname under which your site is served
   // For GitHub pages deployment, it is often '/<projectName>/'
   baseUrl: '/AURCache/',
 
   // GitHub pages deployment config.
   // If you aren't using GitHub pages, you don't need these.
-  organizationName: 'lukas-heiligenbrunner', // Usually your GitHub org/user name.
-  projectName: 'lukas-heiligenbrunner.github.io',
+  organizationName: 'gyscos', // Usually your GitHub org/user name.
+  projectName: 'gyscos.github.io',
   trailingSlash: false,
 
   onBrokenLinks: 'warn',
@@ -80,7 +80,7 @@ const config = {
             label: 'Docs',
           },
           {
-            href: 'https://github.com/lukas-heiligenbrunner/aurcache',
+            href: 'https://github.com/gyscos/AURCache',
             label: 'GitHub',
             position: 'right',
           },

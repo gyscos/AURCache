@@ -51,7 +51,7 @@ jobs:
         name: Determine image tags
         id: vars
         run: |
-          REPO=ghcr.io/lukas-heiligenbrunner
+          REPO=ghcr.io/gyscos
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
           else
@@ -73,7 +73,7 @@ jobs:
           emit builder_tags "$REPO/aurcache-builder"
           # The release tag for the binaries to report, if this is one (see
           # aurcache-common's build script): empty on the weekly cron refresh,
-          # which builds master rather than a release and names its commit.
+          # which builds main rather than a release and names its commit.
           echo "git_tag=$VERSION" >> "$GITHUB_OUTPUT"
       -
         name: Build worker container

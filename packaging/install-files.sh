@@ -8,7 +8,7 @@
 # is what stops an image being a second, hand-maintained copy of the host
 # contract.
 #
-# Usage: install-files.sh sandbox|server|worker|worker-docker <pkgdir> <repo-root> <binary-dir>
+# Usage: install-files.sh sandbox|server|worker|worker-docker|cli <pkgdir> <repo-root> <binary-dir>
 set -euo pipefail
 
 readonly ROLE=$1
@@ -24,6 +24,7 @@ sandbox)       _pkgname=aurcache-sandbox ;;
 server)        _pkgname=aurcache-server ;;
 worker)        _pkgname=aurcache-worker ;;
 worker-docker) _pkgname=aurcache-worker-docker ;;
+cli)           _pkgname=aurcache-cli ;;
 *)  echo "install-files.sh: unknown role '$ROLE'" >&2; exit 1 ;;
 esac
 
@@ -35,9 +36,9 @@ esac
 # idempotent, so declaring one user or directory twice is a no-op.
 #
 # `$_decl` names the source file; the installed name is always the package.
-# aurcache-sandbox is exempt: it is one binary the other packages depend on and
-# owns no users, directories or state of its own.
-if [ "$ROLE" != sandbox ]; then
+# aurcache-sandbox and aurcache-cli are exempt: each is one binary the other
+# packages do not depend on, owning no users, directories or state of its own.
+if [ "$ROLE" != sandbox ] && [ "$ROLE" != cli ]; then
     case "$ROLE" in
     server) _decl=aurcache-server ;;
     *)      _decl=aurcache-worker ;;   # both workers share the worker declarations
@@ -86,6 +87,10 @@ worker-docker)
     # directories declared above.
     install -Dm755 "$BINDIR/aurcache-worker-docker" \
         "$PKGDIR/usr/bin/aurcache-worker-docker"
+    ;;
+cli)
+    # The client is one binary with no service, users or state of its own.
+    install -Dm755 "$BINDIR/aurcache-cli" "$PKGDIR/usr/bin/aurcache-cli"
     ;;
 *)
     echo "install-files.sh: unknown role '$ROLE'" >&2

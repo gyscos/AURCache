@@ -42,7 +42,7 @@ qemu-binfmt only supports x86_64. So this can only be used to cross compile from
 
 If your output looks like this:
 ```
-Pulling image: ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest
+Pulling image: ghcr.io/gyscos/aurcache-worker:latest
 {"msg":"exec container process (missing dynamic library?) `/usr/sbin/sh`: No such file or directory","level":"error","time":"2024-10-25T19:56:14.842412Z"}
 Docker container wait error
 ```
