@@ -18,6 +18,10 @@ use std::fmt::Write as _;
 pub const SERVER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-server:latest";
 pub const WORKER_IMAGE: &str = "ghcr.io/lukas-heiligenbrunner/aurcache-worker:latest";
 
+/// Static file server for the pacman repository. nginx serves archives with
+/// sendfile where Rocket streams them through userspace in 4 KiB chunks.
+pub const NGINX_IMAGE: &str = "nginx:alpine";
+
 /// The PostgreSQL major version a generated file runs.
 ///
 /// The image tag and the upgrade step's `TARGET_VERSION` both name it, and a
@@ -252,6 +256,7 @@ pub fn render_compose(params: &ComposeParams) -> String {
         {
             out.push_str(&database_services(password, *upgrade_step));
         }
+        out.push_str(&repo_service());
     }
     if params.role.has_worker() {
         out.push_str(&worker_service(params));
@@ -378,7 +383,9 @@ fn server_service(params: &ComposeParams) -> String {
          \x20   image: {server_image}\n\
          \x20   ports:\n\
          \x20     - \"{AURCACHE_HTTP_PORT}:{AURCACHE_HTTP_PORT}\"   # Web UI + API (plain HTTP; front with a reverse proxy for TLS)\n\
-         \x20     - \"{AURCACHE_MIRROR_PORT}:{AURCACHE_MIRROR_PORT}\"   # Pacman repository (plain HTTP, for `pacman -Sy`)\n\
+         \x20     # No mirror port here: the `repo` service below publishes nginx on\n\
+         \x20     # it instead. Rocket's builtin file handler keeps listening inside\n\
+         \x20     # this container for deployments without that service.\n\
          \x20     - \"{AURCACHE_WORKER_PORT}:{AURCACHE_WORKER_PORT}\"   # Remote-worker protocol (HTTPS + mutual TLS)\n\
          \x20   environment:\n\
          \x20     - LOG_LEVEL={log_level}\n\
@@ -399,6 +406,46 @@ fn server_service(params: &ComposeParams) -> String {
          \x20     - aurcache_ca:/app/data/ca      # internal worker CA (persist across restarts)\n\
          \x20     - enroll:{ENROLLMENT_DIR}:ro             # read the workers' enrollment CSRs\n\
          {depends_on}\
+         \x20   networks:\n\
+         \x20     - aurcache\n\
+         \x20   restart: unless-stopped\n\n"
+    )
+}
+
+/// The pacman repository, served statically by nginx: the same files Rocket's
+/// builtin file handler would serve, at line rate instead of ~200 MB/s. The
+/// server remains the only writer (publishing renames into place), so this
+/// service mounts the repository volume read-only.
+///
+/// The nginx config travels inside `command` rather than a mounted file, so a
+/// generated file stays one file: paste it into Portainer or Unraid as is,
+/// with no sibling files to carry along. (The repository's own
+/// `docker-compose.yaml` mounts `docker/repo-nginx.conf` instead -- the same
+/// server block, kept as a file because it lives beside it.)
+fn repo_service() -> String {
+    format!(
+        "  repo:\n\
+         \x20   # Static file server for the pacman repository.\n\
+         \x20   image: {NGINX_IMAGE}\n\
+         \x20   ports:\n\
+         \x20     - \"{AURCACHE_MIRROR_PORT}:80\"   # Pacman repository (plain HTTP, for `pacman -Sy`)\n\
+         \x20   volumes:\n\
+         \x20     - aurcache_repo:/app/repo:ro   # read the repository the server publishes\n\
+         \x20   command:\n\
+         \x20     - sh\n\
+         \x20     - -c\n\
+         \x20     - |\n\
+         \x20       printf '%s' 'server {{\n\
+         \x20         listen 80;\n\
+         \x20         root /app/repo;\n\
+         \x20         sendfile on;\n\
+         \x20         tcp_nopush on;\n\
+         \x20         server_tokens off;\n\
+         \x20         location ~ /\\. {{ return 404; }}\n\
+         \x20       }}' > /etc/nginx/conf.d/default.conf\n\
+         \x20       exec nginx -g 'daemon off;'\n\
+         \x20   depends_on:\n\
+         \x20     - aurcache\n\
          \x20   networks:\n\
          \x20     - aurcache\n\
          \x20   restart: unless-stopped\n\n"
@@ -581,8 +628,9 @@ fn volumes(params: &ComposeParams) -> String {
 mod tests {
     use super::{
         ComposeDatabase, ComposeParams, ComposeRole, ENROLLMENT_DIR, FINGERPRINT_PLACEHOLDER,
-        POSTGRES_IMAGE, POSTGRES_MAJOR, WorkerEnv, is_plain_password, render_compose,
+        NGINX_IMAGE, POSTGRES_IMAGE, POSTGRES_MAJOR, WorkerEnv, is_plain_password, render_compose,
     };
+    use aurcache_common::ports::AURCACHE_MIRROR_PORT;
     use yaml_rust2::{Yaml, YamlLoader};
 
     fn params(role: ComposeRole) -> ComposeParams {
@@ -919,6 +967,67 @@ mod tests {
         );
         assert!(rendered.contains("WORKER_NAME=arm-box"), "{rendered}");
         assert!(rendered.contains("WORKER_ARCHES=aarch64"), "{rendered}");
+    }
+
+    /// A service's published ports as `"host:container"` strings.
+    fn ports(doc: &Yaml, service: &str) -> Vec<String> {
+        doc["services"][service]["ports"]
+            .as_vec()
+            .unwrap_or_else(|| panic!("{service} publishes no ports"))
+            .iter()
+            .map(|v| v.as_str().expect("a port mapping").to_string())
+            .collect()
+    }
+
+    /// The mirror port moved off the server onto nginx: the same host port,
+    /// statically served, with the repository mounted read-only and the
+    /// server still the only writer.
+    #[test]
+    fn server_roles_serve_the_repo_statically() {
+        for role in [ComposeRole::Bundle, ComposeRole::Backend] {
+            let doc = parsed(&params(role));
+            assert_eq!(
+                doc["services"]["repo"]["image"].as_str(),
+                Some(NGINX_IMAGE),
+                "{role:?}"
+            );
+            let repo_ports = ports(&doc, "repo");
+            assert!(
+                repo_ports
+                    .iter()
+                    .any(|p| *p == format!("{AURCACHE_MIRROR_PORT}:80")),
+                "{role:?}: {repo_ports:?}"
+            );
+            assert!(
+                !ports(&doc, "aurcache")
+                    .iter()
+                    .any(|p| p.contains(&AURCACHE_MIRROR_PORT.to_string())),
+                "{role:?}: the server keeps only API and worker protocol"
+            );
+            let volumes = doc["services"]["repo"]["volumes"]
+                .as_vec()
+                .expect("repo mounts the repository");
+            assert!(
+                volumes
+                    .iter()
+                    .any(|v| v.as_str() == Some("aurcache_repo:/app/repo:ro")),
+                "{role:?}: {volumes:?}"
+            );
+            let depends_on = doc["services"]["repo"]["depends_on"]
+                .as_vec()
+                .expect("repo starts after the server");
+            assert!(
+                depends_on.iter().any(|v| v.as_str() == Some("aurcache")),
+                "{role:?}: {depends_on:?}"
+            );
+        }
+    }
+
+    /// A worker file has no repository to serve.
+    #[test]
+    fn a_worker_file_has_no_repo_service() {
+        let doc = parsed(&params(ComposeRole::Worker));
+        assert!(doc["services"]["repo"].is_badvalue());
     }
 
     #[test]
