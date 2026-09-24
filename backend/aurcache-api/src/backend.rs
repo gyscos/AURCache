@@ -4,7 +4,7 @@ use crate::build::{
     build_output, cancel_build, delete_build, download_build_output, get_build, list_builds,
     list_package_builds, retry_build,
 };
-use crate::health::health;
+use crate::health::{health, server_version};
 use crate::log::log;
 use crate::package::{
     active_operations, bulk_add_progress, get_package, package_add_endpoint, package_del,
@@ -57,6 +57,7 @@ pub fn build_api() -> Vec<Route> {
         package_source_preview_file,
         cancel_build,
         health,
+        server_version,
         crate::repo::repo_info,
         log,
         settings,

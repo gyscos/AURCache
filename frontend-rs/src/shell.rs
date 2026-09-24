@@ -67,6 +67,17 @@ fn SideMenu() -> Element {
     // on `Route` so it can be tested without rendering.
     let active = use_route::<Route>().menu_entry();
     let mut preferences_open = use_signal(|| false);
+    // The running server's version, not this crate's: the two only agree when
+    // the UI asks. `None` until the first fetch lands (and if it never does),
+    // when the display falls back to the baked-in crate version below.
+    let mut server_version = use_signal(|| None::<String>);
+    use_future(move || async move {
+        if let Ok(client) = crate::api::client()
+            && let Ok(info) = client.server_info().await
+        {
+            server_version.set(Some(info.version));
+        }
+    });
 
     rsx! {
             aside { class: "bg-base-100 w-64 min-h-full flex flex-col",
@@ -153,11 +164,21 @@ fn SideMenu() -> Element {
             MenuSection { title: "Project info",
                     ExternalMenuLink { href: GITHUB_URL, label: "GitHub" }
                     div { class: "px-5 pt-1 pb-4 text-xs opacity-50",
-                        "Version {env!(\"CARGO_PKG_VERSION\")}"
+                        "Version {display_version(server_version.read().as_deref())}"
                     }
                 }
             }
         }
+}
+
+/// What the sidebar's version line shows: the running server's version once
+/// the fetch lands, otherwise the crate version baked in at compile time.
+/// The fallback only matters before the first fetch, or when the server
+/// cannot be reached at all — the bundled UI always agrees with its server.
+fn display_version(server_version: Option<&str>) -> String {
+    server_version
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_string()
 }
 
 #[component]
@@ -538,6 +559,30 @@ mod tests {
         assert!(
             !html.contains("href=\"#"),
             "a fragment href survived: {html}"
+        );
+    }
+
+    /// The version line prefers the running server over the baked-in crate
+    /// version, which is what keeps the bundled UI and its server in
+    /// agreement. The fallback only shows before the fetch lands.
+    #[test]
+    fn the_version_line_prefers_the_server_version() {
+        assert_eq!(
+            display_version(Some("0.5.0+g8afa04a.dirty")),
+            "0.5.0+g8afa04a.dirty"
+        );
+        assert_eq!(display_version(None), env!("CARGO_PKG_VERSION"));
+    }
+
+    /// The version line renders even before the server version arrives (SSR
+    /// and first paint run no fetches), so the menu never has a hole where
+    /// it goes.
+    #[test]
+    fn the_version_line_renders_without_a_server() {
+        let html = render_at("/");
+        assert!(
+            html.contains(&format!("Version {}", env!("CARGO_PKG_VERSION"))),
+            "{html}"
         );
     }
 

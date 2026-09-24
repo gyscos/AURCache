@@ -16,6 +16,7 @@ pub use aurcache_common::api::dump::{
     RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
 };
 pub use aurcache_common::api::events::{Event, KINDS, Kind, Segment, kind_label};
+pub use aurcache_common::api::info::ServerInfo;
 pub use aurcache_common::api::log::{
     BuildRef, EntityRef, LogEntry, LogPage, PackageRef, WorkerRef,
 };
@@ -274,6 +275,15 @@ impl AurCacheClient {
         } else {
             ApiReachability::Api
         })
+    }
+
+    /// Asks the server for its own version: the release, plus the commit when
+    /// the build is not exactly that release. The bundled UI shows this
+    /// rather than its own crate version, so the two agree about what is
+    /// running.
+    pub async fn server_info(&self) -> Result<ServerInfo> {
+        self.request_json::<ServerInfo, Value>(Method::GET, "/version", &[], None)
+            .await
     }
 
     /// Fetches information about the currently authenticated user.

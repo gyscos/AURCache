@@ -1,10 +1,14 @@
+use aurcache_common::api::info::ServerInfo;
 use rocket::http::Status;
+use rocket::serde::json::Json;
 use rocket::{State, get};
 use sea_orm::DatabaseConnection;
 use utoipa::OpenApi;
 
+use crate::init::ServerVersion;
+
 #[derive(OpenApi)]
-#[openapi(paths(health))]
+#[openapi(paths(health, server_version), components(schemas(ServerInfo)))]
 pub struct HealthApi;
 
 #[utoipa::path(
@@ -25,6 +29,25 @@ pub async fn health(db: &State<DatabaseConnection>) -> Result<(), Status> {
         return Err(Status::InternalServerError);
     }
     Ok(())
+}
+
+/// The running server's own version.
+///
+/// The bundled UI shows this rather than its own crate version, so the two
+/// agree about what is running. Separate from [`health`] because that route's
+/// empty 200 is load-bearing (see above), and unauthenticated like it: a
+/// version string says nothing worth protecting, and the startup log says it
+/// anyway.
+#[utoipa::path(
+    responses(
+            (status = 200, description = "The running server's version", body = ServerInfo),
+    )
+)]
+#[get("/version")]
+pub fn server_version(version: &State<ServerVersion>) -> Json<ServerInfo> {
+    Json(ServerInfo {
+        version: version.0.clone(),
+    })
 }
 
 async fn check_health(db: &DatabaseConnection) -> anyhow::Result<()> {
