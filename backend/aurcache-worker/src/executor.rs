@@ -152,12 +152,21 @@ impl ChrootExecutor {
         let shared = Arc::new(Shared {
             srcdest: SrcdestLocks::new(),
             chroots: Chroots::new(
-                cfg.chroot_dir.clone(),
+                cfg.pool_config(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
-                cfg.chroot_mode,
             ),
         });
-        shared.chroots.detect().await;
+        // Before anything can claim work: no build of ours is running yet, so
+        // whatever a build left in the pool belongs to a run that is over.
+        if shared.chroots.open().await {
+            let cleared = shared
+                .chroots
+                .sweep(&std::collections::HashSet::new())
+                .await;
+            if cleared > 0 {
+                tracing::info!("removed {cleared} build(s) a previous run left in the pool");
+            }
+        }
         Self {
             cfg: RwLock::new(cfg),
             shared,
@@ -246,7 +255,8 @@ impl Executor for ChrootExecutor {
     }
 
     async fn ready_for_work(&self) -> bool {
-        self.shared.chroots.ready_for_work().await
+        let build_limit = self.current().build_disk_max;
+        self.shared.chroots.ready_for_work(build_limit).await
     }
 
     fn describe_self(&self) -> String {
@@ -290,6 +300,13 @@ impl Executor for ChrootExecutor {
             let _ = hierarchy.apply_total(&next.total_build_limits);
         }
 
+        // Like the memory totals, the disk total bounds the builds already
+        // running, so it goes on now.
+        if next.disk_max != current.disk_max
+            && let Err(e) = self.shared.chroots.set_total(next.disk_max).await
+        {
+            tracing::warn!("could not apply the delivered WORKER_DISK_MAX ({e:#})");
+        }
         self.shared
             .chroots
             .set_interval(Duration::from_secs(next.chroot_refresh_interval));

@@ -273,15 +273,13 @@ AURCache.
 | Variable | Type | Description | Default |
 |---|---|---|---|
 | `WORKER_DATA_DIR` | Path | Worker identity, credentials, chroots | `/var/lib/aurcache-worker` |
-| `WORKER_CHROOT_DIR` | Path | Base chroot and per-job copies | `<data dir>/chroot` |
+| `WORKER_CHROOT_DIR` | Path | Where the storage pool's image and mount point go (see below) | `<data dir>/chroot` |
 | `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
 | `WORKER_CHROOT_REFRESH_INTERVAL` | Duration | How long a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `15m` |
-| `WORKER_CHROOT_OVERLAY` | `auto`/on/off | Mount each build's chroot as an overlay instead of copying the base | `auto` |
 
 The base chroot is brought up to date with `pacman -Syu` before a build, but
 not more often than `WORKER_CHROOT_REFRESH_INTERVAL`. The refresh takes around
-13 seconds and only one build may hold the chroot while it runs, so paying it
-per build delayed every build start in a burst; measured over a day on one
+13 seconds, so paying it per build delayed every build start in a burst; measured over a day on one
 worker, 23 of 26 refreshes upgraded nothing at all, because Arch's repositories
 move a few times a day rather than a few times an hour. Lower it if you would
 rather have the newest dependencies than the fastest starts; `0` restores the
@@ -292,78 +290,110 @@ and its generated SSH key; if it is lost, the worker re-enrolls as a new,
 unapproved worker and generates a new key, which the remote will no longer
 accept.
 
-### Overlay chroots
+## Disk quota and the storage pool
 
-`makechrootpkg` gives each build a copy of the base chroot. On btrfs that copy
-is a snapshot and costs nothing; everywhere else it is an `rsync` of the whole
-chroot -- around 800 MB per build, which on an SSD is both slow and wear you
-did not ask for.
+| Variable | Type | Description | Default |
+|---|---|---|---|
+| `WORKER_BUILD_DISK_MAX` | Size | Disk one build may write: its chroot, its sources, the packages it makes | `50G` |
+| `WORKER_DISK_MAX` | Size | Everything the worker stores in its pool: the base chroot and every running build | `200G` |
+| `WORKER_POOL` | Path | What backs the pool: unset for an image file, a block device, or an existing btrfs mount | unset |
+| `WORKER_DISK_RESERVE` | Bool | Allocate the whole image up front instead of as builds write | `false` |
 
-`WORKER_CHROOT_OVERLAY` mounts the base read-only as an overlay's lower layer
-instead, with a directory of the build's own on top. The mount takes about 15
-milliseconds and the upper layer holds only what the build changed, which for
-an ordinary package is a few hundred kilobytes. The base cannot be written
-through the mount, so builds are as isolated from each other as they were with
-copies.
+Every chroot lives in the worker's **storage pool**: a btrfs filesystem the
+worker owns, with quotas. The base chroot is a subvolume there, and each build
+runs in a snapshot of it -- taken in milliseconds, and charged nothing for what
+it shares with the base -- with a second subvolume beside it for its source and
+packages. Both count against `WORKER_BUILD_DISK_MAX`, and everything together
+against `WORKER_DISK_MAX`.
 
-It defaults to `auto`, which decides at startup, because the right answer is a
-property of the machine rather than a preference:
+The kernel enforces both as the build writes. A build that tries to fill the
+disk -- by accident or on purpose; `fallocate -l 1T` is one syscall -- fails its
+own build with "Disk quota exceeded", and the worker's report says which limit
+was reached. Nothing outside the pool is touched. Lowering either value applies
+at once, to builds already running.
 
-* On **btrfs** the worker copies. A copy there is already a snapshot -- 0.29
-  seconds and no space -- so an overlay would save nothing and cost something
-  (see below).
-* Anywhere else the worker **tries to mount an overlay**, and uses one if the
-  kernel allows it. The check is a real mount, because nothing else is
-  conclusive: an upper layer needs whiteouts and trusted extended attributes,
-  which ext4, XFS and btrfs have, ZFS has from 2.2, and NFS does not -- and a
-  container may not be permitted to mount at all.
-* If that mount fails, it copies, and says so once at startup.
+A build's snapshot is deleted the moment it ends, and btrfs frees the space in
+the background: there is no tree of millions of files to remove.
 
-Set it to `1` or `0` to decide yourself. An unrecognised value means `auto`, so
-a typo cannot quietly disable something you were trying to enable.
+`WORKER_POOL`, `WORKER_DISK_RESERVE` and `WORKER_CHROOT_DIR` describe the
+machine, so they are set on the worker only, never from AURCache: they decide
+what the worker formats and mounts.
 
-Refreshes accumulate as layers, and layers are merged back into the base once
-there are enough of them. Merging runs alongside builds: it reads what they
-read, writes the new base somewhere nothing is reading, and publishes it with a
-rename, which a mounted chroot does not notice. The base and layers it replaces
-are retained -- almost free, since the new base is hardlinked from the old --
-and deleted once no build is reading them.
+### What backs the pool
 
-A live overlay's lower layer must not change, which is why a refresh publishes
-a layer rather than rewriting the base: nothing a running build reads is ever
-modified, so refreshes keep to their interval however busy the worker is.
+- **Unset (the default): an image file**, `<chroot dir>/pool.img`, loop-mounted
+  at `<chroot dir>/pool`. Nothing to set up. The image is sparse -- it takes
+  host space only as builds write, and hands it back as they are deleted -- and
+  grows when `WORKER_DISK_MAX` does. It needs loop devices, which a privileged
+  container has. On a btrfs host its directory is made `nodatacow` first, so
+  writes in the pool are not copied twice.
+- **A block device**, such as a zvol or a partition. Formatted the first time
+  and mounted directly, with no loop device. A device that already holds a
+  filesystem the worker did not create is refused, never formatted. On ZFS this
+  is the best choice: create the zvol with `volblocksize=16K`, matching btrfs's
+  metadata nodes, and leave it thick-provisioned so its space is reserved.
+- **An existing btrfs mount**, given as a directory. Used as it is, with no
+  loop device and no second filesystem -- the fastest option on a btrfs host.
+  It must be a whole btrfs filesystem mounted there and **dedicated to the
+  worker**, because quotas apply to the entire filesystem; the worker enables
+  btrfs simple quotas on it. One with full btrfs quotas already enabled is
+  refused rather than switched.
 
-### Putting the chroot on other storage
+The pool needs Linux 6.7 or later (btrfs simple quotas) and `btrfs-progs`. A
+worker that cannot open its pool takes no builds and says why in its log,
+because a build without its quota could fill the host.
+
+### Reserving the space
+
+A sparse image assumes the host has the room when the builds want it. If the
+host fills up for another reason, writes into the pool fail, the builds
+running at that moment fail with I/O errors, and the pool is remounted -- its
+contents are safe, since btrfs only ever commits complete transactions. To
+make that unlikely, a worker with a sparse image stops claiming builds while
+the host has less than `WORKER_BUILD_DISK_MAX` free, and says so in its log.
+
+For a guarantee instead, set `WORKER_DISK_RESERVE=true`: the whole image is
+allocated up front and freed space stays in it. On ZFS that does not reserve
+anything -- ZFS cannot preallocate -- so use a thick-provisioned zvol, or set
+`refreservation` on the dataset holding the image.
+
+### Tuning an image on ZFS
+
+If the image sits on a ZFS dataset, give it a dataset of its own with:
+
+- `recordsize=16K` (or 32K). With the default 128K, every small write from
+  btrfs rewrites a whole record.
+- `primarycache=metadata`, so data is not cached both by the kernel and in ARC.
+- `logbias=throughput`, so the flushes btrfs sends do not write data twice
+  through the ZIL.
+- `compression=lz4` is fine; btrfs already compresses inside the pool, and lz4
+  gives up quickly on data that does not compress.
+
+### Shrinking
+
+Lowering `WORKER_DISK_MAX` lowers the quota at once. An image shrinks with it,
+online, when what the pool holds fits in the smaller size; when it does not,
+the image keeps its size for now, the worker logs it, and the lower quota
+applies regardless.
+
+A device is the operator's to resize. Its btrfs filesystem can be shrunk online
+first (`btrfs filesystem resize <size> <pool>`), and then the device -- a zvol
+with `zfs set volsize=`. **Never shrink the device first**: ZFS discards
+whatever lies past the new end, and btrfs refuses to mount a filesystem larger
+than its device.
+
+### Putting the pool on other storage
 
 Builds are the bulk of a worker's disk use, and some packages are extravagant:
-`unreal-engine` needs around 300&nbsp;GB live. `WORKER_CHROOT_DIR` moves the base
-chroot and the per-build copies somewhere with room, leaving the small stuff
-(`WORKER_CACHE_DIR` is usually a few GB) where it is.
+`unreal-engine` needs around 300&nbsp;GB live. `WORKER_CHROOT_DIR` moves the
+pool's image somewhere with room, leaving the small stuff (`WORKER_CACHE_DIR`
+is usually a few GB) where it is.
 
-Whatever you point it at has to behave like a real Unix filesystem. A base
-chroot contains setuid binaries, thousands of hardlinks, files owned by several
-users, and a couple of files carrying `security.capability` extended attributes
-(`newuidmap` and `newgidmap`, used for user-namespace id mapping).
-
-- **A local filesystem, or a network block device** (iSCSI, formatted on the
-  worker) supports all of it, because the filesystem is local either way.
-- **NFS** works if the export is `no_root_squash` and the client does not mount
-  it `nosuid`. Two caveats: `security.*` xattrs are not carried over NFS, so
-  those file capabilities are lost -- harmless unless a package builds something
-  in a rootless user namespace -- and builds are a many-small-files workload,
-  which NFS is not fast at.
-- **SMB/CIFS** cannot represent Unix ownership, setuid bits or hardlinks. The
-  chroot cannot be created on it at all.
-
-:::tip btrfs makes per-build copies free
-`makechrootpkg` snapshots the base chroot when the chroot directory is btrfs and
-`root` is a subvolume, and copies it wholesale otherwise -- 7--12&nbsp;GB of
-rsync per build on ext4, against a copy-on-write snapshot that costs almost
-nothing. If you are formatting new storage for this, make it btrfs and create
-`root` as a subvolume. This applies to local and block storage; a chroot on NFS
-is a directory tree on the server's filesystem, so it takes the copying path
-whatever the server's pool is made of.
-:::
+Because the chroots live inside the pool's own btrfs filesystem, what the image
+sits on only has to store a large file. A base chroot contains setuid binaries,
+thousands of hardlinks, files owned by several users and file capabilities, and
+those are all btrfs's business inside the image -- so an image on NFS or SMB
+works where a chroot there directly could not, if slowly.
 
 ## Timing
 

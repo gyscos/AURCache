@@ -19,7 +19,8 @@ members = [
     "aurcache-worker-core",
     "aurcache-worker-demo",
     "aurcache-worker-docker",
-    "aurcache-sandbox"]
+    "aurcache-sandbox",
+    "aurcache-chroot"]
 
 # Idioms enforced across the workspace. Every lint here is at zero warnings, so
 # these guard against regression rather than demanding a cleanup.

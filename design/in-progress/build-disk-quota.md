@@ -5,7 +5,16 @@ sets out to fill the disk fails its own build instead of taking the worker's
 host down with it. The same mechanism bounds everything else the worker
 stores, so one figure caps the worker's whole footprint.
 
-Status: **Proposed** · Last updated: 2026-09-24
+Status: **In progress** · Last updated: 2026-09-24
+
+Done so far: the server-side parse writes nothing; the `aurcache-chroot` crate
+(pool on an image, a device or a mount; per-build subvolumes and qgroups; the
+total; grow and online shrink; sweep); the worker builds in pool snapshots with
+`WORKER_BUILD_DISK_MAX`/`WORKER_DISK_MAX`, reports a quota failure, and stops
+claiming while a sparse image's host lacks room; the overlay and copy
+strategies are gone. Not yet: the caches in the pool (the second phase below),
+the drain-and-recreate fallback when an image cannot shrink online, and
+reporting disk usage beside peak memory.
 
 ---
 
@@ -74,8 +83,9 @@ owns, with [simple quotas][squota] enabled. Builds, the base chroot and every
 cache all live there, so one limit bounds the whole worker, which is the figure
 an operator actually cares about.
 
-- The pool's top qgroup `1/0` is limited to `WORKER_DISK_MAX`: the worker's
-  whole footprint.
+- The pool's top qgroup `2/0` is limited to `WORKER_DISK_MAX`: the worker's
+  whole footprint. (btrfs only allows a qgroup's parent to be at a higher
+  level, so the total is the level-2 group and everything else hangs below it.)
 - Each build gets its own subvolumes, grouped under a qgroup limited to
   `WORKER_BUILD_DISK_MAX`.
 - Each cache gets a qgroup of its own, limited by the size setting it already
@@ -174,8 +184,8 @@ With the base chroot in the pool, a build's chroot is a snapshot of it:
 
 ```
 <pool>/root              base chroot (subvolume)
-<pool>/job-<id>          btrfs subvolume snapshot of root   ┐ qgroup 2/<id>
-<pool>/job-<id>.data     work/ (source, PKGDEST), pacman/   ┘ limit WORKER_BUILD_DISK_MAX
+<pool>/job-<id>          btrfs subvolume snapshot of root   ┐ qgroup 1/<id>
+<pool>/job-<id>.data     work/ (source, PKGDEST)            ┘ limit WORKER_BUILD_DISK_MAX
 ```
 
 - The worker takes the snapshot and sets up its qgroups before `makechrootpkg`
@@ -185,12 +195,17 @@ With the base chroot in the pool, a build's chroot is a snapshot of it:
 - Teardown is `btrfs subvolume delete` for both subvolumes and
   `qgroup destroy`. The command returns at once and the btrfs cleaner frees the
   space in the background, instead of an `rm -rf` over millions of files.
-- `run_job` moves the job's workdir (`data_dir/work/<id>`) and private pacman
-  cache (`Cache::pacman_pkg_job`) into `job-<id>.data`, so the quota covers
-  them too. `Cache::promote_job_pkgs` now crosses a subvolume boundary, where
-  btrfs refuses `rename` with `EXDEV`. So it reflinks into a temp file in the
-  shared cache (`FICLONE`: no data copied, instant) and renames that, which
-  keeps the "never a partial file" guarantee its doc comment requires.
+- `run_job` moves the job's workdir (`data_dir/work/<id>`) into
+  `job-<id>.data`, so the build's quota covers it too.
+- The job's private pacman cache (`Cache::pacman_pkg_job`) becomes a directory
+  *inside* the `pacman-pkg` subvolume (`pacman-pkg/.jobs/job-<id>`), not part
+  of the build's subvolumes. Promotion stays a plain `rename` within one
+  subvolume: atomic and instant, as `promote_job_pkgs` requires. A reflink
+  across subvolumes would work mechanically, but simple quotas never move an
+  extent's charge: the promoted package would stay charged to the deleted
+  build for as long as the cache kept it (measured; see below). The cost of
+  this layout is that a build's dependency downloads count against the
+  package cache's limit rather than its own. That limit is still hard.
 
 This makes the overlay machinery in `chroots.rs` unnecessary: update layers,
 flattening, `MAX_LAYERS`/`HARD_MAX_LAYERS` and the draining that comes with
@@ -213,13 +228,15 @@ old base under the chroot directory is removed.
 Builds are only part of the worker's disk use. The rest moves into the pool too:
 
 ```
-<pool>/root                        base chroot                      qgroup 1/0
-<pool>/job-<id>, job-<id>.data     one build (above)                  ├ 2/<id>   WORKER_BUILD_DISK_MAX
-<pool>/srcdest/<pkgbase>           a subvolume per pkgbase            ├ 3/1      WORKER_SRCCACHE_MAX_SIZE
-<pool>/builddir/<arch>/<pkgbase>   a subvolume per kept tree          ├ 3/2      WORKER_BUILDDIR_MAX_BYTES
-<pool>/pacman-pkg                  shared package cache               ├ 3/3      WORKER_PKGCACHE_MAX_SIZE
-<pool>/gnupg                       shared keyring                     └ (under 1/0 only)
+<pool>/root                        base chroot                      qgroup 2/0  WORKER_DISK_MAX
+<pool>/job-<id>, job-<id>.data     one build (above)                  ├ 1/<id>   WORKER_BUILD_DISK_MAX
+<pool>/srcdest/<pkgbase>           a subvolume per pkgbase            ├ 1/1      WORKER_SRCCACHE_MAX_SIZE
+<pool>/builddir/<arch>/<pkgbase>   a subvolume per kept tree          ├ 1/2      WORKER_BUILDDIR_MAX_BYTES
+<pool>/pacman-pkg                  shared package cache + job caches  ├ 1/3      WORKER_PKGCACHE_MAX_SIZE
+<pool>/gnupg                       shared keyring                     └ (under 2/0 only)
 <pool>/tmp                         the worker's TMPDIR
+
+Build ids start well above the fixed cache groups (1/1..1/99 reserved).
 ```
 
 - **SRCDEST and kept build trees**: a build writes into these, and they
@@ -423,6 +440,48 @@ chroot worker, so both get quotas.
   else on it.
 - **Docker `storage_opt` for the docker worker.** Unsupported on overlay2 over
   ZFS, and the bind directory would remain uncapped.
+
+## Prototype results (2026-09-24)
+
+A root prototype on the local worker (kernel 7.2.4, btrfs-progs 7.1): a sparse
+4G image in a `+C` directory on the chroot btrfs, `losetup --direct-io=on`
+(which the host accepted), `mkfs.btrfs -m single`, simple quotas. A 300M base
+with 5000 files stood in for the chroot.
+
+| Check | Result |
+|---|---|
+| Fresh snapshot of the base | charged 32 KiB; snapshot + data subvolume in 55-80 ms |
+| `fallocate -l 300M` past a 200M build limit | `EDQUOT` at once, nothing allocated |
+| `dd` 300M of random data | stopped at 200 MiB, the group at 199M |
+| 8K files into the data subvolume | refused after 24127 files, at 199M: both subvolumes share the build's limit |
+| Overwriting a base file in the snapshot | charged to the build (100M written, 100M charged) |
+| Total `2/0` over three builds and the base | held at 999M of 1000M; the third build refused at 247M of its 400M |
+| Writes through a bind mount into a cache subvolume | charged to the cache's group, not the build's |
+| `rename(2)` across subvolumes | `EXDEV`, as assumed; within one subvolume, fine |
+| Reflink across subvolumes | works, but the charge stays with the writer, even after it is deleted (a `<squota space holder>` until the extent is freed, then `<stale>`) |
+| `subvolume delete` | returns in 50-66 ms; the cleaner freed ~450M in ~40 s, and the total dropped accordingly |
+| Online shrink 4G -> 2G right after deletes | worked; `truncate` + `losetup -c` + `resize max` too |
+| Host blocks used by the sparse image after deletes | 1128M of 2048M (`discard=async` hands space back) |
+| A sparse 4G pool on a 1G host filesystem, 1.5G written | the writer gets `EIO` (write or `fsync`); reading back gives `EIO`, never wrong bytes; btrfs aborts the transaction and forces the pool read-only |
+| Remount after that | clean; the base chroot's committed data intact; scrub finds no errors |
+
+What this changed in the design:
+- The qgroup levels are inverted: the total is level 2, builds and caches
+  level 1.
+- The job's pacman cache moved into the `pacman-pkg` subvolume, because
+  reflinks don't move charges.
+- A deleted build's qgroups can't always be destroyed at once (`EBUSY` while
+  a space holder still carries charge). The sweep clears them later with
+  `btrfs qgroup clear-stale` and destroys empty level-1 groups, instead of
+  treating a failed destroy as an error.
+
+So a host filling up underneath a sparse pool is contained the way
+"Reservation is optional" assumes: the builds running at that moment fail
+loudly, and the pool needs a remount (the worker unmounts and remounts it
+when it finds it read-only), not a rebuild.
+
+Still open: 6 (real build times) from the list below, which needs the worker
+integration.
 
 ## To confirm before building
 

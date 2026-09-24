@@ -50,39 +50,20 @@ fn makechrootpkg_path() -> String {
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
-    devtools_owns_copy: bool,
     binds: &[(PathBuf, PathBuf)],
     build_flags: &[String],
     build_user: &str,
 ) -> Vec<String> {
+    // No `-c`: the worker has already made this build's chroot, a snapshot in
+    // the storage pool with a disk quota on it, and devtools finds it there.
+    // Nor `-T`: the worker deletes it too, with the quota group around it.
     let mut argv = vec![makechrootpkg_path()];
-    if devtools_owns_copy {
-        argv.push("-c".to_string());
-    }
     argv.extend([
         "-r".to_string(),
         chroot_root.display().to_string(),
         "-l".to_string(),
         copy_label.to_string(),
     ]);
-    // Delete the copy when the build ends, which devtools only does for a
-    // temporary chroot: `delete_chroot` is called under `(( temp_chroot ))`
-    // and nowhere else. Without it every build left a full chroot behind for
-    // good -- 26 of them, 362G, until the disk filled and took a four-hour
-    // build with it.
-    //
-    // Ordering matters: `-T` appends `-$$` to the copy name and `-l` *assigns*
-    // it, so a `-T` before the label would have its suffix overwritten and the
-    // copy would outlive the build after all.
-    //
-    // Letting devtools do the deleting rather than doing it ourselves is what
-    // keeps this correct on btrfs, where the copy is a subvolume snapshot that
-    // `rm -rf` cannot remove. It is conditional on devtools having made the
-    // copy in the first place: a strategy that makes its own must also take it
-    // down, and asking it to delete what it did not create fails the build.
-    if devtools_owns_copy {
-        argv.push("-T".to_string());
-    }
     // Name the build user explicitly. Without `-U`, makechrootpkg infers it
     // from `SUDO_USER`, which is whoever invoked us -- so the worker's own user
     // would run the build, and a build could then read the worker's mTLS
@@ -187,7 +168,6 @@ mod tests {
         let cmd = build_command(
             Path::new("/chroot"),
             "job-42",
-            true,
             &[],
             &["--nocheck".to_string()],
             "builder",
@@ -204,42 +184,27 @@ mod tests {
         );
         assert!(!cmd.iter().any(|a| a == "systemd-run"));
         assert!(!cmd.iter().any(|a| a == "--pkgdest"));
-        assert!(joined.contains("makechrootpkg -c -r /chroot -l job-42"));
+        assert!(joined.contains("makechrootpkg -r /chroot -l job-42"));
         // Builds must never inherit the worker's user via SUDO_USER.
         assert!(joined.contains("-U builder"));
-        // The copy has to be temporary, or it is never deleted.
-        assert!(joined.contains(" -T "), "{joined}");
-        // ... and `-T` must follow `-l`, which assigns the name it suffixes.
-        assert!(
-            joined.find(" -l ") < joined.find(" -T "),
-            "-T must come after -l: {joined}"
-        );
         assert!(joined.contains("-- --nocheck"));
     }
 
-    /// Every build syncs its own copy first, whichever strategy made it. The
-    /// shared base is refreshed on an interval, and a dependency AURCache built
-    /// since that interval last elapsed is in the repository but not in the
-    /// base's sync databases.
+    /// Every build syncs its own chroot first. The shared base is refreshed
+    /// on an interval, and a dependency AURCache built since that interval
+    /// last elapsed is in the repository but not in the base's sync databases.
     #[test]
     fn every_build_refreshes_its_own_copy() {
-        for owns in [true, false] {
-            let cmd = build_command(Path::new("/chroot"), "job-1", owns, &[], &[], "builder");
-            assert!(
-                cmd.iter().any(|a| a == "-u"),
-                "copy owned by devtools={owns}: {}",
-                cmd.join(" ")
-            );
-        }
+        let cmd = build_command(Path::new("/chroot"), "job-1", &[], &[], "builder");
+        assert!(cmd.iter().any(|a| a == "-u"), "{}", cmd.join(" "));
     }
 
-    /// A strategy that makes the copy itself leaves devtools' half out: no
-    /// `-c` to copy the base over it, and no `-T` to delete what devtools did
-    /// not create. Everything else about the command is the same, which is the
-    /// point of asking the lease rather than branching at the call site.
+    /// The worker makes and deletes each build's chroot, so devtools must do
+    /// neither: `-c` would copy the base over the snapshot (and its quota),
+    /// and `-T` would delete what devtools did not create.
     #[test]
-    fn a_caller_owned_copy_drops_the_devtools_flags() {
-        let cmd = build_command(Path::new("/chroot"), "job-9", false, &[], &[], "builder");
+    fn devtools_neither_makes_nor_deletes_the_chroot() {
+        let cmd = build_command(Path::new("/chroot"), "job-9", &[], &[], "builder");
         let joined = cmd.join(" ");
         assert!(!cmd.iter().any(|a| a == "-c"), "{joined}");
         assert!(!cmd.iter().any(|a| a == "-T"), "{joined}");
@@ -251,7 +216,7 @@ mod tests {
     /// itself, so adding one here would compete with devtools' own bind.
     #[test]
     fn build_command_does_not_bind_srcdest() {
-        let cmd = build_command(Path::new("/chroot"), "job-1", true, &[], &[], "builder");
+        let cmd = build_command(Path::new("/chroot"), "job-1", &[], &[], "builder");
         assert!(!cmd.join(" ").contains("/srcdest"));
         assert!(!cmd.iter().any(|a| a == "-d"));
         assert!(!cmd.iter().any(|a| a == "--"));
@@ -267,7 +232,7 @@ mod tests {
             ),
             (PathBuf::from("/host/netrc"), PathBuf::from("/etc/netrc")),
         ];
-        let cmd = build_command(Path::new("/chroot"), "job-7", true, &binds, &[], "builder");
+        let cmd = build_command(Path::new("/chroot"), "job-7", &binds, &[], "builder");
         let joined = cmd.join(" ");
         assert!(joined.contains("/job/secrets:/build-secrets"));
         assert!(joined.contains("/host/netrc:/etc/netrc"));

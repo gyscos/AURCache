@@ -58,12 +58,10 @@ pub fn devtools(program: &str) -> Command {
 /// * Otherwise refreshes it with `arch-nspawn … pacman -Syu`.
 ///
 /// **The caller must hold `root.lock`** while this runs, or hold nothing
-/// because there was no lock to hold. `makechrootpkg` takes it shared across
-/// `sync_chroot` so it never clones a half-updated chroot, and an overlay
-/// build holds it shared for its whole life because its lower layer must not
-/// change -- but `arch-nspawn`, which is how the chroot gets updated, takes no
-/// lock at all, so devtools' care only ever covered devtools' own writers.
-/// [`crate::chroots::Chroots::refresh`] is what decides that here.
+/// because there was no lock to hold. A build's snapshot is taken under the
+/// same lock held shared, so it never captures a half-updated chroot --
+/// `arch-nspawn`, which is how the chroot gets updated, takes no lock of its
+/// own. [`crate::chroots::Chroots::refresh`] is what decides that here.
 ///
 /// `report_to` names who to tell about a refresh problem, and the build to
 /// file it under -- `None` for `build-once`, which runs this same machinery
@@ -98,21 +96,6 @@ pub async fn ensure_base_chroot(
         // Existing chroots too: this arrived after the first ones were built,
         // and a chroot is long-lived.
         ensure_multilib(&root).await;
-        return Ok(root);
-    }
-    create_base(&root, pacman_conf).await
-}
-
-/// Create the base chroot if it is missing, and leave it alone if it is not.
-///
-/// What an overlay worker calls instead of [`ensure_base_chroot`]: its base is
-/// frozen, and a refresh there is a new layer on top rather than a change to
-/// the thing every running build is reading. See `design/implemented/overlay-chroot.md`.
-pub async fn create_base_chroot(chroot_dir: &Path, pacman_conf: &Path) -> Result<PathBuf> {
-    let _guard = BASE_CHROOT_LOCK.lock().await;
-
-    let root = base_dir(chroot_dir)?;
-    if base_exists(&root) {
         return Ok(root);
     }
     create_base(&root, pacman_conf).await
@@ -464,47 +447,11 @@ pub fn write_configs(
     Ok((makepkg, pacman))
 }
 
-/// Delete per-build chroot copies left behind by earlier runs.
-///
-/// Each build's copy is temporary now (`makechrootpkg -T`), so in the ordinary
-/// case there is nothing here to find. A worker that was killed mid-build
-/// leaves one anyway, and a worker upgraded from a version that never passed
-/// `-T` leaves every copy it ever made -- which is how this host reached 26 of
-/// them and 362G before the disk filled.
-///
-/// Startup is the safe moment: this worker is running no builds yet, so every
-/// `job-*` under the chroot directory is by definition garbage. It is *not*
-/// safe to run later, and two workers must not share a chroot directory.
-///
-/// Never fatal. Failing to reclaim space is worth reporting and carrying on;
-/// refusing to start over it would turn a full disk into an offline worker.
-pub async fn remove_stale_copies(chroot_dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(chroot_dir) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        if !is_stale_copy(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        let path = entry.path();
-        match remove_copy(&path).await {
-            Ok(()) => removed += 1,
-            Err(e) => tracing::warn!("could not remove stale chroot {}: {e:#}", path.display()),
-        }
-    }
-    if removed > 0 {
-        tracing::info!("removed {removed} stale chroot cop(ies) from a previous run");
-    }
-    removed
-}
-
 /// What asking for the base chroot's lock produced.
 pub enum BaseLock {
     /// Held. The base chroot is ours to change until this is dropped.
     Held(std::fs::File),
-    /// Someone else holds it: a copy being taken, or an overlay build using
-    /// the base as its lower layer.
+    /// Someone else holds it: a build's snapshot being taken.
     Busy,
     /// There is no usable lock here at all. Not a reason to refuse to work --
     /// that is what happened before any of this existed.
@@ -513,11 +460,10 @@ pub enum BaseLock {
 
 /// Ask for devtools' `root.lock` exclusively, without waiting.
 ///
-/// Never blocks, and that is the point. An overlay build holds the lock
-/// *shared* for its whole life, so a blocking wait here would hold up every
-/// job start behind it for as long as the longest build runs. A refresh that
-/// cannot have the chroot right now simply happens later; being a few minutes
-/// out of date is a smaller problem than a worker that starts no builds.
+/// Never blocks. The lock is only ever held shared for the instant of taking a
+/// snapshot, so it is rarely busy; when it is, the refresh simply happens
+/// later, and being a few minutes out of date is a smaller problem than
+/// holding up the job start that asked for it.
 pub async fn try_lock_base(root: &Path) -> BaseLock {
     // Same rule as every other lock path here (`lock_beside`): append, never
     // `with_extension`, which would replace an extension instead. All three
@@ -550,12 +496,8 @@ pub async fn try_lock_base(root: &Path) -> BaseLock {
 }
 
 /// Take devtools' `root.lock` *shared*, which is what `sync_chroot` does while
-/// it copies.
-///
-/// An overlay uses the base chroot as its lower layer for the whole build, not
-/// for the instant of a copy, so it holds the same shared lock for the whole
-/// build: several may read it at once, and a refresh -- which takes it
-/// exclusively -- waits for them.
+/// it copies, for the instant of taking a build's snapshot. Several builds may
+/// snapshot at once; a refresh, which takes it exclusively, waits for them.
 pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
     open_base_lock(root).await
 }
@@ -568,7 +510,7 @@ pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
 /// since this is best-effort. `flock(2)` places either kind of lock through a
 /// read-only descriptor perfectly well; the open mode and the lock mode are
 /// unrelated. There is nothing to create here either: by the time a chroot can
-/// be refreshed or overlaid, `mkarchroot` has made both it and its lock.
+/// be refreshed or snapshotted, `mkarchroot` has made both it and its lock.
 ///
 /// The lock is held until the returned file is dropped. `None` if it could not
 /// be taken at all, which is worth carrying on without -- that is what
@@ -596,155 +538,11 @@ async fn open_base_lock(root: &Path) -> Option<std::fs::File> {
     }
 }
 
-/// Whether a name in the chroot directory is a per-build copy.
-///
-/// `job-<build id>`, and `job-<build id>-<pid>` once devtools has added the
-/// suffix `-T` gives it. The copy's lock sits *beside* it rather than inside
-/// and is removed along with the copy it belongs to, so matching it here as
-/// well reported twice as many reclaimed as there were.
-fn is_stale_copy(name: &str) -> bool {
-    name.starts_with("job-") && !name.ends_with(".lock")
-}
-
-/// Whether `name` is the copy `makechrootpkg -l <label> -T` made: `-T` appends
-/// `-$$`, so `<label>-<pid>` and nothing else. Exact, because labels share
-/// prefixes -- `job-99`'s copy must never match `job-995-482762`.
-fn is_copy_of(name: &str, label: &str) -> bool {
-    name.strip_prefix(label)
-        .and_then(|rest| rest.strip_prefix('-'))
-        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Delete the copy one build's `makechrootpkg` left behind, if it left one.
-///
-/// It deletes its own copy on the way out -- from an EXIT trap, which a SIGKILL
-/// never runs. Stopping a build kills its whole cgroup, so every stopped build
-/// used to leave a full chroot copy (4.4G for unreal-engine) on disk until the
-/// worker next restarted and swept `job-*`. Called once the build's tree is
-/// dead, and matching only this build's label, so it cannot reach a copy
-/// another build is using. A build that ended normally has nothing here, and
-/// this costs one `read_dir`.
-pub async fn remove_leftover_copy(chroot_dir: &Path, label: &str) {
-    let Ok(entries) = std::fs::read_dir(chroot_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !is_copy_of(&entry.file_name().to_string_lossy(), label) {
-            continue;
-        }
-        let path = entry.path();
-        match remove_copy(&path).await {
-            Ok(()) => tracing::info!(
-                "removed chroot copy {} left by a killed build",
-                path.display()
-            ),
-            Err(e) => tracing::warn!("could not remove chroot copy {}: {e:#}", path.display()),
-        }
-    }
-}
-
 /// The lock `makechrootpkg` takes for a copy, which sits beside it rather than
 /// inside it.
 fn lock_beside(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     Some(path.with_file_name(format!("{name}.lock")))
-}
-
-/// btrfs, from `statfs`.
-const BTRFS_SUPER_MAGIC: i64 = 0x9123_683E;
-
-/// Every btrfs subvolume root has this inode number, and only a subvolume root
-/// has it -- on btrfs. Any other filesystem hands out 256 like any other
-/// number, which is why the filesystem type is half the test.
-const BTRFS_SUBVOLUME_INODE: u64 = 256;
-
-/// Whether a filesystem type and inode number describe a subvolume root.
-fn is_subvolume_ino(fs_type: i64, inode: u64) -> bool {
-    fs_type == BTRFS_SUPER_MAGIC && inode == BTRFS_SUBVOLUME_INODE
-}
-
-/// Whether a path is a btrfs subvolume, by the test devtools uses.
-///
-/// Deliberately not `btrfs subvolume show`: that searches the B-tree and needs
-/// root, so asking it as the worker's own user answers "not a subvolume" for
-/// every subvolume there is. The caller then reaches for `rm`, which cannot
-/// delete a subvolume -- and every copy this ever swept was left on disk, one
-/// per crashed build, forever. `statfs` and the inode number need no
-/// privileges.
-fn is_btrfs_subvolume(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let Some(fs_type) = fs_type(path) else {
-        return false;
-    };
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    is_subvolume_ino(fs_type, meta.ino())
-}
-
-/// The filesystem type under `path`, from `statfs`.
-fn fs_type(path: &Path) -> Option<i64> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is a NUL-terminated path and `buf` is a valid statfs.
-    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
-        return None;
-    }
-    Some(buf.f_type as i64)
-}
-
-/// Whether `path` is on btrfs, where `makechrootpkg` copies a chroot by taking
-/// a snapshot and there is nothing for an overlay to save.
-#[must_use]
-pub fn is_btrfs(path: &Path) -> bool {
-    fs_type(path) == Some(BTRFS_SUPER_MAGIC)
-}
-
-/// Remove one chroot copy, whatever kind of thing it is.
-///
-/// A copy on btrfs is a subvolume snapshot, and `rm -rf` cannot delete a
-/// subvolume -- it empties it and then fails on the directory itself. This is
-/// the same distinction `delete_chroot` makes inside devtools.
-async fn remove_copy(path: &Path) -> Result<()> {
-    let is_subvolume = is_btrfs_subvolume(path);
-
-    let mut cmd = Command::new("sudo");
-    if is_subvolume {
-        cmd.arg("btrfs").arg("subvolume").arg("delete").arg(path);
-    } else {
-        // `--one-file-system`, as devtools does: an unmount that failed leaves
-        // something mounted under here, and this must not walk into it.
-        cmd.arg("rm")
-            .arg("--recursive")
-            .arg("--force")
-            .arg("--one-file-system")
-            .arg(path);
-    }
-    let (log, status) = run_capture(cmd).await?;
-    if !status.success() {
-        bail!("removing {}:\n{log}", path.display());
-    }
-    // The lock lives beside the copy and is root's, like the copy. devtools
-    // removes it in `delete_chroot`; a sweep that does not leaves one empty
-    // file per crashed build behind for good.
-    if let Some(lock) = lock_beside(path) {
-        let mut cmd = Command::new("sudo");
-        cmd.arg("rm").arg("--force").arg(&lock);
-        if let Ok((log, status)) = run_capture(cmd).await
-            && !status.success()
-        {
-            tracing::warn!("could not remove {}:\n{log}", lock.display());
-        }
-    }
-    // The lock beside the copy went out with the `sudo rm` above, which names
-    // the same `lock_beside` path: devtools keeps it beside the copy, not
-    // inside it, and it is root's. (A second computation of the path used to
-    // live here with `with_extension` instead of the append rule — same file
-    // for every real copy name, a different one the moment a dot appears.)
-    Ok(())
 }
 
 #[cfg(test)]
@@ -817,17 +615,6 @@ mod tests {
         assert!(conf.contains("no-auto-check-trustdb"), "{conf}");
     }
 
-    /// The inode number alone means nothing off btrfs, where 256 is just a
-    /// number -- and the filesystem type alone means nothing either, since
-    /// every directory in a chroot copy sits on btrfs too.
-    #[test]
-    fn a_subvolume_is_a_filesystem_and_an_inode() {
-        assert!(is_subvolume_ino(BTRFS_SUPER_MAGIC, BTRFS_SUBVOLUME_INODE));
-        assert!(!is_subvolume_ino(BTRFS_SUPER_MAGIC, 257));
-        // ext4.
-        assert!(!is_subvolume_ino(0xEF53, BTRFS_SUBVOLUME_INODE));
-    }
-
     /// The lock is a sibling, not a child: `job-604-2844759.lock` beside
     /// `job-604-2844759`.
     #[test]
@@ -836,30 +623,6 @@ mod tests {
             lock_beside(Path::new("/chroot/job-604-2844759")),
             Some(PathBuf::from("/chroot/job-604-2844759.lock"))
         );
-    }
-
-    /// The lock beside a copy is removed with it, so matching it separately
-    /// double-counts what was reclaimed. The base chroot must never match.
-    #[test]
-    fn only_per_build_copies_are_swept() {
-        assert!(is_stale_copy("job-604"));
-        assert!(is_stale_copy("job-604-2844759"));
-        assert!(!is_stale_copy("job-604-2844759.lock"));
-        assert!(!is_stale_copy("root"));
-        assert!(!is_stale_copy("root.lock"));
-    }
-
-    /// A killed build's copy is found by its own label only. Labels share
-    /// prefixes, so a looser match would delete a copy a running build is in.
-    #[test]
-    fn a_leftover_copy_is_matched_by_its_own_label_only() {
-        assert!(is_copy_of("job-995-482762", "job-995"));
-        assert!(!is_copy_of("job-995-482762", "job-99"));
-        assert!(!is_copy_of("job-995-482762.lock", "job-995"));
-        assert!(!is_copy_of("job-995", "job-995"));
-        assert!(!is_copy_of("job-995-", "job-995"));
-        assert!(!is_copy_of("job-995-abc", "job-995"));
-        assert!(!is_copy_of("root", "job-995"));
     }
 
     /// One build's overrides go to a file of that build's own, which

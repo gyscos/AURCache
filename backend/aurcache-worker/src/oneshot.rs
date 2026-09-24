@@ -29,11 +29,12 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     // chroot's own, matching what a served build gets.
     let pacman_conf = existing("/etc/pacman.conf")?;
     let chroots = Chroots::new(
-        cfg.chroot_dir.clone(),
+        cfg.pool_config(),
         std::time::Duration::from_secs(cfg.chroot_refresh_interval),
-        cfg.chroot_mode,
     );
-    chroots.detect().await;
+    if !chroots.open().await {
+        bail!("the storage pool could not be opened; see the log above");
+    }
     chroots
         .refresh(&pacman_conf, None)
         .await
@@ -53,28 +54,33 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
 
     // Through `with_lease` like the polling path: a spawn failure must give
     // the chroot back too, not just the happy path. The release happens
-    // after the child has exited, never before.
+    // after the child has exited, never before. The chroot is held to the
+    // same disk quota a served build gets; the packages land in `pkgdir`,
+    // which is the developer's own directory.
     let status = chroots
-        .with_lease("build-once", async |lease| {
-            let argv = build::build_command(
-                lease.chroot_dir(),
-                lease.label(),
-                lease.devtools_owns_copy(),
-                &cfg.bind_mounts,
-                flags,
-                &cfg.build_user,
-            );
-            tracing::info!("$ sudo {}", argv.join(" "));
+        .with_lease(
+            crate::chroots::ONE_SHOT_BUILD_ID,
+            Some(cfg.build_disk_max),
+            async |lease| {
+                let argv = build::build_command(
+                    lease.chroot_dir(),
+                    lease.label(),
+                    &cfg.bind_mounts,
+                    flags,
+                    &cfg.build_user,
+                );
+                tracing::info!("$ sudo {}", argv.join(" "));
 
-            let mut cmd = chroot::devtools(&argv[0]);
-            cmd.args(&argv[1..]).current_dir(&pkgdir);
-            // devtools binds `$SRCDEST` itself; unset, it falls back to the
-            // PKGBUILD directory and downloads are not cached between runs.
-            if let Some(dir) = srcdest.as_deref() {
-                cmd.env("SRCDEST", dir);
-            }
-            cmd.status().await.context("running build")
-        })
+                let mut cmd = chroot::devtools(&argv[0]);
+                cmd.args(&argv[1..]).current_dir(&pkgdir);
+                // devtools binds `$SRCDEST` itself; unset, it falls back to the
+                // PKGBUILD directory and downloads are not cached between runs.
+                if let Some(dir) = srcdest.as_deref() {
+                    cmd.env("SRCDEST", dir);
+                }
+                cmd.status().await.context("running build")
+            },
+        )
         .await?;
 
     let report = report::classify_exit(status, false);

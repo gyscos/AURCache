@@ -4,9 +4,11 @@ Plan for making a build's chroot cost nothing to create on filesystems that
 cannot snapshot, and for refreshing the base without waiting for the builds
 using it.
 
-Status: **implemented.** The overlay strategy, its startup detection and update
-layers (`refresh_by_layer`, flattened past `MAX_LAYERS`) are all in
-`aurcache-worker/src/chroots.rs`.
+Status: **superseded** by `design/in-progress/build-disk-quota.md`. Every
+chroot is now a snapshot in the worker's btrfs storage pool, which works the
+same on every host filesystem, so the overlay strategy, its update layers and
+flattening were removed. Kept for the measurements and the reasoning, which
+that design builds on.
 
 ---
 

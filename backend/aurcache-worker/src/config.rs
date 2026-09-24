@@ -8,7 +8,7 @@
 use crate::settings::keys;
 use aurcache_worker_core::config::{CoreConfig, env_opt};
 use aurcache_worker_core::settings::WorkerSettings;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Fully-resolved configuration for the chroot worker.
 #[derive(Clone, Debug)]
@@ -23,8 +23,15 @@ pub struct Config {
     /// Extra `host:chroot` bind mounts exposed to every build, for credentials
     /// that are not SSH (a `.netrc`, an API token, a licence file).
     pub bind_mounts: Vec<(PathBuf, PathBuf)>,
-    /// Directory holding the shared base chroot + per-job copies.
+    /// Directory the storage pool lives under by default: its image and its
+    /// mount point.
     pub chroot_dir: PathBuf,
+    /// What backs the storage pool every chroot and build lives in
+    /// (`WORKER_POOL`, `WORKER_DISK_RESERVE`). The machine's alone: it decides
+    /// what the worker formats and mounts, so the server can never name it.
+    pub pool_backing: aurcache_chroot::Backing,
+    /// Where the pool is mounted.
+    pub pool_mountpoint: PathBuf,
     /// Directory holding worker-local caches (srcdest, gnupg, pacman pkg).
     pub cache_dir: PathBuf,
     /// Keyserver for `gpg --recv-keys`.
@@ -60,13 +67,6 @@ pub struct Config {
     /// few times a day. Keeping the base close to current is what leaves that
     /// per-build sync with nothing to download.
     pub chroot_refresh_interval: u64,
-    /// Whether each build's chroot is an overlay on the base or a copy of it.
-    ///
-    /// Defaults to deciding at startup, because the right answer is a property
-    /// of the machine: on btrfs a copy is a snapshot and already free, while
-    /// anywhere else it is an rsync of the whole chroot. See
-    /// [`crate::chroots::ChrootMode`].
-    pub chroot_mode: crate::chroots::ChrootMode,
     /// Package cache TTL in seconds. Defaults to `0` (disabled) because a
     /// cached package's mtime is its *download* time — pacman does not touch
     /// it on a cache hit — so age-evicting would discard a package used daily
@@ -80,6 +80,10 @@ pub struct Config {
     /// (`WORKER_TOTAL_BUILD_MEMORY_MAX`, `WORKER_TOTAL_BUILD_SWAP_MAX`,
     /// `WORKER_TOTAL_BUILD_CPUS`). Unset means unlimited.
     pub total_build_limits: crate::cgroup::BuildLimits,
+    /// Disk one build may write (`WORKER_BUILD_DISK_MAX`).
+    pub build_disk_max: u64,
+    /// Everything the worker may store in its pool (`WORKER_DISK_MAX`).
+    pub disk_max: u64,
 }
 
 impl Config {
@@ -109,13 +113,19 @@ impl Config {
             bind_mounts: env_opt("WORKER_BIND_MOUNTS")
                 .map(|raw| crate::credentials::parse_bind_mounts(&raw))
                 .unwrap_or_default(),
-            chroot_dir,
+            chroot_dir: chroot_dir.clone(),
             cache_dir: env_opt("WORKER_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/var/cache/aurcache-worker")),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
-            chroot_mode: crate::chroots::ChrootMode::parse(
-                env_opt("WORKER_CHROOT_OVERLAY").as_deref(),
+            pool_backing: pool_backing(
+                env_opt("WORKER_POOL").map(PathBuf::from),
+                env_opt("WORKER_DISK_RESERVE").is_some_and(|v| truthy(&v)),
+                &chroot_dir,
+            ),
+            pool_mountpoint: pool_mountpoint(
+                env_opt("WORKER_POOL").map(PathBuf::from),
+                &chroot_dir,
             ),
             // Filled in from the settings just below, by the same code that
             // fills them in again whenever the server delivers new values.
@@ -127,10 +137,31 @@ impl Config {
             chroot_refresh_interval: 0,
             build_limits: crate::cgroup::BuildLimits::default(),
             total_build_limits: crate::cgroup::BuildLimits::default(),
+            build_disk_max: 0,
+            disk_max: 0,
             core,
         };
+        if env_opt("WORKER_CHROOT_OVERLAY").is_some() {
+            tracing::warn!(
+                "WORKER_CHROOT_OVERLAY is no longer used: every chroot is a snapshot in the \
+                 storage pool now"
+            );
+        }
         cfg.read_settings();
         cfg
+    }
+
+    /// How to open the storage pool, with the current total.
+    #[must_use]
+    pub fn pool_config(&self) -> aurcache_chroot::PoolConfig {
+        // SAFETY: neither call has preconditions or can fail.
+        let owner = unsafe { (libc::getuid(), libc::getgid()) };
+        aurcache_chroot::PoolConfig {
+            backing: self.pool_backing.clone(),
+            mountpoint: self.pool_mountpoint.clone(),
+            total: self.disk_max,
+            owner,
+        }
     }
 
     /// The same configuration with `settings` in force: the protocol's
@@ -180,7 +211,50 @@ impl Config {
             keys::TOTAL_BUILD_SWAP_MAX,
             keys::TOTAL_BUILD_CPUS,
         );
+        self.build_disk_max = settings
+            .size(keys::BUILD_DISK_MAX)
+            .unwrap_or(crate::settings::DEFAULT_BUILD_DISK_MAX);
+        self.disk_max = settings
+            .size(keys::DISK_MAX)
+            .unwrap_or(crate::settings::DEFAULT_DISK_MAX);
     }
+}
+
+/// What backs the pool, from `WORKER_POOL`: unset is an image under the chroot
+/// directory; a block device is formatted and mounted; a directory is an
+/// existing btrfs mount used as it is.
+fn pool_backing(
+    pool: Option<PathBuf>,
+    reserve: bool,
+    chroot_dir: &Path,
+) -> aurcache_chroot::Backing {
+    use std::os::unix::fs::FileTypeExt;
+    match pool {
+        None => aurcache_chroot::Backing::Image {
+            path: chroot_dir.join("pool.img"),
+            reserve,
+        },
+        Some(path) if std::fs::metadata(&path).is_ok_and(|m| m.file_type().is_block_device()) => {
+            aurcache_chroot::Backing::Device(path)
+        }
+        Some(_) => aurcache_chroot::Backing::Mount,
+    }
+}
+
+/// Where the pool is mounted: the existing mount itself when `WORKER_POOL`
+/// names one, otherwise a directory under the chroot directory.
+fn pool_mountpoint(pool: Option<PathBuf>, chroot_dir: &Path) -> PathBuf {
+    match pool {
+        Some(path) if path.is_dir() => path,
+        _ => chroot_dir.join("pool"),
+    }
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// The same three limits per build and for all builds together, read the same
@@ -293,6 +367,50 @@ mod tests {
         assert_eq!(cfg.build_limits.swap_max, None);
         assert_eq!(cfg.build_limits.cpus, None);
         assert_eq!(cfg.total_build_limits.memory_max, None);
+        assert_eq!(cfg.build_disk_max, 50 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.disk_max, 200 * 1024 * 1024 * 1024);
+    }
+
+    /// Unset, the pool is an image under the chroot directory, sparse unless
+    /// reserving; a directory is an existing mount, used where it is.
+    #[test]
+    fn the_pool_backing_follows_what_worker_pool_names() {
+        let chroot = Path::new("/var/lib/aurcache-worker/chroot");
+        assert_eq!(
+            pool_backing(None, false, chroot),
+            aurcache_chroot::Backing::Image {
+                path: chroot.join("pool.img"),
+                reserve: false
+            }
+        );
+        assert_eq!(
+            pool_backing(None, true, chroot),
+            aurcache_chroot::Backing::Image {
+                path: chroot.join("pool.img"),
+                reserve: true
+            }
+        );
+        assert_eq!(pool_mountpoint(None, chroot), chroot.join("pool"));
+
+        let mount = tempfile::tempdir().unwrap();
+        assert_eq!(
+            pool_backing(Some(mount.path().to_path_buf()), false, chroot),
+            aurcache_chroot::Backing::Mount
+        );
+        assert_eq!(
+            pool_mountpoint(Some(mount.path().to_path_buf()), chroot),
+            mount.path()
+        );
+    }
+
+    #[test]
+    fn reserving_takes_the_usual_spellings_of_yes() {
+        for yes in ["1", "true", "YES", " on "] {
+            assert!(truthy(yes), "{yes:?}");
+        }
+        for no in ["0", "false", "no", ""] {
+            assert!(!truthy(no), "{no:?}");
+        }
     }
 
     /// `0` disables a budget, and must survive as `0` rather than being

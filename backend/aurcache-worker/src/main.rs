@@ -96,15 +96,8 @@ async fn announce_build_credential(cfg: &Config) {
 }
 
 async fn run(cfg: Arc<Config>) -> Result<()> {
-    // Before anything can claim work: no build of ours is running yet, so a
-    // per-build chroot still on disk belongs to a run that is already over.
-    aurcache_worker::chroots::Chroots::new(
-        cfg.chroot_dir.clone(),
-        std::time::Duration::from_secs(cfg.chroot_refresh_interval),
-        cfg.chroot_mode,
-    )
-    .sweep()
-    .await;
+    // What a previous run left in the storage pool is swept when the
+    // executor opens it, before anything can claim work.
 
     // Before enrollment or any build: a crafted PKGBUILD can reach the
     // worker-protocol port from inside a build (shared network namespace) and

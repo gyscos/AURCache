@@ -714,6 +714,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurcache-chroot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aurcache-cli"
 version = "0.0.0"
 dependencies = [
@@ -871,6 +881,7 @@ dependencies = [
  "aurcache-activitylog",
  "aurcache-api",
  "aurcache-ca",
+ "aurcache-chroot",
  "aurcache-common",
  "aurcache-db",
  "aurcache-utils",

@@ -31,6 +31,8 @@ pub mod keys {
     pub const TOTAL_BUILD_MEMORY_MAX: &str = "total_build_memory_max";
     pub const TOTAL_BUILD_SWAP_MAX: &str = "total_build_swap_max";
     pub const TOTAL_BUILD_CPUS: &str = "total_build_cpus";
+    pub const BUILD_DISK_MAX: &str = "build_disk_max";
+    pub const DISK_MAX: &str = "disk_max";
 }
 
 /// Re-exported from the shared executor settings: the legacy container
@@ -46,6 +48,11 @@ pub const DEFAULT_CACHE_TTL: u64 = 30 * 24 * 60 * 60;
 /// of 26 of them upgraded nothing: Arch's repositories move a few times a day,
 /// not a few times an hour.
 pub const DEFAULT_CHROOT_REFRESH_INTERVAL: u64 = 15 * 60;
+/// Disk one build may use when nothing is configured.
+pub const DEFAULT_BUILD_DISK_MAX: u64 = 50 * 1024 * 1024 * 1024;
+/// Everything the worker may store when nothing is configured: the base
+/// chroot, the builds, and (once they move into the pool) the caches.
+pub const DEFAULT_DISK_MAX: u64 = 200 * 1024 * 1024 * 1024;
 
 /// The settings this executor accepts, on top of the protocol ones.
 #[must_use]
@@ -189,6 +196,28 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             applies: Applies::Immediately,
             default: Builtin::Unset,
         },
+        SettingSpec {
+            key: keys::BUILD_DISK_MAX,
+            env_var: "WORKER_BUILD_DISK_MAX",
+            kind: ValueKind::Size,
+            description: "Disk one build may write: its chroot, its sources and the packages it \
+                          makes. Enforced by the kernel as the build writes, so a build past it \
+                          fails with \"Disk quota exceeded\" instead of filling the host.",
+            category: "Disk",
+            applies: Applies::NextJob,
+            default: Builtin::Size(DEFAULT_BUILD_DISK_MAX),
+        },
+        SettingSpec {
+            key: keys::DISK_MAX,
+            env_var: "WORKER_DISK_MAX",
+            kind: ValueKind::Size,
+            description: "Everything this worker may store in its storage pool: the base chroot \
+                          and every running build. Also the size of the pool's image, which \
+                          grows to follow it. Applies to builds already running.",
+            category: "Disk",
+            applies: Applies::Immediately,
+            default: Builtin::Size(DEFAULT_DISK_MAX),
+        },
     ]
 }
 
@@ -255,6 +284,8 @@ mod tests {
             "WORKER_BUILD_USER",
             "WORKER_MAKECHROOTPKG",
             "WORKER_CHROOT_DIR",
+            "WORKER_POOL",
+            "WORKER_DISK_RESERVE",
             "WORKER_CACHE_DIR",
             "WORKER_GIT_SSH_KEY",
             "WORKER_SSH_KNOWN_HOSTS",

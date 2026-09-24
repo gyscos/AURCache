@@ -125,26 +125,10 @@ async fn run_job_inner(
         });
     }
 
-    // 1. Fetch + extract source.
-    log(client, build_id, "[worker] downloading source\n").await;
-    let source = client
-        .source(build_id)
-        .await
-        .context("downloading source")?;
     // Defensive: a crash mid-job could have left a tree behind under this id.
+    // Only this job's configs live here now; its source and packages are in
+    // its own subvolume in the pool, under its disk quota (step 4).
     let _ = std::fs::remove_dir_all(workdir);
-    let pkgdir = artifacts::extract_source(&source, workdir).context("extracting source")?;
-
-    // The archive unpacks owned by this worker's user, with the modes baked
-    // into it (0644/0755); the build then runs as a *different* user
-    // (`build_user`). makepkg rewrites the PKGBUILD in place for VCS packages
-    // (`pkgver()` at build time), and its `update_pkgver` prints a warning and
-    // proceeds with the stale version whenever the file is not writable — the
-    // `ttf-google-fonts-git` symptom of a pkgver that never advances. The
-    // docker builder needs the same and solves it with `chmod -R a+w .`.
-    make_source_writable(&pkgdir)
-        .await
-        .context("making source writable")?;
 
     // 1.5. Reconcile the shared package cache against what the served
     // repository publishes *now* (see design/implemented/stale-shared-pacman-cache.md).
@@ -326,16 +310,46 @@ async fn run_job_inner(
     // The lease is given back on the error path too, which is the half a
     // caller forgets -- and it is given back *after* the build's child has been
     // waited on, which a `Drop` could not promise.
+    //
+    // Everything that touches the build's source and packages happens inside
+    // it: they live in the lease's own subvolume, counted against the build's
+    // disk quota, and are deleted with it.
     let report = shared
         .chroots
-        .with_lease(&job_label, async |lease| {
+        .with_lease(build_id, Some(cfg.build_disk_max), async |lease| {
+            log(client, build_id, "[worker] downloading source\n").await;
+            let source = client
+                .source(build_id)
+                .await
+                .context("downloading source")?;
+            let pkgdir =
+                artifacts::extract_source(&source, lease.workdir()).context("extracting source")?;
+
+            // The archive unpacks owned by this worker's user, with the modes
+            // baked into it (0644/0755); the build then runs as a *different*
+            // user (`build_user`). makepkg rewrites the PKGBUILD in place for
+            // VCS packages (`pkgver()` at build time), and its `update_pkgver`
+            // prints a warning and proceeds with the stale version whenever the
+            // file is not writable — the `ttf-google-fonts-git` symptom of a
+            // pkgver that never advances. The docker builder needs the same and
+            // solves it with `chmod -R a+w .`.
+            make_source_writable(&pkgdir)
+                .await
+                .context("making source writable")?;
+
             let ctx = WorkerContext {
                 cfg,
                 cgroups,
                 dropin: &dropin,
                 lease,
+                chroots: &shared.chroots,
             };
-            run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await
+            let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
+            // Before the lease goes, and the packages with it.
+            if report.success {
+                upload_artifacts(client, build_id, &pkgdir).await?;
+            }
+            Ok(report)
         })
         .await?;
 
@@ -382,12 +396,6 @@ async fn run_job_inner(
             "package-cache promote",
         )
         .await;
-    }
-
-    // 6. Upload artifacts on success. (The workspace is cleaned by `run_job`
-    // on every exit path, including the `?` above.)
-    if report.success {
-        upload_artifacts(client, build_id, &pkgdir).await?;
     }
 
     Ok(report)
@@ -525,9 +533,11 @@ fn agent_socket() -> Option<PathBuf> {
 struct WorkerContext<'a> {
     cfg: &'a Config,
     cgroups: Option<&'a Hierarchy>,
-    /// This build's chroot, which names itself to `makechrootpkg` and says who
-    /// is responsible for taking it down.
+    /// This build's chroot, which names itself to `makechrootpkg`.
     lease: &'a Lease,
+    /// Where the lease came from, to tell whether a failed build ran out of
+    /// its disk quota.
+    chroots: &'a crate::chroots::Chroots,
     /// This build's makepkg overrides, which `makechrootpkg` installs into the
     /// chroot copy it makes for it.
     dropin: &'a Path,
@@ -553,7 +563,6 @@ async fn run_build(
     let argv = build::build_command(
         ctx.lease.chroot_dir(),
         ctx.lease.label(),
-        ctx.lease.devtools_owns_copy(),
         binds,
         &job.build_flags,
         &ctx.cfg.build_user,
@@ -834,6 +843,21 @@ async fn run_build(
             crate::cgroup::OomCause::classify(build_ooms, total_ooms_during),
             ctx.cfg,
         );
+        log(client, build_id, &format!("\n[worker] {reason}\n")).await;
+        report.reason = Some(reason);
+    }
+    // Running out of disk looks like any other failure too: whichever write
+    // hit the quota fails with "Disk quota exceeded", somewhere in the log.
+    // The quota group's own figures say whether that is what happened.
+    if !report.success
+        && !canceled
+        && !timed_out
+        && report
+            .reason
+            .as_deref()
+            .is_none_or(|r| !r.starts_with("out of memory"))
+        && let Some(reason) = ctx.chroots.disk_reason(ctx.lease).await
+    {
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
         report.reason = Some(reason);
     }
