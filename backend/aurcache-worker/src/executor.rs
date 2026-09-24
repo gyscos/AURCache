@@ -154,6 +154,7 @@ impl ChrootExecutor {
             chroots: Chroots::new(
                 cfg.pool_config(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
+                cfg.cache_owner(),
             ),
         });
         // Before anything can claim work: no build of ours is running yet, so

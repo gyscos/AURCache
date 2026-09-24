@@ -62,7 +62,6 @@ services:
     volumes:
       - enroll:/enroll
       - worker_data:/var/lib/aurcache-worker
-      - worker_cache:/var/cache/aurcache-worker
     # Each package is built in a systemd-nspawn chroot, which needs mounts and
     # namespaces a plain container forbids.
     privileged: true
@@ -92,7 +91,6 @@ volumes:
   aurcache_ca:
   enroll:
   worker_data:
-  worker_cache:
 
 networks:
   aurcache_network:

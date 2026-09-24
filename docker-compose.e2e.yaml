@@ -55,7 +55,6 @@ services:
     volumes:
       - enroll:/enroll
       - worker_data:/var/lib/aurcache-worker
-      - worker_cache:/var/cache/aurcache-worker
     privileged: true
     tmpfs:
       - /run
@@ -69,7 +68,6 @@ volumes:
   ca:
   enroll:
   worker_data:
-  worker_cache:
 
 networks:
   aurcache_network:

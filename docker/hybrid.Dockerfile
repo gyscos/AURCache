@@ -195,8 +195,7 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
     && systemd-sysusers \
     && systemd-tmpfiles --create
 
-ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
-    WORKER_CACHE_DIR=/var/cache/aurcache-worker
+ENV WORKER_DATA_DIR=/var/lib/aurcache-worker
 
 # Wrapper so devtools' systemd-nspawn works without a systemd manager.
 COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
@@ -206,13 +205,13 @@ COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
 #
 #   /app/data                 the internal CA that signs every worker's
 #                             certificate.
-#   /var/lib/aurcache-worker  the embedded worker's identity, and its base chroot.
-#   /var/cache/aurcache-worker  its package and source caches.
+#   /var/lib/aurcache-worker  the embedded worker's identity, and its storage
+#                             pool: base chroot, builds and caches.
 #
 # `/app/data` was missing here, and its absence was worse than it looks: losing
 # the CA invalidates the certificate of *every* worker that ever enrolled, so a
-# recreate orphaned the whole fleet and not just the embedded worker. The two
-# directories below were declared without the one that makes them useful.
+# recreate orphaned the whole fleet and not just the embedded worker. The
+# worker directory below was declared without the one that makes it useful.
 #
 # Declaring them means `docker compose up` carries them across a recreate even
 # for a compose file that mounts none of them. That is not universal, though:
@@ -221,7 +220,7 @@ COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
 # fresh anonymous volumes, and the embedded worker then enrolls as a new machine
 # every single time. A deployment that updates regularly should mount named
 # volumes here explicitly rather than trusting the anonymous ones to survive.
-VOLUME ["/app/data", "/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
+VOLUME ["/app/data", "/var/lib/aurcache-worker"]
 
 WORKDIR /app
 CMD ["/usr/local/bin/hybrid-entrypoint"]

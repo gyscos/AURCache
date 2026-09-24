@@ -149,8 +149,8 @@ pub struct WorkerRunSpec {
     /// Whether to join the local docker network, which is how a worker beside
     /// the server reaches it by container name.
     pub join_network: bool,
+    /// Holds the identity and the storage pool, caches included.
     pub data_volume: String,
-    pub cache_volume: String,
     /// Extra `docker run` arguments, placed before the image.
     pub extra: Vec<String>,
 }
@@ -164,7 +164,6 @@ pub fn worker_run(spec: &WorkerRunSpec) -> DockerRun {
         log_level,
         join_network,
         data_volume,
-        cache_volume,
         extra,
     } = spec;
 
@@ -194,8 +193,6 @@ pub fn worker_run(spec: &WorkerRunSpec) -> DockerRun {
 
     args.push("-v".into());
     args.push(format!("{data_volume}:/var/lib/aurcache-worker"));
-    args.push("-v".into());
-    args.push(format!("{cache_volume}:/var/cache/aurcache-worker"));
     if env.enrollment_dir.is_some() {
         args.push("-v".into());
         args.push(format!("{ENROLL_VOLUME}:{ENROLLMENT_DIR}"));
@@ -316,7 +313,7 @@ mod tests {
         run.args.join(" ")
     }
 
-    fn spec(env: WorkerEnv, join_network: bool, data: &str, cache: &str) -> WorkerRunSpec {
+    fn spec(env: WorkerEnv, join_network: bool, data: &str) -> WorkerRunSpec {
         WorkerRunSpec {
             image: "img".to_string(),
             container_name: "w".to_string(),
@@ -324,7 +321,6 @@ mod tests {
             log_level: "info".to_string(),
             join_network,
             data_volume: data.to_string(),
-            cache_volume: cache.to_string(),
             extra: Vec::new(),
         }
     }
@@ -382,7 +378,7 @@ mod tests {
     /// Not optional: a chroot build needs namespaces a plain container forbids.
     #[test]
     fn a_worker_is_always_privileged_with_a_tmpfs_run() {
-        let run = worker_run(&spec(WorkerEnv::default(), false, "d", "c"));
+        let run = worker_run(&spec(WorkerEnv::default(), false, "d"));
         let args = args_of(&run);
         assert!(args.contains("--privileged"), "{args}");
         assert!(args.contains("--tmpfs /run"), "{args}");
@@ -392,13 +388,11 @@ mod tests {
     /// which is indistinguishable from nobody having approved it.
     #[test]
     fn a_worker_always_persists_its_identity() {
-        let run = worker_run(&spec(WorkerEnv::default(), false, "mydata", "mycache"));
+        let run = worker_run(&spec(WorkerEnv::default(), false, "mydata"));
         let args = args_of(&run);
         assert!(args.contains("mydata:/var/lib/aurcache-worker"), "{args}");
-        assert!(
-            args.contains("mycache:/var/cache/aurcache-worker"),
-            "{args}"
-        );
+        // The caches live in the storage pool, inside that volume.
+        assert!(!args.contains("/var/cache/aurcache-worker"), "{args}");
     }
 
     /// The local pair reproduces the bundle: shared network, shared volume, no
@@ -406,7 +400,7 @@ mod tests {
     #[test]
     fn a_local_worker_joins_the_network_and_shares_the_enrollment_volume() {
         let env = local_worker_env(WorkerEnv::default());
-        let run = worker_run(&spec(env, true, "d", "c"));
+        let run = worker_run(&spec(env, true, "d"));
         let args = args_of(&run);
         assert!(args.contains(&format!("--network {NETWORK}")), "{args}");
         assert!(args.contains(&format!("{ENROLL_VOLUME}:/enroll")), "{args}");
@@ -422,7 +416,7 @@ mod tests {
     #[test]
     fn a_remote_worker_gets_no_enrollment_volume() {
         let env = remote_worker_env(WorkerEnv::default(), "https://build.example.com:8083");
-        let run = worker_run(&spec(env, false, "d", "c"));
+        let run = worker_run(&spec(env, false, "d"));
         let args = args_of(&run);
         assert!(!args.contains(ENROLL_VOLUME), "{args}");
         assert!(!args.contains("AURCACHE_ENROLLMENT_DIR"), "{args}");
@@ -441,7 +435,7 @@ mod tests {
             },
             "https://build.example.com:8083",
         );
-        let run = worker_run(&spec(env, false, "d", "c"));
+        let run = worker_run(&spec(env, false, "d"));
         assert!(args_of(&run).contains("AURCACHE_SERVER_CA_FINGERPRINT=abc"));
     }
 

@@ -583,8 +583,7 @@ fn worker_service(params: &ComposeParams) -> String {
         );
     }
     out.push_str(
-        "      - worker_data:/var/lib/aurcache-worker   # persisted base chroot\n\
-         \x20     - worker_cache:/var/cache/aurcache-worker\n",
+        "      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)\n",
     );
 
     out.push_str(
@@ -619,7 +618,7 @@ fn volumes(params: &ComposeParams) -> String {
         out.push_str("  enroll:\n");
     }
     if role.has_worker() {
-        out.push_str("  worker_data:\n  worker_cache:\n");
+        out.push_str("  worker_data:\n");
     }
     out
 }

@@ -301,3 +301,40 @@ async fn the_image_follows_the_total_both_ways() {
     );
     pool.unmount().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_cache_subvolume_counts_against_the_total() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("cache");
+    let pool = Pool::open(config(&scratch, 600 * MIB)).await.unwrap();
+    for bad in ["", "root", "job-3", "../escape", "a/b", "Cache"] {
+        assert!(
+            pool.ensure_subvolume(bad, owner(), 0o2775).await.is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    let cache = pool
+        .ensure_subvolume("cache", owner(), 0o2775)
+        .await
+        .unwrap();
+    let again = pool
+        .ensure_subvolume("cache", owner(), 0o2775)
+        .await
+        .unwrap();
+    assert_eq!(cache, again, "made once, found after");
+    let before = pool.total_usage().unwrap().used;
+    assert!(
+        write(&cache.join("src"), 64 * MIB).is_none(),
+        "the owner writes there"
+    );
+    sync(&pool);
+    assert!(
+        pool.total_usage().unwrap().used >= before + 60 * MIB,
+        "the cache counts against the total"
+    );
+    let refused = write(&cache.join("more"), 700 * MIB);
+    assert!(refused.is_some(), "and is bounded by it");
+    pool.unmount().await.unwrap();
+}

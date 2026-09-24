@@ -21,4 +21,3 @@ d /var/lib/aurcache-worker       0755 aurcache aurcache -
 d /var/lib/aurcache-worker/secrets 0700 aurcache aurcache -
 d /var/lib/aurcache-worker/work  2775 builder  aurbuild -
 d /var/lib/aurcache-worker/chroot 0755 aurcache aurcache -
-d /var/cache/aurcache-worker     2775 builder  aurbuild -

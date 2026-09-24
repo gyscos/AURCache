@@ -287,6 +287,56 @@ impl Pool {
         (rc == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
     }
 
+    /// A long-lived subvolume at the pool's top, `name`, counted against the
+    /// pool's total: the caches, which outlive any one build. Made the first
+    /// time with `owner` and `mode`, and left as it is after that.
+    ///
+    /// `name` is one path component, never a path: what the pool holds and
+    /// where is the pool's to decide.
+    pub async fn ensure_subvolume(
+        &self,
+        name: &str,
+        owner: (u32, u32),
+        mode: u32,
+    ) -> Result<PathBuf> {
+        if name.is_empty()
+            || name == ROOT
+            || build_of(name).is_some()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            bail!("{name:?} is not a name the pool gives a subvolume");
+        }
+        let path = self.mountpoint.join(name);
+        if path.exists() {
+            return Ok(path);
+        }
+        self.btrfs_paths(&["subvolume", "create"], &[&path]).await?;
+        let made = async {
+            privileged(&[
+                "chown".as_ref(),
+                format!("{}:{}", owner.0, owner.1).as_ref(),
+                path.as_os_str(),
+            ])
+            .await?;
+            privileged(&[
+                "chmod".as_ref(),
+                format!("{mode:o}").as_ref(),
+                path.as_os_str(),
+            ])
+            .await?;
+            self.charge_to_total(&path).await
+        };
+        if let Err(e) = made.await {
+            // Never leave one behind that is not counted: the next start would
+            // find it and take it as it is.
+            let _ = self.btrfs_paths(&["subvolume", "delete"], &[&path]).await;
+            return Err(e).with_context(|| format!("preparing {}", path.display()));
+        }
+        Ok(path)
+    }
+
     /// Count the subvolume at `path` against the pool's total. What
     /// `mkarchroot` creates, and anything else made outside [`Self::lease`],
     /// is charged to its own level-0 group and nothing above it until this.

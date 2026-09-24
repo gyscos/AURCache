@@ -31,6 +31,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
     let chroots = Chroots::new(
         cfg.pool_config(),
         std::time::Duration::from_secs(cfg.chroot_refresh_interval),
+        cfg.cache_owner(),
     );
     if !chroots.open().await {
         bail!("the storage pool could not be opened; see the log above");

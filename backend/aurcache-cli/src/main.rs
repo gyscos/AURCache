@@ -311,14 +311,11 @@ struct SetupWorkerArgs {
     #[arg(long, default_value = setup::WORKER_CONTAINER)]
     container_name: String,
 
-    /// Volume holding the worker's identity and base chroot. Each worker on a
-    /// host needs its own, or they fight over one identity.
+    /// Volume holding the worker's identity and its storage pool: the base
+    /// chroot, the builds and the caches. Each worker on a host needs its own,
+    /// or they fight over one identity.
     #[arg(long)]
     data_volume: Option<String>,
-
-    /// Volume holding the package cache.
-    #[arg(long)]
-    cache_volume: Option<String>,
 
     /// Extra arguments passed to `docker run`, before the image.
     #[arg(last = true)]
@@ -1012,9 +1009,6 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
     let data_volume = args
         .data_volume
         .unwrap_or_else(|| format!("{}_data", args.container_name.replace('-', "_")));
-    let cache_volume = args
-        .cache_volume
-        .unwrap_or_else(|| format!("{}_cache", args.container_name.replace('-', "_")));
 
     let run = setup::worker_run(&setup::WorkerRunSpec {
         image,
@@ -1023,7 +1017,6 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
         log_level: args.common.log_level,
         join_network: local,
         data_volume,
-        cache_volume,
         extra: args.docker_args,
     });
 

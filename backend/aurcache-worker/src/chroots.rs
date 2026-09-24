@@ -37,6 +37,8 @@ pub const ONE_SHOT_BUILD_ID: i32 = i32::MAX;
 /// The chroots on this worker: one base, and a snapshot per build.
 pub struct Chroots {
     config: std::sync::Mutex<PoolConfig>,
+    /// Owner of the cache subvolume made when the pool opens.
+    cache_owner: (u32, u32),
     pool: RwLock<Option<Pool>>,
     /// When opening the pool last failed, so retries are spaced out.
     last_failure: std::sync::Mutex<Option<Instant>>,
@@ -58,9 +60,10 @@ impl Chroots {
     /// [`Self::open`], so a pool that cannot be opened yet costs a worker its
     /// builds, not its ability to start and say why.
     #[must_use]
-    pub fn new(config: PoolConfig, interval: Duration) -> Self {
+    pub fn new(config: PoolConfig, interval: Duration, cache_owner: (u32, u32)) -> Self {
         Self {
             config: std::sync::Mutex::new(config),
+            cache_owner,
             pool: RwLock::new(None),
             last_failure: std::sync::Mutex::new(None),
             last_refresh: Mutex::new(None),
@@ -89,7 +92,17 @@ impl Chroots {
             }
         }
         let config = self.config.lock().expect("not poisoned").clone();
-        match Pool::open(config).await {
+        let opened = async {
+            let pool = Pool::open(config).await?;
+            // The caches outlive every build, and a build writes into two of
+            // them (its sources and its kept tree), so they are in the pool
+            // too, under its total. Mode as the package's tmpfiles made the
+            // cache directory: group-writable, the group inherited.
+            pool.ensure_subvolume(crate::config::CACHE_SUBVOLUME, self.cache_owner, 0o2775)
+                .await?;
+            anyhow::Ok(pool)
+        };
+        match opened.await {
             Ok(opened) => {
                 tracing::info!(
                     "storage pool mounted at {}{}",

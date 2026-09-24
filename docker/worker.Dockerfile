@@ -200,16 +200,16 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
 # The same locations the package's tmpfiles declaration creates. A container
 # has no systemd unit to carry them, so they are set here instead.
 ENV WORKER_DATA_DIR=/var/lib/aurcache-worker \
-    WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot \
-    WORKER_CACHE_DIR=/var/cache/aurcache-worker
+    WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot
 
-# Persist the identity, the base chroot and the caches even when the worker is
+# Persist the identity and the storage pool -- base chroot, builds and caches,
+# all in one image under the chroot directory -- even when the worker is
 # started with a bare `docker run` and no `-v`. Without this they sit in the
 # container's writable layer, so recreating the container (an image bump, a
 # config edit) re-enrolls the worker as a new, unapproved machine and rebuilds
 # the base chroot from nothing. `docker run` fills these with anonymous volumes;
 # a compose file or `-v` still overrides them with named ones.
-VOLUME ["/var/lib/aurcache-worker", "/var/cache/aurcache-worker"]
+VOLUME ["/var/lib/aurcache-worker"]
 
 # Wrapper so devtools' systemd-nspawn works without a systemd manager (see
 # script). Container-only: a real host has a manager and needs none of this.

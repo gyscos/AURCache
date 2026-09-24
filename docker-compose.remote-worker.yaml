@@ -53,7 +53,6 @@ services:
       # - WORKER_NAME=arm-box
     volumes:
       - worker_data:/var/lib/aurcache-worker   # persisted base chroot
-      - worker_cache:/var/cache/aurcache-worker
     privileged: true
     tmpfs:
       - /run
@@ -61,4 +60,3 @@ services:
 
 volumes:
   worker_data:
-  worker_cache:

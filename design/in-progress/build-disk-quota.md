@@ -12,8 +12,12 @@ Done so far: the server-side parse writes nothing; the `aurcache-chroot` crate
 total; grow and online shrink; sweep); the worker builds in pool snapshots with
 `WORKER_BUILD_DISK_MAX`/`WORKER_DISK_MAX`, reports a quota failure, and stops
 claiming while a sparse image's host lacks room; the overlay and copy
-strategies are gone. Not yet: the caches in the pool (the second phase below),
-the drain-and-recreate fallback when an image cannot shrink online, and
+strategies are gone. The caches live in one `cache` subvolume in the pool,
+under the total (`WORKER_CACHE_DIR` and the separate cache volume are gone).
+Not yet: a subvolume per pkgbase for SRCDEST and kept trees (instant eviction,
+measuring by qgroup), the caches' budgets as hard qgroup limits (a behaviour
+change: a large legitimate source would fail its build rather than be evicted
+later), the drain-and-recreate fallback when an image cannot shrink online, and
 reporting disk usage beside peak memory.
 
 ---

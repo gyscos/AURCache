@@ -115,8 +115,7 @@ services:
       # - WORKER_ARCHES=x86_64
     volumes:
       - enroll:/enroll                # writable: drop CSR for auto-enrollment
-      - worker_data:/var/lib/aurcache-worker   # persisted base chroot
-      - worker_cache:/var/cache/aurcache-worker
+      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)
     # devtools builds each package in a systemd-nspawn chroot, which needs the
     # namespaces/mounts a plain container forbids. `privileged` + a tmpfs `/run`
     # is the tightest config that works out of the box. If your host lets you,
@@ -169,7 +168,6 @@ services:
     volumes:
       - enroll:/enroll
       - worker_data_arm:/var/lib/aurcache-worker
-      - worker_cache_arm:/var/cache/aurcache-worker
     privileged: true
     tmpfs:
       - /run
@@ -181,9 +179,7 @@ volumes:
   aurcache_data:
   enroll:
   worker_data:
-  worker_cache:
   worker_data_arm:
-  worker_cache_arm:
 
 networks:
   aurcache:

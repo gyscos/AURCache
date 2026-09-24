@@ -21,7 +21,6 @@ EnvironmentFile=/etc/aurcache/worker.env
 
 Environment=WORKER_DATA_DIR=/var/lib/aurcache-worker
 Environment=WORKER_CHROOT_DIR=/var/lib/aurcache-worker/chroot
-Environment=WORKER_CACHE_DIR=/var/cache/aurcache-worker
 
 # Deliberately NOT hardened the way the server is, and this is not an oversight.
 #

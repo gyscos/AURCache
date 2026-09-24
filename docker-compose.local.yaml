@@ -65,7 +65,6 @@ services:
     volumes:
       - enroll:/enroll           # writable: the CSR it drops here is its enrollment
       - worker_data:/var/lib/aurcache-worker   # persisted base chroot
-      - worker_cache:/var/cache/aurcache-worker
     # devtools builds each package in a systemd-nspawn chroot, which needs
     # namespaces and mounts a plain container forbids.
     privileged: true
@@ -81,7 +80,6 @@ volumes:
   ca:
   enroll:
   worker_data:
-  worker_cache:
 
 networks:
   aurcache:

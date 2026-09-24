@@ -181,7 +181,14 @@ leaving each build to re-download its dependencies.
 | `WORKER_CACHE_TTL` | Duration | Evict sources unused for this long (`0` disables) | `30d` |
 | `WORKER_PKGCACHE_TTL` | Duration | Evict packages older than this (`0` disables) | `0` |
 | `WORKER_BUILDDIR_MAX_BYTES` | Size | Budget for kept build trees, for packages with a persistent build directory | `200G` |
-| `WORKER_BUILDDIR_MIN_FREE` | Size | Free space to keep on the filesystem holding kept build trees | `50G` |
+| `WORKER_BUILDDIR_MIN_FREE` | Size | Free space to keep in the storage pool when deciding whether to drop kept build trees | `50G` |
+
+The caches live in the worker's [storage pool](#disk-quota-and-the-storage-pool),
+in a `cache` subvolume beside the chroots, so they count against
+`WORKER_DISK_MAX` together with the base chroot and the running builds. The
+budgets here are what eviction keeps them to between builds; leave room under
+`WORKER_DISK_MAX` for at least one build's `WORKER_BUILD_DISK_MAX` on top of
+them, or a build may find the pool full before its own quota is reached.
 
 Sizes are read the way coreutils reads them: a plain number is bytes, a bare
 unit or an `iB` unit is binary, and a `B` unit is decimal -- `450G` and
@@ -274,7 +281,6 @@ AURCache.
 |---|---|---|---|
 | `WORKER_DATA_DIR` | Path | Worker identity, credentials, chroots | `/var/lib/aurcache-worker` |
 | `WORKER_CHROOT_DIR` | Path | Where the storage pool's image and mount point go (see below) | `<data dir>/chroot` |
-| `WORKER_CACHE_DIR` | Path | Source and package caches | `/var/cache/aurcache-worker` |
 | `WORKER_CHROOT_REFRESH_INTERVAL` | Duration | How long a `pacman -Syu`'d base chroot counts as current (`0` refreshes before every build) | `15m` |
 
 The base chroot is brought up to date with `pacman -Syu` before a build, but
@@ -386,8 +392,8 @@ than its device.
 
 Builds are the bulk of a worker's disk use, and some packages are extravagant:
 `unreal-engine` needs around 300&nbsp;GB live. `WORKER_CHROOT_DIR` moves the
-pool's image somewhere with room, leaving the small stuff (`WORKER_CACHE_DIR`
-is usually a few GB) where it is.
+pool's image -- and with it everything the worker stores apart from its
+identity -- somewhere with room.
 
 Because the chroots live inside the pool's own btrfs filesystem, what the image
 sits on only has to store a large file. A base chroot contains setuid binaries,

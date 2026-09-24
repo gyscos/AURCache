@@ -143,9 +143,14 @@ Directories, with ownership that matters for the same reason:
 /var/lib/aurcache-worker           aurcache  worker state
 /var/lib/aurcache-worker/secrets   aurcache  0700, build credentials
 /var/lib/aurcache-worker/work      builder   2775, shared to the worker by group
-/var/lib/aurcache-worker/chroot    aurcache  the shared base chroot
-/var/cache/aurcache-worker         builder   2775, source and package caches
+/var/lib/aurcache-worker/chroot    aurcache  the storage pool: its image and mount point
 ```
+
+Everything that grows -- the base chroot, each build, the source and package
+caches -- lives in the storage pool, a btrfs filesystem the worker creates in
+`chroot/pool.img` and mounts at `chroot/pool`, with a disk quota per build and
+one over the whole worker. See the worker configuration's section on disk
+quota.
 
 ### Why the worker's unit is not hardened
 

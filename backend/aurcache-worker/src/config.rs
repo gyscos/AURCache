@@ -32,7 +32,9 @@ pub struct Config {
     pub pool_backing: aurcache_chroot::Backing,
     /// Where the pool is mounted.
     pub pool_mountpoint: PathBuf,
-    /// Directory holding worker-local caches (srcdest, gnupg, pacman pkg).
+    /// Directory holding worker-local caches (srcdest, gnupg, pacman pkg): a
+    /// subvolume in the storage pool, so the caches count against
+    /// `WORKER_DISK_MAX` with everything else the worker stores.
     pub cache_dir: PathBuf,
     /// Keyserver for `gpg --recv-keys`.
     pub keyserver: String,
@@ -114,9 +116,8 @@ impl Config {
                 .map(|raw| crate::credentials::parse_bind_mounts(&raw))
                 .unwrap_or_default(),
             chroot_dir: chroot_dir.clone(),
-            cache_dir: env_opt("WORKER_CACHE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/var/cache/aurcache-worker")),
+            cache_dir: pool_mountpoint(env_opt("WORKER_POOL").map(PathBuf::from), &chroot_dir)
+                .join(CACHE_SUBVOLUME),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
             pool_backing: pool_backing(
                 env_opt("WORKER_POOL").map(PathBuf::from),
@@ -141,6 +142,12 @@ impl Config {
             disk_max: 0,
             core,
         };
+        if env_opt("WORKER_CACHE_DIR").is_some() {
+            tracing::warn!(
+                "WORKER_CACHE_DIR is no longer used: the caches live in the storage pool, at {}",
+                cfg.cache_dir.display()
+            );
+        }
         if env_opt("WORKER_CHROOT_OVERLAY").is_some() {
             tracing::warn!(
                 "WORKER_CHROOT_OVERLAY is no longer used: every chroot is a snapshot in the \
@@ -149,6 +156,17 @@ impl Config {
         }
         cfg.read_settings();
         cfg
+    }
+
+    /// Who owns the cache subvolume: the build user and its group, as the
+    /// package's tmpfiles declaration made the cache directory. Builds write
+    /// sources into it as that user, and the worker through the group.
+    #[must_use]
+    pub fn cache_owner(&self) -> (u32, u32) {
+        user_ids(&self.build_user).unwrap_or_else(|| {
+            // SAFETY: neither call has preconditions or can fail.
+            unsafe { (libc::getuid(), libc::getgid()) }
+        })
     }
 
     /// How to open the storage pool, with the current total.
@@ -248,6 +266,29 @@ fn pool_mountpoint(pool: Option<PathBuf>, chroot_dir: &Path) -> PathBuf {
         Some(path) if path.is_dir() => path,
         _ => chroot_dir.join("pool"),
     }
+}
+
+/// The subvolume the caches live in, at the pool's top.
+pub const CACHE_SUBVOLUME: &str = "cache";
+
+/// A user's uid and primary gid.
+fn user_ids(name: &str) -> Option<(u32, u32)> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call, `buf` outlives it, and
+    // `result` is only read after it returns.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &raw mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &raw mut result,
+        )
+    };
+    (rc == 0 && !result.is_null()).then_some((pwd.pw_uid, pwd.pw_gid))
 }
 
 fn truthy(value: &str) -> bool {
@@ -401,6 +442,12 @@ mod tests {
             pool_mountpoint(Some(mount.path().to_path_buf()), chroot),
             mount.path()
         );
+    }
+
+    #[test]
+    fn a_users_ids_are_looked_up_by_name() {
+        assert_eq!(user_ids("root"), Some((0, 0)));
+        assert_eq!(user_ids("no-such-user-aurcache-test"), None);
     }
 
     #[test]
