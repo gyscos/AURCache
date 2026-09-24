@@ -43,6 +43,17 @@ pub fn Dashboard() -> Element {
     crate::poll::use_poll(graph, false);
     crate::poll::use_poll(dashboard, false);
 
+    // The warnings sit beside the chart at the top rather than buried in the
+    // grid below: both load on their own requests, so neither moves the other
+    // when it lands, and the wide-short chart never needed the full width.
+    let problems = match &*dashboard.read_unchecked() {
+        None => rsx! { SkeletonCard { title: "Recent problems" } },
+        Some(Err(_)) => rsx! { SectionError { section: "recent problems" } },
+        Some(Ok(view)) => rsx! {
+            RecentProblemsCard { problems: view.problems.clone() }
+        },
+    };
+
     rsx! {
         div { class: "space-y-4",
             match &*stats.read_unchecked() {
@@ -59,41 +70,44 @@ pub fn Dashboard() -> Element {
                 },
             }
 
-            div { class: "card bg-base-100 shadow-xl",
-                div { class: "card-body",
-                    div { class: "flex items-baseline gap-4 flex-wrap",
-                h2 { class: "card-title text-base", "Builds per month" }
-                div { class: "flex items-center gap-3 text-xs opacity-70",
-                    span { class: "flex items-center gap-1",
-                        span { class: "inline-block w-3 h-0.5 bg-primary" }
-                        "started"
-                    }
-                    span { class: "flex items-center gap-1",
-                        span { class: "inline-block w-3 h-0.5 bg-success" }
-                        "succeeded"
-                    }
-                }
-            }
-                    match &*graph.read_unchecked() {
-                        None => rsx! {
-                            div { class: "flex justify-center p-8",
-                                span { class: "loading loading-spinner loading-lg" }
+            div { class: "grid gap-4 lg:grid-cols-2 items-start",
+                div { class: "card bg-base-100 shadow-xl",
+                    div { class: "card-body",
+                        div { class: "flex items-baseline gap-4 flex-wrap",
+                            h2 { class: "card-title text-base", "Builds per month" }
+                            div { class: "flex items-center gap-3 text-xs opacity-70",
+                                span { class: "flex items-center gap-1",
+                                    span { class: "inline-block w-3 h-0.5 bg-primary" }
+                                    "started"
+                                }
+                                span { class: "flex items-center gap-1",
+                                    span { class: "inline-block w-3 h-0.5 bg-success" }
+                                    "succeeded"
+                                }
                             }
-                        },
-                        Some(Err(e)) => rsx! {
-                            div { class: "alert alert-error", span { "Could not load the graph: {e}" } }
-                        },
-                        Some(Ok(points)) => rsx! {
-                            BuildsChart { points: points.clone() }
-                        },
+                        }
+                        match &*graph.read_unchecked() {
+                            None => rsx! {
+                                div { class: "flex justify-center p-8",
+                                    span { class: "loading loading-spinner loading-lg" }
+                                }
+                            },
+                            Some(Err(e)) => rsx! {
+                                div { class: "alert alert-error", span { "Could not load the graph: {e}" } }
+                            },
+                            Some(Ok(points)) => rsx! {
+                                BuildsChart { points: points.clone() }
+                            },
+                        }
                     }
                 }
+                {problems}
             }
 
             match &*dashboard.read_unchecked() {
                 // Skeletons in the cards' full shape, so the page does not
-                // jump when the first response lands; the chart above loads
-                // on its own request, so nothing above them moves.
+                // jump when the first response lands. The problems card
+                // skeleton sits beside the chart above, with its card.
                 None => rsx! {
                     DashboardGrid {
                         left_top: rsx! { SkeletonCard { title: "Recent packages" } },
@@ -101,7 +115,6 @@ pub fn Dashboard() -> Element {
                         left_attention: rsx! { SkeletonCard { title: "Failed packages" } },
                         right_attention: rsx! { SkeletonCard { title: "Out of date" } },
                         left_doing: rsx! { SkeletonCard { title: "Stuck queue" } },
-                        right_doing: rsx! { SkeletonCard { title: "Recent problems" } },
                         left_slow: rsx! { SkeletonCard { title: "Largest packages" } },
                         right_slow: rsx! { SkeletonCard { title: "Longest builds" } },
                     }
@@ -127,9 +140,6 @@ pub fn Dashboard() -> Element {
                         },
                         left_doing: rsx! {
                             StuckQueueCard { queue: view.queue.clone() }
-                        },
-                        right_doing: rsx! {
-                            RecentProblemsCard { problems: view.problems.clone() }
                         },
                         left_slow: rsx! {
                             LargestPackagesCard { packages: view.largest.clone() }
@@ -270,7 +280,7 @@ fn RecentPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
@@ -310,7 +320,7 @@ fn RecentBuildsCard(builds: Option<Vec<Build>>) -> Element {
                 for build in builds {
                     Link {
                         key: "{build.pkg_name} #{build.number}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Build {
                             pkgbase: build.pkg_name.clone(),
                             number: build.number,
@@ -349,7 +359,7 @@ fn FailedPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
@@ -385,7 +395,7 @@ fn OutOfDateCard(slice: Option<OutOfDateSlice>) -> Element {
                 for pkg in slice.needs_hand {
                     Link {
                         key: "{pkg.id}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
@@ -423,7 +433,7 @@ fn StuckQueueCard(queue: Option<QueueSlice>) -> Element {
                 for build in queue.oldest {
                     Link {
                         key: "{build.pkg_name} #{build.number}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Build {
                             pkgbase: build.pkg_name.clone(),
                             number: build.number,
@@ -519,7 +529,7 @@ fn LargestPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
                 for pkg in packages {
                     Link {
                         key: "{pkg.id}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 shrink-0",
@@ -561,7 +571,7 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
                 for item in builds {
                     Link {
                         key: "{item.build.pkg_name} #{item.build.number}",
-                        class: "py-2 flex justify-between items-center gap-2",
+                        class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Build {
                             pkgbase: item.build.pkg_name.clone(),
                             number: item.build.number,
@@ -606,7 +616,8 @@ fn format_duration_secs_raw(secs: i64) -> String {
 ///
 /// Each column is its own vertical stack, so a collapsed one-line card pulls
 /// the card below it up instead of leaving its row's height behind, as paired
-/// rows did.
+/// rows did. The warnings card is not one of them: it sits beside the chart
+/// at the top.
 #[component]
 fn DashboardGrid(
     left_top: Element,
@@ -614,7 +625,6 @@ fn DashboardGrid(
     left_attention: Element,
     right_attention: Element,
     left_doing: Element,
-    right_doing: Element,
     left_slow: Element,
     right_slow: Element,
 ) -> Element {
@@ -629,7 +639,6 @@ fn DashboardGrid(
             div { class: "space-y-4 min-w-0",
                 {right_top}
                 {right_attention}
-                {right_doing}
                 {right_slow}
             }
         }
@@ -1008,7 +1017,6 @@ mod tests {
                 left_attention: rsx! { span { "left-attention" } },
                 right_attention: rsx! { span { "right-attention" } },
                 left_doing: rsx! { span { "left-doing" } },
-                right_doing: rsx! { span { "right-doing" } },
                 left_slow: rsx! { span { "left-slow" } },
                 right_slow: rsx! { span { "right-slow" } },
             },
@@ -1025,7 +1033,6 @@ mod tests {
             "left-slow",
             "right-top",
             "right-attention",
-            "right-doing",
             "right-slow",
         ]
         .iter()

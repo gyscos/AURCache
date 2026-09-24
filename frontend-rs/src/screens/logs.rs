@@ -326,15 +326,12 @@ pub fn RecentActivity(about: EntityRef) -> Element {
     rsx! {
         div { class: "card bg-base-100 shadow-xl",
             div { class: "card-body",
-                div { class: "flex items-baseline justify-between gap-2",
-                    h2 { class: "card-title text-base", "Activity" }
-                    Link {
-                        class: "link link-primary text-sm",
-                        to: Route::Logs {
-                            view: ViewParams::about(about),
-                        },
-                        "See all"
-                    }
+                Link {
+                    class: "card-title text-base link-hover w-fit",
+                    to: Route::Logs {
+                        view: ViewParams::about(about),
+                    },
+                    "Activity"
                 }
                 match &*entries.read_unchecked() {
                     None => rsx! {
@@ -845,6 +842,7 @@ fn actor(user: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{LogTable, actor, entities_of, entity_route, suggest};
+    use crate::listing::ViewParams;
     use crate::routes::Route;
     use aurcache_client::{BuildRef, EntityRef, Event, LogEntry, PackageRef, WorkerRef};
     use dioxus::prelude::*;
@@ -1030,5 +1028,23 @@ mod tests {
                 number: 7
             }
         );
+    }
+
+    /// The Activity card's title links to the log narrowed to this page's
+    /// subject. The mapping SSR cannot render (links need a router) but the
+    /// browser suite navigates.
+    #[test]
+    fn the_activity_title_links_to_the_filtered_log() {
+        let pkg = Route::Logs {
+            view: ViewParams::about(PackageRef::from("hello")),
+        }
+        .to_string();
+        assert!(pkg.contains("e=pkg:hello"), "{pkg}");
+
+        let worker = Route::Logs {
+            view: ViewParams::about(WorkerRef::from("builder-01")),
+        }
+        .to_string();
+        assert!(worker.contains("e=worker:builder-01"), "{worker}");
     }
 }
