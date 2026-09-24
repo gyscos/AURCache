@@ -52,6 +52,15 @@ async fn test_client() -> (Client, DatabaseConnection) {
             )),
             ActivityLog::discarding(),
         ))
+        // The dump route reports which AURCache wrote a dump. Rocket's
+        // sentinels refuse to launch without it, which is the point: a route
+        // needing unmanaged state would otherwise 500 in production.
+        .manage(aurcache_api::init::ServerVersion("test".to_string()))
+        // Dump and restore both move the CA's files, so both need to know
+        // where they are. Rocket's sentinels refuse to launch without it.
+        .manage(aurcache_api::init::CaDirectory(std::path::PathBuf::from(
+            "/nonexistent-ca-dir",
+        )))
         .mount("/api", aurcache_api::backend::build_api())
         .mount("/", aurcache_api::embed::CustomHandler);
     std::mem::forget(checkouts);
