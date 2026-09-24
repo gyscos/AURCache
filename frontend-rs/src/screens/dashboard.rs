@@ -3,7 +3,7 @@
 use super::logs::EntryText;
 use crate::dates::AbsoluteDate;
 use crate::format::{format_bytes, format_secs};
-use crate::listing::ViewParams;
+use crate::listing::{SortDir, SortKey, ViewParams};
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
 use aurcache_client::{
@@ -551,12 +551,18 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
         return rsx! {
             Card {
                 title: longest_title(),
-                to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                to: Route::Builds {
+                    view: ViewParams::with_sort(SortKey::Duration, SortDir::Desc),
+                    q: String::new(),
+                },
                 div {
                     "No successful builds yet. "
                     Link {
                         class: "link link-primary",
-                        to: Route::Builds { view: ViewParams::default(), q: String::new() },
+                        to: Route::Builds {
+                            view: ViewParams::with_sort(SortKey::Duration, SortDir::Desc),
+                            q: String::new(),
+                        },
                         "View builds →"
                     }
                 }
@@ -566,7 +572,10 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
     rsx! {
         Card {
             title: longest_title(),
-            to: Route::Builds { view: ViewParams::default(), q: String::new() },
+            to: Route::Builds {
+                view: ViewParams::with_sort(SortKey::Duration, SortDir::Desc),
+                q: String::new(),
+            },
             div { class: "divide-y divide-base-300",
                 for item in builds {
                     Link {
@@ -823,7 +832,8 @@ fn month_label(month: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Build, BuildState, LONGEST_WINDOW_DAYS, OutOfDateSlice, QueueSlice, Severity, ViewParams,
+        Build, BuildState, LONGEST_WINDOW_DAYS, OutOfDateSlice, QueueSlice, Severity, SortDir,
+        SortKey, ViewParams,
     };
     use super::{
         DashboardGrid, DashboardGridProps, FailedPackagesCard, FailedPackagesCardProps,
@@ -1152,6 +1162,13 @@ mod tests {
         }
         .to_string();
         assert!(problems.contains("v=warning"), "{problems}");
+
+        let longest = Route::Builds {
+            view: ViewParams::with_sort(SortKey::Duration, SortDir::Desc),
+            q: String::new(),
+        }
+        .to_string();
+        assert!(longest.contains("o=duration-desc"), "{longest}");
 
         // Unfiltered cards link to the plain lists.
         let plain = Route::Packages {

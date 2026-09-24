@@ -1745,6 +1745,15 @@ impl ViewParams {
             ..Self::default()
         }
     }
+
+    /// A view sorted by this column and nothing else, for links into a list.
+    #[must_use]
+    pub fn with_sort(key: SortKey, dir: SortDir) -> Self {
+        Self {
+            sort: Some(Sort { key, dir }),
+            ..Self::default()
+        }
+    }
 }
 
 impl std::fmt::Display for ViewParams {
