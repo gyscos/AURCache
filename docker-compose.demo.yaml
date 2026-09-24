@@ -99,6 +99,11 @@ services:
       # Must match a SAN in AURCACHE_TLS_SANS above.
       - AURCACHE_URL=https://aurcache:8083
       - AURCACHE_ENROLLMENT_DIR=/enroll
+      - WORKER_NAME=dummy
+      # Pinned (not _DEFAULT, which the server could override): the dummy
+      # worker is I/O-free, so four concurrent fake builds drain the demo
+      # queue quickly.
+      - WORKER_CONCURRENCY=4
       # Seconds each fake build appears to take: long enough to watch a build
       # move through the queue UI, short enough that dependency fan-out stays
       # lively.
