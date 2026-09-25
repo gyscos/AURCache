@@ -387,11 +387,16 @@ the pool again, empty, at the new size: its caches start cold and the base
 chroot is rebuilt by the next build. Its identity lives outside the pool, so it
 stays enrolled. It logs each step.
 
-A device is the operator's to resize. Its btrfs filesystem can be shrunk online
-first (`btrfs filesystem resize <size> <pool>`), and then the device -- a zvol
-with `zfs set volsize=`. **Never shrink the device first**: ZFS discards
-whatever lies past the new end, and btrfs refuses to mount a filesystem larger
-than its device.
+On a block device or an existing mount, the worker fits the btrfs filesystem
+to the total, online: it shrinks it when `WORKER_DISK_MAX` comes down, and grows
+it back -- as far as the device goes -- when it goes up. It never touches the
+device itself, and never empties it: when what the pool holds does not fit, the
+filesystem keeps its size, the worker logs an error, and the total still
+binds. After a shrink it logs the smallest size the device can safely go down
+to; resizing the device -- a zvol with `zfs set volsize=`, a partition -- is
+then yours. **Never shrink the device below that size, or before the
+filesystem**: ZFS discards whatever lies past the new end, and btrfs refuses to
+mount a filesystem larger than its device.
 
 ### Putting the pool on other storage
 

@@ -468,3 +468,76 @@ async fn cache_entries_are_subvolumes_measured_and_removed_by_btrfs() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     pool.unmount().await.unwrap();
 }
+
+/// Bytes the pool's filesystem uses of its device.
+fn fs_size(pool: &Pool) -> u64 {
+    let out = sudo(&[
+        "btrfs",
+        "filesystem",
+        "show",
+        "--raw",
+        pool.path().to_str().unwrap(),
+    ]);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.first() == Some(&"devid")).then(|| f[3].parse().unwrap())
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_device_pool_is_formatted_built_on_and_its_filesystem_fitted_to_the_total() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("device");
+    let backing = scratch.0.join("disk.img");
+    std::fs::File::create(&backing)
+        .unwrap()
+        .set_len(3072 * MIB)
+        .unwrap();
+    let device =
+        String::from_utf8(sudo(&["losetup", "--find", "--show", backing.to_str().unwrap()]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+    let config = |total| PoolConfig {
+        backing: Backing::Device(PathBuf::from(&device)),
+        mountpoint: scratch.0.join("pool"),
+        total,
+        owner: owner(),
+    };
+
+    // A blank device is formatted, and its filesystem fitted to the total.
+    let pool = Pool::open(config(600 * MIB)).await.unwrap();
+    assert_eq!(fs_size(&pool), aurcache_chroot::pool::size_for(600 * MIB));
+
+    // Builds on it like on any pool.
+    make_base(&pool, 10).await;
+    let build = pool.lease(1, Some(64 * MIB)).await.unwrap();
+    assert!(write(&build.data().join("x"), 8 * MIB).is_none());
+    pool.release(build).await;
+
+    // More than the device holds: grown to the device, and no further.
+    assert_eq!(pool.set_total(4096 * MIB).await.unwrap(), Resize::Fits);
+    assert_eq!(fs_size(&pool), 3072 * MIB);
+
+    // Less than it holds: the filesystem keeps its size, and says so.
+    sudo_ok(&[
+        "sh",
+        "-c",
+        &format!(
+            "head -c 2600M /dev/urandom > {}",
+            scratch.0.join("pool/root/usr/fill").display()
+        ),
+    ]);
+    sync(&pool);
+    let resize = pool.set_total(64 * MIB).await.unwrap();
+    assert!(matches!(resize, Resize::Kept { .. }), "{resize:?}");
+    assert!(pool.oversized().is_none(), "a device is never made again");
+
+    pool.unmount().await.unwrap();
+    sudo_ok(&["losetup", "-d", &device]);
+}

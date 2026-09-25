@@ -311,13 +311,15 @@ meanings, and now also set the caches' qgroup limits.
 | `WORKER_DISK_RESERVE` | pre-allocate the image | `false` |
 
 The pool's own size is the total plus a margin (5%, at least 2G), and the total
-qgroup is what actually binds. The worker refuses a configuration that can't
-fit: the cache limits plus one build's limit plus the base chroot must be
-under `WORKER_DISK_MAX`. Otherwise a build could be refused space that its
-own limit promises it. A btrfs filesystem that is really full is the one
-state where deleting from it can fail, so the pool never gets there. With a
-device or an existing mount, the total may not exceed what the filesystem
-holds, and a larger value is refused.
+qgroup is what actually binds. A btrfs filesystem that is really full is the
+one state where deleting from it can fail, so the pool never gets there. With a
+device or an existing mount, a total larger than the filesystem can hold is
+logged as an error: the filesystem is then what binds.
+
+No check that the cache budgets, a build's quota and the base together fit
+under the total: the total is the one hard bound, and the cache budgets only
+decide what eviction takes first. A build that finds the pool full fails with
+"this worker's storage is full".
 
 A per-package limit was considered and left out for now; one per-build limit per
 worker is enough to start with. If it comes back, it is a server setting sent
@@ -441,8 +443,11 @@ It is only used in the hybrid image's legacy socket mode (`BUILD_ARTIFACT_DIR`
 set). Its builds write to the container's writable layer, which Docker can only
 cap on overlay2 over XFS with `pquota` or on the btrfs/zfs storage drivers, not
 on TrueNAS's overlay2 on ZFS. They also write to a host bind directory the
-worker can only reach through the Docker socket. It logs once that disk quotas
-are not enforced on this executor.
+worker can only reach through the Docker socket.
+
+A disk quota is not a property of a build that every worker promises; it is how
+the chroot worker keeps its own host safe. So the docker worker says nothing
+about it. Whether it can have one at all is for later.
 
 The TrueNAS `builder` service and the hybrid image's default mode both run the
 chroot worker, so both get quotas.

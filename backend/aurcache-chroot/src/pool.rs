@@ -114,8 +114,18 @@ pub struct Pool {
 #[must_use]
 pub enum Resize {
     /// The pool's size follows the total: it was grown or shrunk to it, or
-    /// needed neither, or is a device or mount the pool does not size.
+    /// needed neither.
     Fits,
+    /// A device's or a mount's filesystem holds more than fits in the size
+    /// the total asks for, so it kept its size. The total still binds. The
+    /// worker never empties those -- they are the operator's -- so this is
+    /// for them to act on.
+    Kept {
+        /// The filesystem's size now.
+        size: u64,
+        /// The size the total asks for.
+        wanted: u64,
+    },
     /// An image holds more than fits in the size the total asks for, so it
     /// kept its size. The total still binds. Emptying the pool and making it
     /// again is the way down; see [`Pool::destroy`].
@@ -313,7 +323,7 @@ impl Pool {
         *self.oversized.lock().expect("not poisoned") = None;
         let (Backing::Image { path, reserve }, Some(device)) = (&self.backing, &self.loop_device)
         else {
-            return Ok(Resize::Fits);
+            return self.resize_filesystem(total).await;
         };
         let want = size_for(total);
         let have = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -363,6 +373,92 @@ impl Pool {
             }
         }
         Ok(Resize::Fits)
+    }
+
+    /// Fit a device's or a mount's filesystem to `total` plus its margin, as
+    /// far as the device allows: shrink it when the total came down, grow it
+    /// back when it went up. The device itself is the operator's -- a zvol's
+    /// `volsize`, a partition -- and is never touched; what it frees by
+    /// shrinking the filesystem is theirs to reclaim, and the minimum size for
+    /// that is logged.
+    async fn resize_filesystem(&self, total: u64) -> Result<Resize> {
+        let Some(device) = self.single_device().await? else {
+            tracing::info!(
+                "{} spans several devices; its filesystem is left at its size",
+                self.mountpoint.display()
+            );
+            return Ok(Resize::Fits);
+        };
+        let capacity = device_capacity(&device.path).await?;
+        let wanted = size_for(total);
+        if wanted > capacity {
+            tracing::error!(
+                "WORKER_DISK_MAX asks for {} with its margin, but {} holds {}: the filesystem is \
+                 what binds, not the total",
+                gib(wanted),
+                device.path.display(),
+                gib(capacity)
+            );
+        }
+        let target = wanted.min(capacity);
+        if target == device.size {
+            return Ok(Resize::Fits);
+        }
+        match self
+            .btrfs(&["filesystem", "resize", &target.to_string()])
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "pool filesystem on {} resized from {} to {}",
+                    device.path.display(),
+                    gib(device.size),
+                    gib(target)
+                );
+                if target < capacity {
+                    tracing::info!(
+                        "{} could now be shrunk to {} bytes -- never less, which would cut into \
+                         the filesystem",
+                        device.path.display(),
+                        target
+                    );
+                }
+                Ok(Resize::Fits)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "the pool filesystem on {} stays at {}: what it holds does not fit in {} \
+                     ({e:#}). The total of {} applies regardless",
+                    device.path.display(),
+                    gib(device.size),
+                    gib(target),
+                    gib(total)
+                );
+                Ok(Resize::Kept {
+                    size: device.size,
+                    wanted: target,
+                })
+            }
+        }
+    }
+
+    /// The filesystem's one device and the size the filesystem uses of it;
+    /// `None` when it has several.
+    async fn single_device(&self) -> Result<Option<FsDevice>> {
+        let show = privileged(&[
+            "btrfs".as_ref(),
+            "filesystem".as_ref(),
+            "show".as_ref(),
+            "--raw".as_ref(),
+            self.mountpoint.as_os_str(),
+        ])
+        .await?;
+        let mut devices = parse_devices(&show);
+        Ok(if devices.len() == 1 {
+            devices.pop()
+        } else {
+            None
+        })
     }
 
     /// Bytes free on the filesystem holding a sparse image: what the pool can
@@ -904,6 +1000,50 @@ fn mount_options(discard: bool, via_loop: bool) -> String {
     options
 }
 
+/// One device of a btrfs filesystem, as `btrfs filesystem show` lists it.
+#[derive(Debug, PartialEq, Eq)]
+struct FsDevice {
+    path: PathBuf,
+    /// How much of the device the filesystem uses.
+    size: u64,
+}
+
+/// The devices of `btrfs filesystem show --raw`: `devid 1 size N used M path P`.
+fn parse_devices(show: &str) -> Vec<FsDevice> {
+    show.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.first() != Some(&"devid") {
+                return None;
+            }
+            let after = |key: &str| {
+                fields
+                    .iter()
+                    .position(|f| *f == key)
+                    .and_then(|i| fields.get(i + 1))
+                    .copied()
+            };
+            Some(FsDevice {
+                size: after("size")?.parse().ok()?,
+                path: PathBuf::from(after("path")?),
+            })
+        })
+        .collect()
+}
+
+/// A block device's capacity in bytes.
+async fn device_capacity(device: &Path) -> Result<u64> {
+    let out = privileged(&[
+        "blockdev".as_ref(),
+        "--getsize64".as_ref(),
+        device.as_os_str(),
+    ])
+    .await?;
+    out.trim()
+        .parse()
+        .with_context(|| format!("the size of {}: {out:?}", device.display()))
+}
+
 /// The UUID of the filesystem mounted at `mountpoint`, which names its sysfs
 /// directory.
 async fn fsid(mountpoint: &Path) -> Result<String> {
@@ -1077,6 +1217,22 @@ mod tests {
         assert!(mount_options(true, true).ends_with(",discard=async,loop"));
         assert!(!mount_options(false, false).contains("discard"));
         assert!(!mount_options(false, false).contains("loop"));
+    }
+
+    #[test]
+    fn a_filesystems_devices_come_from_filesystem_show() {
+        let show = "Label: 'aurcache-chroot'  uuid: 40207968-ec27-482a-8e8d-46e4389be924\n\
+                    \tTotal devices 1 FS bytes used 222537543680\n\
+                    \tdevid    1 size 1099511627776 used 252354494464 path /dev/sdc\n";
+        assert_eq!(
+            parse_devices(show),
+            [FsDevice {
+                path: PathBuf::from("/dev/sdc"),
+                size: 1_099_511_627_776
+            }]
+        );
+        let two = format!("{show}\tdevid    2 size 5 used 1 path /dev/sdd\n");
+        assert_eq!(parse_devices(&two).len(), 2);
     }
 
     #[test]

@@ -159,7 +159,9 @@ impl Chroots {
         let short = free.is_some_and(|free| free < build_limit);
         let was_short = self.short_of_room.swap(short, Ordering::Relaxed);
         if short && !was_short {
-            tracing::warn!(
+            // Error, not warning: a worker that stops claiming is otherwise
+            // only visible as builds going elsewhere, or nowhere.
+            tracing::error!(
                 "not taking builds: the host has {} free for the storage pool's image, less than \
                  one build's quota of {} (WORKER_BUILD_DISK_MAX). Free space there, or reserve \
                  the image with WORKER_DISK_RESERVE",
@@ -215,7 +217,7 @@ impl Chroots {
         let active = self.active.load(Ordering::SeqCst);
         if active > 0 {
             if !self.draining.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
+                tracing::error!(
                     "the storage pool holds more than fits in {} (WORKER_DISK_MAX was lowered): \
                      taking no builds until the {active} running finish, then making it again \
                      at that size, with cold caches",
@@ -232,7 +234,7 @@ impl Chroots {
         let Some(pool) = guard.take() else {
             return false;
         };
-        tracing::warn!(
+        tracing::error!(
             "making the storage pool again at {}: its caches and base chroot start over",
             gib(wanted)
         );
