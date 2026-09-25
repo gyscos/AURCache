@@ -7,6 +7,7 @@
 //! `pkgver` for such packages is typically stale (it only reflects when the
 //! PKGBUILD itself was last touched, not the live upstream state).
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
 
 use alpm_srcinfo::SourceInfoV1;
 use alpm_types::Source;
@@ -313,9 +314,30 @@ pub async fn vcs_sources_moved(
 /// Per pass, deliberately, and never held between them: a cache that outlived
 /// the round would answer for a moment that has gone, and this is the very
 /// thing that decides whether upstream has moved.
+///
+/// Fixed gap between distinct VCS remote lookups in one sweep.
+///
+/// The version check already resolves remotes sequentially, but back-to-back
+/// `ls-remote` calls still arrive as one burst each interval, and a server
+/// fronting dozens of them answers some with transient HTTP failures (e.g.
+/// 502). A short fixed pause spreads the sweep without needing jitter: there
+/// is a single sequential scheduler loop, so nothing else can line up with it.
+const VCS_LOOKUP_GAP: Duration = Duration::from_secs(5);
+
+/// Whether a distinct remote lookup waits first: the sweep's first remote goes
+/// at once, every later one waits out [`VCS_LOOKUP_GAP`].
+fn gap_before_lookup(previous_lookups: u64) -> Option<Duration> {
+    if previous_lookups == 0 {
+        None
+    } else {
+        Some(VCS_LOOKUP_GAP)
+    }
+}
+
 #[derive(Default)]
 pub struct RoundCache {
     seen: HashMap<(String, String), String>,
+    lookups: u64,
 }
 
 impl RoundCache {
@@ -334,6 +356,12 @@ impl RoundCache {
         if let Some(commit) = self.seen.get(&key) {
             return Ok(commit.clone());
         }
+        if let Some(gap) = gap_before_lookup(self.lookups) {
+            tokio::time::sleep(gap).await;
+        }
+        // Counted before the attempt so a failure still paces the next one:
+        // failures are not cached and would otherwise retry back-to-back.
+        self.lookups += 1;
         // `resolve_commit` performs blocking network I/O via git2.
         let commit = tokio::task::spawn_blocking(move || source.resolve_commit()).await??;
         self.seen.insert(key, commit.clone());
@@ -371,6 +399,20 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// Distinct VCS lookups are paced: the sweep's first remote goes at once
+    /// so a single VCS package pays nothing, and every later one waits out
+    /// the fixed gap instead of hitting git servers back-to-back.
+    #[test]
+    fn vcs_lookups_are_paced_after_the_first() {
+        use super::{VCS_LOOKUP_GAP, gap_before_lookup};
+        use std::time::Duration;
+
+        assert_eq!(VCS_LOOKUP_GAP, Duration::from_secs(5));
+        assert_eq!(gap_before_lookup(0), None);
+        assert_eq!(gap_before_lookup(1), Some(Duration::from_secs(5)));
+        assert_eq!(gap_before_lookup(40), Some(Duration::from_secs(5)));
     }
 
     /// makepkg's naming rule, which the worker must not re-derive: the server
