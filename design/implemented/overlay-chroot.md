@@ -4,7 +4,7 @@ Plan for making a build's chroot cost nothing to create on filesystems that
 cannot snapshot, and for refreshing the base without waiting for the builds
 using it.
 
-Status: **superseded** by `design/in-progress/build-disk-quota.md`. Every
+Status: **superseded** by `design/implemented/build-disk-quota.md`. Every
 chroot is now a snapshot in the worker's btrfs storage pool, which works the
 same on every host filesystem, so the overlay strategy, its update layers and
 flattening were removed. Kept for the measurements and the reasoning, which

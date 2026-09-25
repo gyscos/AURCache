@@ -7,7 +7,7 @@
 //! a second subvolume beside it for the build's workdir. Both sit in one quota
 //! group limited to `WORKER_BUILD_DISK_MAX`, under the pool's total
 //! (`WORKER_DISK_MAX`), so a build that sets out to fill the disk fails its own
-//! build instead. See `design/in-progress/build-disk-quota.md`.
+//! build instead. See `design/implemented/build-disk-quota.md`.
 //!
 //! A snapshot is point-in-time, so the base is refreshed in place while builds
 //! run: its lock is held shared only for the instant of taking a snapshot. The

@@ -5,9 +5,9 @@ sets out to fill the disk fails its own build instead of taking the worker's
 host down with it. The same mechanism bounds everything else the worker
 stores, so one figure caps the worker's whole footprint.
 
-Status: **In progress** · Last updated: 2026-09-25
+Status: **Implemented** · Last updated: 2026-09-25
 
-Done so far:
+What shipped:
 
 - The server-side parse writes nothing, and is bounded: 60s, 8 MiB of output,
   its whole process group killed on overrun.
@@ -41,14 +41,19 @@ Done so far:
 - Each build reports its disk use part by part -- chroot, working space,
   sources, kept tree -- stored on the build and shown on its page.
 - A patched source keeps its symlinks, directories and file modes.
-- Running on freyja, with the dedicated btrfs filesystem as its pool.
+- Operator docs (`docs/docs/workers/storage-pool.md`) for the three backings
+  and their tuning; `setup worker` and `setup compose` ask for the backing
+  and give zvol tuning.
+- Running on both workers, each pool on a zvol: freyja's over iSCSI, mounted
+  as a dedicated btrfs filesystem, and the TrueNAS builder's as a device.
 
 Decided: the caches' budgets stay eviction targets, not hard qgroup limits.
 The total is the hard bound they were approximating; the budgets only decide
 what to prune first.
 
-Not yet: per-package quotas (a qgroup limit on the package's subvolume, now
-that it has one; later), and a real build-time comparison.
+Deferred: per-package quotas (a qgroup limit on the package's subvolume, now
+that it has one), and a real build-time comparison (item 6 below). Further
+uses of the pool's snapshots are in `design/proposed/btrfs-snapshots.md`.
 
 ---
 
@@ -519,10 +524,9 @@ So a host filling up underneath a sparse pool is contained the way
 loudly, and the pool needs a remount (the worker unmounts and remounts it
 when it finds it read-only), not a rebuild.
 
-Still open: 6 (real build times) from the list below, which needs the worker
-integration.
+Item 6 (real build times) from the list below was never measured.
 
-## To confirm before building
+## What the prototype set out to confirm
 
 A root prototype, in a scratch image outside `/tmp`:
 
@@ -547,9 +551,6 @@ A root prototype, in a scratch image outside `/tmp`:
 
 ## Out of scope
 
-- **The archiver following symlinks.** `create_archive_with_pkgbase_dir`
-  (`snapshot.rs`) uses `tar::Builder` without `follow_symlinks(false)`, so a
-  symlink committed to a package repository is archived as the file it points
-  to, read by the server. A separate security fix, and an urgent one.
-- **A timeout and an output cap on the server parse.** A parse can still hang
-  or print without limit into the server's memory.
+Both items first listed here were fixed alongside this work (see "What
+shipped"): the archiver following symlinks, and a timeout and output cap on
+the server parse.

@@ -3,7 +3,7 @@
 //! workdir, and the caches -- so that a build's disk use is bounded by the
 //! kernel while it runs, and the worker's whole footprint by one figure.
 //!
-//! See `design/in-progress/build-disk-quota.md` for why it is shaped this way.
+//! See `design/implemented/build-disk-quota.md` for why it is shaped this way.
 //!
 //! The API takes plain data (build ids, sizes) and decides every path itself,
 //! so that it could later move behind a socket to a privileged process without
