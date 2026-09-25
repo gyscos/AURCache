@@ -365,6 +365,8 @@ impl Pool {
         // Leftovers under this id, from a crash between making these and
         // recording the build as running.
         self.remove_build(build_id).await;
+        // And the groups earlier builds could not take with them.
+        self.tidy_groups().await;
 
         let made = async {
             self.btrfs_paths(&["subvolume", "snapshot"], &[&root, &volumes.chroot])
@@ -431,8 +433,43 @@ impl Pool {
         }
         // A deleted subvolume's own group lingers while any extent it wrote is
         // still referenced, and as an empty `<stale>` group after.
+        self.tidy_groups().await;
         let _ = self.btrfs(&["qgroup", "clear-stale"]).await;
         builds.len()
+    }
+
+    /// Destroy the groups of builds whose subvolumes are gone.
+    ///
+    /// A release deletes a build's subvolumes and then its group, but btrfs
+    /// refuses to destroy the group while a deleted subvolume's own group
+    /// still hangs off it -- which it does until the cleaner has freed that
+    /// subvolume, in the background, well after the release returned. Once
+    /// the cleaner is done the subvolume's group is `<stale>`, clearing those
+    /// empties the build's group, and it can go. Run before each lease, so
+    /// they are cleared as builds come and go rather than only at startup.
+    async fn tidy_groups(&self) {
+        let orphans: Vec<QgroupId> = self
+            .qgroups
+            .list()
+            .into_iter()
+            .filter(|group| {
+                group.build_id().is_some_and(|id| {
+                    !self.mountpoint.join(chroot_name(id)).exists()
+                        && !self.mountpoint.join(data_name(id)).exists()
+                })
+            })
+            .collect();
+        if orphans.is_empty() {
+            return;
+        }
+        let _ = self.btrfs(&["qgroup", "clear-stale"]).await;
+        for group in orphans {
+            // Still refused while the cleaner has not reached it; the next
+            // lease tries again.
+            if let Err(e) = self.btrfs(&["qgroup", "destroy", &group.to_string()]).await {
+                tracing::debug!("qgroup {group} not destroyed yet: {e:#}");
+            }
+        }
     }
 
     /// Delete one build's subvolumes and group, whatever is left of them.

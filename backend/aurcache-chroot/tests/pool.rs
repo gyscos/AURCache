@@ -338,3 +338,29 @@ async fn a_cache_subvolume_counts_against_the_total() {
     assert!(refused.is_some(), "and is bounded by it");
     pool.unmount().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_released_builds_group_is_cleared_by_a_later_lease() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("tidy");
+    let pool = Pool::open(config(&scratch, 600 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+
+    let first = pool.lease(1, Some(64 * MIB)).await.unwrap();
+    let group = first.group();
+    assert!(write(&first.data().join("x"), 8 * MIB).is_none());
+    pool.release(first).await;
+    // What production sees: the release returns before btrfs's cleaner has
+    // freed the subvolumes, so the group may still be there. Once the
+    // cleaner is done, the next lease clears it.
+    sudo_ok(&["btrfs", "subvolume", "sync", pool.path().to_str().unwrap()]);
+    let second = pool.lease(2, Some(64 * MIB)).await.unwrap();
+    assert!(
+        pool.usage(group).is_none(),
+        "the first build's group outlived the next lease"
+    );
+    pool.release(second).await;
+    pool.unmount().await.unwrap();
+}
