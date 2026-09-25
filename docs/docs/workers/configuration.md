@@ -378,9 +378,11 @@ If the image sits on a ZFS dataset, give it a dataset of its own with:
 ### Shrinking
 
 Lowering `WORKER_DISK_MAX` lowers the quota at once. An image shrinks with it,
-online, when what the pool holds fits in the smaller size; when it does not,
-the image keeps its size for now, the worker logs it, and the lower quota
-applies regardless.
+online, when what the pool holds fits in the smaller size. When it does not,
+the worker stops taking builds, lets the ones running finish, and then makes
+the pool again, empty, at the new size: its caches start cold and the base
+chroot is rebuilt by the next build. Its identity lives outside the pool, so it
+stays enrolled. It logs each step.
 
 A device is the operator's to resize. Its btrfs filesystem can be shrunk online
 first (`btrfs filesystem resize <size> <pool>`), and then the device -- a zvol

@@ -50,6 +50,27 @@ pub fn devtools(program: &str) -> Command {
     cmd
 }
 
+/// [`devtools`], with `TMPDIR` set to `tmpdir` for the program.
+///
+/// For a build: devtools makes its `WORKDIR` with `mktemp` under `TMPDIR`, and
+/// the host-side `makepkg --verifysource` -- which sources the PKGBUILD --
+/// writes there (it is that run's `BUILDDIR` and `TMPDIR`). Left at `/tmp`,
+/// that is the one place a PKGBUILD could fill a disk outside the build's
+/// quota. Pointed into the build's own subvolume, it counts against it.
+///
+/// Through `env` on the command line, because the environment cannot carry
+/// it: glibc removes `TMPDIR` from a setuid program's environment, so sudo
+/// never sees a preserved one. devtools also unsets a preset `WORKDIR`,
+/// which is why this sets the directory `WORKDIR` is made in, not `WORKDIR`.
+pub fn devtools_in(program: &str, tmpdir: &Path) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN,AURCACHE_NSPAWN_KEEP_UNIT")
+        .arg("env")
+        .arg(format!("TMPDIR={}", tmpdir.display()))
+        .arg(program);
+    cmd
+}
+
 /// Ensure the shared base chroot exists and is reasonably fresh. Idempotent.
 ///
 /// * Creates `<chroot_dir>/root` via `mkarchroot` seeded with the job's
@@ -659,6 +680,23 @@ mod tests {
         for var in ["GNUPGHOME", "SRCDEST", "AURCACHE_DROPIN"] {
             assert!(preserve.contains(var), "{preserve} must carry {var}");
         }
+    }
+
+    /// A build's devtools run gets its `TMPDIR` on the command line -- the one
+    /// way through sudo -- and still the preserved environment.
+    #[test]
+    fn a_builds_tmpdir_reaches_devtools_through_env() {
+        let cmd = devtools_in("makechrootpkg", Path::new("/pool/job-7.data/tmp"));
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args[0].starts_with("--preserve-env="), "{args:?}");
+        assert_eq!(
+            &args[1..],
+            ["env", "TMPDIR=/pool/job-7.data/tmp", "makechrootpkg"]
+        );
     }
 
     /// `makechrootpkg` picks the build directories, and a drop-in must not

@@ -48,6 +48,32 @@ pub enum Backing {
     Mount,
 }
 
+/// Who owns something the pool makes for the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Owner {
+    /// The user this process runs as.
+    #[must_use]
+    pub fn current() -> Self {
+        // SAFETY: neither call has preconditions or can fail.
+        unsafe {
+            Self {
+                uid: libc::getuid(),
+                gid: libc::getgid(),
+            }
+        }
+    }
+
+    /// `uid:gid`, as `chown` takes it.
+    fn chown_spec(self) -> String {
+        format!("{}:{}", self.uid, self.gid)
+    }
+}
+
 /// How to open a pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -58,7 +84,7 @@ pub struct PoolConfig {
     /// Everything the worker may store, in bytes (`WORKER_DISK_MAX`).
     pub total: u64,
     /// The worker's uid and gid: the owner of what it writes in the pool.
-    pub owner: (u32, u32),
+    pub owner: Owner,
 }
 
 /// The size an image or device needs for a total of `total`: the total plus
@@ -73,10 +99,31 @@ pub fn size_for(total: u64) -> u64 {
 pub struct Pool {
     mountpoint: PathBuf,
     qgroups: Qgroups,
-    owner: (u32, u32),
+    owner: Owner,
     backing: Backing,
     /// The loop device, for an image.
     loop_device: Option<PathBuf>,
+    /// Set when an image could not shrink to its total: the size it would
+    /// have had. See [`Self::oversized`].
+    oversized: std::sync::Mutex<Option<u64>>,
+}
+
+/// What [`Pool::set_total`] did to the pool's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Resize {
+    /// The pool's size follows the total: it was grown or shrunk to it, or
+    /// needed neither, or is a device or mount the pool does not size.
+    Fits,
+    /// An image holds more than fits in the size the total asks for, so it
+    /// kept its size. The total still binds. Emptying the pool and making it
+    /// again is the way down; see [`Pool::destroy`].
+    TooFull {
+        /// The image's size now.
+        size: u64,
+        /// The size the total asks for.
+        wanted: u64,
+    },
 }
 
 impl Pool {
@@ -94,16 +141,27 @@ impl Pool {
             Backing::Mount => check_dedicated_mount(&mountpoint).await?,
             Backing::Image { path, reserve } => {
                 if !is_mountpoint(&mountpoint) {
-                    let (device, fresh) = attach_image(path, size_for(total), *reserve).await?;
-                    if fresh {
-                        mkfs(&device).await?;
+                    // Formatted and checked as a file: neither needs a loop
+                    // device.
+                    if prepare_image(path, size_for(total), *reserve).await? {
+                        mkfs(path).await?;
                     } else {
-                        check_ours(&device).await?;
+                        check_ours(path).await?;
                     }
-                    mount(&device, &mountpoint, !reserve, owner).await?;
-                    loop_device = Some(device);
-                } else {
-                    loop_device = attached_loop(path).await;
+                    match attached_loop(path).await {
+                        // Attached by an older worker, without autoclear.
+                        Some(device) => {
+                            mount(&device, &mountpoint, !reserve, false, owner).await?;
+                        }
+                        None => {
+                            ensure_free_loop_node().await?;
+                            mount(path, &mountpoint, !reserve, true, owner).await?;
+                        }
+                    }
+                }
+                loop_device = attached_loop(path).await;
+                if let Some(device) = &loop_device {
+                    enable_direct_io(device).await;
                 }
             }
             Backing::Device(device) => {
@@ -113,7 +171,7 @@ impl Pool {
                         None => mkfs(device).await?,
                         Some(_) => check_ours(device).await?,
                     }
-                    mount(device, &mountpoint, true, owner).await?;
+                    mount(device, &mountpoint, true, false, owner).await?;
                 }
             }
         }
@@ -125,9 +183,12 @@ impl Pool {
             owner,
             backing,
             loop_device,
+            oversized: std::sync::Mutex::new(None),
         };
         pool.enable_quotas().await?;
-        pool.set_total(total).await?;
+        // A lowered total the image cannot shrink to is remembered in
+        // `oversized` for the caller; the pool opens either way.
+        let _ = pool.set_total(total).await?;
         Ok(pool)
     }
 
@@ -155,6 +216,32 @@ impl Pool {
         self.qgroups.usage(group)
     }
 
+    /// The size an image would have for its total, when it could not shrink
+    /// to it: what it holds did not fit. `None` when the size follows the
+    /// total.
+    #[must_use]
+    pub fn oversized(&self) -> Option<u64> {
+        *self.oversized.lock().expect("not poisoned")
+    }
+
+    /// Delete an image pool: unmount it, detach it, and remove the image with
+    /// everything in it. [`Self::open`] then makes a new one. The way to
+    /// shrink an image whose contents do not fit the smaller size.
+    ///
+    /// Refused for a device or an existing mount: those are the operator's,
+    /// and never formatted twice by the worker.
+    pub async fn destroy(self) -> Result<()> {
+        let Backing::Image { path, .. } = self.backing.clone() else {
+            bail!(
+                "only an image pool is destroyed and made again; a device or a mount is the operator's"
+            );
+        };
+        self.unmount().await?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        tracing::info!("pool image {} removed", path.display());
+        Ok(())
+    }
+
     /// Unmount the pool, and detach an image's loop device. An existing mount
     /// is the operator's, and is left mounted.
     pub async fn unmount(self) -> Result<()> {
@@ -164,7 +251,11 @@ impl Pool {
         privileged(&["umount".as_ref(), self.mountpoint.as_os_str()])
             .await
             .with_context(|| format!("unmounting the pool at {}", self.mountpoint.display()))?;
-        if let Some(device) = &self.loop_device {
+        // Normally gone already: a device the mount attached autoclears. One
+        // an older worker attached with `losetup` does not.
+        if let Backing::Image { path, .. } = &self.backing
+            && let Some(device) = attached_loop(path).await
+        {
             privileged(&["losetup".as_ref(), "-d".as_ref(), device.as_os_str()]).await?;
         }
         Ok(())
@@ -208,8 +299,9 @@ impl Pool {
     /// it fails however much was written before. An image grows online. It
     /// also shrinks online when what the pool holds fits in the smaller size
     /// -- btrfs moves data out of the part being cut off first. When it does
-    /// not fit, the image keeps its size and says so; the total still binds.
-    pub async fn set_total(&self, total: u64) -> Result<()> {
+    /// not fit, the image keeps its size and says so ([`Resize::TooFull`]);
+    /// the total still binds.
+    pub async fn set_total(&self, total: u64) -> Result<Resize> {
         if !self.qgroups.exists(TOTAL) {
             self.btrfs(&["qgroup", "create", &TOTAL.to_string()])
                 .await?;
@@ -217,9 +309,10 @@ impl Pool {
         // Before any resize: nothing new may land in space about to go.
         self.btrfs(&["qgroup", "limit", &total.to_string(), &TOTAL.to_string()])
             .await?;
+        *self.oversized.lock().expect("not poisoned") = None;
         let (Backing::Image { path, reserve }, Some(device)) = (&self.backing, &self.loop_device)
         else {
-            return Ok(());
+            return Ok(Resize::Fits);
         };
         let want = size_for(total);
         let have = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -252,16 +345,23 @@ impl Pool {
                         gib(total)
                     );
                 }
-                Err(e) => tracing::warn!(
-                    "the pool image stays at {}: what it holds does not fit in {} yet ({e:#}). \
-                     The total of {} applies regardless",
-                    gib(have),
-                    gib(want),
-                    gib(total)
-                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "the pool image stays at {}: what it holds does not fit in {} ({e:#}). \
+                         The total of {} applies regardless",
+                        gib(have),
+                        gib(want),
+                        gib(total)
+                    );
+                    *self.oversized.lock().expect("not poisoned") = Some(want);
+                    return Ok(Resize::TooFull {
+                        size: have,
+                        wanted: want,
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(Resize::Fits)
     }
 
     /// Bytes free on the filesystem holding a sparse image: what the pool can
@@ -293,12 +393,7 @@ impl Pool {
     ///
     /// `name` is one path component, never a path: what the pool holds and
     /// where is the pool's to decide.
-    pub async fn ensure_subvolume(
-        &self,
-        name: &str,
-        owner: (u32, u32),
-        mode: u32,
-    ) -> Result<PathBuf> {
+    pub async fn ensure_subvolume(&self, name: &str, owner: Owner, mode: u32) -> Result<PathBuf> {
         if name.is_empty()
             || name == ROOT
             || build_of(name).is_some()
@@ -316,7 +411,7 @@ impl Pool {
         let made = async {
             privileged(&[
                 "chown".as_ref(),
-                format!("{}:{}", owner.0, owner.1).as_ref(),
+                owner.chown_spec().as_ref(),
                 path.as_os_str(),
             ])
             .await?;
@@ -375,7 +470,7 @@ impl Pool {
                 .await?;
             privileged(&[
                 "chown".as_ref(),
-                format!("{}:{}", self.owner.0, self.owner.1).as_ref(),
+                self.owner.chown_spec().as_ref(),
                 volumes.data.as_os_str(),
             ])
             .await?;
@@ -748,21 +843,29 @@ async fn mkfs(device: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn mount(device: &Path, mountpoint: &Path, discard: bool, owner: (u32, u32)) -> Result<()> {
+/// Mount `source` at `mountpoint`. With `via_loop`, `source` is an image
+/// file, attached to a loop device by the mount itself.
+///
+/// Letting `mount` attach it, rather than `losetup` beforehand, is what sets
+/// the loop device's autoclear flag: it detaches when the last mount of it
+/// goes -- including when a container holding the mount is torn down, which
+/// otherwise leaves the device attached to a deleted image for good, its
+/// space held and its number taken.
+async fn mount(
+    source: &Path,
+    mountpoint: &Path,
+    discard: bool,
+    via_loop: bool,
+    owner: Owner,
+) -> Result<()> {
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("creating {}", mountpoint.display()))?;
-    // `discard=async` hands space the pool frees back to what holds it. Not
-    // for a reserved image, whose point is keeping that space.
-    let options = if discard {
-        format!("{MOUNT_OPTIONS},discard=async")
-    } else {
-        MOUNT_OPTIONS.to_string()
-    };
+    let options = mount_options(discard, via_loop);
     privileged(&[
         "mount".as_ref(),
         "-o".as_ref(),
         options.as_ref(),
-        device.as_os_str(),
+        source.as_os_str(),
         mountpoint.as_os_str(),
     ])
     .await
@@ -771,11 +874,25 @@ async fn mount(device: &Path, mountpoint: &Path, discard: bool, owner: (u32, u32
     // need no root; subvolumes are still made with it.
     privileged(&[
         "chown".as_ref(),
-        format!("{}:{}", owner.0, owner.1).as_ref(),
+        owner.chown_spec().as_ref(),
         mountpoint.as_os_str(),
     ])
     .await?;
     Ok(())
+}
+
+/// The options a pool is mounted with.
+fn mount_options(discard: bool, via_loop: bool) -> String {
+    let mut options = MOUNT_OPTIONS.to_string();
+    // `discard=async` hands space the pool frees back to what holds it. Not
+    // for a reserved image, whose point is keeping that space.
+    if discard {
+        options.push_str(",discard=async");
+    }
+    if via_loop {
+        options.push_str(",loop");
+    }
+    options
 }
 
 /// The UUID of the filesystem mounted at `mountpoint`, which names its sysfs
@@ -811,23 +928,20 @@ async fn subvolume_id(path: &Path) -> Result<u64> {
         .with_context(|| format!("subvolume id of {}: {out:?}", path.display()))
 }
 
-/// Create the image if it is missing, then attach it to a loop device.
-/// Returns the device and whether the image is new.
-async fn attach_image(path: &Path, size: u64, reserve: bool) -> Result<(PathBuf, bool)> {
-    let fresh = !path.exists();
-    if fresh {
-        let dir = path.parent().context("the image path has no directory")?;
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        // Before the file exists: on a btrfs host `+C` only takes on an empty
-        // file, and a new file inherits it from its directory. Elsewhere the
-        // attribute does not exist, which is fine.
-        let _ = query(&["chattr".as_ref(), "+C".as_ref(), dir.as_os_str()]).await;
-        size_image(path, size, reserve)?;
+/// Create the image if it is missing. Returns whether it was, and so needs
+/// formatting.
+async fn prepare_image(path: &Path, size: u64, reserve: bool) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
     }
-    if let Some(device) = attached_loop(path).await {
-        return Ok((device, fresh));
-    }
-    Ok((attach_loop(path).await?, fresh))
+    let dir = path.parent().context("the image path has no directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Before the file exists: on a btrfs host `+C` only takes on an empty
+    // file, and a new file inherits it from its directory. Elsewhere the
+    // attribute does not exist, which is fine.
+    let _ = query(&["chattr".as_ref(), "+C".as_ref(), dir.as_os_str()]).await;
+    size_image(path, size, reserve)?;
+    Ok(true)
 }
 
 /// Make the image `size` bytes: sparse, or allocated in full when reserving.
@@ -866,60 +980,95 @@ async fn attached_loop(path: &Path) -> Option<PathBuf> {
         .map(|(device, _)| PathBuf::from(device))
 }
 
-/// Attach `path` to a free loop device.
+/// Make sure the loop device the kernel hands out next has a node.
 ///
 /// Inside a container `/dev` only has the loop nodes that existed when it
-/// started, and `losetup --find` would ask the kernel for a device whose node
-/// is missing. So the device is asked for first and its node made if needed.
-async fn attach_loop(path: &Path) -> Result<PathBuf> {
-    let device = PathBuf::from(
-        privileged(&["losetup", "--find"])
-            .await
-            .context("finding a free loop device")?
-            .trim(),
-    );
-    if !device.exists() {
-        let minor = device
-            .to_string_lossy()
-            .trim_start_matches("/dev/loop")
-            .parse::<u32>()
-            .with_context(|| format!("loop device name {}", device.display()))?;
+/// started, and a mount asking for a new device would find no node for it.
+/// `losetup --find` names that device -- with ` (lost)` after it when its node
+/// is missing -- so the node is made first.
+async fn ensure_free_loop_node() -> Result<()> {
+    let out = privileged(&["losetup", "--find"])
+        .await
+        .context("finding a free loop device")?;
+    let device =
+        free_loop_device(&out).with_context(|| format!("unexpected `losetup --find`: {out:?}"))?;
+    if !device.path.exists() {
         privileged(&[
             "mknod".as_ref(),
-            device.as_os_str(),
+            device.path.as_os_str(),
             "b".as_ref(),
             "7".as_ref(),
-            minor.to_string().as_ref(),
+            device.minor.to_string().as_ref(),
         ])
         .await
-        .with_context(|| format!("creating {}", device.display()))?;
+        .with_context(|| format!("creating {}", device.path.display()))?;
     }
-    // Direct I/O keeps the data out of the host's page cache, where it would
-    // sit twice. A host filesystem that refuses it gets buffered I/O.
-    let attach = |direct: bool| {
-        let direct = if direct {
-            "--direct-io=on"
-        } else {
-            "--direct-io=off"
-        };
-        let args: Vec<&OsStr> = vec![
-            "losetup".as_ref(),
-            direct.as_ref(),
-            device.as_os_str(),
-            path.as_os_str(),
-        ];
-        async move { privileged(&args).await }
-    };
-    if let Err(e) = attach(true).await {
+    Ok(())
+}
+
+/// A loop device, by node path and minor number.
+#[derive(Debug, PartialEq, Eq)]
+struct LoopDevice {
+    path: PathBuf,
+    minor: u32,
+}
+
+/// The device `losetup --find` printed, ignoring the ` (lost)` it adds when
+/// the node does not exist.
+fn free_loop_device(out: &str) -> Option<LoopDevice> {
+    let name = out.split_whitespace().next()?;
+    let minor = name.strip_prefix("/dev/loop")?.parse().ok()?;
+    Some(LoopDevice {
+        path: PathBuf::from(name),
+        minor,
+    })
+}
+
+/// Switch a loop device to direct I/O, which keeps the image's data out of
+/// the host's page cache, where it would sit twice. A host filesystem that
+/// refuses it keeps buffered I/O, which works the same, only slower.
+async fn enable_direct_io(device: &Path) {
+    if let Err(e) = privileged(&[
+        "losetup".as_ref(),
+        "--direct-io=on".as_ref(),
+        device.as_os_str(),
+    ])
+    .await
+    {
         tracing::info!("direct I/O refused for the pool image ({e:#}); using buffered I/O");
-        attach(false).await?;
     }
-    Ok(device)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inside a container, `losetup --find` marks a device whose node is
+    /// missing -- the one case the name has to survive.
+    #[test]
+    fn a_free_loop_device_is_read_with_or_without_its_node() {
+        let device = |path: &str, minor| LoopDevice {
+            path: PathBuf::from(path),
+            minor,
+        };
+        assert_eq!(
+            free_loop_device("/dev/loop5\n"),
+            Some(device("/dev/loop5", 5))
+        );
+        assert_eq!(
+            free_loop_device("/dev/loop5 (lost)\n"),
+            Some(device("/dev/loop5", 5))
+        );
+        assert_eq!(free_loop_device(""), None);
+        assert_eq!(free_loop_device("/dev/sda"), None);
+    }
+
+    #[test]
+    fn a_pool_image_is_mounted_through_a_loop_device_of_its_own() {
+        assert!(mount_options(true, true).ends_with(",discard=async,loop"));
+        assert!(!mount_options(false, false).contains("discard"));
+        assert!(!mount_options(false, false).contains("loop"));
+    }
 
     #[test]
     fn the_margin_is_a_twentieth_but_never_under_two_gib() {

@@ -5,20 +5,38 @@ sets out to fill the disk fails its own build instead of taking the worker's
 host down with it. The same mechanism bounds everything else the worker
 stores, so one figure caps the worker's whole footprint.
 
-Status: **In progress** · Last updated: 2026-09-24
+Status: **In progress** · Last updated: 2026-09-25
 
-Done so far: the server-side parse writes nothing; the `aurcache-chroot` crate
-(pool on an image, a device or a mount; per-build subvolumes and qgroups; the
-total; grow and online shrink; sweep); the worker builds in pool snapshots with
-`WORKER_BUILD_DISK_MAX`/`WORKER_DISK_MAX`, reports a quota failure, and stops
-claiming while a sparse image's host lacks room; the overlay and copy
-strategies are gone. The caches live in one `cache` subvolume in the pool,
-under the total (`WORKER_CACHE_DIR` and the separate cache volume are gone).
+Done so far:
+
+- The server-side parse writes nothing, and is bounded: 60s, 8 MiB of output,
+  its whole process group killed on overrun.
+- The server never follows a package's symlinks: archives store them as
+  links, `.SRCINFO`/`PKGBUILD` are read only as regular files, and a
+  subfolder resolving outside the checkout is refused. The worker never
+  uploads a symlinked "package".
+- The `aurcache-chroot` crate: the pool on an image, a device or a mount;
+  per-build subvolumes and qgroups; the total; grow, online shrink, and
+  drain-and-recreate when an image cannot shrink; sweep and group cleanup.
+  An image is attached by `mount -o loop`, so its loop device autoclears when
+  a container holding it goes.
+- The worker builds in pool snapshots with `WORKER_BUILD_DISK_MAX` and
+  `WORKER_DISK_MAX`, reports a quota failure, and stops claiming while a sparse
+  image's host lacks room. devtools' `WORKDIR` (where the host-side
+  `makepkg --verifysource` writes) is in the build's own subvolume, through
+  `TMPDIR`. The overlay and copy strategies are gone.
+- The caches live in one `cache` subvolume in the pool, under the total
+  (`WORKER_CACHE_DIR` and the separate cache volume are gone).
+- Running on freyja, with the dedicated btrfs filesystem as its pool.
+
+Decided: the caches' budgets stay eviction targets, not hard qgroup limits.
+The total is the hard bound they were approximating; the budgets only decide
+what to prune first.
+
 Not yet: a subvolume per pkgbase for SRCDEST and kept trees (instant eviction,
-measuring by qgroup), the caches' budgets as hard qgroup limits (a behaviour
-change: a large legitimate source would fail its build rather than be evicted
-later), the drain-and-recreate fallback when an image cannot shrink online, and
-reporting disk usage beside peak memory.
+measuring by qgroup, and a base for per-package quotas later), reporting disk
+usage beside peak memory, the configuration fit check, the ZFS tuning log, the
+docker worker's "not enforced" log, and a real build-time comparison.
 
 ---
 

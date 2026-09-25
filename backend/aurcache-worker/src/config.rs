@@ -162,23 +162,18 @@ impl Config {
     /// package's tmpfiles declaration made the cache directory. Builds write
     /// sources into it as that user, and the worker through the group.
     #[must_use]
-    pub fn cache_owner(&self) -> (u32, u32) {
-        user_ids(&self.build_user).unwrap_or_else(|| {
-            // SAFETY: neither call has preconditions or can fail.
-            unsafe { (libc::getuid(), libc::getgid()) }
-        })
+    pub fn cache_owner(&self) -> aurcache_chroot::Owner {
+        user_ids(&self.build_user).unwrap_or_else(aurcache_chroot::Owner::current)
     }
 
     /// How to open the storage pool, with the current total.
     #[must_use]
     pub fn pool_config(&self) -> aurcache_chroot::PoolConfig {
-        // SAFETY: neither call has preconditions or can fail.
-        let owner = unsafe { (libc::getuid(), libc::getgid()) };
         aurcache_chroot::PoolConfig {
             backing: self.pool_backing.clone(),
             mountpoint: self.pool_mountpoint.clone(),
             total: self.disk_max,
-            owner,
+            owner: aurcache_chroot::Owner::current(),
         }
     }
 
@@ -272,7 +267,7 @@ fn pool_mountpoint(pool: Option<PathBuf>, chroot_dir: &Path) -> PathBuf {
 pub const CACHE_SUBVOLUME: &str = "cache";
 
 /// A user's uid and primary gid.
-fn user_ids(name: &str) -> Option<(u32, u32)> {
+fn user_ids(name: &str) -> Option<aurcache_chroot::Owner> {
     let name = std::ffi::CString::new(name).ok()?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0u8; 16 * 1024];
@@ -288,7 +283,10 @@ fn user_ids(name: &str) -> Option<(u32, u32)> {
             &raw mut result,
         )
     };
-    (rc == 0 && !result.is_null()).then_some((pwd.pw_uid, pwd.pw_gid))
+    (rc == 0 && !result.is_null()).then_some(aurcache_chroot::Owner {
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
+    })
 }
 
 fn truthy(value: &str) -> bool {
@@ -446,7 +444,10 @@ mod tests {
 
     #[test]
     fn a_users_ids_are_looked_up_by_name() {
-        assert_eq!(user_ids("root"), Some((0, 0)));
+        assert_eq!(
+            user_ids("root"),
+            Some(aurcache_chroot::Owner { uid: 0, gid: 0 })
+        );
         assert_eq!(user_ids("no-such-user-aurcache-test"), None);
     }
 

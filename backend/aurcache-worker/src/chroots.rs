@@ -20,7 +20,7 @@ use aurcache_chroot::{BuildVolumes, Pool, PoolConfig, Usage};
 use aurcache_worker_core::client::WorkerClient;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
@@ -38,7 +38,7 @@ pub const ONE_SHOT_BUILD_ID: i32 = i32::MAX;
 pub struct Chroots {
     config: std::sync::Mutex<PoolConfig>,
     /// Owner of the cache subvolume made when the pool opens.
-    cache_owner: (u32, u32),
+    cache_owner: aurcache_chroot::Owner,
     pool: RwLock<Option<Pool>>,
     /// When opening the pool last failed, so retries are spaced out.
     last_failure: std::sync::Mutex<Option<Instant>>,
@@ -53,6 +53,11 @@ pub struct Chroots {
     /// Whether the last readiness check found the host short of room, so the
     /// change is logged once rather than at every poll.
     short_of_room: AtomicBool,
+    /// Builds holding a lease now: a pool is only made again with none.
+    active: AtomicUsize,
+    /// Whether the worker is draining to make an oversized pool again, so
+    /// that is logged once.
+    draining: AtomicBool,
 }
 
 impl Chroots {
@@ -60,7 +65,11 @@ impl Chroots {
     /// [`Self::open`], so a pool that cannot be opened yet costs a worker its
     /// builds, not its ability to start and say why.
     #[must_use]
-    pub fn new(config: PoolConfig, interval: Duration, cache_owner: (u32, u32)) -> Self {
+    pub fn new(
+        config: PoolConfig,
+        interval: Duration,
+        cache_owner: aurcache_chroot::Owner,
+    ) -> Self {
         Self {
             config: std::sync::Mutex::new(config),
             cache_owner,
@@ -69,6 +78,8 @@ impl Chroots {
             last_refresh: Mutex::new(None),
             interval: AtomicU64::new(interval.as_secs()),
             short_of_room: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -141,6 +152,9 @@ impl Chroots {
         if !self.open().await {
             return false;
         }
+        if !self.shrink_when_idle().await {
+            return false;
+        }
         let free = self.pool.read().await.as_ref().and_then(Pool::host_free);
         let short = free.is_some_and(|free| free < build_limit);
         let was_short = self.short_of_room.swap(short, Ordering::Relaxed);
@@ -169,13 +183,69 @@ impl Chroots {
 
     /// Set the total everything in the pool may use. Applies at once, to
     /// builds already running.
+    ///
+    /// An image that holds too much to shrink to it is made again, empty, at
+    /// the new size -- once the builds running now have finished, which is
+    /// why the worker takes no new ones meanwhile. See
+    /// [`Self::shrink_when_idle`].
     pub async fn set_total(&self, total: u64) -> Result<()> {
         self.config.lock().expect("not poisoned").total = total;
         match self.pool.read().await.as_ref() {
-            Some(pool) => pool.set_total(total).await,
+            Some(pool) => pool.set_total(total).await.map(drop),
             // Opened with it, whenever it is.
             None => Ok(()),
         }
+    }
+
+    /// Whether the pool is the size its total asks for, making it again if it
+    /// is not and nothing is building.
+    ///
+    /// An image holding more than fits in its new size cannot shrink online,
+    /// and the only way down is to delete it and make a new one. That throws
+    /// the caches and the base chroot away -- they are rebuilt on the next
+    /// build -- but not the worker's identity, which lives outside the pool.
+    /// A build in flight holds a subvolume in it, so this waits for none to
+    /// be, and the worker claims nothing new until then.
+    async fn shrink_when_idle(&self) -> bool {
+        let oversized = self.pool.read().await.as_ref().and_then(Pool::oversized);
+        let Some(wanted) = oversized else {
+            self.draining.store(false, Ordering::Relaxed);
+            return true;
+        };
+        let active = self.active.load(Ordering::SeqCst);
+        if active > 0 {
+            if !self.draining.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "the storage pool holds more than fits in {} (WORKER_DISK_MAX was lowered): \
+                     taking no builds until the {active} running finish, then making it again \
+                     at that size, with cold caches",
+                    gib(wanted)
+                );
+            }
+            return false;
+        }
+        let mut guard = self.pool.write().await;
+        // A lease may have been taken between the check and the lock.
+        if self.active.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        let Some(pool) = guard.take() else {
+            return false;
+        };
+        tracing::warn!(
+            "making the storage pool again at {}: its caches and base chroot start over",
+            gib(wanted)
+        );
+        if let Err(e) = pool.destroy().await {
+            tracing::error!("could not remove the oversized pool ({e:#}); retrying later");
+            *self.last_failure.lock().expect("not poisoned") = Some(Instant::now());
+            return false;
+        }
+        *self.last_refresh.lock().await = None;
+        self.draining.store(false, Ordering::Relaxed);
+        drop(guard);
+        // Made again the way a first start makes it.
+        self.open().await
     }
 
     /// Remove what builds left in the pool, except those in `keep`. Returns
@@ -201,11 +271,8 @@ impl Chroots {
         pacman_conf: &Path,
         report_to: Option<(&WorkerClient, i32)>,
     ) -> Result<PathBuf> {
-        if !self.open().await {
-            bail!("the storage pool is not available; see the worker's log");
-        }
-        let guard = self.pool.read().await;
-        let pool = guard.as_ref().expect("opened above");
+        let guard = self.open_pool().await?;
+        let pool = guard.as_ref().expect("open_pool hands out an open pool");
         let root = pool.root();
         let mut last = self.last_refresh.lock().await;
         if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval()) {
@@ -248,21 +315,51 @@ impl Chroots {
     /// Take a chroot for one build, limited to `limit` bytes of disk. Give it
     /// back with [`Self::release`], or use [`Self::with_lease`].
     pub async fn acquire(&self, build_id: i32, limit: Option<u64>) -> Result<Lease> {
-        if !self.open().await {
-            bail!("the storage pool is not available; see the worker's log");
-        }
-        let guard = self.pool.read().await;
-        let pool = guard.as_ref().expect("opened above");
+        let guard = self.open_pool().await?;
+        let pool = guard.as_ref().expect("open_pool hands out an open pool");
+        // Counted before the lease is taken, under the read lock: a pool is
+        // only made again with the write lock and no build counted, so it can
+        // never go while a lease is being taken from it.
+        self.active.fetch_add(1, Ordering::SeqCst);
         // Shared, for the instant of the snapshot: a refresh must not be
         // halfway through the base when it is taken.
         let lock = chroot::share_base_chroot(&pool.root()).await;
         let volumes = pool.lease(build_id, limit).await;
         drop(lock);
-        Ok(Lease {
+        let volumes = match volumes {
+            Ok(volumes) => volumes,
+            Err(e) => {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
+        let lease = Lease {
             dir: pool.path().to_path_buf(),
-            volumes: volumes?,
+            volumes,
             limit,
-        })
+        };
+        // The guard goes before `release`, which takes the lock again: with a
+        // writer queued in between, a second read would wait on it for good.
+        drop(guard);
+        if let Err(e) = std::fs::create_dir(lease.tmpdir()) {
+            self.release(lease).await;
+            return Err(e).context("making the build's temporary directory");
+        }
+        Ok(lease)
+    }
+
+    /// A read guard on the pool, opened. Opened again if it was made again
+    /// between the open and the lock.
+    async fn open_pool(&self) -> Result<tokio::sync::RwLockReadGuard<'_, Option<Pool>>> {
+        loop {
+            if !self.open().await {
+                bail!("the storage pool is not available; see the worker's log");
+            }
+            let guard = self.pool.read().await;
+            if guard.is_some() {
+                return Ok(guard);
+            }
+        }
     }
 
     /// Give a build's chroot back: both its subvolumes go, and the space they
@@ -275,9 +372,10 @@ impl Chroots {
         match self.pool.read().await.as_ref() {
             Some(pool) => pool.release(lease.volumes).await,
             // Not reachable: a lease comes from an open pool, and a pool is
-            // never closed while the worker runs. The sweep would find it.
+            // only made again once no lease is held. The sweep would find it.
             None => drop(lease.volumes),
         }
+        self.active.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Run `body` with a chroot and give it back afterwards -- on the error
@@ -353,11 +451,23 @@ impl Lease {
         self.volumes.label()
     }
 
-    /// The build's own writable space, counted against its quota: where its
-    /// source is extracted and its packages land.
+    /// Where the build's source is extracted, and its packages land: in its
+    /// own subvolume, counted against its quota.
+    ///
+    /// A directory of its own rather than the subvolume's top, which also
+    /// holds [`Self::tmpdir`]: the extraction takes the one directory it finds
+    /// as the package's, and must find nothing else there.
     #[must_use]
-    pub fn workdir(&self) -> &Path {
-        self.volumes.data()
+    pub fn srcdir(&self) -> PathBuf {
+        self.volumes.data().join("src")
+    }
+
+    /// Where devtools makes its working directory for this build, and where
+    /// the host-side source download writes: inside the build's own
+    /// subvolume, so under its quota. See [`crate::chroot::devtools_in`].
+    #[must_use]
+    pub fn tmpdir(&self) -> PathBuf {
+        self.volumes.data().join("tmp")
     }
 
     /// The disk this build may use, `None` when unlimited.

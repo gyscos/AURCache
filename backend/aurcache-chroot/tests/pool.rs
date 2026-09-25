@@ -5,7 +5,7 @@
 //! images go under Cargo's target directory rather than `/tmp`, which is often
 //! a size-limited tmpfs.
 
-use aurcache_chroot::{Backing, Pool, PoolConfig};
+use aurcache_chroot::{Backing, Owner, Pool, PoolConfig, Resize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,9 +20,8 @@ fn enabled() -> bool {
     true
 }
 
-fn owner() -> (u32, u32) {
-    // SAFETY: neither call has preconditions or can fail.
-    unsafe { (libc::getuid(), libc::getgid()) }
+fn owner() -> Owner {
+    Owner::current()
 }
 
 fn sudo(args: &[&str]) -> std::process::Output {
@@ -237,6 +236,16 @@ async fn reopening_finds_the_same_pool() {
 
     // Unmounted and detached: a reboot. No mkfs this time.
     pool.unmount().await.unwrap();
+    let attached = sudo(&[
+        "losetup",
+        "-j",
+        scratch.0.join("pool.img").to_str().unwrap(),
+    ]);
+    assert!(
+        attached.stdout.is_empty(),
+        "the loop device outlived the mount: {}",
+        String::from_utf8_lossy(&attached.stdout)
+    );
     let pool = Pool::open(config(&scratch, 800 * MIB)).await.unwrap();
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "still here");
     assert_eq!(pool.total_usage().unwrap().limit, Some(800 * MIB));
@@ -288,10 +297,10 @@ async fn the_image_follows_the_total_both_ways() {
     let small = len();
     assert_eq!(small, aurcache_chroot::pool::size_for(600 * MIB));
 
-    pool.set_total(4096 * MIB).await.unwrap();
+    assert_eq!(pool.set_total(4096 * MIB).await.unwrap(), Resize::Fits);
     assert_eq!(len(), aurcache_chroot::pool::size_for(4096 * MIB), "grown");
 
-    pool.set_total(600 * MIB).await.unwrap();
+    assert_eq!(pool.set_total(600 * MIB).await.unwrap(), Resize::Fits);
     assert_eq!(len(), small, "shrunk back: the base fits");
     assert_eq!(pool.total_usage().unwrap().limit, Some(600 * MIB));
     assert!(pool.root().join("usr/blob").exists(), "the data survived");
@@ -362,5 +371,43 @@ async fn a_released_builds_group_is_cleared_by_a_later_lease() {
         "the first build's group outlived the next lease"
     );
     pool.release(second).await;
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pool_too_full_to_shrink_is_made_again_at_the_new_size() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("recreate");
+    let image = scratch.0.join("pool.img");
+    let pool = Pool::open(config(&scratch, 4096 * MIB)).await.unwrap();
+    let cache = pool
+        .ensure_subvolume("cache", owner(), 0o2775)
+        .await
+        .unwrap();
+    assert!(write(&cache.join("big"), 3072 * MIB).is_none());
+    sync(&pool);
+
+    // 3 GiB held, and the new total asks for 600 MiB plus the 2 GiB margin.
+    let resize = pool.set_total(600 * MIB).await.unwrap();
+    assert!(matches!(resize, Resize::TooFull { .. }), "{resize:?}");
+    assert!(pool.oversized().is_some());
+    assert_eq!(
+        pool.total_usage().unwrap().limit,
+        Some(600 * MIB),
+        "the lower total binds regardless"
+    );
+
+    pool.destroy().await.unwrap();
+    assert!(!image.exists());
+    let pool = Pool::open(config(&scratch, 600 * MIB)).await.unwrap();
+    assert_eq!(
+        std::fs::metadata(&image).unwrap().len(),
+        aurcache_chroot::pool::size_for(600 * MIB),
+        "made again at the new size"
+    );
+    assert!(!pool.path().join("cache").exists(), "and empty");
+    assert!(pool.oversized().is_none());
     pool.unmount().await.unwrap();
 }

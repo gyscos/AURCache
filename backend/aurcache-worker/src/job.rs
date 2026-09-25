@@ -323,7 +323,7 @@ async fn run_job_inner(
                 .await
                 .context("downloading source")?;
             let pkgdir =
-                artifacts::extract_source(&source, lease.workdir()).context("extracting source")?;
+                artifacts::extract_source(&source, &lease.srcdir()).context("extracting source")?;
 
             // The archive unpacks owned by this worker's user, with the modes
             // baked into it (0644/0755); the build then runs as a *different*
@@ -593,7 +593,7 @@ async fn run_build(
     // needs is whether it moved while it ran.
     let total_ooms_before = ctx.cgroups.and_then(Hierarchy::total_ooms);
     let spawn = |argv: &[String]| {
-        let mut cmd = chroot::devtools(&argv[0]);
+        let mut cmd = chroot::devtools_in(&argv[0], &ctx.lease.tmpdir());
         cmd.args(&argv[1..]).current_dir(pkgdir).kill_on_drop(true);
         // The build's own process group: alone it enables the process-group
         // SIGKILL fallback below, which takes makechrootpkg's whole tree even

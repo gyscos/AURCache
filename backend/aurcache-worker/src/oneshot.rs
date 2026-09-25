@@ -72,7 +72,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
                 );
                 tracing::info!("$ sudo {}", argv.join(" "));
 
-                let mut cmd = chroot::devtools(&argv[0]);
+                let mut cmd = chroot::devtools_in(&argv[0], &lease.tmpdir());
                 cmd.args(&argv[1..]).current_dir(&pkgdir);
                 // devtools binds `$SRCDEST` itself; unset, it falls back to the
                 // PKGBUILD directory and downloads are not cached between runs.
