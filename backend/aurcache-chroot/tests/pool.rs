@@ -496,7 +496,7 @@ async fn a_device_pool_is_formatted_built_on_and_its_filesystem_fitted_to_the_to
     let backing = scratch.0.join("disk.img");
     std::fs::File::create(&backing)
         .unwrap()
-        .set_len(3072 * MIB)
+        .set_len(4096 * MIB)
         .unwrap();
     let device =
         String::from_utf8(sudo(&["losetup", "--find", "--show", backing.to_str().unwrap()]).stdout)
@@ -522,7 +522,7 @@ async fn a_device_pool_is_formatted_built_on_and_its_filesystem_fitted_to_the_to
 
     // More than the device holds: grown to the device, and no further.
     assert_eq!(pool.set_total(4096 * MIB).await.unwrap(), Resize::Fits);
-    assert_eq!(fs_size(&pool), 3072 * MIB);
+    assert_eq!(fs_size(&pool), 4096 * MIB);
 
     // Less than it holds: the filesystem keeps its size, and says so.
     sudo_ok(&[
