@@ -918,24 +918,42 @@ fn apply_patch_to_archive(
 ) -> anyhow::Result<(Vec<u8>, SourceInfoV1)> {
     use crate::pkgbuild::parse_pkgbuild_content;
 
-    let (pkgbase, mut files) = extract_tar_gz_to_memory(archive_bytes)?;
+    let mut archive = extract_tar_gz_to_memory(archive_bytes)?;
 
     for rel_path in patch.paths() {
-        let original = files.get(rel_path).cloned().unwrap_or_default();
+        // A file keeps its mode; one the patch creates is an ordinary 0644.
+        let (mode, original) = match archive.entries.get(rel_path) {
+            None => (0o644, Vec::new()),
+            Some(MemoryEntry {
+                mode,
+                kind: EntryKind::File(content),
+            }) => (*mode, content.clone()),
+            Some(_) => anyhow::bail!("'{rel_path}' is a symlink or a directory, cannot patch it"),
+        };
         let original = String::from_utf8(original)
             .map_err(|_| anyhow::anyhow!("File '{rel_path}' is not valid UTF-8, cannot patch"))?;
         let patched = patch.apply_to_content(rel_path, &original)?;
-        files.insert(rel_path.to_string(), patched.into_bytes());
+        archive.entries.insert(
+            rel_path.to_string(),
+            MemoryEntry {
+                mode,
+                kind: EntryKind::File(patched.into_bytes()),
+            },
+        );
     }
 
-    let pkgbuild = files
-        .get("PKGBUILD")
-        .ok_or_else(|| anyhow::anyhow!("Archive has no PKGBUILD to parse"))?;
+    let pkgbuild = match archive.entries.get("PKGBUILD") {
+        Some(MemoryEntry {
+            kind: EntryKind::File(content),
+            ..
+        }) => content,
+        _ => anyhow::bail!("Archive has no PKGBUILD to parse"),
+    };
     let pkgbuild = std::str::from_utf8(pkgbuild)
         .map_err(|_| anyhow::anyhow!("PKGBUILD is not valid UTF-8, cannot parse"))?;
     let sourceinfo = parse_pkgbuild_content(pkgbuild, network)?;
 
-    let tar_gz_bytes = create_archive_from_memory(&pkgbase, &files)?;
+    let tar_gz_bytes = create_archive_from_memory(&archive)?;
 
     Ok((tar_gz_bytes, sourceinfo))
 }
@@ -974,58 +992,108 @@ fn build_cache_entry(
     })
 }
 
-/// Unpack a `{pkgbase}/...` tar.gz archive entirely into memory, returning
-/// the pkgbase directory name and a map of file paths (relative to that
-/// directory) to their raw bytes.
-fn extract_tar_gz_to_memory(
-    archive_bytes: &[u8],
-) -> anyhow::Result<(String, BTreeMap<String, Vec<u8>>)> {
+/// A `{pkgbase}/...` source archive, held in memory to be patched.
+struct MemoryArchive {
+    /// The top-level directory every entry sits in.
+    pkgbase: String,
+    /// Every entry, by its path relative to that directory. Sorted, so a
+    /// directory comes before what it holds when the archive is written back.
+    entries: BTreeMap<String, MemoryEntry>,
+}
+
+/// One entry of a [`MemoryArchive`], with its permission bits.
+struct MemoryEntry {
+    mode: u32,
+    kind: EntryKind,
+}
+
+enum EntryKind {
+    File(Vec<u8>),
+    /// A symlink, and where it points: kept as a link, never followed.
+    Symlink(PathBuf),
+    Dir,
+}
+
+/// Unpack a `{pkgbase}/...` tar.gz archive entirely into memory.
+///
+/// Files, directories and symlinks are all kept, each with its mode: a
+/// patched source must be the unpatched one with only the patched files'
+/// contents changed. Keeping regular files alone dropped every symlink and
+/// empty directory, and writing them back as 0644 took the executable bit off
+/// every script a PKGBUILD runs from its source directory.
+fn extract_tar_gz_to_memory(archive_bytes: &[u8]) -> anyhow::Result<MemoryArchive> {
     let decoder = flate2::read::GzDecoder::new(archive_bytes);
     let mut archive = tar::Archive::new(decoder);
 
     let mut pkgbase = None;
-    let mut files = BTreeMap::new();
+    let mut entries = BTreeMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
         let path = entry.path()?.to_string_lossy().to_string();
         let Some((dir, rel_path)) = path.split_once('/') else {
             continue;
         };
+        let rel_path = rel_path.trim_end_matches('/');
+        if rel_path.is_empty() {
+            continue;
+        }
         if pkgbase.is_none() {
             pkgbase = Some(dir.to_string());
         }
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        files.insert(rel_path.to_string(), buf);
+        let mode = entry.header().mode()?;
+        let kind = match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                EntryKind::File(buf)
+            }
+            tar::EntryType::Symlink => {
+                let Some(target) = entry.link_name()? else {
+                    continue;
+                };
+                EntryKind::Symlink(target.into_owned())
+            }
+            tar::EntryType::Directory => EntryKind::Dir,
+            // Nothing a package checkout holds; the archiver makes none.
+            _ => continue,
+        };
+        entries.insert(rel_path.to_string(), MemoryEntry { mode, kind });
     }
 
     let pkgbase = pkgbase
         .ok_or_else(|| anyhow::anyhow!("Extracted archive did not contain a pkgbase directory"))?;
-    Ok((pkgbase, files))
+    Ok(MemoryArchive { pkgbase, entries })
 }
 
-/// Re-package an in-memory `{relative path -> bytes}` map into a `{pkgbase}/...`
-/// tar.gz archive, matching the layout produced by [`extract_tar_gz_to_memory`].
-fn create_archive_from_memory(
-    pkgbase: &str,
-    files: &BTreeMap<String, Vec<u8>>,
-) -> anyhow::Result<Vec<u8>> {
+/// Re-package a [`MemoryArchive`] as a `{pkgbase}/...` tar.gz, entries as they
+/// were read: files with their modes, symlinks as links, directories.
+fn create_archive_from_memory(archive: &MemoryArchive) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
-    for (rel_path, content) in files {
+    for (rel_path, entry) in &archive.entries {
+        let path = format!("{}/{rel_path}", archive.pkgbase);
         let mut header = tar::Header::new_gnu();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(
-            &mut header,
-            format!("{pkgbase}/{rel_path}"),
-            content.as_slice(),
-        )?;
+        header.set_mode(entry.mode);
+        match &entry.kind {
+            EntryKind::File(content) => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(content.len() as u64);
+                header.set_cksum();
+                tar.append_data(&mut header, path, content.as_slice())?;
+            }
+            EntryKind::Symlink(target) => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                tar.append_link(&mut header, path, target)?;
+            }
+            EntryKind::Dir => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_cksum();
+                tar.append_data(&mut header, path, std::io::empty())?;
+            }
+        }
     }
     // Finish explicitly: dropping the encoder would swallow a compression error.
     tar.into_inner()?.finish()?;
@@ -1146,6 +1214,7 @@ license=('MIT')
     struct ArchivedEntry {
         path: String,
         kind: tar::EntryType,
+        mode: u32,
         /// Where a link points, for a symlink or a hard link.
         link: Option<String>,
         data: Vec<u8>,
@@ -1162,6 +1231,7 @@ license=('MIT')
                 let mut entry = entry.unwrap();
                 let path = entry.path().unwrap().to_string_lossy().to_string();
                 let kind = entry.header().entry_type();
+                let mode = entry.header().mode().unwrap();
                 let link = entry
                     .link_name()
                     .unwrap()
@@ -1171,6 +1241,7 @@ license=('MIT')
                 ArchivedEntry {
                     path,
                     kind,
+                    mode,
                     link,
                     data,
                 }
@@ -1230,6 +1301,46 @@ license=('MIT')
             !entries.iter().any(|e| e.path.starts_with("demo/leakdir/")),
             "a linked directory was walked"
         );
+    }
+
+    /// Patching rewrites the archive from memory, and a patched source must
+    /// be the original with only the patched files changed: scripts keep
+    /// their executable bit, links stay links, empty directories stay.
+    #[test]
+    fn an_archive_rebuilt_from_memory_keeps_modes_links_and_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let checkout = tempfile::tempdir().unwrap();
+        let dir = checkout.path();
+        std::fs::write(dir.join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        std::fs::write(dir.join("build.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dir.join("build.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("PKGBUILD", dir.join("link")).unwrap();
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        std::fs::set_permissions(dir.join("empty"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+
+        let original = create_archive_with_pkgbase_dir(dir, "demo").unwrap();
+        let memory = extract_tar_gz_to_memory(&original).unwrap();
+        assert_eq!(memory.pkgbase, "demo");
+        let rebuilt = archive_entries(&create_archive_from_memory(&memory).unwrap());
+        let find = |p: &str| {
+            rebuilt
+                .iter()
+                .find(|e| e.path == p)
+                .unwrap_or_else(|| panic!("{p} was dropped"))
+        };
+
+        let script = find("demo/build.sh");
+        assert_eq!(script.kind, tar::EntryType::Regular);
+        assert_eq!(script.mode & 0o777, 0o755, "the executable bit");
+        assert_eq!(script.data, b"#!/bin/sh\n");
+        let link = find("demo/link");
+        assert_eq!(link.kind, tar::EntryType::Symlink);
+        assert_eq!(link.link.as_deref(), Some("PKGBUILD"));
+        let empty = find("demo/empty");
+        assert_eq!(empty.kind, tar::EntryType::Directory);
+        assert_eq!(empty.mode & 0o777, 0o700);
     }
 
     /// `.SRCINFO` and the pkgbase fallback read the checkout unconfined, so a
