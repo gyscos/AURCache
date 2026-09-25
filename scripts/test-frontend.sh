@@ -442,7 +442,10 @@ for entry in "${ROUTES[@]}"; do
     echo "  ok    $route ($desc)"
 
     if [ -n "$SHOTS" ]; then
-        name="$(printf '%s' "${route#/}" | tr '/' '-')"
+        # Routes carry query/fragment characters (`?`, `#`, `=`, `:` …) that
+        # `actions/upload-artifact` rejects (NTFS-forbidden `" : < > | * ?`).
+        # Keep only a safe allowlist so every shot uploads.
+        name="$(printf '%s' "${route#/}" | tr '/' '-' | tr -c 'A-Za-z0-9_.-' '-')"
         [ -z "$name" ] && name="index"
         "$CHROME" --headless --disable-gpu --no-sandbox --user-data-dir="$CHROME_PROFILE" --hide-scrollbars \
             --window-size=1440,1400 --virtual-time-budget=8000 \
