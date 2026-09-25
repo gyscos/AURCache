@@ -812,3 +812,42 @@ async fn builds_filter_by_worker_and_state() {
         "names the valid states: {body}"
     );
 }
+
+/// The disk breakdown a worker reported comes back on the build, and a build
+/// without one has none -- not a row of zeros.
+#[rocket::async_test]
+async fn a_builds_disk_usage_is_listed_with_it() {
+    use sea_orm::ConnectionTrait;
+    let (client, db) = test_client().await;
+    let hello = seed(&db, "hello").await;
+    let world = seed(&db, "world").await;
+    insert_build(&db, hello, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
+    insert_build(&db, world, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
+    db.execute_unprepared(&format!(
+        "UPDATE builds SET disk_chroot = 700, disk_workdir = 50, disk_sources = 9 \
+         WHERE pkg_id = {hello}"
+    ))
+    .await
+    .unwrap();
+
+    let response = client.get("/api/builds").dispatch().await;
+    let builds: Vec<aurcache_api::models::builds::BuildSummary> =
+        response.into_json().await.expect("a build list");
+    let usage_of = |name: &str| {
+        builds
+            .iter()
+            .find(|b| b.pkg_name == name)
+            .unwrap()
+            .disk_usage
+    };
+    assert_eq!(
+        usage_of("hello"),
+        Some(aurcache_common::api::builds::DiskUsage {
+            chroot: Some(700),
+            workdir: Some(50),
+            sources: Some(9),
+            build_tree: None,
+        })
+    );
+    assert_eq!(usage_of("world"), None);
+}

@@ -39,6 +39,7 @@ mod m20260923_000000_build_dashboard_indexes;
 mod m20260924_000000_worker_settings;
 mod m20260925_000000_worker_paused;
 mod m20260926_000000_drop_download_counts;
+mod m20260927_000000_build_disk_usage;
 
 pub struct Migrator;
 
@@ -92,6 +93,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260924_000000_worker_settings::Migration),
             Box::new(m20260925_000000_worker_paused::Migration),
             Box::new(m20260926_000000_drop_download_counts::Migration),
+            Box::new(m20260927_000000_build_disk_usage::Migration),
         ]
     }
 }

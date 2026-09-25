@@ -403,6 +403,15 @@ impl Chroots {
         out
     }
 
+    /// What a build's chroot and working space hold now. Empty when the pool
+    /// is not open.
+    pub async fn build_usage(&self, lease: &Lease) -> aurcache_chroot::BuildUsage {
+        match self.pool.read().await.as_ref() {
+            Some(pool) => pool.build_usage(&lease.volumes).await,
+            None => aurcache_chroot::BuildUsage::default(),
+        }
+    }
+
     /// Why a build that failed may have failed for want of disk, in the terms
     /// of the setting to change. `None` when neither its quota nor the pool's
     /// total was reached.

@@ -21,5 +21,7 @@ mkdir -p /tmp/aurcache-legacy-builds
 
 export E2E_COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e-hybrid-legacy.yaml"
 export E2E_SERVICES="aurcache"
+# The container builder has no storage pool, so its builds report no disk use.
+export E2E_EXPECT_DISK_USAGE=0
 
 exec "$SCRIPT_DIR/test-e2e.sh" "${1:-hello}" "${2:-8090}" "${3:-900}"

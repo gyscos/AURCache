@@ -541,3 +541,35 @@ async fn a_device_pool_is_formatted_built_on_and_its_filesystem_fitted_to_the_to
     pool.unmount().await.unwrap();
     sudo_ok(&["losetup", "-d", &device]);
 }
+
+#[tokio::test]
+async fn a_builds_usage_is_measured_part_by_part() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("usage");
+    let pool = Pool::open(config(&scratch, 600 * MIB)).await.unwrap();
+    make_base(&pool, 20).await;
+    let build = pool.lease(1, Some(256 * MIB)).await.unwrap();
+    assert!(write(&build.data().join("pkg.tar.zst"), 16 * MIB).is_none());
+    sudo_ok(&[
+        "sh",
+        "-c",
+        &format!(
+            "head -c 8M /dev/urandom > {}",
+            build.chroot().join("usr/dep").display()
+        ),
+    ]);
+
+    // No sync by the caller: build_usage commits before it reads.
+    let usage = pool.build_usage(&build).await;
+    let chroot = usage.chroot.unwrap();
+    let data = usage.data.unwrap();
+    assert!(
+        (7 * MIB..12 * MIB).contains(&chroot),
+        "the chroot counts its own writes, not the 20M base it shares: {chroot}"
+    );
+    assert!((15 * MIB..20 * MIB).contains(&data), "{data}");
+    pool.release(build).await;
+    pool.unmount().await.unwrap();
+}

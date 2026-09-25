@@ -11,6 +11,7 @@ use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
 use aurcache_common::api::build_log::align;
+use aurcache_common::api::builds::DiskUsage;
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
@@ -416,6 +417,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // even queued has no start, and an ended build always has an end.
     let start_time = use_signal(|| None::<i64>);
     let end_time = use_signal(|| None::<i64>);
+    // What the build used on its worker's disk, once it has ended and the
+    // worker reported it.
+    let disk_usage = use_signal(|| None::<DiskUsage>);
     let error = use_signal(|| Option::<String>::None);
     // True for a couple of seconds after a successful copy, so the button
     // swaps its icon and label to say the log is now on the clipboard.
@@ -453,6 +457,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         let (mut log, mut log_size, mut tail) = (log, log_size, tail);
         let (mut worker_name, mut status, mut start_time, mut end_time) =
             (worker_name, status, start_time, end_time);
+        let mut disk_usage = disk_usage;
         let (mut finished, mut error, following) = (finished, error, following);
         let cap = cap();
         let pkgbase = pkgbase_for_poll.clone();
@@ -492,6 +497,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         status.set(Some(build.status));
                         start_time.set(build.start_time);
                         end_time.set(build.end_time);
+                        disk_usage.set(build.disk_usage);
                         log_size.set(build.log_size);
                         // A successful poll clears a previous failure: the
                         // banner should describe now, not the worst moment so
@@ -663,6 +669,13 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             } else {
                                 {format!("· took {}", format_duration(Some(start), end_time()))}
                             }
+                        }
+                    }
+                    if let Some(disk) = disk_usage().as_ref().and_then(disk_usage_summary) {
+                        span {
+                            class: "text-sm opacity-70 whitespace-nowrap",
+                            title: "Disk the build used on its worker, as stored: what it installed into its chroot, its working space (source and packages), its package's source cache, and its kept build tree.",
+                            "Disk: {disk}"
                         }
                     }
                     div { class: "flex-1" }
@@ -919,5 +932,44 @@ fn LogCopyButton(
                 }
             }
         }
+    }
+}
+
+/// The measured parts of a build's disk usage, as one line: `chroot 1.2 GiB ·
+/// workdir 40 MiB`. `None` when nothing was measured. A part left out was not
+/// measured -- which is not the same as zero, so it is not shown as one.
+pub(crate) fn disk_usage_summary(usage: &DiskUsage) -> Option<String> {
+    let parts: Vec<String> = [
+        ("chroot", usage.chroot),
+        ("workdir", usage.workdir),
+        ("sources", usage.sources),
+        ("build tree", usage.build_tree),
+    ]
+    .into_iter()
+    .filter_map(|(name, bytes)| {
+        let bytes = u64::try_from(bytes?).ok()?;
+        Some(format!("{name} {}", format_bytes(bytes)))
+    })
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+#[cfg(test)]
+mod disk_usage_tests {
+    use super::*;
+
+    #[test]
+    fn only_measured_parts_are_shown() {
+        let usage = DiskUsage {
+            chroot: Some(3 << 30),
+            workdir: Some(40 << 20),
+            sources: None,
+            build_tree: Some(0),
+        };
+        assert_eq!(
+            disk_usage_summary(&usage).as_deref(),
+            Some("chroot 3.0 GiB · workdir 40 MiB · build tree 0 B")
+        );
+        assert_eq!(disk_usage_summary(&DiskUsage::default()), None);
     }
 }

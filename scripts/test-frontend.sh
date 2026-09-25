@@ -200,6 +200,7 @@ ROUTES=(
     # A finished build reports its recorded total; a running one (the fixture
     # gives visual-studio-code-bin a start but no end) measures to now.
     "/package/hello/build/1|took 43s|a finished build reports its total duration"
+    "/package/hello/build/1|chroot 3.0 GiB · workdir 40 MiB · sources 1.0 MiB|a finished build reports its disk usage"
     "/package/visual-studio-code-bin/build/1|so far|a running build's duration is measured to now"
     # Stop asks first. Whether the dialog opens on click is an interaction
     # test; this is only that a running build renders one to open.
@@ -273,8 +274,6 @@ ROUTES=(
     # Summed over every version and architecture the package has produced
     # (1200 + 34 + 99), and not over `hello-world`, which a prefix match on the
     # name would have swallowed.
-    "/package/hello|1333 downloads|downloads are counted across a package's files"
-    "/package/neofetch|not downloaded yet|a package nobody has fetched says so"
     "/settings|Version check interval|settings"
     # The fixture server runs with VERSION_CHECK_INTERVAL set, so this row is
     # env-locked. Naming the variable proves the source made it all the way

@@ -557,10 +557,11 @@ impl Pool {
         if !root.join("usr").exists() {
             bail!("the pool has no base chroot yet at {}", root.display());
         }
-        let volumes = BuildVolumes {
+        let mut volumes = BuildVolumes {
             chroot: self.mountpoint.join(chroot_name(build_id)),
             data: self.mountpoint.join(data_name(build_id)),
             group: QgroupId::build(build_id),
+            ids: None,
             released: false,
         };
         // Leftovers under this id, from a crash between making these and
@@ -584,21 +585,46 @@ impl Pool {
                 self.btrfs(&["qgroup", "create", &volumes.group.to_string()])
                     .await?;
             }
-            for subvolume in [&volumes.chroot, &volumes.data] {
-                let id = subvolume_id(subvolume).await?;
+            let ids = SubvolumeIds {
+                chroot: subvolume_id(&volumes.chroot).await?,
+                data: subvolume_id(&volumes.data).await?,
+            };
+            for id in [ids.chroot, ids.data] {
                 self.assign(QgroupId::subvolume(id), volumes.group).await?;
             }
             self.assign(volumes.group, TOTAL).await?;
             let limit = limit.map_or_else(|| "none".to_string(), |l| l.to_string());
             self.btrfs(&["qgroup", "limit", &limit, &volumes.group.to_string()])
                 .await?;
-            anyhow::Ok(())
+            anyhow::Ok(ids)
         };
-        if let Err(e) = made.await {
-            self.remove_build(build_id).await;
-            return Err(e).with_context(|| format!("preparing build {build_id}'s volumes"));
+        match made.await {
+            Ok(ids) => volumes.ids = Some(ids),
+            Err(e) => {
+                self.remove_build(build_id).await;
+                return Err(e).with_context(|| format!("preparing build {build_id}'s volumes"));
+            }
         }
         Ok(volumes)
+    }
+
+    /// What a build's chroot and working space hold now. Commits first: the
+    /// quota figures only move when a transaction does, and a build that just
+    /// ended has usually written more than the last commit saw.
+    pub async fn build_usage(&self, volumes: &BuildVolumes) -> BuildUsage {
+        let Some(ids) = volumes.ids else {
+            return BuildUsage::default();
+        };
+        let _ = self.btrfs(&["filesystem", "sync"]).await;
+        let used = |id| {
+            self.qgroups
+                .usage(QgroupId::subvolume(id))
+                .map(|usage| usage.used)
+        };
+        BuildUsage {
+            chroot: used(ids.chroot),
+            data: used(ids.data),
+        }
     }
 
     /// Give a build's volumes back. See [`BuildVolumes::release`].
@@ -750,7 +776,28 @@ pub struct BuildVolumes {
     chroot: PathBuf,
     data: PathBuf,
     group: QgroupId,
+    /// The two subvolumes' ids, whose own groups say what each holds. Set
+    /// once the lease has made them.
+    ids: Option<SubvolumeIds>,
     released: bool,
+}
+
+/// The subvolume ids of one build's chroot and working space.
+#[derive(Clone, Copy, Debug)]
+struct SubvolumeIds {
+    chroot: u64,
+    data: u64,
+}
+
+/// What one build's two subvolumes hold, in bytes as stored. `None` for a
+/// part that could not be read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildUsage {
+    /// What the build wrote into its chroot snapshot; the base it shares is
+    /// charged to the base.
+    pub chroot: Option<u64>,
+    /// Its working space: source, temporary files, packages.
+    pub data: Option<u64>,
 }
 
 impl BuildVolumes {

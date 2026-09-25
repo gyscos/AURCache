@@ -101,6 +101,25 @@ pub async fn record_peak_memory<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Record the disk a build used on its worker, part by part. Best-effort, for
+/// the same reason as [`record_peak_memory`], and for a failed build too: one
+/// that ran out of disk is the one whose figures matter most.
+pub async fn record_disk_usage<C: ConnectionTrait>(
+    db: &C,
+    build_id: i32,
+    usage: &aurcache_common::api::builds::DiskUsage,
+) -> Result<(), DbErr> {
+    Builds::update_many()
+        .col_expr(builds::Column::DiskChroot, usage.chroot.into())
+        .col_expr(builds::Column::DiskWorkdir, usage.workdir.into())
+        .col_expr(builds::Column::DiskSources, usage.sources.into())
+        .col_expr(builds::Column::DiskBuildTree, usage.build_tree.into())
+        .filter(builds::Column::Id.eq(build_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// A build the worker was building is no longer `ACTIVE`-and-owned by it (the
 /// lease was reclaimed by the reaper and possibly re-handed to another worker).
 /// The late completion must be discarded rather than clobbering the new owner.
@@ -429,6 +448,29 @@ mod tests {
         let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
         assert_eq!(row.peak_memory, Some(6 * 1024 * 1024 * 1024));
         assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
+    }
+
+    /// A build's disk usage is kept part by part, and a part the worker did
+    /// not measure stays unknown rather than becoming 0.
+    #[tokio::test]
+    async fn disk_usage_is_recorded_part_by_part() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+
+        let usage = aurcache_common::api::builds::DiskUsage {
+            chroot: Some(700),
+            workdir: Some(50),
+            sources: Some(9),
+            build_tree: None,
+        };
+        record_disk_usage(&db, 1, &usage).await.unwrap();
+
+        let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
+        assert_eq!(row.disk_chroot, Some(700));
+        assert_eq!(row.disk_workdir, Some(50));
+        assert_eq!(row.disk_sources, Some(9));
+        assert_eq!(row.disk_build_tree, None, "not measured is not zero");
     }
 
     #[tokio::test]

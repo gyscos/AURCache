@@ -282,6 +282,11 @@ pub struct CompleteReport {
     /// Distinct from a build that genuinely used nothing, which cannot happen.
     #[serde(default)]
     pub peak_memory_bytes: Option<i64>,
+    /// Disk the build used, part by part; see
+    /// [`crate::api::builds::DiskUsage`]. `None` from a worker without a
+    /// storage pool, or one that predates this.
+    #[serde(default)]
+    pub disk_usage: Option<crate::api::builds::DiskUsage>,
     /// What each `git+` source was at in the worker's own source cache when the
     /// build finished, keyed by `source_url`.
     ///

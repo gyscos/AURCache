@@ -120,6 +120,34 @@ impl Cache {
         self.entry(self.root.join("srcdest").join(sanitize(pkgbase)))
     }
 
+    /// Bytes a package's source cache holds, as stored, when it is a
+    /// subvolume; `None` otherwise -- a plain directory is not walked for a
+    /// report. Never creates anything.
+    #[must_use]
+    pub fn source_size(&self, pkgbase: &str) -> Option<u64> {
+        self.entry_size(&self.root.join("srcdest").join(sanitize(pkgbase)))
+    }
+
+    /// Bytes a package's kept build tree holds: its quota group's figure when
+    /// it is a subvolume, else the size recorded after its last build. `None`
+    /// when there is neither. Never walks or creates anything.
+    #[must_use]
+    pub fn build_tree_size(&self, platform: &str, pkgbase: &str) -> Option<u64> {
+        let tree = self
+            .root
+            .join("builddir")
+            .join(sanitize(platform))
+            .join(sanitize(pkgbase));
+        self.entry_size(&tree).or_else(|| {
+            std::fs::read_to_string(self.size_stamp(platform, pkgbase))
+                .ok()?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+    }
+
     /// Persistent build tree root for one architecture, bound over `/build`
     /// when a package asks to keep its tree between builds.
     ///

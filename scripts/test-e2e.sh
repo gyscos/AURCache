@@ -270,6 +270,17 @@ request_package() {
         dump_logs_on_failure
         exit 1
     fi
+
+    # A chroot worker measures what each build used on its disk. Off for the
+    # legacy container builder, which has no storage pool to measure.
+    local usage
+    usage=$(aurcache_cli --format json builds list --limit 20 2>/dev/null \
+        | jq -c "[.[] | select(.pkg_name == \"$PACKAGE\")] | max_by(.number) | .disk_usage" 2>/dev/null)
+    log "    disk usage: ${usage:-none}"
+    if [ "${E2E_EXPECT_DISK_USAGE:-1}" = 1 ] && { [ -z "$usage" ] || [ "$usage" = null ]; }; then
+        log "ERROR: the build reported no disk usage"
+        exit 1
+    fi
 }
 
 validate() {

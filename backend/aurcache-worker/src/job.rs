@@ -815,6 +815,7 @@ async fn run_build(
         report::classify_exit(status, canceled)
     };
     report.peak_memory_bytes = peak_memory_bytes;
+    report.disk_usage = disk_usage(ctx, cache, job).await;
     // What the build was actually made from, while the job still holds its
     // SRCDEST guard and no sibling can have fetched into the mirror. Only for a
     // success: nothing else is ever consulted as a baseline, and a failure has
@@ -902,6 +903,45 @@ async fn run_build(
         }
     }
     Ok(report)
+}
+
+/// What the build used on disk, part by part, as it ended; `None` when nothing
+/// could be measured. After the build tree's size is recorded, so a kept tree
+/// that is a plain directory reports its fresh figure.
+async fn disk_usage(
+    ctx: &WorkerContext<'_>,
+    cache: &Cache,
+    job: &JobDescriptor,
+) -> Option<aurcache_common::api::builds::DiskUsage> {
+    /// The package's caches, measured off the async runtime.
+    #[derive(Default)]
+    struct CacheSizes {
+        sources: Option<u64>,
+        build_tree: Option<u64>,
+    }
+
+    let build = ctx.chroots.build_usage(ctx.lease).await;
+    let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
+    let keeps_tree = job.persistent_builddir;
+    let cached = join_cache_task(
+        tokio::task::spawn_blocking(move || CacheSizes {
+            sources: cache.source_size(&pkgbase),
+            build_tree: keeps_tree
+                .then(|| cache.build_tree_size(&arch, &pkgbase))
+                .flatten(),
+        }),
+        "disk usage",
+    )
+    .await
+    .unwrap_or_default();
+    let bytes = |b: Option<u64>| b.and_then(|b| i64::try_from(b).ok());
+    let usage = aurcache_common::api::builds::DiskUsage {
+        chroot: bytes(build.chroot),
+        workdir: bytes(build.data),
+        sources: bytes(cached.sources),
+        build_tree: bytes(cached.build_tree),
+    };
+    (!usage.is_empty()).then_some(usage)
 }
 
 /// The CPUs one build's parallelism is sized to: the smaller of its own limit

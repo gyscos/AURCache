@@ -953,6 +953,11 @@ async fn complete_job_inner(
     {
         record_failed("peak memory", e.to_string());
     }
+    if let Some(usage) = report.disk_usage.as_ref().filter(|u| !u.is_empty())
+        && let Err(e) = worker_complete::record_disk_usage(db, build_id, usage).await
+    {
+        record_failed("disk usage", e.to_string());
+    }
 
     if report.success {
         // What the worker actually checked out replaces what the server

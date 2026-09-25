@@ -2,6 +2,38 @@ use crate::api::waiting::WaitingReason;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Disk a build used on its worker, in bytes as stored -- after the pool's
+/// compression -- when the build ended.
+///
+/// Each part is `None` when it was not measured, which is not the same as `0`:
+/// a package that keeps no build tree has no `build_tree` figure at all. A
+/// total over the parts is only meaningful when every part it adds is known.
+#[derive(Deserialize, ToSchema, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// What the build wrote into its chroot: mostly the dependencies it
+    /// installed. The base chroot it started from is not counted.
+    pub chroot: Option<i64>,
+    /// The build's own working space: its extracted source, what the source
+    /// download left there, and the packages it made.
+    pub workdir: Option<i64>,
+    /// The package's source cache (`SRCDEST`), which outlives the build and
+    /// is shared with its later builds.
+    pub sources: Option<i64>,
+    /// The package's kept build tree, for a package that keeps one.
+    pub build_tree: Option<i64>,
+}
+
+impl DiskUsage {
+    /// Whether nothing at all was measured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.chroot.is_none()
+            && self.workdir.is_none()
+            && self.sources.is_none()
+            && self.build_tree.is_none()
+    }
+}
+
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct BuildSummary {
@@ -34,6 +66,11 @@ pub struct BuildSummary {
     /// container builder (Docker exposes no peak on cgroup v2), or a worker
     /// whose cgroup subtree could not be prepared.
     pub peak_memory: Option<i64>,
+    /// Disk the build used on its worker, part by part. `None` where no
+    /// figure was reported: an older worker, or one without a storage pool.
+    #[cfg_attr(feature = "db", sea_orm(skip))]
+    #[serde(default)]
+    pub disk_usage: Option<DiskUsage>,
     /// The worker that ran this build, by name.
     ///
     /// `None` where no worker has claimed it -- a queued build -- and for

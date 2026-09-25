@@ -9,6 +9,7 @@ use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
+use aurcache_common::api::builds::DiskUsage;
 use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
 use aurcache_common::build_state::{BuildState, BuildStates, BuildTrigger};
@@ -299,6 +300,10 @@ pub(crate) fn build_row_select() -> Select<Builds> {
         .column(builds::Column::Platform)
         .column(builds::Column::Size)
         .column(builds::Column::PeakMemory)
+        .column(builds::Column::DiskChroot)
+        .column(builds::Column::DiskWorkdir)
+        .column(builds::Column::DiskSources)
+        .column(builds::Column::DiskBuildTree)
         // Left, so a queued build -- which has no worker yet -- still lists.
         .join(JoinType::LeftJoin, builds::Relation::Workers.def())
         .column_as(workers::Column::Name, "worker_name")
@@ -320,6 +325,10 @@ pub(crate) struct BuildRow {
     platform: String,
     size: Option<i64>,
     peak_memory: Option<i64>,
+    disk_chroot: Option<i64>,
+    disk_workdir: Option<i64>,
+    disk_sources: Option<i64>,
+    disk_build_tree: Option<i64>,
     worker_name: Option<String>,
 }
 
@@ -335,6 +344,13 @@ impl BuildRow {
             platform: self.platform,
             size: self.size,
             peak_memory: self.peak_memory,
+            disk_usage: Some(DiskUsage {
+                chroot: self.disk_chroot,
+                workdir: self.disk_workdir,
+                sources: self.disk_sources,
+                build_tree: self.disk_build_tree,
+            })
+            .filter(|usage| !usage.is_empty()),
             worker_name: self.worker_name,
             // Filled only by the detail route, which knows it is rendering one
             // build; the lists would pay a stat per row for fields they do not

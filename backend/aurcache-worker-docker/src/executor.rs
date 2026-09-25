@@ -418,6 +418,7 @@ impl DockerExecutor {
                 // The legacy container builder samples neither the build tree
                 // nor the sources it was made from.
                 peak_memory_bytes: None,
+                disk_usage: None,
                 vcs_commits: BTreeMap::new(),
             },
             Some(code) => CompleteReport {
@@ -428,6 +429,7 @@ impl DockerExecutor {
                 // The legacy container builder samples neither the build tree
                 // nor the sources it was made from.
                 peak_memory_bytes: None,
+                disk_usage: None,
                 vcs_commits: BTreeMap::new(),
             },
             None => report::setup_failure("build container exited without a status"),

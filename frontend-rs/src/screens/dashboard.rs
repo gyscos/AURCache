@@ -1087,6 +1087,7 @@ mod tests {
             platform: "x86_64".to_string(),
             size: None,
             peak_memory: None,
+            disk_usage: None,
             worker_name: None,
             log_size: None,
             waiting_reason: Some(WaitingReason::Arch {

@@ -34,6 +34,12 @@ pub struct Model {
     /// `memory.peak` of the cgroup the build ran in. `None` for a build whose
     /// worker did not report one.
     pub peak_memory: Option<i64>,
+    /// Disk the build used on its worker, part by part, as stored; see
+    /// `aurcache_common::api::builds::DiskUsage`. `None` where not reported.
+    pub disk_chroot: Option<i64>,
+    pub disk_workdir: Option<i64>,
+    pub disk_sources: Option<i64>,
+    pub disk_build_tree: Option<i64>,
     /// Id of the worker that holds the active lease on this build, if any.
     pub worker_id: Option<i32>,
     /// Epoch seconds when the current worker's lease expires. Renewed by

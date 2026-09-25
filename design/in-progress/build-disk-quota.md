@@ -32,6 +32,15 @@ Done so far:
   assigns it where it does not): measured by its quota group, evicted by
   `subvolume delete`. Plain directories from before keep the old walk and
   `rm`. A build is bound only its own tree, at `/build/<pkgbase>`.
+- A device's or a mount's filesystem is fitted to the total online (shrunk
+  when it comes down, grown back when it goes up, never past the device); the
+  device itself is the operator's, and the smallest safe size is logged.
+- A worker that stops claiming says so at error severity.
+- ZFS guidance where the setup is made: the compose file and `setup worker`,
+  plus a startup log when the image is on ZFS.
+- Each build reports its disk use part by part -- chroot, working space,
+  sources, kept tree -- stored on the build and shown on its page.
+- A patched source keeps its symlinks, directories and file modes.
 - Running on freyja, with the dedicated btrfs filesystem as its pool.
 
 Decided: the caches' budgets stay eviction targets, not hard qgroup limits.
@@ -39,8 +48,7 @@ The total is the hard bound they were approximating; the budgets only decide
 what to prune first.
 
 Not yet: per-package quotas (a qgroup limit on the package's subvolume, now
-that it has one), reporting disk usage beside peak memory, the configuration fit check, the ZFS tuning log, the
-docker worker's "not enforced" log, and a real build-time comparison.
+that it has one; later), and a real build-time comparison.
 
 ---
 
