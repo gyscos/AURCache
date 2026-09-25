@@ -1062,6 +1062,12 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
                 println!("  aurcache-cli worker list");
             }
             println!("  aurcache-cli doctor            # check it connected");
+            println!();
+            println!(
+                "Its chroots, builds and caches live in one storage pool in the data volume, \
+                 up to WORKER_DISK_MAX (200G by default). If Docker keeps its volumes on ZFS, \
+                 see the docs' worker configuration, \"Tuning an image on ZFS\"."
+            );
             Ok(())
         }
     }

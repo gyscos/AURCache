@@ -172,7 +172,7 @@ fn is_subvolume(path: &Path) -> bool {
     meta.is_dir() && meta.ino() == SUBVOLUME_ROOT_INODE && fs_type(path) == Some(BTRFS_SUPER_MAGIC)
 }
 
-fn fs_type(path: &Path) -> Option<i64> {
+pub(crate) fn fs_type(path: &Path) -> Option<i64> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: `c_path` is NUL-terminated and outlives the call; `buf` is a
     // valid out-parameter.

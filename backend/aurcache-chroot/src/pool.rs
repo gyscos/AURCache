@@ -174,6 +174,7 @@ impl Pool {
                 if let Some(device) = &loop_device {
                     enable_direct_io(device).await;
                 }
+                advise_on_zfs(path);
             }
             Backing::Device(device) => {
                 if !is_mountpoint(&mountpoint) {
@@ -1171,6 +1172,27 @@ fn free_loop_device(out: &str) -> Option<LoopDevice> {
         path: PathBuf::from(name),
         minor,
     })
+}
+
+/// ZFS, from `statfs`.
+const ZFS_SUPER_MAGIC: i64 = 0x2FC1_2FC1;
+
+/// Say how to tune the dataset an image sits on, when it is ZFS: a nested
+/// btrfs pays for ZFS's defaults on every write. The worker cannot read the
+/// dataset's properties from inside a container, so it says what they should
+/// be rather than whether they are.
+fn advise_on_zfs(image: &Path) {
+    let Some(dir) = image.parent() else {
+        return;
+    };
+    if crate::volumes::fs_type(dir) == Some(ZFS_SUPER_MAGIC) {
+        tracing::info!(
+            "the pool image {} is on ZFS: its dataset should have recordsize=16K (or 32K), \
+             primarycache=metadata and logbias=throughput, or the pool a zvol of its own \
+             (WORKER_POOL) -- see the worker configuration docs, \"Tuning an image on ZFS\"",
+            image.display()
+        );
+    }
 }
 
 /// Switch a loop device to direct I/O, which keeps the image's data out of

@@ -583,7 +583,13 @@ fn worker_service(params: &ComposeParams) -> String {
         );
     }
     out.push_str(
-        "      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)\n",
+        "      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)\n\
+         \x20   # The storage pool is one image file in that volume, holding every chroot,\n\
+         \x20   # build and cache under one disk quota (WORKER_DISK_MAX, 200G by default).\n\
+         \x20   # On ZFS -- TrueNAS -- give the volume a dataset of its own with\n\
+         \x20   # recordsize=16K, primarycache=metadata and logbias=throughput, or hand the\n\
+         \x20   # worker a zvol instead (WORKER_POOL). See the docs' worker configuration,\n\
+         \x20   # \"Disk quota and the storage pool\".\n",
     );
 
     out.push_str(
