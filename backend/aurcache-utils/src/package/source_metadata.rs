@@ -33,10 +33,30 @@ pub struct SourceMetadata {
 /// The parts that come out of a parsed `.SRCINFO`.
 #[must_use]
 pub fn from_sourceinfo(sourceinfo: &SourceInfoV1) -> SourceMetadata {
+    use alpm_srcinfo::source_info::v1::package::Override;
+
     let base = &sourceinfo.base;
 
+    // Split packages sometimes only describe the sub-packages: `backintime`
+    // has no top-level `pkgdesc`, but its `backintime` sub-package does. Fall
+    // back to the first sub-package description so those packages still get
+    // one.
+    let description = base
+        .description
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| {
+            sourceinfo
+                .packages
+                .iter()
+                .find_map(|pkg| match &pkg.description {
+                    Override::Yes { value } => Some(value.to_string()),
+                    _ => None,
+                })
+        });
+
     SourceMetadata {
-        description: base.description.as_ref().map(ToString::to_string),
+        description,
         project_url: base.url.as_ref().map(ToString::to_string),
         licenses: (!base.licenses.is_empty()).then(|| {
             base.licenses
@@ -149,5 +169,38 @@ build() {
     fn a_pkgbuild_without_the_comment_has_no_maintainer() {
         assert_eq!(maintainer_from_pkgbuild("pkgname=demo\n"), None);
         assert_eq!(maintainer_from_pkgbuild("# Maintainer:\npkgname=x"), None);
+    }
+
+    use super::from_sourceinfo;
+    use alpm_srcinfo::SourceInfoV1;
+
+    fn metadata_description(srcinfo: &str) -> Option<String> {
+        let parsed = SourceInfoV1::from_string(srcinfo).expect("fixture parses");
+        from_sourceinfo(&parsed).description
+    }
+
+    /// Split packages like `backintime` carry `pkgdesc` only on the
+    /// sub-packages, so the first sub-package description is used.
+    #[test]
+    fn a_missing_top_level_description_falls_back_to_the_first_subpackage() {
+        let srcinfo = "pkgbase = backintime\n\tpkgver = 1.4.3\n\tpkgrel = 1\n\tarch = any\n\npkgname = backintime\n\tpkgdesc = Back In Time description\n\npkgname = backintime-cli\n";
+        assert_eq!(
+            metadata_description(srcinfo).as_deref(),
+            Some("Back In Time description")
+        );
+    }
+
+    /// The top-level description still wins when it exists.
+    #[test]
+    fn a_top_level_description_is_not_overridden_by_subpackages() {
+        let srcinfo = "pkgbase = demo\n\tpkgdesc = Top level\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n\tpkgdesc = Sub package\n";
+        assert_eq!(metadata_description(srcinfo).as_deref(), Some("Top level"));
+    }
+
+    /// No description anywhere stays missing rather than becoming blank.
+    #[test]
+    fn no_description_anywhere_stays_missing() {
+        let srcinfo = "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = any\n\npkgname = one\n\npkgname = two\n";
+        assert_eq!(metadata_description(srcinfo), None);
     }
 }
