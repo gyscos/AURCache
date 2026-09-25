@@ -18,7 +18,7 @@ use aurcache_client::{
 use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::{BuildState, BuildStates};
 use aurcache_common::repo::host_from_url;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{
     load_config, resolve_runtime_config, save_config, set_token, set_url, summarize_config,
@@ -1934,7 +1934,7 @@ async fn dump_command(
     let path = output.unwrap_or_else(|| {
         PathBuf::from(format!(
             "aurcache-dump-{}.tar.gz",
-            Utc::now().format("%Y%m%d")
+            Local::now().format("%Y%m%d")
         ))
     });
 
@@ -3428,7 +3428,8 @@ fn describe_source(source: &PackageSource) -> String {
 
 fn format_timestamp(timestamp: Option<i64>) -> String {
     timestamp
-        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
+        .map(|timestamp| timestamp.with_timezone(&Local))
         .map(|timestamp| timestamp.to_rfc3339())
         .unwrap_or_else(|| "-".to_string())
 }
