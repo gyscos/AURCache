@@ -446,6 +446,9 @@ impl WorkerKnobs {
             _ if !chosen && ask => prompt_pool_backing()?,
             _ => compose::PoolBacking::Image,
         };
+        if let Some(dataset) = backing.zvol() {
+            eprintln!("{}", compose::zvol_tuning(&dataset).join("\n"));
+        }
         Ok(compose::PoolSetup {
             backing,
             reserve: self.disk_reserve,

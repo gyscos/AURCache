@@ -144,6 +144,41 @@ pub enum PoolBacking {
     Mount(String),
 }
 
+impl PoolBacking {
+    /// The ZFS dataset behind a zvol device, when this is one: the part after
+    /// `/dev/zvol/`, or a placeholder for a bare `/dev/zdN`, whose path does
+    /// not carry the name.
+    #[must_use]
+    pub fn zvol(&self) -> Option<String> {
+        let Self::Device(path) = self else {
+            return None;
+        };
+        if let Some(dataset) = path.strip_prefix("/dev/zvol/") {
+            return Some(dataset.to_string());
+        }
+        let zd = path.strip_prefix("/dev/zd")?;
+        (!zd.is_empty() && zd.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| "<pool>/<zvol>".to_string())
+    }
+}
+
+/// How a zvol backing the pool should be tuned, one line each, for the wizard
+/// to print and the compose file to carry as comments. `volblocksize` is fixed
+/// when the zvol is made, so it is checked rather than set.
+#[must_use]
+pub fn zvol_tuning(dataset: &str) -> Vec<String> {
+    vec![
+        "Tuning for a zvol backing the pool (see the docs' \"Storage pool\" page):".to_string(),
+        format!("  zfs set compression=off primarycache=metadata logbias=throughput {dataset}"),
+        "    btrfs compresses inside the pool, the kernel already caches its data,".to_string(),
+        "    and its flushes need not be written twice through the ZIL.".to_string(),
+        format!("  zfs get volblocksize {dataset}   # 16K or 32K; fixed at creation"),
+        "    To make one: zfs create -s -V <size> -o volblocksize=32K <pool>/<zvol>".to_string(),
+        "    (-s: sparse; leave it out to reserve the space). Size it at".to_string(),
+        "    WORKER_DISK_MAX plus 5% (at least 2G), or more.".to_string(),
+    ]
+}
+
 /// The storage pool as `setup` writes it: its backing, whether an image is
 /// allocated up front, and its total.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -675,9 +710,14 @@ fn worker_service(params: &ComposeParams) -> String {
         out.push_str(
             "    # The storage pool: every chroot, build and cache, under one disk quota\n\
              \x20   # (WORKER_DISK_MAX). Formatted the first time; a device that already holds\n\
-             \x20   # a filesystem the worker did not make is refused, never formatted.\n\
-             \x20   devices:\n",
+             \x20   # a filesystem the worker did not make is refused, never formatted.\n",
         );
+        if let Some(dataset) = env.pool.backing.zvol() {
+            for line in zvol_tuning(&dataset) {
+                let _ = writeln!(out, "    # {line}");
+            }
+        }
+        out.push_str("    devices:\n");
         let _ = writeln!(out, "      - {mapping}");
     }
 
@@ -822,6 +862,38 @@ mod tests {
             "{env:?}"
         );
         assert!(image["services"]["builder"]["devices"].is_badvalue());
+    }
+
+    /// A zvol is recognised by its path, and its compose file carries the
+    /// tuning for it with the dataset filled in; another device gets none.
+    #[test]
+    fn a_zvol_pool_comes_with_its_tuning() {
+        let device = |path: &str| PoolBacking::Device(path.to_string());
+        assert_eq!(
+            device("/dev/zvol/tank/aur").zvol().as_deref(),
+            Some("tank/aur")
+        );
+        assert_eq!(device("/dev/zd16").zvol().as_deref(), Some("<pool>/<zvol>"));
+        assert_eq!(device("/dev/sdb2").zvol(), None);
+        assert_eq!(device("/dev/zd").zvol(), None);
+        assert_eq!(PoolBacking::Mount("/dev/zvol/x".to_string()).zvol(), None);
+
+        let render = |path: &str| {
+            let params = worker_with_pool(PoolSetup {
+                backing: device(path),
+                ..PoolSetup::default()
+            });
+            parsed(&params);
+            render_compose(&params)
+        };
+        let zvol = render("/dev/zvol/tank/aur");
+        assert!(
+            zvol.contains(
+                "zfs set compression=off primarycache=metadata logbias=throughput tank/aur"
+            ),
+            "{zvol}"
+        );
+        assert!(!render("/dev/sdb2").contains("zfs set"));
     }
 
     /// Reserving is an image's; with a device or a mount it means nothing and
