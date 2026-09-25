@@ -16,7 +16,7 @@ pub use aurcache_common::api::dump::{
     RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
 };
 pub use aurcache_common::api::events::{Event, KINDS, Kind, Segment, kind_label};
-pub use aurcache_common::api::info::ServerInfo;
+pub use aurcache_common::api::info::{ServerInfo, Timezone};
 pub use aurcache_common::api::log::{
     BuildRef, EntityRef, LogEntry, LogPage, PackageRef, WorkerRef,
 };

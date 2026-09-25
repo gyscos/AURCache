@@ -86,11 +86,17 @@ FROM debian:bookworm-slim
 # Podman/Docker is no longer used at runtime (remote workers build packages),
 # so the server just needs a minimal glibc base. This must stay on the same
 # Debian release as the builder stage above (see the note there). Runtime deps:
-# ca-certificates (HTTPS to the AUR) and bash (the alpm-pkgbuild-bridge PKGBUILD
-# parser is a bash script).
+# ca-certificates (HTTPS to the AUR), bash (the alpm-pkgbuild-bridge PKGBUILD
+# parser is a bash script) and tzdata (so `TZ=Europe/Paris` resolves).
+#
+# The image's own `/etc/localtime` link to Etc/UTC goes: the compose files
+# bind-mount the host's over it, which would otherwise land on the link's
+# target and leave the server naming the host's zone "Etc/UTC". Without either
+# it is UTC all the same.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates bash \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates bash tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/localtime /etc/timezone
 # Copy the built binary from the previous stage
 COPY --from=builder --chmod=0755 /app/backend/target/aurcache /usr/local/bin/aurcache
 COPY --chmod=0755 docker/entrypoint.sh /entrypoint.sh

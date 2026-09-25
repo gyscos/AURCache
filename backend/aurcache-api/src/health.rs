@@ -1,4 +1,5 @@
-use aurcache_common::api::info::ServerInfo;
+use aurcache_common::api::info::{ServerInfo, Timezone};
+use chrono::Local;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get};
@@ -8,7 +9,10 @@ use utoipa::OpenApi;
 use crate::init::ServerVersion;
 
 #[derive(OpenApi)]
-#[openapi(paths(health, server_version), components(schemas(ServerInfo)))]
+#[openapi(
+    paths(health, server_version),
+    components(schemas(ServerInfo, Timezone))
+)]
 pub struct HealthApi;
 
 #[utoipa::path(
@@ -47,7 +51,27 @@ pub async fn health(db: &State<DatabaseConnection>) -> Result<(), Status> {
 pub fn server_version(version: &State<ServerVersion>) -> Json<ServerInfo> {
     Json(ServerInfo {
         version: version.0.clone(),
+        timezone: Some(local_timezone()),
     })
+}
+
+/// The zone `chrono::Local` -- and so the scheduler -- is using.
+///
+/// `TZ` first, because it wins for `Local` too and `iana-time-zone` ignores
+/// it. Otherwise the name comes from where `/etc/localtime` links; the images
+/// ship without that link so that a host's zone bind-mounted over it is not
+/// mislabelled as the image's `Etc/UTC`, and is reported by offset alone.
+fn local_timezone() -> Timezone {
+    let name = match std::env::var("TZ") {
+        // An empty `TZ` is UTC to `Local`, not "unset".
+        Ok(tz) if tz.is_empty() => Some("UTC".to_string()),
+        Ok(tz) => Some(tz.trim_start_matches(':').to_string()),
+        Err(_) => iana_time_zone::get_timezone().ok(),
+    };
+    Timezone {
+        name,
+        utc_offset: Local::now().offset().local_minus_utc(),
+    }
 }
 
 async fn check_health(db: &DatabaseConnection) -> anyhow::Result<()> {

@@ -203,6 +203,23 @@ pub fn render_time(parts: DateParts, style: DateStyle) -> String {
     }
 }
 
+/// The viewer's timezone, as the browser reports it.
+///
+/// Asked of the browser for the same reason as [`local_parts`]: it already
+/// knows, and its answer is the one every date on the page is rendered in.
+pub fn viewer_timezone() -> aurcache_client::Timezone {
+    let format = js_sys::Intl::DateTimeFormat::new(&js_sys::Array::new(), &js_sys::Object::new());
+    let name = js_sys::Reflect::get(&format.resolved_options(), &"timeZone".into())
+        .ok()
+        .and_then(|zone| zone.as_string());
+    // `getTimezoneOffset` is minutes *behind* UTC: -120 for CEST.
+    let behind = js_sys::Date::new_0().get_timezone_offset();
+    aurcache_client::Timezone {
+        name,
+        utc_offset: -(behind as i32) * 60,
+    }
+}
+
 /// The browser's view of an instant, in the viewer's own timezone.
 ///
 /// Deliberately not computed here. Turning a Unix timestamp into a civil date

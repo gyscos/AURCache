@@ -4,7 +4,7 @@ use aurcache_activitylog::events::Event;
 use aurcache_utils::job_config::{
     mirrorlist_dir, mirrorlist_path, native_arch, shared_mirrorlist_path,
 };
-use chrono::Utc;
+use chrono::Local;
 use cron::Schedule;
 use pacman_mirrors::benchmark::{Bench, gen_mirrorlist};
 use pacman_mirrors::platforms::Platform;
@@ -37,7 +37,7 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
             }
         }
 
-        let mut upcoming = schedule.upcoming(Utc);
+        let mut upcoming = schedule.upcoming(Local);
         let mut reported = false;
         loop {
             // Get the next occurrence from now, or if the schedule has no
@@ -100,7 +100,7 @@ async fn update_mirrorlist() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!("Executing mirror ranking job at: {}", Utc::now());
+    info!("Executing mirror ranking job at: {}", Local::now());
     let urls = pacman_mirrors::get_status(Platform::X86_64).await?.urls;
 
     info!("Ranking mirrorlist");

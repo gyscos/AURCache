@@ -492,6 +492,11 @@ fn server_service(params: &ComposeParams) -> String {
          \x20     - \"{AURCACHE_WORKER_PORT}:{AURCACHE_WORKER_PORT}\"   # Remote-worker protocol (HTTPS + mutual TLS)\n\
          \x20   environment:\n\
          \x20     - LOG_LEVEL={log_level}\n\
+         \x20     # The timezone cron schedules (the auto-update one) are read in. The\n\
+         \x20     # host's by default, through the /etc/localtime mount below; to force\n\
+         \x20     # one, set TZ where compose runs (a shell export, or `TZ=Europe/Paris`\n\
+         \x20     # in a .env file beside this one). Unset there, it stays unset here.\n\
+         \x20     - TZ\n\
          \x20     # The server's TLS certificate must be valid for the hostname each worker\n\
          \x20     # dials. In-compose that is the service name; keep `localhost` so the\n\
          \x20     # UI/API is reachable from the host too.\n\
@@ -508,6 +513,7 @@ fn server_service(params: &ComposeParams) -> String {
          \x20     - aurcache_repo:/app/repo\n\
          \x20     - aurcache_ca:/app/data/ca      # internal worker CA (persist across restarts)\n\
          \x20     - enroll:{ENROLLMENT_DIR}:ro             # read the workers' enrollment CSRs\n\
+         \x20     - /etc/localtime:/etc/localtime:ro   # the host's timezone (see TZ above)\n\
          {depends_on}\
          \x20   networks:\n\
          \x20     - aurcache\n\
@@ -975,6 +981,28 @@ mod tests {
     fn value_of(env: &[String], key: &str) -> Option<String> {
         env.iter()
             .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(str::to_string))
+    }
+
+    /// Cron schedules are read in the server's timezone, so a generated
+    /// server follows the host's -- and `TZ` passes through bare, so it is
+    /// forced only by setting it where compose runs, never pinned to empty.
+    #[test]
+    fn a_server_takes_the_hosts_timezone() {
+        for role in [ComposeRole::Bundle, ComposeRole::Backend] {
+            let doc = parsed(&params(role));
+            let env = environment(&doc, "aurcache");
+            assert!(env.contains(&"TZ".to_string()), "{role:?}: {env:?}");
+            let volumes: Vec<&str> = doc["services"]["aurcache"]["volumes"]
+                .as_vec()
+                .unwrap()
+                .iter()
+                .filter_map(Yaml::as_str)
+                .collect();
+            assert!(
+                volumes.contains(&"/etc/localtime:/etc/localtime:ro"),
+                "{role:?}: {volumes:?}"
+            );
+        }
     }
 
     #[test]

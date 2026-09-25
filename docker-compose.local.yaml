@@ -26,6 +26,7 @@ services:
       - "8093:8083"   # Worker protocol (HTTPS + mutual TLS)
     environment:
       - LOG_LEVEL=info,aurcache=debug,aurcache_api=debug
+      - TZ   # the schedule's timezone: the host's unless set (see docker-compose.yaml)
       # The worker dials `aurcache` over the compose network, so the server's
       # certificate has to be valid for that name; `localhost` keeps the UI
       # reachable from the host.
@@ -42,6 +43,7 @@ services:
       - repo:/app/repo
       - ca:/app/data/ca          # the internal worker CA, kept across restarts
       - enroll:/enroll:ro
+      - /etc/localtime:/etc/localtime:ro   # the host's timezone (see TZ above)
     networks:
       - aurcache
     restart: unless-stopped

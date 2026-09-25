@@ -51,6 +51,7 @@ services:
       - "${AURCACHE_PORT:-8080}:8080"   # Web UI + API (plain HTTP): the only port out
     environment:
       - LOG_LEVEL=info
+      - TZ   # the schedule's timezone: the host's unless set (see docker-compose.yaml)
       # The worker dials `aurcache` over the compose network, so the server's
       # certificate has to be valid for that name; `localhost` keeps the UI
       # reachable from the host.
@@ -70,6 +71,7 @@ services:
       # persists all of it, so no directory added later is silently lost.
       - demo_data:/app
       - enroll:/enroll:ro             # read the workers' enrollment CSRs
+      - /etc/localtime:/etc/localtime:ro   # the host's timezone (see TZ above)
     depends_on:
       aurcache_database:
         condition: service_healthy

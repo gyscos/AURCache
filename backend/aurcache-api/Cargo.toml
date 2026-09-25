@@ -14,6 +14,7 @@ itertools = {workspace = true}
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = {workspace = true}
+iana-time-zone = {workspace = true}
 
 aurcache-deps = {path = "../aurcache-deps"}
 

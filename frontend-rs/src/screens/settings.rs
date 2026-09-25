@@ -10,7 +10,7 @@
 use crate::dates::{Clock, DateOrder, DateParts, DateStyle, render};
 use crate::listing::ListHeader;
 use crate::routes::Route;
-use aurcache_client::{ApplicationSettings, Setting, SettingSource};
+use aurcache_client::{ApplicationSettings, Setting, SettingSource, Timezone};
 use dioxus::prelude::*;
 
 #[component]
@@ -20,6 +20,14 @@ pub fn Settings() -> Element {
             .settings(None)
             .await
             .map_err(|e| e.to_string())
+    });
+
+    // Which timezone the auto-update schedule is read in. A failure leaves the
+    // row saying nothing about it, which is what it said before servers
+    // reported one.
+    let server_timezone = use_resource(|| async move {
+        let client = crate::api::client().ok()?;
+        client.server_info().await.ok()?.timezone
     });
 
     // One banner for the whole page rather than one per row: a save either
@@ -76,7 +84,14 @@ pub fn Settings() -> Element {
                     div { class: "alert alert-error", span { "Could not load settings: {e}" } }
                 },
                 Some(Ok(loaded)) => rsx! {
-                    SettingsSections { settings: loaded.clone(), save }
+                    SettingsSections {
+                        settings: loaded.clone(),
+                        schedule_zone: schedule_zone(
+                            server_timezone.read().clone().flatten().as_ref(),
+                            &crate::dates::viewer_timezone(),
+                        ),
+                        save,
+                    }
                 },
             }
         }
@@ -86,6 +101,7 @@ pub fn Settings() -> Element {
 #[component]
 fn SettingsSections(
     settings: ApplicationSettings,
+    schedule_zone: ScheduleZone,
     save: EventHandler<(Setting, Option<String>)>,
 ) -> Element {
     rsx! {
@@ -112,7 +128,8 @@ fn SettingsSections(
             SettingRow {
                 setting: Setting::AutoUpdateInterval,
                 label: "Auto-update schedule",
-                description: "Cron expression, including seconds, for scheduled rebuilds. Empty disables it.",
+                description: schedule_zone.description,
+                warning: schedule_zone.warning,
                 // Distinct from a stored empty string, which is what
                 // "disabled" is: the field renders empty either way, and the
                 // source badge is what tells the two apart.
@@ -315,6 +332,7 @@ fn RowShell(
     setting: Setting,
     label: String,
     description: String,
+    #[props(default)] warning: Option<String>,
     source: SettingSource,
     /// Put the control on its own line under the label. For values too long to
     /// sit beside their name without squeezing it into a column of single
@@ -335,6 +353,9 @@ fn RowShell(
                 if !description.is_empty() {
                     p { class: "text-xs opacity-60 max-w-prose", "{description}" }
                 }
+                if let Some(warning) = warning {
+                    p { class: "text-xs text-warning max-w-prose", "{warning}" }
+                }
                 EnvNote { setting, source }
             }
             div { class: "flex items-center gap-2 min-w-0", {children} }
@@ -347,6 +368,10 @@ fn SettingRow(
     setting: Setting,
     label: String,
     description: String,
+    /// Shown under the description, for a value that means something other
+    /// than the viewer would assume.
+    #[props(default)]
+    warning: Option<String>,
     value: String,
     source: SettingSource,
     editor: Editor,
@@ -365,7 +390,7 @@ fn SettingRow(
     let dirty = draft() != value;
 
     rsx! {
-        RowShell { setting, label, description, source, stacked: editor.is_stacked(),
+        RowShell { setting, label, description, warning, source, stacked: editor.is_stacked(),
             {
                 let control = match editor {
                     Editor::Toggle => rsx! {
@@ -641,10 +666,58 @@ fn ApiAccessSection() -> Element {
     }
 }
 
+/// What the auto-update schedule's row says about timezones.
+#[derive(Clone, PartialEq, Debug)]
+struct ScheduleZone {
+    description: String,
+    warning: Option<String>,
+}
+
+/// The schedule's description, naming the server timezone its hours are in,
+/// and a warning when that is not the viewer's.
+///
+/// Compared by current offset rather than by name: `UTC` and `Etc/UTC` are
+/// the same clock, and a server that only knows its offset has no name to
+/// compare. Two zones that agree now but switch to summer time on different
+/// dates are the price, and they disagree by an hour for a few weeks at most.
+fn schedule_zone(server: Option<&Timezone>, viewer: &Timezone) -> ScheduleZone {
+    const BASE: &str =
+        "Cron expression, including seconds, for scheduled rebuilds. Empty disables it.";
+    let Some(server) = server else {
+        return ScheduleZone {
+            description: BASE.to_string(),
+            warning: None,
+        };
+    };
+
+    let ahead = server.utc_offset - viewer.utc_offset;
+    let warning = (ahead != 0).then(|| {
+        let gap = ahead.unsigned_abs() / 60;
+        let gap = match (gap / 60, gap % 60) {
+            (hours, 0) => format!("{hours}h"),
+            (0, minutes) => format!("{minutes}m"),
+            (hours, minutes) => format!("{hours}h{minutes:02}m"),
+        };
+        let direction = if ahead > 0 { "ahead of" } else { "behind" };
+        format!(
+            "The server's clock is {gap} {direction} yours ({}): the hours above are server time.",
+            viewer.describe()
+        )
+    });
+
+    ScheduleZone {
+        description: format!(
+            "{BASE} Hours are in the server's timezone, {}.",
+            server.describe()
+        ),
+        warning,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Editor, SettingRow, is_stored};
-    use aurcache_client::{Setting, SettingSource};
+    use super::{Editor, ScheduleZone, SettingRow, is_stored, schedule_zone};
+    use aurcache_client::{Setting, SettingSource, Timezone};
     use dioxus::prelude::*;
 
     /// An `EventHandler` can only be built inside a running runtime, so the row
@@ -669,6 +742,73 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { source, editor });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn zone(name: Option<&str>, utc_offset: i32) -> Timezone {
+        Timezone {
+            name: name.map(str::to_string),
+            utc_offset,
+        }
+    }
+
+    /// The schedule names the zone its hours are in, and says nothing more
+    /// when that is the viewer's own.
+    #[test]
+    fn a_schedule_in_the_viewers_timezone_names_it_without_a_warning() {
+        let paris = zone(Some("Europe/Paris"), 7200);
+        let ScheduleZone {
+            description,
+            warning,
+        } = schedule_zone(Some(&paris), &paris);
+        assert!(
+            description.ends_with("in the server's timezone, Europe/Paris (UTC+02:00)."),
+            "{description}"
+        );
+        assert_eq!(warning, None);
+    }
+
+    /// `UTC` and `Etc/UTC` are the same clock, and a server that knows only
+    /// its offset has no name to disagree with.
+    #[test]
+    fn differently_named_zones_at_the_same_offset_are_not_a_mismatch() {
+        let viewer = zone(Some("UTC"), 0);
+        assert_eq!(
+            schedule_zone(Some(&zone(Some("Etc/UTC"), 0)), &viewer).warning,
+            None
+        );
+        assert_eq!(schedule_zone(Some(&zone(None, 0)), &viewer).warning, None);
+    }
+
+    /// The warning says which way and how far, since that is the arithmetic
+    /// the viewer would otherwise have to do to know when the schedule fires.
+    #[test]
+    fn a_schedule_in_another_timezone_warns_by_how_far() {
+        let viewer = zone(Some("America/New_York"), -4 * 3600);
+        let warning = schedule_zone(Some(&zone(None, 7200)), &viewer).warning;
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "The server's clock is 6h ahead of yours (America/New_York (UTC-04:00)): \
+                 the hours above are server time."
+            )
+        );
+
+        let india = zone(Some("Asia/Kolkata"), 19800);
+        let utc = zone(Some("Etc/UTC"), 0);
+        let warning = schedule_zone(Some(&utc), &india).warning.unwrap();
+        assert!(warning.contains("5h30m behind yours"), "{warning}");
+    }
+
+    /// A server that predates reporting its timezone gets the plain
+    /// description rather than a guess.
+    #[test]
+    fn a_server_without_a_timezone_gets_the_plain_description() {
+        let ScheduleZone {
+            description,
+            warning,
+        } = schedule_zone(None, &zone(Some("Europe/Paris"), 7200));
+        assert!(!description.contains("timezone"), "{description}");
+        assert_eq!(warning, None);
     }
 
     /// Reset clears a stored row. `Default` has no row to clear, and `Env` is

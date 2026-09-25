@@ -6,22 +6,27 @@ pub mod official_repos;
 pub mod retired_packages;
 pub mod update_version_check;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use std::time::Duration;
 use tracing::info;
 
 /// Sleep until the next cron fire, logging how long that is.
 ///
+/// Schedules are read in the server's local timezone (`TZ`, else
+/// `/etc/localtime`), so `0 0 3 * * *` means 3 am where the server is, which
+/// is what someone writing it expects. The settings page says which timezone
+/// that is.
+///
 /// Returns `false` when the schedule has no upcoming occurrence. A negative
 /// delta (clock jump) just means "run now".
 pub(crate) async fn sleep_until_next_fire(
-    upcoming: &mut impl Iterator<Item = DateTime<Utc>>,
+    upcoming: &mut impl Iterator<Item = DateTime<Local>>,
     what: &str,
 ) -> bool {
     match upcoming.next() {
         Some(next_time) => {
             let duration = next_time
-                .signed_duration_since(Utc::now())
+                .signed_duration_since(Local::now())
                 .to_std()
                 .unwrap_or(Duration::ZERO);
             info!(

@@ -40,6 +40,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 |------------------------|---------------|-----------------------------------------------------------------------|---------|
 | VERSION_CHECK_INTERVAL | Integer       | Interval in seconds for checking package versions                     | 3600    |
 | AUTO_UPDATE_SCHEDULE   | String (CRON) | Auto update schedule in cronjob syntax with seconds (null to disable) | null    |
+| TZ                     | String        | Timezone cron schedules (`AUTO_UPDATE_SCHEDULE`, `MIRROR_RANK_SCHEDULE`) are read in, e.g. `Europe/Paris`. The compose files forward the host's `/etc/localtime` and pass `TZ` through when it is set where compose runs | the host's, else UTC |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
 | JOB_TIMEOUT            | Integer       | Longest a build may run before the server reclaims it, in seconds     | 3600    |
 | MAX_ARTIFACT_SIZE      | Size          | Largest package file a worker may upload, e.g. `20G`; also a setting, per package or global | `20G` |

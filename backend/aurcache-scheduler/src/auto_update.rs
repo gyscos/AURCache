@@ -4,7 +4,7 @@ use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::services::Services;
 use aurcache_utils::settings::general::SettingsTraits;
-use chrono::Utc;
+use chrono::Local;
 use cron::Schedule;
 use std::str::FromStr;
 use std::time::Duration;
@@ -41,10 +41,10 @@ pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
                     tokio::time::sleep(Duration::from_mins(15)).await;
                 }
                 Some(Ok(schedule)) => {
-                    let mut upcoming = schedule.upcoming(Utc);
+                    let mut upcoming = schedule.upcoming(Local);
 
                     if sleep_until_next_fire(&mut upcoming, "update").await {
-                        info!("Executing scheduled job at: {}", Utc::now());
+                        info!("Executing scheduled job at: {}", Local::now());
                         if let Err(e) = package_update_all_outdated(&services).await {
                             services.activity.emit(Event::UpdateQueueFailed {
                                 error: format!("{e:#}"),

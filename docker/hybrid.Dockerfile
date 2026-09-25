@@ -164,7 +164,11 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
     && pacman -Syu --noconfirm --needed \
     && pacman-key --init \
     && pacman-key --populate \
-    && systemd-machine-id-setup
+    && systemd-machine-id-setup \
+    && rm -f /etc/localtime /etc/timezone
+# (That last line: a host's /etc/localtime bind-mounted over the image's link
+# would land on the link's UTC target and be reported as "UTC"; see
+# server.Dockerfile.)
 
 # Everything this image runs, installed as packages: the four binaries, the two
 # users and their group membership, the directories and their modes, the

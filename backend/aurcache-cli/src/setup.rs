@@ -34,6 +34,8 @@ pub const NETWORK: &str = "aurcache";
 pub const SERVER_CONTAINER: &str = "aurcache";
 pub const WORKER_CONTAINER: &str = "aurcache-worker";
 pub const ENROLL_VOLUME: &str = "aurcache_enroll";
+/// Where the host keeps its timezone, and where the server image reads it.
+const LOCALTIME: &str = "/etc/localtime";
 
 /// A `docker run` invocation, built before anything is executed so `--dry-run`
 /// can print exactly what would happen.
@@ -122,6 +124,17 @@ pub fn server_run(
     }
     args.push("-v".into());
     args.push(format!("{ENROLL_VOLUME}:{ENROLLMENT_DIR}:ro"));
+
+    // The timezone cron schedules are read in: this host's. `-e TZ` without a
+    // value forwards `TZ` only if it is set here, so exporting it is how to
+    // force one; otherwise the host's /etc/localtime decides. Mounted only
+    // where it exists, since Docker would create a directory in its place.
+    args.push("-e".into());
+    args.push("TZ".into());
+    if cfg!(target_os = "linux") && std::path::Path::new(LOCALTIME).is_file() {
+        args.push("-v".into());
+        args.push(format!("{LOCALTIME}:{LOCALTIME}:ro"));
+    }
 
     args.extend(extra.iter().cloned());
     args.push(image.to_string());
@@ -347,6 +360,18 @@ mod tests {
         for port in ["8080:8080", "8081:8081", "8083:8083"] {
             assert!(args.contains(port), "{args}");
         }
+    }
+
+    /// `-e TZ` with no value forwards the CLI's own `TZ` only when it is set,
+    /// so an unset one leaves the host's /etc/localtime in charge.
+    #[test]
+    fn the_server_is_handed_the_hosts_timezone() {
+        let run = server_run("img", "http://localhost:8081", "info", "sans", &[]);
+        assert!(
+            run.args.windows(2).any(|pair| pair == ["-e", "TZ"]),
+            "{:?}",
+            run.args
+        );
     }
 
     /// The CA and the database are what a restart must not lose.
