@@ -185,7 +185,10 @@ leaving each build to re-download its dependencies.
 
 The caches live in the worker's [storage pool](#disk-quota-and-the-storage-pool),
 in a `cache` subvolume beside the chroots, so they count against
-`WORKER_DISK_MAX` together with the base chroot and the running builds. The
+`WORKER_DISK_MAX` together with the base chroot and the running builds. Each
+package's sources and each kept build tree is a subvolume of its own: its size
+is read from btrfs rather than by walking it, and evicting it is instant
+however many files it holds. A build is given only its own kept tree. The
 budgets here are what eviction keeps them to between builds; leave room under
 `WORKER_DISK_MAX` for at least one build's `WORKER_BUILD_DISK_MAX` on top of
 them, or a build may find the pool full before its own quota is reached.

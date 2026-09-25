@@ -75,3 +75,46 @@ fn display<S: AsRef<OsStr>>(args: &[S]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// [`privileged`], blocking: for code that already runs on a blocking thread.
+pub fn privileged_blocking<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
+    let shown = display(args);
+    tracing::debug!("$ {shown}");
+    let (program, rest) = args.split_first().expect("a command to run");
+    let mut cmd = if is_root() {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(rest);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n").args(args);
+        cmd
+    };
+    let output = cmd.output().with_context(|| format!("running {shown}"))?;
+    if !output.status.success() {
+        bail!(
+            "{shown} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`query`], blocking.
+pub fn query_blocking<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
+    let shown = display(args);
+    let (program, rest) = args.split_first().expect("a command to run");
+    let output = std::process::Command::new(program)
+        .args(rest)
+        .output()
+        .with_context(|| format!("running {shown}"))?;
+    if !output.status.success() {
+        bail!(
+            "{shown} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}

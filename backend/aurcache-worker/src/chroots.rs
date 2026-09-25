@@ -248,6 +248,17 @@ impl Chroots {
         self.open().await
     }
 
+    /// The cache subvolume's entries, for [`crate::cache::Cache`] to make each
+    /// package's sources and kept tree a subvolume. `None` while the pool is
+    /// not open.
+    pub async fn cache_volumes(&self) -> Option<aurcache_chroot::CacheVolumes> {
+        self.pool
+            .read()
+            .await
+            .as_ref()
+            .map(|pool| pool.cache_volumes(crate::config::CACHE_SUBVOLUME))
+    }
+
     /// Remove what builds left in the pool, except those in `keep`. Returns
     /// how many were cleared. Nothing to do on a pool not open yet.
     pub async fn sweep(&self, keep: &HashSet<i32>) -> usize {

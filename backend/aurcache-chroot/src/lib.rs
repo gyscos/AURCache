@@ -13,6 +13,8 @@
 mod cmd;
 pub mod pool;
 pub mod qgroup;
+pub mod volumes;
 
 pub use pool::{Backing, BuildVolumes, Owner, Pool, PoolConfig, Resize};
 pub use qgroup::{QgroupId, Usage};
+pub use volumes::CacheVolumes;

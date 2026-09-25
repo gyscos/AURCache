@@ -46,7 +46,8 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         cfg.cache_ttl,
         cfg.pkgcache_max_size,
         cfg.pkgcache_ttl,
-    );
+    )
+    .with_volumes(chroots.cache_volumes().await);
     let pkgbase = pkgdir
         .file_name()
         .and_then(|s| s.to_str())

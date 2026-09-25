@@ -99,7 +99,8 @@ async fn run_job_inner(
         cfg.cache_ttl,
         cfg.pkgcache_max_size,
         cfg.pkgcache_ttl,
-    );
+    )
+    .with_volumes(shared.chroots.cache_volumes().await);
 
     // Opportunistic cache GC (never blocks the build). Pin every pkgbase that is
     // currently building — not just this job's — so a concurrent sibling's
@@ -272,8 +273,12 @@ async fn run_job_inner(
             "builddir reclaim",
         )
         .await;
-        if let Some(dir) = cache.builddir(&job.arch) {
-            binds.push((dir, PathBuf::from(chroot::BUILDDIR_MOUNT)));
+        // Only this package's tree, at the path makepkg uses for it
+        // (`$BUILDDIR/$pkgbase`). Binding the whole per-arch directory, as
+        // this did, handed every build every other package's tree to read
+        // and rewrite.
+        if let Some(tree) = cache.builddir_tree(&job.arch, &job.pkgbase) {
+            binds.push((tree, Path::new(chroot::BUILDDIR_MOUNT).join(&job.pkgbase)));
         } else {
             let msg = format!(
                 "{} asked for a persistent build directory but one could not be \

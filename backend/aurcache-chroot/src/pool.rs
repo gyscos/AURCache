@@ -8,6 +8,7 @@
 
 use crate::cmd::{privileged, query};
 use crate::qgroup::{QgroupId, Qgroups, TOTAL, Usage};
+use crate::volumes::CacheVolumes;
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -430,6 +431,14 @@ impl Pool {
             return Err(e).with_context(|| format!("preparing {}", path.display()));
         }
         Ok(path)
+    }
+
+    /// The entries of the cache subvolume `name` (see
+    /// [`Self::ensure_subvolume`]), for the cache code to make, measure and
+    /// remove as subvolumes of their own.
+    #[must_use]
+    pub fn cache_volumes(&self, name: &str) -> CacheVolumes {
+        CacheVolumes::new(self.mountpoint.join(name), self.qgroups.clone())
     }
 
     /// Count the subvolume at `path` against the pool's total. What

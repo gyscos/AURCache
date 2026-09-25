@@ -411,3 +411,60 @@ async fn a_pool_too_full_to_shrink_is_made_again_at_the_new_size() {
     assert!(pool.oversized().is_none());
     pool.unmount().await.unwrap();
 }
+
+#[tokio::test]
+async fn cache_entries_are_subvolumes_measured_and_removed_by_btrfs() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("volumes");
+    let pool = Pool::open(config(&scratch, 600 * MIB)).await.unwrap();
+    pool.ensure_subvolume("cache", owner(), 0o2775)
+        .await
+        .unwrap();
+    let volumes = pool.cache_volumes("cache");
+    let entry = volumes.root().join("srcdest/hello");
+
+    let (v, e) = (volumes.clone(), entry.clone());
+    tokio::task::spawn_blocking(move || {
+        v.ensure(&e, owner(), 0o2775).unwrap();
+        v.ensure(&e, owner(), 0o2775).unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(volumes.is_volume(&entry), "made a subvolume");
+    assert!(
+        !volumes.is_volume(&volumes.root().join("srcdest")),
+        "its parent stays a directory"
+    );
+
+    let before = pool.total_usage().unwrap().used;
+    assert!(
+        write(&entry.join("tarball"), 32 * MIB).is_none(),
+        "the owner writes there"
+    );
+    sync(&pool);
+    let used = volumes.usage(&entry).unwrap();
+    assert!(used >= 30 * MIB, "measured by its own group: {used}");
+    assert!(
+        pool.total_usage().unwrap().used >= before + 30 * MIB,
+        "and counted under the total"
+    );
+
+    // A plain directory from before entries were subvolumes: not measured by
+    // a group, and never deleted as a subvolume.
+    let legacy = volumes.root().join("srcdest/legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    assert_eq!(volumes.usage(&legacy), None);
+    assert!(volumes.remove(&legacy).is_err());
+    assert!(
+        volumes.remove(&pool.root()).is_err(),
+        "nothing outside the cache"
+    );
+
+    let started = std::time::Instant::now();
+    volumes.remove(&entry).unwrap();
+    assert!(!entry.exists());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    pool.unmount().await.unwrap();
+}

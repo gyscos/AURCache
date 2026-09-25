@@ -25,6 +25,11 @@ pub struct Cache {
     ttl: Duration,
     pkg_max_size: u64,
     pkg_ttl: Duration,
+    /// Present when the cache is the storage pool's: then each package's
+    /// sources and each kept build tree is a subvolume of its own, measured by
+    /// its quota group and removed by deleting it. Entries from before that --
+    /// plain directories -- are measured and removed the old way.
+    volumes: Option<aurcache_chroot::CacheVolumes>,
 }
 
 /// A per-pkgbase source cache entry considered for eviction.
@@ -49,13 +54,70 @@ impl Cache {
             ttl: Duration::from_secs(ttl_secs),
             pkg_max_size,
             pkg_ttl: Duration::from_secs(pkg_ttl_secs),
+            volumes: None,
+        }
+    }
+
+    /// Make new entries subvolumes in the pool; see [`Cache::volumes`].
+    #[must_use]
+    pub fn with_volumes(mut self, volumes: Option<aurcache_chroot::CacheVolumes>) -> Self {
+        self.volumes = volumes;
+        self
+    }
+
+    /// An entry of the cache -- one package's sources, one kept build tree --
+    /// made if missing: a subvolume where the cache is the pool's, otherwise
+    /// a directory. `None` only if neither could be made.
+    fn entry(&self, path: PathBuf) -> Option<PathBuf> {
+        let Some(volumes) = &self.volumes else {
+            return Self::ensured(path);
+        };
+        // The same owner, group and mode `ensured` leaves a directory with:
+        // the worker's, the parent's group (setgid: the build user's), and
+        // group-writable, so the build user writes into it.
+        let parent = Self::ensured(path.parent()?.to_path_buf())?;
+        let owner = aurcache_chroot::Owner {
+            uid: aurcache_chroot::Owner::current().uid,
+            gid: {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&parent).ok()?.gid()
+            },
+        };
+        match volumes.ensure(&path, owner, 0o2775) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                // Still a place to build: a directory works, only without the
+                // subvolume's cheap size and removal.
+                tracing::warn!(
+                    "{} not made a subvolume ({e:#}); using a directory",
+                    path.display()
+                );
+                Self::ensured(path)
+            }
+        }
+    }
+
+    /// Bytes an entry holds: its quota group's figure when it is a subvolume,
+    /// otherwise walked.
+    fn entry_size(&self, path: &Path) -> Option<u64> {
+        self.volumes.as_ref().and_then(|v| v.usage(path))
+    }
+
+    /// Remove an entry: deleted as a subvolume, at once, when it is one;
+    /// otherwise set aside and removed as a tree ([`remove_tree`]).
+    fn remove_entry(&self, path: &Path) -> std::io::Result<()> {
+        match &self.volumes {
+            Some(volumes) if volumes.is_volume(path) => volumes
+                .remove(path)
+                .map_err(|e| std::io::Error::other(format!("{e:#}"))),
+            _ => remove_tree(path),
         }
     }
 
     /// `SRCDEST` for a pkgbase; created on demand. Returns `None` only if the
     /// directory truly cannot be created (build falls back to an ephemeral dir).
     pub fn srcdest(&self, pkgbase: &str) -> Option<PathBuf> {
-        Self::ensured(self.root.join("srcdest").join(sanitize(pkgbase)))
+        self.entry(self.root.join("srcdest").join(sanitize(pkgbase)))
     }
 
     /// Persistent build tree root for one architecture, bound over `/build`
@@ -72,6 +134,19 @@ impl Cache {
     /// happens for those; see `design/implemented/persistent-build-directory.md`.
     pub fn builddir(&self, platform: &str) -> Option<PathBuf> {
         Self::ensured(self.root.join("builddir").join(sanitize(platform)))
+    }
+
+    /// One package's persistent build tree, `$BUILDDIR/$pkgbase`: what a
+    /// build is given at `/build/<pkgbase>`, rather than the whole
+    /// [`Self::builddir`] with every other package's tree in it.
+    pub fn builddir_tree(&self, platform: &str, pkgbase: &str) -> Option<PathBuf> {
+        self.builddir(platform)?;
+        self.entry(
+            self.root
+                .join("builddir")
+                .join(sanitize(platform))
+                .join(sanitize(pkgbase)),
+        )
     }
 
     /// The file caching a tree's measured size, written after each build so
@@ -101,7 +176,8 @@ impl Cache {
         let Some(tree) = self.builddir(platform).map(|r| r.join(sanitize(pkgbase))) else {
             return;
         };
-        if !tree.is_dir() {
+        // A subvolume's size is its quota group's, always current.
+        if !tree.is_dir() || self.entry_size(&tree).is_some() {
             return;
         }
         let size = measure_tree(&tree);
@@ -217,7 +293,7 @@ impl Cache {
             {
                 continue;
             }
-            match remove_tree(&path) {
+            match self.remove_entry(&path) {
                 Ok(()) => {
                     total = total.saturating_sub(size);
                     short_of_free = min_free > 0 && free_bytes(&root).is_some_and(|f| f < min_free);
@@ -238,6 +314,9 @@ impl Cache {
     /// Tolerates a stamp carrying more than one field, from the brief time a
     /// rebuild cost was recorded alongside.
     fn stamped_size(&self, platform: &str, tree: &Path) -> u64 {
+        if let Some(size) = self.entry_size(tree) {
+            return size;
+        }
         let Some(name) = tree.file_name().and_then(|n| n.to_str()) else {
             return measure_tree(tree);
         };
@@ -597,7 +676,7 @@ impl Cache {
     /// cannot outlive it; see [`Self::wipe_borrowed_checkouts`].
     pub fn wipe_srcdest(&self, pkgbase: &str) {
         let path = self.root.join("srcdest").join(sanitize(pkgbase));
-        if let Err(e) = remove_tree(&path) {
+        if let Err(e) = self.remove_entry(&path) {
             tracing::warn!("could not wipe cache {}: {e}", path.display());
         }
         self.wipe_borrowed_checkouts(pkgbase);
@@ -702,7 +781,9 @@ impl Cache {
             }
             let pkgbase = ent.file_name().to_string_lossy().into_owned();
             let path = ent.path();
-            let size = aurcache_common::fs::dir_size(&path);
+            let size = self
+                .entry_size(&path)
+                .unwrap_or_else(|| aurcache_common::fs::dir_size(&path));
             let last_used = ent
                 .metadata()
                 .and_then(|m| m.modified())

@@ -26,16 +26,20 @@ Done so far:
   `makepkg --verifysource` writes) is in the build's own subvolume, through
   `TMPDIR`. The overlay and copy strategies are gone.
 - The caches live in one `cache` subvolume in the pool, under the total
-  (`WORKER_CACHE_DIR` and the separate cache volume are gone).
+  (`WORKER_CACHE_DIR` and the separate cache volume are gone). Each package's
+  sources and each kept build tree is a subvolume inside it (created by the
+  worker, which the kernel counts under the total on its own; the worker
+  assigns it where it does not): measured by its quota group, evicted by
+  `subvolume delete`. Plain directories from before keep the old walk and
+  `rm`. A build is bound only its own tree, at `/build/<pkgbase>`.
 - Running on freyja, with the dedicated btrfs filesystem as its pool.
 
 Decided: the caches' budgets stay eviction targets, not hard qgroup limits.
 The total is the hard bound they were approximating; the budgets only decide
 what to prune first.
 
-Not yet: a subvolume per pkgbase for SRCDEST and kept trees (instant eviction,
-measuring by qgroup, and a base for per-package quotas later), reporting disk
-usage beside peak memory, the configuration fit check, the ZFS tuning log, the
+Not yet: per-package quotas (a qgroup limit on the package's subvolume, now
+that it has one), reporting disk usage beside peak memory, the configuration fit check, the ZFS tuning log, the
 docker worker's "not enforced" log, and a real build-time comparison.
 
 ---
