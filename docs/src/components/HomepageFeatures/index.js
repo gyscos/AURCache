@@ -13,8 +13,17 @@ const images = [
     ),
   },
   {
-    title: 'Detailed Build Logs',
+    title: 'Package Management',
     src: require('@site/static/img/screenshot2.png').default,
+    description: (
+      <>
+        Each package gets its own page with its builds, dependencies and dependents, produced artifacts, and build configuration. Rebuilding, changing platforms and flags, editing sources, or removing the package all happen in one place.
+      </>
+    ),
+  },
+  {
+    title: 'Detailed Build Logs',
+    src: require('@site/static/img/screenshot3.png').default,
     description: (
       <>
         The build output page in AURCache provides detailed logs for each package build. You can easily track build progress, view logs, and diagnose issues. This feature helps you maintain control over the build process and quickly address any problems that arise.
@@ -22,13 +31,11 @@ const images = [
     ),
   },
   {
-    title: 'User-Friendly Interface',
-    src: require('@site/static/img/screenshot3.png').default,
+    title: 'Responsive Mobile View',
+    src: require('@site/static/img/screenshot_mobile1.png').default,
     description: (
       <>
-        With its clear and concise web frontend, AURCache is designed to be easy to use. 
-        Adding and Managing packages is straightforward, letting you focus on development without complex processes.
-        Under the hood, the robust Rust backend guarantees stability and performance, providing a reliable foundation for all your repository needs.
+        The interface adapts to narrow screens, so you can monitor builds, check package status, and read logs from your phone just as easily as from your desktop.
       </>
     ),
   },

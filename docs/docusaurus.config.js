@@ -69,7 +69,7 @@ const config = {
       navbar: {
         title: 'AURCache',
         logo: {
-          alt: 'My Site Logo',
+          alt: 'AURCache Logo',
           src: 'img/favicon.png',
         },
         items: [
