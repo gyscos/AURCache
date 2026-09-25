@@ -34,7 +34,12 @@ pub fn discover_artifacts(dir: &Path) -> Vec<PathBuf> {
     };
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_artifact(&name) {
+        // Regular files only, judged without following links: the directory
+        // holds whatever the PKGBUILD's source and build put there, and a
+        // symlink named like a package would otherwise be uploaded as the
+        // file it points at -- the worker's own key, its build credential.
+        let regular = entry.file_type().is_ok_and(|t| t.is_file());
+        if regular && is_artifact(&name) {
             out.push(entry.path());
         }
     }
@@ -64,6 +69,21 @@ pub fn is_artifact(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A symlink named like a package is not a package: it would be uploaded
+    /// as whatever it points at, which on a worker includes its own key.
+    #[test]
+    fn a_symlink_named_like_a_package_is_not_an_artifact() {
+        let outside = tempfile::tempdir().unwrap();
+        let key = outside.path().join("worker-key.pem");
+        std::fs::write(&key, "PRIVATE KEY").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("demo-1-1-x86_64.pkg.tar.zst");
+        std::fs::write(&real, "package").unwrap();
+        std::os::unix::fs::symlink(&key, dir.path().join("leak-1-1-x86_64.pkg.tar.zst")).unwrap();
+
+        assert_eq!(discover_artifacts(dir.path()), [real]);
+    }
 
     fn make_tar_gz(pkgbase: &str, files: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();

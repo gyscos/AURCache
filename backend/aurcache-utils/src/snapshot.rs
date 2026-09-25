@@ -790,7 +790,9 @@ async fn checkout_and_parse(
         let package_dir = if subfolder.is_empty() {
             path
         } else {
-            path.join(&subfolder)
+            let package_dir = path.join(&subfolder);
+            ensure_inside(&package_dir, &path)?;
+            package_dir
         };
         anyhow::Ok((commit, package_dir))
     })
@@ -805,7 +807,7 @@ async fn checkout_and_parse(
             let srcinfo_path = package_dir.join(".SRCINFO");
             let pkgbuild_path = package_dir.join("PKGBUILD");
             let parsed = if srcinfo_path.exists() {
-                std::fs::read_to_string(&srcinfo_path)
+                read_checkout_file(&srcinfo_path)
                     .map_err(anyhow::Error::from)
                     .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
                     .or_else(|err| {
@@ -836,11 +838,49 @@ async fn checkout_and_parse(
     Ok((commit, tar_gz_bytes, pkgbase, sourceinfo))
 }
 
+/// Read a file from a package checkout, which the package's repository wrote.
+///
+/// Only a regular file is read. The server reads these unconfined, and a
+/// repository may commit a symlink -- `.SRCINFO` pointing at the server's
+/// environment file would otherwise be read, parsed and its lines reported.
+/// A symlinked file is treated as unreadable, which sends a `.SRCINFO` to the
+/// sandboxed PKGBUILD parse instead.
+fn read_checkout_file(path: &Path) -> std::io::Result<String> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// Refuse a package directory that resolves outside its checkout: a
+/// repository can make the configured subfolder a symlink to anywhere, and
+/// everything under the package directory is archived and served to workers.
+fn ensure_inside(package_dir: &Path, checkout: &Path) -> anyhow::Result<()> {
+    let resolved = package_dir
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("resolving {}: {e}", package_dir.display()))?;
+    let root = checkout
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("resolving {}: {e}", checkout.display()))?;
+    if !resolved.starts_with(&root) {
+        anyhow::bail!(
+            "the package directory {} resolves outside its checkout, to {}",
+            package_dir.display(),
+            resolved.display()
+        );
+    }
+    Ok(())
+}
+
 /// Best-effort pkgbase name to use as the archive's top-level directory when
 /// `.SRCINFO`/PKGBUILD parsing fails: read `pkgbase=`/`pkgname=` directly out
 /// of the PKGBUILD text, falling back to the checkout directory's name.
 fn fallback_pkgbase(package_dir: &Path) -> String {
-    if let Ok(content) = std::fs::read_to_string(package_dir.join("PKGBUILD")) {
+    if let Ok(content) = read_checkout_file(&package_dir.join("PKGBUILD")) {
         for line in content.lines() {
             let line = line.trim();
             for prefix in ["pkgbase=", "pkgname="] {
@@ -1051,10 +1091,18 @@ fn read_file_from_archive(
 /// served to workers, and shipping it would attach the repository's entire
 /// history to every job download. Only the top level is filtered, which is
 /// sufficient because the checkout is a plain clone with no submodules.
+///
+/// Symlinks are archived as symlinks. `tar::Builder` follows them by default,
+/// and this runs in the server, unconfined, over files a package's repository
+/// wrote: a committed `x -> /proc/self/environ` or `-> /etc/aurcache/...` would
+/// put the target's contents -- the server's secrets -- into an archive every
+/// worker, and the build that package runs there, can read. A symlink is what
+/// makepkg expects anyway.
 fn create_archive_with_pkgbase_dir(source_dir: &Path, pkgbase: &str) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
+    tar.follow_symlinks(false);
 
     let root = Path::new(pkgbase);
     tar.append_dir(root, source_dir)?;
@@ -1093,6 +1141,137 @@ url=\"https://example.org/\"
 arch=('x86_64')
 license=('MIT')
 ";
+
+    /// One entry of an archive, as a test inspects it.
+    struct ArchivedEntry {
+        path: String,
+        kind: tar::EntryType,
+        /// Where a link points, for a symlink or a hard link.
+        link: Option<String>,
+        data: Vec<u8>,
+    }
+
+    /// Every entry of a tar.gz.
+    fn archive_entries(bytes: &[u8]) -> Vec<ArchivedEntry> {
+        use std::io::Read;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().to_string();
+                let kind = entry.header().entry_type();
+                let link = entry
+                    .link_name()
+                    .unwrap()
+                    .map(|l| l.to_string_lossy().to_string());
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).unwrap();
+                ArchivedEntry {
+                    path,
+                    kind,
+                    link,
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    /// A repository can commit a symlink to anything. The archive is built by
+    /// the server, unconfined, and served to every worker: a followed link
+    /// would carry the target's contents -- the server's secrets -- to the
+    /// build. It must stay a link, and a linked directory must not be walked.
+    #[test]
+    fn a_committed_symlink_is_archived_as_a_link_not_its_target() {
+        let secrets = tempfile::tempdir().unwrap();
+        let secret = secrets.path().join("server.env");
+        std::fs::write(&secret, "DB_PWD=hunter2\n").unwrap();
+        std::fs::create_dir(secrets.path().join("ca")).unwrap();
+        std::fs::write(secrets.path().join("ca/key.pem"), "PRIVATE KEY").unwrap();
+
+        let checkout = tempfile::tempdir().unwrap();
+        let dir = checkout.path();
+        std::fs::write(dir.join("PKGBUILD"), "pkgname=demo\n").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("leak")).unwrap();
+        std::os::unix::fs::symlink(secrets.path().join("ca"), dir.join("leakdir")).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("sub/deeper")).unwrap();
+
+        let entries = archive_entries(&create_archive_with_pkgbase_dir(dir, "demo").unwrap());
+        for entry in &entries {
+            let text = String::from_utf8_lossy(&entry.data);
+            assert!(
+                !text.contains("hunter2") && !text.contains("PRIVATE KEY"),
+                "{} carries a secret",
+                entry.path
+            );
+        }
+        let find = |p: &str| {
+            entries
+                .iter()
+                .find(|e| e.path == p)
+                .unwrap_or_else(|| panic!("{p}"))
+        };
+        for (path, target) in [
+            ("demo/leak", &secret),
+            ("demo/sub/deeper", &secret),
+            ("demo/leakdir", &secrets.path().join("ca")),
+        ] {
+            let entry = find(path);
+            assert_eq!(entry.kind, tar::EntryType::Symlink, "{path}");
+            assert_eq!(
+                entry.link.as_deref(),
+                Some(target.to_str().unwrap()),
+                "{path}"
+            );
+        }
+        assert!(
+            !entries.iter().any(|e| e.path.starts_with("demo/leakdir/")),
+            "a linked directory was walked"
+        );
+    }
+
+    /// `.SRCINFO` and the pkgbase fallback read the checkout unconfined, so a
+    /// symlinked one is not read at all.
+    #[test]
+    fn a_symlinked_checkout_file_is_not_read() {
+        let secrets = tempfile::tempdir().unwrap();
+        let secret = secrets.path().join("server.env");
+        std::fs::write(&secret, "pkgname=hunter2\n").unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&secret, checkout.path().join(".SRCINFO")).unwrap();
+        std::os::unix::fs::symlink(&secret, checkout.path().join("PKGBUILD")).unwrap();
+
+        assert!(read_checkout_file(&checkout.path().join(".SRCINFO")).is_err());
+        assert_ne!(
+            fallback_pkgbase(checkout.path()),
+            "hunter2",
+            "the pkgbase came out of the linked file"
+        );
+        std::fs::write(checkout.path().join("real"), "ok").unwrap();
+        assert_eq!(
+            read_checkout_file(&checkout.path().join("real")).unwrap(),
+            "ok"
+        );
+    }
+
+    /// The package's subfolder is configured on the server, but whether it is
+    /// a directory or a symlink out of the checkout is the repository's say.
+    #[test]
+    fn a_subfolder_that_resolves_outside_the_checkout_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join("pkg")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("escape")).unwrap();
+
+        assert!(ensure_inside(&checkout.path().join("pkg"), checkout.path()).is_ok());
+        let error = ensure_inside(&checkout.path().join("escape"), checkout.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside its checkout"),
+            "{error:#}"
+        );
+    }
 
     fn make_fixture_archive(pkgbase: &str, pkgbuild: &str) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();

@@ -67,10 +67,25 @@ pub async fn upload_artifacts(client: &WorkerClient, build_id: i32, pkgdir: &Pat
             .and_then(|s| s.to_str())
             .context("artifact has no filename")?
             .to_string();
-        let reader = tokio::fs::File::open(&path)
+        // `O_NOFOLLOW`, and a regular file: see `discover_artifacts`. Checked
+        // again at the open, which is the moment that decides what is read.
+        let reader = tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
             .await
-            .with_context(|| format!("opening {}", path.display()))?;
-        let len = reader.metadata().await.ok().map(|m| m.len());
+            .with_context(|| format!("opening {} (a symlink is refused)", path.display()))?;
+        let meta = reader
+            .metadata()
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "{} is not a regular file; refusing to upload it",
+                path.display()
+            );
+        }
+        let len = Some(meta.len());
         log(client, build_id, &format!("[worker] uploading {name}\n")).await;
         client
             .upload_artifact(build_id, &name, reader, len)

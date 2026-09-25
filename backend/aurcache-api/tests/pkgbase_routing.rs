@@ -733,13 +733,30 @@ async fn insert_worker(db: &DatabaseConnection, id: i32) {
     .expect("insert worker");
 }
 
-/// `(pkg_name, number)` of what a list route returned.
-async fn listed(client: &Client, path: &str) -> Vec<(String, i32)> {
+/// A listed build, by what names it.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Listed {
+    pkg: String,
+    number: i32,
+}
+
+fn listed_build(pkg: &str, number: i32) -> Listed {
+    Listed {
+        pkg: pkg.to_string(),
+        number,
+    }
+}
+
+/// What a list route returned, sorted so the comparison ignores its order.
+async fn listed(client: &Client, path: &str) -> Vec<Listed> {
     let response = client.get(path).dispatch().await;
     assert_eq!(response.status(), Status::Ok, "{path}");
     let builds: Vec<aurcache_api::models::builds::BuildSummary> =
         response.into_json().await.expect("a build list");
-    let mut out: Vec<_> = builds.into_iter().map(|b| (b.pkg_name, b.number)).collect();
+    let mut out: Vec<_> = builds
+        .into_iter()
+        .map(|b| listed_build(&b.pkg_name, b.number))
+        .collect();
     out.sort();
     out
 }
@@ -761,9 +778,9 @@ async fn builds_filter_by_worker_and_state() {
     insert_worker_build(&db, world, 1, BuildStates::PUBLISHING, Some(2)).await;
     insert_worker_build(&db, queued, 1, BuildStates::ENQUEUED_BUILD, None).await;
 
-    let h = |n| ("hello".to_string(), n);
-    let w = |n| ("world".to_string(), n);
-    let q = |n| ("queued".to_string(), n);
+    let h = |n| listed_build("hello", n);
+    let w = |n| listed_build("world", n);
+    let q = |n| listed_build("queued", n);
     assert_eq!(listed(&client, "/api/builds?worker=1").await, [h(1), h(2)]);
     assert_eq!(
         listed(&client, "/api/builds?worker=1&status=active").await,

@@ -916,6 +916,7 @@ dependencies = [
  "aurcache-common",
  "flate2",
  "hex",
+ "libc",
  "percent-encoding",
  "rcgen",
  "reqwest",
