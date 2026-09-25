@@ -102,6 +102,91 @@ jobs:
         run: |
           cargo check -p aurcache-common --no-default-features
           cargo check -p aurcache-client
+  # The frontend is its own workspace, built only for wasm32, so the backend
+  # job above never lints or tests it. Both targets are linted, as `just lint`
+  # does: the crate ships as wasm and its tests run on the host.
+  lintAndTestFrontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend-rs
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update local toolchain
+        run: |
+          rustup update
+          rustup component add clippy rustfmt
+          rustup target add wasm32-unknown-unknown
+
+      - name: Lint
+        run: |
+          cargo fmt -- --check
+          cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  # The unit tests render components directly, so they cannot see whether the
+  # page boots; this opens every route in the runner's Chrome against a
+  # seeded server with the frontend embedded. Offline routes only: `--online`
+  # would make the run depend on the AUR being up.
+  browserTest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update local toolchain
+        run: rustup update
+
+      - name: Install wasm toolchain
+        run: bash docker/install-wasm-bindgen.sh frontend-rs/Cargo.lock
+
+      - name: Render every route
+        run: ./scripts/test-frontend.sh --shots "$RUNNER_TEMP/shots"
+
+      - name: Keep the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-screenshots
+          path: ${{ runner.temp }}/shots
+          if-no-files-found: ignore
+
+  # What `cargo test` leaves out because it needs root and a real kernel: the
+  # worker's btrfs storage pool (loop devices, simple quotas) and its build
+  # cgroups. They run as root in a privileged container on the runner's
+  # kernel. The pool needs Linux 6.7+; on an older runner kernel the script
+  # skips those tests with a warning annotation rather than failing.
+  #
+  # Not covered here: a pool on a real block device or zvol, and ZFS under an
+  # image -- the runner has neither. `test-e2e.sh` builds in an image pool.
+  kernelTests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update local toolchain
+        run: rustup update
+
+      - name: Pool and cgroup tests
+        run: ./scripts/test-kernel.sh
+
+  # A PKGBUILD runs outside the chroot while its sources are fetched; this
+  # checks the Landlock confinement around that, both that it denies and that
+  # the same fixture escapes without it. Docker only, on the runner's kernel.
+  sandboxTest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update local toolchain
+        run: rustup update
+
+      - name: Sandbox test
+        run: ./scripts/test-sandbox.sh
+
   e2eTest:
     runs-on: ubuntu-latest
     steps:

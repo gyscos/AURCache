@@ -39,6 +39,7 @@ just format        # cargo fmt, both workspaces
 just lint          # clippy over both workspaces; the frontend for wasm *and* host
 just test          # cargo test, both workspaces (no browser)
 just test-browser  # scripts/test-frontend.sh
+just test-kernel   # scripts/test-kernel.sh (docker, privileged)
 just clean
 
 # Rust backend workspace
@@ -96,6 +97,15 @@ cover, rather than running all four as a matter of course:
   hybrid image, the chroot builder, or the docker builder.
 - `test-sandbox.sh` — only for changes to `aurcache-sandbox` or the PKGBUILD
   sourcing path.
+- `test-kernel.sh` — for changes to `aurcache-chroot`, the worker's pool or
+  cache volumes, or its cgroups. It runs the tests `cargo test` leaves out
+  (`AURCACHE_POOL_TESTS`, `#[ignore]`d cgroup tests) as root in a privileged
+  container. Needs Linux 6.7+ for the pool, and Cargo's target directory on
+  local storage: root in the container cannot write to a root-squashed NFS.
+
+CI runs the lint and unit tests for both workspaces, `test-frontend.sh`,
+`test-kernel.sh`, `test-sandbox.sh` and `test-e2e.sh`. It cannot cover a pool
+on a block device or zvol, or an image on ZFS; the runner has neither.
 
 Unit and integration tests are cheap (backend ~8s, frontend <1s) and should be
 the reflex. They render components directly, though, so they cannot see whether

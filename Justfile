@@ -32,3 +32,7 @@ test:
 # Render every route in a real browser and drive the interactive ones
 test-browser:
   ./scripts/test-frontend.sh
+
+# The storage pool and cgroup tests, as root in a privileged container
+test-kernel:
+  ./scripts/test-kernel.sh
