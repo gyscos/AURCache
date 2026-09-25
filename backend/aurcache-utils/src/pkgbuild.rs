@@ -54,6 +54,151 @@ pub(crate) struct Bridge {
     network: bool,
 }
 
+/// How long a parse may take and how much it may print.
+///
+/// A parse runs the PKGBUILD's top level, which is attacker-supplied: it can
+/// sleep forever, or print without end into the server's memory. Sourcing a
+/// real recipe takes well under a second and prints a few kilobytes of
+/// `.SRCINFO`; the minute is for the rare `pkgver=$(curl ...)` allowed the
+/// network by `parse_network`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    pub(crate) timeout: std::time::Duration,
+    /// Bytes of stdout, the bridge's output, before the parse is killed.
+    pub(crate) max_stdout: usize,
+    /// Bytes of stderr kept for the error message; the rest is discarded.
+    pub(crate) max_stderr: usize,
+}
+
+pub(crate) const PARSE_LIMITS: Limits = Limits {
+    timeout: std::time::Duration::from_secs(60),
+    max_stdout: 8 << 20,
+    max_stderr: 64 << 10,
+};
+
+/// What a bounded run produced.
+#[derive(Debug)]
+pub(crate) struct BoundedOutput {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Run `command` to completion within `limits`, killing its whole process
+/// group when it overruns either.
+///
+/// Its own process group, so the kill reaches whatever the PKGBUILD started --
+/// `Child::kill` alone would stop the shell and leave a backgrounded `sleep`
+/// holding the pipes. Output is read on threads so neither pipe can fill and
+/// stall the child, and collecting it is bounded by the same deadline: a
+/// process that escaped the group can keep a pipe open indefinitely.
+pub(crate) fn run_bounded(mut command: Command, limits: Limits) -> anyhow::Result<BoundedOutput> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("starting the parse")?;
+    let group = i32::try_from(child.id()).context("process id")?;
+    let kill_group = move || {
+        // SAFETY: a plain kill(2) of a process group this function created.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    };
+
+    /// What one pipe carried, up to its cap.
+    #[derive(Default)]
+    struct Captured {
+        kept: Vec<u8>,
+        /// Whether there was more than the cap.
+        overflow: bool,
+    }
+
+    /// Read up to `cap` bytes, then keep draining so the writer never blocks.
+    /// `on_overflow` runs once, the moment the cap is passed: a writer that
+    /// never stops would otherwise only be noticed at the deadline.
+    fn read_capped(mut from: impl Read, cap: usize, on_overflow: impl FnOnce()) -> Captured {
+        let mut kept = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut on_overflow = Some(on_overflow);
+        loop {
+            match from.read(&mut chunk) {
+                Ok(0) | Err(_) => {
+                    return Captured {
+                        kept,
+                        overflow: on_overflow.is_none(),
+                    };
+                }
+                Ok(n) => {
+                    let room = cap.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                    if n > room
+                        && let Some(stop) = on_overflow.take()
+                    {
+                        stop();
+                    }
+                }
+            }
+        }
+    }
+
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    let stdout = child.stdout.take().context("stdout was piped")?;
+    let stderr = child.stderr.take().context("stderr was piped")?;
+    let max_stdout = limits.max_stdout;
+    std::thread::spawn(move || {
+        // Past the cap, the parse is stopped at once.
+        let _ = out_tx.send(read_capped(stdout, max_stdout, kill_group));
+    });
+    let max_stderr = limits.max_stderr;
+    std::thread::spawn(move || {
+        // Too much here only truncates the message.
+        let _ = err_tx.send(read_capped(stderr, max_stderr, || {}));
+    });
+
+    let deadline = Instant::now() + limits.timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for the parse")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            kill_group();
+            let _ = child.wait();
+            anyhow::bail!(
+                "the PKGBUILD took longer than {}s to parse; it was stopped",
+                limits.timeout.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Whatever it left running in its group goes too: nothing a parse starts
+    // outlives it.
+    kill_group();
+
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let stdout = out_rx
+        .recv_timeout(remaining())
+        .context("the parse's output was never closed")?;
+    let stderr = err_rx.recv_timeout(remaining()).unwrap_or_default();
+    if stdout.overflow {
+        anyhow::bail!(
+            "the PKGBUILD printed more than {} MiB while being parsed; it was stopped",
+            limits.max_stdout >> 20
+        );
+    }
+    Ok(BoundedOutput {
+        status,
+        stdout: stdout.kept,
+        stderr: stderr.kept,
+    })
+}
+
 /// Paths kept unreadable in addition to the server's working directory.
 ///
 /// The native packages put the server's environment file here; the parse needs
@@ -165,11 +310,11 @@ impl Bridge {
 
     /// Parse the PKGBUILD at `pkgbuild`.
     pub(crate) fn parse(&self, pkgbuild: &Path) -> anyhow::Result<SourceInfoV1> {
-        let output = self.command(pkgbuild)?.output().with_context(|| {
+        let output = run_bounded(self.command(pkgbuild)?, PARSE_LIMITS).with_context(|| {
             format!(
-                "cannot run {} to parse {}",
-                self.sandbox.display(),
-                pkgbuild.display()
+                "cannot parse {} with {}",
+                pkgbuild.display(),
+                self.sandbox.display()
             )
         })?;
         if !output.status.success() {
@@ -361,6 +506,88 @@ pub(crate) mod tests {
         let dir = command.get_current_dir().unwrap();
         assert!(dir.is_absolute());
         assert!(dir.ends_with("demo"));
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    fn limits(timeout_ms: u64) -> Limits {
+        Limits {
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            max_stdout: 1 << 20,
+            max_stderr: 1024,
+        }
+    }
+
+    fn alive(pid: &str) -> bool {
+        Path::new("/proc").join(pid.trim()).exists()
+    }
+
+    #[test]
+    fn a_bounded_run_returns_status_and_both_streams() {
+        let out = run_bounded(sh("echo hi; echo err >&2; exit 3"), limits(10_000)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"hi\n");
+        assert_eq!(out.stderr, b"err\n");
+    }
+
+    /// A PKGBUILD that never finishes is stopped at the deadline, and what it
+    /// started in the background goes with it.
+    #[test]
+    fn a_parse_that_hangs_is_stopped_with_everything_it_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let started = std::time::Instant::now();
+        let error = run_bounded(
+            sh(&format!(
+                "sleep 300 & echo $! > {}; wait",
+                pidfile.display()
+            )),
+            limits(500),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("longer than"), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!alive(&pid), "the backgrounded sleep outlived the parse");
+    }
+
+    /// Printing without end is stopped at the cap, not at the deadline, and
+    /// never all held in memory.
+    #[test]
+    fn a_parse_that_floods_its_output_is_stopped_at_the_cap() {
+        let started = std::time::Instant::now();
+        let error = run_bounded(sh("yes"), limits(30_000)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("printed more than"),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "stopped at the cap, well before the deadline"
+        );
+    }
+
+    /// A background process holding the pipe open must not stall a parse that
+    /// has finished: it is killed with the rest of the group.
+    #[test]
+    fn a_finished_parse_is_not_held_open_by_what_it_backgrounded() {
+        let started = std::time::Instant::now();
+        let out = run_bounded(sh("sleep 300 & echo done"), limits(10_000)).unwrap();
+        assert_eq!(out.stdout, b"done\n");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Too much stderr is truncated for the message, not an error.
+    #[test]
+    fn excess_stderr_is_truncated() {
+        let out = run_bounded(sh("head -c 5000 /dev/zero >&2; echo ok"), limits(10_000)).unwrap();
+        assert_eq!(out.stderr.len(), 1024);
+        assert_eq!(out.stdout, b"ok\n");
     }
 
     /// Missing the sandbox is an error, never an unconfined parse.

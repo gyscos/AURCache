@@ -857,6 +857,7 @@ dependencies = [
  "flate2",
  "futures",
  "git2",
+ "libc",
  "lru",
  "pacman-mirrors",
  "pacman-repo-utils",

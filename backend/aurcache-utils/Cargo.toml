@@ -6,6 +6,8 @@ edition = "2024"
 workspace = true
 
 [dependencies]
+# Killing a parse's whole process group; see `pkgbuild::run_bounded`.
+libc = "0.2"
 # "https" enables the OpenSSL-backed HTTPS transport (required to clone AUR/git
 # sources over https://); "vendored-openssl" builds OpenSSL from source so we
 # don't depend on a system OpenSSL dev package being present (incl. for cross
