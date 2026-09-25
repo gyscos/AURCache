@@ -371,6 +371,34 @@ struct WorkerKnobs {
     /// Shared secret matching the server's `AURCACHE_ENROLLMENT_TOKEN`.
     #[arg(long)]
     enrollment_token: Option<String>,
+
+    /// Back the worker's storage pool with this block device on the host: a
+    /// zvol or a partition, formatted the first time. One that already holds a
+    /// filesystem the worker did not make is refused. The best choice on ZFS.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["pool_mount", "pool_image"])]
+    pool_device: Option<String>,
+
+    /// Back it with an existing btrfs filesystem mounted at PATH on the host.
+    /// It must be a whole filesystem, dedicated to the worker: quotas apply to
+    /// all of it.
+    #[arg(long, value_name = "PATH", conflicts_with = "pool_image")]
+    pool_mount: Option<String>,
+
+    /// Back it with an image file in the worker's data volume -- the default,
+    /// which needs nothing prepared on the host.
+    #[arg(long)]
+    pool_image: bool,
+
+    /// Allocate the image in full up front, so its space is the worker's.
+    /// Image only; on ZFS it reserves nothing.
+    #[arg(long, conflicts_with_all = ["pool_device", "pool_mount"])]
+    disk_reserve: bool,
+
+    /// Everything the worker may store -- base chroot, builds, caches -- e.g.
+    /// `500G` (`WORKER_DISK_MAX`, 200G by default). With a device or a mount,
+    /// leave about 5% of it, and at least 2G, free.
+    #[arg(long, value_name = "SIZE", value_parser = parse_size_value)]
+    disk_max: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -389,8 +417,11 @@ struct SetupCommon {
 }
 
 impl WorkerKnobs {
-    fn to_env(&self) -> compose::WorkerEnv {
-        compose::WorkerEnv {
+    /// The worker's environment. With `ask`, a pool not given on the command
+    /// line is asked for; without, it is the default image.
+    fn to_env(&self, ask: bool) -> Result<compose::WorkerEnv> {
+        Ok(compose::WorkerEnv {
+            pool: self.pool_setup(ask)?,
             url: None,
             ca_fingerprint: None,
             enrollment_token: self.enrollment_token.clone(),
@@ -401,8 +432,66 @@ impl WorkerKnobs {
             packages: self.packages.clone(),
             concurrency: self.concurrency,
             priority: self.priority,
-        }
+        })
     }
+
+    fn pool_setup(&self, ask: bool) -> Result<compose::PoolSetup> {
+        let chosen = self.pool_device.is_some()
+            || self.pool_mount.is_some()
+            || self.pool_image
+            || self.disk_reserve;
+        let backing = match (&self.pool_device, &self.pool_mount) {
+            (Some(device), _) => compose::PoolBacking::Device(device.clone()),
+            (_, Some(mount)) => compose::PoolBacking::Mount(mount.clone()),
+            _ if !chosen && ask => prompt_pool_backing()?,
+            _ => compose::PoolBacking::Image,
+        };
+        Ok(compose::PoolSetup {
+            backing,
+            reserve: self.disk_reserve,
+            disk_max: self.disk_max.clone(),
+        })
+    }
+}
+
+/// A size as the worker reads it (`500G`, `1T`, bytes), checked here so a typo
+/// fails now rather than as a default on the worker.
+fn parse_size_value(raw: &str) -> Result<String, String> {
+    aurcache_common::units::parse_size(raw)
+        .filter(|&bytes| bytes > 0)
+        .map(|_| raw.trim().to_string())
+        .ok_or_else(|| format!("{raw:?} is not a size (e.g. 500G, 1T)"))
+}
+
+fn prompt_pool_backing() -> Result<compose::PoolBacking> {
+    eprintln!(
+        "The worker keeps every chroot, build and cache in one storage pool, under one\n\
+         disk quota. See the docs' \"Storage pool\" page for the trade-offs."
+    );
+    let choices = [
+        "An image file in the worker's volume -- nothing to prepare (default)",
+        "A block device: a zvol or a partition -- best on ZFS",
+        "An existing btrfs filesystem, dedicated to the worker -- best on btrfs",
+    ];
+    let choice = Select::new()
+        .with_prompt("What should back the storage pool?")
+        .items(choices)
+        .default(0)
+        .interact()
+        .context("failed to read the storage pool choice")?;
+    let path = |prompt: &str| -> Result<String> {
+        dialoguer::Input::<String>::new()
+            .with_prompt(prompt)
+            .interact_text()
+            .context("failed to read the path")
+    };
+    Ok(match choice {
+        1 => compose::PoolBacking::Device(path(
+            "Device path on the host (e.g. /dev/zvol/tank/aurcache-worker)",
+        )?),
+        2 => compose::PoolBacking::Mount(path("Mount point on the host")?),
+        _ => compose::PoolBacking::Image,
+    })
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -921,7 +1010,7 @@ fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
         public_url: args.public_url.unwrap_or(defaults.public_url),
         log_level: args.common.log_level,
         tls_sans: args.tls_sans.unwrap_or(defaults.tls_sans),
-        worker: args.worker.to_env(),
+        worker: args.worker.to_env(args.role.has_worker() && can_prompt())?,
     };
     let rendered = compose::render_compose(&params);
 
@@ -1007,7 +1096,7 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
         Some(url) => host_from_url(url).is_some_and(setup::is_local_host),
     };
 
-    let mut env = args.worker.to_env();
+    let mut env = args.worker.to_env(can_prompt() && !args.dry_run)?;
     env.ca_fingerprint.clone_from(&args.ca_fingerprint);
     let env = if local {
         setup::local_worker_env(env)
@@ -3655,6 +3744,33 @@ mod tests {
         let swapped = [build("hello", 3, ACTIVE), build("world", 1, ACTIVE)];
         assert_eq!(drain_progress(4, &two), drain_progress(4, &swapped));
         assert!(drain_progress(4, &two).contains("2 builds: hello/3, world/1"));
+    }
+
+    /// One backing at a time, reserving only for an image, and a size that is
+    /// one -- all refused before anything is written.
+    #[test]
+    fn pool_options_are_checked_when_parsed() {
+        let base = [
+            "aurcache-cli",
+            "setup",
+            "compose",
+            "--role",
+            "worker",
+            "-o",
+            "-",
+        ];
+        let parses =
+            |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()).copied()).is_ok();
+        assert!(parses(&["--pool-device", "/dev/zd0", "--disk-max", "500G"]));
+        assert!(parses(&["--pool-image", "--disk-reserve"]));
+        assert!(!parses(&[
+            "--pool-device",
+            "/dev/zd0",
+            "--pool-mount",
+            "/srv"
+        ]));
+        assert!(!parses(&["--pool-mount", "/srv", "--disk-reserve"]));
+        assert!(!parses(&["--disk-max", "lots"]));
     }
 
     /// Naming nothing is a usage error, not a silent no-op.

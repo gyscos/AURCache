@@ -183,7 +183,7 @@ leaving each build to re-download its dependencies.
 | `WORKER_BUILDDIR_MAX_BYTES` | Size | Budget for kept build trees, for packages with a persistent build directory | `200G` |
 | `WORKER_BUILDDIR_MIN_FREE` | Size | Free space to keep in the storage pool when deciding whether to drop kept build trees | `50G` |
 
-The caches live in the worker's [storage pool](#disk-quota-and-the-storage-pool),
+The caches live in the worker's [storage pool](./storage-pool.md),
 in a `cache` subvolume beside the chroots, so they count against
 `WORKER_DISK_MAX` together with the base chroot and the running builds. Each
 package's sources and each kept build tree is a subvolume of its own: its size
@@ -304,112 +304,19 @@ accept.
 | Variable | Type | Description | Default |
 |---|---|---|---|
 | `WORKER_BUILD_DISK_MAX` | Size | Disk one build may write: its chroot, its sources, the packages it makes | `50G` |
-| `WORKER_DISK_MAX` | Size | Everything the worker stores in its pool: the base chroot and every running build | `200G` |
-| `WORKER_POOL` | Path | What backs the pool: unset for an image file, a block device, or an existing btrfs mount | unset |
+| `WORKER_DISK_MAX` | Size | Everything the worker stores in its pool: the base chroot, the caches and every running build | `200G` |
+| `WORKER_POOL` | Path | What backs the pool: unset for an image file, a block device, or a dedicated btrfs mount | unset |
 | `WORKER_DISK_RESERVE` | Bool | Allocate the whole image up front instead of as builds write | `false` |
 
-Every chroot lives in the worker's **storage pool**: a btrfs filesystem the
-worker owns, with quotas. The base chroot is a subvolume there, and each build
-runs in a snapshot of it -- taken in milliseconds, and charged nothing for what
-it shares with the base -- with a second subvolume beside it for its source and
-packages. Both count against `WORKER_BUILD_DISK_MAX`, and everything together
-against `WORKER_DISK_MAX`.
+Every chroot, build and cache lives in the worker's **storage pool**, a btrfs
+filesystem with quotas. The kernel enforces both limits as builds write: a
+build that tries to fill the disk fails with "Disk quota exceeded" and nothing
+outside the pool is touched. By default the pool is a sparse image file that
+needs no setup. On ZFS, a zvol is better.
 
-The kernel enforces both as the build writes. A build that tries to fill the
-disk -- by accident or on purpose; `fallocate -l 1T` is one syscall -- fails its
-own build with "Disk quota exceeded", and the worker's report says which limit
-was reached. Nothing outside the pool is touched. Lowering either value applies
-at once, to builds already running.
-
-A build's snapshot is deleted the moment it ends, and btrfs frees the space in
-the background: there is no tree of millions of files to remove.
-
-`WORKER_POOL`, `WORKER_DISK_RESERVE` and `WORKER_CHROOT_DIR` describe the
-machine, so they are set on the worker only, never from AURCache: they decide
-what the worker formats and mounts.
-
-### What backs the pool
-
-- **Unset (the default): an image file**, `<chroot dir>/pool.img`, loop-mounted
-  at `<chroot dir>/pool`. Nothing to set up. The image is sparse -- it takes
-  host space only as builds write, and hands it back as they are deleted -- and
-  grows when `WORKER_DISK_MAX` does. It needs loop devices, which a privileged
-  container has. On a btrfs host its directory is made `nodatacow` first, so
-  writes in the pool are not copied twice.
-- **A block device**, such as a zvol or a partition. Formatted the first time
-  and mounted directly, with no loop device. A device that already holds a
-  filesystem the worker did not create is refused, never formatted. On ZFS this
-  is the best choice: create the zvol with `volblocksize=16K`, matching btrfs's
-  metadata nodes, and leave it thick-provisioned so its space is reserved.
-- **An existing btrfs mount**, given as a directory. Used as it is, with no
-  loop device and no second filesystem -- the fastest option on a btrfs host.
-  It must be a whole btrfs filesystem mounted there and **dedicated to the
-  worker**, because quotas apply to the entire filesystem; the worker enables
-  btrfs simple quotas on it. One with full btrfs quotas already enabled is
-  refused rather than switched.
-
-The pool needs Linux 6.7 or later (btrfs simple quotas) and `btrfs-progs`. A
-worker that cannot open its pool takes no builds and says why in its log,
-because a build without its quota could fill the host.
-
-### Reserving the space
-
-A sparse image assumes the host has the room when the builds want it. If the
-host fills up for another reason, writes into the pool fail, the builds
-running at that moment fail with I/O errors, and the pool is remounted -- its
-contents are safe, since btrfs only ever commits complete transactions. To
-make that unlikely, a worker with a sparse image stops claiming builds while
-the host has less than `WORKER_BUILD_DISK_MAX` free, and says so in its log.
-
-For a guarantee instead, set `WORKER_DISK_RESERVE=true`: the whole image is
-allocated up front and freed space stays in it. On ZFS that does not reserve
-anything -- ZFS cannot preallocate -- so use a thick-provisioned zvol, or set
-`refreservation` on the dataset holding the image.
-
-### Tuning an image on ZFS
-
-If the image sits on a ZFS dataset, give it a dataset of its own with:
-
-- `recordsize=16K` (or 32K). With the default 128K, every small write from
-  btrfs rewrites a whole record.
-- `primarycache=metadata`, so data is not cached both by the kernel and in ARC.
-- `logbias=throughput`, so the flushes btrfs sends do not write data twice
-  through the ZIL.
-- `compression=lz4` is fine; btrfs already compresses inside the pool, and lz4
-  gives up quickly on data that does not compress.
-
-### Shrinking
-
-Lowering `WORKER_DISK_MAX` lowers the quota at once. An image shrinks with it,
-online, when what the pool holds fits in the smaller size. When it does not,
-the worker stops taking builds, lets the ones running finish, and then makes
-the pool again, empty, at the new size: its caches start cold and the base
-chroot is rebuilt by the next build. Its identity lives outside the pool, so it
-stays enrolled. It logs each step.
-
-On a block device or an existing mount, the worker fits the btrfs filesystem
-to the total, online: it shrinks it when `WORKER_DISK_MAX` comes down, and grows
-it back -- as far as the device goes -- when it goes up. It never touches the
-device itself, and never empties it: when what the pool holds does not fit, the
-filesystem keeps its size, the worker logs an error, and the total still
-binds. After a shrink it logs the smallest size the device can safely go down
-to; resizing the device -- a zvol with `zfs set volsize=`, a partition -- is
-then yours. **Never shrink the device below that size, or before the
-filesystem**: ZFS discards whatever lies past the new end, and btrfs refuses to
-mount a filesystem larger than its device.
-
-### Putting the pool on other storage
-
-Builds are the bulk of a worker's disk use, and some packages are extravagant:
-`unreal-engine` needs around 300&nbsp;GB live. `WORKER_CHROOT_DIR` moves the
-pool's image -- and with it everything the worker stores apart from its
-identity -- somewhere with room.
-
-Because the chroots live inside the pool's own btrfs filesystem, what the image
-sits on only has to store a large file. A base chroot contains setuid binaries,
-thousands of hardlinks, files owned by several users and file capabilities, and
-those are all btrfs's business inside the image -- so an image on NFS or SMB
-works where a chroot there directly could not, if slowly.
+[Storage pool](./storage-pool.md) covers the three backings (an image file, a
+zvol or partition, a dedicated btrfs filesystem), their tuning, sizing, and
+resizing.
 
 ## Timing
 

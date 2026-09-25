@@ -137,6 +137,13 @@ More workers on the same machine each need their own name and identity volume:
 aurcache-cli setup worker --container-name worker-2
 ```
 
+The worker keeps its chroots, builds and caches in a
+[storage pool](../workers/storage-pool.md) with a disk quota. `setup worker`
+asks what should back it: an image file in its volume (nothing to prepare), a
+block device such as a zvol, or a dedicated btrfs filesystem. `--pool-image`,
+`--pool-device PATH` or `--pool-mount PATH` answer without asking, and
+`--disk-max 500G` sets its size.
+
 A worker on *other* hardware joins over the network, where trust has to be
 explicit — pin the server's CA fingerprint from its startup log:
 
@@ -161,7 +168,9 @@ aurcache-cli setup compose --role worker    # a worker for another machine
 `docker-compose.yaml` (or `docker-compose.<role>.yaml`) and refuses to clobber an
 existing file without `--force`. The output keeps the comments explaining why the
 worker needs `privileged` and what the `enroll` volume is for, because those are
-the parts worth reading before you deploy it.
+the parts worth reading before you deploy it. A file with a worker asks what
+backs its storage pool, as `setup worker` does. On TrueNAS, answer with a zvol:
+`--pool-device /dev/zvol/<pool>/<name>`.
 
 A file with a server asks which database it should use, or takes
 `--database postgres` or `--database sqlite` (required when there is no terminal

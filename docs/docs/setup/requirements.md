@@ -21,8 +21,12 @@ sidebar_position: 1
   `SYS_ADMIN`, seccomp/apparmor unconfined) — each package is built in a
   `systemd-nspawn` chroot
 * A writable tmpfs at `/run`
-* Disk for the base chroot and the source/package caches (20 GB by default,
-  tunable — see [worker configuration](../workers/configuration.md))
+* Linux 6.7 or newer. Everything the worker stores lives in a btrfs
+  [storage pool](../workers/storage-pool.md) with simple quotas, so a build
+  cannot fill the host's disk
+* Disk for that pool: `WORKER_DISK_MAX`, 200 GB by default. By default the pool
+  is a sparse image file that takes space only as builds write. A zvol or a
+  spare partition can back it instead, which is better on ZFS
 * CPU and memory scale with the packages being built
 
 Workers can run on the same host as the server or on separate machines,

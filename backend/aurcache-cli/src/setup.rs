@@ -193,6 +193,15 @@ pub fn worker_run(spec: &WorkerRunSpec) -> DockerRun {
 
     args.push("-v".into());
     args.push(format!("{data_volume}:/var/lib/aurcache-worker"));
+    // The storage pool, when it is not the image in the data volume.
+    if let Some(mapping) = env.pool.device_mapping() {
+        args.push("--device".into());
+        args.push(mapping);
+    }
+    if let Some(mapping) = env.pool.volume_mapping() {
+        args.push("-v".into());
+        args.push(mapping);
+    }
     if env.enrollment_dir.is_some() {
         args.push("-v".into());
         args.push(format!("{ENROLL_VOLUME}:{ENROLLMENT_DIR}"));
@@ -382,6 +391,32 @@ mod tests {
         let args = args_of(&run);
         assert!(args.contains("--privileged"), "{args}");
         assert!(args.contains("--tmpfs /run"), "{args}");
+    }
+
+    /// A device or mount backing reaches the container at the path the worker
+    /// is told about in its environment.
+    #[test]
+    fn a_worker_run_passes_its_pool_through() {
+        let mut env = WorkerEnv::default();
+        env.pool.backing = crate::compose::PoolBacking::Device("/dev/sdz".to_string());
+        let args = args_of(&worker_run(&spec(env, false, "d")));
+        assert!(
+            args.contains("--device /dev/sdz:/dev/aurcache-pool"),
+            "{args}"
+        );
+        assert!(args.contains("WORKER_POOL=/dev/aurcache-pool"), "{args}");
+
+        let mut env = WorkerEnv::default();
+        env.pool.backing = crate::compose::PoolBacking::Mount("/srv/pool".to_string());
+        let args = args_of(&worker_run(&spec(env, false, "d")));
+        assert!(
+            args.contains("-v /srv/pool:/var/lib/aurcache-pool"),
+            "{args}"
+        );
+        assert!(
+            args.contains("WORKER_POOL=/var/lib/aurcache-pool"),
+            "{args}"
+        );
     }
 
     /// Without a named data volume a recreated worker re-enrolls as a stranger,

@@ -86,13 +86,33 @@ can narrow this to specific capabilities with seccomp/apparmor unconfined.
 Only the **worker** needs this. The server handles no build payloads and runs
 unprivileged.
 
+## Where the worker keeps its builds
+
+Everything a worker stores (the base chroot, each build, its caches) lives in
+its [storage pool](../workers/storage-pool.md), a btrfs filesystem with a disk
+quota per build and one over the whole worker. By default the pool is a sparse
+image file in the worker's `/var/lib/aurcache-worker` volume, and needs no
+setup. On ZFS, such as TrueNAS, back it with a zvol instead. Pass the zvol
+through as a device and name it in `WORKER_POOL`:
+
+```yaml
+  builder:
+    environment:
+      - WORKER_POOL=/dev/aurcache-pool
+      - WORKER_DISK_MAX_DEFAULT=950G
+    devices:
+      - /dev/zvol/tank/aurcache-worker:/dev/aurcache-pool
+```
+
 ## Generating these files
 
 `aurcache-cli setup compose --role bundle|backend|worker` writes the file for
 each of these topologies, with the same comments and the same defaults, and
 `--database postgres|sqlite` chooses the server's database, and
 `--[no-]postgres-upgrade` whether PostgreSQL gets an upgrade step (both asked
-for when omitted). It needs
+for when omitted). A file with a worker also asks what backs its
+[storage pool](../workers/storage-pool.md#setting-it-up-with-the-cli), or takes
+`--pool-image`, `--pool-device PATH` or `--pool-mount PATH`. It needs
 no server and no token, so it is available before anything is running — useful
 for a system that deploys from a pasted compose file, such as TrueNAS, Portainer
 or Unraid. See [Quick Start](../overview/quick-start.md#for-truenas-portainer-unraid).

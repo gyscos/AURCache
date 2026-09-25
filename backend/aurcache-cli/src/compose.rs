@@ -99,7 +99,7 @@ impl ComposeRole {
         matches!(self, Self::Backend | Self::Bundle)
     }
 
-    const fn has_worker(self) -> bool {
+    pub const fn has_worker(self) -> bool {
         matches!(self, Self::Worker | Self::Bundle)
     }
 }
@@ -122,6 +122,58 @@ pub struct WorkerEnv {
     pub packages: Vec<String>,
     pub concurrency: Option<u32>,
     pub priority: Option<i32>,
+    /// What backs the worker's storage pool, and how big it may get.
+    pub pool: PoolSetup,
+}
+
+/// Where a pool device appears inside the worker's container.
+pub const POOL_DEVICE: &str = "/dev/aurcache-pool";
+/// Where a pool filesystem is mounted inside the worker's container.
+pub const POOL_MOUNT: &str = "/var/lib/aurcache-pool";
+
+/// What backs the worker's storage pool, named as the *host* sees it: the
+/// container gets it at [`POOL_DEVICE`] or [`POOL_MOUNT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PoolBacking {
+    /// An image file inside the worker's data volume. Nothing to prepare.
+    #[default]
+    Image,
+    /// A block device -- a zvol, a partition -- formatted the first time.
+    Device(String),
+    /// An existing btrfs filesystem, mounted there and dedicated to the worker.
+    Mount(String),
+}
+
+/// The storage pool as `setup` writes it: its backing, whether an image is
+/// allocated up front, and its total.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoolSetup {
+    pub backing: PoolBacking,
+    /// Allocate the image in full (`WORKER_DISK_RESERVE`); image only.
+    pub reserve: bool,
+    /// Everything the worker may store (`WORKER_DISK_MAX`), as written, e.g.
+    /// `500G`. `None` keeps the worker's default.
+    pub disk_max: Option<String>,
+}
+
+impl PoolSetup {
+    /// `host:container` for `devices:` or `--device`, for a device backing.
+    #[must_use]
+    pub fn device_mapping(&self) -> Option<String> {
+        match &self.backing {
+            PoolBacking::Device(host) => Some(format!("{host}:{POOL_DEVICE}")),
+            _ => None,
+        }
+    }
+
+    /// `host:container` for a bind mount, for a mount backing.
+    #[must_use]
+    pub fn volume_mapping(&self) -> Option<String> {
+        match &self.backing {
+            PoolBacking::Mount(host) => Some(format!("{host}:{POOL_MOUNT}")),
+            _ => None,
+        }
+    }
 }
 
 impl WorkerEnv {
@@ -162,6 +214,22 @@ impl WorkerEnv {
             "WORKER_PRIORITY_DEFAULT",
             self.priority.map(|v| v.to_string()),
         );
+        // What backs the pool is the machine's, so it is pinned; how big it may
+        // get is policy, a starting point like the ones above.
+        push(
+            "WORKER_POOL",
+            match &self.pool.backing {
+                PoolBacking::Image => None,
+                PoolBacking::Device(_) => Some(POOL_DEVICE.to_string()),
+                PoolBacking::Mount(_) => Some(POOL_MOUNT.to_string()),
+            },
+        );
+        push(
+            "WORKER_DISK_RESERVE",
+            (self.pool.reserve && self.pool.backing == PoolBacking::Image)
+                .then(|| "true".to_string()),
+        );
+        push("WORKER_DISK_MAX_DEFAULT", self.pool.disk_max.clone());
         pairs
     }
 }
@@ -582,15 +650,36 @@ fn worker_service(params: &ComposeParams) -> String {
             "      - enroll:/enroll                # writable: drop CSR for auto-enrollment\n",
         );
     }
-    out.push_str(
-        "      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)\n\
-         \x20   # The storage pool is one image file in that volume, holding every chroot,\n\
-         \x20   # build and cache under one disk quota (WORKER_DISK_MAX, 200G by default).\n\
-         \x20   # On ZFS -- TrueNAS -- give the volume a dataset of its own with\n\
-         \x20   # recordsize=16K, primarycache=metadata and logbias=throughput, or hand the\n\
-         \x20   # worker a zvol instead (WORKER_POOL). See the docs' worker configuration,\n\
-         \x20   # \"Disk quota and the storage pool\".\n",
-    );
+    match &env.pool.backing {
+        PoolBacking::Image => out.push_str(
+            "      - worker_data:/var/lib/aurcache-worker   # identity + storage pool (chroots, caches)\n\
+             \x20   # The storage pool is one image file in that volume, holding every chroot,\n\
+             \x20   # build and cache under one disk quota (WORKER_DISK_MAX, 200G by default).\n\
+             \x20   # On ZFS -- TrueNAS -- a zvol is better (`setup compose --pool-device`), or\n\
+             \x20   # give the volume a dataset of its own with recordsize=16K,\n\
+             \x20   # primarycache=metadata and logbias=throughput. See the docs' \"Storage pool\".\n",
+        ),
+        PoolBacking::Device(_) | PoolBacking::Mount(_) => {
+            out.push_str(
+                "      - worker_data:/var/lib/aurcache-worker   # identity (the pool is below)\n",
+            );
+            if let Some(mapping) = env.pool.volume_mapping() {
+                let _ = writeln!(
+                    out,
+                    "      - {mapping}   # storage pool: a dedicated btrfs filesystem"
+                );
+            }
+        }
+    }
+    if let Some(mapping) = env.pool.device_mapping() {
+        out.push_str(
+            "    # The storage pool: every chroot, build and cache, under one disk quota\n\
+             \x20   # (WORKER_DISK_MAX). Formatted the first time; a device that already holds\n\
+             \x20   # a filesystem the worker did not make is refused, never formatted.\n\
+             \x20   devices:\n",
+        );
+        let _ = writeln!(out, "      - {mapping}");
+    }
 
     out.push_str(
         "    # devtools builds each package in a systemd-nspawn chroot, which needs the\n\
@@ -633,7 +722,8 @@ fn volumes(params: &ComposeParams) -> String {
 mod tests {
     use super::{
         ComposeDatabase, ComposeParams, ComposeRole, ENROLLMENT_DIR, FINGERPRINT_PLACEHOLDER,
-        NGINX_IMAGE, POSTGRES_IMAGE, POSTGRES_MAJOR, WorkerEnv, is_plain_password, render_compose,
+        NGINX_IMAGE, POSTGRES_IMAGE, POSTGRES_MAJOR, PoolBacking, PoolSetup, WorkerEnv,
+        is_plain_password, render_compose,
     };
     use aurcache_common::ports::AURCACHE_MIRROR_PORT;
     use yaml_rust2::{Yaml, YamlLoader};
@@ -660,6 +750,97 @@ mod tests {
         };
         let pairs = env.to_pairs();
         assert_eq!(pairs, vec![("WORKER_ARCHES", "x86_64,aarch64".to_string())]);
+    }
+
+    fn worker_with_pool(pool: PoolSetup) -> ComposeParams {
+        ComposeParams {
+            role: ComposeRole::Worker,
+            worker: WorkerEnv {
+                pool,
+                ..WorkerEnv::default()
+            },
+            ..ComposeParams::default()
+        }
+    }
+
+    /// Each pool backing is valid YAML, reaches the container where the worker
+    /// looks for it, and names it in the environment. The default image needs
+    /// neither a device nor a mount.
+    #[test]
+    fn each_pool_backing_is_wired_into_the_worker() {
+        let device = parsed(&worker_with_pool(PoolSetup {
+            backing: PoolBacking::Device("/dev/zvol/tank/aurcache".to_string()),
+            disk_max: Some("500G".to_string()),
+            ..PoolSetup::default()
+        }));
+        let devices = device["services"]["builder"]["devices"].as_vec().unwrap();
+        assert_eq!(
+            devices[0].as_str(),
+            Some("/dev/zvol/tank/aurcache:/dev/aurcache-pool")
+        );
+        let env = environment(&device, "builder");
+        assert!(
+            env.contains(&"WORKER_POOL=/dev/aurcache-pool".to_string()),
+            "{env:?}"
+        );
+        assert!(
+            env.contains(&"WORKER_DISK_MAX_DEFAULT=500G".to_string()),
+            "{env:?}"
+        );
+
+        let mount = parsed(&worker_with_pool(PoolSetup {
+            backing: PoolBacking::Mount("/srv/aurcache-pool".to_string()),
+            ..PoolSetup::default()
+        }));
+        let volumes: Vec<&str> = mount["services"]["builder"]["volumes"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter_map(Yaml::as_str)
+            .collect();
+        assert!(
+            volumes.contains(&"/srv/aurcache-pool:/var/lib/aurcache-pool"),
+            "{volumes:?}"
+        );
+        assert!(
+            environment(&mount, "builder")
+                .contains(&"WORKER_POOL=/var/lib/aurcache-pool".to_string())
+        );
+        assert!(mount["services"]["builder"]["devices"].is_badvalue());
+
+        let image = parsed(&worker_with_pool(PoolSetup {
+            reserve: true,
+            ..PoolSetup::default()
+        }));
+        let env = environment(&image, "builder");
+        assert!(
+            env.contains(&"WORKER_DISK_RESERVE=true".to_string()),
+            "{env:?}"
+        );
+        assert!(
+            !env.iter().any(|e| e.starts_with("WORKER_POOL=")),
+            "{env:?}"
+        );
+        assert!(image["services"]["builder"]["devices"].is_badvalue());
+    }
+
+    /// Reserving is an image's; with a device or a mount it means nothing and
+    /// is not written.
+    #[test]
+    fn reserve_is_only_written_for_an_image() {
+        let env = WorkerEnv {
+            pool: PoolSetup {
+                backing: PoolBacking::Device("/dev/sdz".to_string()),
+                reserve: true,
+                disk_max: None,
+            },
+            ..WorkerEnv::default()
+        };
+        assert!(
+            !env.to_pairs()
+                .iter()
+                .any(|(k, _)| *k == "WORKER_DISK_RESERVE")
+        );
     }
 
     /// The file is built by string concatenation, so one bad indent would ship

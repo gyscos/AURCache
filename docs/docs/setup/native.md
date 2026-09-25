@@ -149,8 +149,10 @@ Directories, with ownership that matters for the same reason:
 Everything that grows -- the base chroot, each build, the source and package
 caches -- lives in the storage pool, a btrfs filesystem the worker creates in
 `chroot/pool.img` and mounts at `chroot/pool`, with a disk quota per build and
-one over the whole worker. See the worker configuration's section on disk
-quota.
+one over the whole worker. A zvol, a partition or a dedicated btrfs filesystem
+can back it instead of the image, set with `WORKER_POOL`. On a btrfs root, make
+`/var/lib/aurcache-worker/chroot` a subvolume of its own before the first start,
+so host snapshots leave the image alone. See [Storage pool](../workers/storage-pool.md).
 
 ### Why the worker's unit is not hardened
 
