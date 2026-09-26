@@ -217,7 +217,7 @@ fn ensure_interactive(field_name: &str) -> Result<()> {
         Ok(())
     } else {
         bail!(
-            "missing {field_name}; set it with CLI flags, environment variables, or `aurcache-cli config`"
+            "missing {field_name}; set it with CLI flags, environment variables, or `aurcli config`"
         )
     }
 }

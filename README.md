@@ -29,7 +29,7 @@ Bring up the server plus a local build worker with a single command — no edits
 no secrets, no approval clicks:
 
 ```bash
-curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/compose/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -37,10 +37,10 @@ docker compose up -d
 - Pacman repo: `http://localhost:8081` (add as a `[repo] Server` in `pacman.conf`)
 
 The bundled worker auto-enrolls via a shared volume and starts polling for jobs
-within seconds. Scale local build throughput with `docker compose up -d --scale
-builder=3` or raise the worker's concurrency on its page in the web UI. To attach a worker on separate
+within seconds. Scale local build throughput by raising the worker's concurrency
+on its page in the web UI. To attach a worker on separate
 hardware or a foreign architecture (e.g. aarch64), see
-[`docker-compose.remote-worker.yaml`](docker-compose.remote-worker.yaml).
+[`docker-compose.remote-worker.yaml`](compose/docker-compose.remote-worker.yaml).
 
 Already running AURCache as a single container? It keeps working — the
 `aurcache` image now bundles a build worker for exactly that case. It is
@@ -49,32 +49,34 @@ deprecated, so migrate to the split setup when convenient; see
 
 ## CLI client
 
-A typed CLI for the HTTP API lives in `backend/aurcache-cli`. It authenticates with the API token via `Authorization: Bearer <token>`.
+Install it from the git repo:
+
+```bash
+cargo install --git https://github.com/gyscos/AURCache aurcache-cli
+```
+
+A typed CLI for the HTTP API (installed as `aurcli`). It authenticates with an API token via `Authorization: Bearer <token>`; generate one on the settings page of the web UI.
 The reusable Rust client library backing it lives in `backend/aurcache-client`.
+Configuration, tokens and `setup` are covered in [its README](backend/aurcache-cli/README.md).
 
 ```bash
 export AURCACHE_URL=http://localhost:8080/api
 export AURCACHE_TOKEN=your-token
 
-cargo run -p aurcache-cli -- pkg list
-cargo run -p aurcache-cli -- pkg add paru --platform x86_64
-cargo run -p aurcache-cli -- builds list --limit 10
-cargo run -p aurcache-cli -- token regenerate
+aurcli pkg list
+aurcli pkg add paru --platform x86_64
+aurcli builds list --limit 10
+aurcli token regenerate
 ```
 
-The CLI also reads `~/.config/aurcache-client/config.json`. Resolution order is:
-
-1. `--url` / `--token`
-2. `AURCACHE_URL` / `AURCACHE_TOKEN`
-3. `~/.config/aurcache-client/config.json`
-4. interactive prompt, with the prompted values saved back to the config file
+The CLI also reads `~/.config/aurcache-client/config.json`.
 
 Useful config commands:
 
 ```bash
-cargo run -p aurcache-cli -- config show
-cargo run -p aurcache-cli -- config set-url http://localhost:8080/api
-cargo run -p aurcache-cli -- config set-token
+aurcli config show
+aurcli config set-url http://localhost:8080/api
+aurcli config set-token
 ```
 
 Use `--format json` for machine-readable output, or `raw` for endpoints that do not have a dedicated subcommand yet.

@@ -263,7 +263,7 @@ To grow a device, grow it first (`zfs set volsize=`), then raise
 
 ## Setting it up with the CLI
 
-`aurcache-cli setup worker` and `aurcache-cli setup compose` ask what should
+`aurcli setup worker` and `aurcli setup compose` ask what should
 back the pool when they have a terminal. Otherwise they take it as flags:
 
 | Flag | Effect |
@@ -276,7 +276,7 @@ back the pool when they have a terminal. Otherwise they take it as flags:
 
 ```bash
 # TrueNAS: a compose file for a worker on a zvol
-aurcache-cli setup compose --role bundle \
+aurcli setup compose --role bundle \
   --pool-device /dev/zvol/tank/aurcache-worker --disk-max 950G -o -
 ```
 
@@ -285,7 +285,7 @@ aurcache-cli setup compose --role bundle \
 The pool holds nothing that cannot be rebuilt: the base chroot and caches. To
 move to another backing:
 
-1. Pause the worker with `aurcache-cli worker pause <id> --wait`.
+1. Pause the worker with `aurcli worker pause <id> --wait`.
 2. Stop it.
 3. Set `WORKER_POOL`, and start it again.
 

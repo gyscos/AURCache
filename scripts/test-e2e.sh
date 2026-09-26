@@ -4,7 +4,7 @@ set -euo pipefail
 # End-to-end test for the remote-worker architecture.
 #
 # Brings up the AURCache server + one real privileged build worker (see
-# docker-compose.e2e.yaml), then: requests a package, waits for the worker to
+# compose/docker-compose.e2e.yaml), then: requests a package, waits for the worker to
 # enroll/approve, waits for the build to finish, and finally installs the built
 # package from the repo in a throwaway container. Single mode only.
 #
@@ -19,7 +19,7 @@ BUILD_TIMEOUT="${3:-600}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
+CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcli"
 
 # The human-facing API is plain HTTP now (worker mTLS lives on its own port), so
 # the CLI needs no TLS to talk to it.
@@ -28,7 +28,7 @@ export AURCACHE_TOKEN="${AURCACHE_TOKEN:-}"
 
 # Overridable so the same harness can drive an alternative topology — see
 # scripts/test-e2e-hybrid.sh, which points it at the single-container image.
-COMPOSE_FILE="${E2E_COMPOSE_FILE:-$PROJECT_DIR/docker-compose.e2e.yaml}"
+COMPOSE_FILE="${E2E_COMPOSE_FILE:-$PROJECT_DIR/compose/docker-compose.e2e.yaml}"
 # Services that must stay alive for the run to be meaningful. The hybrid image
 # runs both roles in one container, so it overrides this to a single name.
 E2E_SERVICES="${E2E_SERVICES:-aurcache builder}"

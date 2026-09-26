@@ -10,7 +10,7 @@ workers**, which build packages and upload the results. The bundled compose file
 starts one of each on a single host.
 
 ```bash
-curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/compose/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -114,14 +114,14 @@ restore.
 
 ## Or let the CLI do it
 
-If you have `aurcache-cli` (`cargo install aurcache-cli`), it can stand the whole
+If you have `aurcli` (`cargo install aurcache-cli`), it can stand the whole
 thing up. Nothing here needs a token or a running server — it is the command for
 when you have neither:
 
 ```bash
-aurcache-cli setup server      # the backend, on this machine
-aurcache-cli setup worker      # one build worker beside it
-aurcache-cli doctor            # check they found each other
+aurcli setup server      # the backend, on this machine
+aurcli setup worker      # one build worker beside it
+aurcli doctor            # check they found each other
 ```
 
 The worker approves itself. `setup` gives the pair a shared `enroll` volume, the
@@ -134,7 +134,7 @@ running it.
 More workers on the same machine each need their own name and identity volume:
 
 ```bash
-aurcache-cli setup worker --container-name worker-2
+aurcli setup worker --container-name worker-2
 ```
 
 The worker keeps its chroots, builds and caches in a
@@ -148,7 +148,7 @@ A worker on *other* hardware joins over the network, where trust has to be
 explicit — pin the server's CA fingerprint from its startup log:
 
 ```bash
-aurcache-cli setup worker \
+aurcli setup worker \
   --server-url https://aurcache.example.com:8083 \
   --ca-fingerprint <sha256> \
   --arch aarch64
@@ -159,9 +159,9 @@ aurcache-cli setup worker \
 Anything that takes a compose file gets one:
 
 ```bash
-aurcache-cli setup compose --role bundle    # server + a local worker
-aurcache-cli setup compose --role backend   # server alone
-aurcache-cli setup compose --role worker    # a worker for another machine
+aurcli setup compose --role bundle    # server + a local worker
+aurcli setup compose --role backend   # server alone
+aurcli setup compose --role worker    # a worker for another machine
 ```
 
 `-o -` writes to stdout to paste into a web UI; otherwise it writes
@@ -195,7 +195,7 @@ from the AUR, that is the set you probably want mirrored, and `pacman -Qm` is
 what lists it:
 
 ```bash
-aurcache-cli pkg add --from-installed
+aurcli pkg add --from-installed
 ```
 
 It prints what it found and asks before submitting — adding a package resolves
@@ -206,14 +206,14 @@ otherwise refused rather than assumed.
 Once something has built, wire the repository into pacman:
 
 ```bash
-aurcache-cli repo config | sudo tee -a /etc/pacman.conf
+aurcli repo config | sudo tee -a /etc/pacman.conf
 sudo pacman -Sy
 ```
 
-If a build does not start, [`aurcache-cli doctor`](../workers/managing.md#why-is-a-build-not-starting)
+If a build does not start, [`aurcli doctor`](../workers/managing.md#why-is-a-build-not-starting)
 says why.
 
-`aurcache-cli completions <shell>` prints a completion script for bash, zsh,
+`aurcli completions <shell>` prints a completion script for bash, zsh,
 fish, elvish or powershell.
 
 ## Upgrading from a single-container setup

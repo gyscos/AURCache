@@ -46,9 +46,9 @@ of it — fewer builds with more memory each cannot arrive as more builds with
 more memory each. The CLI does the same:
 
 ```bash
-aurcache-cli worker config 3                                  # show
-aurcache-cli worker config 3 --set concurrency=2 --set build_memory_max=48G
-aurcache-cli worker config 3 --reset build_timeout            # back to the worker's own
+aurcli worker config 3                                  # show
+aurcli worker config 3 --set concurrency=2 --set build_memory_max=48G
+aurcli worker config 3 --reset build_timeout            # back to the worker's own
 ```
 
 A value is checked against what that worker says it accepts before it is saved,
@@ -95,7 +95,7 @@ the page names the variable doing the pinning.
 
 Renaming a variable is the whole of the handover: `WORKER_CONCURRENCY=2`
 becomes `WORKER_CONCURRENCY_DEFAULT=2`, and the machine keeps running 2 until a
-value is set for it. The compose files AURCache ships, and those `aurcache-cli
+value is set for it. The compose files AURCache ships, and those `aurcli
 setup` writes, use the `_DEFAULT` names. A worker older than this feature ignores
 `_DEFAULT` and runs its built-in default instead, so upgrade workers before
 renaming their variables.

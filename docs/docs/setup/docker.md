@@ -28,11 +28,11 @@ also as `:git` for the current main branch.
 
 ## Single host
 
-The bundled [`docker-compose.yaml`](https://github.com/gyscos/AURCache/blob/main/docker-compose.yaml)
+The bundled [`docker-compose.yaml`](https://github.com/gyscos/AURCache/blob/main/compose/docker-compose.yaml)
 starts a server plus one local worker and needs no edits:
 
 ```bash
-curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/compose/docker-compose.yaml
 docker compose up -d
 ```
 
@@ -106,7 +106,7 @@ through as a device and name it in `WORKER_POOL`:
 
 ## Generating these files
 
-`aurcache-cli setup compose --role bundle|backend|worker` writes the file for
+`aurcli setup compose --role bundle|backend|worker` writes the file for
 each of these topologies, with the same comments and the same defaults, and
 `--database postgres|sqlite` chooses the server's database, and
 `--[no-]postgres-upgrade` whether PostgreSQL gets an upgrade step (both asked
@@ -117,8 +117,8 @@ no server and no token, so it is available before anything is running — useful
 for a system that deploys from a pasted compose file, such as TrueNAS, Portainer
 or Unraid. See [Quick Start](../overview/quick-start.md#for-truenas-portainer-unraid).
 
-On a machine with Docker to hand, `aurcache-cli setup server` and
-`aurcache-cli setup worker` skip the file and run the containers directly.
+On a machine with Docker to hand, `aurcli setup server` and
+`aurcli setup worker` skip the file and run the containers directly.
 
 ## More workers
 
@@ -130,7 +130,7 @@ docker compose up -d --scale builder=3
 
 Workers on separate hardware, or on a foreign architecture, are covered in
 [Build Workers](../workers/configuration.md) and
-[`docker-compose.remote-worker.yaml`](https://github.com/gyscos/AURCache/blob/main/docker-compose.remote-worker.yaml).
+[`docker-compose.remote-worker.yaml`](https://github.com/gyscos/AURCache/blob/main/compose/docker-compose.remote-worker.yaml).
 
 ## Backward compatibility: the hybrid image
 

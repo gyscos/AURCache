@@ -39,7 +39,7 @@ enum OutputFormat {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "aurcache-cli",
+    name = "aurcli",
     version,
     about = "CLI client for the AURCache API using bearer-token authentication"
 )]
@@ -1080,8 +1080,8 @@ fn run_setup_server(format: OutputFormat, args: SetupServerArgs) -> Result<()> {
         OutputFormat::Text => {
             println!();
             println!("Server started. Next:");
-            println!("  aurcache-cli setup worker      # a build worker on this machine");
-            println!("  aurcache-cli doctor            # check it came up");
+            println!("  aurcli setup worker      # a build worker on this machine");
+            println!("  aurcli doctor            # check it came up");
             Ok(())
         }
     }
@@ -1151,9 +1151,9 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
                 );
             } else {
                 println!("Worker started. Approve it once it appears:");
-                println!("  aurcache-cli worker list");
+                println!("  aurcli worker list");
             }
-            println!("  aurcache-cli doctor            # check it connected");
+            println!("  aurcli doctor            # check it connected");
             println!();
             println!(
                 "Its chroots, builds and caches live in one storage pool in the data volume, \
@@ -3642,7 +3642,7 @@ mod tests {
     /// bare names and the removal takes as many as it is given.
     #[test]
     fn rm_takes_the_names_list_prints() {
-        let cli = Cli::parse_from(["aurcache-cli", "pkg", "list", "-q"]);
+        let cli = Cli::parse_from(["aurcli", "pkg", "list", "-q"]);
         let Command::Pkg {
             command: PackagesCommand::List(args),
         } = cli.command
@@ -3651,7 +3651,7 @@ mod tests {
         };
         assert!(args.quiet);
 
-        let cli = Cli::parse_from(["aurcache-cli", "pkg", "rm", "paru", "yay"]);
+        let cli = Cli::parse_from(["aurcli", "pkg", "rm", "paru", "yay"]);
         let Command::Pkg {
             command: PackagesCommand::Rm { pkgbases },
         } = cli.command
@@ -3665,7 +3665,7 @@ mod tests {
     /// `--wait`; a plain `pause` is unchanged.
     #[test]
     fn pause_waits_only_when_asked() {
-        let cli = Cli::parse_from(["aurcache-cli", "worker", "pause", "4", "--wait"]);
+        let cli = Cli::parse_from(["aurcli", "worker", "pause", "4", "--wait"]);
         let Command::Worker {
             command:
                 WorkerCommand::Pause {
@@ -3678,7 +3678,7 @@ mod tests {
             panic!("parsed as {:?}", cli.command);
         };
         let cli = Cli::parse_from([
-            "aurcache-cli",
+            "aurcli",
             "worker",
             "pause",
             "4",
@@ -3696,15 +3696,8 @@ mod tests {
             }
         ));
         assert!(
-            Cli::try_parse_from([
-                "aurcache-cli",
-                "worker",
-                "pause",
-                "4",
-                "--wait-timeout",
-                "600"
-            ])
-            .is_err(),
+            Cli::try_parse_from(["aurcli", "worker", "pause", "4", "--wait-timeout", "600"])
+                .is_err(),
             "a timeout without --wait is a mistake worth saying"
         );
     }
@@ -3714,7 +3707,7 @@ mod tests {
     #[test]
     fn builds_list_filters_by_worker_and_state() {
         let cli = Cli::parse_from([
-            "aurcache-cli",
+            "aurcli",
             "builds",
             "list",
             "--worker",
@@ -3730,9 +3723,7 @@ mod tests {
         };
         assert_eq!(args.worker.as_deref(), Some("freyja"));
         assert_eq!(args.status, [BuildState::Active, BuildState::Publishing]);
-        assert!(
-            Cli::try_parse_from(["aurcache-cli", "builds", "list", "--status", "running"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["aurcli", "builds", "list", "--status", "running"]).is_err());
     }
 
     /// The progress line only changes when the set of builds does, whatever
@@ -3754,15 +3745,7 @@ mod tests {
     /// one -- all refused before anything is written.
     #[test]
     fn pool_options_are_checked_when_parsed() {
-        let base = [
-            "aurcache-cli",
-            "setup",
-            "compose",
-            "--role",
-            "worker",
-            "-o",
-            "-",
-        ];
+        let base = ["aurcli", "setup", "compose", "--role", "worker", "-o", "-"];
         let parses =
             |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()).copied()).is_ok();
         assert!(parses(&["--pool-device", "/dev/zd0", "--disk-max", "500G"]));
@@ -3780,13 +3763,13 @@ mod tests {
     /// Naming nothing is a usage error, not a silent no-op.
     #[test]
     fn rm_still_requires_a_package() {
-        assert!(Cli::try_parse_from(["aurcache-cli", "pkg", "rm"]).is_err());
+        assert!(Cli::try_parse_from(["aurcli", "pkg", "rm"]).is_err());
     }
 
     /// The old name keeps working for anything already scripted against it.
     #[test]
     fn delete_stays_an_alias_for_rm() {
-        let cli = Cli::parse_from(["aurcache-cli", "pkg", "delete", "paru"]);
+        let cli = Cli::parse_from(["aurcli", "pkg", "delete", "paru"]);
         let Command::Pkg {
             command: PackagesCommand::Rm { pkgbases },
         } = cli.command
@@ -3799,13 +3782,7 @@ mod tests {
     #[test]
     fn repo_config_takes_the_publishing_knobs() {
         let cli = Cli::parse_from([
-            "aurcache-cli",
-            "repo",
-            "config",
-            "--port",
-            "9000",
-            "--name",
-            "mine",
+            "aurcli", "repo", "config", "--port", "9000", "--name", "mine",
         ]);
         let Command::Repo {
             command: RepoCommand::Config(args),
@@ -3819,20 +3796,20 @@ mod tests {
 
     #[test]
     fn completions_name_a_shell() {
-        let cli = Cli::parse_from(["aurcache-cli", "completions", "bash"]);
+        let cli = Cli::parse_from(["aurcli", "completions", "bash"]);
         assert!(matches!(cli.command, Command::Completions { .. }));
-        assert!(Cli::try_parse_from(["aurcache-cli", "completions", "smash"]).is_err());
+        assert!(Cli::try_parse_from(["aurcli", "completions", "smash"]).is_err());
     }
 
     #[test]
     fn doctor_takes_no_arguments() {
-        let cli = Cli::parse_from(["aurcache-cli", "doctor"]);
+        let cli = Cli::parse_from(["aurcli", "doctor"]);
         assert!(matches!(cli.command, Command::Doctor));
     }
 
     #[test]
     fn setup_compose_defaults_to_the_bundle() {
-        let cli = Cli::parse_from(["aurcache-cli", "setup", "compose"]);
+        let cli = Cli::parse_from(["aurcli", "setup", "compose"]);
         let Command::Setup { command } = cli.command else {
             panic!("expected setup");
         };
@@ -3846,7 +3823,7 @@ mod tests {
     }
 
     fn compose_args(argv: &[&str]) -> ComposeArgs {
-        let cli = Cli::parse_from(["aurcache-cli", "setup", "compose"].iter().chain(argv));
+        let cli = Cli::parse_from(["aurcli", "setup", "compose"].iter().chain(argv));
         let Command::Setup { command } = cli.command else {
             panic!("expected setup");
         };
@@ -3913,7 +3890,7 @@ mod tests {
         ]));
         assert!(
             Cli::try_parse_from([
-                "aurcache-cli",
+                "aurcli",
                 "setup",
                 "compose",
                 "--postgres-upgrade",
@@ -3958,7 +3935,7 @@ mod tests {
     #[test]
     fn setup_worker_collects_repeated_architectures() {
         let cli = Cli::parse_from([
-            "aurcache-cli",
+            "aurcli",
             "setup",
             "worker",
             "--dry-run",
@@ -3980,7 +3957,7 @@ mod tests {
     /// Everything after `--` belongs to docker, not to us.
     #[test]
     fn setup_passes_trailing_arguments_through_to_docker() {
-        let cli = Cli::parse_from(["aurcache-cli", "setup", "server", "--", "--pull=always"]);
+        let cli = Cli::parse_from(["aurcli", "setup", "server", "--", "--pull=always"]);
         let Command::Setup { command } = cli.command else {
             panic!("expected setup");
         };
@@ -3992,7 +3969,7 @@ mod tests {
 
     #[test]
     fn repo_config_can_install() {
-        let cli = Cli::parse_from(["aurcache-cli", "repo", "config", "--install"]);
+        let cli = Cli::parse_from(["aurcli", "repo", "config", "--install"]);
         let Command::Repo {
             command: RepoCommand::Config(args),
         } = cli.command
@@ -4006,7 +3983,7 @@ mod tests {
     #[test]
     fn packages_patch_accepts_source_patches() {
         let cli = Cli::parse_from([
-            "aurcache-cli",
+            "aurcli",
             "pkg",
             "patch",
             "hello",
@@ -4034,7 +4011,7 @@ mod tests {
     #[test]
     fn packages_patch_combines_patches_with_other_fields() {
         let cli = Cli::parse_from([
-            "aurcache-cli",
+            "aurcli",
             "pkg",
             "patch",
             "hello",

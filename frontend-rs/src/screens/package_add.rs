@@ -10,7 +10,7 @@
 //! and two of them usually keep their defaults.
 //!
 //! And one field for the source, not a pair of tabs: `looks_like_git_url` tells
-//! a remote from a package name, the same way `aurcache-cli packages add` does,
+//! a remote from a package name, the same way `aurcli packages add` does,
 //! so nobody has to say which kind of thing they are about to paste.
 //!
 //! Several packages can be queued before committing, all onto the same
@@ -254,7 +254,7 @@ fn rank_results(query: &str, results: &mut [SearchResult]) {
 ///
 /// One entry field decides its own kind: anything shaped like a git remote is
 /// one, and everything else is an AUR package name. That is the same call
-/// `aurcache-cli packages add` makes, from the same function, so the two cannot
+/// `aurcli packages add` makes, from the same function, so the two cannot
 /// disagree about what a given string means.
 ///
 /// An AUR name is taken as typed rather than requiring a search result to be

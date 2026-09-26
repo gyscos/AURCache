@@ -32,12 +32,12 @@ export AURCACHE_WORKER_PORT=$((AURCACHE_PORT + 3))
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
+CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcli"
 export AURCACHE_URL="http://localhost:$AURCACHE_PORT/api"
 export AURCACHE_TOKEN="${AURCACHE_TOKEN:-}"
 export SSH_TEST_MARKER="aurcache-ssh-credential-reached-the-chroot"
 
-COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yaml" -f "$PROJECT_DIR/docker-compose.e2e-ssh.yaml")
+COMPOSE=(-f "$PROJECT_DIR/compose/docker-compose.e2e.yaml" -f "$PROJECT_DIR/compose/docker-compose.e2e-ssh.yaml")
 dc() { docker compose "${COMPOSE[@]}" "$@"; }
 # Progress goes to stderr: `run_phase`'s stdout is captured by the caller, so
 # anything logged there would be swallowed into the result.

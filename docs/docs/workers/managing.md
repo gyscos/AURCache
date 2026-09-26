@@ -43,7 +43,7 @@ its intake** first — the **Stop intake** button on the Workers list or on the
 worker's page, or:
 
 ```bash
-aurcache-cli worker pause 3
+aurcli worker pause 3
 ```
 
 The worker is given no new builds from its next claim on; they go to other
@@ -62,7 +62,7 @@ the builds take). Pausing is idempotent, so a worker paused earlier can be
 waited on the same way:
 
 ```bash
-aurcache-cli worker pause 3 --wait --wait-timeout 7200 && systemctl restart aurcache-worker
+aurcli worker pause 3 --wait --wait-timeout 7200 && systemctl restart aurcache-worker
 ```
 
 A build counts as finished for the worker once it is `publishing`: the worker
@@ -70,10 +70,10 @@ has handed its packages over, and the server puts them in the repository on
 its own. To see what a worker ran, or is running, filter the builds list:
 
 ```bash
-aurcache-cli builds list --worker freyja --status active,publishing
+aurcli builds list --worker freyja --status active,publishing
 ```
 
-When the machine is ready again, **Resume intake** (`aurcache-cli worker resume
+When the machine is ready again, **Resume intake** (`aurcli worker resume
 3`) and it takes new builds from its next claim. A stopped intake survives the
 worker restarting, so it will not start building the moment it comes back up.
 
@@ -128,16 +128,16 @@ Builds run either way — this measures the work, it does not do it.
 
 ## Why is a build not starting?
 
-`aurcache-cli doctor` answers this directly. It walks the chain — server, token,
+`aurcli doctor` answers this directly. It walks the chain — server, token,
 fleet, queue — and names the first thing that is actually wrong, with the
 command that fixes it:
 
 ```
-$ aurcache-cli doctor
+$ aurcli doctor
 ✓ server   reachable at http://localhost:8080/api
 ✓ token    authenticated as you
 ✗ workers  1 worker(s) enrolled, none approved
-           → aurcache-cli worker approve 3
+           → aurcli worker approve 3
 ✓ queue    nothing queued
 ```
 
@@ -149,10 +149,10 @@ calling in. The queue check reports the same reasons the Builds page shows,
 `doctor` exits non-zero if any check fails, so it doubles as a health gate in a
 script, and `--format json` gives the checks as structured output.
 
-`aurcache-cli builds watch` follows the queue and explains what it sees:
+`aurcli builds watch` follows the queue and explains what it sees:
 
 ```
-$ aurcache-cli builds watch
+$ aurcli builds watch
 [   0s] turso #3: waiting-for-deps
 [   0s] libaegis #1: active
 [  47s] libaegis #1: successful
@@ -184,7 +184,7 @@ finished build, so the failure is silently skipped.
 Use `--wait` on the command that does the triggering:
 
 ```
-$ aurcache-cli pkg add turso --wait
+$ aurcli pkg add turso --wait
 queued 3 build(s) across 3 package(s)
 [   0s] libaegis/1: active
 [  47s] libaegis/1: successful

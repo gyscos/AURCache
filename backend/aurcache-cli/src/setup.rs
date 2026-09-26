@@ -1,4 +1,4 @@
-//! `aurcache-cli setup` — stand an instance up from nothing.
+//! `aurcli setup` — stand an instance up from nothing.
 //!
 //! The audience is someone who has just run `cargo install aurcache-cli` and has
 //! no server, no worker and no token. So nothing here talks to the API: every

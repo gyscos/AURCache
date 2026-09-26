@@ -19,9 +19,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e.yaml"
+COMPOSE_FILE="$PROJECT_DIR/compose/docker-compose.e2e.yaml"
 SHOTS_DIR="$(mktemp -d -t aurcache-shots-XXXXXX)"
-CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcache-cli"
+CLI_BIN="$PROJECT_DIR/backend/target/debug/aurcli"
 
 PORT="${PORT:-8080}"
 PACKAGES="${PACKAGES:-hello neofetch downgrade}"

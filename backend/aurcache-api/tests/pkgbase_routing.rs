@@ -761,7 +761,7 @@ async fn listed(client: &Client, path: &str) -> Vec<Listed> {
     out
 }
 
-/// What `aurcache-cli builds list --worker/--status` and `worker pause --wait`
+/// What `aurcli builds list --worker/--status` and `worker pause --wait`
 /// ask: which builds one worker ran, and which it is running now. A finished
 /// build keeps its worker, so the history lists too.
 #[rocket::async_test]

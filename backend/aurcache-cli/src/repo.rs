@@ -1,4 +1,4 @@
-//! `aurcache-cli repo config` — the `pacman.conf` stanza for this instance.
+//! `aurcli repo config` — the `pacman.conf` stanza for this instance.
 //!
 //! The last step of setting AURCache up is consuming it, and the documentation
 //! can only print a stanza with `<server_ip>` left as an exercise. The CLI
@@ -234,14 +234,14 @@ pub struct Installed {
 
 /// Print the stanza on stdout and the what-to-do-with-it on stderr.
 ///
-/// Split that way on purpose: `aurcache-cli repo config >> pacman.conf` has to
+/// Split that way on purpose: `aurcli repo config >> pacman.conf` has to
 /// append three usable lines and nothing else, so the instructions cannot share
 /// the stream with them.
 pub fn print_repo_config(config: &RepoConfig) {
     print!("{}", config.block);
     eprintln!();
     eprintln!("Add it to /etc/pacman.conf (asks for sudo only if it has to):");
-    eprintln!("  aurcache-cli repo config --install");
+    eprintln!("  aurcli repo config --install");
 }
 
 #[cfg(test)]

@@ -15,12 +15,12 @@ Server = http://<server_ip>:8081/$arch
 
 ## Let the CLI fill it in
 
-`aurcache-cli` is already configured to talk to the instance, and the repository
+`aurcli` is already configured to talk to the instance, and the repository
 is the same host on the mirror port — so it can print the stanza with nothing
 left to substitute:
 
 ```bash
-$ aurcache-cli repo config
+$ aurcli repo config
 [repo]
 SigLevel = Optional TrustAll
 Server = http://192.168.1.10:8081/$arch
@@ -29,7 +29,7 @@ Server = http://192.168.1.10:8081/$arch
 Or have it make the change:
 
 ```bash
-aurcache-cli repo config --install
+aurcli repo config --install
 sudo pacman -Sy
 ```
 
@@ -44,7 +44,7 @@ Without `--install` the stanza goes to stdout and the instructions to stderr, so
 it also appends cleanly by hand:
 
 ```bash
-aurcache-cli repo config | sudo tee -a /etc/pacman.conf
+aurcli repo config | sudo tee -a /etc/pacman.conf
 ```
 
 With a token configured, it asks the server how it actually publishes the

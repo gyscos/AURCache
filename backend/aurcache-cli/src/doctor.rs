@@ -1,4 +1,4 @@
-//! `aurcache-cli doctor` — why is nothing building?
+//! `aurcli doctor` — why is nothing building?
 //!
 //! The common failure of a fresh install is not a crash, it is silence: a
 //! package sits in the queue and nothing happens. Diagnosing that today means
@@ -125,7 +125,7 @@ pub fn check_workers(workers: &[Worker]) -> Check {
             Some(first) => Check::fail(
                 "workers",
                 format!("{} worker(s) enrolled, none approved", workers.len()),
-                format!("aurcache-cli worker approve {}", first.id),
+                format!("aurcli worker approve {}", first.id),
             ),
             // Everything present is revoked: the rows are kept so build history
             // still resolves, so this reads as an empty fleet rather than a
@@ -220,7 +220,7 @@ fn hint_for_reason(reason: &WaitingReason) -> String {
             workers.join(", ")
         ),
         WaitingReason::Paused { workers } => format!(
-            "intake is stopped on {} — resume one with `aurcache-cli worker resume <id>` once it is ready",
+            "intake is stopped on {} — resume one with `aurcli worker resume <id>` once it is ready",
             workers.join(", ")
         ),
     }
@@ -232,7 +232,7 @@ fn api_url_hint(api_url: &str) -> String {
     if trimmed.ends_with("/api") {
         format!("`{trimmed}` already names the API, so something else is answering on that address")
     } else {
-        format!("point the CLI at the API: `aurcache-cli config set-url {trimmed}/api`")
+        format!("point the CLI at the API: `aurcli config set-url {trimmed}/api`")
     }
 }
 
@@ -263,7 +263,7 @@ pub async fn run_doctor(
             checks.push(Check::fail(
                 "server",
                 format!("cannot reach {api_url}: {e:#}"),
-                "check the URL with `aurcache-cli config show`, and that the server is running",
+                "check the URL with `aurcli config show`, and that the server is running",
             ));
             return finish(format, Report::new(checks));
         }
@@ -281,7 +281,7 @@ pub async fn run_doctor(
             checks.push(Check::fail(
                 "token",
                 format!("rejected: {e:#}"),
-                "set a working token with `aurcache-cli config set-token`",
+                "set a working token with `aurcli config set-token`",
             ));
             return finish(format, Report::new(checks));
         }
@@ -431,7 +431,7 @@ mod tests {
     fn a_pending_worker_is_named_in_the_approve_command() {
         let check = check_workers(&[worker(7, ApprovalStatus::Pending, false)]);
         assert_eq!(check.status, Status::Fail);
-        assert_eq!(check.hint.as_deref(), Some("aurcache-cli worker approve 7"));
+        assert_eq!(check.hint.as_deref(), Some("aurcli worker approve 7"));
     }
 
     /// Revoked rows are kept so build history still resolves, so a fleet of

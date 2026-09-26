@@ -90,7 +90,7 @@ worker-docker)
     ;;
 cli)
     # The client is one binary with no service, users or state of its own.
-    install -Dm755 "$BINDIR/aurcache-cli" "$PKGDIR/usr/bin/aurcache-cli"
+    install -Dm755 "$BINDIR/aurcli" "$PKGDIR/usr/bin/aurcli"
     ;;
 *)
     echo "install-files.sh: unknown role '$ROLE'" >&2
