@@ -50,14 +50,20 @@ pub async fn resolve(sources: &[JobVcsSource], srcdest: Option<&Path>) -> BTreeM
 /// remote's advertisement preferring `refs/heads`. A repository carrying both a
 /// branch and a tag of one name would then have the two ends disagree forever,
 /// each rebuild "detecting" a move that never happened.
+///
+/// There is deliberately no `HEAD` fallback: an unknown ref resolves to
+/// nothing rather than to the mirror's own `HEAD`, which would silently agree
+/// with the server's old fallback and track the default branch tip.
 fn candidates(git_ref: &str) -> Vec<String> {
+    if git_ref == "HEAD" {
+        return vec!["HEAD".to_string()];
+    }
     let mut candidates = Vec::new();
     if git_ref.starts_with("refs/") {
         candidates.push(git_ref.to_string());
     }
     candidates.push(format!("refs/heads/{git_ref}"));
     candidates.push(format!("refs/tags/{git_ref}"));
-    candidates.push("HEAD".to_string());
     candidates
 }
 
@@ -103,11 +109,7 @@ mod tests {
     fn candidates_prefer_a_branch_the_way_the_server_does() {
         assert_eq!(
             candidates("main"),
-            vec![
-                "refs/heads/main".to_string(),
-                "refs/tags/main".to_string(),
-                "HEAD".to_string()
-            ]
+            vec!["refs/heads/main".to_string(), "refs/tags/main".to_string()]
         );
         assert_eq!(
             candidates("refs/heads/main").first().map(String::as_str),
@@ -116,13 +118,22 @@ mod tests {
         );
         assert_eq!(
             candidates("HEAD"),
-            vec![
-                "refs/heads/HEAD".to_string(),
-                "refs/tags/HEAD".to_string(),
-                "HEAD".to_string()
-            ],
+            vec!["HEAD".to_string()],
             "and an unqualified HEAD still ends at the mirror's own HEAD"
         );
+    }
+
+    /// An unknown ref resolves to nothing rather than to the mirror's HEAD:
+    /// falling back meant a `#tag=<sha>` pin agreed with the server's old
+    /// fallback and tracked the default branch tip together.
+    #[test]
+    fn unknown_refs_do_not_fall_back_to_head() {
+        for git_ref in ["6e481d6bf0a69f8c9bd2866eb491e1e4e9b0717f", "no-such-branch"] {
+            assert!(
+                !candidates(git_ref).contains(&"HEAD".to_string()),
+                "{git_ref} must not resolve to HEAD"
+            );
+        }
     }
 
     /// A worker with no source cache, or a source that was never fetched,

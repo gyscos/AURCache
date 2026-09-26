@@ -112,7 +112,8 @@ pub fn job_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<JobVcsSource> {
 /// Only the package base's generic `source` array is considered;
 /// architecture-specific overrides (`source_x86_64=(...)` etc.) are not
 /// tracked. Sources pinned to an exact `#commit=<sha>` are skipped, since
-/// they're immutable by construction and can never go "out of date".
+/// they're immutable by construction and can never go "out of date" — as are
+/// `#tag=`/`#branch=` values that are themselves a full commit SHA.
 /// Non-git VCS types (`svn+`, `hg+`, `bzr+`, `fossil+`) are not yet
 /// supported and are skipped.
 pub fn extract_git_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<VcsSource> {
@@ -122,6 +123,17 @@ pub fn extract_git_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<VcsSource> {
         .iter()
         .filter_map(git_vcs_source_from)
         .collect()
+}
+
+/// Whether a `#branch=`/`#tag=` value is really a pinned commit SHA.
+///
+/// Some PKGBUILDs write the pin as `#tag=<sha>` (e.g. libgcrypt15's
+/// `_tag=6e481d6b…` used as `#tag=${_tag}`): makepkg still checks out that
+/// exact commit, so it is immutable like `#commit=` and there is nothing to
+/// track. Only full-length SHAs count (SHA-1's 40 or SHA-256's 64 hex
+/// digits): a short prefix could also be a genuine branch or tag name.
+fn is_commit_sha(name: &str) -> bool {
+    (name.len() == 40 || name.len() == 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn git_vcs_source_from(source: &Source) -> Option<VcsSource> {
@@ -136,6 +148,11 @@ fn git_vcs_source_from(source: &Source) -> Option<VcsSource> {
     let git_ref = match fragment {
         // Pinned to an exact commit: never changes, nothing to track.
         Some(GitFragment::Commit(_)) => return None,
+        // A tag/branch value that is a full commit SHA pins the same way
+        // (`#tag=<sha>`): immutable, nothing to track.
+        Some(GitFragment::Branch(name) | GitFragment::Tag(name)) if is_commit_sha(name) => {
+            return None;
+        }
         Some(GitFragment::Branch(name) | GitFragment::Tag(name)) => name.clone(),
         None => "HEAD".to_string(),
     };
@@ -391,7 +408,7 @@ fn source_moved(
 
 #[cfg(test)]
 mod tests {
-    use super::source_moved;
+    use super::{extract_git_vcs_sources, is_commit_sha, source_moved};
     use std::collections::{BTreeMap, HashMap};
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -513,5 +530,73 @@ mod tests {
             "b has no build record, so its watermark answers"
         );
         assert!(source_moved(&built, &watermark, "b", "b2"));
+    }
+
+    /// Only full-length SHAs pin: a short prefix could be a real branch name.
+    #[test]
+    fn only_full_length_hex_counts_as_a_pinned_sha() {
+        assert!(is_commit_sha("6e481d6bf0a69f8c9bd2866eb491e1e4e9b0717f"));
+        assert!(is_commit_sha(&"0123456789abcdef".repeat(4)));
+        assert!(!is_commit_sha("6e481d6"), "a short prefix may be a name");
+        assert!(!is_commit_sha("v1.5.6"), "a tag name is not a SHA");
+        assert!(!is_commit_sha("main"), "a branch name is not a SHA");
+        assert!(
+            !is_commit_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            "40 non-hex chars are not a SHA"
+        );
+    }
+
+    fn srcinfo_with_source(source: &str) -> alpm_srcinfo::SourceInfoV1 {
+        let raw = format!(
+            "pkgbase = demo\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = x86_64\n\tsource = {source}\n\npkgname = demo\n"
+        );
+        alpm_srcinfo::SourceInfoV1::from_string(&raw).expect("fixture parses")
+    }
+
+    /// libgcrypt15 pins its VCS source as `#tag=<sha>`: makepkg checks out
+    /// that exact commit, so it is immutable and there is nothing to track.
+    /// Tracking it resolved the default branch tip instead and rebuilt on
+    /// every upstream commit without any PKGBUILD change.
+    #[test]
+    fn a_tag_holding_a_commit_sha_is_not_tracked() {
+        let info = srcinfo_with_source(
+            "git+https://github.com/gpg/libgcrypt.git#tag=6e481d6bf0a69f8c9bd2866eb491e1e4e9b0717f",
+        );
+        assert!(
+            extract_git_vcs_sources(&info).is_empty(),
+            "a #tag=<sha> pin must not be tracked"
+        );
+    }
+
+    /// The same pin spelled `#branch=<sha>` is a pin all the same.
+    #[test]
+    fn a_branch_holding_a_commit_sha_is_not_tracked() {
+        let info = srcinfo_with_source(
+            "git+https://example.test/repo.git#branch=6e481d6bf0a69f8c9bd2866eb491e1e4e9b0717f",
+        );
+        assert!(
+            extract_git_vcs_sources(&info).is_empty(),
+            "a #branch=<sha> pin must not be tracked"
+        );
+    }
+
+    /// Genuine tags and branches are still tracked, and a bare `git+` source
+    /// still follows the default branch.
+    #[test]
+    fn real_tags_branches_and_bare_sources_are_still_tracked() {
+        let tagged = srcinfo_with_source("git+https://example.test/repo.git#tag=v1.5.6");
+        let tagged = extract_git_vcs_sources(&tagged);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].git_ref(), "v1.5.6");
+
+        let branched = srcinfo_with_source("git+https://example.test/repo.git#branch=main");
+        let branched = extract_git_vcs_sources(&branched);
+        assert_eq!(branched.len(), 1);
+        assert_eq!(branched[0].git_ref(), "main");
+
+        let bare = srcinfo_with_source("git+https://example.test/repo.git");
+        let bare = extract_git_vcs_sources(&bare);
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].git_ref(), "HEAD");
     }
 }

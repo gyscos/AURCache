@@ -189,6 +189,24 @@ pub fn checkout_or_fetch_repo_ref(
     resolve_and_checkout(&repo, git_ref)
 }
 
+/// The remote refs a `git_ref` may be advertised under: the exact name,
+/// then `refs/heads/<name>`, then `refs/tags/<name>`.
+///
+/// There is deliberately no `HEAD` fallback. `HEAD` is only a candidate when
+/// it was asked for: an unknown ref used to fall through to the remote's
+/// `HEAD`, so a mistyped branch/tag — or a `#tag=<sha>` pin — silently
+/// tracked the default branch tip and rebuilt on every upstream commit.
+fn ls_remote_candidates(git_ref: &str) -> Vec<String> {
+    if git_ref == "HEAD" {
+        return vec!["HEAD".to_string()];
+    }
+    vec![
+        git_ref.to_string(),
+        format!("refs/heads/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+    ]
+}
+
 /// Resolve the commit that `git_ref` currently points to on the remote
 /// `git_repo`, without cloning or fetching any objects (equivalent to
 /// `git ls-remote <repo> <ref>`).
@@ -207,12 +225,7 @@ pub fn ls_remote(git_repo: &str, git_ref: &str) -> anyhow::Result<String> {
     remote.connect(Direction::Fetch)?;
 
     let heads = remote.list()?;
-    let candidates = [
-        git_ref.to_string(),
-        format!("refs/heads/{git_ref}"),
-        format!("refs/tags/{git_ref}"),
-        "HEAD".to_string(),
-    ];
+    let candidates = ls_remote_candidates(git_ref);
 
     let result = candidates
         .iter()
@@ -475,6 +488,33 @@ mod tests {
             std::fs::read_to_string(path.join("PKGBUILD"))
                 .unwrap()
                 .contains("1.0")
+        );
+    }
+
+    /// An unknown ref must not fall through to HEAD: it used to resolve the
+    /// default branch tip, so a mistyped branch/tag — or a `#tag=<sha>` pin —
+    /// silently tracked upstream and rebuilt on every commit.
+    #[test]
+    fn unknown_refs_do_not_fall_back_to_head() {
+        for git_ref in [
+            "6e481d6bf0a69f8c9bd2866eb491e1e4e9b0717f",
+            "no-such-branch",
+            "v9.9.9",
+        ] {
+            assert!(
+                !ls_remote_candidates(git_ref).contains(&"HEAD".to_string()),
+                "{git_ref} must not resolve to HEAD"
+            );
+        }
+        assert_eq!(ls_remote_candidates("HEAD"), vec!["HEAD".to_string()]);
+        assert_eq!(
+            ls_remote_candidates("main"),
+            vec![
+                "main".to_string(),
+                "refs/heads/main".to_string(),
+                "refs/tags/main".to_string(),
+            ],
+            "branches still prefer heads over tags, as the worker does"
         );
     }
 
