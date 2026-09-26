@@ -5,21 +5,21 @@
 # server, one dummy worker that completes every job with synthetic near-empty
 # packages (see backend/aurcache-worker-demo), and PostgreSQL.
 #
-#     docker compose -f docker-compose.demo.yaml up -d --build
-#     docker compose -f docker-compose.demo.yaml logs -f
-#     docker compose -f docker-compose.demo.yaml down -v     # -v drops all data
+#     docker compose -f compose/docker-compose.demo.yaml up -d --build
+#     docker compose -f compose/docker-compose.demo.yaml logs -f
+#     docker compose -f compose/docker-compose.demo.yaml down -v     # -v drops all data
 #
 # Or run the prebuilt images instead of compiling: scripts/deploy-truenas.sh
 # (local-only) pushes `aurcache-server` and `aurcache-demo-worker` to
 # $AURCACHE_REGISTRY, so
 #
-#     docker compose -f docker-compose.demo.yaml pull aurcache demo-worker
-#     docker compose -f docker-compose.demo.yaml up -d
+#     docker compose -f compose/docker-compose.demo.yaml pull aurcache demo-worker
+#     docker compose -f compose/docker-compose.demo.yaml up -d
 #
 # runs this tree's code without building it. `up -d --build` always ignores
 # the registry and compiles locally, which is the path that needs no
 # registry access. Set AURCACHE_REGISTRY to point the `image:` tags below at
-# another registry (default: docker.abury.me).
+# another registry (default: ghcr.io/gyscos).
 #
 # Web UI / API : http://localhost:8080
 #
@@ -43,9 +43,9 @@ services:
   aurcache:
     # Prebuilt equivalent of the `build:` below; `pull` fetches it, `--build`
     # recompiles and re-tags this same name.
-    image: ${AURCACHE_REGISTRY:-docker.abury.me}/aurcache-server:latest
+    image: ${AURCACHE_REGISTRY:-ghcr.io/gyscos}/aurcache-server:latest
     build:
-      context: .
+      context: ..
       dockerfile: docker/server.Dockerfile
     ports:
       - "${AURCACHE_PORT:-8080}:8080"   # Web UI + API (plain HTTP): the only port out
@@ -108,9 +108,9 @@ services:
   demo-worker:
     # Prebuilt equivalent of the `build:` below; `pull` fetches it, `--build`
     # recompiles and re-tags this same name.
-    image: ${AURCACHE_REGISTRY:-docker.abury.me}/aurcache-demo-worker:latest
+    image: ${AURCACHE_REGISTRY:-ghcr.io/gyscos}/aurcache-demo-worker:latest
     build:
-      context: .
+      context: ..
       dockerfile: docker/demo-worker.Dockerfile
     depends_on:
       - aurcache

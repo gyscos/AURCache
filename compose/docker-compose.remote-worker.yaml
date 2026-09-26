@@ -24,7 +24,7 @@
 #         AURCACHE_ENROLLMENT_TOKEN and this worker's AURCACHE_ENROLLMENT_TOKEN.
 #      c) Just approve it once in the web UI (Workers page).
 #
-# Then:  docker compose -f docker-compose.remote-worker.yaml up -d
+# Then:  docker compose -f compose/docker-compose.remote-worker.yaml up -d
 # =============================================================================
 
 services:

@@ -1,9 +1,10 @@
 name: Publish Arch-based images
 
 # The Arch-based images: the worker, the hybrid compatibility image, and the
-# legacy builder image the hybrid's compatibility executor spawns.
+# legacy builder image the hybrid's compatibility executor spawns — plus the
+# Debian-based demo worker, which the demo compose file pulls from ghcr.io.
 #
-# All three must be published for every release tag: a release whose server and
+# All four must be published for every release tag: a release whose server and
 # worker images come from different commits can disagree about the worker
 # protocol. The weekly cron additionally refreshes `latest`, which these images
 # need more than most — an Arch image that is never rebuilt eventually fails its
@@ -71,6 +72,7 @@ jobs:
           emit worker_tags "$REPO/aurcache-worker"
           emit hybrid_tags "$REPO/aurcache"
           emit builder_tags "$REPO/aurcache-builder"
+          emit demo_tags "$REPO/aurcache-demo-worker"
           # The release tag for the binaries to report, if this is one (see
           # aurcache-common's build script): empty on the weekly cron refresh,
           # which builds main rather than a release and names its commit.
@@ -131,3 +133,23 @@ jobs:
           context: .
           file: ./docker/builder.Dockerfile
           tags: ${{ steps.vars.outputs.builder_tags }}
+      -
+        # The dummy worker the demo compose file pulls from ghcr.io.
+        # amd64 only: it builds natively per platform, so a foreign arch
+        # would each pay a full emulated Rust build, and the demo runs on
+        # x86_64.
+        name: Build demo worker container
+        uses: docker/build-push-action@v7
+        with:
+          platforms: linux/amd64
+          cache-from: type=gha,scope=demo-worker
+          cache-to: type=gha,scope=demo-worker,mode=max
+          push: true
+          context: .
+          file: ./docker/demo-worker.Dockerfile
+          tags: ${{ steps.vars.outputs.demo_tags }}
+          # What the worker binary reports as its version (see
+          # aurcache-common's build script).
+          build-args: |
+            LATEST_COMMIT_SHA=${{ github.sha }}
+            AURCACHE_GIT_TAG=${{ steps.vars.outputs.git_tag }}

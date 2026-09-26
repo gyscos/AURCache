@@ -19,7 +19,7 @@ docker build -q -f "$PROJECT_DIR/docker/builder.Dockerfile" \
 # Shared with the Docker daemon by absolute path, so it must exist on the host.
 mkdir -p /tmp/aurcache-legacy-builds
 
-export E2E_COMPOSE_FILE="$PROJECT_DIR/docker-compose.e2e-hybrid-legacy.yaml"
+export E2E_COMPOSE_FILE="$PROJECT_DIR/compose/docker-compose.e2e-hybrid-legacy.yaml"
 export E2E_SERVICES="aurcache"
 # The container builder has no storage pool, so its builds report no disk use.
 export E2E_EXPECT_DISK_USAGE=0

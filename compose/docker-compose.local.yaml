@@ -1,14 +1,13 @@
 # =============================================================================
-# AURCache — local test stack, from images on docker.abury.me
+# AURCache — local test stack, from images on ghcr.io
 # =============================================================================
 # The same topology as the turnkey `docker-compose.yaml` (server + one local
-# build worker, auto-enrolled through a shared volume), but running the images
-# built from this working tree and pushed to the private registry rather than
-# the published ghcr.io ones.
+# build worker, auto-enrolled through a shared volume), running the published
+# ghcr.io images.
 #
-#     docker compose -f docker-compose.local.yaml up -d
-#     docker compose -f docker-compose.local.yaml logs -f
-#     docker compose -f docker-compose.local.yaml down -v     # -v drops the data
+#     docker compose -f compose/docker-compose.local.yaml up -d
+#     docker compose -f compose/docker-compose.local.yaml logs -f
+#     docker compose -f compose/docker-compose.local.yaml down -v     # -v drops the data
 #
 # Web UI / API : http://localhost:8090
 # Pacman repo  : http://localhost:8091
@@ -19,7 +18,7 @@
 
 services:
   aurcache:
-    image: docker.abury.me/aurcache-server:latest
+    image: ghcr.io/gyscos/aurcache-server:latest
     ports:
       - "8090:8080"   # Web UI + API
       - "8091:8081"   # Pacman repository
@@ -49,7 +48,7 @@ services:
     restart: unless-stopped
 
   builder:
-    image: docker.abury.me/aurcache-worker:latest
+    image: ghcr.io/gyscos/aurcache-worker:latest
     depends_on:
       - aurcache
     environment:

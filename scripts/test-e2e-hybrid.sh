@@ -18,7 +18,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-export E2E_COMPOSE_FILE="$(dirname "$SCRIPT_DIR")/docker-compose.e2e-hybrid.yaml"
+export E2E_COMPOSE_FILE="$(dirname "$SCRIPT_DIR")/compose/docker-compose.e2e-hybrid.yaml"
 # One container fills both roles, so only one service must stay alive.
 export E2E_SERVICES="aurcache"
 

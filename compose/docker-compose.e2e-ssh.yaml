@@ -3,7 +3,7 @@
 # =============================================================================
 # Used together with docker-compose.e2e.yaml:
 #
-#   docker compose -f docker-compose.e2e.yaml -f docker-compose.e2e-ssh.yaml …
+#   docker compose -f compose/docker-compose.e2e.yaml -f compose/docker-compose.e2e-ssh.yaml …
 #
 # Adds a throwaway git server and points the worker at a generated keypair.
 # `SSH_TEST_KEYS` is a host directory holding `id_ed25519{,.pub}`, created per
@@ -15,7 +15,7 @@
 services:
   gitssh:
     build:
-      context: .
+      context: ..
       dockerfile: docker/git-ssh.Dockerfile
     environment:
       - MARKER=${SSH_TEST_MARKER:-aurcache-ssh-credential-reached-the-chroot}

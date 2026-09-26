@@ -141,7 +141,7 @@ defect this frontend has had was of that kind.
   `pacman -Qm` reports, behind a confirmation. `setup compose|server|worker` (in `compose.rs` and
   `setup.rs`) stands an instance up from nothing — a compose file for TrueNAS-style hosts, or
   `docker run` locally. The local server/worker pair shares an `enroll` volume so the worker
-  self-approves, mirroring `docker-compose.yaml`; compose output is templated rather than
+  self-approves, mirroring `compose/docker-compose.yaml`; compose output is templated rather than
   serialized so the explanatory comments survive. `repo config --install` appends to pacman.conf,
   falling back to `sudo` only on a permission error, and asks `GET /repo/info` how the repository is
   published when a token is configured (host substitution shared with the worker template through
@@ -208,9 +208,9 @@ defect this frontend has had was of that kind.
 - The schema's foreign keys are enforced, on SQLite too — sqlx opens connections with `foreign_keys` on
   and `init.rs` sets it explicitly. `files.package_id` and both of `dependencies`' package columns
   cascade. A test that inserts a child row has to insert its package first.
-- The repo includes multiple containerized workflows: `docker-compose.hostmode.dev.yaml` mounts the host
-  Docker socket for builds, `docker-compose.dindmode.dev.yaml` is the simpler dev setup, and
-  `scripts/test-e2e.sh` exercises `docker-compose.e2e.yaml` end to end.
+- The repo includes multiple containerized workflows (all under `compose/`): `compose/docker-compose.hostmode.dev.yaml` mounts the host
+  Docker socket for builds, `compose/docker-compose.dindmode.dev.yaml` is the simpler dev setup, and
+  `scripts/test-e2e.sh` exercises `compose/docker-compose.e2e.yaml` end to end.
 
 <!-- graft:start -->
 ## Graft — repo context graph
