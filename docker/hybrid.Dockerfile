@@ -156,8 +156,10 @@ FROM runtime-${TARGETARCH}${TARGETVARIANT:+${TARGETVARIANT}} AS final
 # Interpolated into the pacman cache id below.
 ARG TARGETPLATFORM
 
-# DisableSandbox: pacman 7's Landlock-based download sandbox cannot initialise
-# inside an unprivileged/nested container, which makes every `pacman -Sy` abort.
+# DisableSandbox: pacman 7's Landlock-based download sandbox needs syscalls
+# that some runtimes block or do not implement (older seccomp profiles, qemu
+# emulation), which makes every `pacman -Sy` abort there. Disabling it keeps
+# this image working everywhere.
 # It only affects pacman's own download isolation, not the per-build chroot.
 RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \

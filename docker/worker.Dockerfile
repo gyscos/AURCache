@@ -155,11 +155,12 @@ ARG TARGETPLATFORM
 
 # devtools provides mkarchroot / makechrootpkg / arch-nspawn.
 #
-# DisableSandbox: pacman 7's Landlock-based download sandbox cannot initialise
-# inside an unprivileged/nested container (no Landlock access here), which makes
-# every `pacman -Sy` abort. Disabling it is required for pacman to run at all in
-# this image; it only affects pacman's own download isolation, not the per-build
-# chroot isolation (each build still runs in its own `makechrootpkg` chroot).
+# DisableSandbox: pacman 7's Landlock-based download sandbox needs syscalls
+# that some runtimes block or do not implement (older seccomp profiles, qemu
+# emulation), which makes every `pacman -Sy` abort there. Disabling it keeps
+# this image working everywhere; it only affects pacman's own download
+# isolation, not the per-build chroot isolation (each build still runs in its
+# own `makechrootpkg` chroot).
 RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \

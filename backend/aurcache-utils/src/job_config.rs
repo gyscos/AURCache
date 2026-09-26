@@ -66,9 +66,10 @@ pub async fn create_makepkg_config(
 /// packages.  Pass `None` for standalone builds (e.g. the test-builder) where
 /// no AURCache server is running.
 ///
-/// `DisableSandbox`: pacman 7's Landlock download sandbox cannot initialise
-/// inside the unprivileged/nested build chroot and aborts every `pacman -Sy`.
-/// Disabling it is required for pacman to run there; it only relaxes pacman's
+/// `DisableSandbox`: pacman 7's Landlock download sandbox needs syscalls that
+/// some runtimes block or do not implement (older seccomp profiles, qemu
+/// emulation), and aborts every `pacman -Sy` where they are unavailable.
+/// Disabling it keeps builds working on any host; it only relaxes pacman's
 /// own download isolation, not the surrounding `makechrootpkg` chroot.
 pub fn base_pacman_config() -> String {
     "[options]\nDisableSandbox\nSigLevel = Never\nHoldPkg = pacman glibc\nArchitecture = auto\n\n\

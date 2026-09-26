@@ -8,17 +8,22 @@ Both halves on a single x86_64 Arch Linux machine, no Docker: the server and
 one worker as two systemd services sharing the `aurcache` user. Several things
 the container images do exist only *because* they are containers and drop away
 here — no privileged container, `systemd-nspawn` has a real systemd manager,
-and pacman 7's Landlock download sandbox works instead of being disabled.
+and pacman 7's Landlock download sandbox stays on (the images set
+`DisableSandbox` for runtimes that block or lack its syscalls; natively those
+are normally available).
 
-This page is the worked example; [Native install](../native.md) is the
+This page is the worked example; [Native install](../setup/native.md) is the
 reference for every setting and for why the worker's unit looks the way it
 does.
 
 ## Install both packages
 
 ```bash
-pacman -S aurcache-server aurcache-worker
+paru -S aurcache-server aurcache-worker
 ```
+
+Both packages live in the AUR, not the official repositories, so use an AUR
+helper (`paru`, `yay`, …).
 
 They are separate because their dependencies are: the server needs no
 `devtools`, `base-devel` or `sudo`, and most build machines do not want a
@@ -40,7 +45,7 @@ localhost. Two are worth setting before anything else reaches it:
   `http://192.168.1.10:8081` once other machines use it.
 - The `OAUTH_*` block. With all of them unset there is **no authentication**,
   which is only sensible on a machine nothing else can reach. See
-  [Authentication](../../Configuration/authentication.md).
+  [Authentication](../Configuration/authentication.md).
 
 The server listens on **8080** (API + web UI), **8081** (pacman repository)
 and **8083** (workers). State lives in `/var/lib/aurcache`: the repository,
@@ -76,7 +81,7 @@ WORKER_CONCURRENCY_DEFAULT=2
 ```
 
 Everything the worker stores (base chroot, builds, source and package caches)
-lives in its [storage pool](../../workers/storage-pool.md), a btrfs filesystem
+lives in its [storage pool](../workers/storage-pool.md), a btrfs filesystem
 with quotas. The default is a sparse image at
 `/var/lib/aurcache-worker/chroot/pool.img` — nothing to prepare. A zvol, a
 spare partition or a dedicated btrfs filesystem can back it instead via
@@ -108,7 +113,7 @@ sudo pacman -Sy
 builds leaf-first; `repo config --install` appends the stanza to
 `/etc/pacman.conf` (safe to run twice) and, with a token configured, asks the
 server how it actually publishes the repository. If a build does not start,
-[`aurcli doctor`](../../workers/managing.md#why-is-a-build-not-starting) says
+[`aurcli doctor`](../workers/managing.md#why-is-a-build-not-starting) says
 why.
 
 ## Growing past one machine
@@ -116,5 +121,5 @@ why.
 This topology scales by adding workers, not by touching the server: a worker on
 another machine enrols with a token and pins the CA fingerprint, and jobs for
 its native architecture route to it. See
-[Worker Configuration](../../workers/configuration.md#connecting-to-aurcache)
+[Worker Configuration](../workers/split-chroot.md#connecting-to-aurcache)
 and the [Raspberry Pi example](./raspberry-pi.md) for the split layout.

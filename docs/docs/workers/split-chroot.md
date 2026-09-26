@@ -1,12 +1,12 @@
 ---
-sidebar_position: 1
+sidebar_position: 2
 ---
 
 # Worker Configuration
 
 :::note Upgrading from a single container
 If you are still running AURCache as one container, it keeps working through the
-[hybrid compatibility image](../setup/docker.md#backward-compatibility-the-hybrid-image),
+[hybrid compatibility image](./hybrid.md),
 which is deprecated. Everything on this page applies to a worker you run
 yourself.
 :::
@@ -125,6 +125,44 @@ machine has cores; two or three is a large increase for most hosts.
 A foreign architecture is only ever emulated when **no** worker builds it
 natively. That keeps an aarch64 job waiting for the aarch64 machine instead of
 crawling through emulation somewhere else.
+
+## Building for another architecture
+
+A foreign-architecture worker is the *same* worker image run emulated, with
+`platform: linux/arm64` (or `linux/arm/v7`). Docker uses binfmt_misc to register
+the qemu interpreter for that platform, so from the worker's point of view it is
+building natively and the build path is identical to a native worker's.
+
+The bundled compose file ships this behind a profile:
+
+```bash
+docker compose --profile arm up -d
+```
+
+which also runs `tonistiigi/binfmt` once to register the handlers on the host
+kernel. Emulated builds are slow, so that worker is configured with
+`WORKER_CONCURRENCY=1`; if you later add a native aarch64 machine, give it a
+higher [priority](./routing.md) and aarch64 jobs will prefer it,
+falling back to emulation only when it is busy or offline.
+
+Supported platforms are `x86_64`, `aarch64` and `armv7` — the Arch Linux base
+image the worker is built on exists only for those. Emulation itself only runs
+one way: qemu user-mode runs on an x86_64 host, so cross builds always start
+there.
+
+If a worker fails to start with `exec container process (missing dynamic
+library?)`, its qemu/binfmt setup is misconfigured: `binfmt_misc` must be
+enabled in the kernel (`cat /proc/sys/fs/binfmt_misc/status`), enabling it with
+`mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc` if not.
+
+## Swarm and other runtimes
+
+In Docker Swarm the worker is an ordinary service with the same needs: the
+permissions a chroot build requires — `privileged: true`, or `SYS_ADMIN` /
+`SYS_PTRACE` with seccomp and AppArmor unconfined — plus a writable tmpfs at
+`/run`. Constrain workers to particular nodes with the usual Swarm `placement`
+rules, which pairs well with [routing](./routing.md) when a package must be
+built on a specific machine.
 
 ## Routing
 

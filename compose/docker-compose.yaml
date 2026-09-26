@@ -14,9 +14,9 @@
 # Web UI / API : http://localhost:8080   (plain HTTP; put a reverse proxy in front for TLS)
 # Pacman repo  : http://localhost:8081   (add as a [repo] Server in pacman.conf)
 #
-# To scale local build throughput, raise the worker's concurrency on its page in
-# AURCache (or WORKER_CONCURRENCY_DEFAULT below), or run more workers:
-#     docker compose up -d --scale builder=3
+# For more local build throughput, raise the worker's concurrency on its page
+# in AURCache (or WORKER_CONCURRENCY_DEFAULT below): each build already uses
+# every core, so concurrency buys builds at once, not faster builds.
 #
 # For a worker on separate hardware / a foreign architecture (e.g. aarch64), see
 # docker-compose.remote-worker.yaml.

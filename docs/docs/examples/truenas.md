@@ -5,7 +5,7 @@ sidebar_position: 1
 # TrueNAS setup
 
 Server plus one local worker on TrueNAS SCALE, with the worker's
-[storage pool](../../workers/storage-pool.md) on a zvol instead of the default
+[storage pool](../workers/storage-pool.md) on a zvol instead of the default
 image file. The server keeps the database, repository, logs and worker CA; the
 worker builds each package in a `devtools` chroot inside that zvol.
 
@@ -73,7 +73,7 @@ recommended for anything you intend to keep (`--database postgres`, with a
 generated password unless you pass `--db-password`), and it asks whether to add
 the `ixsystems/postgres-upgrade` step (`--postgres-upgrade` /
 `--no-postgres-upgrade`) that TrueNAS's own apps use for major-version
-upgrades. See [Quick Start](../../overview/quick-start.md#for-truenas-portainer-unraid).
+upgrades. See [Quick Start](../overview/quick-start.md#for-truenas-portainer-unraid).
 
 ## 3. App config
 
@@ -89,7 +89,7 @@ starts:
   storage (a large `/app/repo` on bulk disks) works, but the inner mount
   **shadows** whatever the outer volume holds at that path — copy existing data
   across before adding one to a running deployment, or it looks exactly like
-  data loss. See [Docker Compose setup](../docker.md#what-to-persist).
+  data loss. See [Docker Compose setup](../setup/docker.md#what-to-persist).
 - **Ports.** `8080` (web UI + API), `8081` (pacman repository, served by the
   bundled nginx), `8083` (worker protocol). Publish all three on the LAN.
 - **`AURCACHE_PUBLIC_URL`.** Set it to how pacman clients reach this machine,
@@ -106,7 +106,7 @@ starts:
 
 The worker enrolls itself within a few seconds and starts polling for jobs. On
 the **Workers** page it should read as connected; if a build does not start,
-[`aurcli doctor`](../../workers/managing.md#why-is-a-build-not-starting) says
+[`aurcli doctor`](../workers/managing.md#why-is-a-build-not-starting) says
 why. Then:
 
 ```bash
@@ -116,4 +116,4 @@ aurcli repo config | sudo tee -a /etc/pacman.conf
 
 Moving the pool to another backing later (a larger zvol, a partition) is just
 pause, stop, set `WORKER_POOL`, start — the pool holds nothing that cannot be
-rebuilt. See [Storage pool](../../workers/storage-pool.md#moving-to-another-backing).
+rebuilt. See [Storage pool](../workers/storage-pool.md#moving-to-another-backing).

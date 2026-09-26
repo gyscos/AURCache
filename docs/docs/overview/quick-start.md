@@ -1,5 +1,5 @@
 ---
-sidebar_position: 2
+sidebar_position: 3
 ---
 
 # Quick Start
@@ -18,9 +18,10 @@ docker compose up -d
 - Pacman repo: `http://localhost:8081` (add as a `[repo] Server` in `pacman.conf`)
 
 The worker enrolls itself and starts polling for jobs within a few seconds — no
-token and no approval click. Add build capacity with `docker compose up -d
---scale builder=3`, or raise the worker's concurrency on its page in the web
-UI.
+token and no approval click. For more build throughput, raise the worker's
+concurrency on its page in the web UI (or `WORKER_CONCURRENCY_DEFAULT`): each
+build already uses every core, so concurrency buys builds at once, not faster
+builds.
 
 ## With PostgreSQL
 
@@ -32,8 +33,10 @@ services:
   aurcache:
     image: ghcr.io/gyscos/aurcache-server:latest
     ports:
-      - "8080:8080"   # Web UI + API
-      - "8081:8081"   # Pacman repository
+      - "8080:8080"   # Web UI + API (plain HTTP; front with a reverse proxy for TLS)
+      # No 8081 here: the `repo` service below publishes nginx on that host
+      # port instead. Rocket's builtin file handler keeps listening on 8081
+      # inside this container, unpublished.
       - "8083:8083"   # Worker protocol (HTTPS + mutual TLS)
     volumes:
       - ./aurcache/repo:/app/repo
@@ -71,6 +74,24 @@ services:
       aurcache_network:
     restart: unless-stopped
 
+  repo:
+    # The pacman repository, served statically at line rate: nginx uses
+    # sendfile while Rocket's builtin handler streams 4 KiB chunks through
+    # userspace. Mounts the repository read-only; the server remains the only
+    # writer. Fetch the conf from the repo next to the compose file:
+    # curl -O https://raw.githubusercontent.com/gyscos/AURCache/main/docker/repo-nginx.conf
+    image: nginx:alpine
+    ports:
+      - "8081:80"   # Pacman repository (plain HTTP, for `pacman -Sy`)
+    volumes:
+      - ./aurcache/repo:/app/repo:ro
+      - ./repo-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - aurcache
+    networks:
+      aurcache_network:
+    restart: unless-stopped
+
   aurcache_database:
     # Pin both the major version and the Debian release. A new major version
     # will not start on the old one's data directory, and a new Debian release
@@ -101,7 +122,7 @@ The server and the worker authenticate to each other with mutual TLS on port
 8083. Sharing the `enroll` volume is what tells the server this worker is
 trusted, so no secret has to be configured. For a worker on another machine —
 where there is no shared volume — see
-[Build Workers](../workers/configuration.md).
+[Build Workers](../workers/split-chroot.md).
 
 Keep the Postgres image pinned as shown rather than `postgres:latest` or even
 `postgres:17`. Those tags move to a newer Debian release from time to time, and
@@ -219,7 +240,7 @@ fish, elvish or powershell.
 ## Upgrading from a single-container setup
 
 If you already run AURCache as one container, it keeps working: see
-[backward compatibility](../setup/docker.md#backward-compatibility-the-hybrid-image).
+[hybrid compatibility image](../workers/hybrid.md).
 
 For more advanced setup see the
 [Configuration](/docs/Configuration/environment-variables) page.

@@ -71,11 +71,11 @@ server may later override per worker. Builds are already parallel inside
 (`MAKEFLAGS=-j$(nproc)`), so raise concurrency for memory and disk headroom,
 not core count. The pool defaults to a sparse image file in the worker's
 volume, which is fine on ordinary filesystems; on ZFS back it with a zvol
-instead — see [Storage pool](../../workers/storage-pool.md).
+instead — see [Storage pool](../workers/storage-pool.md).
 
 Alternatively, if the x86_64 machine runs Arch Linux, skip Docker and install
-the worker natively (`pacman -S aurcache-worker`, enrol with a token from the
-**Workers** page). See [Native install](../native.md#worker).
+the worker natively (`paru -S aurcache-worker` — it lives in the AUR, so use
+an AUR helper — enrol with a token from the **Workers** page). See [Native install](../setup/native.md#worker).
 
 ## Optionally: native aarch64 builds on the Pi
 
@@ -118,4 +118,4 @@ Add packages from the **Packages** page or with `aurcli pkg add`. Note that
 `pkg add --from-installed` mirrors what `pacman -Qm` reports on the machine it
 runs on — run it on the Arch machines, not on the Pi, which has no pacman
 database to mirror. If a build does not start, see
-[Why is a build not starting](../../workers/managing.md#why-is-a-build-not-starting).
+[Why is a build not starting](../workers/managing.md#why-is-a-build-not-starting).

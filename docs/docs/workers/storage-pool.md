@@ -1,5 +1,5 @@
 ---
-sidebar_position: 2
+sidebar_position: 3
 ---
 
 # Storage pool
@@ -21,7 +21,7 @@ and how to size it.
 `WORKER_POOL`, `WORKER_DISK_RESERVE` and `WORKER_CHROOT_DIR` describe the
 machine, so they are set on the worker only, never from AURCache: they decide
 what the worker formats and mounts. The two sizes can also be set from
-AURCache (see [`_DEFAULT`](./configuration.md#_default-a-value-the-server-may-take-over)).
+AURCache (see [`_DEFAULT`](./split-chroot.md#_default-a-value-the-server-may-take-over)).
 
 ## How it works
 

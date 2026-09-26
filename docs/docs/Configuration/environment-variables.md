@@ -50,7 +50,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | SECRET_KEY             | String        | \>32Byte Random String for singing cookies                            | Random  |
 | AURCACHE_PUBLIC_URL    | String        | Base URL workers use for the pacman repo, baked into build configs. Example: `http://aurcache:8081` | `http://localhost:8081` |
 
-Builds run on [build workers](../workers/configuration.md), which are configured
+Builds run on [build workers](../workers/split-chroot.md), which are configured
 on the worker itself rather than here — including how many builds it runs at
 once and how long it will let one run.
 
@@ -58,11 +58,11 @@ once and how long it will let one run.
 `BUILDER_IMAGE`, `CPU_LIMIT`, `MEMORY_LIMIT` and `BUILD_ARTIFACT_DIR`
 configured the per-build Docker container that AURCache used to spawn. In the
 split setup they do nothing on the server: a worker limits its own builds with
-[`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS` and their `WORKER_TOTAL_BUILD_*` totals](../workers/configuration.md#resource-limits),
+[`WORKER_BUILD_MEMORY_MAX`, `WORKER_BUILD_CPUS` and their `WORKER_TOTAL_BUILD_*` totals](../workers/split-chroot.md#resource-limits),
 and uploads packages over the API rather than through a shared directory.
 
 They are still read by the [hybrid compatibility
-image](../setup/docker.md#backward-compatibility-the-hybrid-image), where they
+image](../workers/hybrid.md), where they
 keep their original meanings — `BUILD_ARTIFACT_DIR` is in fact what selects the
 legacy builder there.
 
@@ -73,7 +73,7 @@ legacy builder there.
 ## Build workers
 
 Workers connect to a dedicated mTLS listener and are configured through their
-own environment. See [Build Workers](../workers/configuration.md).
+own environment. See [Build Workers](../workers/index.md).
 
 | Variable                | Type    | Description                                                  | Default |
 |-------------------------|---------|--------------------------------------------------------------|---------|
