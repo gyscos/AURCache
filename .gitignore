@@ -34,3 +34,6 @@ rustc-ice-*.txt
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+/.claude
+/.ignore
+/.mcp.json
