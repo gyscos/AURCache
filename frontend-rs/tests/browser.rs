@@ -270,6 +270,7 @@ async fn interactions() {
     a_second_page_holds_different_builds(&session).await;
     a_build_can_be_found_by_the_name_the_list_shows(&session).await;
     stopping_a_build_asks_first(&session).await;
+    the_add_dialog_focuses_its_search(&session).await;
     // Fetches the PKGBUILD from the AUR, like the source editor's route checks.
     if std::env::var("AURCACHE_ONLINE").as_deref() == Ok("1") {
         a_source_edit_can_be_reset_either_way_and_its_patch_read(&session).await;
@@ -461,6 +462,24 @@ async fn a_source_edit_can_be_reset_either_way_and_its_patch_read(session: &Sess
         !session.text().await.contains("View patch"),
         "saving upstream content removes the patch"
     );
+}
+
+/// Opening "Add package" puts the cursor in its search field, so typing
+/// starts at once without a click first.
+///
+/// Only a live page shows this: the `autofocus` attribute fires on a full
+/// page load but not when client-side navigation opens the dialog, which is
+/// why the field focuses itself on mount instead. Markup alone renders
+/// identically either way.
+async fn the_add_dialog_focuses_its_search(session: &Session) {
+    session.open("/packages/add").await;
+    session.wait_for(".modal.modal-open input").await;
+    session
+        .wait_for_script(
+            "the search field to take focus",
+            "return document.activeElement instanceof HTMLInputElement;".to_string(),
+        )
+        .await;
 }
 
 /// Stop opens a dialog instead of stopping, and backing out of it stops

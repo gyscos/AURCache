@@ -537,7 +537,13 @@ fn AddPackageDialog(q: String) -> Element {
                             r#type: "text",
                             class: "input input-bordered w-full font-mono text-sm",
                             placeholder: "hello   ·   https://github.com/user/repo.git",
-                            autofocus: true,
+                            // `autofocus` only fires on a full page load, not
+                            // when client-side navigation opens this dialog,
+                            // so take focus explicitly when the field mounts.
+                            // It remounts on every open, so this runs each time.
+                            onmounted: move |e| async move {
+                                let _ = e.set_focus(true).await;
+                            },
                             value: "{entry}",
                             oninput: move |e| {
                                 let typed = e.value();
