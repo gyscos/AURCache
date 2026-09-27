@@ -13,7 +13,7 @@ was removed once it had diverged past usefulness, and `git log` is where to find
 
 ## Packaging lives in AUR submodules
 
-`packaging/aurcache-{sandbox,worker,server,worker-docker}` are **git submodules**
+`packaging/aurcache-{sandbox,worker,server,worker-docker,cli}` are **git submodules**
 of the AUR repositories the packages are published from, so the PKGBUILD in the
 tree and the one users install from cannot drift. A fresh clone has empty
 directories until:

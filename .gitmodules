@@ -14,3 +14,7 @@
 	path = packaging/aurcache-worker-docker
 	url = https://aur.archlinux.org/aurcache-worker-docker.git
 	pushurl = ssh://aur@aur.archlinux.org/aurcache-worker-docker.git
+[submodule "packaging/aurcache-cli"]
+	path = packaging/aurcache-cli
+	url = https://aur.archlinux.org/aurcache-cli.git
+	pushurl = ssh://aur@aur.archlinux.org/aurcache-cli.git
