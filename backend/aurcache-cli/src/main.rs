@@ -11,9 +11,9 @@ use aurcache_client::{
     AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BuildQuery, BulkAddAccepted,
     BulkAddOutcome, BulkAddProgress, CandidateSource, DependencyOptions, ExtendedPackage,
     GitSourceSpec, GraphDataPoint, ListStats, Method, PackageDependency, PackageSource,
-    PatchPackageRequest, ReplacementVerdict, RestoreOutcome, SearchResult, SimplePackage,
-    SourceData, UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate, WorkerConfigView,
-    looks_like_git_url,
+    PatchPackageRequest, ReplacementVerdict, RestoreOutcome, SearchResult, ServerInfo,
+    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate,
+    WorkerConfigView, looks_like_git_url,
 };
 use aurcache_common::api::build_log::align;
 use aurcache_common::build_state::{BuildState, BuildStates};
@@ -62,7 +62,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 enum Command {
-    /// Check whether the server is healthy.
+    /// Check whether the server is healthy, and report its version.
     Health,
     /// Diagnose why builds are not running.
     Doctor,
@@ -954,7 +954,7 @@ fn is_unauthorized(err: &anyhow::Error) -> bool {
 
 async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) -> Result<()> {
     match command {
-        Command::Health => run_health(client).await,
+        Command::Health => run_health(client, format).await,
         Command::Doctor => doctor::run_doctor(client, format, client.base_url()).await,
         Command::Repo { .. } | Command::Completions { .. } | Command::Setup { .. } => {
             unreachable!("offline commands are handled before client setup")
@@ -1267,10 +1267,10 @@ fn run_config_command(format: OutputFormat, command: ConfigCommand) -> Result<()
     }
 }
 
-async fn run_health(client: &AurCacheClient) -> Result<()> {
+async fn run_health(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
     client.health().await?;
-    println!("ok");
-    Ok(())
+    let info = client.server_info().await?;
+    render(format, &info, print_health)
 }
 
 async fn render_user_info(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
@@ -2881,6 +2881,16 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     }
 }
 
+/// The one-line health report: the server is up, and this is what is running.
+/// Named as the server's because the CLI has a version of its own (`--version`).
+fn format_health(info: &ServerInfo) -> String {
+    format!("ok (server {})", info.version)
+}
+
+fn print_health(info: &ServerInfo) {
+    println!("{}", format_health(info));
+}
+
 fn print_user_info(user: &UserInfo) {
     println!(
         "username: {}",
@@ -3439,7 +3449,7 @@ mod tests {
     use super::{
         AddPackageArgs, Build, BuildState, BuildStates, BuildsCommand, Cli, Command, ComposeArgs,
         PackagesCommand, RepoCommand, SetupCommand, WatchScope, WorkerCommand, build_status_label,
-        compose, compose_database, drain_progress, pad_cell, parse_key_val, repo,
+        compose, compose_database, drain_progress, format_health, pad_cell, parse_key_val, repo,
     };
     use crate::config::ClientConfig;
     use clap::Parser;
@@ -3458,6 +3468,17 @@ mod tests {
     fn parse_key_val_requires_separator() {
         assert!(parse_key_val("limit=10").is_ok());
         assert!(parse_key_val("missing").is_err());
+    }
+
+    /// `health` reports the running server's version, not just that it is up —
+    /// and names it as the server's, because the CLI has a version of its own.
+    #[test]
+    fn health_reports_the_server_version() {
+        let info = super::ServerInfo {
+            version: "0.5.0+g8afa04a.dirty".to_string(),
+            timezone: None,
+        };
+        assert_eq!(format_health(&info), "ok (server 0.5.0+g8afa04a.dirty)");
     }
 
     /// A build row as the list endpoint returns one; only identity and status
