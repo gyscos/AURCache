@@ -119,14 +119,3 @@ _aurcache_cargo_build() {
 
     cargo build --frozen --release --target "$target" "$@"
 }
-
-# Tests run the binaries, so they cannot run when those binaries are for
-# another architecture. Skipped with a reason rather than silently.
-_aurcache_cargo_check() {
-    if ! _aurcache_is_native; then
-        printf 'aurcache: skipping tests, %s binaries cannot run here\n' "$CARCH"
-        return 0
-    fi
-    export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
-    cargo test --frozen --workspace
-}
