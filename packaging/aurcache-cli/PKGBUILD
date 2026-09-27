@@ -7,7 +7,7 @@
 # because its install closure is one binary plus gcc-libs.
 
 pkgname=aurcache-cli
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Typed CLI for the AURCache API"
 arch=(x86_64 aarch64 armv7h)
