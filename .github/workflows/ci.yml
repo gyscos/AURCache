@@ -187,20 +187,6 @@ jobs:
       - name: Sandbox test
         run: ./scripts/test-sandbox.sh
 
-  e2eTest:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          # The e2e suite builds the images, which read the PKGBUILDs from the
-          # AUR submodules under packaging/.
-          submodules: recursive
-
-      - name: Set up Docker
-        uses: docker/setup-docker-action@v5
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Run E2E test
-        run: ./scripts/test-e2e.sh hello
+  # No e2e job here: the full suite builds images and hits the real AUR and
+  # Arch mirrors, so it runs nightly (see e2e-nightly.yml) instead of on every
+  # push -- and only when something landed since the last run.

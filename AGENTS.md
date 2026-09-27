@@ -90,8 +90,8 @@ cd docs && yarn install --frozen-lockfile && yarn build
 ### Which end-to-end suite to run
 
 `scripts/test-e2e.sh` (the split server/worker path, ~4 min) is the default and
-is what CI runs. Reach for the others only when a change touches what they
-cover, rather than running all four as a matter of course:
+is what CI runs nightly. Reach for the others only when a change touches what
+they cover, rather than running all four as a matter of course:
 
 - `test-e2e-hybrid.sh` / `test-e2e-hybrid-legacy.sh` — only for changes to the
   hybrid image, the chroot builder, or the docker builder.
@@ -104,8 +104,9 @@ cover, rather than running all four as a matter of course:
   local storage: root in the container cannot write to a root-squashed NFS.
 
 CI runs the lint and unit tests for both workspaces, `test-frontend.sh`,
-`test-kernel.sh`, `test-sandbox.sh` and `test-e2e.sh`. It cannot cover a pool
-on a block device or zvol, or an image on ZFS; the runner has neither.
+`test-kernel.sh` and `test-sandbox.sh` on every push; `test-e2e.sh` runs
+nightly instead, and only when something landed that day. It cannot cover a
+pool on a block device or zvol, or an image on ZFS; the runner has neither.
 
 Unit and integration tests are cheap (backend ~8s, frontend <1s) and should be
 the reflex. They render components directly, though, so they cannot see whether
