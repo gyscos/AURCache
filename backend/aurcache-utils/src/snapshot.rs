@@ -1781,6 +1781,53 @@ license=('MIT')
         assert_eq!(after_refresh.base.version.to_string(), "2.0-1");
     }
 
+    /// `refresh` on an AUR source must pick up a PKGBUILD bump committed
+    /// after the snapshot was cached.
+    #[tokio::test]
+    async fn refresh_detects_an_aur_bump() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
+            return;
+        }
+
+        let aur_root = tempfile::tempdir().unwrap();
+        let repo_path = create_aur_git_repo(aur_root.path(), "foo", "1.0");
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let source = SourceData::Aur {
+            name: "foo".to_string(),
+        };
+
+        let first = store.sourceinfo(&source, None).await.unwrap();
+        assert_eq!(first.base.version.to_string(), "1.0-1");
+
+        let repo = Repository::open(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("PKGBUILD"),
+            "pkgname=foo\npkgver=1.1\npkgrel=1\narch=('x86_64')\ndepends=()\nsource=()\nsha256sums=()\npackage() {\n  :\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo_path.join(".SRCINFO"),
+            "pkgbase = foo\n\tpkgver = 1.1\n\tpkgrel = 1\n\narch = x86_64\n\npkgname = foo\n",
+        )
+        .unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("PKGBUILD")).unwrap();
+        index.add_path(Path::new(".SRCINFO")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "bump", &tree, &[&parent])
+            .unwrap();
+
+        let changed = store.refresh(&source).await.unwrap();
+        assert!(changed, "refresh should detect the bumped PKGBUILD");
+
+        let second = store.sourceinfo(&source, None).await.unwrap();
+        assert_eq!(second.base.version.to_string(), "1.1-1");
+    }
+
     /// A deleted package's clone must not outlive it.
     #[tokio::test]
     async fn remove_checkout_takes_the_directory_and_the_cached_entry() {

@@ -6,7 +6,7 @@ use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sourc
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
-use aurcache_activitylog::events::{Event, QueueCause};
+use aurcache_activitylog::events::{Event, QueueCause, RefreshTarget};
 use aurcache_common::build_state::BuildTrigger;
 use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
@@ -83,11 +83,10 @@ async fn remove_orphaned_packages(services: &Services, exclude_id: i32) -> anyho
 /// time.
 ///
 /// Anything else runs unforced, because for it the same version means nothing
-/// new to build. The flag says the AUR is ahead of what was built; if the
-/// source this server resolves has not caught up (a failed snapshot refresh),
-/// a forced update would rebuild the old version, the success would clear the
-/// flag, and the next version check would set it again -- a rebuild every
-/// pass. Unforced, it is skipped and stays flagged until the source catches up.
+/// new to build. Every update refreshes the source snapshot first and fails
+/// loudly when the refresh fails, so a forced update can no longer rebuild a
+/// stale version whose success would clear the flag -- the failure keeps it
+/// flagged until the source catches up.
 pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<Vec<i32>> {
     let db = &services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
@@ -241,6 +240,22 @@ async fn package_update_inner(
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     if !visited.insert(pkg_model.id) {
         return Ok(vec![]);
+    }
+
+    // Rebuilds used to resolve through the cached source snapshot, which only
+    // the periodic version check refreshes: a PKGBUILD bumped upstream after
+    // the last check (a pkgrel-only fix, say) rebuilt stale, and nothing about
+    // the build said so. Refresh first, so every update -- forced or not --
+    // resolves what upstream has now. A refresh failure fails the update
+    // rather than building stale: for the auto-updater that is a visible skip
+    // retried next pass, and for an operator it names the real problem.
+    if let Err(e) = services.store.refresh(&pkg_model.source_data).await {
+        services.activity.emit(Event::SourceRefreshFailed {
+            pkg: pkg_model.name.as_str().into(),
+            target: RefreshTarget::Snapshot,
+            error: format!("{e:#}"),
+        });
+        bail!("Could not refresh sources, not building from a stale snapshot: {e:#}");
     }
 
     let sourceinfo = services
@@ -926,8 +941,8 @@ mod tests {
     use pacman_mirrors::platforms::Platform;
     use sea_orm::DatabaseConnection;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, Database, EntityTrait, PaginatorTrait, QueryFilter, Set,
-        TryIntoModel,
+        ActiveModelTrait, ColumnTrait, Database, EntityTrait, IntoActiveModel, PaginatorTrait,
+        QueryFilter, Set, TryIntoModel,
     };
     use sea_orm_migration::MigratorTrait;
     use serde_json::json;
@@ -1035,6 +1050,42 @@ mod tests {
             .unwrap();
 
         repo_path
+    }
+
+    /// Move the fake AUR repo at `aur_root/{pkgbase}.git` to a new version,
+    /// standing in for an upstream PKGBUILD bump the store has not seen. The
+    /// store cache still holds the old snapshot afterwards, which is the point.
+    fn bump_aur_git_repo(aur_root: &Path, pkgbase: &str, version: &str, depends: &[&str]) {
+        let repo_path = aur_root.join(format!("{pkgbase}.git"));
+        let repo = Repository::open(&repo_path).unwrap();
+        let depends_arr = depends
+            .iter()
+            .map(|dep| format!("'{dep}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(
+            repo_path.join("PKGBUILD"),
+            format!(
+                "pkgname={pkgbase}\npkgver={version}\npkgrel=1\narch=('x86_64')\ndepends=({depends_arr})\nsource=()\nsha256sums=()\npackage() {{\n  :\n}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            repo_path.join(".SRCINFO"),
+            make_srcinfo(pkgbase, version, depends),
+        )
+        .unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("PKGBUILD")).unwrap();
+        index.add_path(Path::new(".SRCINFO")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "bump", &tree, &[&parent])
+            .unwrap();
     }
 
     /// Build a `SnapshotStore` for tests: AUR sources resolve against local
@@ -2216,6 +2267,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total_builds, 2, "there should be 2 build records total");
+    }
+
+    /// A forced rebuild resolves what upstream has *now*, not what the last
+    /// version check cached: the update refreshes the source snapshot first,
+    /// so a PKGBUILD bumped after the last check (a pkgrel-only fix, say)
+    /// builds at the new version instead of silently rebuilding the old one.
+    #[tokio::test]
+    async fn forced_rebuild_refreshes_the_snapshot_before_building() {
+        let server = MockServer::start().await;
+        let (client, _official) =
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<Action>(100);
+
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "mypkg", "1.0.0", &[]);
+
+        let pkg = packages::ActiveModel {
+            name: Set("mypkg".to_string()),
+            status: Set(BuildStates::FAILED_BUILD),
+            out_of_date: Set(0),
+            upstream_version: Set(Some("1.0.0".to_string())),
+            latest_build: Set(None),
+            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
+            platforms: Set("x86_64".to_string()),
+            source_type: Set(packages::SourceType::Aur),
+            source_data: Set(SourceData::Aur {
+                name: "mypkg".into(),
+            }),
+            directly_requested: Set(true),
+            split_packages: Set(None),
+            ..Default::default()
+        }
+        .save(&db)
+        .await
+        .unwrap()
+        .try_into_model()
+        .unwrap();
+
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let services = Services::new(
+            db.clone(),
+            tx.clone(),
+            Arc::new(store),
+            Arc::new(client),
+            test_repo(),
+            ActivityLog::discarding(),
+        );
+
+        // Prime the cache: the first rebuild resolves and remembers 1.0.0.
+        package_update(&services, pkg.clone(), true, BuildTrigger::User)
+            .await
+            .unwrap();
+
+        // Upstream moves, with no version check in between to notice.
+        // That build fails, as the reported scenario's first attempt did: a
+        // still-pending build would be reused as-is instead of re-resolved.
+        for build in builds::Entity::find()
+            .filter(builds::Column::PkgId.eq(pkg.id))
+            .all(&db)
+            .await
+            .unwrap()
+        {
+            let mut active = build.into_active_model();
+            active.status = Set(Some(BuildStates::FAILED_BUILD));
+            active.update(&db).await.unwrap();
+        }
+
+        // Upstream moves, with no version check in between to notice.
+        bump_aur_git_repo(aur_root.path(), "mypkg", "1.0.1", &[]);
+
+        // The rebuild must pick up 1.0.1, not requeue the cached 1.0.0.
+        package_update(&services, pkg.clone(), true, BuildTrigger::User)
+            .await
+            .unwrap();
+
+        let versions: Vec<String> = builds::Entity::find()
+            .filter(builds::Column::PkgId.eq(pkg.id))
+            .filter(builds::Column::Status.eq(Some(BuildStates::ENQUEUED_BUILD)))
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.version)
+            .collect();
+        assert!(
+            versions.iter().any(|v| v == "1.0.1-1"),
+            "a rebuild after an upstream bump should enqueue the new version, got: {versions:?}"
+        );
     }
 
     /// Auto-update rebuilds an unchanged version only for a package that tracks
