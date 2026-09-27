@@ -671,11 +671,13 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                             }
                         }
                     }
-                    if let Some(disk) = disk_usage().as_ref().and_then(disk_usage_summary) {
-                        span {
-                            class: "text-sm opacity-70 whitespace-nowrap",
-                            title: "Disk the build used on its worker, as stored: what it installed into its chroot, its working space (source and packages), its package's source cache, and its kept build tree.",
-                            "Disk: {disk}"
+                    if let Some(usage) = disk_usage().as_ref() {
+                        if let Some(kept) = disk_usage_persistent(usage) {
+                            span {
+                                class: "text-sm opacity-70 whitespace-nowrap",
+                                title: "Disk the build used on its worker, as stored (chroot and working space included): {disk_usage_summary(usage).unwrap_or_default()}",
+                                "Disk: {kept}"
+                            }
                         }
                     }
                     div { class: "flex-1" }
@@ -954,6 +956,21 @@ pub(crate) fn disk_usage_summary(usage: &DiskUsage) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// What the build leaves behind: its source cache, which later builds share,
+/// and its kept build tree. The chroot and the working space are measured too
+/// but do not outlive the build, so they are hover-only. `None` when neither
+/// persistent part was measured.
+pub(crate) fn disk_usage_persistent(usage: &DiskUsage) -> Option<String> {
+    let total: u64 = [usage.sources, usage.build_tree]
+        .into_iter()
+        .filter_map(|bytes| u64::try_from(bytes?).ok())
+        .sum();
+    // A figure for either part means something was measured, which is how
+    // "nothing measured" is told apart from "measured zero".
+    let measured = usage.sources.is_some() || usage.build_tree.is_some();
+    measured.then(|| format_bytes(total))
+}
+
 #[cfg(test)]
 mod disk_usage_tests {
     use super::*;
@@ -971,5 +988,26 @@ mod disk_usage_tests {
             Some("chroot 3.0 GiB · workdir 40 MiB · build tree 0 B")
         );
         assert_eq!(disk_usage_summary(&DiskUsage::default()), None);
+    }
+
+    #[test]
+    fn the_shown_figure_counts_only_what_the_build_leaves_behind() {
+        let usage = DiskUsage {
+            chroot: Some(3 << 30),
+            workdir: Some(40 << 20),
+            sources: Some(100 << 20),
+            build_tree: Some(0),
+        };
+        assert_eq!(disk_usage_persistent(&usage).as_deref(), Some("100 MiB"));
+        // Transient parts alone leave nothing to show, and unmeasured
+        // stays hidden rather than reading as zero.
+        assert_eq!(
+            disk_usage_persistent(&DiskUsage {
+                chroot: Some(3 << 30),
+                ..Default::default()
+            }),
+            None
+        );
+        assert_eq!(disk_usage_persistent(&DiskUsage::default()), None);
     }
 }
