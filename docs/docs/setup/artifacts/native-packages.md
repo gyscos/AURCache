@@ -29,11 +29,12 @@ Two PKGBUILDs rather than one split package: the roles share almost no
 dependencies, and `makepkg` cannot build one half of a split — which the
 container images need, since a worker image has no reason to carry the server.
 
-`makepkg -si` installs the build dependencies itself, with one exception: the
-server's `wasm-bindgen-cli` is an AUR package, so install it with an AUR helper
-first. Its version has to match the `wasm-bindgen` crate in
-`frontend-rs/Cargo.lock` — wasm-bindgen refuses a mismatched pair rather than
-producing a subtly broken bundle. The worker has no such dependency; it does
+`makepkg -si` installs the build dependencies itself. One of them — the
+server's `wasm-bindgen` — has a version coupling to watch: it must match the
+`wasm-bindgen` crate in `frontend-rs/Cargo.lock`, and wasm-bindgen refuses a
+mismatched pair rather than producing a subtly broken bundle. The official
+package tracks the lock today; if extra ever moves ahead of it, the server
+build breaks until they agree again. The worker has no such dependency; it does
 not carry the web UI.
 
 Both PKGBUILDs set `options=(!lto)`. makepkg's LTO adds `-flto=auto` to
