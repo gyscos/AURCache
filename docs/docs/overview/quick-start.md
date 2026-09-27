@@ -96,7 +96,7 @@ services:
     # Pin both the major version and the Debian release. A new major version
     # will not start on the old one's data directory, and a new Debian release
     # changes how text sorts under indexes already built.
-    image: postgres:17-trixie
+    image: postgres:18-trixie
     volumes:
       - ./aurcache/db:/var/lib/postgresql/data
     environment:
@@ -125,7 +125,7 @@ where there is no shared volume — see
 [Build Workers](../workers/split-chroot.md).
 
 Keep the Postgres image pinned as shown rather than `postgres:latest` or even
-`postgres:17`. Those tags move to a newer Debian release from time to time, and
+`postgres:18`. Those tags move to a newer Debian release from time to time, and
 a database whose indexes were sorted by the old C library then needs its
 indexes rebuilt. AURCache checks for that at startup and logs the commands to
 run if it finds one (`REINDEX DATABASE` then `ALTER DATABASE ... REFRESH
