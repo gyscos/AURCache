@@ -15,15 +15,38 @@
 //!    tarballs the AUR packages build from): the reported version is then
 //!    the bare crate release, which is exactly right for a release artifact.
 //!
+//! Git is never let above the source tree to look for a repository. A
+//! tarball unpacked inside another checkout -- `makepkg` extracts into the
+//! AUR clone the PKGBUILD came from -- would otherwise report that clone's
+//! commit as its own.
+//!
 //! Nothing here may fail the build: git missing, failing, or slow is not an
 //! error, it just means there is less to report.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The top of the source tree this crate was built from: the repository
+/// root in the tree's own layout, else the crate's own directory.
+fn source_root() -> Option<PathBuf> {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    let tree = manifest.ancestors().nth(2)?;
+    let root = if tree.join("backend/aurcache-common/build.rs").is_file() {
+        tree
+    } else {
+        &manifest
+    };
+    root.canonicalize().ok()
+}
+
 /// One git probe, never failing the build.
 fn git(args: &[&str]) -> Option<String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    // Nothing above the source tree: a repository found there is someone
+    // else's. Without a root to bound the search, there is no probe at all.
+    let ceiling = source_root()?.parent()?.to_path_buf();
+    command
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
         // Never take the index lock: this is a read-only question asked on
         // every build, including ones running beside an editor or a fetch.
         .env("GIT_OPTIONAL_LOCKS", "0")
