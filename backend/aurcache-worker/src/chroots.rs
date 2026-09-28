@@ -321,14 +321,36 @@ impl Chroots {
                 chroot::BaseLock::Unavailable => {}
             }
         }
-        let root = chroot::ensure_base_chroot(pool.path(), pacman_conf, report_to).await?;
-        if !existed {
-            // `mkarchroot` made the base a subvolume of its own; until it is
-            // counted under the pool's total, the base's size is not.
-            pool.charge_to_total(&root)
-                .await
-                .context("counting the new base chroot against the pool's total")?;
-        }
+        let made = async {
+            let root = chroot::ensure_base_chroot(pool.path(), pacman_conf, report_to).await?;
+            if !existed {
+                // `mkarchroot` made the base a subvolume of its own; until it
+                // is counted under the pool's total, the base's size is not.
+                pool.charge_to_total(&root)
+                    .await
+                    .context("counting the new base chroot against the pool's total")?;
+            }
+            anyhow::Ok(root)
+        };
+        let root = match made.await {
+            Ok(root) => root,
+            Err(e) => {
+                if !existed {
+                    // Never left behind half made or uncounted: the next try
+                    // would take it as a base, refresh it forever and never
+                    // count it -- or, with no `usr` yet, `mkarchroot` would
+                    // refuse the directory and every build would fail.
+                    if let Err(cleanup) = pool.discard_root().await {
+                        tracing::error!(
+                            "could not remove the base chroot a failed creation left \
+                             ({cleanup:#}); remove {} by hand",
+                            pool.root().display()
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
         *last = Some(Instant::now());
         Ok(root)
     }

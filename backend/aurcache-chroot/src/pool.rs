@@ -546,6 +546,26 @@ impl Pool {
         self.assign(QgroupId::subvolume(id), TOTAL).await
     }
 
+    /// Delete the base chroot, whatever state it is in: what a failed
+    /// `mkarchroot` leaves is neither usable nor counted against the total,
+    /// and `mkarchroot` refuses to start over on top of it.
+    pub async fn discard_root(&self) -> Result<()> {
+        let root = self.root();
+        if root.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        let deleted = self
+            .btrfs_paths(&["subvolume", "delete", "--recursive"], &[&root])
+            .await;
+        if deleted.is_err() {
+            // Not a subvolume after all: a plain directory goes as one.
+            privileged(&["rm".as_ref(), "-rf".as_ref(), root.as_os_str()])
+                .await
+                .with_context(|| format!("removing {}", root.display()))?;
+        }
+        Ok(())
+    }
+
     /// Make the subvolumes one build runs in: a snapshot of the base chroot,
     /// and an empty one for its workdir, both in one group limited to `limit`
     /// under the pool's total.
