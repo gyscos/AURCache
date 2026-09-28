@@ -37,3 +37,4 @@ rustc-ice-*.txt
 /.claude
 /.ignore
 /.mcp.json
+/opencode.json
