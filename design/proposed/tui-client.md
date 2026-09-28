@@ -233,7 +233,7 @@ dropping whole leading lines with the shared `append_capped`. The view is a
 `ScrollStrategy::StickToBottom`, which is "Follow": scrolling up stops
 following, `End` resumes it. The cap is a fixed number of bytes rather than a
 browser measurement — a terminal's scrollback cost is the `String`, nothing
-else. `s` saves the full log (not just the window) to
+else. `S` saves the full log (not just the window) to
 `./<pkgbase>-<number>.log`, standing in for the web UI's Download.
 
 **The dashboard graph.** `GraphDataPoint`s as one row of `▁▂▃▄▅▆▇█` per
@@ -259,6 +259,160 @@ configured, a full-screen `TextArea` stands in.
 absolute date reads is the server's default, overridable by a
 `date_format` field in the client config file (the TUI's equivalent of the
 browser-local override).
+
+### Mockups
+
+80×24, the size nothing should need more than. The top line is the
+section bar (the current section drawn reversed), the bottom line the status
+line; `▸` is the cursor, `▏` the text caret.
+
+**Dashboard.** The web page's cards, stacked into two columns. Each row can be
+selected, and `Enter` opens it.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+ Builds 1 284  ✓ 1 201  ✗ 83     7d: 96 (+12%)  avg 4m12s (−8%)  repo 18.3 GiB
+ Packages 212 requested · 341 dependencies
+ Builds/day ▂▃▃▅▂▁▄▆▅▃▂▂▃▇█▅▃▂▃▄▃▂▁▂▃▅▆▄   Failures ▁▁▂▁▁▁▁▃▁▁▁▁▁▁▅▂▁▁▁▁▁▁▁▁▁▁▂▁
+┌ Recent problems ───────────────────────┐┌ Recent builds ─────────────────────┐
+│ ✗ 12m  build failed   python-torch #41 ││ ● active   linux-zen #88     3m    │
+│ ! 2h   worker offline stone-2          ││ ◌ queued   yay #12                 │
+│ ! 5h   publish slow   chromium #7      ││ ✓ ok       paru #31      2m14s 1h  │
+└────────────────────────────────────────┘│ ✗ failed   python-torch #41 9m 12m │
+┌ Failed ────────────────────────────────┐│ ✓ ok       neovim-git #203   48s 2h│
+│ python-torch      2.8.0-1    x86_64    │└────────────────────────────────────┘
+│ nvidia-open-beta  580.1-2    aarch64   │┌ Out of date · 3 more handled ──────┐
+└────────────────────────────────────────┘│ zoom       6.4.1 → 6.5.0           │
+┌ Stuck queue · 2 ───────────────────────┐│ obsidian   1.9.4 → 1.9.10          │
+│ ⧗ qt6-webengine #3  waiting for deps   │└────────────────────────────────────┘
+│ ◌ blender-git #58   no armv7h worker   │┌ Longest builds ────────────────────┐
+└────────────────────────────────────────┘│ chromium     3h02m  (was 2h55m)    │
+                                          └────────────────────────────────────┘
+ ● refreshed 3s ago · 1 active                            Enter open  ? help
+```
+
+**Builds, filtered.** The filter line takes the web search box's grammar; the
+status line counts what it hides.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+ / status:failed arch:x86_64 python▏
+   STATE     PACKAGE              #   VERSION       ARCH     WORKER   TOOK  WHEN
+ ▸ ✗ failed  python-torch        41   2.8.0-1       x86_64   stone-1  9m04  12m
+   ✗ failed  python-torch        40   2.8.0-1       x86_64   stone-1  8m51  1d
+   ✗ failed  python-onnxruntime  17   1.22.1-1      x86_64   stone-2  22m   3d
+   ✗ failed  python-jaxlib        5   0.7.0-1       x86_64   stone-1  1h04  9d
+   ✗ failed  python-pyqt6-3d      2   6.9.0-1       x86_64   stone-2  3m12  26d
+
+
+
+
+
+ ● refreshed 3s ago · 5 of 1 284       T retry  Enter log  Esc clear filter  ?
+```
+
+**One package.** The header answers "is it healthy, and if not what do I do";
+the rest is reference, one `Tab` away.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+ python-torch  ✗ failing on x86_64                AUR · requested · 2 dependents
+ upstream 2.8.0-1 · last checked 20m ago
+
+   ARCH      LATEST BUILD              IN THE REPOSITORY
+   x86_64    ✗ #41  2.8.0-1   12m ago  ✓ #38  2.7.1-3   (serving the older one)
+   aarch64   ✓ #39  2.8.0-1   2h ago   ✓ #39  2.8.0-1
+
+ [Overview]  Dependencies  Dependents  Builds  Source  Settings
+ ──────────────────────────────────────────────────────────────────────────────
+ Platforms    x86_64, aarch64
+ Build flags  -Cs --noconfirm --skippgpcheck
+ Size         1.4 GiB (x86_64) · 1.3 GiB (aarch64)
+ Source       https://aur.archlinux.org/python-torch.git @ 4f2c1e9
+ Patches      PKGBUILD (edited 3d ago)
+
+
+ ● refreshed 3s ago       R rebuild  U update  E edit  X remove  Enter #41  ?
+```
+
+**A build's log, following.** Scrolling up stops following; `End` resumes.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+ linux-zen #88  ● active  x86_64 on stone-1 · started 3m12s ago · 6.16.8.zen1-1
+ ──────────────────────────────────────────────────────────────────────────────
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_vm.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.o
+   CC      fs/btrfs/extent-tree.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.o
+   CC      net/ipv4/tcp_output.o
+   AR      fs/btrfs/built-in.a
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_ib.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_pll.o
+   CC      net/ipv4/tcp_timer.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.o
+   CC      kernel/sched/fair.o
+   CC      drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.o
+   CC      net/ipv4/tcp_ipv4.o▏
+
+ ● following · 14.2 MiB, last 16 MiB kept      C cancel  S save  / search  ?
+```
+
+**Workers, with one waiting for approval and a revoke being confirmed.** The
+machine at the gate is pinned above the fleet, as on the web.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+ ! Waiting for approval
+   rpi5-garage   aarch64            7f:3a:…:c2   enrolled 4m ago   A approve
+
+   WORKER      STATUS    ARCHES                 NOW               SEEN  VERSION
+   stone-1     ● online  x86_64 (+i686)         linux-zen #88     2s    0.6.1
+   stone-2     ● online  x86_64                 idle              4s    0.6.1
+ ▸ old-laptop  ○ offline x86_64    ┌──────────────────────────────┐   0.5.3
+                                   │ Revoke old-laptop?           │
+                                   │                              │
+                                   │ Its certificate stops        │
+                                   │ working and its queued and   │
+                                   │ running builds go back to    │
+                                   │ the queue. The row stays.    │
+                                   │                              │
+                                   │           <Cancel> <Revoke>  │
+                                   └──────────────────────────────┘
+
+
+ ● refreshed 3s ago   A approve  P pause  V revoke  Enter details  h retired ?
+```
+
+**Adding packages.** One dialog over the package list; after submitting, the
+dialog closes and the progress moves to the status line.
+
+```
+ aur.example.com      [d]ash  [b]uilds  [p]ackages  [l]og  [w]orkers  [s]ettings
+────────────────────────────────────────────────────────────────────────────────
+   STATE ┌ Add packages ────────────────────────────────────────────┐   UPSTREAM
+   ✓ ok  │ Source  hyprl▏                                           │
+   ✓ ok  │                                                          │
+   ✗ fail│ ▸ hyprland-git      0.51.0.r12-1   ★ 412                 │
+   ✓ ok  │   hyprlock          0.9.1-1        ★ 88                  │
+   ✓ ok  │   hyprland-qtutils  0.1.5-1        ★ 40                  │
+   ✓ ok  │                                                          │
+   ✓ ok  │ Queued  waybar-git, swaync                               │
+   ✓ ok  │                                                          │
+   ✓ ok  │ Platforms  [x] x86_64  [x] aarch64  [ ] armv7h           │
+   ✓ ok  │                                                          │
+   ✓ ok  │                        <Cancel>  <Queue ⏎>  <Add 3 ^S>   │
+         └──────────────────────────────────────────────────────────┘
+
+
+ ● refreshed 3s ago · adding 2: resolving swaync deps (4/9)       Enter open ?
+```
 
 ---
 
