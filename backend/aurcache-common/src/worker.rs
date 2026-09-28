@@ -296,6 +296,12 @@ pub struct CompleteReport {
     /// rebuild rather than a missed one.
     #[serde(default)]
     pub vcs_commits: BTreeMap<String, String>,
+    /// The failed chroot the worker kept for inspection, when it kept one;
+    /// see [`crate::api::builds::KeptBuild`]. `None` from a worker that
+    /// predates this, one with keeping off, and for every build that did not
+    /// fail in a keepable way.
+    #[serde(default)]
+    pub kept: Option<crate::api::builds::KeptBuild>,
 }
 
 /// Worker's poll response for cancel on a specific job.
@@ -488,6 +494,10 @@ mod tests {
         assert!(!parsed.success);
         assert_eq!(parsed.exit_code, Some(137));
         assert!(!parsed.canceled);
+        assert_eq!(
+            parsed.kept, None,
+            "a report from an older worker keeps nothing"
+        );
     }
 
     #[test]

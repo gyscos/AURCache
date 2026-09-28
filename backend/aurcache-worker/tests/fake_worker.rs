@@ -395,6 +395,7 @@ async fn fake_worker_protocol_roundtrip() {
                 peak_memory_bytes: Some(512 * 1024 * 1024),
                 disk_usage: None,
                 vcs_commits: Default::default(),
+                kept: None,
             },
         )
         .await
@@ -428,6 +429,7 @@ async fn fake_worker_protocol_roundtrip() {
                 peak_memory_bytes: None,
                 disk_usage: None,
                 vcs_commits: Default::default(),
+                kept: None,
             },
         )
         .await
@@ -458,6 +460,7 @@ async fn fake_worker_protocol_roundtrip() {
                 peak_memory_bytes: Some(512 * 1024 * 1024),
                 disk_usage: None,
                 vcs_commits: Default::default(),
+                kept: None,
             },
         )
         .await

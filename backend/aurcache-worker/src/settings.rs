@@ -33,6 +33,7 @@ pub mod keys {
     pub const TOTAL_BUILD_CPUS: &str = "total_build_cpus";
     pub const BUILD_DISK_MAX: &str = "build_disk_max";
     pub const DISK_MAX: &str = "disk_max";
+    pub const KEEP_FAILED: &str = "keep_failed";
 }
 
 /// Re-exported from the shared executor settings: the legacy container
@@ -217,6 +218,18 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             category: "Disk",
             applies: Applies::Immediately,
             default: Builtin::Size(DEFAULT_DISK_MAX),
+        },
+        SettingSpec {
+            key: keys::KEEP_FAILED,
+            env_var: "WORKER_KEEP_FAILED",
+            kind: ValueKind::Duration,
+            description: "How long a failed build's chroot is kept for inspection (`systemd-nspawn \
+                          -D <pool>/kept-<id>`). Unset keeps nothing. Canceled, timed-out and \
+                          out-of-disk builds are never kept; a kept build counts against the \
+                          pool's total and goes sooner if the pool needs the room.",
+            category: "Chroots",
+            applies: Applies::NextLoop,
+            default: Builtin::Unset,
         },
     ]
 }

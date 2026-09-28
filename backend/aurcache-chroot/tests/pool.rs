@@ -5,10 +5,11 @@
 //! images go under Cargo's target directory rather than `/tmp`, which is often
 //! a size-limited tmpfs.
 
-use aurcache_chroot::{Backing, Owner, Pool, PoolConfig, Resize};
+use aurcache_chroot::{Backing, Owner, Pool, PoolConfig, QgroupId, Resize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 const MIB: u64 = 1 << 20;
 
@@ -124,6 +125,41 @@ fn sync(pool: &Pool) {
     sudo_ok(&["btrfs", "filesystem", "sync", pool.path().to_str().unwrap()]);
 }
 
+/// Marker files in a chroot, all holding `generation`: a snapshot that mixes
+/// generations was torn by a swap mid-read. As root: the base is root-owned.
+fn write_gen(root: &Path, generation: u64) {
+    let script = (0..8)
+        .map(|i| format!("echo {generation} > '{}'/gen-{i}", root.display()))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    sudo_ok(&["sh", "-c", &script]);
+}
+
+/// Every marker in a chroot, as the build would read them.
+fn read_gen(chroot: &Path) -> Vec<String> {
+    (0..8)
+        .map(|i| {
+            std::fs::read_to_string(chroot.join(format!("gen-{i}")))
+                .unwrap()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Write `bytes` of incompressible data as root; the base and its candidates
+/// are root-owned, so the worker cannot write them itself.
+fn write_root(path: &Path, bytes: u64) {
+    sudo_ok(&[
+        "sh",
+        "-c",
+        &format!(
+            "head -c {bytes} /dev/urandom > '{}' && sync -f '{0}'",
+            path.display()
+        ),
+    ]);
+}
+
 #[tokio::test]
 async fn a_build_is_held_to_its_limit_and_the_pool_to_its_total() {
     if !enabled() {
@@ -206,7 +242,7 @@ async fn a_sweep_clears_what_a_killed_worker_left() {
     // A worker killed mid-build: the volumes are never released.
     std::mem::forget(crashed);
 
-    let cleared = pool.sweep(&HashSet::from([7])).await;
+    let cleared = pool.sweep(&HashSet::from([7]), None).await;
     assert_eq!(cleared, 1);
     assert!(
         pool.path().join("job-7").exists(),
@@ -571,5 +607,346 @@ async fn a_builds_usage_is_measured_part_by_part() {
     );
     assert!((15 * MIB..20 * MIB).contains(&data), "{data}");
     pool.release(build).await;
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_exchange_swaps_the_base_atomically() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("exchange");
+    let pool = Pool::open(config(&scratch, 2048 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+    write_gen(&pool.root(), 0);
+
+    // Sequential rounds: each lease sees exactly the generation swapped in.
+    // A fresh id per round, as served builds have: a released id's group
+    // lingers until the cleaner frees it, and is not leased again meanwhile.
+    for generation in 1..=5u64 {
+        pool.snapshot_next().await.unwrap();
+        write_gen(&pool.next_root(), generation);
+        pool.exchange_root().unwrap();
+        pool.retire_prev().await.unwrap();
+        let build = pool.lease(50 + generation as i32, None).await.unwrap();
+        let seen = read_gen(build.chroot());
+        assert!(
+            seen.iter().all(|g| g == &generation.to_string()),
+            "torn snapshot: {seen:?}"
+        );
+        pool.release(build).await;
+    }
+
+    // Concurrent: leases in a loop while exchanges land. Every snapshot is
+    // all one generation -- never a mix -- and no lease fails on the swap.
+    let pool = std::sync::Arc::new(pool);
+    let leasers: Vec<_> = (0..4)
+        .map(|t| {
+            let pool = std::sync::Arc::clone(&pool);
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for i in 0..10 {
+                    let build = pool.lease(100 + t * 10 + i, None).await.unwrap();
+                    seen.push(read_gen(build.chroot()));
+                    pool.release(build).await;
+                }
+                seen
+            })
+        })
+        .collect();
+    for generation in 6..=15u64 {
+        pool.snapshot_next().await.unwrap();
+        write_gen(&pool.next_root(), generation);
+        pool.exchange_root().unwrap();
+        pool.retire_prev().await.unwrap();
+    }
+    for leaser in leasers {
+        for seen in leaser.await.unwrap() {
+            assert!(
+                seen.iter().all(|g| g == &seen[0]),
+                "torn snapshot: {seen:?}"
+            );
+            let generation: u64 = seen[0].parse().unwrap();
+            assert!(
+                generation <= 15,
+                "a generation from the future: {generation}"
+            );
+        }
+    }
+    let pool = std::sync::Arc::try_unwrap(pool).unwrap();
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_discarded_candidate_leaves_the_base_untouched() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("discard-next");
+    let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+    write_gen(&pool.root(), 0);
+    let blob = pool.root().join("usr/blob");
+    let before = std::fs::read(&blob).unwrap();
+
+    // A failed upgrade, every way one can fail: deleted, rewritten, added.
+    pool.snapshot_next().await.unwrap();
+    let next = pool.next_root();
+    sudo_ok(&["rm", next.join("usr/blob").to_str().unwrap()]);
+    write_gen(&next, 999);
+    sudo_ok(&["touch", next.join("garbage").to_str().unwrap()]);
+    pool.discard_next().await;
+
+    assert!(!pool.next_root().exists(), "the candidate goes");
+    assert_eq!(std::fs::read(&blob).unwrap(), before, "byte-for-byte");
+    assert!(
+        read_gen(&pool.root()).iter().all(|g| g == "0"),
+        "no marker moved"
+    );
+    assert!(!pool.root().join("garbage").exists());
+
+    // And a refused exchange is nothing at all: no candidate, no change.
+    let refused = pool.exchange_root().unwrap_err();
+    assert!(format!("{refused:#}").contains("exchanging"), "{refused:#}");
+    assert_eq!(std::fs::read(&blob).unwrap(), before);
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn refresh_recovery_finishes_both_crash_states() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("recover");
+    let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+    write_gen(&pool.root(), 0);
+
+    // Died before the exchange: an unfinished candidate goes, the base stays.
+    pool.snapshot_next().await.unwrap();
+    write_gen(&pool.next_root(), 1);
+    pool.recover_refresh().await.unwrap();
+    assert!(!pool.next_root().exists());
+    assert!(read_gen(&pool.root()).iter().all(|g| g == "0"));
+
+    // Died between the exchange and the retire: `root.next` is the previous
+    // base, and becomes `root.prev`.
+    pool.snapshot_next().await.unwrap();
+    write_gen(&pool.next_root(), 2);
+    pool.exchange_root().unwrap();
+    pool.recover_refresh().await.unwrap();
+    assert!(!pool.next_root().exists());
+    assert!(
+        read_gen(&pool.root()).iter().all(|g| g == "2"),
+        "root is the new base"
+    );
+    assert!(
+        read_gen(&pool.prev_root()).iter().all(|g| g == "0"),
+        "prev is the old one"
+    );
+
+    // No base at all: a stray candidate goes, and the caller remakes the base
+    // from nothing.
+    pool.discard_root().await.unwrap();
+    sudo_ok(&[
+        "btrfs",
+        "subvolume",
+        "create",
+        pool.next_root().to_str().unwrap(),
+    ]);
+    pool.recover_refresh().await.unwrap();
+    assert!(!pool.next_root().exists());
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_total_survives_a_swap_and_clear_stale_keeps_its_holders() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("swap-total");
+    let pool = Pool::open(config(&scratch, 2048 * MIB)).await.unwrap();
+    make_base(&pool, 50).await;
+    sync(&pool);
+    let before = pool.total_usage().unwrap().used;
+
+    pool.snapshot_next().await.unwrap();
+    write_root(&pool.next_root().join("added"), 10 * MIB);
+    pool.exchange_root().unwrap();
+    pool.retire_prev().await.unwrap();
+    sync(&pool);
+    let after = pool.total_usage().unwrap().used;
+    assert!(
+        (before + 8 * MIB..before + 15 * MIB).contains(&after),
+        "the total counts the refresh's writes once: {before} -> {after}"
+    );
+
+    // A second cycle deletes the first retired base while the live bases
+    // still share its extents: its group stays as a charged space holder, and
+    // `clear-stale` leaves it -- only empty groups go.
+    pool.snapshot_next().await.unwrap();
+    pool.exchange_root().unwrap();
+    pool.retire_prev().await.unwrap();
+    sudo_ok(&[
+        "btrfs",
+        "qgroup",
+        "clear-stale",
+        pool.path().to_str().unwrap(),
+    ]);
+    sync(&pool);
+    let cleared = pool.total_usage().unwrap().used;
+    assert!(
+        cleared.abs_diff(after) < 5 * MIB,
+        "clearing stale groups keeps charged holders: {after} -> {cleared}"
+    );
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kept_build_keeps_its_group_limit_and_locks_down() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("keep");
+    let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+
+    let build = pool.lease(7, Some(64 * MIB)).await.unwrap();
+    assert!(write(&build.data().join("output"), 5 * MIB).is_none());
+    let group = build.group();
+    let kept = pool
+        .keep_build(build, Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    // As root: the keep locked the tops down to the worker, and this test
+    // is not it.
+    sudo_ok(&["test", "-e", kept.path.join("usr/blob").to_str().unwrap()]);
+    sudo_ok(&[
+        "test",
+        "-e",
+        pool.path().join("kept-7.data/output").to_str().unwrap(),
+    ]);
+    assert!(!pool.path().join("job-7").exists());
+    assert!(!pool.path().join("job-7.data").exists());
+    let usage = pool.usage(group).unwrap();
+    assert_eq!(usage.limit, Some(64 * MIB), "a kept build can never grow");
+    assert!(usage.used >= 5 * MIB, "and it still counts: {usage:?}");
+    let until = kept.until.duration_since(SystemTime::now()).unwrap();
+    assert!(
+        until > Duration::from_secs(3500) && until <= Duration::from_secs(3600),
+        "the keep runs about an hour: {until:?}"
+    );
+
+    // Locked down: readable only by the worker, and no sockets left behind
+    // by the agent bind.
+    use std::os::unix::fs::PermissionsExt;
+    for name in ["kept-7", "kept-7.data"] {
+        let mode = std::fs::metadata(pool.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{name}");
+    }
+    // As root, for the same reason: a directory this test cannot enter
+    // would read as socket-free either way.
+    let found = sudo(&[
+        "find",
+        pool.path().join("kept-7").to_str().unwrap(),
+        pool.path().join("kept-7.data").to_str().unwrap(),
+        "-type",
+        "s",
+    ]);
+    assert!(
+        found.stdout.is_empty(),
+        "sockets under a kept build: {}",
+        String::from_utf8_lossy(&found.stdout)
+    );
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_a_fresh_failure_and_deletes_an_expired_one() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("expire");
+    let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+
+    let fresh = pool.lease(7, None).await.unwrap();
+    pool.keep_build(fresh, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let stale = pool.lease(8, None).await.unwrap();
+    pool.keep_build(stale, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    // Expired an hour ago: the keep runs from the chroot's mtime.
+    sudo_ok(&[
+        "touch",
+        "-d",
+        "2 hours ago",
+        pool.path().join("kept-8").to_str().unwrap(),
+    ]);
+
+    let cleared = pool
+        .sweep(&HashSet::new(), Some(Duration::from_secs(3600)))
+        .await;
+    assert_eq!(cleared, 1);
+    assert!(pool.path().join("kept-7").exists(), "a fresh keep stays");
+    assert!(!pool.path().join("kept-8").exists());
+    assert!(!pool.path().join("kept-8.data").exists());
+    // The sweep ran the group tidy, which leaves a kept failure's group
+    // alone: destroying it would be refused at every lease, forever.
+    assert!(pool.usage(QgroupId::build(7)).is_some());
+
+    // Keeping off deletes every kept failure. At least one: the sweep also
+    // counts the lingering group of the keep it just removed, when the
+    // cleaner has not freed it yet.
+    assert!(pool.sweep(&HashSet::new(), None).await >= 1);
+    assert!(!pool.path().join("kept-7").exists());
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
+async fn room_making_takes_kept_failures_before_the_previous_base() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("reclaim");
+    let pool = Pool::open(config(&scratch, 400 * MIB)).await.unwrap();
+    make_base(&pool, 50).await;
+
+    // A kept failure holding ~100M, and a retired base.
+    let build = pool.lease(7, None).await.unwrap();
+    assert!(write(&build.data().join("output"), 100 * MIB).is_none());
+    pool.keep_build(build, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    pool.snapshot_next().await.unwrap();
+    pool.exchange_root().unwrap();
+    pool.retire_prev().await.unwrap();
+    sync(&pool);
+    let used = pool.total_usage().unwrap().used;
+
+    // Room for this fits once the kept failure goes, with the retired base to
+    // spare: the figures have tens of megabytes of slack either way.
+    let need = (400 * MIB).saturating_sub(used).saturating_add(90 * MIB);
+    pool.reclaim_room(need).await;
+    assert!(
+        !pool.path().join("kept-7").exists(),
+        "the kept failure goes first"
+    );
+    assert!(
+        pool.prev_root().exists(),
+        "but nothing is taken past what fits"
+    );
+
+    // Room for the whole total fits never: the retired base goes too, and
+    // then there is nothing left to take.
+    pool.reclaim_room(400 * MIB).await;
+    assert!(!pool.prev_root().exists());
     pool.unmount().await.unwrap();
 }

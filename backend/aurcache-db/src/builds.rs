@@ -66,6 +66,13 @@ pub struct Model {
     /// *saw*. `None` is unknown -- a build that predates this, or one whose
     /// sources could not be resolved -- and never means "nothing changed".
     pub vcs_sources: Option<String>,
+    /// A failed build's chroot, kept on its worker for inspection: where
+    /// (`<pool>/kept-<id>`) and until when (epoch seconds). `None` for every
+    /// build that did not fail in a keepable way, and on a worker with
+    /// keeping off -- which is not the same as "already removed", since the
+    /// worker takes a kept chroot early when the pool needs the room.
+    pub kept_path: Option<String>,
+    pub kept_until: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

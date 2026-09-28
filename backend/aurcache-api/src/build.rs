@@ -9,7 +9,7 @@ use crate::utils::error::{ApiError, err};
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
-use aurcache_common::api::builds::DiskUsage;
+use aurcache_common::api::builds::{DiskUsage, KeptBuild};
 use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
 use aurcache_common::build_state::{BuildState, BuildStates, BuildTrigger};
@@ -304,6 +304,8 @@ pub(crate) fn build_row_select() -> Select<Builds> {
         .column(builds::Column::DiskWorkdir)
         .column(builds::Column::DiskSources)
         .column(builds::Column::DiskBuildTree)
+        .column(builds::Column::KeptPath)
+        .column(builds::Column::KeptUntil)
         // Left, so a queued build -- which has no worker yet -- still lists.
         .join(JoinType::LeftJoin, builds::Relation::Workers.def())
         .column_as(workers::Column::Name, "worker_name")
@@ -329,6 +331,8 @@ pub(crate) struct BuildRow {
     disk_workdir: Option<i64>,
     disk_sources: Option<i64>,
     disk_build_tree: Option<i64>,
+    kept_path: Option<String>,
+    kept_until: Option<i64>,
     worker_name: Option<String>,
 }
 
@@ -351,6 +355,10 @@ impl BuildRow {
                 build_tree: self.disk_build_tree,
             })
             .filter(|usage| !usage.is_empty()),
+            kept: self
+                .kept_path
+                .zip(self.kept_until)
+                .map(|(path, until)| KeptBuild { path, until }),
             worker_name: self.worker_name,
             // Filled only by the detail route, which knows it is rendering one
             // build; the lists would pay a stat per row for fields they do not

@@ -312,51 +312,91 @@ async fn run_job_inner(
         binds.push((dir.to_path_buf(), dir.to_path_buf()));
     }
 
-    // The lease is given back on the error path too, which is the half a
-    // caller forgets -- and it is given back *after* the build's child has been
-    // waited on, which a `Drop` could not promise.
+    // The lease is settled on every path -- kept for inspection on a
+    // keepable failure, deleted everywhere else -- and *after* the build's
+    // child has been waited on, which a `Drop` could not promise.
     //
     // Everything that touches the build's source and packages happens inside
     // it: they live in the lease's own subvolume, counted against the build's
     // disk quota, and are deleted with it.
-    let report = shared
+    let lease = shared
         .chroots
-        .with_lease(build_id, Some(cfg.build_disk_max), async |lease| {
-            log(client, build_id, "[worker] downloading source\n").await;
-            let source = client
-                .source(build_id)
-                .await
-                .context("downloading source")?;
-            let pkgdir =
-                artifacts::extract_source(&source, &lease.srcdir()).context("extracting source")?;
-
-            // The archive unpacks owned by this worker's user, with the modes
-            // baked into it (0644/0755); the build then runs as a *different*
-            // user (`build_user`). makepkg rewrites the PKGBUILD in place for
-            // VCS packages (`pkgver()` at build time), and its `update_pkgver`
-            // prints a warning and proceeds with the stale version whenever the
-            // file is not writable — the `ttf-google-fonts-git` symptom of a
-            // pkgver that never advances. The docker builder needs the same and
-            // solves it with `chmod -R a+w .`.
-            make_source_writable(&pkgdir)
-                .await
-                .context("making source writable")?;
-
-            let ctx = WorkerContext {
-                cfg,
-                cgroups,
-                dropin: &dropin,
-                lease,
-                chroots: &shared.chroots,
-            };
-            let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
-            // Before the lease goes, and the packages with it.
-            if report.success {
-                upload_artifacts(client, build_id, &pkgdir).await?;
-            }
-            Ok(report)
-        })
+        .acquire(build_id, Some(cfg.build_disk_max))
         .await?;
+    let outcome: Result<CompleteReport> = async {
+        log(client, build_id, "[worker] downloading source\n").await;
+        let source = client
+            .source(build_id)
+            .await
+            .context("downloading source")?;
+        let pkgdir =
+            artifacts::extract_source(&source, &lease.srcdir()).context("extracting source")?;
+
+        // The archive unpacks owned by this worker's user, with the modes
+        // baked into it (0644/0755); the build then runs as a *different*
+        // user (`build_user`). makepkg rewrites the PKGBUILD in place for
+        // VCS packages (`pkgver()` at build time), and its `update_pkgver`
+        // prints a warning and proceeds with the stale version whenever the
+        // file is not writable — the `ttf-google-fonts-git` symptom of a
+        // pkgver that never advances. The docker builder needs the same and
+        // solves it with `chmod -R a+w .`.
+        make_source_writable(&pkgdir)
+            .await
+            .context("making source writable")?;
+
+        let ctx = WorkerContext {
+            cfg,
+            cgroups,
+            dropin: &dropin,
+            lease: &lease,
+            chroots: &shared.chroots,
+        };
+        let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
+        // Before the lease goes, and the packages with it.
+        if report.success {
+            upload_artifacts(client, build_id, &pkgdir).await?;
+        }
+        Ok(report)
+    }
+    .await;
+    let mut report = match outcome {
+        Ok(report) => report,
+        Err(e) => {
+            shared.chroots.release(lease).await;
+            return Err(e);
+        }
+    };
+    // A failed build's chroot is kept for inspection when keeping is on and
+    // the failure is keepable. The keep consumes the lease; anything else
+    // releases it.
+    let keep_for = cfg.keep_failed.map(Duration::from_secs);
+    let keepable = match keep_for {
+        Some(_) => {
+            should_keep(build_id, &report) && shared.chroots.disk_reason(&lease).await.is_none()
+        }
+        None => false,
+    };
+    if keepable && let Some(keep_for) = keep_for {
+        if let Some(kept) = shared.chroots.keep(lease, keep_for).await {
+            report.kept = Some(aurcache_common::api::builds::KeptBuild {
+                path: kept.path.display().to_string(),
+                until: kept
+                    .until
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+                    .unwrap_or(0),
+            });
+            log(
+                client,
+                build_id,
+                &format!("[worker] failed chroot kept at {}\n", kept.path.display()),
+            )
+            .await;
+        }
+        // Otherwise the keep failed and the volumes were deleted instead.
+    } else {
+        shared.chroots.release(lease).await;
+    }
 
     // 5. Fold this job's downloads into the shared cache, then bound it. Only
     //    after `makechrootpkg` has exited: promoting mid-build would move
@@ -450,19 +490,8 @@ const LOG_LINE_CAP_BYTES: usize = 1024 * 1024;
 /// Batches flush on size or age, whichever comes first, and always on EOF — so
 /// the last lines of a failed build, which are the ones that explain it, are
 /// never left in the buffer.
-///
-/// While forwarding, listens for the one failure a worker can *do* something
-/// about: makepkg dying in `extract_git`'s `git fetch` because a persistent
-/// tree's checkout refs an object the (fresh) `SRCDEST` mirror no longer
-/// holds. git's own messages are the signal — locale-stable where makepkg's
-/// would not be — and the flag set here lets the job wipe that checkout, since
-/// nothing else will. See `design/implemented/persistent-build-directory.md`.
-async fn pump_output<R>(
-    reader: R,
-    client: Arc<WorkerClient>,
-    build_id: i32,
-    stale_git_checkout: &AtomicBool,
-) where
+async fn pump_output<R>(reader: R, client: Arc<WorkerClient>, build_id: i32)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -486,12 +515,6 @@ async fn pump_output<R>(
             Ok(0) => break,
             Ok(_) => {
                 let text = String::from_utf8_lossy(&line);
-                if !stale_git_checkout.load(Ordering::Relaxed)
-                    && (text.contains("did not send all necessary objects")
-                        || text.contains("bad object "))
-                {
-                    stale_git_checkout.store(true, Ordering::Relaxed);
-                }
                 batch.push_str(&text);
                 if batch.len() >= LOG_BATCH_BYTES || last_flush.elapsed() >= LOG_BATCH_INTERVAL {
                     log(&client, build_id, &batch).await;
@@ -678,13 +701,6 @@ async fn run_build(
     let started = std::time::Instant::now();
     // Forward both streams to the build log. Held so they can be awaited after
     // the child exits, which is what guarantees the final lines are sent.
-    // A persistent tree's checkout can outlive its mirror and ref an object
-    // the fresh one no longer holds; the pumps watch for git reporting exactly
-    // that, so a failed build can clear the checkout instead of retrying into
-    // the same wall. Watched from both streams, so it does not matter which
-    // one git writes its error to. The stores happen before `drain` finishes,
-    // so the `SeqCst` load after it sees them.
-    let stale_git_checkout = Arc::new(AtomicBool::new(false));
     let pumps = [
         child.stdout.take().map(Either::Out),
         child.stderr.take().map(Either::Err),
@@ -693,11 +709,10 @@ async fn run_build(
     .flatten()
     .map(|stream| {
         let client = Arc::clone(client);
-        let stale_git_checkout = Arc::clone(&stale_git_checkout);
         tokio::spawn(async move {
             match stream {
-                Either::Out(r) => pump_output(r, client, build_id, &stale_git_checkout).await,
-                Either::Err(r) => pump_output(r, client, build_id, &stale_git_checkout).await,
+                Either::Out(r) => pump_output(r, client, build_id).await,
+                Either::Err(r) => pump_output(r, client, build_id).await,
             }
         })
     })
@@ -791,16 +806,16 @@ async fn run_build(
         drain.await;
     }
 
-    // Attached after the fact rather than threaded through every constructor:
-    // how much a build used is orthogonal to why it ended, and a timeout or a
-    // cancellation is exactly when the number is most worth having.
-    let peak_memory_bytes = build_cgroup
-        .as_ref()
-        .and_then(crate::cgroup::BuildCgroup::peak_bytes);
+    let mut report = if timed_out {
+        report::timeout_failure(started.elapsed().as_secs())
+    } else {
+        report::classify_exit(status, canceled)
+    };
     // Measure the tree now rather than during the next reclaim: the cost rides
     // on a build that already took minutes, instead of walking every candidate
-    // on every future build.
-    if job.persistent_builddir {
+    // on every future build. Only for a success: a failure's tree is discarded
+    // below, and measuring it first would walk a tree about to go.
+    if job.persistent_builddir && report.success {
         let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
         let _ = join_cache_task(
             tokio::task::spawn_blocking(move || cache.record_builddir_size(&arch, &pkgbase)),
@@ -809,12 +824,12 @@ async fn run_build(
         .await;
     }
 
-    let mut report = if timed_out {
-        report::timeout_failure(started.elapsed().as_secs())
-    } else {
-        report::classify_exit(status, canceled)
-    };
-    report.peak_memory_bytes = peak_memory_bytes;
+    // Attached after the fact rather than threaded through every constructor:
+    // how much a build used is orthogonal to why it ended, and a timeout or a
+    // cancellation is exactly when the number is most worth having.
+    report.peak_memory_bytes = build_cgroup
+        .as_ref()
+        .and_then(crate::cgroup::BuildCgroup::peak_bytes);
     report.disk_usage = disk_usage(ctx, cache, job).await;
     // What the build was actually made from, while the job still holds its
     // SRCDEST guard and no sibling can have fetched into the mirror. Only for a
@@ -867,37 +882,28 @@ async fn run_build(
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
         report.reason = Some(reason);
     }
-    // Self-heal the failure a persistent build tree is prone to: makepkg's
-    // `git fetch` can die in a checkout whose refs point at objects the
-    // (fresh) `SRCDEST` mirror no longer holds — upstream force-pushed the
-    // branch away — and retrying alone fails identically, because nothing
-    // clears the checkout. Only this worker can. Wipe just the borrowed
-    // checkouts, never the tree around them: a checkout is a local clone of
-    // the mirror and costs seconds to make again, while the compiled output
-    // beside it is the hours the tree exists to save. The next retry then
-    // re-clones from the mirror, which the download phase has already
-    // refreshed. See `design/implemented/persistent-build-directory.md`.
-    if !report.success
-        && !canceled
-        && !timed_out
-        && job.persistent_builddir
-        && stale_git_checkout.load(Ordering::SeqCst)
-    {
-        let (cache, pkgbase) = (cache.clone(), job.pkgbase.clone());
-        let wiped = join_cache_task(
-            tokio::task::spawn_blocking(move || cache.wipe_borrowed_checkouts(&pkgbase)),
-            "stale-checkout wipe",
+    // Discard the kept tree on every unsuccessful build: one that died
+    // partway is half-updated, which makepkg treats as resumable next time,
+    // and it can fail every retry identically -- a stale checkout, or an
+    // output a killed compiler left truncated but newer than its inputs,
+    // which make and ninja then treat as built. Failure, cancel, timeout,
+    // out-of-memory and out-of-disk all go through a kill or a half-finished
+    // step, so every one of them can leave the tree in either state. The next
+    // build starts cold, which is always safe. See
+    // `design/implemented/btrfs-snapshots.md`.
+    if !report.success && job.persistent_builddir {
+        let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
+        let discarded = join_cache_task(
+            tokio::task::spawn_blocking(move || cache.discard_builddir(&arch, &pkgbase)),
+            "builddir discard",
         )
         .await
         .unwrap_or_default();
-        if wiped > 0 {
+        if discarded {
             log(
                 client,
                 build_id,
-                &format!(
-                    "[worker] wiped {wiped} stale git checkout(s) from the build tree; \
-                     the next retry re-clones them from the source cache\n"
-                ),
+                "[worker] discarded the build tree; the next retry starts cold\n",
             )
             .await;
         }
@@ -942,6 +948,25 @@ async fn disk_usage(
         build_tree: bytes(cached.build_tree),
     };
     (!usage.is_empty()).then_some(usage)
+}
+
+/// Whether a finished build's chroot is worth keeping for inspection: a real
+/// failure, not a success, a cancel, a timeout, or the fixed one-shot id
+/// (whose next run would collide with the kept name).
+///
+/// Out-of-disk builds are excluded by the caller, which still holds the lease
+/// to ask: their chroot is the largest and says the least, since the cause is
+/// already known. Out-of-memory failures are kept: small on disk, and the
+/// state they died in is the interesting part.
+fn should_keep(build_id: i32, report: &CompleteReport) -> bool {
+    // Exit 124 is the worker's own timeout convention (`timeout_failure`, and
+    // `classify_exit`'s mapping of a bare 124): a build that genuinely exited
+    // 124 reads as timed out everywhere already.
+    const TIMEOUT_EXIT: i32 = 124;
+    !report.success
+        && !report.canceled
+        && report.exit_code != Some(TIMEOUT_EXIT)
+        && build_id != crate::chroots::ONE_SHOT_BUILD_ID
 }
 
 /// The CPUs one build's parallelism is sized to: the smaller of its own limit
@@ -1045,6 +1070,27 @@ mod tests {
 
         let elsewhere = oom_reason(1, OomCause::Elsewhere, &cfg);
         assert!(!elsewhere.contains("WORKER_"), "{elsewhere}");
+    }
+
+    /// Kept: a real failure, including an OOM kill. Not kept: a success, a
+    /// cancel, a timeout, or the one-shot id. (Out-of-disk is excluded by the
+    /// caller, which still holds the lease to ask.)
+    #[test]
+    fn only_real_failures_are_keepable() {
+        use aurcache_worker_core::report;
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        assert!(should_keep(7, &report::classify_exit(status(1), false)));
+        assert!(should_keep(7, &report::classify_exit(status(137), false)));
+        assert!(!should_keep(7, &report::classify_exit(status(0), false)));
+        assert!(!should_keep(7, &report::classify_exit(status(1), true)));
+        assert!(!should_keep(7, &report::timeout_failure(60)));
+        assert!(!should_keep(7, &report::classify_exit(status(124), false)));
+        assert!(!should_keep(
+            crate::chroots::ONE_SHOT_BUILD_ID,
+            &report::classify_exit(status(1), false)
+        ));
     }
 
     /// A finished blocking task hands its value through; a panicking one

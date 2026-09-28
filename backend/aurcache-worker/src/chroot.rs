@@ -3,18 +3,10 @@
 //! the pure argument/parse helpers they rely on live in [`crate::build`].
 
 use anyhow::{Context, Result, bail};
-use aurcache_worker_core::client::WorkerClient;
-use aurcache_worker_core::protocol::report_warning;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-
-/// Serializes base-chroot creation/refresh across concurrent jobs so two builds
-/// never race to `mkarchroot`/`arch-nspawn` the same shared `<chroot_dir>/root`
-/// (which would corrupt it). A worker only ever uses one chroot dir, so a
-/// single process-wide lock is enough.
-static BASE_CHROOT_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Run a command, returning combined stdout+stderr and the exit status.
 pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::ExitStatus)> {
@@ -71,71 +63,19 @@ pub fn devtools_in(program: &str, tmpdir: &Path) -> Command {
     cmd
 }
 
-/// Ensure the shared base chroot exists and is reasonably fresh. Idempotent.
-///
-/// * Creates `<chroot_dir>/root` via `mkarchroot` seeded with the job's
-///   `pacman.conf` on first use. The chroot keeps the `makepkg.conf` its own
-///   `pacman` installs; this worker's settings arrive as a drop-in instead.
-/// * Otherwise refreshes it with `arch-nspawn … pacman -Syu`.
-///
-/// **The caller must hold `root.lock`** while this runs, or hold nothing
-/// because there was no lock to hold. A build's snapshot is taken under the
-/// same lock held shared, so it never captures a half-updated chroot --
-/// `arch-nspawn`, which is how the chroot gets updated, takes no lock of its
-/// own. [`crate::chroots::Chroots::refresh`] is what decides that here.
-///
-/// `report_to` names who to tell about a refresh problem, and the build to
-/// file it under -- `None` for `build-once`, which runs this same machinery
-/// with no server and no build id to name.
-pub async fn ensure_base_chroot(
-    chroot_dir: &Path,
-    pacman_conf: &Path,
-    report_to: Option<(&WorkerClient, i32)>,
-) -> Result<PathBuf> {
-    // Serialize base-chroot creation/refresh: concurrent jobs must not race to
-    // build or `-Syu` the same shared root.
-    let _guard = BASE_CHROOT_LOCK.lock().await;
-
-    let root = base_dir(chroot_dir)?;
-    if base_exists(&root) {
-        // Refresh existing chroot; a failure here is non-fatal for the build.
-        let mut cmd = devtools("arch-nspawn");
-        cmd.arg(&root).args(["pacman", "-Syu", "--noconfirm"]);
-        if let Ok((log, status)) = run_capture(cmd).await
-            && !status.success()
-        {
-            tracing::warn!("chroot refresh returned non-zero:\n{log}");
-            if let Some((client, build_id)) = report_to {
-                report_warning(
-                    client,
-                    Some(build_id),
-                    &format!("chroot refresh returned non-zero:\n{log}"),
-                )
-                .await;
-            }
-        }
-        // Existing chroots too: this arrived after the first ones were built,
-        // and a chroot is long-lived.
-        ensure_multilib(&root).await;
-        return Ok(root);
-    }
-    create_base(&root, pacman_conf).await
-}
-
-/// The base chroot's path, with its directory made.
-fn base_dir(chroot_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(chroot_dir)
-        .with_context(|| format!("creating chroot dir {}", chroot_dir.display()))?;
-    Ok(chroot_dir.join("root"))
-}
-
 /// Whether there is a chroot here already, rather than an empty directory.
-fn base_exists(root: &Path) -> bool {
+pub(crate) fn base_exists(root: &Path) -> bool {
     root.join(".arch-chroot").exists() || (root.exists() && root.join("usr").exists())
 }
 
-/// `mkarchroot` a fresh base chroot.
-async fn create_base(root: &Path, pacman_conf: &Path) -> Result<PathBuf> {
+/// `mkarchroot` a fresh base chroot, seeded with the job's `pacman.conf`. The
+/// chroot keeps the `makepkg.conf` its own `pacman` installs; this worker's
+/// settings arrive as a drop-in instead.
+///
+/// The caller counts it against the pool's total, and removes it when this
+/// fails: what a failed creation leaves is neither usable nor counted, and
+/// `mkarchroot` refuses to start over on top of it.
+pub(crate) async fn create_base(root: &Path, pacman_conf: &Path) -> Result<()> {
     // No `-M`. `mkarchroot` would copy a makepkg.conf into the chroot, and its
     // default is the *host's* -- which is the operator's own build
     // configuration, not this service's. A developer machine with
@@ -162,7 +102,44 @@ async fn create_base(root: &Path, pacman_conf: &Path) -> Result<PathBuf> {
         bail!("mkarchroot failed:\n{log}");
     }
     ensure_multilib(root).await;
-    Ok(root.to_path_buf())
+    Ok(())
+}
+
+/// Upgrade a refresh candidate in place: `root.next`, never the base builds
+/// snapshot. Must exit 0: a failed upgrade is a failed refresh, and the
+/// candidate is deleted rather than swapped in.
+pub(crate) async fn upgrade_candidate(next: &Path) -> Result<()> {
+    let mut cmd = devtools("arch-nspawn");
+    cmd.arg(next).args(["pacman", "-Syu", "--noconfirm"]);
+    let (log, status) = run_capture(cmd).await?;
+    if !status.success() {
+        bail!("chroot upgrade returned non-zero:\n{log}");
+    }
+    Ok(())
+}
+
+/// Check a refresh candidate before it becomes the base, running the checks
+/// inside it so they exercise the binaries just upgraded: dependencies
+/// satisfied, the toolchain still installed, the build-user path working, and
+/// no pacman lock left behind.
+pub(crate) async fn check_candidate(next: &Path) -> Result<()> {
+    let checks: &[&[&str]] = &[
+        &["pacman", "-Dk"],
+        &["pacman", "-Q", "base-devel"],
+        &["sudo", "-u", "nobody", "true"],
+    ];
+    for args in checks {
+        let mut cmd = devtools("arch-nspawn");
+        cmd.arg(next).args(args.iter().copied());
+        let (log, status) = run_capture(cmd).await?;
+        if !status.success() {
+            bail!("chroot check `{}` failed:\n{log}", args.join(" "));
+        }
+    }
+    if next.join("var/lib/pacman/db.lck").exists() {
+        bail!("chroot check failed: /var/lib/pacman/db.lck left behind");
+    }
+    Ok(())
 }
 
 /// Install the 32-bit toolchain, where the architecture has one.
@@ -183,7 +160,7 @@ async fn create_base(root: &Path, pacman_conf: &Path) -> Result<PathBuf> {
 ///
 /// Best-effort for the same reason: absence is the expected case off x86_64,
 /// not a failure worth refusing to build over.
-async fn ensure_multilib(root: &Path) {
+pub(crate) async fn ensure_multilib(root: &Path) {
     let mut cmd = devtools("arch-nspawn");
     cmd.arg(root).args([
         "pacman",
@@ -468,104 +445,6 @@ pub fn write_configs(
     Ok((makepkg, pacman))
 }
 
-/// What asking for the base chroot's lock produced.
-pub enum BaseLock {
-    /// Held. The base chroot is ours to change until this is dropped.
-    Held(std::fs::File),
-    /// Someone else holds it: a build's snapshot being taken.
-    Busy,
-    /// There is no usable lock here at all. Not a reason to refuse to work --
-    /// that is what happened before any of this existed.
-    Unavailable,
-}
-
-/// Ask for devtools' `root.lock` exclusively, without waiting.
-///
-/// Never blocks. The lock is only ever held shared for the instant of taking a
-/// snapshot, so it is rarely busy; when it is, the refresh simply happens
-/// later, and being a few minutes out of date is a smaller problem than
-/// holding up the job start that asked for it.
-pub async fn try_lock_base(root: &Path) -> BaseLock {
-    // Same rule as every other lock path here (`lock_beside`): append, never
-    // `with_extension`, which would replace an extension instead. All three
-    // must name the same file or the exclusion silently stops excluding.
-    let Some(path) = lock_beside(root) else {
-        tracing::warn!("could not form a lock path for {}", root.display());
-        return BaseLock::Unavailable;
-    };
-    let taken = tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        }
-    })
-    .await;
-    match taken {
-        Ok(Ok(Some(file))) => BaseLock::Held(file),
-        Ok(Ok(None)) => BaseLock::Busy,
-        Ok(Err(e)) => {
-            tracing::warn!("could not lock the base chroot: {e}");
-            BaseLock::Unavailable
-        }
-        Err(e) => {
-            tracing::warn!("could not lock the base chroot: {e}");
-            BaseLock::Unavailable
-        }
-    }
-}
-
-/// Take devtools' `root.lock` *shared*, which is what `sync_chroot` does while
-/// it copies, for the instant of taking a build's snapshot. Several builds may
-/// snapshot at once; a refresh, which takes it exclusively, waits for them.
-pub async fn share_base_chroot(root: &Path) -> Option<std::fs::File> {
-    open_base_lock(root).await
-}
-
-/// Open and lock the base chroot's lock file.
-///
-/// Opened **read-only**, which is not a detail: `mkarchroot` creates the lock
-/// as root and leaves it `0644`, while the worker is not root, so asking for
-/// write access fails with `EACCES` and the lock is never taken -- silently,
-/// since this is best-effort. `flock(2)` places either kind of lock through a
-/// read-only descriptor perfectly well; the open mode and the lock mode are
-/// unrelated. There is nothing to create here either: by the time a chroot can
-/// be refreshed or snapshotted, `mkarchroot` has made both it and its lock.
-///
-/// The lock is held until the returned file is dropped. `None` if it could not
-/// be taken at all, which is worth carrying on without -- that is what
-/// happened before this existed, and refusing to build over it would be a
-/// worse trade.
-async fn open_base_lock(root: &Path) -> Option<std::fs::File> {
-    // See `try_lock_base`: one rule for every lock path.
-    let path = lock_beside(root)?;
-    let taken = tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)?;
-        file.lock_shared()?;
-        std::io::Result::Ok(file)
-    })
-    .await;
-    match taken {
-        Ok(Ok(file)) => Some(file),
-        Ok(Err(e)) => {
-            tracing::warn!("could not lock the base chroot: {e}");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("could not lock the base chroot: {e}");
-            None
-        }
-    }
-}
-
-/// The lock `makechrootpkg` takes for a copy, which sits beside it rather than
-/// inside it.
-fn lock_beside(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    Some(path.with_file_name(format!("{name}.lock")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,16 +513,6 @@ mod tests {
         let conf = std::fs::read_to_string(replica.join("gpg.conf")).unwrap();
         assert!(conf.contains("lock-never"), "{conf}");
         assert!(conf.contains("no-auto-check-trustdb"), "{conf}");
-    }
-
-    /// The lock is a sibling, not a child: `job-604-2844759.lock` beside
-    /// `job-604-2844759`.
-    #[test]
-    fn the_lock_sits_beside_the_copy() {
-        assert_eq!(
-            lock_beside(Path::new("/chroot/job-604-2844759")),
-            Some(PathBuf::from("/chroot/job-604-2844759.lock"))
-        );
     }
 
     /// One build's overrides go to a file of that build's own, which

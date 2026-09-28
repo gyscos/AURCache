@@ -345,6 +345,7 @@ accept.
 | `WORKER_DISK_MAX` | Size | Everything the worker stores in its pool: the base chroot, the caches and every running build | `200G` |
 | `WORKER_POOL` | Path | What backs the pool: unset for an image file, a block device, or a dedicated btrfs mount | unset |
 | `WORKER_DISK_RESERVE` | Bool | Allocate the whole image up front instead of as builds write | `false` |
+| `WORKER_KEEP_FAILED` | Duration | How long a failed build's chroot is kept for inspection | unset (keeps nothing) |
 
 Every chroot, build and cache lives in the worker's **storage pool**, a btrfs
 filesystem with quotas. The kernel enforces both limits as builds write: a
@@ -355,6 +356,14 @@ needs no setup. On ZFS, a zvol is better.
 [Storage pool](./storage-pool.md) covers the three backings (an image file, a
 zvol or partition, a dedicated btrfs filesystem), their tuning, sizing, and
 resizing.
+
+When `WORKER_KEEP_FAILED` is set, a failed build's chroot is kept at
+`<pool>/kept-<id>` (with its workdir beside it) instead of deleted, so a
+failure can be inspected in the state it died in:
+`systemd-nspawn -D <pool>/kept-<id>`. The build's page says where and until
+when. Canceled, timed-out and out-of-disk builds are never kept, and one-shot
+builds neither; a kept build counts against `WORKER_DISK_MAX` and is deleted
+early, oldest first, when the pool needs the room.
 
 ## Timing
 

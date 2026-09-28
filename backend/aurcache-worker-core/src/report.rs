@@ -24,6 +24,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
             peak_memory_bytes: None,
             disk_usage: None,
             vcs_commits: BTreeMap::new(),
+            kept: None,
         };
     }
     let code = status.code();
@@ -41,6 +42,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         peak_memory_bytes: None,
         disk_usage: None,
         vcs_commits: BTreeMap::new(),
+        kept: None,
     }
 }
 
@@ -71,6 +73,7 @@ pub fn setup_failure(reason: impl std::fmt::Display) -> CompleteReport {
         peak_memory_bytes: None,
         disk_usage: None,
         vcs_commits: BTreeMap::new(),
+        kept: None,
     }
 }
 
@@ -91,6 +94,7 @@ fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
         peak_memory_bytes: None,
         disk_usage: None,
         vcs_commits: BTreeMap::new(),
+        kept: None,
     }
 }
 
@@ -105,6 +109,7 @@ pub fn timeout_failure(secs: u64) -> CompleteReport {
         peak_memory_bytes: None,
         disk_usage: None,
         vcs_commits: BTreeMap::new(),
+        kept: None,
     }
 }
 

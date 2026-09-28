@@ -120,6 +120,23 @@ pub async fn record_disk_usage<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Record the failed chroot the worker kept for inspection, where and until
+/// when. Best-effort, for the same reason as [`record_peak_memory`]: a stale
+/// write records a keep that did happen, for a build that did run.
+pub async fn record_kept<C: ConnectionTrait>(
+    db: &C,
+    build_id: i32,
+    kept: &aurcache_common::api::builds::KeptBuild,
+) -> Result<(), DbErr> {
+    Builds::update_many()
+        .col_expr(builds::Column::KeptPath, Some(kept.path.clone()).into())
+        .col_expr(builds::Column::KeptUntil, Some(kept.until).into())
+        .filter(builds::Column::Id.eq(build_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// A build the worker was building is no longer `ACTIVE`-and-owned by it (the
 /// lease was reclaimed by the reaper and possibly re-handed to another worker).
 /// The late completion must be discarded rather than clobbering the new owner.
@@ -471,6 +488,27 @@ mod tests {
         assert_eq!(row.disk_workdir, Some(50));
         assert_eq!(row.disk_sources, Some(9));
         assert_eq!(row.disk_build_tree, None, "not measured is not zero");
+    }
+
+    /// A kept failure records where its chroot is and until when, for the
+    /// build's page to point an operator at.
+    #[tokio::test]
+    async fn a_kept_failure_records_where_and_until_when() {
+        let db = setup().await;
+        pkg(&db, 1).await;
+        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+
+        let kept = aurcache_common::api::builds::KeptBuild {
+            path: "/pool/kept-1".to_string(),
+            until: 1_800_000_000,
+        };
+        record_kept(&db, 1, &kept).await.unwrap();
+        complete_failure(&db, 1, 1).await.unwrap();
+
+        let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
+        assert_eq!(row.kept_path.as_deref(), Some("/pool/kept-1"));
+        assert_eq!(row.kept_until, Some(1_800_000_000));
+        assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
     }
 
     #[tokio::test]

@@ -66,6 +66,7 @@ async fn an_oversized_pool_is_made_again_once_its_builds_finish() {
             owner: owner(),
         },
         Duration::from_secs(3600),
+        None,
         owner(),
     );
     assert!(chroots.ready_for_work(64 * MIB, 0).await);

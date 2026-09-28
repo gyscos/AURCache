@@ -1,7 +1,10 @@
 # Persistent build directories
 
 Plan for keeping a package's build tree between builds, so a long compilation
-is not repeated from scratch, and so a failure late in a build is recoverable.
+is not repeated from scratch. Only successful builds keep their tree: an
+unsuccessful build discards it, and the retry starts cold (see
+`design/implemented/btrfs-snapshots.md`). What the tree saves is the next
+version's rebuild, not the retry.
 
 Status: **implemented**, except where noted under "What this does not
 solve". The reclaim policy below differs from what was first designed; the
@@ -146,10 +149,11 @@ What survives re-extraction is everything the tarball does *not* contain --
 confirmed in the same test: a planted `config.cache` and `png.o` were both
 still there afterwards. That is the actual risk, and it is inseparable from the
 benefit: leftover object files are what make an incremental rebuild fast, and
-also what makes it wrong when compiler flags changed underneath them, or when a
-killed build left something half-written. Such a failure produces a package
-that is quietly incorrect rather than one that fails loudly, which is the
-expensive kind.
+also what makes it wrong when compiler flags changed underneath them. A killed
+build used to be the other half of that risk, leaving something half-written;
+it no longer is, since a failed build discards its tree. What remains produces
+a package that is quietly incorrect rather than one that fails loudly, which is
+the expensive kind.
 
 That residual risk is real but rare, and it is the same mechanism as the
 benefit -- so it is a reason to keep an escape hatch, not a reason to default to
@@ -254,17 +258,17 @@ it is the hours this whole feature exists to save, and it borrows nothing --
 stamp is dropped rather than corrected, so the next reclaim measures instead of
 over-counting a tree that just shrank.
 
-Wiping on mirror eviction alone is not enough: a checkout can be left stale by
-an *earlier* re-creation that predates this wipe, and then outlive a healthy
-mirror forever, failing every retry from inside makepkg where only the worker
-can reach it. So the worker also watches the build's streams for the failure's
-own signature -- git's "did not send all necessary objects" / "bad object",
-locale-stable where makepkg's message would not be -- and when a build dies
-with it on a package that opted into a persistent tree, wipes just the borrowed
-checkouts (still not the compiled tree). The next retry re-clones them from the
-mirror, which the download phase refreshes at the same time; no manual cleanup
-on a worker is needed, and a failure that had nothing wrong with the checkout
-is untouched, so nothing is lost by misclassifying one.
+That used to be only half the story: a checkout left stale by an *earlier*
+re-creation could outlive a healthy mirror forever, failing every retry from
+inside makepkg where only the worker could reach it. The worker watched the
+build's streams for the failure's own signature and wiped just the borrowed
+checkouts after such a failure. It no longer does: an unsuccessful build now
+discards the whole tree, and the next build starts cold. A half-updated tree
+can fail every retry identically -- a stale checkout, or an output a killed
+compiler left truncated but newer than its inputs -- and telling the two apart
+costs more than a cold rebuild saves. See
+`design/implemented/btrfs-snapshots.md`. The mirror wipe above stays: wiping a
+mirror still orphans the checkouts a kept tree borrowed from it.
 
 ## What this does not solve
 

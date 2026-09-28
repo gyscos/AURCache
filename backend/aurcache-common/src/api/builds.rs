@@ -34,6 +34,18 @@ impl DiskUsage {
     }
 }
 
+/// A failed build's chroot, kept on its worker for inspection instead of
+/// deleted (`WORKER_KEEP_FAILED`).
+#[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct KeptBuild {
+    /// Where the chroot is on the worker, `<pool>/kept-<id>`; entered with
+    /// `systemd-nspawn -D`, with the workdir beside it at `<pool>/kept-<id>.data`.
+    pub path: String,
+    /// Epoch seconds until which it is kept -- or sooner, if the worker needs
+    /// the room: kept builds are the first thing reclaimed.
+    pub until: i64,
+}
+
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct BuildSummary {
@@ -71,6 +83,13 @@ pub struct BuildSummary {
     #[cfg_attr(feature = "db", sea_orm(skip))]
     #[serde(default)]
     pub disk_usage: Option<DiskUsage>,
+    /// The failed chroot the worker kept for inspection, when it kept one.
+    /// `None` for every build that did not fail in a keepable way, on a
+    /// worker with keeping off -- and, eventually, for one whose keep ran
+    /// out, though the row does not say so.
+    #[cfg_attr(feature = "db", sea_orm(skip))]
+    #[serde(default)]
+    pub kept: Option<KeptBuild>,
     /// The worker that ran this build, by name.
     ///
     /// `None` where no worker has claimed it -- a queued build -- and for

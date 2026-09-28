@@ -1,7 +1,7 @@
 //! A build's log output.
 
 use crate::api::LoadError;
-use crate::dates::AbsoluteDate;
+use crate::dates::{AbsoluteDate, absolute, use_date_style};
 use crate::format::{format_bytes, format_duration, now_secs};
 use crate::listing::ViewParams;
 use crate::log_tail::{
@@ -11,7 +11,7 @@ use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
 use aurcache_common::api::build_log::align;
-use aurcache_common::api::builds::DiskUsage;
+use aurcache_common::api::builds::{DiskUsage, KeptBuild};
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
 
@@ -420,6 +420,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // What the build used on its worker's disk, once it has ended and the
     // worker reported it.
     let disk_usage = use_signal(|| None::<DiskUsage>);
+    // The failed chroot the worker kept for inspection, when it kept one.
+    let kept = use_signal(|| None::<KeptBuild>);
+    // How the keep's "until" reads: absolute dates are the viewer's choice.
+    let date_style = use_date_style();
     let error = use_signal(|| Option::<String>::None);
     // True for a couple of seconds after a successful copy, so the button
     // swaps its icon and label to say the log is now on the clipboard.
@@ -458,6 +462,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
         let (mut worker_name, mut status, mut start_time, mut end_time) =
             (worker_name, status, start_time, end_time);
         let mut disk_usage = disk_usage;
+        let mut kept = kept;
         let (mut finished, mut error, following) = (finished, error, following);
         let cap = cap();
         let pkgbase = pkgbase_for_poll.clone();
@@ -498,6 +503,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                         start_time.set(build.start_time);
                         end_time.set(build.end_time);
                         disk_usage.set(build.disk_usage);
+                        kept.set(build.kept.clone());
                         log_size.set(build.log_size);
                         // A successful poll clears a previous failure: the
                         // banner should describe now, not the worst moment so
@@ -678,6 +684,16 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                                 title: "Disk the build used on its worker, as stored (chroot and working space included): {disk_usage_summary(usage).unwrap_or_default()}",
                                 "Disk: {kept}"
                             }
+                        }
+                    }
+                    if let Some(kept) = kept() {
+                        span {
+                            class: "text-sm opacity-70 whitespace-nowrap",
+                            title: "{kept_summary(&kept.path, worker_name().as_deref(), &absolute(Some(kept.until), date_style()))}",
+                            "Kept at "
+                            span { class: "font-mono", "{kept.path}" }
+                            " until "
+                            AbsoluteDate { ts: Some(kept.until) }
                         }
                     }
                     div { class: "flex-1" }
@@ -971,6 +987,18 @@ pub(crate) fn disk_usage_persistent(usage: &DiskUsage) -> Option<String> {
     measured.then(|| format_bytes(total))
 }
 
+/// Where a kept failure is, as hover text. The date arrives already rendered --
+/// how an absolute date reads is the viewer's choice, and this sentence is not
+/// the place that choice is made.
+pub(crate) fn kept_summary(path: &str, worker: Option<&str>, until: &str) -> String {
+    match worker {
+        Some(worker) => format!(
+            "kept on {worker} at {path} until {until}, or sooner if the worker needs the room"
+        ),
+        None => format!("kept at {path} until {until}, or sooner if the worker needs the room"),
+    }
+}
+
 #[cfg(test)]
 mod disk_usage_tests {
     use super::*;
@@ -1009,5 +1037,18 @@ mod disk_usage_tests {
             None
         );
         assert_eq!(disk_usage_persistent(&DiskUsage::default()), None);
+    }
+
+    #[test]
+    fn the_keep_names_its_worker_path_and_end() {
+        assert_eq!(
+            kept_summary("/pool/kept-7", Some("freyja"), "2026-09-29 12:00"),
+            "kept on freyja at /pool/kept-7 until 2026-09-29 12:00, or sooner if the worker \
+             needs the room"
+        );
+        assert_eq!(
+            kept_summary("/pool/kept-7", None, "2026-09-29 12:00"),
+            "kept at /pool/kept-7 until 2026-09-29 12:00, or sooner if the worker needs the room"
+        );
     }
 }

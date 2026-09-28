@@ -420,6 +420,7 @@ impl DockerExecutor {
                 peak_memory_bytes: None,
                 disk_usage: None,
                 vcs_commits: BTreeMap::new(),
+                kept: None,
             },
             Some(code) => CompleteReport {
                 success: false,
@@ -431,6 +432,7 @@ impl DockerExecutor {
                 peak_memory_bytes: None,
                 disk_usage: None,
                 vcs_commits: BTreeMap::new(),
+                kept: None,
             },
             None => report::setup_failure("build container exited without a status"),
         })

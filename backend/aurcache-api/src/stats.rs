@@ -639,6 +639,7 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
                 size: row.size,
                 peak_memory: row.peak_memory,
                 disk_usage: None,
+                kept: None,
                 worker_name: row.worker_name,
                 log_size: None,
                 waiting_reason: None,

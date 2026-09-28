@@ -65,6 +65,7 @@ async fn cache_entries_are_subvolumes_that_eviction_deletes() {
             owner: Owner::current(),
         },
         Duration::from_secs(3600),
+        None,
         Owner::current(),
     );
     assert!(chroots.ready_for_work(64 * MIB, 0).await);

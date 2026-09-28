@@ -154,6 +154,7 @@ impl ChrootExecutor {
             chroots: Chroots::new(
                 cfg.pool_config(),
                 Duration::from_secs(cfg.chroot_refresh_interval),
+                cfg.keep_failed.map(Duration::from_secs),
                 cfg.cache_owner(),
             ),
         });
@@ -314,6 +315,9 @@ impl Executor for ChrootExecutor {
         self.shared
             .chroots
             .set_interval(Duration::from_secs(next.chroot_refresh_interval));
+        self.shared
+            .chroots
+            .set_keep_failed(next.keep_failed.map(Duration::from_secs));
         *self
             .cfg
             .write()

@@ -97,6 +97,7 @@ impl Executor for DemoExecutor {
                 peak_memory_bytes: None,
                 disk_usage: None,
                 vcs_commits: Default::default(),
+                kept: None,
             },
             Err(e) => report::setup_failure(format!("demo packaging failed: {e:#}")),
         }

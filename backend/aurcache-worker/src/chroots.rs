@@ -9,8 +9,9 @@
 //! (`WORKER_DISK_MAX`), so a build that sets out to fill the disk fails its own
 //! build instead. See `design/implemented/build-disk-quota.md`.
 //!
-//! A snapshot is point-in-time, so the base is refreshed in place while builds
-//! run: its lock is held shared only for the instant of taking a snapshot. The
+//! A snapshot is point-in-time, so the base is refreshed as a new snapshot,
+//! swapped in: builds snapshot whatever `root` is at the instant they ask,
+//! before or after the swap, and a refresh in flight never holds one up. The
 //! overlay chroots, update layers and flattening this replaced existed because
 //! an overlay's lower layer must not change for as long as a build reads it.
 
@@ -18,6 +19,7 @@ use crate::chroot;
 use anyhow::{Context, Result, bail};
 use aurcache_chroot::{BuildVolumes, Pool, PoolConfig, Usage};
 use aurcache_worker_core::client::WorkerClient;
+use aurcache_worker_core::protocol::report_warning;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -50,6 +52,10 @@ pub struct Chroots {
     /// How long a refresh counts as current, in seconds. Atomic because it is
     /// a setting the server may change while builds run.
     interval: AtomicU64,
+    /// How long a failed build's chroot is kept for inspection, `None` to
+    /// keep nothing (`WORKER_KEEP_FAILED`). Read at sweep time, so lowering
+    /// it shortens keeps already made.
+    keep_failed: std::sync::Mutex<Option<Duration>>,
     /// Whether the last readiness check found the host short of room, so the
     /// change is logged once rather than at every poll.
     short_of_room: AtomicBool,
@@ -68,6 +74,7 @@ impl Chroots {
     pub fn new(
         config: PoolConfig,
         interval: Duration,
+        keep_failed: Option<Duration>,
         cache_owner: aurcache_chroot::Owner,
     ) -> Self {
         Self {
@@ -77,6 +84,7 @@ impl Chroots {
             last_failure: std::sync::Mutex::new(None),
             last_refresh: Mutex::new(None),
             interval: AtomicU64::new(interval.as_secs()),
+            keep_failed: std::sync::Mutex::new(keep_failed),
             short_of_room: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
@@ -180,6 +188,17 @@ impl Chroots {
         self.interval.store(interval.as_secs(), Ordering::Relaxed);
     }
 
+    /// Change how long a failed build's chroot is kept, from the next sweep
+    /// on -- including keeps already made, whose expiry is read from this.
+    pub fn set_keep_failed(&self, keep_failed: Option<Duration>) {
+        *self.keep_failed.lock().expect("not poisoned") = keep_failed;
+    }
+
+    /// How long a failed build's chroot is kept now, `None` to keep nothing.
+    fn keep_failed(&self) -> Option<Duration> {
+        *self.keep_failed.lock().expect("not poisoned")
+    }
+
     fn interval(&self) -> Duration {
         Duration::from_secs(self.interval.load(Ordering::Relaxed))
     }
@@ -269,11 +288,13 @@ impl Chroots {
             .map(|pool| pool.cache_volumes(crate::config::CACHE_SUBVOLUME))
     }
 
-    /// Remove what builds left in the pool, except those in `keep`. Returns
-    /// how many were cleared. Nothing to do on a pool not open yet.
+    /// Remove what builds left in the pool, except those in `keep`: crash
+    /// leftovers, kept failures past their time, and an interrupted refresh.
+    /// Returns how many builds and kept failures were cleared. Nothing to do
+    /// on a pool not open yet.
     pub async fn sweep(&self, keep: &HashSet<i32>) -> usize {
         match self.pool.read().await.as_ref() {
-            Some(pool) => pool.sweep(keep).await,
+            Some(pool) => pool.sweep(keep, self.keep_failed()).await,
             None => 0,
         }
     }
@@ -285,6 +306,14 @@ impl Chroots {
     /// than per build. Every build still syncs its own snapshot before it
     /// starts (`makechrootpkg -u`); this bounds how much that has to fetch.
     ///
+    /// As a new snapshot, swapped in: the base is snapshotted to `root.next`,
+    /// which is upgraded and checked, then exchanged into `root`'s place while
+    /// the old base becomes `root.prev`. A build snapshots whatever `root` is
+    /// at the instant it asks, before or after the swap, and is never exposed
+    /// to a base halfway through an upgrade -- so a refresh in flight never
+    /// holds up a build start, and a failed refresh leaves the base exactly as
+    /// it was. See `design/implemented/btrfs-snapshots.md`.
+    ///
     /// `report_to` names who to tell about a problem preparing the chroot, and
     /// the build to file it under -- `None` for `build-once`.
     pub async fn refresh(
@@ -295,68 +324,90 @@ impl Chroots {
         let guard = self.open_pool().await?;
         let pool = guard.as_ref().expect("open_pool hands out an open pool");
         let root = pool.root();
-        let mut last = self.last_refresh.lock().await;
-        if root.exists() && !refresh_due(last.map(|at| at.elapsed()), self.interval()) {
+        // One decision for "is it due" and "refresh it", or two builds
+        // starting together both find it due.
+        let Some(mut last) = self.refresh_gate(chroot::base_exists(&root)).await else {
+            return Ok(root);
+        };
+        if chroot::base_exists(&root) && !refresh_due(last.map(|at| at.elapsed()), self.interval())
+        {
             tracing::debug!("base chroot is current; not refreshing");
             return Ok(root);
         }
-        // Only while no snapshot is being taken of it. That takes an instant,
-        // so a busy base is rare, and it means "later", never "queue up": this
-        // holds the lock every job start needs. `last` is deliberately not
-        // stamped, so the next build tries again.
-        let existed = root.exists();
-        if existed {
-            match chroot::try_lock_base(&root).await {
-                chroot::BaseLock::Held(lock) => {
-                    let root =
-                        chroot::ensure_base_chroot(pool.path(), pacman_conf, report_to).await?;
-                    drop(lock);
-                    *last = Some(Instant::now());
-                    return Ok(root);
-                }
-                chroot::BaseLock::Busy => {
-                    tracing::info!("a build is snapshotting the base chroot; refreshing it later");
-                    return Ok(root);
-                }
-                chroot::BaseLock::Unavailable => {}
-            }
-        }
-        let made = async {
-            let root = chroot::ensure_base_chroot(pool.path(), pacman_conf, report_to).await?;
-            if !existed {
-                // `mkarchroot` made the base a subvolume of its own; until it
-                // is counted under the pool's total, the base's size is not.
-                pool.charge_to_total(&root)
-                    .await
-                    .context("counting the new base chroot against the pool's total")?;
-            }
-            anyhow::Ok(root)
+        // Across processes: `build-once` can share a pool with a running
+        // worker. Busy means another process is refreshing now, and the
+        // refresh is skipped the same way as above.
+        let Some(_flock) = pool.try_refresh_lock() else {
+            tracing::debug!("another process is refreshing the base chroot; using it as it is");
+            return Ok(root);
         };
-        let root = match made.await {
-            Ok(root) => root,
-            Err(e) => {
-                if !existed {
-                    // Never left behind half made or uncounted: the next try
-                    // would take it as a base, refresh it forever and never
-                    // count it -- or, with no `usr` yet, `mkarchroot` would
-                    // refuse the directory and every build would fail.
-                    if let Err(cleanup) = pool.discard_root().await {
-                        tracing::error!(
-                            "could not remove the base chroot a failed creation left \
-                             ({cleanup:#}); remove {} by hand",
-                            pool.root().display()
-                        );
-                    }
+        // Whatever a previous refresh left: an unfinished candidate, or the
+        // previous base past the exchange.
+        pool.recover_refresh().await?;
+        if !chroot::base_exists(&root) {
+            // First start, or an operator removed the base: made in place, as
+            // it always was, then counted against the total.
+            if root.exists() {
+                pool.discard_root().await?;
+            }
+            if let Err(e) = chroot::create_base(&root, pacman_conf).await {
+                // Never left behind half made or uncounted: the next try
+                // would take it as a base, refresh it forever and never
+                // count it -- or, with no `usr` yet, `mkarchroot` would
+                // refuse the directory and every build would fail.
+                if let Err(cleanup) = pool.discard_root().await {
+                    tracing::error!(
+                        "could not remove the base chroot a failed creation left \
+                         ({cleanup:#}); remove {} by hand",
+                        root.display()
+                    );
                 }
                 return Err(e);
             }
+            // `mkarchroot` made the base a subvolume of its own; until it is
+            // counted under the pool's total, the base's size is not.
+            pool.charge_to_total(&root)
+                .await
+                .context("counting the new base chroot against the pool's total")?;
+            *last = Some(Instant::now());
+            return Ok(root);
+        }
+        // Snapshot, upgrade, check, swap. Any failure deletes the candidate
+        // and leaves `root` exactly as it was; it is reported as a refresh
+        // warning, and `last` is stamped anyway, so a refresh that fails waits
+        // out the interval instead of running before every build. Builds are
+        // not exposed to the stale base by this: each still runs its own
+        // `makechrootpkg -u` in its snapshot, where the same failure shows up
+        // in that build's log.
+        let candidate = async {
+            pool.snapshot_next().await?;
+            chroot::upgrade_candidate(&pool.next_root()).await?;
+            chroot::ensure_multilib(&pool.next_root()).await;
+            chroot::check_candidate(&pool.next_root()).await?;
+            // The swap is atomic; a refusal is a failed check like any other.
+            pool.exchange_root()
+                .context("swapping the refreshed base in")?;
+            anyhow::Ok(())
         };
+        if let Err(e) = candidate.await {
+            pool.discard_next().await;
+            warn_refresh(report_to, &e).await;
+            *last = Some(Instant::now());
+            return Ok(root);
+        }
+        // Past the exchange `root` is the new base. Retiring the old one can
+        // only fail to a state the next recovery finishes, so a failure here
+        // is logged, not returned.
+        if let Err(e) = pool.retire_prev().await {
+            tracing::warn!("could not retire the previous base chroot ({e:#})");
+        }
         *last = Some(Instant::now());
         Ok(root)
     }
 
     /// Take a chroot for one build, limited to `limit` bytes of disk. Give it
-    /// back with [`Self::release`], or use [`Self::with_lease`].
+    /// back with [`Self::release`], keep it with [`Self::keep`], or use
+    /// [`Self::with_lease`].
     pub async fn acquire(&self, build_id: i32, limit: Option<u64>) -> Result<Lease> {
         let guard = self.open_pool().await?;
         let pool = guard.as_ref().expect("open_pool hands out an open pool");
@@ -364,11 +415,13 @@ impl Chroots {
         // only made again with the write lock and no build counted, so it can
         // never go while a lease is being taken from it.
         self.active.fetch_add(1, Ordering::SeqCst);
-        // Shared, for the instant of the snapshot: a refresh must not be
-        // halfway through the base when it is taken.
-        let lock = chroot::share_base_chroot(&pool.root()).await;
+        // Expired failures go before a new build's volumes come in, and kept
+        // failures and the retired base go before a build that would not fit.
+        pool.expire_kept(self.keep_failed()).await;
+        if let Some(limit) = limit {
+            pool.reclaim_room(limit).await;
+        }
         let volumes = pool.lease(build_id, limit).await;
-        drop(lock);
         let volumes = match volumes {
             Ok(volumes) => volumes,
             Err(e) => {
@@ -389,6 +442,22 @@ impl Chroots {
             return Err(e).context("making the build's temporary directory");
         }
         Ok(lease)
+    }
+
+    /// The in-process refresh exclusion. Without waiting when there is a base
+    /// to lease meanwhile: a refresh in flight never holds up a build start,
+    /// which snapshots the current base at once instead (`None`). The one
+    /// exception is a pool with no base yet, which waits -- there is nothing
+    /// to snapshot until `mkarchroot` is done.
+    async fn refresh_gate(
+        &self,
+        base_exists: bool,
+    ) -> Option<tokio::sync::MutexGuard<'_, Option<Instant>>> {
+        match self.last_refresh.try_lock() {
+            Ok(last) => Some(last),
+            Err(_) if base_exists => None,
+            Err(_) => Some(self.last_refresh.lock().await),
+        }
     }
 
     /// A read guard on the pool, opened. Opened again if it was made again
@@ -419,6 +488,30 @@ impl Chroots {
             None => drop(lease.volumes),
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Keep a failed build's chroot for `keep_for` instead of deleting it, for
+    /// an operator to inspect. Returns where, and until when -- `None` when
+    /// the keep itself failed, in which case the volumes are deleted instead
+    /// of leaked.
+    ///
+    /// Like [`Self::release`], after the build's child has been reaped: what
+    /// is kept is the state the build failed in.
+    pub async fn keep(
+        &self,
+        lease: Lease,
+        keep_for: Duration,
+    ) -> Option<aurcache_chroot::KeptBuild> {
+        let kept = match self.pool.read().await.as_ref() {
+            Some(pool) => pool.keep_build(lease.volumes, keep_for).await.ok(),
+            // Not reachable, as in `release`.
+            None => {
+                drop(lease.volumes);
+                None
+            }
+        };
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        kept
     }
 
     /// Run `body` with a chroot and give it back afterwards -- on the error
@@ -453,6 +546,21 @@ impl Chroots {
         // compilers write at once.
         const SLACK: u64 = 1 << 20;
         disk_reason(pool.usage(lease.volumes.group()), pool.total_usage(), SLACK)
+    }
+}
+
+/// A refresh that failed and left the base as it was: to the log, and to the
+/// build that triggered it -- `None` for `build-once`, which has no server to
+/// tell and no build id to file it under.
+async fn warn_refresh(report_to: Option<(&WorkerClient, i32)>, e: &anyhow::Error) {
+    tracing::warn!("base chroot refresh failed, keeping the current base:\n{e:#}");
+    if let Some((client, build_id)) = report_to {
+        report_warning(
+            client,
+            Some(build_id),
+            &format!("base chroot refresh failed, keeping the current base:\n{e:#}"),
+        )
+        .await;
     }
 }
 
@@ -543,6 +651,56 @@ mod tests {
         assert!(!refresh_due(Some(Duration::from_secs(60)), interval));
         assert!(refresh_due(Some(Duration::from_secs(900)), interval));
         assert!(refresh_due(Some(Duration::from_secs(60)), Duration::ZERO));
+    }
+
+    /// A refresh in flight makes a job start lease at once -- unless there is
+    /// no base yet, in which case there is nothing to snapshot and it waits.
+    #[tokio::test]
+    async fn a_refresh_in_flight_is_skipped_unless_the_base_is_missing() {
+        use aurcache_chroot::{Backing, PoolConfig};
+        use std::sync::Arc;
+        use std::time::Duration as StdDuration;
+
+        let chroots = Arc::new(Chroots::new(
+            PoolConfig {
+                backing: Backing::Image {
+                    path: "/nonexistent/pool.img".into(),
+                    reserve: false,
+                },
+                mountpoint: "/nonexistent".into(),
+                total: 0,
+                owner: aurcache_chroot::Owner::current(),
+            },
+            StdDuration::from_secs(900),
+            None,
+            aurcache_chroot::Owner::current(),
+        ));
+        // Free when nothing is refreshing.
+        assert!(chroots.refresh_gate(true).await.is_some());
+
+        // A refresh in flight, holding the exclusion.
+        let held = chroots.last_refresh.lock().await;
+        assert!(
+            chroots.refresh_gate(true).await.is_none(),
+            "with a base to lease, a start does not queue behind the refresh"
+        );
+        // With no base, a start queues behind it instead of snapshotting
+        // nothing.
+        let mut waiting = tokio::spawn({
+            let chroots = Arc::clone(&chroots);
+            async move { chroots.refresh_gate(false).await.is_some() }
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "with no base, a start waits for the refresh"
+        );
+        drop(held);
+        assert!(
+            waiting.await.expect("the waiter finishes"),
+            "the waiter proceeds once the refresh is done"
+        );
     }
 
     /// The reason names the setting that was reached, and prefers the build's

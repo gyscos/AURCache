@@ -8,7 +8,7 @@ it afterwards. That makes it cheap to get three things: a rollback point,
 isolation between writers, and a copy to inspect later. This doc collects the
 places where the worker could use them, and settles how each one behaves.
 
-Status: **Proposed** · Last updated: 2026-09-28
+Status: **Implemented** · Last updated: 2026-09-28
 
 Split off from this doc:
 - `design/rejected/source-cache-snapshots.md`: per-build snapshots of the source

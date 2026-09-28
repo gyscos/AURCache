@@ -958,6 +958,11 @@ async fn complete_job_inner(
     {
         record_failed("disk usage", e.to_string());
     }
+    if let Some(kept) = report.kept.as_ref()
+        && let Err(e) = worker_complete::record_kept(db, build_id, kept).await
+    {
+        record_failed("kept chroot", e.to_string());
+    }
 
     if report.success {
         // What the worker actually checked out replaces what the server

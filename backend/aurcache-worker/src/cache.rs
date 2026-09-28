@@ -358,6 +358,30 @@ impl Cache {
         size
     }
 
+    /// Delete a package's persistent build tree outright, with its size stamp:
+    /// what an unsuccessful build leaves is half-updated, which makepkg treats
+    /// as resumable, and the next build starts cold instead. A subvolume goes
+    /// at once; a plain directory is set aside and removed as a tree.
+    ///
+    /// Best-effort, like every other wipe here: the next build rebuilds over
+    /// -- or without -- whatever this leaves. Blocking: run it off the async
+    /// runtime.
+    pub fn discard_builddir(&self, platform: &str, pkgbase: &str) -> bool {
+        let tree = self
+            .root
+            .join("builddir")
+            .join(sanitize(platform))
+            .join(sanitize(pkgbase));
+        if tree.symlink_metadata().is_err() {
+            return false;
+        }
+        if let Err(e) = self.remove_entry(&tree) {
+            tracing::warn!("could not discard build tree {}: {e}", tree.display());
+        }
+        let _ = std::fs::remove_file(self.size_stamp(platform, pkgbase));
+        true
+    }
+
     /// Shared persistent GnuPG home for validpgpkeys.
     pub fn gnupg_home(&self) -> Option<PathBuf> {
         Self::ensured(self.root.join("gnupg"))
@@ -1315,6 +1339,30 @@ mod pkgcache_tests {
 
     fn write(path: &Path, bytes: usize) {
         std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    /// Discarding takes the tree and its size stamp, and says whether there
+    /// was one: a build that failed before its tree existed discards nothing.
+    #[test]
+    fn a_discarded_tree_and_its_stamp_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+        let tree = root.join("gone");
+        std::fs::create_dir_all(tree.join("src/deep")).unwrap();
+        write(&tree.join("src/deep/blob"), 10);
+        c.write_size_stamp("x86_64", "gone", 1000);
+
+        assert!(c.discard_builddir("x86_64", "gone"));
+        assert!(!tree.exists(), "the tree goes");
+        assert!(
+            !c.size_stamp("x86_64", "gone").exists(),
+            "its stamp goes with it"
+        );
+        assert!(
+            !c.discard_builddir("x86_64", "never-there"),
+            "nothing there, nothing discarded"
+        );
     }
 
     /// Every other cache directory is group-writable so the build user can

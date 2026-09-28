@@ -86,6 +86,9 @@ pub struct Config {
     pub build_disk_max: u64,
     /// Everything the worker may store in its pool (`WORKER_DISK_MAX`).
     pub disk_max: u64,
+    /// How long a failed build's chroot is kept for inspection, in seconds;
+    /// `None` keeps nothing (`WORKER_KEEP_FAILED`).
+    pub keep_failed: Option<u64>,
 }
 
 impl Config {
@@ -140,6 +143,7 @@ impl Config {
             total_build_limits: crate::cgroup::BuildLimits::default(),
             build_disk_max: 0,
             disk_max: 0,
+            keep_failed: None,
             core,
         };
         if env_opt("WORKER_CACHE_DIR").is_some() {
@@ -230,6 +234,7 @@ impl Config {
         self.disk_max = settings
             .size(keys::DISK_MAX)
             .unwrap_or(crate::settings::DEFAULT_DISK_MAX);
+        self.keep_failed = settings.duration(keys::KEEP_FAILED);
     }
 }
 
@@ -408,6 +413,7 @@ mod tests {
         assert_eq!(cfg.total_build_limits.memory_max, None);
         assert_eq!(cfg.build_disk_max, 50 * 1024 * 1024 * 1024);
         assert_eq!(cfg.disk_max, 200 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.keep_failed, None);
     }
 
     /// Unset, the pool is an image under the chroot directory, sparse unless
