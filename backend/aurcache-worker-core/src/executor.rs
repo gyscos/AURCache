@@ -55,8 +55,12 @@ pub trait Executor: Send + Sync + 'static {
     /// the server expects progress on.
     ///
     /// Consulted before each claim, so an implementation should be cheap and
-    /// is a reasonable place to do the waiting-for work itself.
-    fn ready_for_work(&self) -> impl Future<Output = bool> + Send {
+    /// is a reasonable place to do the waiting-for work itself. `claimed` is
+    /// how many jobs this worker holds now, counted from the claim: a job is
+    /// in flight before [`Self::run_job`] has started, and until its report
+    /// is sent.
+    fn ready_for_work(&self, claimed: usize) -> impl Future<Output = bool> + Send {
+        let _ = claimed;
         async { true }
     }
 

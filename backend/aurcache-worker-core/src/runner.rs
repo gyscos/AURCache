@@ -66,7 +66,7 @@ pub struct Runner<E: Executor> {
     client: Arc<WorkerClient>,
     executor: Arc<E>,
     registration: Registration,
-    /// Build ids currently executing (reported in each heartbeat).
+    /// Build ids claimed and not yet reported (reported in each heartbeat).
     active: Mutex<HashMap<i32, Arc<AtomicBool>>>,
     /// Unix seconds of the last successful server contact.
     last_contact: AtomicU64,
@@ -208,7 +208,8 @@ impl<E: Executor> Runner<E> {
             // Ask before claiming rather than after: a job we cannot start yet
             // is better left queued on the server, where it is visible and
             // costs nothing, than held here against a lease.
-            if !self.executor.ready_for_work().await {
+            let claimed = self.active.lock().await.len();
+            if !self.executor.ready_for_work(claimed).await {
                 drop(permit);
                 tokio::time::sleep(Duration::from_secs(cfg.poll_interval)).await;
                 continue;
@@ -223,9 +224,17 @@ impl<E: Executor> Runner<E> {
                 Ok(Some(mut job)) => {
                     self.mark_contact();
                     self.apply_mirrorlist(&cfg, &mut job).await;
+                    // Counted here rather than in the task: the next
+                    // readiness check may run before the task does, and
+                    // must see this job.
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    self.active
+                        .lock()
+                        .await
+                        .insert(job.build_id, Arc::clone(&cancel));
                     let this = Arc::clone(&self);
                     tokio::spawn(async move {
-                        this.run_one(job).await;
+                        this.run_one(job, cancel).await;
                         drop(permit);
                     });
                 }
@@ -271,13 +280,8 @@ impl<E: Executor> Runner<E> {
     }
 
     /// Execute a single job with panic-safe, always-emitted completion.
-    async fn run_one(self: &Arc<Self>, job: JobDescriptor) {
+    async fn run_one(self: &Arc<Self>, job: JobDescriptor, cancel: Arc<AtomicBool>) {
         let build_id = job.build_id;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.active
-            .lock()
-            .await
-            .insert(build_id, Arc::clone(&cancel));
         tracing::info!("Building {}", report::describe(&job));
 
         // Panic-wrap so a task panic still yields a terminal completion.

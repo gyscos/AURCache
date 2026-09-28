@@ -68,7 +68,7 @@ async fn an_oversized_pool_is_made_again_once_its_builds_finish() {
         Duration::from_secs(3600),
         owner(),
     );
-    assert!(chroots.ready_for_work(64 * MIB).await);
+    assert!(chroots.ready_for_work(64 * MIB, 0).await);
 
     // A stand-in base chroot, as `mkarchroot` would leave one.
     let root = mountpoint.join("root");
@@ -90,14 +90,22 @@ async fn an_oversized_pool_is_made_again_once_its_builds_finish() {
 
     chroots.set_total(600 * MIB).await.unwrap();
     assert!(
-        !chroots.ready_for_work(64 * MIB).await,
+        !chroots.ready_for_work(64 * MIB, 0).await,
         "a worker whose pool must be made again takes no new build"
     );
     assert!(filler.exists(), "nothing is thrown away while a build runs");
 
     chroots.release(lease).await;
     assert!(
-        chroots.ready_for_work(64 * MIB).await,
+        !chroots.ready_for_work(64 * MIB, 1).await,
+        "a job claimed but not yet leased still keeps the pool"
+    );
+    assert!(
+        filler.exists(),
+        "nothing is thrown away while a job sets up"
+    );
+    assert!(
+        chroots.ready_for_work(64 * MIB, 0).await,
         "with nothing running, the pool is made again and work resumes"
     );
     assert!(!filler.exists(), "the new pool starts empty");

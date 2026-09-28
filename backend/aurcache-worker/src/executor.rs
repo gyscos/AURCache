@@ -255,9 +255,12 @@ impl Executor for ChrootExecutor {
         .await
     }
 
-    async fn ready_for_work(&self) -> bool {
+    async fn ready_for_work(&self, claimed: usize) -> bool {
         let build_limit = self.current().build_disk_max;
-        self.shared.chroots.ready_for_work(build_limit).await
+        self.shared
+            .chroots
+            .ready_for_work(build_limit, claimed)
+            .await
     }
 
     fn describe_self(&self) -> String {

@@ -67,7 +67,7 @@ async fn cache_entries_are_subvolumes_that_eviction_deletes() {
         Duration::from_secs(3600),
         Owner::current(),
     );
-    assert!(chroots.ready_for_work(64 * MIB).await);
+    assert!(chroots.ready_for_work(64 * MIB, 0).await);
     let volumes = chroots.cache_volumes().await.expect("the pool is open");
 
     // A 1-byte source budget, so anything cached is over it; no TTL.

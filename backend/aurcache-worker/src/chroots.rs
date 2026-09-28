@@ -141,18 +141,19 @@ impl Chroots {
 
     /// Whether a build limited to `build_limit` can start: once the pool is
     /// open, and -- for a sparse image -- while the host has room for the
-    /// build to use its whole quota.
+    /// build to use its whole quota. `claimed` is how many jobs the worker
+    /// holds, leased or not yet; see [`Self::shrink_when_idle`].
     ///
     /// Asked before claiming, not after: a claimed job holds a lease the
     /// server expects progress on, while one left queued waits where everyone
     /// can see it. The check is a guard, not a guarantee -- the host's space is
     /// shared with whatever else runs there -- and a host that fills up anyway
     /// fails the builds writing at that moment, not the pool.
-    pub async fn ready_for_work(&self, build_limit: u64) -> bool {
+    pub async fn ready_for_work(&self, build_limit: u64, claimed: usize) -> bool {
         if !self.open().await {
             return false;
         }
-        if !self.shrink_when_idle().await {
+        if !self.shrink_when_idle(claimed).await {
             return false;
         }
         let free = self.pool.read().await.as_ref().and_then(Pool::host_free);
@@ -208,13 +209,20 @@ impl Chroots {
     /// build -- but not the worker's identity, which lives outside the pool.
     /// A build in flight holds a subvolume in it, so this waits for none to
     /// be, and the worker claims nothing new until then.
-    async fn shrink_when_idle(&self) -> bool {
+    ///
+    /// In flight from the claim, not from the lease: a job claimed and still
+    /// setting up -- its caches, a base refresh, its binds -- has no lease
+    /// yet, but would find the pool gone under it, and its cache writing
+    /// onto the host beneath the unmounted mountpoint. `claimed` counts
+    /// those; no claim can happen meanwhile, since the same loop that asks
+    /// this is the one that claims.
+    async fn shrink_when_idle(&self, claimed: usize) -> bool {
         let oversized = self.pool.read().await.as_ref().and_then(Pool::oversized);
         let Some(wanted) = oversized else {
             self.draining.store(false, Ordering::Relaxed);
             return true;
         };
-        let active = self.active.load(Ordering::SeqCst);
+        let active = claimed.max(self.active.load(Ordering::SeqCst));
         if active > 0 {
             if !self.draining.swap(true, Ordering::Relaxed) {
                 tracing::error!(
