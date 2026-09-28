@@ -99,19 +99,6 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
     // What a previous run left in the storage pool is swept when the
     // executor opens it, before anything can claim work.
 
-    // Before enrollment or any build: a crafted PKGBUILD can reach the
-    // worker-protocol port from inside a build (shared network namespace) and
-    // submit a rogue registration, so the build user is firewalled off it
-    // first. Best-effort like the credential announcement below: a worker
-    // that cannot set the rule still builds, but says so loudly.
-    match aurcache_worker::build_firewall::ensure(&cfg.core.aurcache_url, &cfg.build_user) {
-        Ok(()) => tracing::info!("Build user firewalled off the worker-protocol port"),
-        Err(e) => tracing::warn!(
-            "Build-user worker-port rule not installed ({e:#}); builds can reach \
-             the worker protocol port"
-        ),
-    }
-
     let identity = Identity::load_or_create(&cfg.core.data_dir)?;
     announce_build_credential(&cfg).await;
 
@@ -161,6 +148,24 @@ async fn run(cfg: Arc<Config>) -> Result<()> {
             }
         }
     };
+
+    // Before any build: a crafted PKGBUILD can reach the worker-protocol port
+    // from inside a build (shared network namespace) and submit a rogue
+    // registration, so the build user is firewalled off it first. After
+    // enrollment, because the repository the rule must leave open comes from
+    // the server. Best-effort like the credential announcement: a worker that
+    // cannot set the rule still builds, but says so loudly.
+    match aurcache_worker::build_firewall::ensure(
+        &cfg.core.aurcache_url,
+        client.repo_section(),
+        &cfg.build_user,
+    ) {
+        Ok(()) => tracing::info!("Build user firewalled off the worker-protocol port"),
+        Err(e) => tracing::warn!(
+            "Build-user worker-port rule not installed ({e:#}); builds can reach \
+             the worker protocol port"
+        ),
+    }
 
     let executor = Arc::new(ChrootExecutor::new(cfg).await);
     // What the runner registers again with when delivered values change what

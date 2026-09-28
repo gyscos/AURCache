@@ -10,19 +10,31 @@
 //! (`uid`, `port`) rather than by host: every build runs as the unprivileged
 //! build user (`WORKER_BUILD_USER`, `builder` by default), while the worker
 //! itself runs as `aurcache`. One `OUTPUT` rule per address family rejects the
-//! build user's TCP traffic to the worker port the server is reached on, and
-//! nothing else. Set `WORKER_BUILD_FIREWALL=0` to skip this (exotic network
-//! setups); the worker logs a warning either way when the rule cannot be
-//! installed, and never refuses to start over it.
+//! build user's TCP traffic to the port the worker actually dials, and nothing
+//! else.
+//!
+//! That port is not always the worker's own: a server reached as
+//! `https://aurcache.example.com` (TLS passthrough on 443) shares its port with
+//! the whole web, and possibly with the repository. Then the rule is narrowed
+//! to the addresses the server's host resolves to, and when the repository is
+//! served on one of those same addresses and ports no rule is installed at
+//! all, since blocking the worker protocol would block the repository with it.
+//!
+//! Set `WORKER_BUILD_FIREWALL=0` to skip this (exotic network setups); the
+//! worker logs a warning either way when the rule cannot be installed, and
+//! never refuses to start over it.
 
 use anyhow::{Context, Result};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::process::Command;
 
 /// Environment switch that disables the rule; see the module docs.
 const DISABLE_ENV: &str = "WORKER_BUILD_FIREWALL";
 
-/// Port assumed when `AURCACHE_URL` names none.
-const DEFAULT_WORKER_PORT: u16 = aurcache_common::ports::AURCACHE_WORKER_PORT;
+/// Ports builds need towards any host: how sources, the AUR and mirrors are
+/// fetched. A worker protocol reached on one of them can only be blocked
+/// host by host.
+const WEB_PORTS: [u16; 2] = [80, 443];
 
 /// Whether the operator disabled the rule.
 #[must_use]
@@ -37,32 +49,84 @@ pub fn disabled() -> bool {
     )
 }
 
-/// Worker-protocol port parsed from the server URL the worker dials.
+/// Where a URL's traffic goes: its host and the port actually dialled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+/// The endpoint a URL is dialled on.
 ///
-/// Takes the explicit port when present, else the compiled default. Only the
-/// host part is inspected, so paths, queries and userinfo cannot smuggle a
-/// different value in.
-#[must_use]
-pub fn worker_port_from_url(url: &str) -> u16 {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host_port = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or(after_scheme)
-        .trim_end_matches(':');
-    host_port
-        .rsplit(':')
-        .next()
-        .and_then(|port| {
-            // An IPv6 literal without a port (`[::1]`) leaves the bracketed
-            // address as the last segment; only a purely numeric tail counts.
-            if port.bytes().all(|b| b.is_ascii_digit()) && !port.is_empty() {
-                port.parse::<u16>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(DEFAULT_WORKER_PORT)
+/// The port is the explicit one, else the scheme's default -- what the HTTP
+/// client connects to, so what the rule has to name. An IPv6 literal is
+/// returned without its brackets, ready for resolution.
+fn endpoint(url: &str) -> Option<Endpoint> {
+    let url = url::Url::parse(url).ok()?;
+    let host = match url.host()? {
+        url::Host::Domain(domain) => domain.to_string(),
+        url::Host::Ipv4(addr) => addr.to_string(),
+        url::Host::Ipv6(addr) => addr.to_string(),
+    };
+    Some(Endpoint {
+        host,
+        port: url.port_or_known_default()?,
+    })
+}
+
+/// Every address an endpoint's host resolves to, deduplicated.
+///
+/// Resolved once, at startup: an address that changes afterwards is not
+/// followed until the worker restarts.
+fn resolve(endpoint: &Endpoint) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .map(|found| found.map(|a| a.ip()).collect())
+        .unwrap_or_default();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+/// An endpoint together with the addresses its host resolved to.
+struct Resolved<'a> {
+    endpoint: &'a Endpoint,
+    addrs: &'a [IpAddr],
+}
+
+/// Which destinations the rule covers, besides the worker port.
+#[derive(Debug, PartialEq, Eq)]
+enum Scope {
+    /// The port alone: nothing else a build needs is served on it.
+    AnyHost,
+    /// Only these addresses, because the port is shared with what builds
+    /// must still reach.
+    Addresses(Vec<IpAddr>),
+}
+
+/// Decide the rule's scope, refusing one that would block the repository.
+fn scope(worker: &Resolved, repo: Option<&Resolved>) -> Result<Scope> {
+    let port = worker.endpoint.port;
+    let repo_on_port = repo.filter(|r| r.endpoint.port == port);
+    if !WEB_PORTS.contains(&port) && repo_on_port.is_none() {
+        return Ok(Scope::AnyHost);
+    }
+    anyhow::ensure!(
+        !worker.addrs.is_empty(),
+        "the worker port {port} is shared with other traffic, and {} did not \
+         resolve to narrow the rule to",
+        worker.endpoint.host
+    );
+    if let Some(repo) = repo_on_port {
+        anyhow::ensure!(
+            !repo.addrs.iter().any(|a| worker.addrs.contains(a)),
+            "the package repository ({}:{port}) is served on the same address and \
+             port as the worker protocol, so blocking one would block both; give \
+             the worker protocol a port of its own",
+            repo.endpoint.host
+        );
+    }
+    Ok(Scope::Addresses(worker.addrs.to_vec()))
 }
 
 /// This process's own uid: the rule must never name it (see below).
@@ -124,20 +188,19 @@ fn uid_of_user(username: &str) -> Result<u32> {
 ///
 /// Idempotent installation is check-then-add: `-C` reports presence, `-I`
 /// inserts at the head only when absent.
-fn rule_args(uid: u32, port: u16) -> Vec<String> {
-    vec![
+fn rule_args(uid: u32, port: u16, destination: Option<IpAddr>) -> Vec<String> {
+    let mut args = vec![
         "OUTPUT".to_string(),
         "-m".to_string(),
         "owner".to_string(),
         "--uid-owner".to_string(),
         uid.to_string(),
-        "-p".to_string(),
-        "tcp".to_string(),
-        "--dport".to_string(),
-        port.to_string(),
-        "-j".to_string(),
-        "REJECT".to_string(),
-    ]
+    ];
+    if let Some(destination) = destination {
+        args.extend(["-d".to_string(), destination.to_string()]);
+    }
+    args.extend(["-p", "tcp", "--dport", &port.to_string(), "-j", "REJECT"].map(str::to_string));
+    args
 }
 
 fn run_sudo(
@@ -159,12 +222,18 @@ fn run_sudo(
 }
 
 /// Ensure the rule exists for one address family (`iptables` or `ip6tables`).
-fn ensure_one(tool: &str, uid: u32, port: u16) -> Result<()> {
-    ensure_one_in(tool, uid, port, None)
+fn ensure_one(tool: &str, uid: u32, port: u16, destination: Option<IpAddr>) -> Result<()> {
+    ensure_one_in(tool, uid, port, destination, None)
 }
 
-fn ensure_one_in(tool: &str, uid: u32, port: u16, path_override: Option<&str>) -> Result<()> {
-    let args = rule_args(uid, port);
+fn ensure_one_in(
+    tool: &str,
+    uid: u32,
+    port: u16,
+    destination: Option<IpAddr>,
+    path_override: Option<&str>,
+) -> Result<()> {
+    let args = rule_args(uid, port, destination);
     let mut check = vec!["-C".to_string()];
     check.extend(args.clone());
     if run_sudo(tool, &check, path_override)?.status.success() {
@@ -184,33 +253,77 @@ fn ensure_one_in(tool: &str, uid: u32, port: u16, path_override: Option<&str>) -
 
 /// Block the build user's TCP traffic to the worker-protocol port.
 ///
-/// Resolves the build user's uid and the port from `server_url`, then ensures
-/// the rule via `iptables` and `ip6tables` (each best-effort: a v6-less host
-/// fails only its own leg). A no-op when disabled; an `Err` names what failed
-/// so the caller can warn and continue.
+/// Resolves the build user's uid, the port `server_url` is dialled on and the
+/// repository `repo_section` points builds at, then ensures the rule via
+/// `iptables` and `ip6tables`. Called after enrollment, since the repository
+/// comes from the server, and before any build. A no-op when disabled; an
+/// `Err` names what failed so the caller can warn and continue.
 ///
-/// The rule is intentionally never removed — not on shutdown, not on package
+/// A rule on the port alone is best-effort per family (a v6-less host fails
+/// only its own leg); one narrowed to addresses must land for every address.
+///
+/// The rule is intentionally never removed -- not on shutdown, not on package
 /// removal. It names only the build user's uid and one destination port, so a
 /// stale rule affects nobody else, while remove-on-stop could never be
 /// reliable anyway: a killed worker would leave it behind, and two workers
 /// sharing a build user would race to delete each other's. Restarts are safe
 /// because installation is check-then-add.
-pub fn ensure(server_url: &str, build_user: &str) -> Result<()> {
+pub fn ensure(server_url: &str, repo_section: &str, build_user: &str) -> Result<()> {
     if disabled() {
         tracing::info!("{DISABLE_ENV} disables the build-user worker-port rule; skipping");
         return Ok(());
     }
     let uid = uid_of_user(build_user)?;
     check_not_self(uid, own_uid()?, build_user)?;
-    let port = worker_port_from_url(server_url);
-    ensure_one("iptables", uid, port)?;
-    match ensure_one("ip6tables", uid, port) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::debug!("ip6tables leg of the worker-port rule not installed: {e:#}");
-            Ok(())
+    let worker = endpoint(server_url)
+        .with_context(|| format!("no host and port to firewall in {server_url:?}"))?;
+    let worker_addrs = resolve(&worker);
+    // The arch only fills in `$arch`; the host and port are the same for all.
+    let repo = aurcache_worker_core::repo::repo_db_url(repo_section, "x86_64")
+        .as_deref()
+        .and_then(endpoint);
+    let repo_addrs = repo.as_ref().map(resolve).unwrap_or_default();
+    let scope = scope(
+        &Resolved {
+            endpoint: &worker,
+            addrs: &worker_addrs,
+        },
+        repo.as_ref()
+            .map(|endpoint| Resolved {
+                endpoint,
+                addrs: &repo_addrs,
+            })
+            .as_ref(),
+    )?;
+    let port = worker.port;
+    match scope {
+        Scope::AnyHost => {
+            ensure_one("iptables", uid, port, None)?;
+            if let Err(e) = ensure_one("ip6tables", uid, port, None) {
+                tracing::debug!("ip6tables leg of the worker-port rule not installed: {e:#}");
+            }
+        }
+        Scope::Addresses(addrs) => {
+            tracing::info!(
+                "Port {port} is shared with other traffic; firewalling the build user \
+                 off it on {} only",
+                addrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for addr in addrs {
+                let tool = if addr.is_ipv4() {
+                    "iptables"
+                } else {
+                    "ip6tables"
+                };
+                ensure_one(tool, uid, port, Some(addr))?;
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -218,19 +331,131 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn at(host: &str, port: u16) -> Endpoint {
+        Endpoint {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().unwrap()
+    }
+
     #[test]
-    fn port_comes_from_the_url_or_falls_back() {
-        assert_eq!(worker_port_from_url("https://aurcache:8083"), 8083);
+    fn the_port_is_the_one_the_client_dials() {
         assert_eq!(
-            worker_port_from_url("https://build.example.com:9090/api"),
-            9090
+            endpoint("https://aurcache:8083"),
+            Some(at("aurcache", 8083))
         );
-        assert_eq!(worker_port_from_url("https://aurcache:8083/"), 8083);
-        assert_eq!(worker_port_from_url("https://example.com"), 8083);
-        assert_eq!(worker_port_from_url("https://example.com/api"), 8083);
-        assert_eq!(worker_port_from_url("https://[::1]:8083"), 8083);
-        assert_eq!(worker_port_from_url("https://[::1]/api"), 8083);
-        assert_eq!(worker_port_from_url("not a url"), 8083);
+        assert_eq!(
+            endpoint("https://build.example.com:9090/api"),
+            Some(at("build.example.com", 9090))
+        );
+        assert_eq!(
+            endpoint("https://example.com"),
+            Some(at("example.com", 443))
+        );
+        assert_eq!(
+            endpoint("http://example.com/api"),
+            Some(at("example.com", 80))
+        );
+        assert_eq!(endpoint("https://[::1]:8083"), Some(at("::1", 8083)));
+        assert_eq!(endpoint("https://[::1]/api"), Some(at("::1", 443)));
+        assert_eq!(endpoint("not a url"), None);
+    }
+
+    #[test]
+    fn a_port_of_its_own_is_blocked_towards_every_host() {
+        let worker = at("aurcache", 8083);
+        let repo = at("aurcache", 8081);
+        let addrs = [ip("10.0.0.2")];
+        let scope = scope(
+            &Resolved {
+                endpoint: &worker,
+                addrs: &addrs,
+            },
+            Some(&Resolved {
+                endpoint: &repo,
+                addrs: &addrs,
+            }),
+        )
+        .unwrap();
+        assert_eq!(scope, Scope::AnyHost);
+    }
+
+    #[test]
+    fn a_web_port_is_blocked_towards_the_server_only() {
+        let worker = at("aurcache.example.com", 443);
+        let addrs = [ip("192.0.2.1"), ip("2001:db8::1")];
+        let scope = scope(
+            &Resolved {
+                endpoint: &worker,
+                addrs: &addrs,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(scope, Scope::Addresses(addrs.to_vec()));
+    }
+
+    #[test]
+    fn a_repository_on_another_address_stays_reachable() {
+        let worker = at("workers.example.com", 443);
+        let repo = at("repo.example.com", 443);
+        let scope = scope(
+            &Resolved {
+                endpoint: &worker,
+                addrs: &[ip("192.0.2.1")],
+            },
+            Some(&Resolved {
+                endpoint: &repo,
+                addrs: &[ip("192.0.2.2")],
+            }),
+        )
+        .unwrap();
+        assert_eq!(scope, Scope::Addresses(vec![ip("192.0.2.1")]));
+    }
+
+    #[test]
+    fn the_repository_is_never_blocked_with_the_worker_port() {
+        let worker = at("aurcache.example.com", 443);
+        let repo = at("aurcache.example.com", 443);
+        let addrs = [ip("192.0.2.1")];
+        let err = scope(
+            &Resolved {
+                endpoint: &worker,
+                addrs: &addrs,
+            },
+            Some(&Resolved {
+                endpoint: &repo,
+                addrs: &addrs,
+            }),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("repository"), "{err:#}");
+    }
+
+    #[test]
+    fn a_shared_port_is_not_blocked_blindly_when_the_host_does_not_resolve() {
+        let worker = at("aurcache.example.com", 443);
+        assert!(
+            scope(
+                &Resolved {
+                    endpoint: &worker,
+                    addrs: &[],
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_narrowed_rule_names_its_destination() {
+        let args = rule_args(967, 443, Some(ip("192.0.2.1")));
+        let d = args.iter().position(|a| a == "-d").unwrap();
+        assert_eq!(args[d + 1], "192.0.2.1");
     }
 
     #[test]
@@ -245,7 +470,7 @@ mod tests {
     #[test]
     fn rule_names_uid_and_port_and_nothing_else() {
         assert_eq!(
-            rule_args(967, 8083),
+            rule_args(967, 8083, None),
             [
                 "OUTPUT",
                 "-m",
@@ -311,11 +536,11 @@ mod tests {
             std::env::var("PATH").unwrap_or_default()
         );
         let path = Some(path.as_str());
-        ensure_one_in("iptables", 967, 8083, path).unwrap();
+        ensure_one_in("iptables", 967, 8083, None, path).unwrap();
         let first = std::fs::read_to_string(bin.join("calls.log")).unwrap();
         assert!(first.contains("-C OUTPUT"), "checks first:\n{first}");
         assert!(first.contains("-I OUTPUT"), "adds when absent:\n{first}");
-        ensure_one_in("iptables", 967, 8083, path).unwrap();
+        ensure_one_in("iptables", 967, 8083, None, path).unwrap();
         let second = std::fs::read_to_string(bin.join("calls.log")).unwrap();
         assert_eq!(
             second.matches("-I OUTPUT").count(),
