@@ -358,10 +358,11 @@ zvol or partition, a dedicated btrfs filesystem), their tuning, sizing, and
 resizing.
 
 When `WORKER_KEEP_FAILED` is set, a failed build's chroot is kept at
-`<pool>/kept-<id>` (with its workdir beside it) instead of deleted, so a
-failure can be inspected in the state it died in:
-`systemd-nspawn -D <pool>/kept-<id>`. The build's page says where and until
-when. Canceled, timed-out and out-of-disk builds are never kept, and one-shot
+`<pool>/kept-<id>` (with its workdir beside it, and its build tree at
+`<pool>/kept-<id>.build` when the build kept one) instead of deleted, so a
+failure can be inspected in the state it died in. The build's page says where
+and until when, and shows the one `systemd-nspawn` command that enters it.
+Canceled, timed-out and out-of-disk builds are never kept, and one-shot
 builds neither; a kept build counts against `WORKER_DISK_MAX` and is deleted
 early, oldest first, when the pool needs the room.
 

@@ -454,6 +454,9 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // runs for the life of the screen, so it takes its own copy and the rsx
     // below keeps the original for the header and the copy/download buttons.
     let pkgbase_for_poll = pkgbase.clone();
+    // And the kept-build command takes one more: the original is moved into
+    // the copy/download buttons above where the command renders.
+    let pkgbase_for_keep = pkgbase.clone();
     // Counted once per page that lands, not on every render: the window can be
     // 16 MiB of text, and the header re-renders on every status poll.
     let line_count = use_memo(move || log.read().lines().count());
@@ -801,6 +804,19 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                     }
                 }
 
+                if let Some(kept) = kept() {
+                    // The one command that enters the failed state: the kept
+                    // chroot, with the moved tree bound where makepkg left it
+                    // when the build kept one.
+                    div { class: "flex items-center gap-2 text-sm",
+                        span { class: "opacity-70 whitespace-nowrap", "Enter the failed state:" }
+                        code {
+                            class: "font-mono break-all",
+                            "{kept_command(&kept.path, kept.tree.as_deref(), &pkgbase_for_keep)}"
+                        }
+                    }
+                }
+
                 if let Some(e) = error() {
                     div { class: "alert alert-error", span { "{e}" } }
                 }
@@ -999,6 +1015,15 @@ pub(crate) fn kept_summary(path: &str, worker: Option<&str>, until: &str) -> Str
     }
 }
 
+/// The one command that enters the failed state: the kept chroot, with the
+/// moved tree bound where makepkg left it when the build kept one.
+pub(crate) fn kept_command(path: &str, tree: Option<&str>, pkgbase: &str) -> String {
+    match tree {
+        Some(tree) => format!("systemd-nspawn -D {path} --bind={tree}:/build/{pkgbase}"),
+        None => format!("systemd-nspawn -D {path}"),
+    }
+}
+
 #[cfg(test)]
 mod disk_usage_tests {
     use super::*;
@@ -1049,6 +1074,18 @@ mod disk_usage_tests {
         assert_eq!(
             kept_summary("/pool/kept-7", None, "2026-09-29 12:00"),
             "kept at /pool/kept-7 until 2026-09-29 12:00, or sooner if the worker needs the room"
+        );
+    }
+
+    #[test]
+    fn the_command_binds_the_moved_tree_where_makepkg_left_it() {
+        assert_eq!(
+            kept_command("/pool/kept-7", Some("/pool/kept-7.build"), "hello"),
+            "systemd-nspawn -D /pool/kept-7 --bind=/pool/kept-7.build:/build/hello"
+        );
+        assert_eq!(
+            kept_command("/pool/kept-7", None, "hello"),
+            "systemd-nspawn -D /pool/kept-7"
         );
     }
 }

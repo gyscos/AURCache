@@ -490,6 +490,16 @@ impl Chroots {
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Where a kept build's moved tree goes. `None` when the pool is not
+    /// open -- never, while a lease from it is held.
+    pub(crate) async fn keep_tree_dest(&self, build_id: i32) -> Option<PathBuf> {
+        self.pool
+            .read()
+            .await
+            .as_ref()
+            .map(|pool| pool.kept_tree_path(build_id))
+    }
+
     /// Keep a failed build's chroot for `keep_for` instead of deleting it, for
     /// an operator to inspect. Returns where, and until when -- `None` when
     /// the keep itself failed, in which case the volumes are deleted instead

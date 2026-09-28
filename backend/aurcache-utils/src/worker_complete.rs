@@ -131,6 +131,7 @@ pub async fn record_kept<C: ConnectionTrait>(
     Builds::update_many()
         .col_expr(builds::Column::KeptPath, Some(kept.path.clone()).into())
         .col_expr(builds::Column::KeptUntil, Some(kept.until).into())
+        .col_expr(builds::Column::KeptTree, kept.tree.clone().into())
         .filter(builds::Column::Id.eq(build_id))
         .exec(db)
         .await?;
@@ -501,6 +502,7 @@ mod tests {
         let kept = aurcache_common::api::builds::KeptBuild {
             path: "/pool/kept-1".to_string(),
             until: 1_800_000_000,
+            tree: Some("/pool/kept-1.build".to_string()),
         };
         record_kept(&db, 1, &kept).await.unwrap();
         complete_failure(&db, 1, 1).await.unwrap();
@@ -508,6 +510,7 @@ mod tests {
         let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
         assert_eq!(row.kept_path.as_deref(), Some("/pool/kept-1"));
         assert_eq!(row.kept_until, Some(1_800_000_000));
+        assert_eq!(row.kept_tree.as_deref(), Some("/pool/kept-1.build"));
         assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
     }
 

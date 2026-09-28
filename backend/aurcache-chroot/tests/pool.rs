@@ -867,6 +867,51 @@ async fn a_kept_build_keeps_its_group_limit_and_locks_down() {
 }
 
 #[tokio::test]
+async fn a_keep_carries_its_build_tree() {
+    if !enabled() {
+        return;
+    }
+    let scratch = Scratch::new("keep-tree");
+    let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
+    make_base(&pool, 10).await;
+
+    let build = pool.lease(7, None).await.unwrap();
+    // The worker's move, as the worker: one rename of the tree subvolume
+    // beside the keep, unprivileged -- btrfs lets a subvolume be renamed out
+    // of its parent, and its id (and so its quota group) follows it.
+    let standin = pool.path().join("tree-standin");
+    sudo_ok(&["btrfs", "subvolume", "create", standin.to_str().unwrap()]);
+    sudo_ok(&[
+        "sh",
+        "-c",
+        &format!("echo built > '{}'/output", standin.display()),
+    ]);
+    let moved = pool.kept_tree_path(7);
+    std::fs::rename(&standin, &moved).unwrap();
+    pool.keep_build(build, Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    // Locked down with the rest of the keep.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&moved).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "kept-7.build");
+    let output = sudo(&["cat", moved.join("output").to_str().unwrap()]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "built",
+        "the tree lands beside the keep"
+    );
+
+    // And goes away with it.
+    pool.sweep(&HashSet::new(), None).await;
+    assert!(!pool.path().join("kept-7").exists());
+    assert!(!pool.path().join("kept-7.data").exists());
+    assert!(!moved.exists());
+    pool.unmount().await.unwrap();
+}
+
+#[tokio::test]
 async fn the_sweep_keeps_a_fresh_failure_and_deletes_an_expired_one() {
     if !enabled() {
         return;

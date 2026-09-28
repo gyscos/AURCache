@@ -24,13 +24,16 @@ Decided (details in each section; measurements in "Prototype results"):
   then swaps it in with `renameat2(RENAME_EXCHANGE)`, which works on subvolume
   roots, as the worker's own user. No fallback is needed. `root.lock` and every
   user of it go. A refresh in flight never holds up a build start.
-- **Kept build trees** are discarded on any unsuccessful build. Discarding needs
-  no snapshot, so the `.pre` snapshot comes only with per-package rollback,
-  which is deferred. Its rules are written down below so they are ready.
-- **Failed builds** are kept by renaming `job-<id>*` to `kept-<id>*`. The keep
-  runs from the chroot directory's mtime, with no sidecar file. Canceled, timed
-  out and out-of-disk builds are not kept, and kept builds are the first thing
-  deleted when the pool needs room.
+- **Kept build trees** are moved beside the keep on a kept failure, and
+  discarded on any other unsuccessful build. Either way the next build starts
+  cold. Moving needs no snapshot, so the `.pre` snapshot comes only with
+  per-package rollback, which is deferred. Its rules are written down below so
+  they are ready.
+- **Failed builds** are kept by renaming `job-<id>*` to `kept-<id>*`, with the
+  build tree moved to `kept-<id>.build` first. The keep runs from the chroot
+  directory's mtime, with no sidecar file. Canceled, timed out and out-of-disk
+  builds are not kept, and kept builds are the first thing deleted when the
+  pool needs room.
 - One naming scheme and one sweep cover every new name. See "Crash recovery".
 
 ---
@@ -248,21 +251,34 @@ fail every retry identically:
   it is interrupted by `SIGTERM` or `SIGINT`, but not on `SIGKILL`, and
   `SIGKILL` (`cgroup.kill`) is how the worker ends a build.
 
-**Decided: discard on every unsuccessful build.** Failure, cancel, timeout,
-out-of-memory and out-of-disk all go through a kill or a half-finished step, so
-every one of them can leave the tree in either state. The worker deletes the
-tree (`subvolume delete`, instant), and the next
-build starts cold, which is always safe.
+**Decided: move the tree into the keep, or discard it.** The tree's fate is
+decided in the same place as the lease's, after the keep decision: kept means
+the tree moves to `<pool>/kept-<id>.build`, anything else means the tree is
+deleted (`subvolume delete`, instant). Either way the package finds no tree
+and the next build starts cold, which is always safe: failure, cancel,
+timeout, out-of-memory and out-of-disk all go through a kill or a
+half-finished step, so every one of them can leave the tree half-updated. The
+keep then carries its tree and goes away with it; without the move, an
+operator entering `kept-<id>` would find `/build/<pkgbase>` empty, and for
+those packages the tree is most of what is worth inspecting.
 
-**This needs no snapshot.** Discarding is deleting the tree. The `<tree>.pre`
-snapshot the first draft of this section proposed only matters for a
-*rollback*, which is deferred. So this item is a few lines in the failure path.
+The move is one `rename`: instant for a subvolume, which keeps its id (and so
+its quota group) across the rename, so the space stays counted and kept builds
+stay the first thing reclaimed. A plain-directory tree -- from before trees
+were subvolumes, living inside the cache subvolume -- cannot cross into the
+pool's top (`EXDEV`), and is discarded instead; those disappear as they get
+rebuilt anyway.
+
+**This needs no snapshot.** Moving and discarding are a rename and a delete.
+The `<tree>.pre` snapshot the first draft of this section proposed only
+matters for a *rollback*, which is deferred.
 
 **The cost, stated plainly:** today a failed build of a long package leaves its
 compiled output for the next attempt. After this, every failure of a
 `persistent_builddir` package costs a cold build next time: hours for
 unreal-engine. That is the case the deferred rollback, or a per-package "keep",
-would be for.
+would be for. A kept failure at least keeps the output inspectable until the
+keep expires.
 
 ### Deferred: per-package rollback
 
@@ -299,13 +315,17 @@ re-derived:
 **Proposal.** When a build fails, keep its subvolumes for `WORKER_KEEP_FAILED`
 (a duration; unset by default, which keeps nothing) instead of deleting them at
 once. An operator can then enter the exact state it failed in:
-`systemd-nspawn -D <pool>/kept-<id>`, with the workdir at
-`<pool>/kept-<id>.data`.
+`systemd-nspawn -D <pool>/kept-<id> --bind=<pool>/kept-<id>.build:/build/<pkgbase>`,
+with the workdir at `<pool>/kept-<id>.data` (and no `--bind` when the build
+kept no tree).
 
 - **Kept means renamed.** At the end of a failed build the worker:
+  0. moves the persistent tree to `kept-<id>.build` first, when the build has
+     one (section 2);
   1. renames `job-<id>` → `kept-<id>`, and likewise `.data`;
   2. `touch`es `kept-<id>`;
-  3. `chmod 0700` on each (see "Credentials");
+  3. `chmod 0700` on each, and on `kept-<id>.build` when there is one (see
+     "Credentials");
   4. removes `job-<id>.lock`.
 
   A rename keeps the subvolume ids, so the group `1/<1000+id>` keeps its members
@@ -340,10 +360,12 @@ once. An operator can then enter the exact state it failed in:
   lost, but it would be retried and logged at every lease. The naming change
   below fixes this.
 - **Where it is shown.** `CompleteReport` gains
-  `kept: Option<KeptBuild { path, until }>` (`aurcache-common`, stored on the
-  build). The build's page says "kept on `<worker>` at `<path>` until `<time>`,
-  or sooner if the worker needs the room". A "debug on worker" action stays
-  deferred.
+  `kept: Option<KeptBuild { path, until, tree }>` (`aurcache-common`, stored on
+  the build), where `tree` is the moved tree's path when the build kept one.
+  The build's page says "kept on `<worker>` at `<path>` until `<time>`, or
+  sooner if the worker needs the room", and shows the one command that enters
+  the failed state, with the `--bind` when there is a tree. A "debug on
+  worker" action stays deferred.
 
 ### Credentials
 
@@ -357,7 +379,8 @@ Nothing secret is left in a kept chroot that the build did not already have:
   the job (`wipe_gnupg_job`) whether or not the build is kept.
 - The makepkg drop-in (the worker's makepkg settings) is inside the chroot.
   So is whatever the PKGBUILD fetched *with* the credential: a private
-  repository's source, in `.data`.
+  repository's source, in `.data` -- and, for a persistent build, the moved
+  tree in `.build`, which is why it gets the same `0700`.
 
 The last point is why kept builds are `0700`. A running build's chroot is
 readable by any local user of the worker host for as long as the build runs.
@@ -370,7 +393,7 @@ first thing reclaimed.
 
 `build_of()` becomes a parser for every name the pool uses:
 `enum Entry { Build { id, part }, Kept { id, part }, Base(Root | Next | Prev), RefreshLock, DevtoolsLock }`,
-with `part` one of chroot, `.data` and `.lock`. `sweep`, `tidy_groups`
+with `part` one of chroot, `.data`, `.lock` and `.build`. `sweep`, `tidy_groups`
 (which counts a `Build` or a `Kept` entry as present) and `ensure_subvolume`
 (which refuses any name that parses) all use it. `ensure_subvolume` already
 refuses dots, so it only has to learn `kept-`.
@@ -378,7 +401,7 @@ refuses dots, so it only has to learn `kept-`.
 | Name | Made by | A leftover means | Handled by | When |
 |---|---|---|---|---|
 | `job-<id>`, `.data`, `.lock` | lease | a build that died with the worker | delete (recursive), group destroyed once empty | startup (all not running); lease (its own id) |
-| `kept-<id>`, `.data` | a failed build | a kept failure | delete when past `WORKER_KEEP_FAILED`, or all if unset | startup; every lease |
+| `kept-<id>`, `.data`, `.build` | a failed build | a kept failure | delete when past `WORKER_KEEP_FAILED`, or all if unset | startup; every lease |
 | `root.next` | refresh | an unfinished base, or the previous base after the exchange | the UUID rule in section 1 | startup; every refresh (under `refresh.lock`) |
 | `root.prev` | refresh | the rollback point | kept; replaced by the next refresh; reclaimed for room | |
 | `refresh.lock` | refresh | nothing: a `flock` dies with its holder | left | |
@@ -405,11 +428,14 @@ Unit tests run with `cargo test`. "Root-gated" means `AURCACHE_POOL_TESTS` in
      - a refresh in flight makes a job start lease at once (the `try_lock`
        path), while a missing base makes it wait.
    - `test-e2e-hybrid.sh`, since the chroot builder changes.
-2. **Kept-tree discard**
-   - Unit: each unsuccessful outcome discards the tree, and a success keeps it.
+2. **Kept-tree move or discard**
+   - Unit: a moved tree lands beside the keep with its stamp dropped, a missing
+     tree moves nothing, and an unmovable tree is discarded instead.
 3. **Kept failures**
    - Root-gated:
      - a kept build keeps its group and limit;
+     - a keep carries its moved tree: locked down with the rest, and removed
+       with it on expiry;
      - the sweep keeps one within its time and deletes an expired one, at
        startup too;
      - `tidy_groups` leaves kept groups alone;

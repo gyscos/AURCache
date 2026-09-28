@@ -44,6 +44,12 @@ pub struct KeptBuild {
     /// Epoch seconds until which it is kept -- or sooner, if the worker needs
     /// the room: kept builds are the first thing reclaimed.
     pub until: i64,
+    /// The persistent build tree moved beside the keep, `<pool>/kept-<id>.build`,
+    /// when the failed build kept one. Bound over `/build/<pkgbase>` it puts
+    /// the failed state back in place; `None` for a build with no persistent
+    /// tree, or one whose tree could not move and was discarded instead.
+    #[serde(default)]
+    pub tree: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]

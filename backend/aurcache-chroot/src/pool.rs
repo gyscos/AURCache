@@ -245,6 +245,13 @@ impl Pool {
         self.mountpoint.join(ROOT_PREV)
     }
 
+    /// Where a kept build's moved tree goes: `<pool>/kept-<id>.build`, beside
+    /// the kept chroot and workdir, removed with them when the keep expires.
+    #[must_use]
+    pub fn kept_tree_path(&self, build_id: i32) -> PathBuf {
+        self.mountpoint.join(kept_build_name(build_id))
+    }
+
     /// The refresh's cross-process exclusion, taken without waiting: `None`
     /// when another process is refreshing now. Held until the returned file is
     /// dropped; the kernel drops it for a dead holder, so a crash never leaves
@@ -833,7 +840,8 @@ impl Pool {
     /// Keep a failed build's volumes for `keep_for` instead of deleting them:
     /// renamed to `kept-<id>*`, readable only by the worker, expiring by
     /// mtime. An operator enters the state the build failed in with
-    /// `systemd-nspawn -D <pool>/kept-<id>`.
+    /// `systemd-nspawn -D <pool>/kept-<id>`. A moved build tree already beside
+    /// it (`kept-<id>.build`) is locked down and expired with the rest.
     ///
     /// A rename keeps the subvolume ids, so the group keeps its members and
     /// its limit: a kept build can never grow, and it stays under the total.
@@ -866,13 +874,19 @@ impl Pool {
             // kept one would be for days -- and it holds whatever the PKGBUILD
             // fetched with the build credential.
             privileged(&["touch".as_ref(), kept.as_os_str()]).await?;
-            privileged(&[
+            // The moved build tree, when the failed build kept one: locked
+            // down with the rest, since it holds the fetched sources.
+            let mut private: Vec<&OsStr> = vec![
                 "chmod".as_ref(),
                 "0700".as_ref(),
                 kept.as_os_str(),
                 kept_data.as_os_str(),
-            ])
-            .await?;
+            ];
+            let kept_build = self.mountpoint.join(kept_build_name(build_id));
+            if kept_build.exists() {
+                private.push(kept_build.as_os_str());
+            }
+            privileged(&private).await?;
             // `makechrootpkg` takes a lock beside the copy and leaves it.
             let lock = self
                 .mountpoint
@@ -1121,8 +1135,7 @@ impl Pool {
     /// Delete one build's subvolumes and group, whatever is left of them.
     async fn remove_build(&self, build_id: i32) {
         self.remove_volumes(
-            chroot_name(build_id),
-            data_name(build_id),
+            vec![chroot_name(build_id), data_name(build_id)],
             Some(format!("{}.lock", chroot_name(build_id))),
             Some(QgroupId::build(build_id)),
         )
@@ -1130,11 +1143,15 @@ impl Pool {
     }
 
     /// Delete one kept failure's subvolumes and group, whatever is left of
-    /// them. A kept failure has no lock: the keep removed it.
+    /// them: the chroot, the workdir, and the moved build tree, when the
+    /// failed build kept one. A kept failure has no lock: the keep removed it.
     async fn remove_kept(&self, build_id: i32) {
         self.remove_volumes(
-            kept_name(build_id),
-            kept_data_name(build_id),
+            vec![
+                kept_name(build_id),
+                kept_data_name(build_id),
+                kept_build_name(build_id),
+            ],
             None,
             Some(QgroupId::build(build_id)),
         )
@@ -1145,23 +1162,21 @@ impl Pool {
     /// interrupted between its two renames leaves beside the kept build.
     async fn remove_build_parts(&self, build_id: i32) {
         self.remove_volumes(
-            chroot_name(build_id),
-            data_name(build_id),
+            vec![chroot_name(build_id), data_name(build_id)],
             Some(format!("{}.lock", chroot_name(build_id))),
             None,
         )
         .await;
     }
 
-    /// Delete two subvolumes, an optional lock file, and an optional group.
+    /// Delete subvolumes, an optional lock file, and an optional group.
     async fn remove_volumes(
         &self,
-        chroot: String,
-        data: String,
+        subvolumes: Vec<String>,
         lock: Option<String>,
         group: Option<QgroupId>,
     ) {
-        let subvolumes: Vec<PathBuf> = [chroot, data]
+        let subvolumes: Vec<PathBuf> = subvolumes
             .into_iter()
             .map(|name| self.mountpoint.join(name))
             .filter(|path| path.exists())
@@ -1333,6 +1348,10 @@ fn kept_data_name(build_id: i32) -> String {
     format!("{KEPT_PREFIX}{build_id}.data")
 }
 
+fn kept_build_name(build_id: i32) -> String {
+    format!("{KEPT_PREFIX}{build_id}.build")
+}
+
 /// One of the pool's top-level names: every build's volumes, every kept
 /// failure, the base in its three generations, and the two lock files. What
 /// the sweep, the group tidy and the subvolume guard all read.
@@ -1353,13 +1372,14 @@ enum BaseKind {
     Prev,
 }
 
-/// Which part of a build's volumes a name is: its chroot, its workdir, or the
-/// lock `makechrootpkg` leaves beside the copy.
+/// Which part of a build's volumes a name is: its chroot, its workdir, the
+/// lock `makechrootpkg` leaves beside the copy, or a kept build's moved tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryPart {
     Chroot,
     Data,
     Lock,
+    Build,
 }
 
 fn entry_of(name: &str) -> Option<Entry> {
@@ -1380,6 +1400,10 @@ fn entry_of(name: &str) -> Option<Entry> {
                 .or_else(|| {
                     rest.strip_suffix(".lock")
                         .map(|digits| (digits, EntryPart::Lock))
+                })
+                .or_else(|| {
+                    rest.strip_suffix(".build")
+                        .map(|digits| (digits, EntryPart::Build))
                 })
                 .unwrap_or((rest, EntryPart::Chroot));
             let id: i32 = digits.parse().ok().filter(|&id| id > 0)?;
@@ -1875,7 +1899,7 @@ mod tests {
     #[test]
     fn pool_entries_name_what_they_are() {
         use BaseKind::{Next, Prev, Root};
-        use EntryPart::{Chroot, Data, Lock};
+        use EntryPart::{Build, Chroot, Data, Lock};
         assert_eq!(
             entry_of("job-42"),
             Some(Entry::Build {
@@ -1901,6 +1925,20 @@ mod tests {
         assert_eq!(
             entry_of("kept-42.data"),
             Some(Entry::Kept { id: 42, part: Data })
+        );
+        assert_eq!(
+            entry_of("kept-42.build"),
+            Some(Entry::Kept {
+                id: 42,
+                part: Build
+            })
+        );
+        assert_eq!(
+            entry_of("job-42.build"),
+            Some(Entry::Build {
+                id: 42,
+                part: Build
+            })
         );
         assert_eq!(entry_of("root"), Some(Entry::Base(Root)));
         assert_eq!(entry_of("root.next"), Some(Entry::Base(Next)));

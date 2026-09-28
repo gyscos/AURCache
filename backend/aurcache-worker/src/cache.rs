@@ -363,6 +363,12 @@ impl Cache {
     /// as resumable, and the next build starts cold instead. A subvolume goes
     /// at once; a plain directory is set aside and removed as a tree.
     ///
+    /// Failure, cancel, timeout, out-of-memory and out-of-disk all go through
+    /// a kill or a half-finished step, so every one of them can leave the tree
+    /// half-updated -- a stale checkout, or an output a killed compiler left
+    /// truncated but newer than its inputs, which make and ninja then treat as
+    /// built. Every retry would fail identically; starting cold is always safe.
+    ///
     /// Best-effort, like every other wipe here: the next build rebuilds over
     /// -- or without -- whatever this leaves. Blocking: run it off the async
     /// runtime.
@@ -380,6 +386,46 @@ impl Cache {
         }
         let _ = std::fs::remove_file(self.size_stamp(platform, pkgbase));
         true
+    }
+
+    /// Move a package's persistent tree beside a kept build, so the operator
+    /// gets the state the build failed in and the next build still starts
+    /// cold: the package finds no tree, exactly as with a discard. The discard
+    /// is really just postponed until the keep expires, which removes the
+    /// moved tree with it. Returns the tree's new path, or `None` when there
+    /// was no tree -- or when the move failed and the tree was discarded
+    /// instead, which keeps the retry cold either way.
+    ///
+    /// The move is one `rename`: instant for a subvolume, which keeps its id
+    /// (and so its quota group) across the rename. A plain-directory tree --
+    /// from before trees were subvolumes, living inside the cache subvolume --
+    /// cannot cross into the pool's top (`EXDEV`), and is discarded instead;
+    /// those disappear as they get rebuilt anyway. Blocking when it discards:
+    /// run it off the async runtime.
+    pub fn move_builddir_to_keep(
+        &self,
+        platform: &str,
+        pkgbase: &str,
+        dest: &Path,
+    ) -> Option<PathBuf> {
+        let tree = self
+            .root
+            .join("builddir")
+            .join(sanitize(platform))
+            .join(sanitize(pkgbase));
+        if tree.symlink_metadata().is_err() {
+            return None;
+        }
+        if let Err(e) = std::fs::rename(&tree, dest) {
+            tracing::warn!(
+                "could not move build tree {} beside the kept build ({e}); discarding it",
+                tree.display()
+            );
+            self.discard_builddir(platform, pkgbase);
+            return None;
+        }
+        let _ = std::fs::remove_file(self.size_stamp(platform, pkgbase));
+        Some(dest.to_path_buf())
     }
 
     /// Shared persistent GnuPG home for validpgpkeys.
@@ -1363,6 +1409,60 @@ mod pkgcache_tests {
             !c.discard_builddir("x86_64", "never-there"),
             "nothing there, nothing discarded"
         );
+    }
+
+    /// A moved tree is gone from the package (so the next build starts cold)
+    /// and present at the keep, with its stamp dropped; a missing tree moves
+    /// nothing.
+    #[test]
+    fn a_moved_tree_lands_beside_the_keep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+        let tree = root.join("kept-pkg");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        write(&tree.join("src/blob"), 10);
+        c.write_size_stamp("x86_64", "kept-pkg", 1000);
+        let dest = tmp.path().join("kept-7.build");
+
+        assert_eq!(
+            c.move_builddir_to_keep("x86_64", "kept-pkg", &dest),
+            Some(dest.clone())
+        );
+        assert!(!tree.exists(), "the package finds no tree");
+        assert!(
+            !c.size_stamp("x86_64", "kept-pkg").exists(),
+            "its stamp goes with it"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("src/blob")).unwrap(),
+            vec![b'x'; 10],
+            "the content lands beside the keep"
+        );
+        assert_eq!(
+            c.move_builddir_to_keep("x86_64", "never-there", &tmp.path().join("kept-8.build")),
+            None,
+            "nothing there, nothing moved"
+        );
+    }
+
+    /// A tree that cannot move is discarded instead: the retry is still cold,
+    /// and the keep simply has no tree. A destination whose parent is missing
+    /// stands in for the `EXDEV` a plain-directory tree gets crossing into
+    /// the pool's top.
+    #[test]
+    fn an_unmovable_tree_is_discarded_instead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cache(tmp.path(), 0);
+        let root = c.builddir("x86_64").unwrap();
+        let tree = root.join("stuck");
+        std::fs::create_dir_all(&tree).unwrap();
+        write(&tree.join("blob"), 10);
+        let dest = tmp.path().join("no-such-dir").join("kept-7.build");
+
+        assert_eq!(c.move_builddir_to_keep("x86_64", "stuck", &dest), None);
+        assert!(!tree.exists(), "the failed move still discards");
+        assert!(!c.size_stamp("x86_64", "stuck").exists(), "stamp and all");
     }
 
     /// Every other cache directory is group-writable so the build user can

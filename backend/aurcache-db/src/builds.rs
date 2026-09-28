@@ -73,6 +73,10 @@ pub struct Model {
     /// worker takes a kept chroot early when the pool needs the room.
     pub kept_path: Option<String>,
     pub kept_until: Option<i64>,
+    /// The persistent build tree moved beside the keep (`<pool>/kept-<id>.build`),
+    /// when the failed build kept one. `None` for a build with no persistent
+    /// tree, or one whose tree could not move and was discarded instead.
+    pub kept_tree: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

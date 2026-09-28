@@ -306,6 +306,7 @@ pub(crate) fn build_row_select() -> Select<Builds> {
         .column(builds::Column::DiskBuildTree)
         .column(builds::Column::KeptPath)
         .column(builds::Column::KeptUntil)
+        .column(builds::Column::KeptTree)
         // Left, so a queued build -- which has no worker yet -- still lists.
         .join(JoinType::LeftJoin, builds::Relation::Workers.def())
         .column_as(workers::Column::Name, "worker_name")
@@ -333,6 +334,7 @@ pub(crate) struct BuildRow {
     disk_build_tree: Option<i64>,
     kept_path: Option<String>,
     kept_until: Option<i64>,
+    kept_tree: Option<String>,
     worker_name: Option<String>,
 }
 
@@ -358,7 +360,11 @@ impl BuildRow {
             kept: self
                 .kept_path
                 .zip(self.kept_until)
-                .map(|(path, until)| KeptBuild { path, until }),
+                .map(|(path, until)| KeptBuild {
+                    path,
+                    until,
+                    tree: self.kept_tree,
+                }),
             worker_name: self.worker_name,
             // Filled only by the detail route, which knows it is rendering one
             // build; the lists would pay a stat per row for fields they do not
