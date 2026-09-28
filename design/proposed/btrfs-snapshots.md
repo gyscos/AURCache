@@ -6,9 +6,32 @@ every worker, not only on hosts that happen to be btrfs. A snapshot is instant,
 and under simple quotas a new snapshot is charged only for what is written into
 it afterwards. That makes it cheap to get three things: a rollback point,
 isolation between writers, and a copy to inspect later. This doc collects the
-places where the worker could use them.
+places where the worker could use them, and settles how each one behaves.
 
-Status: **Proposed** · Last updated: 2026-09-25
+Status: **Proposed** · Last updated: 2026-09-28
+
+Split off from this doc:
+- `design/rejected/source-cache-snapshots.md`: per-build snapshots of the source
+  cache merged back with git, and mirrors shared by URL. Designed and
+  prototyped, then rejected for now as not worth their cost.
+- `design/proposed/git-mirror-maintenance.md`, postponed: git's auto-gc in a
+  source mirror can prune objects a kept checkout still borrows. It is a
+  separate issue that snapshots do not touch.
+
+Decided (details in each section; measurements in "Prototype results"):
+
+- **Base refresh** snapshots `root` into `root.next`, upgrades and checks it,
+  then swaps it in with `renameat2(RENAME_EXCHANGE)`, which works on subvolume
+  roots, as the worker's own user. No fallback is needed. `root.lock` and every
+  user of it go. A refresh in flight never holds up a build start.
+- **Kept build trees** are discarded on any unsuccessful build. Discarding needs
+  no snapshot, so the `.pre` snapshot comes only with per-package rollback,
+  which is deferred. Its rules are written down below so they are ready.
+- **Failed builds** are kept by renaming `job-<id>*` to `kept-<id>*`. The keep
+  runs from the chroot directory's mtime, with no sidecar file. Canceled, timed
+  out and out-of-disk builds are not kept, and kept builds are the first thing
+  deleted when the pool needs room.
+- One naming scheme and one sweep cover every new name. See "Crash recovery".
 
 ---
 
@@ -37,173 +60,393 @@ the extent exists, and never move that charge:
   stays as a `<squota space holder>` carrying that charge, and it keeps its
   relations to the groups above it. So the charge stays under the pool's total,
   as long as we never destroy a group that still carries charge. The pool code
-  only destroys groups btrfs agrees are empty (`tidy_groups`), which keeps this
-  true.
+  only destroys groups btrfs agrees are empty (`tidy_groups`, and
+  `qgroup clear-stale`, which was checked to leave a charged space holder
+  alone), which keeps this true.
+- **"Something else" includes the next generation of the same thing.** A
+  subvolume snapshotted from an older one shares every extent neither has
+  rewritten, and those stay charged to the older one after it is deleted: its
+  space holder lives as long as the newer one keeps those files, not just as
+  long as the builds that were running. Measured on a refreshed base: 257 MB of
+  a 308 MB base stayed on the retired base's space holder after every build had
+  ended, and the current base's own group showed only the 51 MB its refresh
+  wrote. The total is right throughout. What is wrong is any figure read from
+  one subvolume's group as "the size of this thing". Section 1 and the deferred
+  rollback in section 2 both run into this.
 - **Never reflink out of a build into long-lived storage.** A reflinked extent
   stays charged to the build that wrote it, so it is invisible to the
   destination's figures. This is why a job's pacman cache already lives inside
   the `pacman-pkg` subvolume rather than the build's. The same rule applies
-  below: data moving from a build into a cache is copied, never reflinked.
+  below: data moving from a build into a cache is copied, never reflinked, and
+  never promoted by snapshotting the build's subvolume.
 
 ## 1. Refresh the base as a new snapshot and swap it in
 
 **Today.** A refresh upgrades `root` in place. It takes `root.lock` exclusively;
-a build start that finds it held only shared (for the instant of its own
-snapshot) defers the refresh. An upgrade that breaks halfway (a failing hook, a
+a build start that finds it held shared (for the instant of its own snapshot)
+defers the refresh. An upgrade that breaks halfway (a failing hook, a
 half-installed package, a full disk) leaves the base broken for every build
-after it, and nothing puts it back.
+after it, and nothing puts it back. A non-zero `pacman -Syu` is only warned
+about (`ensure_base_chroot`), so the broken base is used as it is.
 
-**Proposal.**
-1. `btrfs subvolume snapshot root root.next`.
-2. Upgrade `root.next`, with the same `arch-nspawn … pacman -Syu` and
-   `ensure_multilib`.
-3. Check it: at least a clean exit and `pacman -Dk`. A failed or failed-check
-   upgrade deletes `root.next` and leaves `root` as it was.
-4. Swap: `renameat2(root.next, root, RENAME_EXCHANGE)`, so the path `root`
-   atomically becomes the new base and `root.next` the old one. Then rename the
-   old one to `root.prev` and delete the `root.prev` before it.
+### The refresh
+
+Under the refresh exclusion (below):
+
+1. **Recover** whatever a previous refresh left (see "Crash states").
+2. `btrfs subvolume snapshot root root.next`, then `charge_to_total(root.next)`
+   at once, before anything is written into it. The snapshot is made at the
+   pool's top, which the total does not cover on its own.
+3. **Upgrade:** `arch-nspawn root.next pacman -Syu --noconfirm`. It must exit 0.
+   devtools does not care what the directory is called.
+4. **Multilib:** `ensure_multilib(root.next)`, best-effort as today. Its failure
+   off x86_64 is expected and is not a failed check.
+5. **Check**, inside `root.next` with `arch-nspawn`, so the checks also run the
+   binaries that were just upgraded:
+   - `pacman -Dk`: every installed package's dependencies are satisfied and
+     nothing conflicts;
+   - `pacman -Q base-devel`: the build toolchain is still installed;
+   - `sudo -u nobody true`: the path `makechrootpkg`'s `chrootbuild` takes to
+     drop to the build user works (a broken sudo, PAM or glibc fails every
+     build);
+   - no `/var/lib/pacman/db.lck` is left.
+6. **Swap:** `renameat2(root.next, root, RENAME_EXCHANGE)`, in-process
+   (`libc::renameat2`). The pool's top directory belongs to the worker, and an
+   exchange within one directory needs no rights over the subvolumes
+   themselves, so no sudo is needed (measured). The path `root` is never
+   absent: it names the old base, then the new one. Afterwards `root.next`
+   names the old one.
+7. **Retire:** delete `root.prev` if there is one, then rename `root.next` to
+   `root.prev`. The deletion comes first because a rename onto a non-empty
+   directory fails with `ENOTEMPTY` (measured).
+8. Stamp `last_refresh`.
+
+If any of steps 2 to 5 fails, `root.next` is deleted and `root` stays exactly as
+it was. The failure is reported as a refresh warning is today (`report_warning`,
+to the build that triggered it), and `last_refresh` is still stamped: a refresh
+that fails will fail again, so the next attempt waits for the interval rather
+than running before every build. Builds are not exposed to the stale base by
+this. Each one still runs its own `makechrootpkg -u` in its snapshot, where the
+same failure shows up in that build's log.
+
+If the exchange itself is refused, that is the same as a failed check:
+`root.next` goes and `root` stays. It exists on every kernel that has simple
+quotas (btrfs gained `RENAME_EXCHANGE` in 4.7; squota needs 6.7), so no
+two-rename fallback, and no `ENOENT` retry in `lease()`, is specified. Two
+renames would open a window with no `root` at all, which is the thing the
+exchange is for.
 
 A build snapshots whatever `root` is at the instant it asks, before or after
-the swap, and is never exposed to a base halfway through an upgrade. The
-refresh never waits on builds and builds never wait on it, so `root.lock` and
-the deferral logic (`try_lock_base`, `BaseLock::Busy`) go away. `root.prev` is
-a rollback: if a new base turns out bad, renaming it back restores the last
-one, which could be an explicit operation (`aurcache-cli worker …`) later.
+the swap, and is never exposed to a base halfway through an upgrade. A build
+already running on the old base is unaffected by the exchange, and so is any
+file it holds open or any directory it is in (measured).
 
-**Accounting.** `root.next` is made at the pool's top, which the total does not
-cover, so it is assigned to `2/0` on creation, as `mkarchroot`'s base is today
-(`charge_to_total`). What the upgrade writes is charged to `root.next`. When
-the old base is deleted while builds still hold snapshots of it, its group
-becomes a space holder for what they share, still under `2/0`, and it empties
-as those builds end.
+`root.prev` is a rollback point: renaming it back over `root` (by the same
+exchange) restores the last base. That can become an explicit operation
+(`aurcache-cli worker …`) later. Nothing does it automatically.
 
-**Cost.** One snapshot per refresh (milliseconds), plus the old base's
-exclusive extents held until `root.prev` is replaced: roughly one refresh's
-worth of upgraded packages.
+### Exclusion without `root.lock`
+
+A snapshot is atomic and the swap is atomic, so nothing about *taking* a
+snapshot needs to be excluded from a refresh any more. What still needs
+excluding is two refreshes at once:
+
+- **Within the worker:** the existing `last_refresh: Mutex<Option<Instant>>`
+  in `Chroots` stays the in-process exclusion, and is where "is it due" and
+  "refresh it" remain one decision. A job start takes it with `try_lock`. If
+  it is held, a refresh is already running, and the job leases the current
+  `root` at once instead of queueing behind a 13-second upgrade. The one
+  exception is a pool with no base yet: that start waits (`lock().await`),
+  because there is nothing to snapshot until `mkarchroot` is done.
+- **Across processes:** `build-once` can share a pool with a running worker
+  (`ONE_SHOT_BUILD_ID`). The refresh also takes a `flock` on
+  `<pool>/refresh.lock`, a worker-owned file, without waiting. If it is busy,
+  the refresh is skipped as above. The kernel drops the lock when its holder
+  dies, so a lock left by a crash never exists. That is also what lets step 1
+  treat any `root.next` it finds as dead.
+
+What goes, all in `aurcache-worker` (the docker worker has no chroot and none
+of these):
+
+| Item | Where | Why it existed |
+|---|---|---|
+| `BaseLock`, `try_lock_base` | `chroot.rs` | the refresh's exclusive `root.lock` |
+| `share_base_chroot`, `open_base_lock` | `chroot.rs` | a lease's shared `root.lock` for its snapshot |
+| `lock_beside` and its test | `chroot.rs` | the path of `root.lock` |
+| the `BaseLock` match in `Chroots::refresh`, the shared lock in `Chroots::acquire` | `chroots.rs` | the two callers |
+| `BASE_CHROOT_LOCK` | `chroot.rs` | serializing creation and refresh within a process: now the `last_refresh` mutex |
+| the "caller must hold `root.lock`" contract | `ensure_base_chroot`'s doc | |
+
+devtools itself only takes `root.lock` in `mkarchroot` (first creation, which
+runs under the refresh exclusion) and in `makechrootpkg`'s `sync_chroot`, which
+never runs here: it only runs when the copy is missing or with `-c`, and the
+worker always makes the copy itself and never passes `-c` (checked in devtools
+1.5.1). `arch-nspawn` takes no lock. The `root.lock` file `mkarchroot` left is
+deleted by the startup sweep.
+
+### Crash states
+
+The recovery in step 1 runs when a refresh starts and in the startup sweep,
+both while holding `refresh.lock`. It reads the two subvolumes' UUIDs
+(`btrfs subvolume show`):
+
+| Found | What happened | Recovery |
+|---|---|---|
+| `root.next`, whose Parent UUID is `root`'s UUID | the refresh died before the exchange: an unfinished, unchecked base | delete `root.next` |
+| `root.next`, and `root`'s Parent UUID is `root.next`'s UUID | the refresh died between the exchange and the retire step: `root.next` is the previous base | delete any `root.prev`, rename `root.next` to `root.prev` |
+| `root.next`, neither relation readable | cannot tell | delete `root.next` (the cost is losing the rollback point) |
+| `root.prev` | the rollback point | keep |
+| no `root` | first start, or an operator removed it | `mkarchroot`, as today; any `root.next` is deleted first |
+
+After an exchange, `root`'s Parent UUID is `root.next`'s UUID (measured), so the
+two middle cases cannot be confused. The invariant the whole sequence keeps is
+that `root` is always a complete, checked base.
+
+### Accounting
+
+- `root.next` goes under `2/0` as soon as it is made (step 2), as `mkarchroot`'s
+  base does today (`charge_to_total`). What the upgrade writes is charged to it.
+  After the exchange nothing needs reassigning: groups follow subvolume ids, not
+  names.
+- `root.prev` keeps its group under `2/0`. When it is deleted, its group becomes
+  a space holder for every extent something still references: builds'
+  snapshots of it, and, for as long as they last, the files the newer bases
+  never rewrote (see "Accounting" above). A space holder stays under `2/0`, so
+  the total is right.
+- Such groups accumulate: one level-0 space holder per past base that wrote an
+  extent still in use, emptied when the last file it wrote is replaced. In
+  practice that is bounded by how many refreshes a package's lifetime spans
+  (hundreds a year at most), and btrfs handles that many groups. `clear-stale`
+  removes each one once it is empty. `tidy_groups` needs no change: it only
+  considers level-1 build groups, and base groups are level 0.
+- The consequence is that the base's size can no longer be read from `root`'s
+  group: it holds only what the last refresh wrote. Nothing reads it today (a
+  build's report splits its own usage, never the base's). If it is ever shown,
+  it has to be derived (the total minus the caches' and builds' groups), not
+  read from one group.
+- `root.prev` is the second thing reclaimed when a build needs room, after kept
+  failed builds and before any cache (section 3).
+
+**Cost.** One snapshot per refresh (milliseconds), plus the retired base's
+exclusive extents until the next refresh replaces `root.prev`: roughly one
+refresh's upgraded packages and sync databases.
 
 **Rejected before, and why that no longer holds.** `overlay-chroot.md`
 rejected "a new base per refresh" because on the filesystems it targeted a
 copy was a full write of the chroot (~62 GB a day at a 30-minute interval).
 Inside the pool a copy is a snapshot, so the objection is gone.
 
-## 2. Per-build snapshots of the source cache, merged back with git
-
-**Today.** A build writes its package's source cache directly: downloads, and
-`git fetch` into bare mirrors. So two builds of one package cannot run at
-once, and a source cache *shared across packages* -- the gcc and glibc
-toolchain case in the deferred shared-SRCDEST idea -- cannot exist, because two
-builds would write the same mirror concurrently. A fetch that corrupts a mirror
-is caught only afterwards, by `wipe_srcdest`'s self-heal.
-
-**Proposal.**
-1. At lease time, snapshot the source cache into the build:
-   `cache/srcdest/<key>` → `<pool>/job-<id>.src`, put in the build's group
-   (`1/<1000+id>`) and bound at `/srcdest`. The build fetches into its own copy.
-   Nothing it does reaches the shared cache while it runs.
-2. When the build succeeds, merge its copy back **at the git level, not by
-   replacing the subvolume**, under a short per-key lock:
-   - **git mirrors:** in the shared mirror, fetch from the build's copy. That
-     adds every object the build has. Git objects are only ever added, so a
-     union of two builds' fetches is always safe.
-   - **plain downloads** (tarballs): copy the files the shared cache lacks,
-     with `--reflink=never` (see Accounting).
-3. A failed build's copy is discarded, fetches and all: a corrupt mirror never
-   reaches the shared cache.
-
-**Why not promote the whole snapshot.** Two builds that snapshot the same
-mirror and fetch at different times each end with a complete, consistent
-mirror. Promoting either one discards what only the other fetched. A kept build
-tree's checkouts are `git clone -s` of the mirror, so they own no objects and
-borrow them through `alternates`: a checkout made by the losing build can
-reference objects the promoted mirror lacks, and that package's next build
-fails with `bad object … did not send all necessary objects`. That is the
-failure `wipe_borrowed_checkouts` exists for. A git-level merge keeps the
-union, so every checkout's objects stay present.
-
-**Refs.** Objects merge freely; refs need a rule.
-- A ref only moves forward when the build's value is a descendant of the
-  shared one (a fast-forward).
-- A ref that is not (upstream force-pushed) takes the value from whichever
-  build *fetched* later -- each copy records when it fetched -- not whichever
-  finished later.
-- The older value's objects stay in the mirror either way, so a checkout still
-  pointing at them keeps working. They are pinned under
-  `refs/aurcache/kept/…` so a later `git gc` does not prune what a checkout
-  borrows, and those pins are dropped when the package's kept tree is evicted.
-
-Open detail: whether to fetch with an explicit refspec and apply the rule in
-our code, or fetch into a staging namespace (`refs/aurcache/incoming/<id>/*`)
-and move refs from there. The second keeps every decision out of git's
-`+`/no-`+` semantics.
-
-**What it enables.** Builds of one package no longer serialize on its sources,
-and the shared cross-package source cache becomes possible: the cache key
-becomes a *source* (a mirror URL) rather than a pkgbase. Eviction then works
-on shared keys, so wiping one no longer means "this package's sources are
-bad".
-
-**Accounting.** What a build fetches is charged to its own copy, inside its
-per-build limit: its downloads are part of its build, as they are not today. The
-merge writes new packs into the shared mirror, charged to the shared cache.
-`git fetch` from a local path goes through its transport and writes objects
-normally; unlike `git clone --local`, it does not hardlink. Downloads are copied
-without reflink for the same reason. When the build's copy is deleted, its
-extents are freed.
-
-**Cost.** A snapshot per build (milliseconds) and a local fetch per success,
-proportional to what the build fetched, not to the mirror's size. The lock is
-held only for that local merge.
-
-## 3. A rollback point for kept build trees
+## 2. Discard a kept build tree when its build fails
 
 **Today.** A build writes its kept tree in place. One that dies partway leaves
-a half-updated tree, which makepkg treats as resumable next time, and a stale
-checkout in it can fail every retry identically (the self-heal in
-`wipe_borrowed_checkouts` and the stale-checkout detection in `job.rs`).
+a half-updated tree, which makepkg treats as resumable next time, and it can
+fail every retry identically:
+- a stale checkout, handled after the fact by `wipe_borrowed_checkouts` and the
+  stale-checkout detection in `job.rs`;
+- an output a killed compiler left truncated but newer than its inputs, which
+  make and ninja then treat as built. GNU make deletes a half-built target when
+  it is interrupted by `SIGTERM` or `SIGINT`, but not on `SIGKILL`, and
+  `SIGKILL` (`cgroup.kill`) is how the worker ends a build.
 
-**Proposal.** Snapshot the tree before the build (`<tree>` → `<tree>.pre`). On
-success, delete the snapshot. On failure, either:
-- **roll back:** delete the tree and rename the snapshot into its place. The
-  next build resumes from the last good state; or
-- **discard:** delete both. The next build starts cold, which is always safe.
+**Decided: discard on every unsuccessful build.** Failure, cancel, timeout,
+out-of-memory and out-of-disk all go through a kill or a half-finished step, so
+every one of them can leave the tree in either state. The worker deletes the
+tree (`subvolume delete`, instant), and the next
+build starts cold, which is always safe.
 
-**Accounting caveat, which decides between them.** The kept tree's size is read
-from its own subvolume's group. After a rollback, the tree is the snapshot,
-whose own group carries only what was written into it since (nothing), while
-its real contents stay charged to the deleted original, now a space holder. The
-total stays right, but that tree then reads as nearly empty to eviction, which
-would never pick it by size until it is rebuilt. So either:
-- rollback also re-measures the tree the old way (the size stamp) and eviction
-  prefers the stamp for such a tree, or
-- failures discard instead, which is simpler and always accurate, at the price
-  of a cold rebuild.
+**This needs no snapshot.** Discarding is deleting the tree. The `<tree>.pre`
+snapshot the first draft of this section proposed only matters for a
+*rollback*, which is deferred. So this item is a few lines in the failure path.
 
-Discard is the safer default. Rollback is worth it for packages whose tree
-takes hours to rebuild (unreal-engine), which could make it a per-package
-choice.
+**The cost, stated plainly:** today a failed build of a long package leaves its
+compiled output for the next attempt. After this, every failure of a
+`persistent_builddir` package costs a cold build next time: hours for
+unreal-engine. That is the case the deferred rollback, or a per-package "keep",
+would be for.
 
-**Cost while the build runs.** The snapshot holds the tree's old extents that
-the build overwrites, charged to the tree, until the build ends. For a build
-that rewrites most of its tree, that is up to one extra tree's worth of disk.
+### Deferred: per-package rollback
 
-## 4. Keep a failed build's chroot for a while
+If it is ever needed, it becomes a package setting,
+`BUILDDIR_ON_FAILURE = discard | rollback`. It is resolved on the server
+through `ApplicationSettings` (Package → Env → Global → Default) and sent in
+`JobDescriptor` next to `persistent_builddir`, which is resolved and sent the
+same way. What it would take, settled now so it does not have to be
+re-derived:
 
-**Proposal.** When a build fails (not when it is canceled or times out), keep
-its snapshot and workdir for a configurable time (`WORKER_KEEP_FAILED`, off by
-default) instead of deleting them at once. An operator can then enter the exact
-state it failed in: `systemd-nspawn -D <pool>/job-<id>`, with the workdir at
-`<pool>/job-<id>.data`. The release happens later, from the sweep.
+- **Name:** `cache/builddir/<arch>/.pre.<pkgbase>`, snapshotted from the tree
+  at lease time. makepkg refuses a `pkgname` that begins with a dot, so no
+  tree can have that name (`lint_pkgbuild/pkgname.sh`). The scans skip only
+  the set-aside suffix today (`is_set_aside`), so they, and
+  `reclaim_builddirs`, must learn to skip dot-prefixed names too.
+- **Orphans:** a `.pre.<pkgbase>` with no running build of that package means
+  the build died with the worker. The startup sweep and every lease on that
+  arch discard both the tree and the `.pre`. The sweep never rolls back: a
+  crash says nothing about whether the tree was worth keeping.
+- **Rollback** is a delete of the tree and a rename of `.pre` into its place,
+  followed by a size stamp: `record_builddir_size` walks the tree, and eviction
+  prefers the stamp for it. This is needed because the restored tree's own
+  group reads nearly empty, its contents being charged to the deleted original
+  (see "Accounting").
+- **Reserve up to twice the tree.** While the build runs, every extent it
+  overwrites stays charged to the tree as long as `.pre` holds it. So before the
+  build, `reclaim_builddirs` has to make room for this tree's size a second
+  time, and the pool-wide check ("evict until the build's limit fits under the
+  total") has to add it. The caches' budgets are eviction targets, not qgroup
+  limits, so it is the total that must have the room.
 
-- **The sweep** keeps what is kept and still within its time, and deletes the
-  rest. The startup sweep does the same, instead of treating every leftover as
-  garbage.
-- **Its quota group** keeps its limit, so a kept build can never grow, and it
-  stays under the total: kept builds count against `WORKER_DISK_MAX`, and when
-  the pool is short of room they are the first things deleted, before caches.
-- **Where it is shown.** The build's report could say it was kept and where; a
-  "debug on worker" action is further off.
+## 3. Keep a failed build's chroot for a while
 
-**Cost.** Up to one build's disk per kept failure, for the time set.
+**Proposal.** When a build fails, keep its subvolumes for `WORKER_KEEP_FAILED`
+(a duration; unset by default, which keeps nothing) instead of deleting them at
+once. An operator can then enter the exact state it failed in:
+`systemd-nspawn -D <pool>/kept-<id>`, with the workdir at
+`<pool>/kept-<id>.data`.
+
+- **Kept means renamed.** At the end of a failed build the worker:
+  1. renames `job-<id>` → `kept-<id>`, and likewise `.data`;
+  2. `touch`es `kept-<id>`;
+  3. `chmod 0700` on each (see "Credentials");
+  4. removes `job-<id>.lock`.
+
+  A rename keeps the subvolume ids, so the group `1/<1000+id>` keeps its members
+  and its limit (measured). A kept build can never grow, and it stays under the
+  total. The name is what tells a kept build from a crash leftover, which the
+  startup sweep must be able to do without any record.
+- **Keep-until is `mtime(kept-<id>) + WORKER_KEEP_FAILED`, with no sidecar.**
+  The `touch` sets the mtime to when the build ended. The mtime of the chroot's
+  top directory only moves when an entry directly under `/` is made or removed,
+  which neither makepkg nor devtools does after the build. The setting is read
+  at sweep time, so lowering it shortens keeps already made. `touch` extends
+  one, and so does an operator's own work at the top of the chroot. That is
+  harmless, and arguably what they want.
+- **Not kept:**
+  - canceled builds;
+  - timed-out builds;
+  - out-of-disk builds (`disk_reason` is `Some`): the largest chroots, with the
+    least to show, since the cause is already known;
+  - one-shot builds (their id is fixed, so the next run would collide).
+
+  Out-of-memory failures are kept: small on disk, and the state they died in is
+  the interesting part.
+- **The sweep** keeps a `kept-<id>` still within its time and deletes one past
+  it, or every one when the setting is unset. It runs at startup, and at every
+  lease (where `tidy_groups` already runs), so no new timer is needed.
+- **Room first comes from kept builds.** Before a build, the worker evicts
+  until the build's limit fits under the total. It now deletes, in order: kept
+  builds, oldest first; then `root.prev`; then caches, as today.
+- **`tidy_groups`** must treat a `kept-*` entry as present. Otherwise it tries
+  to destroy the kept build's group at every lease. btrfs refuses that with
+  `EBUSY` while the group has live members (measured), so nothing would be
+  lost, but it would be retried and logged at every lease. The naming change
+  below fixes this.
+- **Where it is shown.** `CompleteReport` gains
+  `kept: Option<KeptBuild { path, until }>` (`aurcache-common`, stored on the
+  build). The build's page says "kept on `<worker>` at `<path>` until `<time>`,
+  or sooner if the worker needs the room". A "debug on worker" action stays
+  deferred.
+
+### Credentials
+
+Nothing secret is left in a kept chroot that the build did not already have:
+
+- The SSH key lives in `<data_dir>/secrets`, outside the pool, and is never bound
+  into a chroot (`credentials.rs`). It is used through the agent.
+- The agent's socket *directory* is bound in (`agent.rs`). A bind mount ends
+  with the container, so the kept chroot holds an empty mount point.
+- The GnuPG replica is public keys, in the cache subvolume, and is wiped with
+  the job (`wipe_gnupg_job`) whether or not the build is kept.
+- The makepkg drop-in (the worker's makepkg settings) is inside the chroot.
+  So is whatever the PKGBUILD fetched *with* the credential: a private
+  repository's source, in `.data`.
+
+The last point is why kept builds are `0700`. A running build's chroot is
+readable by any local user of the worker host for as long as the build runs.
+A kept one would be readable for days.
+
+**Cost.** Up to one build's disk per kept failure, for the time set, and the
+first thing reclaimed.
+
+## Crash recovery: every name in the pool
+
+`build_of()` becomes a parser for every name the pool uses:
+`enum Entry { Build { id, part }, Kept { id, part }, Base(Root | Next | Prev), RefreshLock, DevtoolsLock }`,
+with `part` one of chroot, `.data` and `.lock`. `sweep`, `tidy_groups`
+(which counts a `Build` or a `Kept` entry as present) and `ensure_subvolume`
+(which refuses any name that parses) all use it. `ensure_subvolume` already
+refuses dots, so it only has to learn `kept-`.
+
+| Name | Made by | A leftover means | Handled by | When |
+|---|---|---|---|---|
+| `job-<id>`, `.data`, `.lock` | lease | a build that died with the worker | delete (recursive), group destroyed once empty | startup (all not running); lease (its own id) |
+| `kept-<id>`, `.data` | a failed build | a kept failure | delete when past `WORKER_KEEP_FAILED`, or all if unset | startup; every lease |
+| `root.next` | refresh | an unfinished base, or the previous base after the exchange | the UUID rule in section 1 | startup; every refresh (under `refresh.lock`) |
+| `root.prev` | refresh | the rollback point | kept; replaced by the next refresh; reclaimed for room | |
+| `refresh.lock` | refresh | nothing: a `flock` dies with its holder | left | |
+| `root.lock` | `mkarchroot` | unused since the swap | delete | startup |
+| `cache/builddir/<arch>/.pre.<pkgbase>` | rollback (deferred) | a build that died | discard the tree and it | startup; lease on that arch |
+
+## Test plan
+
+Unit tests run with `cargo test`. "Root-gated" means `AURCACHE_POOL_TESTS` in
+`aurcache-chroot` (or the worker's pool tests), run by `scripts/test-kernel.sh`.
+
+1. **Base refresh**
+   - Root-gated:
+     - the exchange swaps the base atomically: lease in a loop while
+       refreshing, and assert every snapshot holds all old or all new marker
+       files;
+     - a failing check leaves `root` byte-for-byte and deletes `root.next`;
+     - both crash states built by hand: an unfinished `root.next` is deleted,
+       a post-exchange one becomes `root.prev`;
+     - the total is unchanged across a swap, and the retired base's space
+       holder stays under `2/0` and survives `clear-stale`.
+   - Unit:
+     - the `Entry` parser;
+     - a refresh in flight makes a job start lease at once (the `try_lock`
+       path), while a missing base makes it wait.
+   - `test-e2e-hybrid.sh`, since the chroot builder changes.
+2. **Kept-tree discard**
+   - Unit: each unsuccessful outcome discards the tree, and a success keeps it.
+3. **Kept failures**
+   - Root-gated:
+     - a kept build keeps its group and limit;
+     - the sweep keeps one within its time and deletes an expired one, at
+       startup too;
+     - `tidy_groups` leaves kept groups alone;
+     - room-making deletes kept builds before `root.prev` and before caches;
+     - after a build that used the agent, no file under `kept-*` contains the
+       key's bytes or is a socket, and the tops are `0700`.
+   - Unit: which outcomes are kept.
+
+## Prototype results (2026-09-28)
+
+A root prototype on the local worker (kernel 7.2.4, btrfs-progs 7.1): a sparse
+4G image, `-m single`, simple quotas, a `2/0` total. A 300 MB base with 3000
+files stood in for the chroot. The git prototypes run in the same session are
+recorded with the designs they belong to (see the top of this doc).
+
+| Check | Result |
+|---|---|
+| `renameat2(RENAME_EXCHANGE)` on two subvolume roots | works, and as a non-root user owning the pool's top directory |
+| During the exchange: a build's snapshot of the old base, a file held open in it, a process whose cwd is inside the old base | all unaffected; a snapshot of `root` taken after it is of the new base |
+| Exchange with `root.next` missing | `ENOENT`, nothing changed |
+| Rename of a subvolume onto an existing `root.prev` | `ENOTEMPTY`: the old one is deleted first |
+| UUIDs after the exchange | `root`'s Parent UUID is `root.next`'s UUID, which tells "after the exchange" from "unfinished" |
+| Deleting the old base while a build's snapshot shares it | its group becomes a space holder under `2/0`; the total is unchanged |
+| After every build ended | the space holder stays with 257 of 308 MB: the new base shares the old base's unchanged files, which stay charged to the old base. `root`'s own group shows 51 MB, what the refresh wrote |
+| `qgroup clear-stale` with that space holder | leaves it (only empty groups go) |
+| Rename `job-7` → `kept-7` | group membership and limit kept |
+| `qgroup destroy` of a group with live members | `EBUSY` |
+
+What this changed in the design:
+- The swap needs no fallback, and the refresh needs no sudo for it.
+- Retiring `root.prev` deletes before it renames.
+- Crash recovery reads UUIDs rather than guessing.
+- The base's size can no longer be read from its own group.
+- Discard-on-failure needs no snapshot.
+
+Still to measure before implementing:
+- How long the health checks take on a real base.
 
 ## Rejected: a per-package chroot with its dependencies installed
 
@@ -218,10 +461,8 @@ package can link against something it never declared.
 
 1. **Base refresh by snapshot and swap.** It removes a failure mode (a broken
    base) and a source of contention (the refresh lock), and it is small: the
-   refresh path and the removal of the lock logic.
-2. **Per-build source snapshots with git-level merge.** The largest, and the
-   one that unlocks something new (the shared cross-package source cache).
-   Start with same-package concurrency, then change the cache key.
-3. **Keep failed builds.** Small and independent, useful for debugging.
-4. **Kept-tree snapshots.** Discard on failure first; rollback per package only
-   if a long rebuild justifies it.
+   refresh path, the recovery, and the removal of the lock logic.
+2. **Keep failed builds.** Small and independent, useful for debugging, and it
+   brings the naming parser the refresh's recovery also uses.
+3. **Discard kept trees on failure.** A few lines in the failure path. Rollback
+   only if a long rebuild justifies it.
