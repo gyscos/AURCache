@@ -54,6 +54,11 @@ pub const KEY_FILE: &str = "id_ed25519";
 /// `known_hosts` filename within that directory.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
+/// Where the worker generates its own key when none is provided.
+pub fn generated_key(data_dir: &Path) -> PathBuf {
+    data_dir.join("ssh").join(KEY_FILE)
+}
+
 /// A credential staged for a build: the `GIT_SSH_COMMAND` that uses it.
 ///
 /// Only the command is carried — the staged key path lives at the fixed
@@ -88,7 +93,7 @@ impl KeySource {
 pub fn resolve(cfg: &Config) -> KeySource {
     match &cfg.git_ssh_key {
         Some(path) => KeySource::Provided(path.clone()),
-        None => KeySource::Generated(cfg.core.data_dir.join("ssh").join(KEY_FILE)),
+        None => KeySource::Generated(generated_key(&cfg.core.data_dir)),
     }
 }
 

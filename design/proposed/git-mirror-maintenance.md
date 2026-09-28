@@ -49,13 +49,19 @@ whichever build's fetch triggered it, and that build pays its time. On a
 
 - **Not observed.** It needs a force-push, a kept tree, and auto-gc happening
   to trigger on the right fetch.
-- **Already recovered from.** `job.rs` recognizes the `bad object` signature
-  after a failed build and calls `wipe_borrowed_checkouts`, so the retry
-  re-clones the checkout from the mirror. The cost is one failed build.
+- **Already recovered from, at a price.** Any unsuccessful build of a package
+  with a persistent tree discards that tree, so the retry starts cold and
+  makes a fresh checkout from the mirror, which the retry's own fetch fills
+  again (`design/implemented/btrfs-snapshots.md`). The cost is one failed
+  build and a cold rebuild: seconds for most packages, hours for one like
+  unreal-engine. (Before that, the worker watched the build's output for the
+  `bad object` signature and wiped only the borrowed checkouts, which cost
+  seconds; that watch went when discarding took its place.)
 
 ## When to pick it up
 
-- a stale-checkout failure traced to a prune rather than to an eviction, or
+- a stale-checkout failure traced to a prune rather than to an eviction,
+  especially on a package whose cold rebuild is long, or
 - a build log showing git repacking a large mirror mid-build, costing real time.
 
 ## Candidate fixes

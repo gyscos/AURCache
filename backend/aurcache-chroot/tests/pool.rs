@@ -815,7 +815,7 @@ async fn a_kept_build_keeps_its_group_limit_and_locks_down() {
     assert!(write(&build.data().join("output"), 5 * MIB).is_none());
     let group = build.group();
     let kept = pool
-        .keep_build(build, Duration::from_secs(3600))
+        .keep_build(build, Duration::from_secs(3600), None)
         .await
         .unwrap();
 
@@ -875,22 +875,31 @@ async fn a_keep_carries_its_build_tree() {
     let pool = Pool::open(config(&scratch, 1024 * MIB)).await.unwrap();
     make_base(&pool, 10).await;
 
-    let build = pool.lease(7, None).await.unwrap();
-    // The worker's move, as the worker: one rename of the tree subvolume
-    // beside the keep, unprivileged -- btrfs lets a subvolume be renamed out
-    // of its parent, and its id (and so its quota group) follows it.
-    let standin = pool.path().join("tree-standin");
-    sudo_ok(&["btrfs", "subvolume", "create", standin.to_str().unwrap()]);
+    // The tree as the worker keeps it: a subvolume inside the cache
+    // subvolume -- here root-owned, as a build that became root can leave
+    // it. Moving it crosses a subvolume boundary, which btrfs allows for a
+    // subvolume and refuses for anything else.
+    let cache = pool.path().join("tree-cache");
+    sudo_ok(&["btrfs", "subvolume", "create", cache.to_str().unwrap()]);
+    let tree = cache.join("hello");
+    sudo_ok(&["btrfs", "subvolume", "create", tree.to_str().unwrap()]);
     sudo_ok(&[
         "sh",
         "-c",
-        &format!("echo built > '{}'/output", standin.display()),
+        &format!("echo built > '{}'/output", tree.display()),
     ]);
-    let moved = pool.kept_tree_path(7);
-    std::fs::rename(&standin, &moved).unwrap();
-    pool.keep_build(build, Duration::from_secs(3600))
+    // And a plain-directory tree, from before trees were subvolumes.
+    let plain = cache.join("plain");
+    sudo_ok(&["mkdir", plain.to_str().unwrap()]);
+
+    let build = pool.lease(7, None).await.unwrap();
+    let kept = pool
+        .keep_build(build, Duration::from_secs(3600), Some(&tree))
         .await
         .unwrap();
+    let moved = pool.path().join("kept-7.build");
+    assert_eq!(kept.tree.as_deref(), Some(moved.as_path()));
+    assert!(!tree.exists(), "the package finds no tree");
 
     // Locked down with the rest of the keep.
     use std::os::unix::fs::PermissionsExt;
@@ -903,11 +912,42 @@ async fn a_keep_carries_its_build_tree() {
         "the tree lands beside the keep"
     );
 
-    // And goes away with it.
+    // A plain directory cannot leave the cache subvolume: it stays, and is
+    // never copied.
+    let build = pool.lease(8, None).await.unwrap();
+    let kept = pool
+        .keep_build(build, Duration::from_secs(3600), Some(&plain))
+        .await
+        .unwrap();
+    assert_eq!(kept.tree, None);
+    assert!(plain.exists(), "left for the caller to discard");
+    assert!(
+        !pool.path().join("kept-8.build").exists(),
+        "and never copied"
+    );
+
+    // A path outside the pool is refused, and the build's volumes go.
+    let build = pool.lease(9, None).await.unwrap();
+    assert!(
+        pool.keep_build(build, Duration::from_secs(3600), Some(Path::new("/etc")))
+            .await
+            .is_err()
+    );
+    assert!(!pool.path().join("job-9").exists());
+    assert!(!pool.path().join("kept-9").exists());
+
+    // The keep goes away with its tree.
     pool.sweep(&HashSet::new(), None).await;
     assert!(!pool.path().join("kept-7").exists());
     assert!(!pool.path().join("kept-7.data").exists());
     assert!(!moved.exists());
+    sudo_ok(&[
+        "btrfs",
+        "subvolume",
+        "delete",
+        "--recursive",
+        cache.to_str().unwrap(),
+    ]);
     pool.unmount().await.unwrap();
 }
 
@@ -921,11 +961,11 @@ async fn the_sweep_keeps_a_fresh_failure_and_deletes_an_expired_one() {
     make_base(&pool, 10).await;
 
     let fresh = pool.lease(7, None).await.unwrap();
-    pool.keep_build(fresh, Duration::from_secs(3600))
+    pool.keep_build(fresh, Duration::from_secs(3600), None)
         .await
         .unwrap();
     let stale = pool.lease(8, None).await.unwrap();
-    pool.keep_build(stale, Duration::from_secs(3600))
+    pool.keep_build(stale, Duration::from_secs(3600), None)
         .await
         .unwrap();
     // Expired an hour ago: the keep runs from the chroot's mtime.
@@ -967,7 +1007,7 @@ async fn room_making_takes_kept_failures_before_the_previous_base() {
     // A kept failure holding ~100M, and a retired base.
     let build = pool.lease(7, None).await.unwrap();
     assert!(write(&build.data().join("output"), 100 * MIB).is_none());
-    pool.keep_build(build, Duration::from_secs(3600))
+    pool.keep_build(build, Duration::from_secs(3600), None)
         .await
         .unwrap();
     pool.snapshot_next().await.unwrap();

@@ -338,6 +338,11 @@ the initial scenarios need, checked against the current CLI.
   a tree exists, not that the build started from it. A field on the build
   (shown on the build page too) answers the question the scenario asks. The
   same goes for a warm source cache, if a scenario ends up asserting that.
+- **When a worker's base chroot was last refreshed, and how it went**
+  (swapped in, or failed and kept the old base), on `worker list`. Without it
+  `base-refresh` can only show that the second build succeeded, not that a
+  new base was swapped in first -- and an operator asking why builds see a
+  stale base has the same question.
 - **Waiting for the fleet**: `worker list --wait-online <n|names>`, or a
   `doctor` mode that waits instead of reporting. The harness's readiness loop
   and `e2e-worker-env` would both use it instead of polling with `jq`, and an
@@ -353,6 +358,8 @@ first, not to reach for `aurcli raw` or `docker exec`.
 | `basic`: add, wait, install | — | split nightly; hybrid, legacy, split-2 with `run-e2e` |
 | `ssh-credentials` | chroot, fixture `gitssh` | split nightly |
 | `rebuild-keeps-tree`: build twice on a pinned worker, the second reuses the tree | kept-tree | split, split-2 nightly |
+| `base-refresh`: with `chroot_refresh_interval=0`, build twice on a pinned worker; the second refresh swaps a new base in and the build succeeds | chroot | split nightly |
+| `kept-failure`: with `keep_failed` set, a `--patch`ed PKGBUILD whose `build()` fails, `--persist-build-dir`; the build fails, `builds get` reports `.kept.path` and `.kept.tree`; the fixed PKGBUILD then builds cold | chroot, kept-tree | split nightly |
 | `dependency-chain`: a package with AUR deps, built leaf first | — | split-2 nightly |
 | `worker-restart`: restart between two builds; enrollment and cache survive | chroot | split nightly |
 | `affinity`: a pinned package only ever builds on its worker | multi-worker | split-2 nightly |

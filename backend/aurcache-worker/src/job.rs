@@ -377,66 +377,62 @@ async fn run_job_inner(
         None => false,
     };
     if keepable && let Some(keep_for) = keep_for {
-        // The persistent tree moves beside the keep first: the package's next
-        // build finds no tree and starts cold, exactly as with a discard, and
-        // the operator gets the state the build failed in. A tree that cannot
-        // move is discarded instead -- the retry is still cold either way.
-        let tree = if job.persistent_builddir
-            && let Some(dest) = shared.chroots.keep_tree_dest(build_id).await
-        {
-            let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
-            join_cache_task(
-                tokio::task::spawn_blocking(move || {
-                    cache.move_builddir_to_keep(&arch, &pkgbase, &dest)
-                }),
-                "builddir move",
-            )
-            .await
-            .flatten()
-        } else {
-            None
-        };
-        if let Some(kept) = shared.chroots.keep(lease, keep_for).await {
-            let tree = tree.as_ref().map(|t| t.display().to_string());
-            report.kept = Some(aurcache_common::api::builds::KeptBuild {
-                path: kept.path.display().to_string(),
-                until: kept
-                    .until
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-                    .unwrap_or(0),
-                tree: tree.clone(),
-            });
-            let mut msg = format!("[worker] failed chroot kept at {}", kept.path.display());
-            if let Some(tree) = tree {
-                msg.push_str(&format!(" with its build tree at {tree}"));
+        // The persistent tree goes with the keep: the pool moves it beside the
+        // kept chroot, after the chroot itself, so the operator gets the state
+        // the build failed in and the package's next build finds no tree.
+        let tree = job
+            .persistent_builddir
+            .then(|| cache.builddir_tree_path(&job.arch, &job.pkgbase));
+        match shared.chroots.keep(lease, keep_for, tree.as_deref()).await {
+            Ok(kept) => {
+                let tree = kept.tree.as_ref().map(|t| t.display().to_string());
+                report.kept = Some(aurcache_common::api::builds::KeptBuild {
+                    path: kept.path.display().to_string(),
+                    until: kept
+                        .until
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+                        .unwrap_or(0),
+                    tree: tree.clone(),
+                });
+                let mut msg = format!("[worker] failed chroot kept at {}", kept.path.display());
+                if let Some(tree) = tree {
+                    msg.push_str(&format!(" with its build tree at {tree}"));
+                }
+                msg.push('\n');
+                log(client, build_id, &msg).await;
             }
-            msg.push('\n');
-            log(client, build_id, &msg).await;
-        }
-        // Otherwise the keep failed and the volumes were deleted instead.
-    } else {
-        // Not kept: an unsuccessful build's tree goes here, after the keep
-        // decision -- kept would have moved it instead. See
-        // `Cache::discard_builddir` for why a failure never resumes its tree.
-        if !report.success && job.persistent_builddir {
-            let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
-            let discarded = join_cache_task(
-                tokio::task::spawn_blocking(move || cache.discard_builddir(&arch, &pkgbase)),
-                "builddir discard",
-            )
-            .await
-            .unwrap_or_default();
-            if discarded {
+            Err(e) => {
                 log(
                     client,
                     build_id,
-                    "[worker] discarded the build tree; the next retry starts cold\n",
+                    &format!("[worker] could not keep the failed chroot ({e:#}); deleted it\n"),
                 )
                 .await;
             }
         }
+    } else {
         shared.chroots.release(lease).await;
+    }
+    // An unsuccessful build never leaves its tree for the next one: whatever
+    // the keep did not take -- no keep, a keep that failed, a tree that could
+    // not move -- goes here. See `Cache::discard_builddir` for why.
+    if !report.success && job.persistent_builddir {
+        let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
+        let discarded = join_cache_task(
+            tokio::task::spawn_blocking(move || cache.discard_builddir(&arch, &pkgbase)),
+            "builddir discard",
+        )
+        .await
+        .unwrap_or_default();
+        if discarded {
+            log(
+                client,
+                build_id,
+                "[worker] discarded the build tree; the next retry starts cold\n",
+            )
+            .await;
+        }
     }
 
     // 5. Fold this job's downloads into the shared cache, then bound it. Only

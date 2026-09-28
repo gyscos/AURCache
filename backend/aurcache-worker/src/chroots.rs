@@ -342,8 +342,20 @@ impl Chroots {
             return Ok(root);
         };
         // Whatever a previous refresh left: an unfinished candidate, or the
-        // previous base past the exchange.
-        pool.recover_refresh().await?;
+        // previous base past the exchange. `root` is whole whatever recovery
+        // finds, so a recovery that fails is a failed refresh, not a failed
+        // build: with a base, it is used as it is until the interval comes
+        // round again; without one, it is made regardless, since what could
+        // not be cleared is only ever `root.next`.
+        if let Err(e) = pool.recover_refresh().await {
+            let e = e.context("recovering an interrupted base refresh");
+            if chroot::base_exists(&root) {
+                warn_refresh(report_to, &e).await;
+                *last = Some(Instant::now());
+                return Ok(root);
+            }
+            tracing::warn!("{e:#}");
+        }
         if !chroot::base_exists(&root) {
             // First start, or an operator removed the base: made in place, as
             // it always was, then counted against the total.
@@ -490,20 +502,11 @@ impl Chroots {
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// Where a kept build's moved tree goes. `None` when the pool is not
-    /// open -- never, while a lease from it is held.
-    pub(crate) async fn keep_tree_dest(&self, build_id: i32) -> Option<PathBuf> {
-        self.pool
-            .read()
-            .await
-            .as_ref()
-            .map(|pool| pool.kept_tree_path(build_id))
-    }
-
     /// Keep a failed build's chroot for `keep_for` instead of deleting it, for
-    /// an operator to inspect. Returns where, and until when -- `None` when
-    /// the keep itself failed, in which case the volumes are deleted instead
-    /// of leaked.
+    /// an operator to inspect, with its persistent `tree` moved beside it when
+    /// it has one. Returns where, and until when. On an error the volumes are
+    /// deleted instead of leaked, and the tree is either gone with them or
+    /// still in place for the caller to discard.
     ///
     /// Like [`Self::release`], after the build's child has been reaped: what
     /// is kept is the state the build failed in.
@@ -511,16 +514,20 @@ impl Chroots {
         &self,
         lease: Lease,
         keep_for: Duration,
-    ) -> Option<aurcache_chroot::KeptBuild> {
+        tree: Option<&Path>,
+    ) -> Result<aurcache_chroot::KeptBuild> {
         let kept = match self.pool.read().await.as_ref() {
-            Some(pool) => pool.keep_build(lease.volumes, keep_for).await.ok(),
+            Some(pool) => pool.keep_build(lease.volumes, keep_for, tree).await,
             // Not reachable, as in `release`.
             None => {
                 drop(lease.volumes);
-                None
+                Err(anyhow::anyhow!("the storage pool is not open"))
             }
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
+        if let Err(e) = &kept {
+            tracing::warn!("could not keep a failed build's chroot; deleted it instead ({e:#})");
+        }
         kept
     }
 

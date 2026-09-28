@@ -43,6 +43,12 @@ use tokio::process::{Child, Command};
 const AGENT_DIR: &str = "agent";
 const SOCKET_FILE: &str = "agent.sock";
 
+/// The directory the agent's socket lives in, under the worker's data
+/// directory -- never in the storage pool, so no kept build can hold it.
+pub fn dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(AGENT_DIR)
+}
+
 /// The group shared by the worker and the users it builds as.
 ///
 /// The socket's directory belongs to it, so the build user can create the
@@ -115,7 +121,7 @@ pub async fn start(data_dir: &Path, key: &Path, build_user: &str) -> Result<Opti
         return Ok(None);
     }
 
-    let dir = data_dir.join(AGENT_DIR);
+    let dir = dir(data_dir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     // Group-writable, because the process creating the socket in here is the
     // build user rather than us. Both are in `aurbuild`; nobody else reaches

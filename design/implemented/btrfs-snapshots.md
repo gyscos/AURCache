@@ -30,10 +30,10 @@ Decided (details in each section; measurements in "Prototype results"):
   per-package rollback, which is deferred. Its rules are written down below so
   they are ready.
 - **Failed builds** are kept by renaming `job-<id>*` to `kept-<id>*`, with the
-  build tree moved to `kept-<id>.build` first. The keep runs from the chroot
-  directory's mtime, with no sidecar file. Canceled, timed out and out-of-disk
-  builds are not kept, and kept builds are the first thing deleted when the
-  pool needs room.
+  build tree moved to `kept-<id>.build` after the chroot. The keep runs from
+  the chroot directory's mtime, with no sidecar file. Canceled, timed out and
+  out-of-disk builds are not kept, and kept builds are the first thing deleted
+  when the pool needs room.
 - One naming scheme and one sweep cover every new name. See "Crash recovery".
 
 ---
@@ -197,12 +197,16 @@ both while holding `refresh.lock`. It reads the two subvolumes' UUIDs
 |---|---|---|
 | `root.next`, whose Parent UUID is `root`'s UUID | the refresh died before the exchange: an unfinished, unchecked base | delete `root.next` |
 | `root.next`, and `root`'s Parent UUID is `root.next`'s UUID | the refresh died between the exchange and the retire step: `root.next` is the previous base | delete any `root.prev`, rename `root.next` to `root.prev` |
-| `root.next`, neither relation readable | cannot tell | delete `root.next` (the cost is losing the rollback point) |
+| `root.next`, neither relation holds, or a UUID cannot be read | cannot tell | delete `root.next` (the cost is losing the rollback point) |
 | `root.prev` | the rollback point | keep |
 | no `root` | first start, or an operator removed it | `mkarchroot`, as today; any `root.next` is deleted first |
 
 After an exchange, `root`'s Parent UUID is `root.next`'s UUID (measured), so the
-two middle cases cannot be confused. The invariant the whole sequence keeps is
+two middle cases cannot be confused. A recovery that fails anyway (a delete or
+a rename refused) is a failed refresh, never a failed build: with a base, it is
+warned about and the base is used as it is until the interval comes round;
+without one, `mkarchroot` makes it regardless, since what could not be cleared
+is only ever `root.next`. The invariant the whole sequence keeps is
 that `root` is always a complete, checked base.
 
 ### Accounting
@@ -262,12 +266,18 @@ keep then carries its tree and goes away with it; without the move, an
 operator entering `kept-<id>` would find `/build/<pkgbase>` empty, and for
 those packages the tree is most of what is worth inspecting.
 
-The move is one `rename`: instant for a subvolume, which keeps its id (and so
-its quota group) across the rename, so the space stays counted and kept builds
-stay the first thing reclaimed. A plain-directory tree -- from before trees
-were subvolumes, living inside the cache subvolume -- cannot cross into the
-pool's top (`EXDEV`), and is discarded instead; those disappear as they get
-rebuilt anyway.
+The move is one rename, done by the pool inside the keep (`Pool::keep_build`),
+after the chroot is renamed: nothing ever sees a `kept-<id>.build` without its
+`kept-<id>`, which the expiry at every other build's lease would take for an
+expired keep. It is instant for a subvolume, which keeps its id (and so its
+quota group) across the rename, so the space stays counted and kept builds
+stay the first thing reclaimed. It runs as root (`mv --no-copy -T`): a build
+that became root in its chroot can own its tree's top, and `--no-copy` keeps
+it a rename or nothing. A plain-directory tree -- from before trees were
+subvolumes, living inside the cache subvolume -- cannot cross into the pool's
+top (`EXDEV`), stays where it is, and is discarded with everything else the
+keep did not take; those disappear as they get rebuilt anyway. A tree path
+outside the pool is refused, as every path the pool deletes is its own.
 
 **This needs no snapshot.** Moving and discarding are a rename and a delete.
 The `<tree>.pre` snapshot the first draft of this section proposed only
@@ -320,20 +330,26 @@ with the workdir at `<pool>/kept-<id>.data` (and no `--bind` when the build
 kept no tree).
 
 - **Kept means renamed.** At the end of a failed build the worker:
-  0. moves the persistent tree to `kept-<id>.build` first, when the build has
-     one (section 2);
-  1. renames `job-<id>` → `kept-<id>`, and likewise `.data`;
-  2. `touch`es `kept-<id>`;
-  3. `chmod 0700` on each, and on `kept-<id>.build` when there is one (see
+  1. `touch`es `job-<id>`, before any rename, so a `kept-<id>` is never
+     visible with the build's old mtime;
+  2. renames `job-<id>` → `kept-<id>`, and likewise `.data`;
+  3. moves the persistent tree to `kept-<id>.build`, when the build has one
+     (section 2);
+  4. `chmod 0700` on each, and on `kept-<id>.build` when there is one (see
      "Credentials");
-  4. removes `job-<id>.lock`.
+  5. removes `job-<id>.lock`.
+
+  Anything the keep did not take -- no keep, a keep that failed, a tree that
+  could not move -- is discarded after it, and the build's log says why a keep
+  failed.
 
   A rename keeps the subvolume ids, so the group `1/<1000+id>` keeps its members
   and its limit (measured). A kept build can never grow, and it stays under the
   total. The name is what tells a kept build from a crash leftover, which the
   startup sweep must be able to do without any record.
 - **Keep-until is `mtime(kept-<id>) + WORKER_KEEP_FAILED`, with no sidecar.**
-  The `touch` sets the mtime to when the build ended. The mtime of the chroot's
+  The `touch` sets the mtime to when the build ended, and a rename leaves a
+  directory's own mtime alone. The mtime of the chroot's
   top directory only moves when an entry directly under `/` is made or removed,
   which neither makepkg nor devtools does after the build. The setting is read
   at sweep time, so lowering it shortens keeps already made. `touch` extends
@@ -425,6 +441,8 @@ Unit tests run with `cargo test`. "Root-gated" means `AURCACHE_POOL_TESTS` in
        holder stays under `2/0` and survives `clear-stale`.
    - Unit:
      - the `Entry` parser;
+     - a leftover `root.next` classified by UUIDs, an unreadable one as
+       unknown, so it is deleted rather than failing every refresh;
      - a refresh in flight makes a job start lease at once (the `try_lock`
        path), while a missing base makes it wait.
    - `test-e2e-hybrid.sh`, since the chroot builder changes.
@@ -440,9 +458,13 @@ Unit tests run with `cargo test`. "Root-gated" means `AURCACHE_POOL_TESTS` in
        startup too;
      - `tidy_groups` leaves kept groups alone;
      - room-making deletes kept builds before `root.prev` and before caches;
-     - after a build that used the agent, no file under `kept-*` contains the
-       key's bytes or is a socket, and the tops are `0700`.
-   - Unit: which outcomes are kept.
+     - the tops are `0700`; a plain-directory tree stays out of the keep and is
+       never copied; a tree outside the pool is refused.
+   - Unit: which outcomes are kept; nothing secret (the build credential, the
+     generated key, the agent's socket directory) lives under the pool, so no
+     keep can hold it. The agent's socket reaches a build only as a bind
+     mount, which ends with the container; no unit test can see that, and no
+     e2e scenario covers it yet.
 
 ## Prototype results (2026-09-28)
 

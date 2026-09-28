@@ -245,13 +245,6 @@ impl Pool {
         self.mountpoint.join(ROOT_PREV)
     }
 
-    /// Where a kept build's moved tree goes: `<pool>/kept-<id>.build`, beside
-    /// the kept chroot and workdir, removed with them when the keep expires.
-    #[must_use]
-    pub fn kept_tree_path(&self, build_id: i32) -> PathBuf {
-        self.mountpoint.join(kept_build_name(build_id))
-    }
-
     /// The refresh's cross-process exclusion, taken without waiting: `None`
     /// when another process is refreshing now. Held until the returned file is
     /// dropped; the kernel drops it for a dead holder, so a crash never leaves
@@ -624,29 +617,37 @@ impl Pool {
             self.delete_tree(&next).await?;
             return Ok(());
         }
-        let (root_uuid, root_parent) = subvolume_uuids(&root).await?;
-        let (next_uuid, next_parent) = subvolume_uuids(&next).await?;
-        if next_parent.as_ref() == Some(&root_uuid) {
-            // Died before the exchange: an unfinished, unchecked base.
-            tracing::info!("removing an unfinished base at {}", next.display());
-            self.delete_tree(&next).await?;
-        } else if root_parent.as_ref() == Some(&next_uuid) {
-            // Died between the exchange and the retire: `next` is the previous
-            // base. The rename below is what the retire step would have done.
-            let prev = self.prev_root();
-            if prev.exists() {
-                self.delete_tree(&prev).await?;
+        // Unreadable UUIDs are an answer too, not an error: which side of the
+        // exchange this is cannot be told, and the base itself is whole
+        // either way.
+        let read = |path: PathBuf| async move {
+            subvolume_uuids(&path)
+                .await
+                .inspect_err(|e| tracing::warn!("{e:#}"))
+                .ok()
+        };
+        match classify_next(read(root.clone()).await, read(next.clone()).await) {
+            NextBase::Unfinished => {
+                tracing::info!("removing an unfinished base at {}", next.display());
+                self.delete_tree(&next).await?;
             }
-            std::fs::rename(&next, &prev)
-                .with_context(|| format!("retiring the previous base at {}", prev.display()))?;
-        } else {
-            // Neither relation readable: lose the rollback point rather than
-            // guess which one this is.
-            tracing::warn!(
-                "removing {} whose relation to the base is unreadable",
-                next.display()
-            );
-            self.delete_tree(&next).await?;
+            NextBase::Previous => {
+                // The rename below is what the retire step would have done.
+                let prev = self.prev_root();
+                if prev.exists() {
+                    self.delete_tree(&prev).await?;
+                }
+                std::fs::rename(&next, &prev)
+                    .with_context(|| format!("retiring the previous base at {}", prev.display()))?;
+            }
+            NextBase::Unknown => {
+                // Lose the rollback point rather than guess which one this is.
+                tracing::warn!(
+                    "removing {} whose relation to the base is unreadable",
+                    next.display()
+                );
+                self.delete_tree(&next).await?;
+            }
         }
         Ok(())
     }
@@ -840,8 +841,16 @@ impl Pool {
     /// Keep a failed build's volumes for `keep_for` instead of deleting them:
     /// renamed to `kept-<id>*`, readable only by the worker, expiring by
     /// mtime. An operator enters the state the build failed in with
-    /// `systemd-nspawn -D <pool>/kept-<id>`. A moved build tree already beside
-    /// it (`kept-<id>.build`) is locked down and expired with the rest.
+    /// `systemd-nspawn -D <pool>/kept-<id>`.
+    ///
+    /// `tree` is the build's persistent tree, when it has one. It is moved to
+    /// `kept-<id>.build` here, after the chroot, so nothing ever sees a kept
+    /// tree without its keep, and it expires with the rest. The move is one
+    /// rename: a subvolume keeps its id, and so its quota group. A tree that
+    /// cannot move -- a plain directory, which `EXDEV`s out of the cache
+    /// subvolume -- stays where it is, and [`KeptBuild::tree`] says so; the
+    /// caller discards whatever is left. Refused outright for a path outside
+    /// the pool: what the pool deletes is the pool's to decide.
     ///
     /// A rename keeps the subvolume ids, so the group keeps its members and
     /// its limit: a kept build can never grow, and it stays under the total.
@@ -850,12 +859,13 @@ impl Pool {
     ///
     /// Never called for an id another kept build already has -- build ids are
     /// unique, and the one-shot id keeps nothing -- so the rename never
-    /// collides. On any failure nothing is kept and nothing is leaked: both
-    /// names are removed.
+    /// collides. On any failure nothing is kept and nothing is leaked: every
+    /// name is removed, a tree already moved included.
     pub async fn keep_build(
         &self,
         mut volumes: BuildVolumes,
         keep_for: Duration,
+        tree: Option<&Path>,
     ) -> Result<KeptBuild> {
         let build_id = volumes
             .group()
@@ -863,28 +873,62 @@ impl Pool {
             .expect("a build's volumes carry a build's group");
         let kept = self.mountpoint.join(kept_name(build_id));
         let kept_data = self.mountpoint.join(kept_data_name(build_id));
+        let kept_tree = self.mountpoint.join(kept_build_name(build_id));
+        if let Some(tree) = tree
+            && !tree.starts_with(&self.mountpoint)
+        {
+            self.remove_build(build_id).await;
+            volumes.released = true;
+            bail!("{} is not in the pool; refusing to keep it", tree.display());
+        }
         let done = async {
+            // As root: the chroot is root-owned, and neither its mtime nor its
+            // mode is the renamer's to change. Touched *before* the rename,
+            // which leaves a directory's own mtime alone: a `kept-<id>` is
+            // never visible with the build's old mtime, which the expiry at
+            // every other lease would take for an expired keep.
+            privileged(&["touch".as_ref(), volumes.chroot().as_os_str()]).await?;
             std::fs::rename(volumes.chroot(), &kept)
                 .with_context(|| format!("keeping the failed build at {}", kept.display()))?;
             std::fs::rename(volumes.data(), &kept_data)
                 .with_context(|| format!("keeping the failed build at {}", kept_data.display()))?;
-            // As root: both are root-owned, and neither mtime nor mode is the
-            // renamer's to change. `0700`, because a running build's chroot is
-            // readable by any local user for as long as the build runs, and a
-            // kept one would be for days -- and it holds whatever the PKGBUILD
-            // fetched with the build credential.
-            privileged(&["touch".as_ref(), kept.as_os_str()]).await?;
-            // The moved build tree, when the failed build kept one: locked
-            // down with the rest, since it holds the fetched sources.
+            // As root, since a build that became root in its chroot can own
+            // its tree's top. `--no-copy`: a rename or nothing -- `mv` would
+            // otherwise copy a plain-directory tree across the subvolume
+            // boundary, file by file, charged to nobody's keep.
+            let moved = match tree {
+                Some(tree) if tree.exists() => match privileged(&[
+                    "mv".as_ref(),
+                    "--no-copy".as_ref(),
+                    "-T".as_ref(),
+                    tree.as_os_str(),
+                    kept_tree.as_os_str(),
+                ])
+                .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            "the build tree {} stays out of the keep ({e:#})",
+                            tree.display()
+                        );
+                        false
+                    }
+                },
+                _ => false,
+            };
+            // `0700`, because a running build's chroot is readable by any
+            // local user for as long as the build runs, and a kept one would
+            // be for days -- and it, its workdir and its tree hold whatever
+            // the PKGBUILD fetched with the build credential.
             let mut private: Vec<&OsStr> = vec![
                 "chmod".as_ref(),
                 "0700".as_ref(),
                 kept.as_os_str(),
                 kept_data.as_os_str(),
             ];
-            let kept_build = self.mountpoint.join(kept_build_name(build_id));
-            if kept_build.exists() {
-                private.push(kept_build.as_os_str());
+            if moved {
+                private.push(kept_tree.as_os_str());
             }
             privileged(&private).await?;
             // `makechrootpkg` takes a lock beside the copy and leaves it.
@@ -894,14 +938,17 @@ impl Pool {
             if lock.exists() {
                 let _ = privileged(&["rm".as_ref(), "-f".as_ref(), lock.as_os_str()]).await;
             }
-            anyhow::Ok(())
+            anyhow::Ok(moved)
         };
-        if let Err(e) = done.await {
-            self.remove_build(build_id).await;
-            self.remove_kept(build_id).await;
-            volumes.released = true;
-            return Err(e);
-        }
+        let moved = match done.await {
+            Ok(moved) => moved,
+            Err(e) => {
+                self.remove_build(build_id).await;
+                self.remove_kept(build_id).await;
+                volumes.released = true;
+                return Err(e);
+            }
+        };
         volumes.released = true;
         // The keep runs from the touch, not from now: an operator's own work
         // at the top of the chroot moves its mtime, and extends it, which is
@@ -912,6 +959,7 @@ impl Pool {
         Ok(KeptBuild {
             path: kept,
             until: touched + keep_for,
+            tree: moved.then_some(kept_tree),
         })
     }
 
@@ -923,7 +971,10 @@ impl Pool {
     ///
     /// What makes teardown reliable: `release` loses to `SIGKILL`.
     pub async fn sweep(&self, keep: &HashSet<i32>, keep_failed: Option<Duration>) -> usize {
-        let (mut builds, kept) = self.pool_builds();
+        let PoolBuilds {
+            live: mut builds,
+            kept,
+        } = self.pool_builds();
         // Kept failures are not crash leftovers: their group stays until they
         // expire, and `tidy_groups` counts them as present for the same reason.
         for id in &kept {
@@ -965,7 +1016,7 @@ impl Pool {
     /// every lease, so no timer watches over kept builds.
     pub async fn expire_kept(&self, keep_failed: Option<Duration>) -> usize {
         let mut removed = 0;
-        for id in self.pool_builds().1 {
+        for id in self.pool_builds().kept {
             let fresh = keep_failed.is_some_and(|keep| {
                 std::fs::metadata(self.mountpoint.join(kept_name(id)))
                     .and_then(|m| m.modified())
@@ -1039,59 +1090,54 @@ impl Pool {
 
     /// Delete the oldest kept failure. `false` when there is none.
     async fn remove_oldest_kept(&self) -> bool {
-        let mut kept: Vec<(SystemTime, i32)> = self
-            .pool_builds()
-            .1
-            .into_iter()
-            .map(|id| {
-                let touched = std::fs::metadata(self.mountpoint.join(kept_name(id)))
-                    .and_then(|m| m.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                (touched, id)
-            })
-            .collect();
-        kept.sort();
-        let Some((_, id)) = kept.first() else {
+        // By when it was kept, then by id so the choice is stable. One whose
+        // time cannot be read counts as oldest.
+        let oldest = self.pool_builds().kept.into_iter().min_by_key(|&id| {
+            let touched = std::fs::metadata(self.mountpoint.join(kept_name(id)))
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (touched, id)
+        });
+        let Some(id) = oldest else {
             return false;
         };
         tracing::info!("reclaiming kept failure {id} for room");
-        self.remove_kept(*id).await;
+        self.remove_kept(id).await;
         true
     }
 
     /// The builds named at the pool's top: live ones (`job-*`, from entries
     /// and from groups, which outlive a crashed worker's entries) and kept
     /// failures (`kept-*`).
-    fn pool_builds(&self) -> (HashSet<i32>, HashSet<i32>) {
-        let (mut builds, kept) = self.entry_builds();
-        builds.extend(
+    fn pool_builds(&self) -> PoolBuilds {
+        let mut builds = self.entry_builds();
+        builds.live.extend(
             self.qgroups
                 .list()
                 .into_iter()
                 .filter_map(QgroupId::build_id),
         );
-        (builds, kept)
+        builds
     }
 
     /// The builds with entries at the pool's top: what is really there, rather
     /// than what the groups remember.
-    fn entry_builds(&self) -> (HashSet<i32>, HashSet<i32>) {
-        let mut builds = HashSet::new();
-        let mut kept = HashSet::new();
+    fn entry_builds(&self) -> PoolBuilds {
+        let mut builds = PoolBuilds::default();
         if let Ok(entries) = std::fs::read_dir(&self.mountpoint) {
             for entry in entries.flatten() {
                 match entry_of(&entry.file_name().to_string_lossy()) {
                     Some(Entry::Build { id, .. }) => {
-                        builds.insert(id);
+                        builds.live.insert(id);
                     }
                     Some(Entry::Kept { id, .. }) => {
-                        kept.insert(id);
+                        builds.kept.insert(id);
                     }
                     _ => {}
                 }
             }
         }
-        (builds, kept)
+        builds
     }
 
     /// Destroy the groups of builds whose subvolumes are gone.
@@ -1106,7 +1152,7 @@ impl Pool {
     async fn tidy_groups(&self) {
         // Entries, not groups: a group outlives its entries, and counting it
         // as its own presence would keep every orphan forever.
-        let (builds, kept) = self.entry_builds();
+        let PoolBuilds { live: builds, kept } = self.entry_builds();
         let orphans: Vec<QgroupId> = self
             .qgroups
             .list()
@@ -1280,6 +1326,15 @@ pub struct BuildUsage {
     pub data: Option<u64>,
 }
 
+/// The builds named at the pool's top, by what they are.
+#[derive(Debug, Default)]
+struct PoolBuilds {
+    /// Builds running or left by a crash: `job-*`.
+    live: HashSet<i32>,
+    /// Kept failures: `kept-*`.
+    kept: HashSet<i32>,
+}
+
 /// A failed build's volumes, kept for inspection instead of deleted.
 #[derive(Clone, Debug)]
 pub struct KeptBuild {
@@ -1289,6 +1344,10 @@ pub struct KeptBuild {
     /// When the keep runs out, after which a sweep removes it -- or sooner,
     /// if the pool needs the room.
     pub until: SystemTime,
+    /// The build's persistent tree, moved beside the keep as
+    /// `<pool>/kept-<id>.build`; `None` when it had none, or it could not be
+    /// moved and stayed where it was.
+    pub tree: Option<PathBuf>,
 }
 
 impl BuildVolumes {
@@ -1670,7 +1729,42 @@ fn parse_fsid(show: &str) -> Option<String> {
 /// A subvolume's UUID and its parent's, which say which side of a refresh it
 /// is from: a snapshot is parented to its origin, so after an exchange
 /// `root`'s parent is `root.next`'s UUID.
-async fn subvolume_uuids(path: &Path) -> Result<(String, Option<String>)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubvolumeUuids {
+    uuid: String,
+    /// `None` for a subvolume made outright rather than snapshotted.
+    parent: Option<String>,
+}
+
+/// What a `root.next` found by recovery is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextBase {
+    /// Snapshotted from `root` and never swapped in: the refresh died before
+    /// the exchange.
+    Unfinished,
+    /// The base `root` was snapshotted from: the refresh died between the
+    /// exchange and the retire.
+    Previous,
+    /// Neither relation holds, or a UUID could not be read.
+    Unknown,
+}
+
+/// Which side of the exchange a leftover `root.next` is on, from the two
+/// subvolumes' UUIDs; `None` for one that could not be read.
+fn classify_next(root: Option<SubvolumeUuids>, next: Option<SubvolumeUuids>) -> NextBase {
+    let (Some(root), Some(next)) = (root, next) else {
+        return NextBase::Unknown;
+    };
+    if next.parent.as_ref() == Some(&root.uuid) {
+        NextBase::Unfinished
+    } else if root.parent.as_ref() == Some(&next.uuid) {
+        NextBase::Previous
+    } else {
+        NextBase::Unknown
+    }
+}
+
+async fn subvolume_uuids(path: &Path) -> Result<SubvolumeUuids> {
     let out = privileged(&[
         "btrfs".as_ref(),
         "subvolume".as_ref(),
@@ -1683,7 +1777,7 @@ async fn subvolume_uuids(path: &Path) -> Result<(String, Option<String>)> {
 
 /// The `UUID` and `Parent UUID` lines of `btrfs subvolume show`. The parent is
 /// `-` for a subvolume made outright, and its origin's UUID for a snapshot.
-fn parse_uuids(show: &str) -> Option<(String, Option<String>)> {
+fn parse_uuids(show: &str) -> Option<SubvolumeUuids> {
     let mut uuid = None;
     let mut parent = None;
     for line in show.lines().map(str::trim) {
@@ -1694,7 +1788,10 @@ fn parse_uuids(show: &str) -> Option<(String, Option<String>)> {
             uuid = Some(value.trim().to_string());
         }
     }
-    Some((uuid?, parent))
+    Some(SubvolumeUuids {
+        uuid: uuid?,
+        parent,
+    })
 }
 
 /// A subvolume's id; its own qgroup is `0/<id>`.
@@ -1967,10 +2064,10 @@ job-7
 ";
         assert_eq!(
             parse_uuids(show),
-            Some((
-                "11111111-2222-3333-4444-555555555555".to_string(),
-                Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
-            ))
+            Some(SubvolumeUuids {
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                parent: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string())
+            })
         );
         let made = show.replace(
             "Parent UUID: \t\taaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -1978,9 +2075,42 @@ job-7
         );
         assert_eq!(
             parse_uuids(&made),
-            Some(("11111111-2222-3333-4444-555555555555".to_string(), None))
+            Some(SubvolumeUuids {
+                uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                parent: None
+            })
         );
         assert_eq!(parse_uuids("no uuid here\n"), None);
+    }
+
+    /// Which side of the exchange a leftover `root.next` is on -- and an
+    /// unreadable UUID is an answer, not an error: it is deleted, never left
+    /// to fail every refresh.
+    #[test]
+    fn a_leftover_candidate_is_classified_by_its_uuids() {
+        let volume = |uuid: &str, parent: Option<&str>| {
+            Some(SubvolumeUuids {
+                uuid: uuid.to_string(),
+                parent: parent.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            classify_next(volume("a", None), volume("b", Some("a"))),
+            NextBase::Unfinished
+        );
+        assert_eq!(
+            classify_next(volume("b", Some("a")), volume("a", None)),
+            NextBase::Previous
+        );
+        assert_eq!(
+            classify_next(volume("a", None), volume("c", None)),
+            NextBase::Unknown
+        );
+        assert_eq!(classify_next(volume("a", None), None), NextBase::Unknown);
+        assert_eq!(
+            classify_next(None, volume("b", Some("a"))),
+            NextBase::Unknown
+        );
     }
 
     #[test]

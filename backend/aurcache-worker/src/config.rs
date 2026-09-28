@@ -416,6 +416,31 @@ mod tests {
         assert_eq!(cfg.keep_failed, None);
     }
 
+    /// Nothing secret lives in the storage pool, so nothing secret can
+    /// outlive a build in a kept one (`kept-<id>*`): the build credential,
+    /// the key the worker generates and the agent's socket are all under the
+    /// data directory, beside the pool rather than inside it. The agent's
+    /// socket reaches a build only as a bind mount, which ends with the
+    /// container.
+    #[test]
+    fn no_secret_lives_in_the_pool() {
+        let data_dir = Path::new("/var/lib/aurcache-worker");
+        let chroot_dir = data_dir.join("chroot");
+        let pool = pool_mountpoint(None, &chroot_dir);
+        for secret in [
+            crate::credentials::secrets_dir(data_dir),
+            crate::credentials::generated_key(data_dir),
+            crate::agent::dir(data_dir),
+        ] {
+            assert!(
+                !secret.starts_with(&pool),
+                "{} is inside the pool at {}",
+                secret.display(),
+                pool.display()
+            );
+        }
+    }
+
     /// Unset, the pool is an image under the chroot directory, sparse unless
     /// reserving; a directory is an existing mount, used where it is.
     #[test]
