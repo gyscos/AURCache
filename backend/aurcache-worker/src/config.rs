@@ -198,7 +198,7 @@ impl Config {
     /// Read this executor's declared fields from `core.settings`.
     fn read_settings(&mut self) {
         let settings = &self.core.settings;
-        let (src_budget, pkg_budget) = split_cache_budgets(
+        let budgets = split_cache_budgets(
             settings.size(keys::CACHE_MAX_SIZE),
             settings.size(keys::SRCCACHE_MAX_SIZE),
             settings.size(keys::PKGCACHE_MAX_SIZE),
@@ -207,11 +207,11 @@ impl Config {
             .raw(keys::KEYSERVER)
             .unwrap_or(crate::settings::DEFAULT_KEYSERVER)
             .to_string();
-        self.cache_max_size = src_budget;
+        self.cache_max_size = budgets.src;
         self.cache_ttl = settings
             .duration(keys::CACHE_TTL)
             .unwrap_or(crate::settings::DEFAULT_CACHE_TTL);
-        self.pkgcache_max_size = pkg_budget;
+        self.pkgcache_max_size = budgets.pkg;
         self.pkgcache_ttl = settings.duration(keys::PKGCACHE_TTL).unwrap_or(0);
         self.chroot_refresh_interval = settings
             .duration(keys::CHROOT_REFRESH_INTERVAL)
@@ -339,32 +339,60 @@ fn limits_from_settings(
 /// because silently shrinking a number the operator wrote down is worse than
 /// exceeding one they did not.
 #[must_use]
-pub fn split_cache_budgets(total: Option<u64>, src: Option<u64>, pkg: Option<u64>) -> (u64, u64) {
+pub fn split_cache_budgets(total: Option<u64>, src: Option<u64>, pkg: Option<u64>) -> CacheBudgets {
     let half = total.unwrap_or(crate::settings::DEFAULT_TOTAL_CACHE_SIZE) / 2;
-    (src.unwrap_or(half), pkg.unwrap_or(half))
+    CacheBudgets {
+        src: src.unwrap_or(half),
+        pkg: pkg.unwrap_or(half),
+    }
+}
+
+/// Byte budgets of the two cache pools; `0` disables one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheBudgets {
+    /// `SRCDEST`, the sources.
+    pub src: u64,
+    /// The shared pacman package cache.
+    pub pkg: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn budgets(src: u64, pkg: u64) -> CacheBudgets {
+        CacheBudgets { src, pkg }
+    }
+
     #[test]
     fn total_budget_is_split_evenly() {
-        assert_eq!(split_cache_budgets(Some(1000), None, None), (500, 500));
+        assert_eq!(
+            split_cache_budgets(Some(1000), None, None),
+            budgets(500, 500)
+        );
     }
 
     /// A pinned pool is honoured exactly; the total only fills in the pool the
     /// operator left unset.
     #[test]
     fn a_pinned_pool_wins_and_leaves_the_other_alone() {
-        assert_eq!(split_cache_budgets(Some(1000), None, Some(900)), (500, 900));
-        assert_eq!(split_cache_budgets(Some(1000), Some(900), None), (900, 500));
-        assert_eq!(split_cache_budgets(Some(10), Some(1), Some(2)), (1, 2));
+        assert_eq!(
+            split_cache_budgets(Some(1000), None, Some(900)),
+            budgets(500, 900)
+        );
+        assert_eq!(
+            split_cache_budgets(Some(1000), Some(900), None),
+            budgets(900, 500)
+        );
+        assert_eq!(
+            split_cache_budgets(Some(10), Some(1), Some(2)),
+            budgets(1, 2)
+        );
     }
 
     #[test]
     fn defaults_split_the_default_total() {
-        let (src, pkg) = split_cache_budgets(None, None, None);
+        let CacheBudgets { src, pkg } = split_cache_budgets(None, None, None);
         assert_eq!(src, pkg);
         assert_eq!(src + pkg, crate::settings::DEFAULT_TOTAL_CACHE_SIZE);
     }
@@ -496,7 +524,10 @@ mod tests {
     /// mistaken for "unset" and replaced by a default.
     #[test]
     fn zero_disables_rather_than_defaulting() {
-        assert_eq!(split_cache_budgets(Some(1000), Some(0), None), (0, 500));
-        assert_eq!(split_cache_budgets(Some(0), None, None), (0, 0));
+        assert_eq!(
+            split_cache_budgets(Some(1000), Some(0), None),
+            budgets(0, 500)
+        );
+        assert_eq!(split_cache_budgets(Some(0), None, None), budgets(0, 0));
     }
 }

@@ -10,7 +10,7 @@ use crate::log_tail::{
 use crate::routes::Route;
 use crate::shell::{CheckIcon, CopyIcon, DownloadIcon, WarnIcon};
 use crate::status::BuildStatusBadge;
-use aurcache_common::api::build_log::align;
+use aurcache_common::api::build_log::{Alignment, align};
 use aurcache_common::api::builds::{DiskUsage, KeptBuild};
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
@@ -568,7 +568,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                                 error.set(None);
                             }
                             if !page.is_empty() {
-                                let (front_skip, back_drop) = align(&page);
+                                let Alignment {
+                                    front_skip,
+                                    back_drop,
+                                } = align(&page);
                                 // A page that aligns to nothing — the log
                                 // ended mid-codepoint and it is all tail —
                                 // cannot advance `next_offset`, so it is

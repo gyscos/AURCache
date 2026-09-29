@@ -25,6 +25,12 @@ pub struct Ca {
     key_pem: String,
 }
 
+/// A server certificate and its private key, both PEM.
+pub struct ServerCert {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
 /// The result of signing a worker CSR.
 pub struct SignedWorkerCert {
     /// PEM of the signed leaf certificate.
@@ -53,15 +59,15 @@ impl Ca {
             return Ok(Self { cert_pem, key_pem });
         }
 
-        let (cert_pem, key_pem) = Self::generate_ca()?;
-        write_secret(&key_path, &key_pem)?;
-        std::fs::write(&cert_path, &cert_pem).context("writing CA cert")?;
+        let ca = Self::generate_ca()?;
+        write_secret(&key_path, &ca.key_pem)?;
+        std::fs::write(&cert_path, &ca.cert_pem).context("writing CA cert")?;
         tracing::info!("Generated new AURCache internal CA at {}", dir.display());
 
-        Ok(Self { cert_pem, key_pem })
+        Ok(ca)
     }
 
-    fn generate_ca() -> anyhow::Result<(String, String)> {
+    fn generate_ca() -> anyhow::Result<Self> {
         let key = KeyPair::generate().context("generating CA key")?;
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -72,7 +78,10 @@ impl Ca {
         params.not_before = OffsetDateTime::now_utc() - Duration::hours(1);
         params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
         let cert = params.self_signed(&key).context("self-signing CA")?;
-        Ok((cert.pem(), key.serialize_pem()))
+        Ok(Self {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        })
     }
 
     /// PEM of the CA certificate (served to workers so they can pin it).
@@ -126,7 +135,7 @@ impl Ca {
     }
 
     /// Issue a server certificate for the given subject alt names, signed by the CA.
-    pub fn issue_server_cert(&self, sans: Vec<String>) -> anyhow::Result<(String, String)> {
+    pub fn issue_server_cert(&self, sans: Vec<String>) -> anyhow::Result<ServerCert> {
         let issuer = self.issuer()?;
         let key = KeyPair::generate().context("generating server key")?;
         let mut params = CertificateParams::new(sans)?;
@@ -138,7 +147,10 @@ impl Ca {
         let cert = params
             .signed_by(&key, &issuer)
             .context("signing server cert")?;
-        Ok((cert.pem(), key.serialize_pem()))
+        Ok(ServerCert {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+        })
     }
 
     /// Sign a worker CSR, returning the issued certificate and its metadata.
@@ -286,7 +298,8 @@ mod tests {
     fn issues_server_cert_chaining_to_ca() {
         let dir = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_create(dir.path()).unwrap();
-        let (cert_pem, key_pem) = ca.issue_server_cert(vec!["localhost".to_string()]).unwrap();
+        let ServerCert { cert_pem, key_pem } =
+            ca.issue_server_cert(vec!["localhost".to_string()]).unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(key_pem.contains("PRIVATE KEY"));
     }

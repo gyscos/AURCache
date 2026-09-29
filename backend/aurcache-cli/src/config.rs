@@ -60,14 +60,14 @@ pub fn resolve_runtime_config(
     cli_token: Option<String>,
 ) -> Result<RuntimeConfig> {
     let mut config = load_config()?;
-    let (url, url_prompted) = resolve_url(cli_url, &mut config)?;
-    let (token, token_prompted) = resolve_token(cli_token, &mut config)?;
-    if url_prompted || token_prompted {
+    let url = resolve_url(cli_url, &mut config)?;
+    let token = resolve_token(cli_token, &mut config)?;
+    if url.prompted || token.prompted {
         save_config(&config)?;
     }
     Ok(RuntimeConfig {
-        url,
-        token: token.filter(|token| !token.is_empty()),
+        url: url.value,
+        token: token.value.filter(|token| !token.is_empty()),
     })
 }
 
@@ -78,11 +78,11 @@ pub fn resolve_runtime_config(
 /// one just to print a `pacman.conf` stanza.
 pub fn resolve_url_only(cli_url: Option<String>) -> Result<String> {
     let mut config = load_config()?;
-    let (url, prompted) = resolve_url(cli_url, &mut config)?;
-    if prompted {
+    let url = resolve_url(cli_url, &mut config)?;
+    if url.prompted {
         save_config(&config)?;
     }
-    Ok(url)
+    Ok(url.value)
 }
 
 /// The configured token, if there is one, without prompting for it.
@@ -170,30 +170,53 @@ fn prompt_for_token() -> Result<String> {
         .context("failed to read AURCache token")
 }
 
-fn resolve_url(cli_url: Option<String>, config: &mut ClientConfig) -> Result<(String, bool)> {
+/// A setting and where it came from.
+struct Resolved<T> {
+    value: T,
+    /// Asked for interactively, and written into the config to be saved.
+    prompted: bool,
+}
+
+impl<T> Resolved<T> {
+    fn given(value: T) -> Self {
+        Self {
+            value,
+            prompted: false,
+        }
+    }
+
+    fn prompted(value: T) -> Self {
+        Self {
+            value,
+            prompted: true,
+        }
+    }
+}
+
+fn resolve_url(cli_url: Option<String>, config: &mut ClientConfig) -> Result<Resolved<String>> {
     if let Some(url) = normalize_url(cli_url).or_else(|| normalize_url(config.url.clone())) {
-        return Ok((url, false));
+        return Ok(Resolved::given(url));
     }
 
     ensure_interactive("AURCache URL")?;
     let prompted = prompt_for_url()?;
     config.url = Some(prompted.clone());
-    Ok((prompted, true))
+    Ok(Resolved::prompted(prompted))
 }
 
 fn resolve_token(
     cli_token: Option<String>,
     config: &mut ClientConfig,
-) -> Result<(Option<String>, bool)> {
+) -> Result<Resolved<Option<String>>> {
     match cli_token {
-        Some(token) => Ok((Some(token.trim().to_string()), false)),
+        Some(token) => Ok(Resolved::given(Some(token.trim().to_string()))),
         None => match config.token.clone() {
-            Some(token) => Ok((Some(token.trim().to_string()), false)),
+            Some(token) => Ok(Resolved::given(Some(token.trim().to_string()))),
             None => {
                 ensure_interactive("AURCache token")?;
                 let prompted = prompt_for_token()?;
                 config.token = Some(prompted.clone());
-                Ok((Some(prompted), true))
+                Ok(Resolved::prompted(Some(prompted)))
             }
         },
     }

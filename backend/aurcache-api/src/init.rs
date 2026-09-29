@@ -58,8 +58,8 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec!["localhost".to_string()]);
 
-    let (cert_pem, key_pem) = match ca.issue_server_cert(sans) {
-        Ok(pair) => pair,
+    let aurcache_ca::ServerCert { cert_pem, key_pem } = match ca.issue_server_cert(sans) {
+        Ok(cert) => cert,
         Err(e) => {
             error!("Failed to issue server certificate, TLS disabled: {e}");
             return None;

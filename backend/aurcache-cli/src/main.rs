@@ -15,7 +15,7 @@ use aurcache_client::{
     SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate,
     WorkerConfigView, looks_like_git_url,
 };
-use aurcache_common::api::build_log::align;
+use aurcache_common::api::build_log::{Alignment, align};
 use aurcache_common::build_state::{BuildState, BuildStates};
 use aurcache_common::repo::host_from_url;
 use chrono::{DateTime, Local};
@@ -2401,7 +2401,10 @@ async fn render_build_output(
         if page.is_empty() {
             break;
         }
-        let (front_skip, back_drop) = align(&page);
+        let Alignment {
+            front_skip,
+            back_drop,
+        } = align(&page);
         // When the whole page is a split character, `back_drop` covers it and
         // the offset cannot advance. That is EOF mid-character — stop, rather
         // than re-read the same tail forever (the empty-page rule alone would

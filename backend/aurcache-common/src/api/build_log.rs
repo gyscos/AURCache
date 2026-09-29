@@ -6,10 +6,17 @@
 //! same way. The one function that needs to be identical everywhere, so the
 //! offsets both ends compute always agree, lives here.
 
+/// How much of a page's edges [`align`] holds back; see there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Alignment {
+    pub front_skip: usize,
+    pub back_drop: usize,
+}
+
 /// Resolve a raw page of build log to a UTF-8-aligned slice, and say how far
 /// the page actually advanced.
 ///
-/// Returns `(front_skip, back_drop)`:
+/// Returns an [`Alignment`]:
 ///
 /// - `front_skip` is how many leading bytes to drop before the slice is
 ///   displayable — the *tail* of a character that started on the previous
@@ -29,12 +36,15 @@
 /// split character — which is why callers also stop when
 /// `raw.len() - back_drop == 0`: no forward progress, so EOF mid-character
 /// terminates rather than re-reading the same tail forever.
-pub fn align(raw: &[u8]) -> (usize, usize) {
+pub fn align(raw: &[u8]) -> Alignment {
     // Leading continuation bytes continue a character started before the
     // page. Full stop — that character cannot be recovered from what we have
     // been given, so it is dropped from the display.
     let front_skip = raw.iter().take_while(|b| is_continuation(**b)).count();
-    (front_skip, unfinished_suffix(&raw[front_skip..]))
+    Alignment {
+        front_skip,
+        back_drop: unfinished_suffix(&raw[front_skip..]),
+    }
 }
 
 fn is_continuation(byte: u8) -> bool {
@@ -65,16 +75,23 @@ fn unfinished_suffix(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::align;
+    use super::{Alignment, align};
+
+    fn at(front_skip: usize, back_drop: usize) -> Alignment {
+        Alignment {
+            front_skip,
+            back_drop,
+        }
+    }
 
     /// The trivial case: an already-aligned page is dropped as-is.
     #[test]
     fn a_complete_page_needs_no_adjustment() {
-        assert_eq!(align(b""), (0, 0));
-        assert_eq!(align(b"hello\n"), (0, 0));
+        assert_eq!(align(b""), at(0, 0));
+        assert_eq!(align(b"hello\n"), at(0, 0));
         assert_eq!(
             align("unrecognized option \u{2018}a\u{2019}\n".as_bytes()),
-            (0, 0)
+            at(0, 0)
         );
     }
 
@@ -86,9 +103,9 @@ mod tests {
         let raw = "unrecognized option \u{2018}".as_bytes();
         // Cut after 'unrecognized option ' (index 20) plus the leading byte of
         // U+2018: the page is 21 bytes, of which the last is half a character.
-        assert_eq!(align(&raw[..21]), (0, 1));
+        assert_eq!(align(&raw[..21]), at(0, 1));
         // `next_offset = 0 + 21 - 1 = 20` re-reads the character whole.
-        assert_eq!(align(&raw[20..]), (0, 0));
+        assert_eq!(align(&raw[20..]), at(0, 0));
         assert_eq!(&raw[20..23], "\u{2018}".as_bytes());
     }
 
@@ -97,7 +114,7 @@ mod tests {
     #[test]
     fn leading_continuation_bytes_are_dropped() {
         let raw = b"\x80\x98-fno_char8_t\n";
-        assert_eq!(align(raw), (2, 0));
+        assert_eq!(align(raw), at(2, 0));
     }
 
     /// A page of nothing but one character's remaining bytes is all slack:
@@ -105,9 +122,9 @@ mod tests {
     #[test]
     fn a_page_of_only_continuation_bytes_has_nothing_to_show() {
         let raw = b"\x80\x98";
-        let (front, back) = align(raw);
-        assert_eq!((front, back), (2, 0));
-        assert_eq!(&raw[front..raw.len() - back], b"");
+        let aligned = align(raw);
+        assert_eq!(aligned, at(2, 0));
+        assert_eq!(&raw[aligned.front_skip..raw.len() - aligned.back_drop], b"");
     }
 
     /// The zero-progress case that makes EOF mid-character terminate: a page
@@ -117,7 +134,7 @@ mod tests {
     #[test]
     fn an_entire_page_of_a_split_character_is_zero_progress() {
         let raw = b"\xE2";
-        assert_eq!(align(raw), (0, 1));
+        assert_eq!(align(raw), at(0, 1));
         assert_eq!(raw.len() - 1, 0);
     }
 
@@ -125,7 +142,7 @@ mod tests {
     /// knows it has caught up with a log that ends on a character boundary.
     #[test]
     fn an_empty_page_is_zero_progress() {
-        assert_eq!(align(b""), (0, 0));
+        assert_eq!(align(b""), at(0, 0));
     }
 
     /// Garbage is left for the caller's lossy decode, wherever it is. Holding
@@ -134,14 +151,14 @@ mod tests {
     #[test]
     fn garbage_is_kept_and_only_a_cut_character_is_held_back() {
         let raw = b"before\xFFafter";
-        assert_eq!(align(&raw[..9]), (0, 0));
-        assert_eq!(align(b"\xFF"), (0, 0));
+        assert_eq!(align(&raw[..9]), at(0, 0));
+        assert_eq!(align(b"\xFF"), at(0, 0));
         // Garbage earlier in the page does not hide a character cut at its end.
         let cut = [b"before\xFFafter ".as_slice(), &"\u{2018}".as_bytes()[..2]].concat();
-        assert_eq!(align(&cut), (0, 2));
+        assert_eq!(align(&cut), at(0, 2));
         // A four-byte character is complete once all four bytes are there.
         let emoji = "\u{1F600}".as_bytes();
-        assert_eq!(align(&emoji[..3]), (0, 3));
-        assert_eq!(align(emoji), (0, 0));
+        assert_eq!(align(&emoji[..3]), at(0, 3));
+        assert_eq!(align(emoji), at(0, 0));
     }
 }

@@ -418,6 +418,13 @@ pub const BUILDDIR_MOUNT: &str = "/build";
 
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
+/// Where [`write_configs`] put the files the caller goes on to install.
+pub struct StagedConfigs {
+    /// The makepkg overrides, for [`stage_makepkg_dropin`].
+    pub makepkg_overrides: PathBuf,
+    pub pacman_conf: PathBuf,
+}
+
 /// Write the per-package makepkg overrides, `pacman.conf` and mirrorlist to a
 /// staging directory the caller seeds the base chroot from.
 ///
@@ -430,7 +437,7 @@ pub fn write_configs(
     pacman_conf: &str,
     mirrorlist: Option<&str>,
     shared_pkg_cache: Option<&Path>,
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<StagedConfigs> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating config dir {}", dir.display()))?;
     let makepkg = dir.join("makepkg.conf");
@@ -442,7 +449,10 @@ pub fn write_configs(
     if let Some(list) = mirrorlist {
         std::fs::write(dir.join("mirrorlist"), list).context("writing mirrorlist")?;
     }
-    Ok((makepkg, pacman))
+    Ok(StagedConfigs {
+        makepkg_overrides: makepkg,
+        pacman_conf: pacman,
+    })
 }
 
 #[cfg(test)]
@@ -602,7 +612,10 @@ mod tests {
     #[test]
     fn only_the_jobs_overrides_are_staged() {
         let dir = tempfile::tempdir().unwrap();
-        let (makepkg, _pacman) = write_configs(
+        let StagedConfigs {
+            makepkg_overrides: makepkg,
+            ..
+        } = write_configs(
             dir.path(),
             "PKGDEST=/output\nMAKEFLAGS=-j4\n",
             "[options]\n",

@@ -2001,14 +2001,19 @@ mod tests {
         assert_eq!(parent_after.upstream_version.as_deref(), Some("2.0.0-1"));
     }
 
+    /// What [`two_providers_of_one_name`] sets up.
+    struct TwoProviders {
+        parent: packages::Model,
+        /// Id of `mydep`, which carries the name.
+        by_name: i32,
+        /// Id of `mydep-git`, which only provides it.
+        by_provides: i32,
+    }
+
     /// Set up a git package declaring `mydep`, with two tracked packages able
     /// to satisfy it: `mydep`, which carries the name, and `mydep-git`, which
-    /// only provides it. Ranking prefers the first; the returned ids are
-    /// `(parent, mydep, mydep-git)`.
-    async fn two_providers_of_one_name(
-        db: &DatabaseConnection,
-        repo_path: &Path,
-    ) -> (packages::Model, i32, i32) {
+    /// only provides it. Ranking prefers the first.
+    async fn two_providers_of_one_name(db: &DatabaseConnection, repo_path: &Path) -> TwoProviders {
         let parent = packages::ActiveModel {
             name: Set("git-parent".to_string()),
             status: Set(BuildStates::SUCCESSFUL_BUILD),
@@ -2062,7 +2067,11 @@ mod tests {
 
         let by_name = provider("mydep", None).await;
         let by_provides = provider("mydep-git", Some(json!(["mydep"]))).await;
-        (parent, by_name, by_provides)
+        TwoProviders {
+            parent,
+            by_name,
+            by_provides,
+        }
     }
 
     /// A dependency someone repointed by hand survives re-resolution.
@@ -2083,7 +2092,11 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         commit_pkgbuild(&repo, "initial", "1.0.0", &["mydep"]);
 
-        let (parent, _by_name, by_provides) = two_providers_of_one_name(&db, dir.path()).await;
+        let TwoProviders {
+            parent,
+            by_provides,
+            ..
+        } = two_providers_of_one_name(&db, dir.path()).await;
 
         // The hand-picked edge, as an "update this link" action would leave it.
         dependencies::ActiveModel {
@@ -2140,7 +2153,9 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         commit_pkgbuild(&repo, "initial", "1.0.0", &["mydep"]);
 
-        let (parent, by_name, _by_provides) = two_providers_of_one_name(&db, dir.path()).await;
+        let TwoProviders {
+            parent, by_name, ..
+        } = two_providers_of_one_name(&db, dir.path()).await;
 
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkout_dir.path().to_path_buf());

@@ -24,13 +24,13 @@ use bollard::query_parameters::{
 };
 use futures::StreamExt;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::commands;
-use crate::config::Config;
+use crate::config::{BuildDirs, Config};
 use crate::network::{self, NetworkPlan};
 
 /// Where the shared build directory is mounted inside the container. The
@@ -92,9 +92,12 @@ impl DockerExecutor {
     }
 
     /// Local and container-visible paths for one build's shared directory.
-    fn job_dirs(&self, cfg: &Config, build_id: i32) -> (PathBuf, PathBuf) {
+    fn job_dirs(&self, cfg: &Config, build_id: i32) -> BuildDirs {
         let name = build_id.to_string();
-        (cfg.dirs.local.join(&name), cfg.dirs.host.join(&name))
+        BuildDirs {
+            host: cfg.dirs.host.join(&name),
+            local: cfg.dirs.local.join(&name),
+        }
     }
 
     async fn pull_image(
@@ -151,7 +154,10 @@ impl DockerExecutor {
         cancel: &AtomicBool,
     ) -> Result<CompleteReport> {
         let build_id = job.build_id;
-        let (local_dir, host_dir) = self.job_dirs(cfg, build_id);
+        let BuildDirs {
+            host: host_dir,
+            local: local_dir,
+        } = self.job_dirs(cfg, build_id);
 
         // A crash mid-job could have left a tree behind under this id.
         let _ = std::fs::remove_dir_all(&local_dir);

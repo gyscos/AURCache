@@ -20,7 +20,7 @@ use pacman_mirrors::platforms::Platform;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
 
-use crate::package::add::{AddContext, add_resolved_source, build_add_context};
+use crate::package::add::{AddContext, AddedSource, add_resolved_source, build_add_context};
 use crate::services::Services;
 
 /// How a source was named in the request, for reporting it back.
@@ -142,8 +142,14 @@ async fn add_one(
     // was already tracked, from the check inside its own finalize — one query
     // for one fact, and no race with a concurrent add in between.
     match add_resolved_source(services, context, source, None).await {
-        Ok((pkgbase, true)) => (BulkAddOutcome::Existed, Some(pkgbase)),
-        Ok((pkgbase, false)) => (BulkAddOutcome::Added, Some(pkgbase)),
+        Ok(AddedSource {
+            pkgbase,
+            already_tracked: true,
+        }) => (BulkAddOutcome::Existed, Some(pkgbase)),
+        Ok(AddedSource {
+            pkgbase,
+            already_tracked: false,
+        }) => (BulkAddOutcome::Added, Some(pkgbase)),
         Err(e) => (
             BulkAddOutcome::Failed {
                 error: format!("{e:#}"),

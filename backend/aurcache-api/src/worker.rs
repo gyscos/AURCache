@@ -32,7 +32,7 @@ use aurcache_db::helpers::{worker_jobs, worker_store};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, workers};
 use aurcache_utils::build_logger::append_build_output;
-use aurcache_utils::job_config::{build_job_config, mirrorlist_for};
+use aurcache_utils::job_config::{JobConfig, build_job_config, mirrorlist_for};
 use aurcache_utils::publish::publish_build;
 use aurcache_utils::repository::Repository;
 use aurcache_utils::settings::general::SettingsTraits;
@@ -161,9 +161,20 @@ fn config_revision(values: &BTreeMap<String, String>) -> String {
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
+/// What a job descriptor carries for the mirrorlist; the fields of the same
+/// names on the job.
+#[derive(Debug, Default)]
+struct MirrorlistOffer {
+    content: Option<String>,
+    checksum: Option<String>,
+    /// The worker's copy is current: keep it. False with no content means the
+    /// server has none, and the worker drops whatever it cached.
+    unchanged: bool,
+}
+
 /// Decide what to put in a job descriptor for the mirrorlist.
 ///
-/// Returns `(content, checksum, unchanged)`. The mirrorlist is deployment
+/// The mirrorlist is deployment
 /// configuration rather than build configuration, but it is delivered on the
 /// claim because it *changes* -- `MIRROR_RANK_SCHEDULE` rewrites it on a
 /// schedule -- and the claim is the only exchange that recurs. Revalidating a
@@ -172,26 +183,33 @@ fn resolve_mirrorlist(
     held: &MirrorlistPreference,
     arch: &str,
     current: Option<String>,
-) -> (Option<String>, Option<String>, bool) {
+) -> MirrorlistOffer {
     // A worker with its own mirrorlist would discard anything sent, so nothing
     // is computed or sent for it.
     if matches!(held, MirrorlistPreference::Local) {
-        return (None, None, false);
+        return MirrorlistOffer::default();
     }
     let Some(content) = current else {
         // No mirrorlist for this arch: the worker drops whatever it cached and
         // falls back to its image's own. `unchanged` stays false precisely so
         // it can tell this apart from "keep what you have".
-        return (None, None, false);
+        return MirrorlistOffer::default();
     };
     let checksum = mirrorlist_checksum(&content);
     let MirrorlistPreference::Server { checksums } = held else {
         unreachable!("Local handled above");
     };
     if checksums.get(arch).map(String::as_str) == Some(checksum.as_str()) {
-        (None, None, true)
+        MirrorlistOffer {
+            unchanged: true,
+            ..MirrorlistOffer::default()
+        }
     } else {
-        (Some(content), Some(checksum), false)
+        MirrorlistOffer {
+            content: Some(content),
+            checksum: Some(checksum),
+            unchanged: false,
+        }
     }
 }
 
@@ -541,14 +559,21 @@ async fn build_descriptor(
         .await?
         .ok_or_else(|| anyhow::anyhow!("package {} not found", build.pkg_id))?;
 
-    let (makepkg_conf, pacman_conf) =
+    let JobConfig {
+        makepkg_conf,
+        pacman_conf,
+    } =
         // No `[repo]` section here: the worker appends one rendered from the
         // template it received at registration, using the host it actually
         // reaches this server on.
         build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST)).await;
 
     let arch = build.platform.as_str().to_string();
-    let (mirrorlist, mirrorlist_checksum, mirrorlist_unchanged) = resolve_mirrorlist(
+    let MirrorlistOffer {
+        content: mirrorlist,
+        checksum: mirrorlist_checksum,
+        unchanged: mirrorlist_unchanged,
+    } = resolve_mirrorlist(
         held_mirrorlist,
         &arch,
         mirrorlist_for(&arch, &mirrorlist_dir()).await,
@@ -1604,7 +1629,11 @@ mod repo_template_tests {
     /// field does, since `MirrorlistPreference` defaults to holding nothing.
     #[test]
     fn a_worker_holding_nothing_is_sent_the_mirrorlist() {
-        let (content, checksum, unchanged) = super::resolve_mirrorlist(
+        let super::MirrorlistOffer {
+            content,
+            checksum,
+            unchanged,
+        } = super::resolve_mirrorlist(
             &MirrorlistPreference::default(),
             "x86_64",
             Some("Server = http://mirror/\n".to_string()),
@@ -1618,13 +1647,16 @@ mod repo_template_tests {
     #[test]
     fn a_matching_checksum_withholds_the_content() {
         let list = "Server = http://mirror/\n".to_string();
-        let (_, checksum, _) = super::resolve_mirrorlist(
+        let super::MirrorlistOffer { checksum, .. } = super::resolve_mirrorlist(
             &MirrorlistPreference::default(),
             "x86_64",
             Some(list.clone()),
         );
-        let (content, checksum2, unchanged) =
-            super::resolve_mirrorlist(&holding("x86_64", &checksum.unwrap()), "x86_64", Some(list));
+        let super::MirrorlistOffer {
+            content,
+            checksum: checksum2,
+            unchanged,
+        } = super::resolve_mirrorlist(&holding("x86_64", &checksum.unwrap()), "x86_64", Some(list));
         assert!(content.is_none(), "content should not be resent");
         assert!(checksum2.is_none());
         assert!(unchanged, "the worker must be told to keep what it has");
@@ -1635,12 +1667,14 @@ mod repo_template_tests {
     #[test]
     fn a_checksum_for_another_arch_does_not_match() {
         let list = "Server = http://mirror/\n".to_string();
-        let (_, checksum, _) = super::resolve_mirrorlist(
+        let super::MirrorlistOffer { checksum, .. } = super::resolve_mirrorlist(
             &MirrorlistPreference::default(),
             "x86_64",
             Some(list.clone()),
         );
-        let (content, _, unchanged) = super::resolve_mirrorlist(
+        let super::MirrorlistOffer {
+            content, unchanged, ..
+        } = super::resolve_mirrorlist(
             &holding("x86_64", &checksum.unwrap()),
             "aarch64",
             Some(list),
@@ -1654,8 +1688,11 @@ mod repo_template_tests {
     /// entry rather than reuse it.
     #[test]
     fn no_server_mirrorlist_is_not_reported_as_unchanged() {
-        let (content, checksum, unchanged) =
-            super::resolve_mirrorlist(&holding("x86_64", "whatever"), "x86_64", None);
+        let super::MirrorlistOffer {
+            content,
+            checksum,
+            unchanged,
+        } = super::resolve_mirrorlist(&holding("x86_64", "whatever"), "x86_64", None);
         assert!(content.is_none());
         assert!(checksum.is_none());
         assert!(!unchanged);
@@ -1664,7 +1701,11 @@ mod repo_template_tests {
     /// A worker with its own mirrorlist is sent nothing at all.
     #[test]
     fn a_local_worker_is_sent_nothing() {
-        let (content, checksum, unchanged) = super::resolve_mirrorlist(
+        let super::MirrorlistOffer {
+            content,
+            checksum,
+            unchanged,
+        } = super::resolve_mirrorlist(
             &MirrorlistPreference::Local,
             "x86_64",
             Some("Server = http://mirror/\n".to_string()),

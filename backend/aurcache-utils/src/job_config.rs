@@ -113,20 +113,24 @@ pub async fn mirrorlist_for(arch: &str, mirrorlist_dir: &Path) -> Option<String>
     }
 }
 
+/// The rendered configuration a worker injects into its chroot.
+pub struct JobConfig {
+    pub makepkg_conf: String,
+    /// Without a `[repo]` section: the worker appends one for the host it
+    /// reaches this server on.
+    pub pacman_conf: String,
+}
+
 /// Assemble the self-contained build configuration for a [`JobDescriptor`].
-///
-/// Returns the rendered `(makepkg.conf, pacman.conf)` a worker injects into its
-/// chroot. `aurcache_repo_url` is the public base URL of the AURCache package
-/// server; a `[repo]` section pointing at it is appended so the build can
-/// resolve previously built packages.
 pub async fn build_job_config(
     db: &DatabaseConnection,
     pkg_id: i32,
     pkgdest_dir: &Path,
-) -> (String, String) {
-    let makepkg_conf = create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await;
-    let pacman_conf = create_pacman_config(db, pkg_id).await;
-    (makepkg_conf, pacman_conf)
+) -> JobConfig {
+    JobConfig {
+        makepkg_conf: create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await,
+        pacman_conf: create_pacman_config(db, pkg_id).await,
+    }
 }
 
 #[cfg(test)]

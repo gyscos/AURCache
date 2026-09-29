@@ -226,7 +226,15 @@ async fn resolve_srcinfo_to_spec(
     })
 }
 
-/// The pkgbase, plus whether it was already tracked.
+/// The package an add settled on.
+pub(crate) struct AddedSource {
+    pub(crate) pkgbase: String,
+    /// It was tracked before this add, which then changed nothing but its
+    /// source metadata.
+    pub(crate) already_tracked: bool,
+}
+
+/// Add the package `package_spec` describes, unless it is already tracked.
 ///
 /// Reporting pre-existence from here rather than probing before the call: the
 /// check-then-act is one step inside the finalize, so the reported outcome
@@ -236,7 +244,7 @@ async fn finalize_package_add(
     services: &Services,
     context: &AddContext,
     package_spec: PackageInsertSpec,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<AddedSource> {
     let Services {
         client,
         store,
@@ -255,7 +263,10 @@ async fn finalize_package_add(
             std::slice::from_ref(&package_spec.pkgbase),
         )
         .await;
-        return Ok((package_spec.pkgbase, true));
+        return Ok(AddedSource {
+            pkgbase: package_spec.pkgbase,
+            already_tracked: true,
+        });
     }
 
     let mut visited: HashSet<String> = HashSet::from([package_spec.pkgbase.clone()]);
@@ -306,7 +317,10 @@ async fn finalize_package_add(
         .ok_or_else(|| anyhow!("Package add produced no inserted packages"))?;
 
     trigger_initial_builds(db, tx, &services.activity, &context.platforms, &added_order).await?;
-    Ok((pkgbase, false))
+    Ok(AddedSource {
+        pkgbase,
+        already_tracked: false,
+    })
 }
 
 // Each argument is an independent input to the add flow (services, targeting,
@@ -341,7 +355,7 @@ async fn add_package_with_source(
     let source_data = resolve_source_pkgbase(client, source_data).await?;
     add_resolved_source(services, context, source_data, patched_files)
         .await
-        .map(|(pkgbase, _existed)| pkgbase)
+        .map(|added| added.pkgbase)
 }
 
 /// Turn a caller's source into one naming a pkgbase.
@@ -376,7 +390,7 @@ pub(crate) async fn add_resolved_source(
     context: &AddContext,
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<AddedSource> {
     let Services {
         client: _, store, ..
     } = services;

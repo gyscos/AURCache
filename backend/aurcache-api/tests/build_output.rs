@@ -204,8 +204,12 @@ async fn the_output_aligns_after_a_mid_character_offset() {
     std::fs::write(root.path().join("hello/1.log"), "option ‘-fno_char8_t’\n").unwrap();
 
     let (_, body) = get_bytes(&client, "/api/package/hello/build/1/output?offset=8").await;
-    let (front_skip, back_drop) = aurcache_common::api::build_log::align(&body);
-    assert_eq!((front_skip, back_drop), (2, 0));
-    let text = String::from_utf8_lossy(&body[front_skip..]);
+    let aligned = aurcache_common::api::build_log::align(&body);
+    let expected = aurcache_common::api::build_log::Alignment {
+        front_skip: 2,
+        back_drop: 0,
+    };
+    assert_eq!(aligned, expected);
+    let text = String::from_utf8_lossy(&body[aligned.front_skip..]);
     assert_eq!(text, "-fno_char8_t’\n");
 }

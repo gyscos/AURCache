@@ -182,7 +182,10 @@ async fn run_job_inner(
     // the host it reaches the server on (see aurcache_worker_core::repo).
     let pacman_conf =
         aurcache_worker_core::repo::append_to_pacman_conf(&job.pacman_conf, client.repo_section());
-    let (makepkg_overrides, pacman_conf) = chroot::write_configs(
+    let chroot::StagedConfigs {
+        makepkg_overrides,
+        pacman_conf,
+    } = chroot::write_configs(
         &cfg_dir,
         &build::limit_parallelism(
             &credentials::augment_makepkg_conf(

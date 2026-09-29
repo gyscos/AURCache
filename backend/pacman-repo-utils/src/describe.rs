@@ -76,7 +76,7 @@ pub fn describe_package(pkgfile: &Path) -> anyhow::Result<PackageEntry> {
     pkginfo.set_signature(pkgfile)?;
 
     let csize = fs::metadata(pkgfile)?.len();
-    let (md5sum, sha256sum) = calc_checksums(pkgfile)?;
+    let Checksums { md5sum, sha256sum } = calc_checksums(pkgfile)?;
 
     let filename = pkgfile
         .file_name()
@@ -101,8 +101,14 @@ pub fn describe_package(pkgfile: &Path) -> anyhow::Result<PackageEntry> {
     })
 }
 
+/// A file's digests, lowercase hex, named after the `desc` fields they fill.
+struct Checksums {
+    md5sum: String,
+    sha256sum: String,
+}
+
 /// md5 and sha256 of a file, in one streamed pass.
-fn calc_checksums(path: &Path) -> anyhow::Result<(String, String)> {
+fn calc_checksums(path: &Path) -> anyhow::Result<Checksums> {
     let mut file = File::open(path)?;
     let mut md5 = md5::Context::new();
     let mut sha256 = Sha256::new();
@@ -120,7 +126,10 @@ fn calc_checksums(path: &Path) -> anyhow::Result<(String, String)> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    Ok((format!("{:x}", md5.finalize()), sha256sum))
+    Ok(Checksums {
+        md5sum: format!("{:x}", md5.finalize()),
+        sha256sum,
+    })
 }
 
 #[cfg(test)]
@@ -136,7 +145,7 @@ mod tests {
         let bytes: Vec<u8> = (0..(3 << 20) + 17).map(|i| (i % 251) as u8).collect();
         fs::write(&path, &bytes).unwrap();
 
-        let (md5sum, sha256sum) = calc_checksums(&path).unwrap();
+        let Checksums { md5sum, sha256sum } = calc_checksums(&path).unwrap();
 
         assert_eq!(md5sum, format!("{:x}", md5::compute(&bytes)));
         assert_eq!(

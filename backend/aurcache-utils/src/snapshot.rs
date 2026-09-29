@@ -360,16 +360,16 @@ impl SnapshotStore {
         }
 
         // Off the executor: walking the full git history holds no `.await`.
-        // Best-effort stays best-effort — a panicked walk still yields
-        // `(None, None)`, like an unreadable repository.
+        // Best-effort stays best-effort — a panicked walk still yields an
+        // empty history, like an unreadable repository.
         let history_path = self
             .checkout_root
             .join(sanitize_cache_key(&source_data.cache_key()));
-        let (first, last) = tokio::task::spawn_blocking(move || Self::history_at(&history_path))
+        let history = tokio::task::spawn_blocking(move || Self::history_at(&history_path))
             .await
-            .unwrap_or((None, None));
-        metadata.first_submitted = first;
-        metadata.last_modified = last;
+            .unwrap_or_default();
+        metadata.first_submitted = history.first_submitted;
+        metadata.last_modified = history.last_modified;
         metadata
     }
 
@@ -379,17 +379,17 @@ impl SnapshotStore {
     /// This is the packaging repository's history, not the upstream project's:
     /// for an AUR package it is exactly "first submitted" and "last modified".
     ///
-    /// Returns `(None, None)` rather than failing — a shallow or unreadable
+    /// Returns an empty history rather than failing — a shallow or unreadable
     /// repository should cost two display fields, not the whole lookup.
-    fn history_at(path: &std::path::Path) -> (Option<i64>, Option<i64>) {
+    fn history_at(path: &std::path::Path) -> PackagingHistory {
         let Ok(repo) = git2::Repository::open(path) else {
-            return (None, None);
+            return PackagingHistory::default();
         };
         let Ok(mut walk) = repo.revwalk() else {
-            return (None, None);
+            return PackagingHistory::default();
         };
         if walk.push_head().is_err() {
-            return (None, None);
+            return PackagingHistory::default();
         }
 
         let mut newest = None;
@@ -407,7 +407,10 @@ impl SnapshotStore {
             oldest = Some(time);
         }
 
-        (oldest, newest)
+        PackagingHistory {
+            first_submitted: oldest,
+            last_modified: newest,
+        }
     }
 
     /// Forget a source: its cached snapshot and its persistent checkout.
@@ -532,25 +535,18 @@ impl SnapshotStore {
         };
         let previous_commit = previous.as_ref().map(|entry| entry.commit);
 
-        let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
+        let coordinates = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
 
         // Read once (see the fetch path): both consumers below want the same
         // answer, and each call is a DB round trip.
         let network = self.parse_network().await;
-        let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path, network)
-                .await
-                .map_err(|e| explain_source_failure(source_data, e))?;
+        let CheckedOutSource { commit, raw } = checkout_and_parse(coordinates, &path, network)
+            .await
+            .map_err(|e| explain_source_failure(source_data, e))?;
 
         let changed = previous_commit != Some(commit);
         if changed {
-            let raw = SourceSnapshot {
-                archive_bytes,
-                sourceinfo,
-                pkgbase,
-            };
-
             // Re-apply whichever patch (if any) was previously active for
             // this source, so a `refresh` doesn't silently drop it.
             let existing_patch = previous.and_then(|entry| entry.patch.clone());
@@ -585,20 +581,14 @@ impl SnapshotStore {
             }
         }
 
-        let (repo_url, git_ref, subfolder) = self.git_coordinates(source_data)?;
+        let coordinates = self.git_coordinates(source_data)?;
         let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
         // Read once: a DB round trip per call, and both consumers below want
         // the same answer.
         let network = self.parse_network().await;
-        let (commit, archive_bytes, pkgbase, sourceinfo) =
-            checkout_and_parse(&repo_url, &git_ref, &subfolder, &path, network)
-                .await
-                .map_err(|e| explain_source_failure(source_data, e))?;
-        let raw = SourceSnapshot {
-            archive_bytes,
-            sourceinfo,
-            pkgbase,
-        };
+        let CheckedOutSource { commit, raw } = checkout_and_parse(coordinates, &path, network)
+            .await
+            .map_err(|e| explain_source_failure(source_data, e))?;
 
         // Off the executor: patching unpacks, re-tars and re-parses the whole
         // archive with no `.await` in between.
@@ -637,21 +627,19 @@ impl SnapshotStore {
         entry.patch.as_ref() == patch
     }
 
-    /// Map a `SourceData` to the git coordinates used to fetch it: repo URL,
-    /// ref, and subfolder within the repo containing the PKGBUILD/.SRCINFO.
-    fn git_coordinates(
-        &self,
-        source_data: &SourceData,
-    ) -> anyhow::Result<(String, String, String)> {
+    /// Map a `SourceData` to the git coordinates used to fetch it.
+    fn git_coordinates(&self, source_data: &SourceData) -> anyhow::Result<GitCoordinates> {
         match source_data {
-            SourceData::Aur { name } => Ok((
-                format!("{}/{name}.git", self.aur_git_base_url),
-                "HEAD".to_string(),
-                String::new(),
-            )),
-            SourceData::Git { spec } => {
-                Ok((spec.url.clone(), spec.r#ref.clone(), spec.subfolder.clone()))
-            }
+            SourceData::Aur { name } => Ok(GitCoordinates {
+                repo_url: format!("{}/{name}.git", self.aur_git_base_url),
+                git_ref: "HEAD".to_string(),
+                subfolder: String::new(),
+            }),
+            SourceData::Git { spec } => Ok(GitCoordinates {
+                repo_url: spec.url.clone(),
+                git_ref: spec.r#ref.clone(),
+                subfolder: spec.subfolder.clone(),
+            }),
             SourceData::Upload { .. } => anyhow::bail!("Upload sources are not yet supported"),
         }
     }
@@ -752,6 +740,28 @@ fn sanitize_cache_key(cache_key: &str) -> String {
         .collect()
 }
 
+/// Unix timestamps of the first and latest commit of a packaging checkout.
+#[derive(Default)]
+struct PackagingHistory {
+    first_submitted: Option<i64>,
+    last_modified: Option<i64>,
+}
+
+/// Where a source's PKGBUILD lives in git.
+struct GitCoordinates {
+    repo_url: String,
+    git_ref: String,
+    /// Directory within the repository holding the PKGBUILD/.SRCINFO; empty
+    /// for the repository root.
+    subfolder: String,
+}
+
+/// A source as [`checkout_and_parse`] found it, before any patch.
+struct CheckedOutSource {
+    commit: Oid,
+    raw: SourceSnapshot,
+}
+
 /// Checkout (or fetch-and-update) `repo_url`@`git_ref` into the persistent
 /// `path`, then parse the `.SRCINFO`/PKGBUILD and build a tar.gz archive of
 /// `subfolder` (or the repo root if empty) with `{pkgbase}/` as the
@@ -769,19 +779,19 @@ fn sanitize_cache_key(cache_key: &str) -> String {
 /// a package. A best-effort `pkgbase` is derived from the repo URL/subfolder
 /// in that case.
 async fn checkout_and_parse(
-    repo_url: &str,
-    git_ref: &str,
-    subfolder: &str,
+    coordinates: GitCoordinates,
     path: &Path,
     network: bool,
-) -> anyhow::Result<(Oid, Vec<u8>, String, Option<SourceInfoV1>)> {
+) -> anyhow::Result<CheckedOutSource> {
     use crate::git::checkout::checkout_or_fetch_repo_ref;
     use crate::pkgbuild::parse_pkgbuild;
 
-    let repo_url = repo_url.to_string();
-    let git_ref = git_ref.to_string();
+    let GitCoordinates {
+        repo_url,
+        git_ref,
+        subfolder,
+    } = coordinates;
     let path = path.to_path_buf();
-    let subfolder = subfolder.to_string();
 
     // git2 types are not `Send`, so the checkout itself must run fully
     // within the blocking closure.
@@ -802,40 +812,43 @@ async fn checkout_and_parse(
     // above: PKGBUILD parsing shells out to a bridge script and archiving
     // tar+gzs the whole tree, and neither holds an `.await` — running them on
     // the executor would stall unrelated tasks.
-    let (pkgbase, sourceinfo, tar_gz_bytes) =
-        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let srcinfo_path = package_dir.join(".SRCINFO");
-            let pkgbuild_path = package_dir.join("PKGBUILD");
-            let parsed = if srcinfo_path.exists() {
-                read_checkout_file(&srcinfo_path)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
-                    .or_else(|err| {
-                        tracing::warn!(
-                            "{} does not parse, parsing the PKGBUILD instead: {err:#}",
-                            srcinfo_path.display()
-                        );
-                        parse_pkgbuild(&pkgbuild_path, network)
-                    })
-            } else {
-                parse_pkgbuild(&pkgbuild_path, network)
-            };
+    let raw = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let srcinfo_path = package_dir.join(".SRCINFO");
+        let pkgbuild_path = package_dir.join("PKGBUILD");
+        let parsed = if srcinfo_path.exists() {
+            read_checkout_file(&srcinfo_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|content| Ok(SourceInfoV1::from_string(&fix_source_urls(&content))?))
+                .or_else(|err| {
+                    tracing::warn!(
+                        "{} does not parse, parsing the PKGBUILD instead: {err:#}",
+                        srcinfo_path.display()
+                    );
+                    parse_pkgbuild(&pkgbuild_path, network)
+                })
+        } else {
+            parse_pkgbuild(&pkgbuild_path, network)
+        };
 
-            let (pkgbase, sourceinfo) = match parsed {
-                Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
-                Err(err) => {
-                    tracing::warn!("{} could not be parsed: {err:#}", pkgbuild_path.display());
-                    (fallback_pkgbase(&package_dir), None)
-                }
-            };
+        let (pkgbase, sourceinfo) = match parsed {
+            Ok(sourceinfo) => (sourceinfo.base.name.to_string(), Some(sourceinfo)),
+            Err(err) => {
+                tracing::warn!("{} could not be parsed: {err:#}", pkgbuild_path.display());
+                (fallback_pkgbase(&package_dir), None)
+            }
+        };
 
-            let tar_gz_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
+        let archive_bytes = create_archive_with_pkgbase_dir(&package_dir, &pkgbase)?;
 
-            Ok((pkgbase, sourceinfo, tar_gz_bytes))
+        Ok(SourceSnapshot {
+            archive_bytes,
+            sourceinfo,
+            pkgbase,
         })
-        .await??;
+    })
+    .await??;
 
-    Ok((commit, tar_gz_bytes, pkgbase, sourceinfo))
+    Ok(CheckedOutSource { commit, raw })
 }
 
 /// Read a file from a package checkout, which the package's repository wrote.

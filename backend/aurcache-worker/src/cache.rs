@@ -13,9 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
-/// The part of a `repo.db` that tells us whether a cached archive is current:
-/// `filename -> (compressed size, sha256)`.
-pub type RepoDb = HashMap<String, (u64, String)>;
+/// The part of a `repo.db` that tells us whether a cached archive is current,
+/// by filename.
+pub type RepoDb = HashMap<String, RepoDbEntry>;
+
+/// What `repo.db` says one package file should be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoDbEntry {
+    /// `%CSIZE%`: the archive's size in bytes.
+    pub csize: u64,
+    /// `%SHA256SUM%`, hex.
+    pub sha256: String,
+}
 
 /// Handle to the on-disk cache layout.
 #[derive(Clone, Debug)]
@@ -498,11 +507,11 @@ impl Cache {
             // in the aurcache DB to compare against, and nothing here can have
             // gone stale through the rename cycle.
             if let Some(want) = repo_db
-                && let Some(&(csize, ref sha)) = want.get(name)
+                && let Some(entry) = want.get(name)
             {
                 let matches = match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() != csize => false,
-                    Ok(_) => sha256_file(&path).is_ok_and(|got| &got == sha),
+                    Ok(meta) if meta.len() != entry.csize => false,
+                    Ok(_) => sha256_file(&path).is_ok_and(|got| got == entry.sha256),
                     Err(_) => false,
                 };
                 if !matches {
@@ -529,8 +538,8 @@ impl Cache {
             match repo_db {
                 Some(want) => {
                     for name in &promoted_names {
-                        if let Some((_, sha)) = want.get(name) {
-                            known.insert((shared.clone(), name.clone()), sha.clone());
+                        if let Some(entry) = want.get(name) {
+                            known.insert((shared.clone(), name.clone()), entry.sha256.clone());
                         }
                     }
                 }
@@ -575,22 +584,22 @@ impl Cache {
         // whole walk serialises every concurrent reconcile for no reason.
         // A concurrent reconcile can only duplicate a stat or a removal,
         // both idempotent, never corrupt the map.
-        let todo: Vec<(String, u64, String)> = {
+        let todo: Vec<(String, RepoDbEntry)> = {
             let known = verified_lock();
             repo_db
                 .iter()
-                .filter(|(name, (_, sha))| {
+                .filter(|(name, entry)| {
                     let key = (shared.clone(), (*name).clone());
-                    !known.get(&key).is_some_and(|seen| seen == sha)
+                    !known.get(&key).is_some_and(|seen| *seen == entry.sha256)
                 })
-                .map(|(name, (csize, sha))| (name.clone(), *csize, sha.clone()))
+                .map(|(name, entry)| (name.clone(), entry.clone()))
                 .collect()
         };
         let mut removed = 0;
         let mut suspects: Vec<(String, String)> = Vec::new();
         let mut absent: Vec<(String, String)> = Vec::new();
         let mut stale: Vec<String> = Vec::new();
-        for (name, csize, sha) in todo {
+        for (name, RepoDbEntry { csize, sha256: sha }) in todo {
             match std::fs::metadata(shared.join(&name)) {
                 // Nothing cached; nothing to verify until some promote
                 // actually lands the file.
@@ -970,7 +979,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Parse `repo.db` (or `<name>.db`) — gzip'd tar of one `desc` per package, as
-/// `repo-add` writes it — into `filename -> (compressed size, sha256)`.
+/// `repo-add` writes it — into a [`RepoDb`].
 ///
 /// Each package's entry is a `<name>-<version>/desc` file holding
 /// `%FILENAME%`, `%CSIZE%` and `%SHA256SUM%` fields. An entry missing any of
@@ -990,17 +999,18 @@ pub fn parse_repo_db(db: &[u8]) -> anyhow::Result<RepoDb> {
         }
         let mut text = String::new();
         entry.read_to_string(&mut text)?;
-        if let Some(triple) = parse_desc(&text) {
-            out.insert(triple.0, (triple.1, triple.2));
+        if let Some((filename, entry)) = parse_desc(&text) {
+            out.insert(filename, entry);
         }
     }
     Ok(out)
 }
 
-/// `%FILENAME%`, `%CSIZE%` and `%SHA256SUM%` of one `desc` file. A field is
+/// `%FILENAME%`, and the `%CSIZE%` and `%SHA256SUM%` recorded for it, of one
+/// `desc` file. A field is
 /// one line plus one following value line, so values use the same `i+1` shape
 /// as every other field parser in this repository.
-fn parse_desc(desc: &str) -> Option<(String, u64, String)> {
+fn parse_desc(desc: &str) -> Option<(String, RepoDbEntry)> {
     // Peeking, not indexing: the value is the line after the field header,
     // and collecting every line only to index `i + 1` is one allocation per
     // package entry in every `repo.db` parse.
@@ -1017,7 +1027,13 @@ fn parse_desc(desc: &str) -> Option<(String, u64, String)> {
             _ => {}
         }
     }
-    Some((filename?, size?, sha?))
+    Some((
+        filename?,
+        RepoDbEntry {
+            csize: size?,
+            sha256: sha?,
+        },
+    ))
 }
 
 /// One cache entry per package file. `last_used` is the file's mtime, which for
@@ -1549,7 +1565,13 @@ mod pkgcache_tests {
         std::fs::create_dir_all(tree.join("pkg")).unwrap();
         write(&tree.join("pkg").join("blob"), 4096);
         write(&tree.join("readable"), 100);
-        assert_eq!(dir_size(&tree), (4196, true));
+        assert_eq!(
+            dir_size(&tree),
+            TreeSize {
+                bytes: 4196,
+                complete: true
+            }
+        );
 
         std::fs::set_permissions(tree.join("pkg"), std::fs::Permissions::from_mode(0o111)).unwrap();
         let unreadable = std::fs::read_dir(tree.join("pkg")).is_err();
@@ -1557,7 +1579,13 @@ mod pkgcache_tests {
         std::fs::set_permissions(tree.join("pkg"), std::fs::Permissions::from_mode(0o755)).unwrap();
         // Root reads everything, so the case only exists for a normal user.
         if unreadable {
-            assert_eq!(measured, (100, false));
+            assert_eq!(
+                measured,
+                TreeSize {
+                    bytes: 100,
+                    complete: false
+                }
+            );
         }
     }
 
@@ -1707,7 +1735,13 @@ mod pkgcache_tests {
     fn make_db(entries: &[(&str, u64, &str)]) -> RepoDb {
         entries
             .iter()
-            .map(|&(name, size, sha)| (name.to_string(), (size, sha.to_string())))
+            .map(|&(name, csize, sha)| {
+                let entry = RepoDbEntry {
+                    csize,
+                    sha256: sha.to_string(),
+                };
+                (name.to_string(), entry)
+            })
             .collect()
     }
 
@@ -1737,10 +1771,11 @@ mod pkgcache_tests {
         ]);
         let repo = parse_repo_db(&bytes).unwrap();
         assert_eq!(repo.len(), 2);
-        assert_eq!(repo.get(name_a), Some(&(100, sha_of(&[b'x'; 100]))));
+        let entry = |csize, sha256| RepoDbEntry { csize, sha256 };
+        assert_eq!(repo.get(name_a), Some(&entry(100, sha_of(&[b'x'; 100]))));
         assert_eq!(
             repo.get("b-2.0-1-x86_64.pkg.tar.zst"),
-            Some(&(42, "f".repeat(64)))
+            Some(&entry(42, "f".repeat(64)))
         );
     }
 
@@ -1798,7 +1833,13 @@ mod pkgcache_tests {
         }
         let repo: RepoDb = entries
             .iter()
-            .map(|(name, sha)| (name.clone(), (100, sha.clone())))
+            .map(|(name, sha)| {
+                let entry = RepoDbEntry {
+                    csize: 100,
+                    sha256: sha.clone(),
+                };
+                (name.clone(), entry)
+            })
             .collect();
 
         assert_eq!(c.reconcile_pkgs(&repo), PARALLEL_HASH_THRESHOLD);
@@ -1919,16 +1960,23 @@ fn free_bytes(path: &Path) -> Option<u64> {
 /// sudo; where that is not available either, the partial figure is the best
 /// there is.
 fn measure_tree(path: &Path) -> u64 {
-    let (size, complete) = dir_size(path);
-    if complete {
-        return size;
+    let measured = dir_size(path);
+    if measured.complete {
+        return measured.bytes;
     }
-    privileged_du(path).unwrap_or(size)
+    privileged_du(path).unwrap_or(measured.bytes)
 }
 
-/// Bytes occupied under `path`, following no symlinks, and whether every
-/// directory and entry could be read.
-fn dir_size(path: &Path) -> (u64, bool) {
+/// What [`dir_size`] could count.
+#[derive(Debug, PartialEq, Eq)]
+struct TreeSize {
+    bytes: u64,
+    /// Every directory and entry could be read, so `bytes` is the whole tree.
+    complete: bool,
+}
+
+/// Bytes occupied under `path`, following no symlinks.
+fn dir_size(path: &Path) -> TreeSize {
     let mut total = 0;
     let mut complete = true;
     let mut stack = vec![path.to_path_buf()];
@@ -1950,7 +1998,10 @@ fn dir_size(path: &Path) -> (u64, bool) {
             }
         }
     }
-    (total, complete)
+    TreeSize {
+        bytes: total,
+        complete,
+    }
 }
 
 /// `du` as root, for a tree the worker cannot read all of.

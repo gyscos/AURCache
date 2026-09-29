@@ -1440,12 +1440,20 @@ async fn official_holds(services: &Services, name: &str) -> Result<bool, ApiErro
         .map_err(|e| err(Status::BadGateway, e))
 }
 
+/// One dependency edge and the packages on its ends.
+struct DependencyEdge {
+    dependent: packages::Model,
+    /// The package currently satisfying the dependency.
+    current: packages::Model,
+    edge: dependencies::Model,
+}
+
 /// Resolve one dependency edge by the two package names on its ends.
 async fn dependency_edge(
     db: &DatabaseConnection,
     dependent: &str,
     dependency: &str,
-) -> Result<(packages::Model, packages::Model, dependencies::Model), ApiError> {
+) -> Result<DependencyEdge, ApiError> {
     // The two endpoints are independent point lookups; the edge query below is
     // what genuinely depends on both.
     let (dependent, current) = tokio::join!(
@@ -1465,7 +1473,11 @@ async fn dependency_edge(
                 format!("{} does not depend on {}", dependent.name, current.name),
             )
         })?;
-    Ok((dependent, current, edge))
+    Ok(DependencyEdge {
+        dependent,
+        current,
+        edge,
+    })
 }
 
 /// The names `dependent` declares that `current` answers to.
@@ -1531,7 +1543,11 @@ pub async fn package_dependency_options(
     dependency: &str,
     _a: Authenticated,
 ) -> Result<Json<DependencyOptions>, ApiError> {
-    let (dependent, current, edge) = dependency_edge(&services.db, pkgbase, dependency).await?;
+    let DependencyEdge {
+        dependent,
+        current,
+        edge,
+    } = dependency_edge(&services.db, pkgbase, dependency).await?;
     let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
 
     let mut official = Vec::new();
@@ -1650,7 +1666,11 @@ pub async fn package_dependency_replace(
     input: Json<ReplaceDependency>,
     a: Authenticated,
 ) -> Result<(), ApiError> {
-    let (dependent, current, edge) = dependency_edge(&services.db, pkgbase, dependency).await?;
+    let DependencyEdge {
+        dependent,
+        current,
+        edge,
+    } = dependency_edge(&services.db, pkgbase, dependency).await?;
     let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
 
     match input.into_inner().replacement {
