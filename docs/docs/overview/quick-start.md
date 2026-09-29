@@ -98,7 +98,9 @@ services:
     # changes how text sorts under indexes already built.
     image: postgres:18-trixie
     volumes:
-      - ./aurcache/db:/var/lib/postgresql/data
+      # The parent of PGDATA, not PGDATA itself: since 18 the data lives in
+      # <major>/docker below it, so an upgrade builds the new directory beside the old.
+      - ./aurcache/db:/var/lib/postgresql
     environment:
       - POSTGRES_PASSWORD=YOUR_SECURE_PWD
       - POSTGRES_USER=aurcache
