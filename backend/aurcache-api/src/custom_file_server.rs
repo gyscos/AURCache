@@ -68,6 +68,13 @@ impl Handler for CustomFileServer {
         };
 
         let metadata = named_file.metadata().await.ok();
+        // A directory opens fine but cannot be written as a response body --
+        // Rocket fails the write with "Is a directory" (os error 21) and the
+        // request answers 500. There is no listing to serve, so a directory
+        // is exactly like a missing file.
+        if metadata.as_ref().is_some_and(|m| m.file_type().is_dir()) {
+            return Outcome::forward(data, Status::NotFound);
+        }
         let file_size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
         let last_modified = metadata.and_then(|m| m.modified().ok()).map(|mtime| {
             let datetime: chrono::DateTime<chrono::Utc> = mtime.into();
@@ -253,5 +260,43 @@ mod download_tests {
         assert_eq!(parse_range_header("bytes=abc-def", 1000), Ignored);
         assert_eq!(parse_range_header("bytes=0-abc", 1000), Ignored);
         assert_eq!(parse_range_header("bytes=0-9,20-29", 1000), Ignored);
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::CustomFileServer;
+    use rocket::http::Status;
+    use rocket::local::asynchronous::Client;
+
+    async fn served_client(root: &std::path::Path) -> Client {
+        Client::tracked(rocket::build().mount("/", CustomFileServer::new(root)))
+            .await
+            .expect("tracked client builds")
+    }
+
+    /// A directory is not a file to download: opening one used to succeed and
+    /// the response write then failed with "Is a directory" (os error 21),
+    /// answering 500. There is no listing to serve, so a directory answers
+    /// exactly like a missing file.
+    #[rocket::async_test]
+    async fn directories_answer_like_missing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let arch = root.path().join("x86_64");
+        std::fs::create_dir(&arch).unwrap();
+        std::fs::write(arch.join("repo.db"), b"db").unwrap();
+
+        let client = served_client(root.path()).await;
+
+        let file = client.get("/x86_64/repo.db").dispatch().await;
+        assert_eq!(file.status(), Status::Ok);
+
+        for path in ["/x86_64", "/x86_64/", "/"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::NotFound, "GET {path}");
+        }
+
+        let missing = client.get("/x86_64/no-such-file").dispatch().await;
+        assert_eq!(missing.status(), Status::NotFound);
     }
 }
