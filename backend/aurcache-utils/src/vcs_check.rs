@@ -291,33 +291,48 @@ pub async fn record_queued_vcs_sources(
     Ok(())
 }
 
+/// Whether a package's tracked VCS sources have moved since its last
+/// successful build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcesMoved {
+    /// At least one source is at a commit the last build did not use, or has
+    /// no commit recorded for it.
+    Moved,
+    /// Every source is where the last build left it.
+    Unmoved,
+    /// The question does not apply: nothing tracked, nothing recorded to
+    /// compare against, or no commit could be resolved. Never "up to date".
+    Unknown,
+}
+
 /// Whether any tracked VCS source has moved since the last successful build.
-///
-/// `None` when the question does not apply: nothing tracked, or nothing
-/// recorded to compare against -- the caller must not read either as "up to
-/// date".
 pub async fn vcs_sources_moved(
     db: &DatabaseConnection,
     package_id: i32,
     sourceinfo: &SourceInfoV1,
-) -> anyhow::Result<Option<bool>> {
+) -> anyhow::Result<SourcesMoved> {
     if extract_git_vcs_sources(sourceinfo).is_empty() {
-        return Ok(None);
+        return Ok(SourcesMoved::Unknown);
     }
     let built = latest_successful_build_vcs_sources(db, package_id).await?;
     if built.is_empty() {
-        return Ok(None);
+        return Ok(SourcesMoved::Unknown);
     }
     let now = resolve_vcs_commits(sourceinfo).await;
     if now.is_empty() {
-        return Ok(None);
+        return Ok(SourcesMoved::Unknown);
     }
     // A source with nothing recorded for it is a source we cannot vouch for,
     // so the answer is "moved" rather than a shrug: better a rebuild than a
     // package silently pinned to a commit nobody chose.
-    Ok(Some(now.iter().any(|(source_url, commit)| {
-        built.get(source_url) != Some(commit)
-    })))
+    let moved = now
+        .iter()
+        .any(|(source_url, commit)| built.get(source_url) != Some(commit));
+    Ok(if moved {
+        SourcesMoved::Moved
+    } else {
+        SourcesMoved::Unmoved
+    })
 }
 
 /// Remote commits already resolved during one pass over the packages.

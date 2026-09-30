@@ -161,15 +161,33 @@ fn config_revision(values: &BTreeMap<String, String>) -> String {
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
-/// What a job descriptor carries for the mirrorlist; the fields of the same
-/// names on the job.
-#[derive(Debug, Default)]
-struct MirrorlistOffer {
-    content: Option<String>,
-    checksum: Option<String>,
-    /// The worker's copy is current: keep it. False with no content means the
-    /// server has none, and the worker drops whatever it cached.
-    unchanged: bool,
+/// What a job descriptor tells the worker about the mirrorlist.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorlistOffer {
+    /// Use this list, and echo its checksum back on the next claim.
+    Send { content: String, checksum: String },
+    /// The worker's copy is current: keep it.
+    Keep,
+    /// Nothing: the server has no mirrorlist for this arch, so the worker
+    /// drops whatever it cached and falls back to its image's own -- or the
+    /// worker keeps its own and would discard anything sent anyway.
+    Nothing,
+}
+
+impl MirrorlistOffer {
+    /// Set the descriptor's mirrorlist fields, whose three values are how the
+    /// wire spells these variants.
+    fn write_to(self, job: &mut JobDescriptor) {
+        (
+            job.mirrorlist,
+            job.mirrorlist_checksum,
+            job.mirrorlist_unchanged,
+        ) = match self {
+            Self::Send { content, checksum } => (Some(content), Some(checksum), false),
+            Self::Keep => (None, None, true),
+            Self::Nothing => (None, None, false),
+        };
+    }
 }
 
 /// Decide what to put in a job descriptor for the mirrorlist.
@@ -187,29 +205,19 @@ fn resolve_mirrorlist(
     // A worker with its own mirrorlist would discard anything sent, so nothing
     // is computed or sent for it.
     if matches!(held, MirrorlistPreference::Local) {
-        return MirrorlistOffer::default();
+        return MirrorlistOffer::Nothing;
     }
     let Some(content) = current else {
-        // No mirrorlist for this arch: the worker drops whatever it cached and
-        // falls back to its image's own. `unchanged` stays false precisely so
-        // it can tell this apart from "keep what you have".
-        return MirrorlistOffer::default();
+        return MirrorlistOffer::Nothing;
     };
     let checksum = mirrorlist_checksum(&content);
     let MirrorlistPreference::Server { checksums } = held else {
         unreachable!("Local handled above");
     };
     if checksums.get(arch).map(String::as_str) == Some(checksum.as_str()) {
-        MirrorlistOffer {
-            unchanged: true,
-            ..MirrorlistOffer::default()
-        }
+        MirrorlistOffer::Keep
     } else {
-        MirrorlistOffer {
-            content: Some(content),
-            checksum: Some(checksum),
-            unchanged: false,
-        }
+        MirrorlistOffer::Send { content, checksum }
     }
 }
 
@@ -569,11 +577,7 @@ async fn build_descriptor(
         build_job_config(db, pkg.id, Path::new(WORKER_PKGDEST)).await;
 
     let arch = build.platform.as_str().to_string();
-    let MirrorlistOffer {
-        content: mirrorlist,
-        checksum: mirrorlist_checksum,
-        unchanged: mirrorlist_unchanged,
-    } = resolve_mirrorlist(
+    let mirrorlist = resolve_mirrorlist(
         held_mirrorlist,
         &arch,
         mirrorlist_for(&arch, &mirrorlist_dir()).await,
@@ -610,7 +614,7 @@ async fn build_descriptor(
 
     // Before `pkg.name` moves into the descriptor below.
     let packages = aurcache_utils::publish::expected_pkgnames(&pkg);
-    Ok(JobDescriptor {
+    let mut job = JobDescriptor {
         build_id: build.id,
         pkgbase: pkg.name,
         packages,
@@ -620,12 +624,14 @@ async fn build_descriptor(
         persistent_builddir,
         makepkg_conf,
         pacman_conf,
-        mirrorlist,
-        mirrorlist_checksum,
-        mirrorlist_unchanged,
+        mirrorlist: None,
+        mirrorlist_checksum: None,
+        mirrorlist_unchanged: false,
         pgp_keys,
         vcs_sources,
-    })
+    };
+    mirrorlist.write_to(&mut job);
+    Ok(job)
 }
 
 /// Stream the (server-patched) source archive for a claimed job.
@@ -1614,8 +1620,8 @@ pub async fn revoke_worker(
 
 #[cfg(test)]
 mod repo_template_tests {
-    use super::render_repo_template;
-    use aurcache_common::worker::MirrorlistPreference;
+    use super::{MirrorlistOffer, render_repo_template};
+    use aurcache_common::worker::{JobDescriptor, MirrorlistPreference};
     use std::collections::BTreeMap;
 
     fn holding(arch: &str, checksum: &str) -> MirrorlistPreference {
@@ -1624,42 +1630,41 @@ mod repo_template_tests {
         MirrorlistPreference::Server { checksums }
     }
 
+    /// The checksum a worker sent `list` would hold.
+    fn checksum_sent_with(list: &str) -> String {
+        match super::resolve_mirrorlist(
+            &MirrorlistPreference::default(),
+            "x86_64",
+            Some(list.to_string()),
+        ) {
+            MirrorlistOffer::Send { checksum, .. } => checksum,
+            other => panic!("expected the list to be sent, got {other:?}"),
+        }
+    }
+
     /// A worker that holds nothing is sent the content, with the checksum it
     /// should echo back next time. This is also what a worker predating the
     /// field does, since `MirrorlistPreference` defaults to holding nothing.
     #[test]
     fn a_worker_holding_nothing_is_sent_the_mirrorlist() {
-        let super::MirrorlistOffer {
-            content,
-            checksum,
-            unchanged,
-        } = super::resolve_mirrorlist(
+        let offer = super::resolve_mirrorlist(
             &MirrorlistPreference::default(),
             "x86_64",
             Some("Server = http://mirror/\n".to_string()),
         );
-        assert_eq!(content.as_deref(), Some("Server = http://mirror/\n"));
-        assert!(checksum.is_some(), "a checksum must accompany the content");
-        assert!(!unchanged);
+        assert!(
+            matches!(&offer, MirrorlistOffer::Send { content, .. } if content == "Server = http://mirror/\n"),
+            "{offer:?}"
+        );
     }
 
     /// The point of the whole exchange: matching checksum, no bytes resent.
     #[test]
     fn a_matching_checksum_withholds_the_content() {
         let list = "Server = http://mirror/\n".to_string();
-        let super::MirrorlistOffer { checksum, .. } = super::resolve_mirrorlist(
-            &MirrorlistPreference::default(),
-            "x86_64",
-            Some(list.clone()),
-        );
-        let super::MirrorlistOffer {
-            content,
-            checksum: checksum2,
-            unchanged,
-        } = super::resolve_mirrorlist(&holding("x86_64", &checksum.unwrap()), "x86_64", Some(list));
-        assert!(content.is_none(), "content should not be resent");
-        assert!(checksum2.is_none());
-        assert!(unchanged, "the worker must be told to keep what it has");
+        let checksum = checksum_sent_with(&list);
+        let offer = super::resolve_mirrorlist(&holding("x86_64", &checksum), "x86_64", Some(list));
+        assert_eq!(offer, MirrorlistOffer::Keep);
     }
 
     /// A checksum held for one architecture says nothing about another, which
@@ -1667,52 +1672,74 @@ mod repo_template_tests {
     #[test]
     fn a_checksum_for_another_arch_does_not_match() {
         let list = "Server = http://mirror/\n".to_string();
-        let super::MirrorlistOffer { checksum, .. } = super::resolve_mirrorlist(
-            &MirrorlistPreference::default(),
-            "x86_64",
-            Some(list.clone()),
+        let checksum = checksum_sent_with(&list);
+        let offer = super::resolve_mirrorlist(&holding("x86_64", &checksum), "aarch64", Some(list));
+        assert!(
+            matches!(offer, MirrorlistOffer::Send { .. }),
+            "aarch64 has not been sent this list"
         );
-        let super::MirrorlistOffer {
-            content, unchanged, ..
-        } = super::resolve_mirrorlist(
-            &holding("x86_64", &checksum.unwrap()),
-            "aarch64",
-            Some(list),
-        );
-        assert!(content.is_some(), "aarch64 has not been sent this list");
-        assert!(!unchanged);
     }
 
-    /// `unchanged == false` with no content is how "the server has none" is
-    /// told apart from "keep what you have" -- the worker must drop a stale
-    /// entry rather than reuse it.
+    /// "The server has none" must reach the worker as something other than
+    /// "keep what you have": it has to drop a stale entry rather than reuse it.
     #[test]
     fn no_server_mirrorlist_is_not_reported_as_unchanged() {
-        let super::MirrorlistOffer {
-            content,
-            checksum,
-            unchanged,
-        } = super::resolve_mirrorlist(&holding("x86_64", "whatever"), "x86_64", None);
-        assert!(content.is_none());
-        assert!(checksum.is_none());
-        assert!(!unchanged);
+        let offer = super::resolve_mirrorlist(&holding("x86_64", "whatever"), "x86_64", None);
+        assert_eq!(offer, MirrorlistOffer::Nothing);
     }
 
     /// A worker with its own mirrorlist is sent nothing at all.
     #[test]
     fn a_local_worker_is_sent_nothing() {
-        let super::MirrorlistOffer {
-            content,
-            checksum,
-            unchanged,
-        } = super::resolve_mirrorlist(
+        let offer = super::resolve_mirrorlist(
             &MirrorlistPreference::Local,
             "x86_64",
             Some("Server = http://mirror/\n".to_string()),
         );
-        assert!(content.is_none());
-        assert!(checksum.is_none());
-        assert!(!unchanged);
+        assert_eq!(offer, MirrorlistOffer::Nothing);
+    }
+
+    /// A descriptor carrying `offer`, and nothing else of note.
+    fn job_with(offer: MirrorlistOffer) -> JobDescriptor {
+        let mut job = JobDescriptor {
+            build_id: 1,
+            pkgbase: "hello".into(),
+            packages: vec!["hello".into()],
+            version: "1.0-1".into(),
+            arch: "x86_64".into(),
+            build_flags: Vec::new(),
+            persistent_builddir: false,
+            makepkg_conf: String::new(),
+            pacman_conf: String::new(),
+            mirrorlist: None,
+            mirrorlist_checksum: None,
+            mirrorlist_unchanged: false,
+            pgp_keys: Vec::new(),
+            vcs_sources: Vec::new(),
+        };
+        offer.write_to(&mut job);
+        job
+    }
+
+    /// Each outcome keeps its wire spelling, which workers already rely on:
+    /// in particular "keep" and "nothing" differ only in `mirrorlist_unchanged`.
+    #[test]
+    fn offers_keep_their_wire_encoding() {
+        let sent = job_with(MirrorlistOffer::Send {
+            content: "list".to_string(),
+            checksum: "sum".to_string(),
+        });
+        assert_eq!(sent.mirrorlist.as_deref(), Some("list"));
+        assert_eq!(sent.mirrorlist_checksum.as_deref(), Some("sum"));
+        assert!(!sent.mirrorlist_unchanged);
+
+        let kept = job_with(MirrorlistOffer::Keep);
+        assert!(kept.mirrorlist.is_none() && kept.mirrorlist_checksum.is_none());
+        assert!(kept.mirrorlist_unchanged);
+
+        let nothing = job_with(MirrorlistOffer::Nothing);
+        assert!(nothing.mirrorlist.is_none() && nothing.mirrorlist_checksum.is_none());
+        assert!(!nothing.mirrorlist_unchanged);
     }
 
     use aurcache_common::worker::REPO_HOST_PLACEHOLDER;

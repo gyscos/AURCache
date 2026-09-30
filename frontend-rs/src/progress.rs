@@ -31,17 +31,25 @@ const POLL_INTERVAL: Duration = Duration::from_millis(700);
 /// says anything about the packages, which may still be landing.
 const MAX_POLL_FAILURES: u32 = 10;
 
-/// Record one failed poll of a running job. Returns whether the follower
-/// should give up: past [`MAX_POLL_FAILURES`] the job is genuinely lost and
-/// the card says so, but below that the caller backs off and retries — a lone
-/// transient must not report running packages as failed.
+/// Where a job's follower stands after a failed poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tracking {
+    /// The failure was within tolerance; the job is still being followed.
+    Kept,
+    /// Too many failures: the job is marked lost and its card finished.
+    Lost,
+}
+
+/// Record one failed poll of a running job. Past [`MAX_POLL_FAILURES`] the job
+/// is genuinely lost and the card says so; below that the caller backs off and
+/// retries — a lone transient must not report running packages as failed.
 fn note_poll_failure(
     jobs: Signal<Vec<Job>>,
     id: u64,
     job: &str,
     failures: &mut u32,
     error: String,
-) -> bool {
+) -> Tracking {
     *failures += 1;
     if *failures > MAX_POLL_FAILURES {
         // `entry`, not `job`: the closure parameter shadows the job-kind
@@ -52,9 +60,9 @@ fn note_poll_failure(
                 .push((String::new(), format!("lost track of the {job}: {error}")));
             entry.finished = true;
         });
-        return true;
+        return Tracking::Lost;
     }
-    false
+    Tracking::Kept
 }
 
 /// What the dialog hands over when it closes.
@@ -346,7 +354,9 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
             // say that rather than reporting packages as failed, which they
             // are not — but only after sustained failure, not one transient.
             Err(e) => {
-                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string()) {
+                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string())
+                    == Tracking::Lost
+                {
                     return;
                 }
                 gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
@@ -427,7 +437,9 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 progress
             }
             Err(e) => {
-                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string()) {
+                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string())
+                    == Tracking::Lost
+                {
                     return;
                 }
                 gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
@@ -509,7 +521,9 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 progress
             }
             Err(e) => {
-                if note_poll_failure(jobs, id, "restore", &mut failures, e.to_string()) {
+                if note_poll_failure(jobs, id, "restore", &mut failures, e.to_string())
+                    == Tracking::Lost
+                {
                     return;
                 }
                 gloo_timers::future::sleep(POLL_INTERVAL * failures).await;

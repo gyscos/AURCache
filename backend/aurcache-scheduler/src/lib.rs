@@ -17,12 +17,11 @@ use tracing::info;
 /// is what someone writing it expects. The settings page says which timezone
 /// that is.
 ///
-/// Returns `false` when the schedule has no upcoming occurrence. A negative
-/// delta (clock jump) just means "run now".
+/// A negative delta (clock jump) just means "run now".
 pub(crate) async fn sleep_until_next_fire(
     upcoming: &mut impl Iterator<Item = DateTime<Local>>,
     what: &str,
-) -> bool {
+) -> Wake {
     match upcoming.next() {
         Some(next_time) => {
             let duration = next_time
@@ -35,8 +34,18 @@ pub(crate) async fn sleep_until_next_fire(
                 duration.as_secs()
             );
             tokio::time::sleep(duration).await;
-            true
+            Wake::Fired
         }
-        None => false,
+        None => Wake::Exhausted,
     }
+}
+
+/// Why [`sleep_until_next_fire`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// The schedule's next occurrence is now: run the job.
+    Fired,
+    /// The schedule has no upcoming occurrence, so there was nothing to sleep
+    /// until.
+    Exhausted,
 }

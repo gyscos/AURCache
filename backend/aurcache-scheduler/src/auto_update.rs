@@ -1,4 +1,4 @@
-use crate::sleep_until_next_fire;
+use crate::{Wake, sleep_until_next_fire};
 use aurcache_activitylog::events::Event;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::update::package_update_all_outdated;
@@ -43,7 +43,7 @@ pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
                 Some(Ok(schedule)) => {
                     let mut upcoming = schedule.upcoming(Local);
 
-                    if sleep_until_next_fire(&mut upcoming, "update").await {
+                    if sleep_until_next_fire(&mut upcoming, "update").await == Wake::Fired {
                         info!("Executing scheduled job at: {}", Local::now());
                         if let Err(e) = package_update_all_outdated(&services).await {
                             services.activity.emit(Event::UpdateQueueFailed {

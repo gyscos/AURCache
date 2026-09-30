@@ -171,10 +171,9 @@ impl Pool {
                 if !is_mountpoint(&mountpoint) {
                     // Formatted and checked as a file: neither needs a loop
                     // device.
-                    if prepare_image(path, size_for(total), *reserve).await? {
-                        mkfs(path).await?;
-                    } else {
-                        check_ours(path).await?;
+                    match prepare_image(path, size_for(total), *reserve).await? {
+                        Image::Created => mkfs(path).await?,
+                        Image::Existing => check_ours(path).await?,
                     }
                     match attached_loop(path).await {
                         // Attached by an older worker, without autoclear.
@@ -1808,11 +1807,18 @@ async fn subvolume_id(path: &Path) -> Result<u64> {
         .with_context(|| format!("subvolume id of {}: {out:?}", path.display()))
 }
 
-/// Create the image if it is missing. Returns whether it was, and so needs
-/// formatting.
-async fn prepare_image(path: &Path, size: u64, reserve: bool) -> Result<bool> {
+/// What [`prepare_image`] found at the image's path.
+enum Image {
+    /// Nothing: a new, empty image was made, which needs formatting.
+    Created,
+    /// An image from an earlier start, to be checked rather than formatted.
+    Existing,
+}
+
+/// Create the image if it is missing.
+async fn prepare_image(path: &Path, size: u64, reserve: bool) -> Result<Image> {
     if path.exists() {
-        return Ok(false);
+        return Ok(Image::Existing);
     }
     let dir = path.parent().context("the image path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1821,7 +1827,7 @@ async fn prepare_image(path: &Path, size: u64, reserve: bool) -> Result<bool> {
     // attribute does not exist, which is fine.
     let _ = query(&["chattr".as_ref(), "+C".as_ref(), dir.as_os_str()]).await;
     size_image(path, size, reserve)?;
-    Ok(true)
+    Ok(Image::Created)
 }
 
 /// Make the image `size` bytes: sparse, or allocated in full when reserving.

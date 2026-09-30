@@ -2,7 +2,9 @@ use crate::package::add::{
     ensure_aur_package_exists_recursive, provides_json, split_packages_json,
 };
 use crate::services::Services;
-use crate::vcs_check::{record_queued_vcs_sources, resolve_vcs_commits, vcs_sources_moved};
+use crate::vcs_check::{
+    SourcesMoved, record_queued_vcs_sources, resolve_vcs_commits, vcs_sources_moved,
+};
 use alpm_types::Version;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
@@ -294,14 +296,14 @@ async fn package_update_inner(
         // never match, and every unforced update rebuilt. The sources are what
         // it should be asking about.
         match vcs_sources_moved(&services.db, pkg_model.id, &sourceinfo).await {
-            Ok(Some(false)) => bail!(
+            Ok(SourcesMoved::Unmoved) => bail!(
                 "Latest build is already up to date (no tracked source has moved; \
                  use --force to rebuild anyway)"
             ),
-            Ok(Some(true)) => {}
+            Ok(SourcesMoved::Moved) => {}
             // Not a VCS package, or nothing recorded to compare against: the
             // version is the only question there is.
-            Ok(None) => {
+            Ok(SourcesMoved::Unknown) => {
                 if built_version.as_deref() == Some(upstream_version.as_str()) {
                     bail!("Latest build is already up to date (version {upstream_version})");
                 }

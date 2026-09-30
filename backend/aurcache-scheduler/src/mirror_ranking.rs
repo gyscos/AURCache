@@ -1,4 +1,4 @@
-use crate::sleep_until_next_fire;
+use crate::{Wake, sleep_until_next_fire};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_utils::job_config::{
@@ -43,7 +43,7 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
             // Get the next occurrence from now, or if the schedule has no
             // future occurrence (unlikely with cron), wait a default duration
             // before retrying.
-            if sleep_until_next_fire(&mut upcoming, "mirror ranking").await {
+            if sleep_until_next_fire(&mut upcoming, "mirror ranking").await == Wake::Fired {
                 match update_mirrorlist().await {
                     Ok(()) => {
                         info!("Mirror ranking finished");
