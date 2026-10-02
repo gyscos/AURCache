@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Patch `makechrootpkg` for the worker: confinement, and one nspawn default.
 
-Mostly the first. The last patch in the list is unrelated to confinement and
-says so; it opts out of a systemd-nspawn default that is about to change.
+Mostly the first. The `arch-nspawn` wrapper patch is not about confinement
+and says so; it opts out of a systemd-nspawn default that is about to change.
+The three after it close the other direction: links the build leaves in its
+output directories, which `makechrootpkg` would otherwise `chown` through as
+root on the host.
 
 A PKGBUILD is bash. Sourcing one runs it. `makechrootpkg` does that twice
 *outside* the chroot, as the build user:
@@ -234,6 +237,46 @@ if (( ${#_aurcache_nspawn_args[@]} )); then
 fi
 
 bindmounts_ro=()""",
+    ),
+    # The three loops that hand the build's outputs back run `chown` as host
+    # root on every entry of the copy's `pkgdest`, `srcpkgdest` and `logdest`.
+    # The build writes those directories, and `chown` follows symlinks: a
+    # PKGBUILD that leaves `/pkgdest/x -> /etc/shadow` has host root give
+    # /etc/shadow to the invoking user (`aurcache`), and clears the setuid bit
+    # of anything it points at. `move_logfiles` runs on a failed build too.
+    # Tested against devtools 1.5.1; see design/proposed/build-runner.md.
+    #
+    # Skip anything that is not a regular file, and `chown -h` what is left so
+    # no link is ever followed. The container has exited by now, and its
+    # processes with it, so nothing can swap a file for a link in between.
+    # A skipped entry is not a product makepkg made; the worker refuses
+    # symlinked artifacts anyway (aurcache-worker-core/src/artifacts.rs).
+    (
+        "move_logfiles: never follow a link the build left in logdest",
+        '\t\tchown "$src_owner" "$l"\n',
+        '\t\tif [[ -L $l || ! -f $l ]]; then\n'
+        "\t\t\twarning 'Skipping %s: not a regular file' \"${l##*/}\"\n"
+        "\t\t\tcontinue\n"
+        "\t\tfi\n"
+        '\t\tchown -h "$src_owner" "$l"\n',
+    ),
+    (
+        "move_products: never follow a link the build left in pkgdest",
+        '\t\tchown "$src_owner" "$pkgfile"\n',
+        '\t\tif [[ -L $pkgfile || ! -f $pkgfile ]]; then\n'
+        "\t\t\twarning 'Skipping %s: not a regular file' \"${pkgfile##*/}\"\n"
+        "\t\t\tcontinue\n"
+        "\t\tfi\n"
+        '\t\tchown -h "$src_owner" "$pkgfile"\n',
+    ),
+    (
+        "move_products: never follow a link the build left in srcpkgdest",
+        '\t\tchown "$src_owner" "$s"\n',
+        '\t\tif [[ -L $s || ! -f $s ]]; then\n'
+        "\t\t\twarning 'Skipping %s: not a regular file' \"${s##*/}\"\n"
+        "\t\t\tcontinue\n"
+        "\t\tfi\n"
+        '\t\tchown -h "$src_owner" "$s"\n',
     ),
 ]
 
