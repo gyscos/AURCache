@@ -1,6 +1,6 @@
 # Design: Home Assistant, Grafana, and an Outbound Event Bus
 
-Status: **Proposed** · Last updated: 2026-09-03
+Status: **Proposed** · Last updated: 2026-09-30
 
 ## Motivation
 
@@ -189,7 +189,8 @@ The question is what stores the numbers.
 | Grafana Infinity/JSON plugin → existing `/api/*` | None | None | Current-state panels | Historical trends |
 | `/metrics` (Prometheus text) + scraper | ~a screenful | Prometheus (or Grafana Alloy / Cloud) | Live gauges, counters, Grafana Alerting | Per-event granularity between scrapes |
 | Push (Pushgateway / remote_write / OTLP) from an event sink | Medium | Pushgateway or OTel Collector | Batch-job semantics, works behind NAT | More moving parts |
-| InfluxDB/Timescale from an event sink | Medium | A TSDB | Purpose-built retention | Overkill unless already run |
+| TimescaleDB (or plain Postgres) sink | Small — the Postgres driver is already linked | A Postgres database, Timescale optional | Per-build rows, retention, SQL in Grafana, backfill from history | Another database to run, if one isn't already |
+| InfluxDB from an event sink | Medium | InfluxDB | Purpose-built retention | Overkill unless already run; a new client and line protocol |
 | Loki + Alloy for build *logs* | None (ship files) | Loki | Log exploration | Not metrics |
 
 Most of what belongs on an AURCache dashboard is relational history already in
@@ -214,6 +215,113 @@ Cautions for `/metrics`: no per-package label on a high-churn metric (hundreds
 of packages is fine, a combinatorial label explosion is not); keep the
 "unknown is `None`, not `0`" convention by omitting a series rather than
 exporting a misleading zero.
+
+### Option: a TimescaleDB sink
+
+TimescaleDB is a Postgres extension, which makes it a much cheaper target than
+the "a TSDB" row suggests: AURCache already links `sqlx-postgres` through
+sea-orm, so writing to it adds no client library, and the same sink works
+against a plain Postgres database with Timescale simply absent. It is the
+option to take when the operator already runs Timescale (or Postgres) for other
+time series and wants AURCache's numbers beside them, queryable in SQL, kept
+past AURCache's own retention.
+
+What it offers over `/metrics` and over Grafana-on-DB:
+
+- **Per-build granularity.** One row per finished build — duration, outcome,
+  size, peak memory, disk usage, worker, platform, trigger — rather than a
+  histogram sampled every scrape interval.
+- **Decoupled from AURCache's schema.** Dashboards query a small, documented
+  table the sink owns, not `builds`/`packages`, so a migration in `aurcache-db`
+  does not break them (the "couples dashboards to schema" weakness of
+  Grafana-on-DB).
+- **Its own retention.** Deleting a package deletes its `builds` rows; in the
+  metrics store they stay for as long as its retention policy says.
+- **Backfill.** History already in `builds` can be written on first start;
+  a Prometheus scrape only ever sees from the day it was switched on.
+
+**Source: the `builds` table, not the event bus.** Everything a build row in
+the metrics store needs is already persisted on `builds` (`start_time`,
+`end_time`, `status`, `end_reason`, `size`, `peak_memory`, `disk_*`,
+`worker_id`, `platform`, `trigger`). So the sink is one task that reads
+finished builds past a watermark (`end_time`, then `id`) and upserts them,
+keyed on the build id, with `ON CONFLICT DO NOTHING`. That makes it
+at-least-once with idempotent writes: a restart, an unreachable database or a
+lagged broadcast receiver costs nothing but delay, and backfill is the same
+loop starting from zero. The `DomainEvent` bus, whose broadcast channel drops
+on lag, is only a wake-up hint so rows land within a second rather than at the
+next poll. The watermark is stored in the metrics database itself, next to the
+rows it describes, so pointing the sink at a fresh database re-backfills and
+AURCache's own schema gains nothing.
+
+**Gauges** — queue depth by state, workers online, repository size and package
+count, out-of-date count — are the same queries `/metrics` would run, sampled
+on an interval into a narrow table. Download counts are written as deltas when
+`DownloadCounter` flushes, per package (a row per flush is fine in a table; it
+is only a *label* that must not explode).
+
+Tables the sink creates, with `CREATE TABLE IF NOT EXISTS`:
+
+```sql
+CREATE TABLE aurcache_builds (
+    time          timestamptz NOT NULL,  -- end_time
+    build_id      bigint      NOT NULL,
+    package       text        NOT NULL,
+    version       text        NOT NULL,
+    platform      text        NOT NULL,
+    worker        text,                  -- NULL: built before workers, or unknown
+    trigger       text        NOT NULL,
+    outcome       text        NOT NULL,  -- success | failure | aborted | ...
+    end_reason    text,
+    duration_s    double precision,      -- NULL when start_time is unknown
+    size_bytes    bigint,                -- all nullable: unknown is NULL, never 0
+    peak_memory   bigint,
+    disk_chroot   bigint,
+    disk_workdir  bigint,
+    disk_sources  bigint,
+    disk_build_tree bigint,
+    PRIMARY KEY (build_id, time)
+);
+CREATE TABLE aurcache_gauges (
+    time  timestamptz NOT NULL,
+    name  text        NOT NULL,          -- e.g. queue.waiting, workers.online
+    value double precision NOT NULL,     -- unknown: no row, not a zero
+    PRIMARY KEY (name, time)
+);
+CREATE TABLE aurcache_downloads (
+    time    timestamptz NOT NULL,
+    package text        NOT NULL,
+    count   bigint      NOT NULL,        -- delta since the previous flush
+    PRIMARY KEY (package, time)
+);
+```
+
+The primary keys include `time` because a hypertable's unique constraints must.
+If `pg_extension` lists `timescaledb`, the sink additionally calls
+`create_hypertable(..., if_not_exists => true)` on each table and, when
+configured, `add_retention_policy` / compression. Without the extension it
+skips those and the tables are ordinary Postgres; nothing else differs.
+
+**This is not AURCache's own database.** It is an external store the operator
+names by URL — possibly on the same server, never the same schema. That keeps
+Timescale DDL out of `aurcache-db` and its migrations (which stay
+backend-agnostic, and would otherwise gain hypertable conversions of `builds`,
+whose single-column primary key a hypertable cannot keep). An operator whose
+AURCache database *is* Postgres with Timescale installed can still point the
+sink at another database on that server.
+
+**Core or plugin?** Under the plugin design's rule this sits on the line: it is
+tied to no vendor (it speaks plain Postgres) and costs no dependency, but most
+operators would not turn it on. The watermark-over-`builds` shape suits either:
+in core it is a scheduler task; as a WASM plugin it needs a socket grant for the
+Postgres wire protocol and reads builds over the API with the same cursor.
+Proposed: core, behind a cargo feature and off unless the URL is set, decided
+together with `/metrics` (see the open question in `plugins.md`).
+
+Cautions: the sink never blocks a build or publish — it is a reader of
+committed state with its own task. Write failures are logged and retried from
+the watermark. Credentials live in the URL or `PG*` environment, resolved
+through `ApplicationSettings`.
 
 ---
 
@@ -253,6 +361,9 @@ ad-hoc `env::var`.
 | `AURCACHE_EVENT_WEBHOOK_URL` | unset (sink off) | POST target for the webhook sink |
 | `AURCACHE_AMQP_URL` | unset (sink off) | RabbitMQ connection for the AMQP sink |
 | `AURCACHE_METRICS_ENABLED` | `false` | Serve `/metrics` |
+| `AURCACHE_METRICS_POSTGRES_URL` | unset (sink off) | Timescale / Postgres metrics sink target |
+| `AURCACHE_METRICS_GAUGE_INTERVAL` | `60s` | Gauge sampling period for that sink |
+| `AURCACHE_METRICS_RETENTION` | unset (keep) | Retention policy, applied only when Timescale is present |
 
 ---
 
@@ -267,5 +378,9 @@ ad-hoc `env::var`.
 3. **MQTT sink with Discovery** (publish only) — the real HA integration.
 4. **MQTT command topic** behind `AURCACHE_MQTT_COMMANDS_ENABLED`, routing to
    `aurcache_utils::package::add`.
-5. Webhook / AMQP sinks as demand appears; HACS integration as a community
+5. **Timescale / Postgres metrics sink**, when an operator wants per-build
+   history outside AURCache's database. Independent of 3–4; needs only the
+   gauge queries from 2 and the `DomainEvent` wake-up from 1 (and works
+   without it, by polling).
+6. Webhook / AMQP sinks as demand appears; HACS integration as a community
    contribution.

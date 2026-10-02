@@ -114,7 +114,8 @@ these ships in the tree.
    Assistant over MQTT. One small daemon each; the operator runs the one they
    use.
    *Needs:* **E** only (plus **R** to decorate a message).
-4. **Metrics exporter.** Prometheus/OpenMetrics, OpenTelemetry, InfluxDB:
+4. **Metrics exporter.** Prometheus/OpenMetrics, OpenTelemetry, InfluxDB,
+   TimescaleDB:
    build durations and outcomes per package and worker, queue depth over time,
    repository size, download counts. Counters come from events; gauges from
    polling the existing `stats`/`dashboard` endpoints.
@@ -184,7 +185,7 @@ server image.
 | 1 | LLM health monitor | **WASM** | HTTP to the model's API (hosted, or a local Ollama) and to the chat it reports to. |
 | 2 | Failure triage | **WASM** | Log over `call`, classification by rules or an HTTP model call. |
 | 3 | Notifications | **WASM** | ntfy, Matrix, Discord, Gotify, Telegram, Home Assistant are HTTP. E-mail (SMTP) and MQTT are TCP: WASM with a socket grant, TLS in the guest (`rustls`). |
-| 4 | Metrics exporter | **WASM** | Pushing (InfluxDB, OTLP/HTTP, Prometheus remote-write) is HTTP. Being *scraped* needs a listener: the `page` export (§8) under a token, or an executable. |
+| 4 | Metrics exporter | **WASM** | Pushing (InfluxDB, OTLP/HTTP, Prometheus remote-write) is HTTP. TimescaleDB is the Postgres wire protocol: WASM with a socket grant, as for MQTT (or core, see `home-assistant-integration.md`). Being *scraped* needs a listener: the `page` export (§8) under a token, or an executable. |
 | 5 | Issue tracker bridge | **WASM** | Gitea/GitHub/GitLab APIs are HTTP; which issue it opened goes in its key-value store. |
 | 6 | LLM recipe reviewer | **WASM** | The source archive over `call`, unpacked in the guest (`tar` and `flate2`/`ruzstd` are pure Rust); the model over HTTP. |
 | 7 | Artifact scanner | **WASM** for rule-based scanning in Rust (the suspicion-signals rules are). **WASM + a local daemon** for ClamAV: the plugin streams the artifact to `clamd` over TCP (`INSTREAM`); `clamd` and `freshclam` run beside the server as their own service. **Executable** to run a scanner CLI such as `traur`, or YARA (YARA-X embeds wasmtime and does not run *in* a guest). |
@@ -1714,7 +1715,7 @@ phase 4.
 - **Metrics in tree?** A `/metrics` endpoint is small and asked for often
   enough that it may deserve to be core, leaving plugins for the richer
   pipelines (example 4). Out of scope here; worth deciding alongside the Home
-  Assistant design.
+  Assistant design, together with its Timescale / Postgres sink.
 
 ## Appendix: Rust plugin frameworks compared
 
