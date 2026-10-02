@@ -1,6 +1,6 @@
 # Running workers without host root
 
-Status: **Proposed** (exploration) · Last updated: 2026-09-28 · TrueNAS facts checked on 25.10
+Status: **Proposed** (exploration) · Last updated: 2026-10-01 · TrueNAS facts checked on 25.10
 
 Upstream issue: Lukas-Heiligenbrunner/AURCache#276 ("Running AURCache without
 --privileged or binding the docker socket"). The issue is about upstream's
@@ -352,7 +352,10 @@ including native ones, and it is the part only this codebase can do.
   process exactly as powerful as those verbs. Together with user-namespaced
   builds, `run-build` would no longer amount to root either. This is the
   larger change: devtools' scripts would have to run inside the helper, not
-  be called with arguments the worker chooses.
+  be called with arguments the worker chooses. `design/proposed/build-runner.md`
+  goes further and replaces `makechrootpkg` and `arch-nspawn` with a runner of
+  our own, because `arch-nspawn` decides binds from the chroot's
+  `pacman.conf`, which no wrapper can make safe.
 
 Option F is what allows trusting AURCache a little **less** on any
 deployment. Options B to E are what let an operator skip trusting it.
@@ -432,10 +435,14 @@ Whether it contains anything depends on what surrounds the worker's
 container, because the engine inside needs `CAP_SYS_ADMIN`, AppArmor
 relaxed and `no-new-privileges` off (the issue lists each):
 
-- **In a plain Docker container, as TrueNAS apps are**, that is option A:
-  `CAP_SYS_ADMIN` in the host's user namespace, with the protections that
-  would narrow it switched off. It is still an improvement on the socket
-  (no host engine to drive, no host devices), but it is not a boundary.
+- **In a plain Docker container, as TrueNAS apps are**, a *rootful* engine
+  is option A: `CAP_SYS_ADMIN` in the host's user namespace, with the
+  protections that would narrow it switched off. It is still an improvement
+  on the socket (no host engine to drive, no host devices), but it is not a
+  boundary. A *rootless* Podman needs none of that: no added capability and
+  no `--privileged`, only a device, a seccomp profile, AppArmor relaxed and
+  writable cgroups. Its builds sit behind a user namespace of their own. See
+  "Rootless Podman in a plain Docker container" below, tested on TrueNAS.
 - **Under `userns-remap` or rootless Docker/Podman**, the issue's own setup,
   it is option B's boundary. The engine is known to work there, which is
   exactly what option B lacks for nspawn.
@@ -454,6 +461,100 @@ where nspawn does not. On TrueNAS 25.10, **C+H** (a system container running
 the worker with Podman builds) is the only container-shaped alternative to
 option D's VM, and the spike shows it works. TrueNAS 26 moving containers to
 libvirt LXC means redoing the spike there before documenting it.
+
+#### Rootless Podman in a plain Docker container
+
+Tested 2026-10-01 on an Arch host (Docker 29.8 with the containerd
+snapshotter, Podman 6.1, ext4, kernel 7.2) and on the TrueNAS builder
+(Docker 28.3.1, overlay2 on ZFS, AppArmor active, kernel 6.12). The outer
+container is `quay.io/podman/stable`, the engine runs as its `podman` user
+(uid 1000), and each build is `podman run` of the Arch image. Scripts were
+throwaway; the flags are what matters.
+
+| outer container | result |
+|---|---|
+| `docker:dind`, unprivileged | fails: `mount: permission denied` |
+| `docker:dind`, `--privileged` | works, and is option A |
+| `docker:dind-rootless`, unprivileged | works with seccomp, AppArmor and systempaths unconfined, `/dev/fuse` and `/dev/net/tun` |
+| rootless Podman, default seccomp, with or without `/dev/fuse` | fails: `cannot clone: Operation not permitted` |
+| rootless Podman, `/dev/fuse` + `seccomp=unconfined` | **works**: base-devel installs and `makepkg` builds, 13 s for a trivial package |
+| the same with Podman's own `seccomp.json` as the outer profile | **works**, so the outer container does not need `unconfined` |
+| the same on TrueNAS, default AppArmor | fails: overlay storage cannot make its mount private |
+| the same on TrueNAS, `apparmor=unconfined` | **works**, build included |
+
+Rootless DinD reaches the same place with more relaxed (a tun device,
+systempaths), so Podman is the engine to use.
+
+**Limits.** Unprivileged Docker mounts `/sys/fs/cgroup` read-only, and a
+`--memory` given to the inner Podman is then dropped without a word
+(`memory.max` stayed `max`, the peak went past it). With
+`--security-opt writable-cgroups=true`, which TrueNAS's 28.3.1 accepts, the
+container's root does the delegation `cgroup.rs` already does (move into a
+leaf, enable `memory pids cpu`, `chown` a subtree to `podman`), and Podman
+runs with `--cgroup-manager cgroupfs --cgroups=enabled
+--cgroup-parent=/<subtree>`. Without `--cgroups=enabled`, rootless Podman on
+cgroupfs creates no cgroups and ignores limits silently. With it, a 100 MB
+build is OOM-killed (137) and a 1 GB one survives, on both hosts; on Arch
+`memory.max`, `memory.peak` and `oom_kill` read correctly from
+`<subtree>/libpod-<id>`. On TrueNAS that path held nothing, so where the
+cgroup lands there is still to find before peak memory can be reported.
+
+**Seccomp.** The outer profile only covers the worker and Podman: filters
+stack, and every build container runs under one of its own (`Seccomp: 2`
+inside in every run). Podman's default build profile still lets a build
+`unshare -Ur`, and with a user namespace create a network namespace and
+configure it, which is the nf_tables/fsconfig class of kernel attack surface
+Docker's default profile exists to close. Running the build with Docker's
+default profile (`--security-opt seccomp=<moby default.json>`) blocks
+`unshare -Ur` and still builds. So: Podman's profile outside, Docker's
+inside. Whether any AUR package needs a user namespace mid-build (tools that
+sandbox themselves with bubblewrap) is untested.
+
+**Disk.** `--storage-opt size=` is no use here. Podman refuses it on any
+backing but XFS. Docker 29 with the containerd snapshotter *accepts*
+`size=200M` on ext4 and ignores it: 400 MB were written without an error,
+which is worse than refusing. The bound has to come from outside: the
+dataset quota mentioned above, or the worker's btrfs pool, where
+`podman run --rootfs <snapshot>` on a snapshot with a 300 MB qgroup limit
+stopped `dd` at exactly 300 MB with the base untouched, a 0.27 s snapshot
+and a 0.11 s container start. Mounting the pool needed `--privileged`, so
+that combination is for hosts where the worker can have a pool, not for
+TrueNAS apps.
+
+**Credentials.** Binding the ssh-agent socket's directory into the build
+works when the build's uid *is* the agent's uid: container root, or
+`--userns=keep-id:uid=1000,gid=1000 --user 1000`. A build uid that maps to a
+subuid is refused by `ssh-agent`'s own peer check ("communication with agent
+failed"), even with the socket world-writable. So the worker picks the build
+uid and maps it to its own, rather than taking the image's.
+
+**Ids: the open problem.** The outer container has no user namespace, so its
+ids are host ids. The image's `/etc/subuid` gives `podman` the range
+`1:999,1001:64535`, and the Podman namespace maps container root to outer
+1000 and container 1-999 to outer 1-999. A build that escapes its container
+therefore lands on a **real host account**: uid 1000 is a person's account on
+the Arch host, and 1-999 are system users on any host (568 is `apps` on
+TrueNAS). This is the direct-mapping rule from option C again. The likely fix
+is an outer `podman` user and a subuid range far above anything allocated
+(say uid 2000000000 and subuids from 2000100000), plus the
+`/proc/self/uid_map` check refusing identity extents. Not yet tested.
+
+So in a TrueNAS app, with the flag set
+
+```yaml
+devices: [/dev/fuse]
+security_opt:
+  - seccomp=./containers-seccomp.json   # Podman's profile, shipped with the image
+  - apparmor=unconfined
+  - writable-cgroups=true
+```
+
+the boundary is a user namespace plus a seccomp filter at least as strict as
+a stock Docker container's, with no added capability. That is option B's
+boundary without needing `userns-remap` on the host. It still needs, in
+order: the id range fixed, the combined flag set rerun on TrueNAS (the
+Podman-profile-outside row was only run on Arch), the cgroup path found
+there, and an AppArmor profile in place of `unconfined`.
 
 #### Which worker: the docker worker, pointed at Podman
 
@@ -544,10 +645,12 @@ recommended to anyone reading this doc.
 3. **Harden the default compose files**: the server settings above, and
    option A's device narrowing for the worker, commented as a reduction of
    exposure and not a boundary.
-4. **C+H on TrueNAS**: the 25.10 spike shows Podman builds work in an
-   unprivileged container and the chroot executor does not. Next is pointing
-   the docker executor at Podman inside such a container, and redoing the
-   spike on TrueNAS 26's libvirt LXC before documenting either.
+4. **H on TrueNAS**: the 25.10 spike shows Podman builds work in an
+   unprivileged container and the chroot executor does not. Rootless Podman
+   also builds inside a plain, unprivileged TrueNAS app (2026-10-01), which
+   needs no system container at all. Next is fixing that setup's id range,
+   then pointing the docker executor at its Podman. Redo the C+H spike on
+   TrueNAS 26's libvirt LXC only if the app route falls through.
 5. **Prototype option G**, the unprivileged "local" executor, since it
    is the only one that fits TrueNAS apps unchanged. It needs the
    reset-between-builds approach settled first, and a decision on whether one
