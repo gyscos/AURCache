@@ -15,6 +15,55 @@ pub(crate) fn retry_policy() -> FibonacciBuilder {
         .with_max_times(3)
 }
 
+/// Send a request under [`retry_policy`], keeping only a successful response.
+///
+/// A 5xx or a 429 is retried like a dropped connection: either is the server
+/// having a bad moment, and the AUR's gateway answers 502 often enough that a
+/// whole version-check pass used to be lost to a single one. Any other error
+/// status is an answer, and fails at once.
+///
+/// The error names the URL without its query. An RPC query lists every
+/// package of its batch, which turned one failure into a line thousands of
+/// characters long -- in the log and in the activity feed alike -- naming
+/// packages that had nothing to do with it.
+pub(crate) async fn send_with_retry<F, Fut>(
+    mut send: F,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let attempt = || {
+        let response = send();
+        async move { response.await?.error_for_status() }
+    };
+    attempt
+        .retry(retry_policy())
+        .when(is_transient)
+        .await
+        .map_err(without_query)
+}
+
+/// Whether trying again could get a different answer.
+fn is_transient(error: &reqwest::Error) -> bool {
+    match error.status() {
+        Some(status) => {
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        None => true,
+    }
+}
+
+fn without_query(error: reqwest::Error) -> reqwest::Error {
+    match error.url().cloned() {
+        Some(mut url) => {
+            url.set_query(None);
+            error.with_url(url)
+        }
+        None => error,
+    }
+}
+
 /// Ceiling for a generated RPC URL, under the server's 8 KiB request-line
 /// limit with room for the scheme, host and path already in the base.
 const MAX_RPC_URL_BYTES: usize = 7_600;
@@ -492,23 +541,13 @@ impl AurClient {
         Ok(packages)
     }
 
-    /// Perform an HTTP GET with the shared retry policy, returning the
-    /// response only if it has a success status.
+    /// Perform an HTTP GET through [`send_with_retry`].
     pub(crate) async fn retry_get<U: reqwest::IntoUrl + Clone>(
         &self,
         url: U,
     ) -> Result<reqwest::Response, Error> {
-        let http = self.http.clone();
-        let fetch = move || {
-            let http = http.clone();
-            let url = url.clone();
-            async move { http.get(url).send().await }
-        };
-        fetch
-            .retry(retry_policy())
+        send_with_retry(|| self.http.get(url.clone()).send())
             .await
-            .map_err(Error::Http)?
-            .error_for_status()
             .map_err(Error::Http)
     }
 

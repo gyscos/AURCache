@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use alpm_compress::tarball::TarballReader;
-use backon::Retryable;
 use reqwest::Client;
 use tokio::sync::RwLock;
 use url::Url;
 
-use crate::client::retry_policy;
+use crate::client::send_with_retry;
 use crate::model::Error;
 
 const OFFICIAL_REPO_NAMES: [&str; 3] = ["core", "extra", "multilib"];
@@ -252,29 +251,19 @@ impl OfficialRepos {
     /// as `.tar.gz`, and every lookup against the cache silently reports "not
     /// found".
     async fn download_from(&self, url: &Url) -> Result<Vec<u8>, Error> {
-        let http = self.http.clone();
-        let url = url.clone();
-        let fetch = move || {
-            let http = http.clone();
-            let url = url.clone();
-            async move {
-                http.get(url)
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
-                    .timeout(DOWNLOAD_TIMEOUT)
-                    .send()
-                    .await
-            }
-        };
-        fetch
-            .retry(retry_policy())
-            .await
-            .map_err(Error::Http)?
-            .error_for_status()
-            .map_err(Error::Http)?
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(Error::Http)
+        send_with_retry(|| {
+            self.http
+                .get(url.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                .timeout(DOWNLOAD_TIMEOUT)
+                .send()
+        })
+        .await
+        .map_err(Error::Http)?
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(Error::Http)
     }
 }
 
