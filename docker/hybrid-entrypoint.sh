@@ -103,6 +103,8 @@ if [ -d /sys/fs/cgroup ]; then
 fi
 
 log "starting AURCache server"
+# Close the server's state to other users; see private-state.sh.
+/usr/local/bin/aurcache-private-state
 /usr/bin/aurcache &
 PIDS+=($!)
 

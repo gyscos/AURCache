@@ -80,6 +80,25 @@ jobs:
           # run above.
           cargo test -p aurcache-api --features static
 
+      # The run above is unprivileged, so it parses under Landlock alone -- a
+      # native install. The container images run the server as root, and there
+      # a parse runs as a separate user with Landlock layered on top where the
+      # kernel has it. The same parse tests, as root: once as the images run on
+      # this kernel, and once with Landlock off, as they run on a kernel
+      # without it (Synology). See aurcache-sandbox/src/parse.rs.
+      - name: Test PKGBUILD parsing as root
+        run: |
+          sudo useradd --system --no-create-home aurcache-parse
+          tests=$(cargo test -p aurcache-utils --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "aurcache_utils" and .executable != null) | .executable')
+          cd aurcache-utils
+          as_root() { sudo --preserve-env=AURCACHE_SANDBOX,AURCACHE_PKGBUILD_BRIDGE,CI env "$@"; }
+          as_root "$tests" pkgbuild snapshot
+          # Denying TCP is Landlock's, and hardening rather than part of the
+          # profile, so a kernel without Landlock cannot be held to it.
+          as_root AURCACHE_SANDBOX_DISABLE=landlock "$tests" pkgbuild snapshot \
+            --skip a_parse_cannot_open_a_tcp_connection
+
       # The Dockerfiles build a subset of the workspace, not all of it. Cargo
       # unifies features across whatever is selected, and `cargo test --all`
       # also pulls in dev-dependencies -- so a crate can under-declare a

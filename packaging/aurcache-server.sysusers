@@ -9,3 +9,9 @@
 # files, because pacman refuses to install two packages that ship the same
 # path even when the contents are identical.
 u aurcache - "AURCache server and build worker" /var/lib/aurcache -
+
+# Who a PKGBUILD parse runs as when the server runs as root on a kernel without
+# Landlock -- the hybrid image, which installs this package. A native server
+# runs as `aurcache` and confines parses with Landlock alone, so there it is
+# never used.
+u aurcache-parse - "AURCache PKGBUILD parsing" /nonexistent /usr/bin/nologin

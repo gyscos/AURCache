@@ -82,7 +82,7 @@ fn warn_about_ephemeral_data() {
         let ephemeral: Vec<String> = [
             PathBuf::from("./repo"),
             aurcache_common::fs::build_log_root(),
-            PathBuf::from(env::var("AURCACHE_CA_DIR").unwrap_or_else(|_| "./data/ca".to_string())),
+            aurcache_common::fs::ca_dir(),
         ]
         .into_iter()
         .filter(|dir| {

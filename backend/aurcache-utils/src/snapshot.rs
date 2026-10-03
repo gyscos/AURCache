@@ -89,7 +89,7 @@ impl CacheEntry {
 /// per `SourceData::cache_key()`. Reusing these clones across calls means a
 /// `refresh` only needs to `git fetch` (transfer new objects) instead of a
 /// full re-clone.
-fn default_checkout_root() -> PathBuf {
+pub(crate) fn default_checkout_root() -> PathBuf {
     std::env::var("AURCACHE_SOURCE_CACHE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./source_cache"))

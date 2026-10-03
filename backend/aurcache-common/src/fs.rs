@@ -58,6 +58,15 @@ pub fn build_log_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("./build_logs"))
 }
 
+/// Where the server keeps the internal CA that signs every worker's
+/// certificate.
+#[must_use]
+pub fn ca_dir() -> PathBuf {
+    std::env::var("AURCACHE_CA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./data/ca"))
+}
+
 /// One path segment, with anything that is not a plain name flattened.
 ///
 /// A pkgbase from the AUR cannot contain a separator, but `AURCache` also builds

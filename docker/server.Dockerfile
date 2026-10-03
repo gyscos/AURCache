@@ -93,13 +93,20 @@ FROM debian:bookworm-slim
 # bind-mount the host's over it, which would otherwise land on the link's
 # target and leave the server naming the host's zone "Etc/UTC". Without either
 # it is UTC all the same.
+#
+# `aurcache-parse` is who a PKGBUILD parse runs as on a kernel without
+# Landlock (see backend/aurcache-sandbox/src/parse.rs); private-state.sh closes
+# the server's directories to it at every start.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates bash tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -f /etc/localtime /etc/timezone
+    && rm -f /etc/localtime /etc/timezone \
+    && useradd --system --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin aurcache-parse
 # Copy the built binary from the previous stage
 COPY --from=builder --chmod=0755 /app/backend/target/aurcache /usr/local/bin/aurcache
 COPY --chmod=0755 docker/entrypoint.sh /entrypoint.sh
+COPY --chmod=0755 docker/private-state.sh /usr/local/bin/aurcache-private-state
 
 # alpm-pkgbuild-bridge parses a PKGBUILD by sourcing it, i.e. by executing
 # attacker-supplied bash in the server process's container. The server runs it

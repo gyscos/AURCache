@@ -817,6 +817,7 @@ name = "aurcache-sandbox"
 version = "0.1.0"
 dependencies = [
  "landlock",
+ "libc",
 ]
 
 [[package]]

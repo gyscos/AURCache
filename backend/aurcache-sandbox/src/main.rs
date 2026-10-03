@@ -1,4 +1,6 @@
-//! Confine `makepkg --verifysource` to one build's own directories.
+//! Confine `makepkg --verifysource` to one build's own directories -- and,
+//! as `aurcache-sandbox parse`, the server's PKGBUILD parsing (see
+//! `parse.rs`, which owns everything about that profile).
 //!
 //! # Why this exists
 //!
@@ -49,29 +51,17 @@
 //! open-ended, and a miss silently breaks builds, whereas enumerating what must
 //! stay secret is short, known, and a miss is the only real risk. The worker wants the permissive form — a build
 //! legitimately reads most of the filesystem, and reading is not how one build
-//! corrupts another. The server wants the strict form, because there the threat
-//! is a PKGBUILD reading the package database or the built packages.
-//!
-//! # Beyond the filesystem
-//!
-//! `--no-net` denies TCP and `--isolate-ipc` denies signalling processes
-//! outside the sandbox and connecting to abstract unix sockets. Both need a
-//! newer kernel than the ABI V2 floor (6.7 and 6.12 respectively), and both
-//! fail rather than run with the restriction dropped.
-//!
-//! `--no-net` is TCP and nothing else, because that is all Landlock defines:
-//! UDP, DNS, QUIC and raw sockets stay open. It is worth applying where the
-//! confined program has no business connecting anywhere, but it is not an
-//! egress boundary and no caller should treat it as one.
+//! corrupts another. The server's `parse` profile uses the strict form, because
+//! there the threat is a PKGBUILD reading the server's own state.
 //!
 //! What this cannot do is protect a secret already in the process environment:
-//! a PKGBUILD reads `$DB_PWD` without touching the filesystem. Callers must
-//! scrub the environment themselves, as `aurcache-utils`' PKGBUILD parsing does
-//! (`aurcache-utils/src/pkgbuild.rs`).
+//! a PKGBUILD reads `$DB_PWD` without touching the filesystem. Callers of this
+//! profile must scrub the environment themselves; the server's `parse` profile
+//! (`parse.rs`) does it for them.
 
 use landlock::{
-    ABI, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -94,75 +84,23 @@ const WRITABLE_FROM_ENV: [&str; 2] = ["SRCDEST", "BUILDDIR"];
 /// a pure mechanical transform.
 const PROTECTED_PATHS_FILE: &str = "/etc/aurcache/sandbox-protected";
 
-/// A restriction beyond the filesystem policy, each needing a newer kernel than
-/// the ABI V2 floor.
-///
-/// Opt-in per invocation and, once asked for, mandatory: an unsupported kernel
-/// refuses rather than running with the restriction quietly dropped. Nothing
-/// degrades to a weaker policy, because a policy whose strength depends on the
-/// host reads as protection without being it -- Linux 6.12 is the floor for the
-/// server (see docs/docs/setup/requirements.md), and every restriction here
-/// lands well below that.
-#[derive(Clone, Copy, PartialEq)]
-enum Extra {
-    /// Deny TCP entirely (ABI V4, Linux 6.7). Parsing a PKGBUILD needs no
-    /// network; a build's source download does, so this is not for builds.
-    NoNet,
-    /// Deny signalling processes outside this sandbox and connecting to
-    /// abstract unix sockets (ABI V6, Linux 6.12). Landlock already blocks
-    /// `ptrace` across domains, but nothing stops a parse from killing the
-    /// server it runs beside, which shares its uid.
-    IsolateIpc,
-}
-
-impl Extra {
-    const ALL: [(&'static str, Self); 2] = [
-        ("--no-net", Self::NoNet),
-        ("--isolate-ipc", Self::IsolateIpc),
-    ];
-
-    /// The flag asking for it, and the kernel that introduced it.
-    fn describe(self) -> (&'static str, &'static str) {
-        match self {
-            Self::NoNet => ("--no-net", "6.7"),
-            Self::IsolateIpc => ("--isolate-ipc", "6.12"),
-        }
-    }
-
-    /// Add this restriction to `ruleset` as a hard requirement.
-    ///
-    /// `HardRequirement` is what turns an unsupported kernel into an error
-    /// here: the default `BestEffort` would drop the restriction and report a
-    /// ruleset that looks enforced.
-    fn apply(self, ruleset: Ruleset) -> Result<Ruleset, Box<dyn std::error::Error>> {
-        let ruleset = ruleset.set_compatibility(CompatLevel::HardRequirement);
-        let (flag, kernel) = self.describe();
-        Ok(match self {
-            Self::NoNet => ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp),
-            Self::IsolateIpc => ruleset.scope(Scope::Signal | Scope::AbstractUnixSocket),
-        }
-        .map_err(|e| format!("{flag} needs Linux {kernel} or newer: {e}"))?)
-    }
-}
+mod parse;
 
 fn main() -> std::process::ExitCode {
+    // The server's profile: the whole policy is the sandbox's, stated by
+    // purpose rather than by mechanism. See `parse.rs`.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "parse") {
+        return parse::main(std::env::args_os().skip(2));
+    }
+
     let mut allow: Vec<PathBuf> = Vec::new();
     let mut read: Vec<PathBuf> = Vec::new();
     let mut read_except: Vec<PathBuf> = Vec::new();
-    let mut extras: Vec<Extra> = Vec::new();
     let mut build_env = false;
     let mut args = std::env::args_os().skip(1).peekable();
 
     while let Some(arg) = args.peek() {
         match arg.to_str() {
-            Some(flag) if Extra::ALL.iter().any(|(name, _)| *name == flag) => {
-                let (_, extra) = Extra::ALL
-                    .iter()
-                    .find(|(name, _)| *name == flag)
-                    .expect("matched above");
-                extras.push(*extra);
-                args.next();
-            }
             Some("--allow-build-env") => {
                 build_env = true;
                 args.next();
@@ -208,8 +146,8 @@ fn main() -> std::process::ExitCode {
     let argv: Vec<_> = args.collect();
     let Some((program, rest)) = argv.split_first() else {
         eprintln!(
-            "usage: aurcache-sandbox [--allow DIR]... [--allow-build-env] [--no-net] \
-             [--isolate-ipc] [--] <command> [args...]"
+            "usage: aurcache-sandbox [--allow DIR]... [--allow-build-env] [--] <command> [args...]\n       \
+             aurcache-sandbox parse --pkgbuild FILE [--private PATH]... [--network] -- PROGRAM [ARGS]..."
         );
         return std::process::ExitCode::from(2);
     };
@@ -249,7 +187,7 @@ fn main() -> std::process::ExitCode {
         }));
     }
 
-    if let Err(e) = restrict(&allow, &read, &extras) {
+    if let Err(e) = restrict(&allow, &read) {
         // Fail closed. Running unconfined would silently reinstate the very
         // cross-build write channel this exists to remove, and it would look
         // exactly like success.
@@ -381,11 +319,7 @@ fn read_grants_excluding(
 }
 
 /// Apply the Landlock policy to this process (inherited by the exec'd child).
-fn restrict(
-    allow: &[PathBuf],
-    read: &[PathBuf],
-    extras: &[Extra],
-) -> Result<(), Box<dyn std::error::Error>> {
+fn restrict(allow: &[PathBuf], read: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     // Writing implies being able to move things around inside a writable tree,
     // and makepkg renames across directories as a matter of course (tar
     // extraction, breezy staging a pack into `packs/`, ...). Landlock only
@@ -403,13 +337,9 @@ fn restrict(
     } else {
         write | read_only
     };
-    let mut builder = Ruleset::default();
-    for extra in extras {
-        builder = extra.apply(builder)?;
-    }
-    // Back to the default for the filesystem policy, whose floor is V2 and
-    // whose shortfalls the `FullyEnforced` check below catches anyway.
-    let mut ruleset = builder
+    // The floor is V2, whose shortfalls the `FullyEnforced` check below
+    // catches anyway.
+    let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(handled)?
         .create()?;

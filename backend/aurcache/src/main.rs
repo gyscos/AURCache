@@ -61,9 +61,7 @@ async fn main() {
 
     // Load (or create on first run) the internal CA used to authenticate remote
     // build workers over mutual TLS. Persisted under the data directory.
-    let ca_dir = std::path::PathBuf::from(
-        env::var("AURCACHE_CA_DIR").unwrap_or_else(|_| "./data/ca".to_string()),
-    );
+    let ca_dir = aurcache_common::fs::ca_dir();
     let ca = aurcache_ca::Ca::load_or_create(&ca_dir).expect("failed to initialize internal CA");
     if let Ok(fp) = ca.ca_cert_fingerprint() {
         tracing::info!("Worker CA fingerprint (pin this on workers): {fp}");

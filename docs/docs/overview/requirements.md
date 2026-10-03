@@ -7,9 +7,14 @@ sidebar_position: 2
 ## Server
 
 * Docker or Podman
-* Linux 6.12 or newer, with Landlock enabled. Parsing a PKGBUILD executes it,
-  so the server confines every parse and refuses to parse rather than run one
-  unconfined — an older kernel means no package can be added
+* Parsing a PKGBUILD executes it, so the server confines every parse and
+  refuses to parse rather than run one unconfined. In the container images
+  this works on any kernel Docker runs on. A native install needs Linux 6.12 or
+  newer with Landlock enabled. See [Package parsing](../Configuration/package-parsing.md)
+* The server's state directories (the database, the worker CA, build logs and
+  the source cache) must not be readable by other users. The container images
+  set this at every start; secrets you mount in yourself should not be
+  world-readable, and nothing the server relies on should be world-writable
 * No special performance requirements — it serves the UI, the API and the
   package repository, and does not build anything
 * Disk for the package repository and the database
