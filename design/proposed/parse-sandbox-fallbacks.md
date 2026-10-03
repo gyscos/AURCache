@@ -129,7 +129,7 @@ native server runs unprivileged and never uses it.
 ## Open
 
 - Images not yet built and run end to end with this.
-- **Synology builds.** The chroot worker needs 6.7 (btrfs simple quotas), so a
-  privileged hybrid on Synology starts with no worker. Parsing alone does not
-  make it work there; a builder fallback (the legacy docker builder, or
-  quota-less chroots) is a separate decision.
+- **Synology builds** were the other half: the chroot worker needs 6.7 (btrfs
+  simple quotas). Settled separately by making the hybrid image's builder the
+  legacy container one in both modes, with Podman inside the container for
+  DinD as the old image had -- so the hybrid image keeps the old requirements.

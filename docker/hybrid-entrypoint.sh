@@ -7,9 +7,14 @@
 # `aurcache-worker` images are the supported setup.
 #
 # Everything temporary about the compatibility path lives in this script — the
-# shared secret, the legacy-mode inference, the supervision. Neither worker
-# binary knows the other exists, so retiring this image retires the whole
+# shared secret, the build-mode inference, the supervision. The worker binary
+# does not know it is embedded, so retiring this image retires the whole
 # mechanism with it.
+#
+# The embedded worker is the legacy container builder, the one closest to what
+# these deployments ran before: a container per package, spawned over a Docker
+# socket. That keeps the old requirements the old requirements -- no new
+# kernel, no loop devices, foreign architectures through binfmt as before.
 set -uo pipefail
 
 log() { printf '[hybrid] %s\n' "$*" >&2; }
@@ -41,49 +46,86 @@ unset AURCACHE_ENROLLMENT_DIR
 # box, and it should say so. Still overridable for a host running more than one.
 export WORKER_NAME="${WORKER_NAME:-bundled}"
 
-# ---------------------------------------------------------------------------
-# Which builder.
-#
-# `BUILD_ARTIFACT_DIR` is not a hint — in the pre-worker code it *was* the
-# definition of host build mode (`get_build_mode()` branched on exactly this).
-# So a deployment that sets it was building in spawned containers against the
-# host's Docker socket, and reproducing that is the faithful thing to do.
-# Everything else gets the chroot worker, which is also what the old dind mode
-# users end up with: they already run privileged, which is what it needs.
-# ---------------------------------------------------------------------------
-if [ -n "${BUILD_ARTIFACT_DIR:-}" ]; then
-    WORKER_BIN=/usr/bin/aurcache-worker-docker
-    WORKER_KIND="legacy container builder"
-else
-    WORKER_BIN=/usr/bin/aurcache-worker
-    WORKER_KIND="devtools chroot builder"
+# The pre-worker setting, under its new name. It was the server's cap on builds
+# at once; it is now the worker's own concurrency, which is the same thing
+# here, where the server has exactly one worker.
+if [ -n "${MAX_CONCURRENT_BUILDS:-}" ] && [ -z "${WORKER_CONCURRENCY:-}" ]; then
+    export WORKER_CONCURRENCY_DEFAULT="${WORKER_CONCURRENCY_DEFAULT:-$MAX_CONCURRENT_BUILDS}"
+fi
 
-    # devtools needs a writable /run and the ability to create mount
-    # namespaces. Both come with `privileged`, which every documented
-    # single-container setup already used.
-    mountpoint -q /run || mount -t tmpfs tmpfs /run 2>/dev/null || true
-
-    if ! unshare --mount --pid --fork true >/dev/null 2>&1; then
-        log "ERROR: this container cannot create the mount/PID namespaces that"
-        log "       chroot builds require, so no packages can be built here."
-        log ""
-        log "       Add 'privileged: true' to this service in your compose file"
-        log "       and recreate it. If your setup instead mounts the Docker"
-        log "       socket, set BUILD_ARTIFACT_DIR as it was before upgrading to"
-        log "       use the legacy container builder."
-        log ""
-        log "       Starting the server alone; the web UI will be reachable and"
-        log "       will report that no worker is available."
-        WORKER_BIN=""
+# Foreign architectures this host can run, as the old builder could: it pulled
+# each build's image for the package's platform and let binfmt run it. Read
+# from the handlers registered on the host kernel, which is what decides
+# whether such a build can work at all.
+if [ -z "${WORKER_EMULATED_ARCHES:-}" ]; then
+    native=$(uname -m)
+    emulated=()
+    for pair in x86_64:qemu-x86_64 aarch64:qemu-aarch64 armv7h:qemu-arm; do
+        arch=${pair%%:*} handler=${pair#*:}
+        [ "$arch" = "$native" ] && continue
+        [ "$arch" = armv7h ] && [ "$native" = armv7l ] && continue
+        if grep -qx enabled "/proc/sys/fs/binfmt_misc/$handler" 2>/dev/null; then
+            emulated+=("$arch")
+        fi
+    done
+    if [ ${#emulated[@]} -gt 0 ]; then
+        WORKER_EMULATED_ARCHES=$(IFS=,; echo "${emulated[*]}")
+        export WORKER_EMULATED_ARCHES
+        log "emulated architectures available through binfmt: $WORKER_EMULATED_ARCHES"
     fi
 fi
 
 # ---------------------------------------------------------------------------
-# Supervision. Two processes, one PID 1: if either exits, bring the container
+# Which Docker API the builder talks to.
+#
+# `BUILD_ARTIFACT_DIR` is not a hint — in the pre-worker code it *was* the
+# definition of host build mode (`get_build_mode()` branched on exactly this).
+# So a deployment that sets it mounted the host's Docker socket, and the builder
+# uses that. Everything else was DinD mode: a privileged container running its
+# own Podman behind a Docker-compatible socket, which is what happens here too.
+# ---------------------------------------------------------------------------
+declare -a PIDS=()
+WORKER=1
+
+if [ -n "${BUILD_ARTIFACT_DIR:-}" ]; then
+    log "host build mode: building against the mounted Docker socket"
+else
+    log "DinD build mode: starting Podman"
+    podman system service --time=0 unix:///var/run/docker.sock &
+    PIDS+=($!)
+    for _ in $(seq 50); do
+        [ -S /var/run/docker.sock ] && podman info >/dev/null 2>&1 && break
+        sleep 0.2
+    done
+    if ! podman info >/dev/null 2>&1; then
+        log "ERROR: Podman cannot run in this container, so no packages can be"
+        log "       built here."
+        log ""
+        log "       Add 'privileged: true' to this service in your compose file"
+        log "       and recreate it, as the single-container setup always needed."
+        log "       If your setup instead mounts the Docker socket, set"
+        log "       BUILD_ARTIFACT_DIR as it was before upgrading."
+        log ""
+        log "       Starting the server alone; the web UI will be reachable and"
+        log "       will report that no worker is available."
+        WORKER=""
+    fi
+    # Podman runs in this container, so its "host" network is this container's
+    # own: builds reach the repository at localhost, as they do through
+    # `container:<id>` against a host daemon -- which is the builder's default,
+    # and names a container this Podman has never heard of.
+    export AURCACHE_BUILDER_NETWORK="${AURCACHE_BUILDER_NETWORK:-host}"
+    # And the build directory is one path, seen the same way from both sides.
+    export BUILD_ARTIFACT_DIR=/app/builds
+    export BUILD_ARTIFACT_DIR_LOCAL=/app/builds
+    mkdir -p /app/builds
+fi
+
+# ---------------------------------------------------------------------------
+# Supervision. Several processes, one PID 1: if any exits, bring the container
 # down so the restart policy applies. A container that stays up while silently
 # building nothing is the failure this whole image exists to prevent.
 # ---------------------------------------------------------------------------
-declare -a PIDS=()
 shutdown() {
     trap - TERM INT
     for pid in "${PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null; done
@@ -91,40 +133,19 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-# Same delegation the split worker image does, minus the sudo: this entrypoint
-# already runs as root. The embedded worker is dropped to `aurcache` below, and
-# without this it cannot create the per-build cgroup that reports peak memory.
-if [ -d /sys/fs/cgroup ]; then
-    for f in /sys/fs/cgroup \
-             /sys/fs/cgroup/cgroup.procs \
-             /sys/fs/cgroup/cgroup.subtree_control; do
-        chown aurcache:aurcache "$f" 2>/dev/null || true
-    done
-fi
-
 log "starting AURCache server"
 # Close the server's state to other users; see private-state.sh.
 /usr/local/bin/aurcache-private-state
 /usr/bin/aurcache &
 PIDS+=($!)
 
-if [ -n "$WORKER_BIN" ]; then
-    log "starting embedded worker: $WORKER_KIND"
+if [ -n "$WORKER" ]; then
+    log "starting embedded worker: legacy container builder"
     log "NOTE: the hybrid image is deprecated. Migrate to the separate"
     log "      aurcache-server and aurcache-worker images when convenient."
-    if [ -n "${BUILD_ARTIFACT_DIR:-}" ]; then
-        # Legacy container builder: it drives the host's Docker socket, which is
-        # root-owned, and it runs no build code locally — the spawned container
-        # does. Staying root matches what the pre-worker server did, which is
-        # the behaviour this path exists to reproduce.
-        "$WORKER_BIN" run &
-    else
-        # The chroot worker runs as `aurcache`, not as the build user: builds are
-        # started as `builder` via `makechrootpkg -U`, so the worker's mTLS
-        # identity and credentials stay unreadable to PKGBUILD code by file
-        # ownership alone.
-        setpriv --reuid=aurcache --regid=aurcache --init-groups "$WORKER_BIN" run &
-    fi
+    # Root, as the pre-worker server was: it drives a root-owned socket, and
+    # runs no build code itself -- each build runs in a container of its own.
+    /usr/bin/aurcache-worker-docker run &
     PIDS+=($!)
 fi
 

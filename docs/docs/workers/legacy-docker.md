@@ -17,11 +17,12 @@ It is the more limited of the two strategies: it builds in a reused image
 rather than a clean chroot, and supports neither the source and package caches
 nor [build credentials](./credentials.md).
 
-In the [hybrid image](./hybrid.md) it is selected by setting
-`BUILD_ARTIFACT_DIR` — in the old code that variable *was* the definition of
-host build mode, so a deployment that sets it keeps the behaviour it had
-before. The directory must be a path the Docker daemon can bind, and the same
-directory must be visible to the container.
+It is the [hybrid image](./hybrid.md)'s builder. With `BUILD_ARTIFACT_DIR` set
+— in the old code that variable *was* the definition of host build mode — it
+builds against the mounted Docker socket, and the directory must be a path the
+Docker daemon can bind, with the same directory visible to the container.
+Without it, it builds against a Podman the hybrid image runs inside its own
+container, as the old DinD mode did.
 
 Its only tunables are `CPU_LIMIT` (milli-CPUs) and `MEMORY_LIMIT` (MB, negative
 for unlimited). Like the chroot worker's settings they are listed on the

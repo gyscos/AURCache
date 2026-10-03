@@ -12,9 +12,10 @@
 # working with no edits. If this ever needs a worker service, a port 8083, or an
 # enrollment volume added to pass, the zero-effort migration claim is false.
 #
-# Note what is *absent*: no tmpfs /run. The entrypoint mounts it itself once it
-# finds it is privileged, because an old compose file would not have provided
-# one. Driven by scripts/test-e2e-hybrid.sh.
+# Note what is *absent*: no Docker socket and no BUILD_ARTIFACT_DIR. That is
+# DinD mode, so the entrypoint starts Podman inside the container, as the old
+# image did, and the embedded legacy builder spawns each build there. Driven by
+# scripts/test-e2e-hybrid.sh.
 # =============================================================================
 
 services:

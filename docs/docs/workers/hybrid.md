@@ -16,25 +16,34 @@ image keeps it building with no changes. On startup it launches the server, then
 an embedded worker that enrolls over loopback with a secret generated inside the
 container.
 
-Which builder it uses is decided from your existing configuration:
+The embedded worker is the [legacy container builder](./legacy-docker.md): a
+container per package, as before, so the requirements are the ones you already
+meet. Which Docker API it builds against is decided from your existing
+configuration:
 
-| Your setup | Embedded builder |
+| Your setup | Builds run in |
 |---|---|
-| `privileged: true` (the old DinD mode) | `devtools` chroot — the same builder the split setup uses |
-| `BUILD_ARTIFACT_DIR` set (the old host mode) | Legacy container builder, spawning a container per package against the mounted Docker socket |
-| Neither | None. The server starts and the UI reports that no worker is available. |
+| `privileged: true` (the old DinD mode) | A Podman running inside the container, as the old image's did |
+| `BUILD_ARTIFACT_DIR` set (the old host mode) | Containers on the host, through the mounted Docker socket |
+| Neither | Nothing. The server starts and the UI reports that no worker is available. |
 
 `BUILD_ARTIFACT_DIR` is not a hint here — in the old code it *was* the
 definition of host build mode, so a deployment that sets it gets the behaviour
-it had before. See [Legacy container builder](./legacy-docker.md) for what that
-implies.
+it had before.
+
+Packages for other architectures build as before too, through the host's
+qemu/binfmt handlers: the image offers every architecture whose handler is
+registered (`/proc/sys/fs/binfmt_misc`). `MAX_CONCURRENT_BUILDS` still sets how
+many packages build at once.
 
 ### What you gain by migrating
 
 - Builds move off the server host, or onto several machines.
-- Workers for other architectures, native or emulated.
+- Native workers for other architectures, instead of emulation.
 - Routing: reserve particular packages for particular workers, and prefer fast
   workers over slow ones — see [Routing](./routing.md).
+- Builds in a clean `devtools` chroot rather than a reused image, with a
+  per-build disk quota.
 - Source and package caches, so rebuilds do not re-download the world.
 - Build credentials for packages whose sources need authentication.
 
@@ -50,6 +59,10 @@ implies.
    shared directory.
 4. Move `privileged: true` from the server to the worker, and give the worker a
    tmpfs `/run`.
+
+The split worker has requirements this image does not, Linux 6.7 or newer
+among them — see [Requirements](../overview/requirements.md). On a host that
+cannot meet them (Synology, for one), stay on this image for now.
 
 The worker your hybrid container was running keeps its history; a new worker
 simply enrolls alongside it, and you can retire the old row from the Workers

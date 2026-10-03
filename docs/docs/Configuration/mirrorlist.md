@@ -183,8 +183,8 @@ next build without shipping the same bytes with every job.
 
 :::note Hybrid image
 In the [hybrid compatibility
-image](../workers/hybrid.md) running the
-legacy container builder, the mirrorlist must live where the spawned build
+image](../workers/hybrid.md), whose
+legacy container builder spawns a container per build, the mirrorlist must live where the spawned build
 containers can reach it — the default `MIRRORLIST_PATH_X86_64` is then
 `BUILD_ARTIFACT_DIR/config/pacman_x86_64`, and any path you mount instead has to
 be inside `BUILD_ARTIFACT_DIR/`.

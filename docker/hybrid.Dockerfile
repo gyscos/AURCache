@@ -8,9 +8,12 @@
 # `aurcache-server` plus one or more `aurcache-worker` containers, which can be
 # scaled and placed independently. See the Build Workers documentation.
 #
-# The base is Arch because the embedded chroot worker needs `devtools`. Run
-# privileged (as the old single-container setups already did) so `arch-nspawn`
-# / `mkarchroot` can create the mounts and namespaces a chroot build requires.
+# The embedded worker is the legacy container builder: the one closest to what
+# these deployments ran before, so their requirements stay what they were. In
+# the old DinD mode (privileged, no socket mounted) it drives a Podman running
+# in this container, as the old image did; in host mode (`BUILD_ARTIFACT_DIR`
+# set, the host's socket mounted) it drives the host's daemon. The base is Arch
+# because what the image runs is installed as Arch packages.
 #
 # amd64, arm64 and armv7. armv7's cross toolchain is AUR-only, so it is built
 # in a stage of its own that the other two never reach.
@@ -120,10 +123,9 @@ RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,
     && install -Dm755 /home/packager/.cargo/bin/wasm-bindgen /home/packager/bin/wasm-bindgen
 
 COPY --chown=packager . /src
-# Build all four packages: the worker-docker package is a wrapper image of its
-# own, and the server needs the same sandbox binary whose paths pacman refuses
-# to double-check across two packages. See build-aurcache-packages.sh for the
-# build itself.
+# Build the three packages this image runs: the server, the sandbox it parses
+# PKGBUILDs through, and the legacy builder. See build-aurcache-packages.sh for
+# the build itself.
 #
 # The cache mounts stop `prepare()`'s `cargo fetch` and the per-architecture
 # `rustup target add` from redownloading what the worker image already fetched.
@@ -131,7 +133,7 @@ COPY --chown=packager . /src
 # through install-rust-toolchain.sh's lock, and cargo locks its own cache.
 RUN --mount=type=cache,target=/home/packager/.cargo,id=cargo-downloads-packager,uid=1000,gid=1000,mode=0700 \
     --mount=type=cache,target=/home/packager/.rustup,id=rustup-downloads-packager,uid=1000,gid=1000,mode=0700 \
-    build-aurcache-packages.sh aurcache-sandbox aurcache-server aurcache-worker aurcache-worker-docker
+    build-aurcache-packages.sh aurcache-sandbox aurcache-server aurcache-worker-docker
 
 ########## Stage 1c: export the built packages to the host ##########
 # The image installs the packages and discards them (`rm -rf /tmp/pkg` below),
@@ -160,7 +162,7 @@ ARG TARGETPLATFORM
 # that some runtimes block or do not implement (older seccomp profiles, qemu
 # emulation), which makes every `pacman -Sy` abort there. Disabling it keeps
 # this image working everywhere.
-# It only affects pacman's own download isolation, not the per-build chroot.
+# It only affects pacman's own download isolation, not the builds.
 RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
     && pacman -Syu --noconfirm --needed \
@@ -172,10 +174,10 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPL
 # would land on the link's UTC target and be reported as "UTC"; see
 # server.Dockerfile.)
 
-# Everything this image runs, installed as packages: the four binaries, the two
-# users and their group membership, the directories and their modes, the
-# sudoers entry, and the patched makechrootpkg. pacman pulls devtools and
-# alpm-pkgbuild-bridge as ordinary dependencies.
+# Everything this image runs, installed as packages: the three binaries, the
+# users, and the directories and their modes. pacman pulls alpm-pkgbuild-bridge
+# as an ordinary dependency. Podman (with crun and fuse-overlayfs, as upstream's
+# image had) is what DinD mode builds in.
 #
 # This is the point of packaging: the image stops being a second,
 # hand-maintained copy of the host contract that can drift from the documented
@@ -197,14 +199,17 @@ COPY --from=packager /pkg/*.pkg.tar.zst /tmp/pkg/
 RUN --mount=type=cache,target=/var/cache/pacman/pkg,id=pacman-runtime-${TARGETPLATFORM} \
     pacman -Syu --noconfirm --needed \
     && pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst \
+    && pacman -S --noconfirm --needed podman crun fuse-overlayfs \
     && rm -rf /tmp/pkg \
     && systemd-sysusers \
     && systemd-tmpfiles --create
 
 ENV WORKER_DATA_DIR=/var/lib/aurcache-worker
 
-# Wrapper so devtools' systemd-nspawn works without a systemd manager.
-COPY --chmod=0755 docker/nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
+# Podman configured to run nested, as upstream's `quay.io/podman/stable` base
+# came; see the files themselves.
+COPY docker/podman-containers.conf /etc/containers/containers.conf
+COPY docker/podman-storage.conf /etc/containers/storage.conf
 COPY --chmod=0755 docker/hybrid-entrypoint.sh /usr/local/bin/hybrid-entrypoint
 COPY --chmod=0755 docker/private-state.sh /usr/local/bin/aurcache-private-state
 
@@ -212,8 +217,11 @@ COPY --chmod=0755 docker/private-state.sh /usr/local/bin/aurcache-private-state
 #
 #   /app/data                 the internal CA that signs every worker's
 #                             certificate.
-#   /var/lib/aurcache-worker  the embedded worker's identity, and its storage
-#                             pool: base chroot, builds and caches.
+#   /var/lib/aurcache-worker  the embedded worker's identity.
+#   /var/lib/containers       Podman's image store in DinD mode, kept off the
+#                             container's own overlay filesystem (see
+#                             podman-storage.conf) and the builder image with
+#                             it, so it is not pulled again on every recreate.
 #
 # `/app/data` was missing here, and its absence was worse than it looks: losing
 # the CA invalidates the certificate of *every* worker that ever enrolled, so a
@@ -227,7 +235,7 @@ COPY --chmod=0755 docker/private-state.sh /usr/local/bin/aurcache-private-state
 # fresh anonymous volumes, and the embedded worker then enrolls as a new machine
 # every single time. A deployment that updates regularly should mount named
 # volumes here explicitly rather than trusting the anonymous ones to survive.
-VOLUME ["/app/data", "/var/lib/aurcache-worker"]
+VOLUME ["/app/data", "/var/lib/aurcache-worker", "/var/lib/containers"]
 
 WORKDIR /app
 CMD ["/usr/local/bin/hybrid-entrypoint"]

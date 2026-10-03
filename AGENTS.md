@@ -93,12 +93,12 @@ cd docs && yarn install --frozen-lockfile && yarn build
 is what CI runs nightly. Reach for the others only when a change touches what
 they cover, rather than running all four as a matter of course:
 
-- `test-e2e-hybrid.sh` — only for changes to the hybrid image itself: its
-  entrypoint, the embedded worker's loopback enrollment, the `/run` tmpfs it
-  provisions. The chroot builder is not a reason: the default suite already
-  runs a chroot worker.
-- `test-e2e-hybrid-legacy.sh` — only for changes to the docker builder (the
-  hybrid image's legacy socket mode).
+- `test-e2e-hybrid.sh` — for changes to the hybrid image itself (its
+  entrypoint, the embedded worker's loopback enrollment, the Podman it runs in
+  DinD mode) or to the legacy docker builder, which is its only builder.
+- `test-e2e-hybrid-legacy.sh` — the same image in host mode, against the
+  host's Docker socket: for changes to how the builder shares its build
+  directory with a daemon outside the container.
 - `test-sandbox.sh` — only for changes to `aurcache-sandbox` or the PKGBUILD
   sourcing path.
 - `test-kernel.sh` — for changes to `aurcache-chroot`, the worker's pool or

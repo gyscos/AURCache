@@ -63,10 +63,11 @@ and uploads packages over the API rather than through a shared directory.
 
 They are still read by the [hybrid compatibility
 image](../workers/hybrid.md), where they
-keep their original meanings — `BUILD_ARTIFACT_DIR` is in fact what selects the
-legacy builder there.
+keep their original meanings — `BUILD_ARTIFACT_DIR` is in fact what selects
+host build mode there, as it always did.
 
-`MAX_CONCURRENT_BUILDS` is replaced by `WORKER_CONCURRENCY` on each worker, and
+`MAX_CONCURRENT_BUILDS` is replaced by `WORKER_CONCURRENCY` on each worker (the
+hybrid image still reads it, as its embedded worker's default), and
 `AURCACHE_REPO_URL` by `AURCACHE_PUBLIC_URL`.
 :::
 
