@@ -34,7 +34,13 @@ install-rust-toolchain.sh "$(_aurcache_rust_target)"
 
 for package in "$@"; do
     cd "/src/packaging/$package"
-    /src/packaging/make-source-tarball.sh /src "$package" 0.5.0 .
+    # The tarball has to carry the name the PKGBUILD's `source=` asks for, so
+    # its version is read from the PKGBUILD rather than written here. When the
+    # two disagree, makepkg does not complain: it downloads the release of that
+    # version from GitHub, and the image ships that release instead of this
+    # tree -- which is what a hard-coded 0.5.0 did from the 0.6.0 bump on.
+    pkgver=$(awk -F= '/^pkgver=/ {print $2; exit}' PKGBUILD)
+    /src/packaging/make-source-tarball.sh /src "$package" "$pkgver" .
     # `--skipinteg` because the tarball is this tree rather than a release, and
     # `--nodeps` because the *build* needs nothing from the target architecture:
     # dependencies are recorded in the package and resolved where it is
