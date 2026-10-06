@@ -3,8 +3,8 @@
 The package page shows only direct edges: what a package declares, and what
 declares it. It cannot answer the two questions anyone touching a package
 actually asks — "what does this pull in" and "what rebuilds if I change this".
-This doc proposes two views over the same data that answer them: transitive
-lists, and a rendered dependency graph.
+This doc proposes three views over the same data that answer them: transitive
+lists, a per-package dependency graph, and a repo-wide graph for debugging.
 
 Status: **Proposed** · Last updated: 2026-10-05
 
@@ -28,8 +28,8 @@ Three precedents shape what follows:
   `DbBackend`), but SeaORM 2.0 also executes built statements directly
   (`db.query_all(&select)`), which nothing in the tree uses yet.
 - Charts are native SVG: `BuildsChart` (`dashboard.rs:749`) renders through
-  `dioxus-charts`. The graph below goes one step further — SVG rendered by our
-  own components, so it can be interactive.
+  `dioxus-charts`. The graphs below go one step further — SVG rendered by our
+  own components, so they can be interactive.
 - The frontend has almost no JS interop (a `js_sys::Date` call, a clipboard
   promise) and no npm asset pipeline — the build shells out to `wasm-bindgen
   --target web` (`aurcache-api/build.rs:78`). Anything needing a JS library is
@@ -80,7 +80,7 @@ Rejected: app-side BFS (N+1 per level, or a full edge-table load per page
 view); a closure table maintained on write (fastest reads, but write-path sync
 machinery for a read-rarely view on a small graph).
 
-## Phase 2: the visual graph
+## Phase 2: the per-package graph
 
 Layout in pure Rust, rendering in native Dioxus SVG — interactive from the
 start, with no system dependency and no JS. `rust-sugiyama` (a cargo
@@ -91,12 +91,29 @@ viewBox state in pure Rust event handlers, and theming falls out of the
 existing CSS.
 
 - **Endpoint.** A graph route per package and direction serving a JSON layout:
-  nodes with positions and sizes plus the edge list. The Dioxus side renders
-  it; the CLI and scripts consume the same JSON. One endpoint with a direction
-  parameter covers dependencies and dependents.
+  nodes with positions, sizes, build status, and `directly_requested`, plus
+  the edge list. The Dioxus side renders it; the CLI and scripts consume the
+  same JSON. One endpoint with a direction parameter covers dependencies and
+  dependents.
 - **Data.** The graph needs the edge list, not just reachable nodes, so the
   Phase 1 CTE is written to return `(parent, child, depth)` and both the list
   UI and the graph consume it.
+- **Placement.** A button in each `RelationList` card header opens the graph in
+  that direction in a wide dialog, following the dialog idiom this page
+  already uses (backdrop, click-away and Escape to close), with a direction
+  switcher inside. The layout is fetched lazily on open, so a normal page view
+  pays nothing. A package sub-route stays the escape hatch if the graph feels
+  cramped — the codebase notes in two places that a modal has less room than a
+  page.
+- **Node encoding, shared by every graph.** Two node dimensions need two
+  channels: fill is the build status, reusing the badge palette so the graph
+  reads the same as the lists; the border carries direct-vs-dependency-only
+  (solid and heavier for directly requested, dashed or lighter for
+  dependency-only). The current package gets a focus ring in per-package
+  views. A legend explains both channels and hover tooltips carry the status
+  text, so color is never the only carrier — `directly_requested` has no
+  visual precedent elsewhere, it is list-filter-only today, so the legend does
+  real work.
 - **Where the layout runs.** Server-side first: positions are computed on
   request, cacheable per package, and keep the wasm bundle lean. The noted
   variant is running `rust-sugiyama` in wasm on the client — it is pure Rust
@@ -123,15 +140,42 @@ if force-directed physics or drag-to-rearrange is ever wanted; hand-rolled
 layered layout — `rust-sugiyama` already is that work, done against the
 literature.
 
+## Phase 3: the repo-wide graph
+
+The same renderer over the whole repository, for debugging: cycles, orphaned
+dependency-only packages, "why is X even here" reverse reachability, and
+repointing mistakes are all visible at a glance in a way no per-package view
+shows. `rust-sugiyama` divides the graph into connected components itself, so
+isolated clusters pop out for free.
+
+- **Data is the easy half.** No CTE: one query dumping the whole edge table
+  plus per-package names, statuses, and `directly_requested`.
+- **Placement.** A dedicated route (e.g. `/packages/graph`), linked from the
+  Packages list header beside the existing filters. Full page width and
+  deep-linkable; a dialog is the wrong size for repo-wide.
+- **Focus makes it usable.** Clicking a node highlights its transitive
+  dependencies and dependents and dims the rest — without that the view is
+  decoration. Plus node search, the list's direct-vs-dependency filter
+  semantics, the Phase 2 node encoding and legend, and the same node cap.
+- **Freshness without jumping.** The layout must not re-run on a poll timer —
+  the packages list polls briskly while building, but a re-layout on every
+  tick would make the graph jump. Refresh on demand with a stale indicator,
+  and cache the server-side layout invalidated on dependency changes (or
+  compute on demand if the timing test says it is fast enough).
+
 ## Validation
 
 - New `aurcache-api` tests: chain (a→b→c), diamond (dedup), 2-cycle plus
   self-edge (termination), both directions, depth values; graph tests assert
-  the layout JSON shape, sane positions, and escaping of nasty labels.
+  the layout JSON shape, sane positions, and escaping of nasty labels; the
+  repo-wide route's filter/focus helpers tested as pure functions beside the
+  listing helpers.
 - `cargo test -p aurcache-api`, then `just test`, `just lint`, `just format`
   (lint already covers the frontend for wasm as well as host).
-- `./scripts/test-frontend.sh` — the package route still boots with the toggle
-  and graph section present.
+- `./scripts/test-frontend.sh` — it asserts every route mounts, so the new
+  repo-wide route is covered by adding its URL to the route list; the package
+  route still boots with the toggle and graph dialog present.
+- The new route round-trips through the `Route` URL test.
 - `EXPLAIN QUERY PLAN` on SQLite shows index use for both CTE legs.
 - SQLite/Postgres CTE parity stays on the checklist — one builder renders for
   both, but Postgres is still verified via the compose dev setup before merge.
@@ -141,8 +185,11 @@ literature.
 - `rust-sugiyama` is quiet (no release since mid-2024) though actively used;
   a layout algorithm going quiet usually means done, and our graphs are small
   enough that mis-layout would show immediately rather than lurk.
-- The depth-cap value, the graph node cap, the `via` field name, and the
-  server-vs-wasm layout side are the review-level choices; all have reversible
-  defaults in this doc.
+- The repo-wide layout is the most expensive render here; if the timing test
+  rules out computing it on demand, the cache needs an invalidation story tied
+  to dependency writes.
+- The depth-cap value, the node caps, the `via` field name, the server-vs-wasm
+  layout side, and the cache strategy are the review-level choices; all have
+  reversible defaults in this doc.
 - The "hundreds of edges" scale assumption, if wrong, flips Phase 1 toward
   pagination or a closure table — the timing test settles it.
