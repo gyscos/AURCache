@@ -43,20 +43,8 @@ async fn main() -> Result<()> {
     let identity = Identity::load_or_create(&core.data_dir)?;
     let executor = Arc::new(DockerExecutor::connect(Arc::clone(&cfg)).await?);
 
-    // The server may not be reachable yet (it may be starting alongside this
-    // process) or may briefly go away. Retry rather than crashing.
-    let client = loop {
-        match enroll::ensure_enrolled(&core, &identity, DockerExecutor::KIND).await {
-            Ok(client) => break client,
-            Err(e) => {
-                tracing::warn!(
-                    "Enrollment not complete ({e:#}); retrying in {}s",
-                    core.poll_interval
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(core.poll_interval)).await;
-            }
-        }
-    };
+    // Waits out a server that is not up yet; see `enroll::enroll`.
+    let client = enroll::enroll(&core, &identity, DockerExecutor::KIND).await?;
 
     let registration = Registration {
         csr_pem: identity.generate_csr(&core.name)?,

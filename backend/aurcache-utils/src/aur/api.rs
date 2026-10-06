@@ -1,11 +1,5 @@
 use anyhow::anyhow;
 use aurcache_deps::AurClient;
-use std::sync::OnceLock;
-
-fn client() -> &'static AurClient {
-    static CLIENT: OnceLock<AurClient> = OnceLock::new();
-    CLIENT.get_or_init(AurClient::new)
-}
 
 /// The whitespace-separated terms of a query, lowercased.
 fn query_terms(query: &str) -> Vec<String> {
@@ -35,7 +29,10 @@ fn package_matches_terms(name: &str, description: Option<&str>, terms: &[String]
 /// longest term, which is the most selective — and the remaining terms narrow
 /// the answer locally. Anything matching all terms necessarily matches that
 /// one, so the narrowed set is the whole answer, not a sample of it.
-pub async fn query_aur(query: &str) -> anyhow::Result<Vec<aurcache_deps::Package>> {
+pub async fn query_aur(
+    client: &AurClient,
+    query: &str,
+) -> anyhow::Result<Vec<aurcache_deps::Package>> {
     let terms = query_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
@@ -44,7 +41,7 @@ pub async fn query_aur(query: &str) -> anyhow::Result<Vec<aurcache_deps::Package
         .iter()
         .max_by_key(|term| term.len())
         .expect("terms is not empty");
-    let mut results = client()
+    let mut results = client
         .search_by_name(base)
         .await
         .map_err(|e| anyhow!("failed to query AUR: {e}"))?;
@@ -55,8 +52,11 @@ pub async fn query_aur(query: &str) -> anyhow::Result<Vec<aurcache_deps::Package
 
 /// Retrieve AUR package information by its name.
 /// Returns `None` if the package is not found.
-pub async fn get_package_info(pkg_name: &str) -> anyhow::Result<Option<aurcache_deps::Package>> {
-    client()
+pub async fn get_package_info(
+    client: &AurClient,
+    pkg_name: &str,
+) -> anyhow::Result<Option<aurcache_deps::Package>> {
+    client
         .info_of(pkg_name)
         .await
         .map_err(|e| anyhow!("failed to get package info: {e}"))

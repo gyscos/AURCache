@@ -1,5 +1,4 @@
 use aurcache_common::api::info::{ServerInfo, Timezone};
-use chrono::Local;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get};
@@ -55,10 +54,10 @@ pub fn server_version(version: &State<ServerVersion>) -> Json<ServerInfo> {
     })
 }
 
-/// The zone `chrono::Local` -- and so the scheduler -- is using.
+/// The zone the server's clock -- and so the scheduler -- is using.
 ///
-/// `TZ` first, because it wins for `Local` too and `iana-time-zone` ignores
-/// it. Otherwise the name comes from where `/etc/localtime` links; the images
+/// `TZ` first, spelled as it was set. Otherwise the name comes from where
+/// `/etc/localtime` links; the images
 /// ship without that link so that a host's zone bind-mounted over it is not
 /// mislabelled as the image's `Etc/UTC`, and is reported by offset alone.
 fn local_timezone() -> Timezone {
@@ -66,11 +65,11 @@ fn local_timezone() -> Timezone {
         // An empty `TZ` is UTC to `Local`, not "unset".
         Ok(tz) if tz.is_empty() => Some("UTC".to_string()),
         Ok(tz) => Some(tz.trim_start_matches(':').to_string()),
-        Err(_) => iana_time_zone::get_timezone().ok(),
+        Err(_) => jiff::tz::TimeZone::system().iana_name().map(str::to_string),
     };
     Timezone {
         name,
-        utc_offset: Local::now().offset().local_minus_utc(),
+        utc_offset: jiff::Zoned::now().offset().seconds(),
     }
 }
 

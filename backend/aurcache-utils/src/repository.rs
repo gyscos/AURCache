@@ -26,7 +26,10 @@ pub const REPO_ROOT: &str = "./repo";
 /// upload is never downloadable before it is published.
 const STAGING_DIR: &str = ".staging";
 
+use aurcache_common::repo::REPO_NAME;
+/// `<REPO_NAME>.db.tar.gz`; a test keeps the two in step.
 const DB_ARCHIVE: &str = "repo.db.tar.gz";
+/// `<REPO_NAME>.files.tar.gz`, likewise.
 const FILES_ARCHIVE: &str = "repo.files.tar.gz";
 
 /// How many times a failed `commit` is tried in all. Enough to ride out a
@@ -98,7 +101,13 @@ impl PublishedFile {
 #[derive(Default)]
 struct Changes {
     add: Vec<Addition>,
-    retire: Vec<(Platform, String)>,
+    retire: Vec<Retirement>,
+}
+
+/// A published file an update takes out of the databases.
+struct Retirement {
+    platform: Platform,
+    filename: String,
 }
 
 struct Addition {
@@ -117,7 +126,10 @@ impl Changes {
     }
 
     fn retire(&mut self, platform: Platform, filename: impl Into<String>) {
-        self.retire.push((platform, filename.into()));
+        self.retire.push(Retirement {
+            platform,
+            filename: filename.into(),
+        });
     }
 
     fn platforms(&self) -> Vec<Platform> {
@@ -125,7 +137,7 @@ impl Changes {
             .add
             .iter()
             .map(|a| a.platform)
-            .chain(self.retire.iter().map(|(platform, _)| *platform))
+            .chain(self.retire.iter().map(|r| r.platform))
             .collect();
         platforms.sort_by_key(Platform::as_str);
         platforms.dedup();
@@ -364,6 +376,17 @@ impl Repository {
         }
     }
 
+    /// Create the databases of every platform that has none yet.
+    pub fn init(&self) -> anyhow::Result<()> {
+        for platform in Platform::ALL {
+            pacman_repo_utils::repo_init::init_repo(
+                &Self::platform_dir(&self.root, platform),
+                REPO_NAME,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record what the repository does, and what goes wrong with it, to `log`.
     #[must_use]
     pub fn with_log(mut self, log: ActivityLog) -> Self {
@@ -439,9 +462,11 @@ impl Repository {
         let root = self.root.clone();
         let known = std::mem::take(&mut *self.retired_times());
         let log = self.log.clone();
-        let (still_retired, deleted) =
-            tokio::task::spawn_blocking(move || sweep_retired(&root, known, now, grace, &log))
-                .await?;
+        let Swept {
+            still_retired,
+            deleted,
+        } = tokio::task::spawn_blocking(move || sweep_retired(&root, known, now, grace, &log))
+            .await?;
         *self.retired_times() = still_retired;
         if !deleted.is_empty() {
             self.log.emit(Event::RepoSwept {
@@ -486,8 +511,8 @@ fn prepare(root: &Path, changes: &Changes) -> anyhow::Result<Vec<Prepared>> {
             let remove: Vec<String> = changes
                 .retire
                 .iter()
-                .filter(|(p, _)| *p == platform)
-                .map(|(_, filename)| filename.clone())
+                .filter(|r| r.platform == platform)
+                .map(|r| r.filename.clone())
                 .collect();
             let add: Vec<PackageEntry> = changes
                 .add
@@ -548,7 +573,7 @@ fn publish(
         rename_logged(log, &p.files_next, &p.files);
     }
     let mut retired = Vec::new();
-    for (platform, filename) in &changes.retire {
+    for Retirement { platform, filename } in &changes.retire {
         // A rebuild at the same version replaces the file it retires: the new
         // one is already in place, and listed, under that name.
         if added.contains(&(*platform, filename.as_str())) {
@@ -567,20 +592,28 @@ fn is_package_file(name: &str) -> bool {
     !name.starts_with('.') && name.contains(".pkg.tar.")
 }
 
+/// What a sweep deleted, and what it found retired and left for later.
+struct Swept {
+    /// When each retired file still on disk was first found unlisted.
+    still_retired: HashMap<PathBuf, Instant>,
+    /// The names of the files it deleted.
+    deleted: Vec<String>,
+}
+
 /// [`Repository::sweep`], given what is known of when files were retired.
-/// Returns the retirement times still worth keeping, and how many files it
-/// deleted.
 fn sweep_retired(
     root: &Path,
     mut known: HashMap<PathBuf, Instant>,
     now: Instant,
     grace: Duration,
     log: &ActivityLog,
-) -> (HashMap<PathBuf, Instant>, Vec<String>) {
-    let mut still_retired = HashMap::new();
-    let mut deleted = Vec::new();
+) -> Swept {
+    let mut swept = Swept {
+        still_retired: HashMap::new(),
+        deleted: Vec::new(),
+    };
     let Ok(platforms) = std::fs::read_dir(root) else {
-        return (still_retired, deleted);
+        return swept;
     };
     for platform in platforms.flatten() {
         let dir = platform.path();
@@ -614,14 +647,14 @@ fn sweep_retired(
             let since = known.remove(&path).unwrap_or(now);
             if now.saturating_duration_since(since) >= grace {
                 if remove_logged(log, &path) {
-                    deleted.push(name.clone());
+                    swept.deleted.push(name.clone());
                 }
             } else {
-                still_retired.insert(path, since);
+                swept.still_retired.insert(path, since);
             }
         }
     }
-    (still_retired, deleted)
+    swept
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -659,6 +692,17 @@ fn remove_logged(log: &ActivityLog, path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The archive names are spelled out as constants, so they are checked
+    /// against the name they derive from.
+    #[test]
+    fn the_archives_carry_the_repository_name() {
+        assert_eq!(super::DB_ARCHIVE, format!("{}.db.tar.gz", super::REPO_NAME));
+        assert_eq!(
+            super::FILES_ARCHIVE,
+            format!("{}.files.tar.gz", super::REPO_NAME)
+        );
+    }
+
     use super::*;
     use std::io::Read;
     use std::sync::atomic::{AtomicU32, Ordering};

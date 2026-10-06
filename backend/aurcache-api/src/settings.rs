@@ -3,11 +3,13 @@ use crate::models::settings::{SettingResponse, SettingValue};
 use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
+use aurcache_common::api::settings::SchedulePreview;
 use aurcache_common::settings::{ApplicationSettings, Setting};
+use aurcache_utils::scheduled::{Job, preview};
 use aurcache_utils::settings::general::SettingsTraits;
 use rocket::http::Status;
 use rocket::serde::json::Json;
-use rocket::{State, delete, get, patch};
+use rocket::{State, delete, get, patch, post};
 use sea_orm::DatabaseConnection;
 use utoipa::OpenApi;
 
@@ -20,7 +22,8 @@ use utoipa::OpenApi;
     setting_patch,
     package_setting_patch,
     setting_reset,
-    package_setting_reset
+    package_setting_reset,
+    setting_schedule_preview
 ))]
 pub struct SettingsApi;
 
@@ -108,7 +111,7 @@ pub async fn package_settings(
     pkgbase: &str,
     _a: Authenticated,
 ) -> Result<Json<ApplicationSettings>, ApiError> {
-    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    let pkg_id = Some(crate::package::package_id(db.inner(), pkgbase).await?);
     settings_impl(db.inner(), pkg_id).await
 }
 
@@ -147,7 +150,7 @@ pub async fn package_setting_get(
     key: &str,
     _a: Authenticated,
 ) -> Result<Json<SettingResponse>, ApiError> {
-    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    let pkg_id = Some(crate::package::package_id(db.inner(), pkgbase).await?);
     setting_get_impl(db.inner(), key, pkg_id).await
 }
 
@@ -200,7 +203,7 @@ pub async fn package_setting_patch(
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    let pkg_id = Some(crate::package::package_id(db.inner(), pkgbase).await?);
     setting_patch_impl(db.inner(), key, pkg_id, input.into_inner().value).await?;
     al.emit_by(
         Event::SettingChanged {
@@ -257,7 +260,7 @@ pub async fn package_setting_reset(
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    let pkg_id = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    let pkg_id = Some(crate::package::package_id(db.inner(), pkgbase).await?);
     setting_reset_impl(db.inner(), key, pkg_id).await?;
     al.emit_by(
         Event::SettingReset {
@@ -267,4 +270,28 @@ pub async fn package_setting_reset(
         a.username,
     );
     Ok(())
+}
+
+#[utoipa::path(
+    request_body = SettingValue,
+    responses(
+        (status = 200, description = "When the schedule would run", body = SchedulePreview),
+        (status = 404, description = "Unknown setting key, or not a schedule"),
+    ),
+    params(("key" = String, Path, description = "Setting key"))
+)]
+/// When a value would run, for a setting that holds a schedule: the next two
+/// runs, or why there are none. Nothing is stored -- this is for showing what
+/// a value means while it is being written.
+#[post("/settings/<key>/schedule", data = "<input>")]
+pub async fn setting_schedule_preview(
+    key: &str,
+    input: Json<SettingValue>,
+    _a: Authenticated,
+) -> Result<Json<SchedulePreview>, ApiError> {
+    let job = match parse_setting(key)? {
+        Setting::AutoUpdateInterval => Job::AutoUpdate,
+        _ => return Err(err(Status::NotFound, format!("{key} is not a schedule"))),
+    };
+    Ok(Json(preview(job, &input.value, 2)))
 }

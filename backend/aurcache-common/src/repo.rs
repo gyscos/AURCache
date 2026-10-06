@@ -11,6 +11,12 @@
 
 use crate::ports::AURCACHE_MIRROR_PORT;
 
+/// What the repository is called. It names the databases (`repo.db`,
+/// `repo.files`), and pacman fetches `<section>.db`, so every `[repo]` section
+/// written for it -- the workers', a user's `pacman.conf` -- has to say the
+/// same.
+pub const REPO_NAME: &str = "repo";
+
 /// The `Server =` line for a repository published at `public_url`, as reached by
 /// a client that gets to the instance at `host`.
 ///

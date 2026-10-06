@@ -80,25 +80,16 @@ impl Executor for DemoExecutor {
         let deadline = std::time::Instant::now() + Duration::from_secs(fake_build_secs());
         while std::time::Instant::now() < deadline {
             if cancel.load(Ordering::Relaxed) || protocol::remote_cancel(&client, build_id).await {
-                return report::classify_exit_canceled();
+                return report::canceled();
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if cancel.load(Ordering::Relaxed) {
-            return report::classify_exit_canceled();
+            return report::canceled();
         }
 
         match fake_and_upload(&client, &job, &names).await {
-            Ok(()) => CompleteReport {
-                success: true,
-                exit_code: Some(0),
-                reason: None,
-                canceled: false,
-                peak_memory_bytes: None,
-                disk_usage: None,
-                vcs_commits: Default::default(),
-                kept: None,
-            },
+            Ok(()) => report::success(),
             Err(e) => report::setup_failure(format!("demo packaging failed: {e:#}")),
         }
     }

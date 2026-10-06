@@ -22,12 +22,11 @@
 use std::io::Write;
 use std::time::Duration;
 
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{ClaimRequest, CompleteReport};
 use aurcache_db::builds;
 use aurcache_db::files;
-use aurcache_db::helpers::worker_jobs::{STATUS_FAILED, STATUS_SUCCESS};
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
 use aurcache_utils::settings::general::SettingsTraits;
@@ -78,14 +77,14 @@ async fn seed_build(db: &DatabaseConnection, id: i32, platform: &str, start: i64
     let source =
         r#"{"type":"git","url":"/nonexistent-aurcache-fake-worker","ref":"HEAD","subfolder":""}"#;
     db.execute_unprepared(&format!(
-        "INSERT INTO packages (id, name, build_flags, source_type, source_data, platforms) \
-         VALUES ({id}, 'p{id}', '', 'git', '{source}', '{platform}')"
+        "INSERT INTO packages (id, name, build_flags, source_data, platforms) \
+         VALUES ({id}, 'p{id}', '', '{source}', '{platform}')"
     ))
     .await
     .unwrap();
     db.execute_unprepared(&format!(
-        "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, attempt_count) \
-         VALUES ({id}, {id}, 3, {start}, '{platform}', '1.0', 0)"
+        "INSERT INTO builds (id, pkg_id, status, start_time, platform, version) \
+         VALUES ({id}, {id}, 3, {start}, '{platform}', '1.0')"
     ))
     .await
     .unwrap();
@@ -402,7 +401,7 @@ async fn fake_worker_protocol_roundtrip() {
         .expect("complete{success} should be accepted");
 
     // Accepted, then published in the background.
-    assert_eq!(settled_status(&db, 1).await, STATUS_SUCCESS);
+    assert_eq!(settled_status(&db, 1).await, BuildStates::SUCCESSFUL_BUILD);
     let repo_db = repo_root.join("x86_64").join("repo.db.tar.gz");
     assert!(repo_db.exists(), "repo db should be written at {repo_db:?}");
     let file_rows = files::Entity::find()
@@ -434,7 +433,7 @@ async fn fake_worker_protocol_roundtrip() {
         )
         .await
         .expect("a repeated completion is acknowledged");
-    assert_eq!(build_status(&db, 1).await, STATUS_SUCCESS);
+    assert_eq!(build_status(&db, 1).await, BuildStates::SUCCESSFUL_BUILD);
 
     // --- Safety rail: a wrong-named artifact is never published.
     let job2 = client
@@ -467,7 +466,7 @@ async fn fake_worker_protocol_roundtrip() {
         .expect("the worker's part is done either way");
     // Refused at publishing, which is the server's: the build fails, and
     // nothing of it reaches the repository.
-    assert_eq!(settled_status(&db, 2).await, STATUS_FAILED);
+    assert_eq!(settled_status(&db, 2).await, BuildStates::FAILED_BUILD);
     let evil_rows = files::Entity::find()
         .filter(files::Column::PackageId.eq(2))
         .all(&db)

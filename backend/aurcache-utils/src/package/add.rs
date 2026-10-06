@@ -1,17 +1,17 @@
 use crate::package::enqueue::trigger_initial_builds;
 use crate::package::metadata::refresh_source_metadata;
 use crate::patch::SourcePatch;
-use crate::pkg::architectures_for_platforms;
 use crate::services::Services;
 use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::helpers::dependency_resolution::{PackageCandidate, TrackedPackages};
+use aurcache_db::lists::ListColumn;
 use aurcache_db::packages;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
 use aurcache_deps::DependencyResolution;
 use pacman_mirrors::platforms::Platform;
@@ -23,10 +23,32 @@ use sea_orm::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// How the packages an add inserts are to be built.
 pub(crate) struct AddContext {
     platforms: Vec<Platform>,
-    platforms_str: String,
-    build_flags_str: String,
+    build_flags: Vec<String>,
+}
+
+impl AddContext {
+    /// A context from what a package row stores, for dependencies added on
+    /// behalf of an existing package. An unknown platform is skipped.
+    fn from_stored(platforms: &str, build_flags: &str) -> Self {
+        Self {
+            platforms: Platform::parse_many(platforms)
+                .filter_map(Result::ok)
+                .collect(),
+            build_flags: ListColumn::Package.split(build_flags),
+        }
+    }
+
+    /// The architectures whose dependencies the packages need.
+    fn architectures(&self) -> Vec<alpm_types::SystemArchitecture> {
+        self.platforms
+            .iter()
+            .copied()
+            .map(crate::pkg::architecture)
+            .collect()
+    }
 }
 
 struct PackageInsertSpec {
@@ -35,7 +57,6 @@ struct PackageInsertSpec {
     deps: crate::pkg::DependencySet,
     pkgnames: Vec<String>,
     provides: Vec<String>,
-    source_type: SourceType,
     source_data: SourceData,
     patch: Option<String>,
 }
@@ -44,7 +65,6 @@ struct PackageInsertSpec {
 struct PlannedPackage {
     pkgbase: String,
     version: String,
-    source_type: SourceType,
     source_data: SourceData,
     patch: Option<String>,
     split_packages: Option<String>,
@@ -110,7 +130,8 @@ impl AddPlan {
     }
 }
 
-fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
+/// Build flags with surrounding whitespace trimmed and blank entries dropped.
+pub fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
     flags
         .into_iter()
         .filter_map(|flag| {
@@ -127,23 +148,16 @@ pub(crate) fn build_add_context(
     // Platform names are validated where they enter as strings (the API's
     // `Platform::from_str`); by the time they are `Platform` values there is
     // nothing left to check.
-    let platforms = platforms.unwrap_or_else(|| vec![Platform::X86_64]);
-
-    let platforms_str = Platform::join_canonical(&platforms);
-
-    let build_flags_str = normalize_build_flags(build_flags.unwrap_or_else(|| {
+    let build_flags = normalize_build_flags(build_flags.unwrap_or_else(|| {
         vec![
             "--noconfirm".to_string(),
             "--noprogressbar".to_string(),
             "--nocolor".to_string(),
         ]
-    }))
-    .join(";");
-
+    }));
     AddContext {
-        platforms,
-        platforms_str,
-        build_flags_str,
+        platforms: platforms.unwrap_or_else(|| vec![Platform::X86_64]),
+        build_flags,
     }
 }
 
@@ -221,7 +235,6 @@ async fn resolve_srcinfo_to_spec(
         pkgnames: deps.pkgnames,
         provides: deps.provides,
         patch,
-        source_type: crate::restore::source_type_of(source_data),
         source_data: source_data.clone(),
     })
 }
@@ -333,7 +346,10 @@ pub async fn package_add(
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<String> {
     let context = build_add_context(platforms, build_flags);
-    add_package_with_source(services, &context, source_data, patched_files).await
+    let source_data = resolve_source_pkgbase(&services.client, source_data).await?;
+    add_resolved_source(services, &context, source_data, patched_files)
+        .await
+        .map(|added| added.pkgbase)
 }
 
 async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyhow::Result<()> {
@@ -343,19 +359,6 @@ async fn set_directly_requested(db: &DatabaseConnection, pkgbase: &str) -> anyho
         .exec(db)
         .await?;
     Ok(())
-}
-
-async fn add_package_with_source(
-    services: &Services,
-    context: &AddContext,
-    source_data: SourceData,
-    patched_files: Option<BTreeMap<String, String>>,
-) -> anyhow::Result<String> {
-    let Services { client, .. } = services;
-    let source_data = resolve_source_pkgbase(client, source_data).await?;
-    add_resolved_source(services, context, source_data, patched_files)
-        .await
-        .map(|added| added.pkgbase)
 }
 
 /// Turn a caller's source into one naming a pkgbase.
@@ -391,14 +394,11 @@ pub(crate) async fn add_resolved_source(
     source_data: SourceData,
     patched_files: Option<BTreeMap<String, String>>,
 ) -> anyhow::Result<AddedSource> {
-    let Services {
-        client: _, store, ..
-    } = services;
     let package_spec = resolve_srcinfo_to_spec(
-        store,
+        &services.store,
         &source_data,
         patched_files,
-        &architectures_for_platforms(&context.platforms_str),
+        &context.architectures(),
     )
     .await?;
     finalize_package_add(services, context, package_spec).await
@@ -428,13 +428,8 @@ async fn plan_dependency_recursive(
     let source_data = SourceData::Aur {
         name: pkgbase.to_string(),
     };
-    let package_spec = resolve_srcinfo_to_spec(
-        store,
-        &source_data,
-        None,
-        &architectures_for_platforms(&context.platforms_str),
-    )
-    .await?;
+    let package_spec =
+        resolve_srcinfo_to_spec(store, &source_data, None, &context.architectures()).await?;
     plan_package_with_deps(plan_context, package_spec, visited, plan).await
 }
 
@@ -452,13 +447,8 @@ pub async fn ensure_aur_package_exists_recursive(
     platforms_str: &str,
     build_flags_str: &str,
 ) -> anyhow::Result<Vec<String>> {
-    // This helper inserts dependency-only rows and relies on the caller to
-    // provide the platform/build flag strings that should be stored on them.
-    let context = AddContext {
-        platforms: vec![],
-        platforms_str: platforms_str.to_string(),
-        build_flags_str: build_flags_str.to_string(),
-    };
+    // The dependency rows are built the way the package needing them is.
+    let context = AddContext::from_stored(platforms_str, build_flags_str);
     let mut visited = HashSet::new();
     let mut plan = AddPlan::default();
     let tracked = TrackedPackages::load(db).await?;
@@ -535,13 +525,13 @@ async fn plan_package_with_deps(
         &package_spec.pkgnames,
         &package_spec.provides,
     );
-    let pairs: Vec<(String, String)> = package_spec
+    let declared: Vec<crate::pkg::Declared> = package_spec
         .deps
-        .to_pairs()
+        .declared()
         .into_iter()
-        .filter(|(name, _)| !self_provided.contains(name))
+        .filter(|dep| !self_provided.contains(&dep.name))
         .collect();
-    let resolved_deps = if pairs.is_empty() {
+    let resolved_deps = if declared.is_empty() {
         aurcache_deps::Resolutions::default()
     } else {
         // Packages planned earlier in this add are not in the database yet, so
@@ -549,7 +539,10 @@ async fn plan_package_with_deps(
         aurcache_db::helpers::dependency_resolution::resolve_dependencies(
             client,
             tracked,
-            &crate::pkg::as_dependencies(&pairs),
+            &declared
+                .iter()
+                .map(crate::pkg::Declared::as_dependency)
+                .collect::<Vec<_>>(),
             &plan.candidates(),
             // An add has no edges yet, so there is nothing to prefer.
             &HashSet::new(),
@@ -592,7 +585,7 @@ async fn plan_package_with_deps(
     let mut dep_constraints_by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> =
         HashMap::new();
     let mut planned_pkgbases: HashSet<String> = HashSet::new();
-    for (dep_name, _) in &pairs {
+    for crate::pkg::Declared { name: dep_name, .. } in &declared {
         let Some(resolution) = resolved_deps.get(dep_name) else {
             continue;
         };
@@ -635,7 +628,6 @@ async fn plan_package_with_deps(
     plan.packages.push(PlannedPackage {
         pkgbase: package_spec.pkgbase,
         version: package_spec.version,
-        source_type: package_spec.source_type,
         source_data: package_spec.source_data,
         patch: package_spec.patch,
         split_packages,
@@ -666,9 +658,8 @@ async fn persist_plan(
             name: Set(pkg.pkgbase.clone()),
             status: Set(BuildStates::ENQUEUED_BUILD),
             upstream_version: Set(Some(pkg.version)),
-            platforms: Set(context.platforms_str.clone()),
-            build_flags: Set(context.build_flags_str.clone()),
-            source_type: Set(pkg.source_type),
+            platforms: Set(Platform::join_canonical(&context.platforms)),
+            build_flags: Set(ListColumn::Package.join(&context.build_flags)),
             source_data: Set(pkg.source_data),
             directly_requested: Set(pkg.directly_requested),
             split_packages: Set(pkg.split_packages),

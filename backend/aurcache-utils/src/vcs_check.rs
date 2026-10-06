@@ -15,7 +15,7 @@ use alpm_types::url::{GitFragment, VcsInfo};
 use aurcache_common::worker::JobVcsSource;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
-use aurcache_db::helpers::builds::{latest_successful_build_vcs_sources, record_build_vcs_sources};
+use aurcache_db::helpers::builds::latest_successful_build_vcs_sources;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::package_vcs_sources::{self, Entity as PackageVcsSources};
 
@@ -167,7 +167,7 @@ fn git_vcs_source_from(source: &Source) -> Option<VcsSource> {
 /// Resolve every trackable git-VCS source in `sourceinfo`, upsert their
 /// current commit into `package_vcs_sources`, remove rows for sources no
 /// longer present (e.g. after a PKGBUILD edit changed/removed a VCS source),
-/// and report whether any tracked source's commit changed since last time.
+/// and report whether any tracked source's commit moved since last time.
 ///
 /// A newly-seen source (no prior row) also counts as "changed", so the
 /// first check after a VCS source is added/discovered is flagged out of
@@ -178,7 +178,7 @@ pub async fn sync_vcs_sources(
     package_id: i32,
     sourceinfo: &SourceInfoV1,
     round: &mut RoundCache,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<VcsSync> {
     let vcs_sources = extract_git_vcs_sources(sourceinfo);
 
     let existing: HashMap<String, String> = PackageVcsSources::find()
@@ -251,7 +251,21 @@ pub async fn sync_vcs_sources(
             .await?;
     }
 
-    Ok(changed)
+    Ok(if changed {
+        VcsSync::Moved
+    } else {
+        VcsSync::Unchanged
+    })
+}
+
+/// What [`sync_vcs_sources`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VcsSync {
+    /// A tracked source's commit moved since it was last built or checked, or
+    /// a source was seen for the first time.
+    Moved,
+    /// Every source is where it was.
+    Unchanged,
 }
 
 /// Resolve every trackable VCS source of `sourceinfo` to the commit it points
@@ -274,21 +288,6 @@ pub async fn resolve_vcs_commits(sourceinfo: &SourceInfoV1) -> BTreeMap<String, 
         }
     }
     resolved
-}
-
-/// Record what `build_id`'s VCS sources were at as it was queued.
-///
-/// Queue time rather than build time: the worker may check out something newer
-/// if upstream moves while the build waits, and recording the earlier commit
-/// errs toward one redundant rebuild rather than a missed one. A worker that
-/// reports what it actually used overwrites this later.
-pub async fn record_queued_vcs_sources(
-    db: &DatabaseConnection,
-    build_id: i32,
-    commits: &BTreeMap<String, String>,
-) -> anyhow::Result<()> {
-    record_build_vcs_sources(db, build_id, commits).await?;
-    Ok(())
 }
 
 /// Whether a package's tracked VCS sources have moved since its last
@@ -335,18 +334,6 @@ pub async fn vcs_sources_moved(
     })
 }
 
-/// Remote commits already resolved during one pass over the packages.
-///
-/// Several packages can name the same upstream -- `gtk2` and `lib32-gtk2`, and
-/// four more pairs on the reference server, 50 tracked sources over 45 distinct
-/// URLs -- and each was asking the remote separately. What a remote's ref points
-/// at is one fact at one instant, so it is worth asking once; what each package
-/// *built* is not, and stays per package.
-///
-/// Per pass, deliberately, and never held between them: a cache that outlived
-/// the round would answer for a moment that has gone, and this is the very
-/// thing that decides whether upstream has moved.
-///
 /// Fixed gap between distinct VCS remote lookups in one sweep.
 ///
 /// The version check already resolves remotes sequentially, but back-to-back
@@ -366,6 +353,17 @@ fn gap_before_lookup(previous_lookups: u64) -> Option<Duration> {
     }
 }
 
+/// Remote commits already resolved during one pass over the packages.
+///
+/// Several packages can name the same upstream -- `gtk2` and `lib32-gtk2`, and
+/// four more pairs on the reference server, 50 tracked sources over 45 distinct
+/// URLs -- and each was asking the remote separately. What a remote's ref points
+/// at is one fact at one instant, so it is worth asking once; what each package
+/// *built* is not, and stays per package.
+///
+/// Per pass, deliberately, and never held between them: a cache that outlived
+/// the round would answer for a moment that has gone, and this is the very
+/// thing that decides whether upstream has moved.
 #[derive(Default)]
 pub struct RoundCache {
     seen: HashMap<(String, String), String>,

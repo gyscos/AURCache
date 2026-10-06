@@ -165,9 +165,9 @@ pub fn env_duration(key: &str) -> Option<u64> {
     seconds
 }
 
-/// Parse a comma/space separated arch list into a normalized vector.
+/// Split a comma- or space-separated list (arches, pkgbases), dropping blanks.
 #[must_use]
-pub fn parse_arches(raw: &str) -> Vec<String> {
+pub fn parse_list(raw: &str) -> Vec<String> {
     raw.split([',', ' '])
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -211,12 +211,12 @@ impl CoreConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let native_arches = env_opt("WORKER_ARCHES")
-            .map(|s| parse_arches(&s))
+            .map(|s| parse_list(&s))
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| vec![detect_arch()]);
 
         let emulated_arches = env_opt("WORKER_EMULATED_ARCHES")
-            .map(|s| parse_arches(&s))
+            .map(|s| parse_list(&s))
             .unwrap_or_default();
 
         let settings = WorkerSettings::from_env(protocol_settings());
@@ -227,7 +227,7 @@ impl CoreConfig {
                 .trim_end_matches('/')
                 .to_string(),
             server_ca_fingerprint: env_opt("AURCACHE_SERVER_CA_FINGERPRINT")
-                .map(|s| s.to_lowercase().replace([':', ' '], "")),
+                .map(|s| aurcache_ca::normalize_fingerprint(&s)),
             enrollment_dir: env_opt("AURCACHE_ENROLLMENT_DIR")
                 .map(PathBuf::from)
                 .or_else(|| Some(PathBuf::from("/enroll"))),
@@ -280,9 +280,13 @@ impl CoreConfig {
         // Clamped rather than refused: a worker that ran no builds at all would
         // be a machine silently doing nothing, and the declared minimum of 1 is
         // what the value is checked against before it ever gets here.
-        self.concurrency = usize::try_from(settings.integer(keys::CONCURRENCY).unwrap_or(1))
-            .unwrap_or(1)
-            .max(1);
+        self.concurrency = usize::try_from(
+            settings
+                .integer(keys::CONCURRENCY)
+                .unwrap_or(crate::settings::DEFAULT_CONCURRENCY),
+        )
+        .unwrap_or(1)
+        .max(1);
         self.packages = settings.list(keys::PACKAGES);
         // A malformed value degrades to the neutral default, never to maximal
         // scheduling privilege: an out-of-range typo must not outrank the
@@ -345,9 +349,9 @@ mod tests {
 
     #[test]
     fn parses_arch_lists() {
-        assert_eq!(parse_arches("x86_64"), vec!["x86_64"]);
-        assert_eq!(parse_arches("aarch64, armv7h"), vec!["aarch64", "armv7h"]);
-        assert_eq!(parse_arches("a b,c  d"), vec!["a", "b", "c", "d"]);
-        assert!(parse_arches("  ,  ").is_empty());
+        assert_eq!(parse_list("x86_64"), vec!["x86_64"]);
+        assert_eq!(parse_list("aarch64, armv7h"), vec!["aarch64", "armv7h"]);
+        assert_eq!(parse_list("a b,c  d"), vec!["a", "b", "c", "d"]);
+        assert!(parse_list("  ,  ").is_empty());
     }
 }

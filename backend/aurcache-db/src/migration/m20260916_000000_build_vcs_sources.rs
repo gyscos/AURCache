@@ -24,7 +24,6 @@
 //! NULL means *unknown* -- a build that predates this, or one whose sources
 //! could not be resolved -- and is never read as "nothing changed".
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -35,7 +34,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite | DbBackend::Postgres => {
                 "ALTER TABLE builds ADD COLUMN vcs_sources TEXT;"
             }

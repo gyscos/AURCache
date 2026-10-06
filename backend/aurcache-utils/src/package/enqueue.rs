@@ -2,10 +2,11 @@ use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
+use aurcache_db::helpers::builds::pending_build;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_db::{builds, packages};
 use futures::future::try_join_all;
@@ -158,7 +159,7 @@ pub async fn enqueue_missing_buildable_packages(
         for platform in platforms {
             let deps_ok = dependencies_satisfied(db, pkg.id, &platform).await?;
 
-            match pending_build_for_platform(db, pkg.id, &platform).await? {
+            match pending_build(db, pkg.id, platform.as_str()).await? {
                 Some(b) if b.status == Some(BuildStates::WAITING_FOR_DEPS) => {
                     if deps_ok {
                         // All deps are now satisfied – promote and dispatch.
@@ -229,26 +230,6 @@ pub async fn enqueue_missing_buildable_packages(
     Ok(queued)
 }
 
-/// Return the single pending build (ACTIVE / ENQUEUED / WAITING_FOR_DEPS) for a package on a
-/// platform, or `None` if no pending build exists.
-async fn pending_build_for_platform(
-    db: &DatabaseConnection,
-    pkg_id: i32,
-    platform: &Platform,
-) -> anyhow::Result<Option<builds::Model>> {
-    Ok(Builds::find()
-        .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.is_in([
-            Some(BuildStates::ACTIVE_BUILD),
-            Some(BuildStates::ENQUEUED_BUILD),
-            Some(BuildStates::WAITING_FOR_DEPS),
-            Some(BuildStates::PUBLISHING),
-        ]))
-        .one(db)
-        .await?)
-}
-
 async fn build_exists_for_platform(
     db: &DatabaseConnection,
     pkg_id: i32,
@@ -262,6 +243,7 @@ async fn build_exists_for_platform(
         != 0)
 }
 
+/// Whether everything `dependent_id` depends on is built, on `platform`.
 async fn dependencies_satisfied(
     db: &DatabaseConnection,
     dependent_id: i32,
@@ -271,21 +253,7 @@ async fn dependencies_satisfied(
         .filter(dependencies::Column::DependentId.eq(dependent_id))
         .all(db)
         .await?;
-
-    for dep in deps {
-        if !aurcache_db::helpers::builds::dependency_satisfied(
-            db,
-            dep.dependee_id,
-            platform.as_str(),
-            &dep.version_constraint,
-        )
-        .await?
-        {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
+    Ok(aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform.as_str()).await?)
 }
 
 /// Create or reuse a pending build entry for `pkg` on each of `platforms`.
@@ -319,7 +287,7 @@ async fn trigger_build_for_package(
             &version,
             aurcache_db::helpers::time::now_secs(),
             initial_status,
-            aurcache_common::build_state::BuildTriggers::USER,
+            aurcache_common::build_state::BuildTrigger::User,
         )
         .await?;
 

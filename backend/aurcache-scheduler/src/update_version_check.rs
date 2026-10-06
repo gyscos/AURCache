@@ -4,14 +4,16 @@ use aurcache_activitylog::events::{Event, RefreshTarget, SourceinfoPurpose};
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::packages;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
 use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::services::Services;
+use aurcache_utils::settings::Seconds;
 use aurcache_utils::settings::general::SettingsTraits;
-use aurcache_utils::vcs_check::{RoundCache, sync_vcs_sources};
+use aurcache_utils::snapshot::Resolved;
+use aurcache_utils::vcs_check::{RoundCache, VcsSync, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -32,9 +34,9 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
                 });
             }
 
-            let check_interval: SettingsEntry<u64> =
+            let check_interval: SettingsEntry<Seconds> =
                 ApplicationSettings::get(Setting::VersionCheckInterval, None, &services.db).await;
-            tokio::time::sleep(Duration::from_secs(check_interval.value.max(1))).await;
+            tokio::time::sleep(Duration::from_secs(check_interval.value.0.max(1))).await;
         }
     })
 }
@@ -42,7 +44,6 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
 async fn check_versions(services: &Services) -> anyhow::Result<()> {
     let Services {
         db,
-        tx: _,
         store,
         client,
         activity,
@@ -51,7 +52,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     let packages = Packages::find().all(db).await?;
     let aur_query_names: Vec<String> = packages
         .iter()
-        .filter(|x| x.source_type == SourceType::Aur)
+        .filter(|x| matches!(x.source_data, SourceData::Aur { .. }))
         .map(|x| {
             // AUR RPC /info matches by pkgname, not pkgbase.  For packages whose
             // pkgbase differs from any child pkgname (e.g. czkawka → czkawka-cli),
@@ -140,14 +141,15 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // from looping: the AUR-reported version is the one from when the
                         // PKGBUILD was last touched, which may be *older* than what was
                         // actually built from the live VCS source.
-                        let newer = upstream_is_newer(
-                            &result.version,
-                            latest_version.as_deref(),
-                            &package.name,
-                            activity,
-                        );
-                        let mut is_outdated = newer;
-                        let mut vcs_new = false;
+                        let mut upstream = Upstream {
+                            newer: upstream_is_newer(
+                                &result.version,
+                                latest_version.as_deref(),
+                                &package.name,
+                                activity,
+                            ),
+                            vcs_moved: false,
+                        };
 
                         // `pkgver` alone doesn't catch VCS packages (-git etc.)
                         // whose upstream repo moved without the AUR PKGBUILD's
@@ -157,20 +159,19 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                             .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
                             .await
                         {
-                            Ok((sourceinfo, metadata)) => {
+                            Ok(Resolved {
+                                sourceinfo,
+                                metadata,
+                            }) => {
                                 apply_source_metadata(&mut package_model, &metadata);
-                                match sync_vcs_sources(db, package_id, &sourceinfo, &mut round)
-                                    .await
-                                {
-                                    Ok(vcs_changed) => {
-                                        is_outdated = is_outdated || vcs_changed;
-                                        vcs_new = vcs_changed;
-                                    }
-                                    Err(e) => activity.emit(Event::VcsSyncFailed {
-                                        pkg: package.name.as_str().into(),
-                                        error: format!("{e:#}"),
-                                    }),
-                                }
+                                upstream.vcs_moved = vcs_moved(
+                                    services,
+                                    &package.name,
+                                    package_id,
+                                    &sourceinfo,
+                                    &mut round,
+                                )
+                                .await;
                             }
                             Err(e) => activity.emit(Event::SourceinfoFailed {
                                 pkg: package.name.as_str().into(),
@@ -179,15 +180,14 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                             }),
                         }
 
-                        package_model.out_of_date = Set(i32::from(is_outdated));
+                        package_model.out_of_date = Set(i32::from(upstream.is_outdated()));
                         report_detected(
                             activity,
                             &package.name,
                             reported.as_deref(),
                             &result.version,
                             latest_version,
-                            newer,
-                            vcs_new,
+                            upstream,
                         );
 
                         // The AUR RPC `/info` response is a cheap way to know
@@ -197,7 +197,9 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                         // `git fetch` -- when it looks like something changed,
                         // instead of unconditionally re-fetching every package
                         // on every check.
-                        if is_outdated && let Err(e) = store.refresh(&source_data).await {
+                        if upstream.is_outdated()
+                            && let Err(e) = store.refresh(&source_data).await
+                        {
                             activity.emit(Event::SourceRefreshFailed {
                                 pkg: package.name.as_str().into(),
                                 target: RefreshTarget::Snapshot,
@@ -228,7 +230,10 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // can't be updated this round; the actual build for this
                 // package will separately fail later with the same error,
                 // which is the desired outcome for an unapplicable patch.
-                let (sourceinfo, metadata) = match store
+                let Resolved {
+                    sourceinfo,
+                    metadata,
+                } = match store
                     .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
                     .await
                 {
@@ -254,31 +259,31 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 apply_source_metadata(&mut package_model, &metadata);
                 // Same logic as for AUR packages: only mark out of date when the
                 // upstream PKGBUILD version is strictly newer than what was built.
-                let newer =
-                    upstream_is_newer(&version, latest_version.as_deref(), &package.name, activity);
-                let mut is_outdated = newer;
-                let mut vcs_new = false;
+                let upstream = Upstream {
+                    newer: upstream_is_newer(
+                        &version,
+                        latest_version.as_deref(),
+                        &package.name,
+                        activity,
+                    ),
+                    vcs_moved: vcs_moved(
+                        services,
+                        &package.name,
+                        package_id,
+                        &sourceinfo,
+                        &mut round,
+                    )
+                    .await,
+                };
 
-                match sync_vcs_sources(db, package_id, &sourceinfo, &mut round).await {
-                    Ok(vcs_changed) => {
-                        is_outdated = is_outdated || vcs_changed;
-                        vcs_new = vcs_changed;
-                    }
-                    Err(e) => activity.emit(Event::VcsSyncFailed {
-                        pkg: package.name.as_str().into(),
-                        error: format!("{e:#}"),
-                    }),
-                }
-
-                package_model.out_of_date = Set(i32::from(is_outdated));
+                package_model.out_of_date = Set(i32::from(upstream.is_outdated()));
                 report_detected(
                     activity,
                     &package.name,
                     reported.as_deref(),
                     &version,
                     latest_version,
-                    newer,
-                    vcs_new,
+                    upstream,
                 );
             }
             SourceData::Upload { .. } => {
@@ -313,13 +318,43 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether `upstream` is a newer version than what was last built.
+/// What a version check found about one package's upstream.
+#[derive(Clone, Copy, Debug)]
+struct Upstream {
+    /// Its version is newer than what was last built, or nothing was built.
+    newer: bool,
+    /// One of its `git+` sources moved since the last check.
+    vcs_moved: bool,
+}
+
+impl Upstream {
+    const fn is_outdated(self) -> bool {
+        self.newer || self.vcs_moved
+    }
+}
+
+/// Whether one of the package's `git+` sources moved since the last check.
 ///
-/// A package that has never been built counts as outdated. When the two
-/// versions cannot be compared (either side is not valid alpm syntax) we fall
-/// back to "did the string change", which errs towards scheduling a build:
-/// reporting "not newer" would silently freeze the package forever, whereas a
-/// spurious rebuild is merely wasted work.
+/// A sync that fails is logged and counts as not moved: a later round retries.
+async fn vcs_moved(
+    services: &Services,
+    pkgbase: &str,
+    package_id: i32,
+    sourceinfo: &alpm_srcinfo::SourceInfoV1,
+    round: &mut RoundCache,
+) -> bool {
+    match sync_vcs_sources(&services.db, package_id, sourceinfo, round).await {
+        Ok(sync) => sync == VcsSync::Moved,
+        Err(e) => {
+            services.activity.emit(Event::VcsSyncFailed {
+                pkg: pkgbase.into(),
+                error: format!("{e:#}"),
+            });
+            false
+        }
+    }
+}
+
 /// Log a new upstream version, once: when the package goes out of date, or
 /// when upstream moves again while it already is. The check runs every hour
 /// and a package can stay out of date for many of them -- its auto-update off,
@@ -331,28 +366,34 @@ fn report_detected(
     activity: &ActivityLog,
     pkgbase: &str,
     reported: Option<&str>,
-    upstream: &str,
+    version: &str,
     built: Option<String>,
-    newer: bool,
-    vcs_changed: bool,
+    upstream: Upstream,
 ) {
-    if newer && reported != Some(upstream) {
+    if upstream.newer && reported != Some(version) {
         activity.emit(Event::VersionDetected {
             pkg: pkgbase.into(),
-            version: upstream.to_string(),
+            version: version.to_string(),
             built,
             vcs: false,
         });
-    } else if vcs_changed && !newer {
+    } else if upstream.vcs_moved && !upstream.newer {
         activity.emit(Event::VersionDetected {
             pkg: pkgbase.into(),
-            version: upstream.to_string(),
+            version: version.to_string(),
             built: None,
             vcs: true,
         });
     }
 }
 
+/// Whether `upstream` is a newer version than what was last built.
+///
+/// A package that has never been built counts as outdated. When the two
+/// versions cannot be compared (either side is not valid alpm syntax) we fall
+/// back to "did the string change", which errs towards scheduling a build:
+/// reporting "not newer" would silently freeze the package forever, whereas a
+/// spurious rebuild is merely wasted work.
 fn upstream_is_newer(
     upstream: &str,
     built: Option<&str>,

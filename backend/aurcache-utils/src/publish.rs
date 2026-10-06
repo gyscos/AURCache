@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Files, Packages};
 use aurcache_db::{builds, dependencies, files, packages};
@@ -22,7 +22,7 @@ use pacman_mirrors::platforms::Platform;
 use pacman_repo_utils::PackageEntry;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
 };
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -168,10 +168,23 @@ struct Staged {
     size: i64,
 }
 
+/// A staged file to publish, before it is read.
+struct Upload {
+    path: PathBuf,
+    filename: String,
+}
+
+/// One published file, as its `files` row will hold it.
+struct FileRow {
+    filename: String,
+    /// The `files` row it already has, if any.
+    existing: Option<i32>,
+    size: i64,
+}
+
 /// What the database is told, decided under the repository lock.
 struct Plan {
-    /// Each published file, with the `files` row it already has, if any.
-    rows: Vec<(String, Option<i32>, i64)>,
+    rows: Vec<FileRow>,
     /// This package's files on this platform that the build no longer
     /// produces.
     stale: Vec<PublishedFile>,
@@ -195,7 +208,7 @@ async fn publish(
     // The slow part, and private: every archive read in full, before anything
     // is locked or changed.
     let mut described = Vec::with_capacity(staged.len());
-    for (path, filename) in staged {
+    for Upload { path, filename } in staged {
         let size = i64::try_from(tokio::fs::metadata(&path).await?.len()).unwrap_or(i64::MAX);
         let entry = repo
             .describe(path.clone())
@@ -225,7 +238,7 @@ async fn publish(
     Ok(Published { packages })
 }
 
-/// The staged files that are to be published, as `(path, filename)`.
+/// The staged files that are to be published, by filename.
 ///
 /// Detached signatures are left out -- the repository moves them with their
 /// package -- and so are makepkg's `-debug` packages (see
@@ -234,7 +247,7 @@ async fn read_staging(
     repo: &Repository,
     build: &builds::Model,
     pkg: &packages::Model,
-) -> anyhow::Result<Vec<(PathBuf, String)>> {
+) -> anyhow::Result<Vec<Upload>> {
     let expected = expected_pkgnames(pkg);
     let mut names = Vec::new();
     let mut entries = match tokio::fs::read_dir(repo.staging_dir(build.id)).await {
@@ -262,14 +275,17 @@ async fn read_staging(
             .await;
             continue;
         }
-        names.push((entry.path(), filename));
+        names.push(Upload {
+            path: entry.path(),
+            filename,
+        });
     }
     if names.is_empty() {
         bail!("no publishable artifacts were uploaded");
     }
-    let filenames: Vec<String> = names.iter().map(|(_, f)| f.clone()).collect();
+    let filenames: Vec<String> = names.iter().map(|upload| upload.filename.clone()).collect();
     validate_artifact_names(&expected, &filenames)?;
-    names.sort_by(|a, b| a.1.cmp(&b.1));
+    names.sort_by(|a, b| a.filename.cmp(&b.filename));
     Ok(names)
 }
 
@@ -324,11 +340,11 @@ async fn plan(
                 );
             }
         }
-        rows.push((
-            staged.filename.clone(),
-            existing.map(PublishedFile::id),
-            staged.size,
-        ));
+        rows.push(FileRow {
+            filename: staged.filename.clone(),
+            existing: existing.map(PublishedFile::id),
+            size: staged.size,
+        });
     }
 
     let published: Vec<&str> = described.iter().map(|s| s.filename.as_str()).collect();
@@ -379,24 +395,24 @@ async fn record(
     let new_rows: Vec<files::ActiveModel> = plan
         .rows
         .iter()
-        .filter(|(_, existing, _)| existing.is_none())
-        .map(|(filename, _, size)| files::ActiveModel {
-            filename: Set(filename.clone()),
+        .filter(|row| row.existing.is_none())
+        .map(|row| files::ActiveModel {
+            filename: Set(row.filename.clone()),
             platform: Set(platform),
             package_id: Set(pkg.id),
-            size: Set(Some(*size)),
+            size: Set(Some(row.size)),
             ..Default::default()
         })
         .collect();
     if !new_rows.is_empty() {
         files::Entity::insert_many(new_rows).exec(&txn).await?;
     }
-    for (_, existing, size) in &plan.rows {
-        if let Some(id) = existing {
+    for row in &plan.rows {
+        if let Some(id) = row.existing {
             files::ActiveModel {
-                id: Set(*id),
+                id: Set(id),
                 package_id: Set(pkg.id),
-                size: Set(Some(*size)),
+                size: Set(Some(row.size)),
                 ..Default::default()
             }
             .update(&txn)
@@ -449,12 +465,12 @@ async fn fail(db: &DatabaseConnection, build: &builds::Model) -> anyhow::Result<
 /// staging directories is safe.
 pub async fn interrupted(db: &DatabaseConnection) -> anyhow::Result<Vec<i32>> {
     Ok(Builds::find()
+        .select_only()
+        .column(builds::Column::Id)
         .filter(builds::Column::Status.eq(BuildStates::PUBLISHING))
+        .into_tuple()
         .all(db)
-        .await?
-        .into_iter()
-        .map(|build| build.id)
-        .collect())
+        .await?)
 }
 
 /// The package names a build of `pkg` may produce: its pkgbase plus any
@@ -477,11 +493,9 @@ pub fn expected_pkgnames(pkg: &packages::Model) -> Vec<String> {
 struct ParsedPkg {
     name: String,
     version: String,
-    #[allow(unused)]
-    arch: String,
 }
 
-/// Parse an Arch package filename into its name / version / arch components.
+/// Parse an Arch package filename into its name and version.
 ///
 /// e.g. `hello-2.12.1-1-x86_64.pkg.tar.zst` -> name `hello`, version `2.12.1-1`.
 fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
@@ -495,7 +509,6 @@ fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
         bail!("Invalid pkg filename format: {filename}");
     }
 
-    let arch = parts[parts.len() - 1].to_string();
     let pkgrel = parts[parts.len() - 2];
     let pkgver = parts[parts.len() - 3];
     let name = parts[..parts.len() - 3].join("-");
@@ -503,7 +516,6 @@ fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
     Ok(ParsedPkg {
         name,
         version: format!("{pkgver}-{pkgrel}"),
-        arch,
     })
 }
 
@@ -571,7 +583,6 @@ mod tests {
         let p = parse_arch_pkg("hello-2.12.1-1-x86_64.pkg.tar.zst").unwrap();
         assert_eq!(p.name, "hello");
         assert_eq!(p.version, "2.12.1-1");
-        assert_eq!(p.arch, "x86_64");
     }
 
     #[test]
@@ -579,7 +590,6 @@ mod tests {
         let p = parse_arch_pkg("my-cool-pkg-1.0.0-2-aarch64.pkg.tar.zst").unwrap();
         assert_eq!(p.name, "my-cool-pkg");
         assert_eq!(p.version, "1.0.0-2");
-        assert_eq!(p.arch, "aarch64");
     }
 
     #[test]

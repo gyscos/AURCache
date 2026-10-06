@@ -9,7 +9,6 @@
 
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
-use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, WorkerReport};
 use aurcache_ca::Ca;
@@ -18,7 +17,7 @@ use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigUpdate, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
 };
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_common::worker::{
     ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
@@ -29,16 +28,18 @@ use aurcache_common::worker_config::{
 };
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
+use aurcache_db::lists::ListColumn;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, workers};
 use aurcache_utils::build_logger::append_build_output;
-use aurcache_utils::job_config::{JobConfig, build_job_config, mirrorlist_for};
+use aurcache_utils::job_config::{JobConfig, build_job_config, mirrorlist_dir, mirrorlist_for};
 use aurcache_utils::publish::publish_build;
 use aurcache_utils::repository::Repository;
 use aurcache_utils::settings::general::SettingsTraits;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::vcs_check::job_vcs_sources;
 use aurcache_utils::worker_complete;
+use aurcache_utils::worker_policy::worker_policy;
 use rocket::data::ToByteUnit;
 use rocket::http::Status;
 use rocket::mtls::Certificate;
@@ -48,56 +49,15 @@ use rocket::{Data, State, get, patch, post};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use utoipa::OpenApi;
 
-/// Lease/liveness tuning (env-overridable; see the design doc).
-fn lease_ttl_secs() -> i64 {
-    env_i64("LEASE_TTL", 60)
-}
-fn max_attempts() -> i32 {
-    *MAX_ATTEMPTS
-}
-/// How long a build must sit `ENQUEUED` before worker priority stops holding it
-/// back. A backstop: `available()` is inferred from heartbeats and lease state,
-/// so a worker can look healthy while never actually claiming (full disk, a bug).
-/// This bounds the damage at one delay per job.
-fn spill_delay_secs() -> i64 {
-    *SPILL_DELAY_SECS
-}
-/// How stale `last_seen` may be before a worker stops counting as available and
-/// therefore stops holding jobs back. ~4x the 15s default heartbeat.
+/// How stale `last_seen` may be before a worker stops counting as available.
 pub(crate) fn liveness_timeout_secs() -> i64 {
-    *LIVENESS_TIMEOUT_SECS
-}
-/// Worker certificates are transport plumbing, not a credential: authorization
-/// is the `workers` row, so holding a valid certificate grants nothing on its
-/// own. There is therefore nothing to gain from short validity, and no renewal
-/// path exists (`ensure_enrolled` reuses a persisted certificate and the server
-/// only signs when it has none) — so a short lifetime would simply brick the
-/// worker. Match the server certificate's 10 years. See
-/// `design/implemented/worker-routing.md` (Appendix).
-fn worker_cert_validity_days() -> i64 {
-    env_i64("WORKER_CERT_VALIDITY_DAYS", 3650)
-}
-fn env_i64(key: &str, default: i64) -> i64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
+    worker_policy().liveness_timeout_secs
 }
 
-/// Read-once copies of the settings above: they back per-claim and
-/// per-heartbeat paths, and re-reading plus re-parsing the environment on
-/// every one is pure overhead. Process env is fixed at start in every
-/// deployment, so a change needs a restart like any other setting.
-static MAX_ATTEMPTS: std::sync::LazyLock<i32> =
-    std::sync::LazyLock::new(|| env_i64("MAX_ATTEMPTS", 3) as i32);
-static SPILL_DELAY_SECS: std::sync::LazyLock<i64> =
-    std::sync::LazyLock::new(|| env_i64("WORKER_SPILL_DELAY", 60));
-static LIVENESS_TIMEOUT_SECS: std::sync::LazyLock<i64> =
-    std::sync::LazyLock::new(|| env_i64("WORKER_LIVENESS_TIMEOUT", 60));
 static REPO_TEMPLATE: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| render_repo_template(&public_repo_url()));
 
@@ -131,12 +91,8 @@ fn render_repo_template(public_url: &str) -> String {
         public_url,
         aurcache_common::worker::REPO_HOST_PLACEHOLDER,
     );
-    format!("[repo]\nSigLevel = Never\nServer = {server}\n")
-}
-
-/// Directory the server reads per-arch mirrorlists from.
-fn mirrorlist_dir() -> PathBuf {
-    PathBuf::from(env::var("AURCACHE_MIRRORLIST_DIR").unwrap_or_else(|_| "./repo".to_string()))
+    let name = aurcache_common::repo::REPO_NAME;
+    format!("[{name}]\nSigLevel = Never\nServer = {server}\n")
 }
 
 /// Checksum identifying one mirrorlist's content.
@@ -204,16 +160,13 @@ fn resolve_mirrorlist(
 ) -> MirrorlistOffer {
     // A worker with its own mirrorlist would discard anything sent, so nothing
     // is computed or sent for it.
-    if matches!(held, MirrorlistPreference::Local) {
+    let MirrorlistPreference::Server { checksums } = held else {
         return MirrorlistOffer::Nothing;
-    }
+    };
     let Some(content) = current else {
         return MirrorlistOffer::Nothing;
     };
     let checksum = mirrorlist_checksum(&content);
-    let MirrorlistPreference::Server { checksums } = held else {
-        unreachable!("Local handled above");
-    };
     if checksums.get(arch).map(String::as_str) == Some(checksum.as_str()) {
         MirrorlistOffer::Keep
     } else {
@@ -369,11 +322,11 @@ pub async fn register_worker(
         &worker_store::WorkerRegistration {
             name: &input.name,
             fingerprint: &fingerprint,
-            native_arches: &input.native_arches.join(","),
-            emulated_arches: &input.emulated_arches.join(","),
+            native_arches: &ListColumn::Worker.join(&input.native_arches),
+            emulated_arches: &ListColumn::Worker.join(&input.emulated_arches),
             version: &input.version,
             kind: &input.kind,
-            package_affinity: &input.packages.join(","),
+            package_affinity: &ListColumn::Worker.join(&input.packages),
             priority: input.priority,
             // Clamped to at least 1: a worker reporting 0 would be treated as
             // permanently full and could never block a lower-priority worker,
@@ -410,7 +363,7 @@ pub async fn register_worker(
     };
     if needs_cert {
         let signed = ca
-            .sign_worker_csr(&input.csr_pem, worker_cert_validity_days())
+            .sign_worker_csr(&input.csr_pem, worker_policy().cert_validity_days)
             .map_err(|e| err(Status::InternalServerError, e))?;
         worker_store::store_signed_cert(db, worker.id, &signed.cert_pem, signed.not_after)
             .await
@@ -533,8 +486,8 @@ pub async fn claim_job(
     let Some(build) = worker_jobs::claim_job(
         db,
         auth.worker.id,
-        lease_ttl_secs(),
-        spill_delay_secs(),
+        worker_policy().lease_ttl_secs,
+        worker_policy().spill_delay_secs,
         liveness_timeout_secs(),
     )
     .await
@@ -603,7 +556,7 @@ async fn build_descriptor(
         Err(_) => (Vec::new(), Vec::new()),
     };
 
-    let build_flags = split_delimited(&pkg.build_flags, ';');
+    let build_flags = ListColumn::Package.split(&pkg.build_flags);
 
     // Resolved here rather than on the worker: settings are the server's,
     // with the package overriding the global default.
@@ -643,15 +596,9 @@ pub async fn job_source(
     build_id: i32,
 ) -> Result<Vec<u8>, ApiError> {
     let db = db.inner();
-    worker_complete::assert_owned_active(db, auth.worker.id, build_id)
+    let build = worker_complete::assert_owned_active(db, auth.worker.id, build_id)
         .await
         .map_err(|e| err(Status::Forbidden, e))?;
-
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| err(Status::NotFound, "build not found"))?;
     let pkg = Packages::find_by_id(build.pkg_id)
         .one(db)
         .await
@@ -877,11 +824,11 @@ pub async fn complete_job(
     build_id: i32,
     input: Json<CompleteReport>,
 ) -> Result<(), ApiError> {
-    // The worker only ever sees the status code -- `error_for_status` keeps
-    // nothing else -- and a refused completion is how a build that finished
-    // becomes a build that failed. So the reason is logged here, on the side
-    // that knows it. Refusing quietly is what made a stale `files` row take an
-    // afternoon to find.
+    // A refused completion is how a build that finished becomes a build that
+    // failed, so the reason is logged here as well as answered: the worker's
+    // journal is on another machine, and the activity log is where an
+    // operator looks. Refusing quietly is what made a stale `files` row take
+    // an afternoon to find.
     let outcome = complete_job_inner(
         db.inner(),
         repo.inner(),
@@ -940,7 +887,7 @@ async fn complete_job_inner(
     // A real ownership check: without it, any authenticated worker that
     // guessed an id could remove another worker's staging directory.
     if build.worker_id == Some(auth.worker.id) {
-        let failed = build.status == Some(worker_jobs::STATUS_FAILED);
+        let failed = build.status == Some(BuildStates::FAILED_BUILD);
         let acknowledged_abort = report.canceled && !report.success && failed;
         let repeated_success = report.success
             && (matches!(
@@ -1125,11 +1072,23 @@ pub async fn heartbeat(
         db,
         auth.worker.id,
         &hb.active_build_ids,
-        lease_ttl_secs(),
-        max_attempts(),
+        worker_policy().lease_ttl_secs,
+        worker_policy().max_attempts,
     )
     .await
     .map_err(|e| err(Status::InternalServerError, e))?;
+    // Builds the worker stopped listing were abandoned above, each with a
+    // fresh attempt while the budget allows. Said the way the reaper says it:
+    // they were taken back from this worker.
+    if !outcome.dropped.is_empty() {
+        let named = aurcache_utils::abandoned::named(&outcome.dropped);
+        al.emit(Event::WorkerReaped {
+            workers: vec![auth.worker.name.as_str().into()],
+            retried: named.retried,
+            failed: named.failed,
+        });
+        aurcache_utils::abandoned::report(db, al, &outcome.dropped).await;
+    }
     Ok(Json(HeartbeatResponse {
         cancel: outcome.cancel_requested,
         config: snapshot_for(db, &auth.worker, hb.received_revision.as_deref()).await,
@@ -1182,12 +1141,12 @@ pub async fn job_status(
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "build not found"))?;
     let mine = build.worker_id == Some(auth.worker.id);
-    if build.status == Some(worker_jobs::STATUS_ACTIVE) && !mine {
+    if build.status == Some(BuildStates::ACTIVE_BUILD) && !mine {
         return Err(err(Status::Forbidden, "not owner"));
     }
     // Cancel is signalled by leaving ACTIVE while owned, or by no longer being
     // this worker's to run.
-    let cancel_requested = build.status != Some(worker_jobs::STATUS_ACTIVE) || !mine;
+    let cancel_requested = build.status != Some(BuildStates::ACTIVE_BUILD) || !mine;
     Ok(Json(JobStatus { cancel_requested }))
 }
 
@@ -1262,14 +1221,14 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         name: worker.name,
         status: worker.status,
         cert_fingerprint: worker.cert_fingerprint,
-        native_arches: split_delimited(&worker.native_arches, ','),
-        emulated_arches: split_delimited(&worker.emulated_arches, ','),
-        package_affinity: split_delimited(&worker.package_affinity, ','),
+        native_arches: ListColumn::Worker.split(&worker.native_arches),
+        emulated_arches: ListColumn::Worker.split(&worker.emulated_arches),
+        package_affinity: ListColumn::Worker.split(&worker.package_affinity),
         priority: worker.priority,
         last_seen: worker.last_seen,
         version: worker.version,
         kind: worker.kind,
-        online: is_online(worker.last_seen, now, timeout),
+        online: worker_jobs::is_live(worker.last_seen, now, timeout),
         active_builds: tally.active,
         successful_builds: tally.successful,
         failed_builds: tally.failed,
@@ -1294,15 +1253,6 @@ fn rejected_settings(effective: Option<&str>, id: i32) -> Option<i32> {
             .count(),
     )
     .ok()
-}
-
-/// Whether a worker has checked in recently enough to count as connected.
-///
-/// A worker that has never checked in is not online, which is a different
-/// statement from one that checked in and stopped -- `last_seen` tells those
-/// apart and this deliberately does not.
-fn is_online(last_seen: Option<i64>, now: i64, timeout: i64) -> bool {
-    last_seen.is_some_and(|seen| now - seen <= timeout)
 }
 
 #[utoipa::path(get, path = "/workers", responses((status = 200, body = [WorkerSummary])))]
@@ -1339,11 +1289,10 @@ pub async fn worker_join_info(_a: Authenticated) -> Json<WorkerJoinInfo> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_WORKER_IMAGE.to_string());
-    let worker_port = env::var("AURCACHE_WORKER_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
-    Json(WorkerJoinInfo { image, worker_port })
+    Json(WorkerJoinInfo {
+        image,
+        worker_port: crate::init::worker_port(),
+    })
 }
 
 /// What one worker can be configured with, and what it is running.
@@ -1600,21 +1549,18 @@ pub async fn revoke_worker(
     id: i32,
 ) -> Result<(), ApiError> {
     let db = db.inner();
-    let revoked = worker_store::revoke_worker(db, id, max_attempts())
+    let revoked = worker_store::revoke_worker(db, id, worker_policy().max_attempts)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "no such worker"))?;
-    // Named for the entry; a lookup that fails costs the list, not the revoke.
-    let requeued = aurcache_db::helpers::builds::build_refs(db, &revoked.requeued)
-        .await
-        .unwrap_or_default();
     al.emit_by(
         Event::WorkerRevoked {
             worker: revoked.worker.name.into(),
-            requeued,
+            requeued: aurcache_utils::abandoned::named(&revoked.abandoned).retried,
         },
         a.username,
     );
+    aurcache_utils::abandoned::report(db, al, &revoked.abandoned).await;
     Ok(())
 }
 

@@ -122,6 +122,20 @@ pub async fn remove_package_logs(pkgbase: &str) {
     }
 }
 
+/// Delete one build's log.
+///
+/// Not optional when a build row goes: numbers are `max + 1` within the
+/// package, so the next build can take a deleted build's number and would
+/// otherwise append to its log. Best-effort like [`remove_package_logs`].
+pub async fn remove_build_log(pkgbase: &str, number: i32) {
+    let path = build_log_path(pkgbase, number);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("could not remove build log {}: {e}", path.display()),
+    }
+}
+
 /// Delete every build log there is, for a wipe that removes every package.
 pub async fn remove_all_logs() {
     let root = build_log_root();

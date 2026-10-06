@@ -10,7 +10,6 @@
 //! entries within one, and the id is what keeps a page boundary between them
 //! from dropping or repeating a row.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -21,7 +20,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "create index if not exists idx_activity_timestamp_id \
                  on activity (timestamp desc, id desc);"

@@ -6,6 +6,7 @@ use rocket::{Request, State, delete, get, post};
 use crate::models::authenticated::Authenticated;
 use crate::models::builds::BuildSummary;
 use crate::utils::error::{ApiError, err};
+use crate::utils::pagination::page_offset;
 use crate::worker::liveness_timeout_secs;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
@@ -17,7 +18,9 @@ use aurcache_db::action::Action;
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
-use aurcache_utils::build_logger::{build_log_path, build_log_size, read_build_output};
+use aurcache_utils::build_logger::{
+    build_log_path, build_log_size, read_build_output, remove_build_log,
+};
 use aurcache_utils::package::update::{package_update, queued};
 use rocket::fs::NamedFile;
 use rocket::http::{ContentType, Header};
@@ -27,6 +30,7 @@ use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait, Select,
 };
+use std::collections::HashMap;
 use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
@@ -209,7 +213,7 @@ pub async fn list_package_builds(
     status: Option<&str>,
     _a: Authenticated,
 ) -> Result<Json<Vec<BuildSummary>>, ApiError> {
-    let pkg = crate::package::package_id_for(db.inner(), Some(pkgbase)).await?;
+    let pkg = Some(crate::package::package_id(db.inner(), pkgbase).await?);
     let filter = BuildFilter::new(pkg, worker, status)?;
     list_builds_impl(db.inner(), &filter, limit, page).await
 }
@@ -252,17 +256,10 @@ async fn list_builds_impl(
     // Every row has a start time since the dashboard-indexes migration
     // backfilled legacy NULLs, so the bare column orders identically on both
     // backends and the `start_time` index serves it.
-    let basequery = build_row_select()
+    let mut query = build_row_select()
         .order_by(builds::Column::StartTime, Order::Desc)
         .limit(limit)
-        // Saturating: user input must never reach unchecked arithmetic — a
-        // huge `page` would wrap the offset in release or panic in debug.
-        .offset(
-            page.zip(limit)
-                .map(|(page, limit)| page.saturating_mul(limit)),
-        );
-
-    let mut query = basequery;
+        .offset(page_offset(page, limit));
     if let Some(pkg_id) = filter.pkg_id {
         query = query.filter(builds::Column::PkgId.eq(pkg_id));
     }
@@ -387,19 +384,24 @@ pub(crate) async fn annotate_waiting(
     if rows.is_empty() {
         return Vec::new();
     }
-    let reasons = match worker_jobs::waiting_reasons(db, liveness_timeout_secs()).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("could not compute build waiting reasons: {e}");
-            Default::default()
-        }
-    };
+    let mut reasons = waiting_reasons(db).await;
     rows.into_iter()
         .map(|row| {
-            let reason = reasons.get(&row.id).cloned();
+            let reason = reasons.remove(&row.id);
             row.into_summary(reason)
         })
         .collect()
+}
+
+/// Why each queued build is waiting, by row id; empty when that cannot be
+/// computed.
+async fn waiting_reasons(db: &DatabaseConnection) -> HashMap<i32, WaitingReason> {
+    worker_jobs::waiting_reasons(db, liveness_timeout_secs())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("could not compute build waiting reasons: {e}");
+            HashMap::new()
+        })
 }
 
 /// Scope a build select to one public build identity — `<pkgbase>/<number>`.
@@ -487,23 +489,12 @@ pub async fn get_build(
     // Waiting reasons only exist for queued builds, and computing them scans
     // the whole queue plus the fleet — skip that for a build whose status
     // already says the annotation would be `None`.
-    let mut summary = if row.status == BuildStates::ENQUEUED_BUILD {
-        // `annotate_waiting` maps rows 1:1, so this always yields the one row —
-        // but an HTTP handler should not panic on an invariant it cannot enforce
-        // locally, so the impossible case is an error rather than an `expect`.
-        annotate_waiting(db, vec![row])
-            .await
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                err(
-                    Status::InternalServerError,
-                    "build vanished while annotating",
-                )
-            })?
+    let reason = if row.status == BuildStates::ENQUEUED_BUILD {
+        waiting_reasons(db).await.remove(&row.id)
     } else {
-        row.into_summary(None)
+        None
     };
+    let mut summary = row.into_summary(reason);
     // The one field only the detail route fills: a metadata stat, not a read.
     summary.log_size = build_log_size(pkgbase, number)
         .await
@@ -531,11 +522,24 @@ pub async fn delete_build(
     let db = db.inner();
 
     let build = build_by_number(db, pkgbase, number).await?;
+    // A worker holds an active build's lease and a publishing one is being
+    // moved into the repository; removing the row under either leaves that
+    // work pointing at nothing.
+    if matches!(
+        build.status,
+        Some(BuildStates::ACTIVE_BUILD | BuildStates::PUBLISHING)
+    ) {
+        return Err(err(
+            Status::Conflict,
+            format!("build {pkgbase}/{number} is running; cancel it first"),
+        ));
+    }
 
     build
         .delete(db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
+    remove_build_log(pkgbase, number).await;
     al.emit_by(
         Event::BuildDeleted {
             build: BuildRef {
@@ -627,7 +631,9 @@ pub async fn retry_build(
     // can be traced to whoever did.
     let platform_results = package_update(services, package, true, BuildTrigger::User)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        // As for an update: an unresolvable source or a patch that no longer
+        // applies is the caller's to fix.
+        .map_err(|e| err(Status::BadRequest, e))?;
     // "Retry" on a build that worked asks for it again: a rebuild.
     al.emit_by(
         queued(

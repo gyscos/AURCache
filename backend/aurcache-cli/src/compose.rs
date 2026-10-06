@@ -218,11 +218,11 @@ impl WorkerEnv {
     /// the host name, the host architecture — and an empty string would
     /// override them with nothing instead of leaving them alone.
     #[must_use]
-    pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
+    pub fn variables(&self) -> Vec<EnvVar> {
         let mut pairs = Vec::new();
         let mut push = |key, value: Option<String>| {
             if let Some(value) = value {
-                pairs.push((key, value));
+                pairs.push(EnvVar { key, value });
             }
         };
 
@@ -266,6 +266,20 @@ impl WorkerEnv {
         );
         push("WORKER_DISK_MAX_DEFAULT", self.pool.disk_max.clone());
         pairs
+    }
+}
+
+/// One environment variable of a worker's configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvVar {
+    pub key: &'static str,
+    pub value: String,
+}
+
+impl std::fmt::Display for EnvVar {
+    /// `KEY=value`, as `docker run -e` and a compose file both take it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.key, self.value)
     }
 }
 
@@ -681,8 +695,8 @@ fn worker_service(params: &ComposeParams) -> String {
 
     out.push_str("    environment:\n");
     let _ = writeln!(out, "      - RUST_LOG={}", params.log_level);
-    for (key, value) in env.to_pairs() {
-        let _ = writeln!(out, "      - {key}={value}");
+    for var in env.variables() {
+        let _ = writeln!(out, "      - {var}");
     }
 
     out.push_str("    volumes:\n");
@@ -767,9 +781,9 @@ fn volumes(params: &ComposeParams) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposeDatabase, ComposeParams, ComposeRole, ENROLLMENT_DIR, FINGERPRINT_PLACEHOLDER,
-        NGINX_IMAGE, POSTGRES_IMAGE, POSTGRES_MAJOR, PoolBacking, PoolSetup, WorkerEnv,
-        is_plain_password, render_compose,
+        ComposeDatabase, ComposeParams, ComposeRole, ENROLLMENT_DIR, EnvVar,
+        FINGERPRINT_PLACEHOLDER, NGINX_IMAGE, POSTGRES_IMAGE, POSTGRES_MAJOR, PoolBacking,
+        PoolSetup, WorkerEnv, is_plain_password, render_compose,
     };
     use aurcache_common::ports::AURCACHE_MIRROR_PORT;
     use yaml_rust2::{Yaml, YamlLoader};
@@ -785,7 +799,7 @@ mod tests {
     /// architecture, and an empty value would override those with nothing.
     #[test]
     fn unset_worker_values_produce_no_variable() {
-        assert!(WorkerEnv::default().to_pairs().is_empty());
+        assert!(WorkerEnv::default().variables().is_empty());
     }
 
     #[test]
@@ -794,8 +808,13 @@ mod tests {
             arches: vec!["x86_64".to_string(), "aarch64".to_string()],
             ..WorkerEnv::default()
         };
-        let pairs = env.to_pairs();
-        assert_eq!(pairs, vec![("WORKER_ARCHES", "x86_64,aarch64".to_string())]);
+        assert_eq!(
+            env.variables(),
+            vec![EnvVar {
+                key: "WORKER_ARCHES",
+                value: "x86_64,aarch64".to_string()
+            }]
+        );
     }
 
     fn worker_with_pool(pool: PoolSetup) -> ComposeParams {
@@ -915,9 +934,9 @@ mod tests {
             ..WorkerEnv::default()
         };
         assert!(
-            !env.to_pairs()
+            !env.variables()
                 .iter()
-                .any(|(k, _)| *k == "WORKER_DISK_RESERVE")
+                .any(|var| var.key == "WORKER_DISK_RESERVE")
         );
     }
 

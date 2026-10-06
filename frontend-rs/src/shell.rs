@@ -463,12 +463,8 @@ mod tests {
     use dioxus::router::components::HistoryProvider;
     use std::rc::Rc;
 
-    /// The whole app rendered at one route, without a browser.
-    ///
-    /// Goes through the real `Router`, so this covers what the unit tests on
-    /// `Route` cannot: that the route table, the shell, the outlet and the menu
-    /// actually compose.
-    /// The whole app rendered at one route with an in-memory history.
+    /// The whole app rendered at one route with an in-memory history, without
+    /// a browser.
     ///
     /// Goes through the real `Router`, so this covers what the unit tests on
     /// `Route` cannot: that the route table, the shell, the outlet and the menu

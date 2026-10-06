@@ -45,8 +45,6 @@ pub struct Model {
     /// Epoch seconds when the current worker's lease expires. Renewed by
     /// heartbeats; a passed value means the worker went silent.
     pub lease_expires_at: Option<i64>,
-    /// Number of times this build has been re-enqueued after a silent worker.
-    pub attempt_count: i32,
     /// Why this build row was created: `user`, `auto_update`, or `timeout_retry`
     /// (see `aurcache_common::build_state::BuildTrigger`). The retry budget for
     /// abandoned builds is derived from the consecutive `timeout_retry` run in

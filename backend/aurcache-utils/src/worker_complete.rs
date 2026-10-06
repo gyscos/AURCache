@@ -7,19 +7,25 @@
 //! `WAITING_FOR_DEPS` to `ENQUEUED` is all that is required to dispatch it.
 
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::builder::BuildStates;
-use aurcache_db::builds;
-use aurcache_db::dependencies;
-use aurcache_db::helpers::build_enqueue::{demote_enqueued_build, promote_waiting_build};
+use aurcache_common::build_state::BuildStates;
+use aurcache_db::helpers::build_enqueue::{Demotion, demote_enqueued_build, promote_waiting_build};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
+use aurcache_db::{builds, dependencies, packages};
 use pacman_mirrors::platforms::Platform;
-use sea_orm::ActiveValue::Set;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    QueryFilter, QuerySelect, TransactionSession, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QuerySelect, TransactionSession,
+    TransactionTrait,
 };
 use std::collections::HashMap;
+
+/// The build `build_id`, or an error naming it.
+async fn find_build<C: ConnectionTrait>(db: &C, build_id: i32) -> Result<builds::Model, DbErr> {
+    Builds::find_by_id(build_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))
+}
 
 /// Confirm the given worker currently holds the active lease on the build.
 /// Uploads and completions are only accepted from the owning worker while the
@@ -29,10 +35,7 @@ pub async fn assert_owned_active<C: ConnectionTrait>(
     worker_id: i32,
     build_id: i32,
 ) -> Result<builds::Model, DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
+    let build = find_build(db, build_id).await?;
     check_owned_active(worker_id, &build)?;
     Ok(build)
 }
@@ -48,15 +51,8 @@ pub async fn assert_owned<C: ConnectionTrait>(
     worker_id: i32,
     build_id: i32,
 ) -> Result<builds::Model, DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-    if build.worker_id != Some(worker_id) {
-        return Err(DbErr::Custom(format!(
-            "build {build_id} is not owned by worker {worker_id}"
-        )));
-    }
+    let build = find_build(db, build_id).await?;
+    check_owned(worker_id, &build)?;
     Ok(build)
 }
 
@@ -66,13 +62,18 @@ pub async fn assert_owned<C: ConnectionTrait>(
 /// hottest worker endpoint for a row that cannot usefully change between the
 /// two reads (a concurrent state change fails the CAS further down anyway).
 pub fn check_owned_active(worker_id: i32, build: &builds::Model) -> Result<(), DbErr> {
-    let build_id = build.id;
     if build.status != Some(BuildStates::ACTIVE_BUILD) {
-        return Err(DbErr::Custom(format!("build {build_id} is not active")));
+        return Err(DbErr::Custom(format!("build {} is not active", build.id)));
     }
+    check_owned(worker_id, build)
+}
+
+/// Whether `worker_id` is the worker that ran `build`, as an error when not.
+fn check_owned(worker_id: i32, build: &builds::Model) -> Result<(), DbErr> {
     if build.worker_id != Some(worker_id) {
         return Err(DbErr::Custom(format!(
-            "build {build_id} is not owned by worker {worker_id}"
+            "build {} is not owned by worker {worker_id}",
+            build.id
         )));
     }
     Ok(())
@@ -147,38 +148,36 @@ fn lease_lost(build_id: i32, worker_id: i32) -> DbErr {
     ))
 }
 
-/// Move a build and its package to a terminal status in one transaction,
-/// releasing the lease. The build write is a compare-and-swap on
-/// `status = ACTIVE AND worker_id = ?`, so a completion arriving after the
-/// reaper reclaimed the build is discarded rather than clobbering the new owner.
+/// End `worker_id`'s lease on `build_id`, moving the build and its package
+/// from `ACTIVE` to `status`, in one transaction; `ended_at` is the build's
+/// end time when it is over.
 ///
-/// Returns the completed build.
-async fn finish_build<C: ConnectionTrait + TransactionTrait>(
+/// A compare-and-swap on `status = ACTIVE AND worker_id = ?`, so a completion
+/// arriving after the reaper reclaimed the build is discarded rather than
+/// clobbering the new owner.
+///
+/// `worker_id` is kept. On a build that has left `ACTIVE` it is no longer a
+/// claim, it is the record of which machine produced it -- which the workers
+/// page promises. Nothing mistakes it for ownership: every path that treats a
+/// build as owned -- heartbeat, `abandon_worker_builds`, the lease reaper,
+/// `claim_job` -- also requires `ACTIVE`.
+async fn release<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
     worker_id: i32,
     status: i32,
-) -> Result<builds::Model, DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
+    ended_at: Option<i64>,
+) -> Result<(), DbErr> {
+    let build = find_build(db, build_id).await?;
 
     let txn = db.begin().await?;
-    let res = Builds::update_many()
+    let mut update = Builds::update_many()
         .col_expr(builds::Column::Status, status.into())
-        // `worker_id` is kept. On a finished build it is no longer a claim,
-        // it is the record of which machine produced the package -- which the
-        // workers page promises ("the row is kept so old builds still name the
-        // machine that ran them") and, until now, could not deliver, because
-        // this cleared it the moment the build ended. Nothing mistakes it for
-        // ownership: every path that treats a build as owned -- heartbeat,
-        // requeue_worker_builds, the lease reaper, claim_job -- also requires
-        // a non-terminal status.
-        //
-        // The lease is a different thing and does end here.
-        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
-        .col_expr(builds::Column::EndTime, Some(now_secs()).into())
+        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into());
+    if let Some(ended_at) = ended_at {
+        update = update.col_expr(builds::Column::EndTime, Some(ended_at).into());
+    }
+    let res = update
         .filter(builds::Column::Id.eq(build_id))
         .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
         .filter(builds::Column::WorkerId.eq(worker_id))
@@ -189,59 +188,28 @@ async fn finish_build<C: ConnectionTrait + TransactionTrait>(
         return Err(lease_lost(build_id, worker_id));
     }
 
-    if let Some(pkg) = Packages::find_by_id(build.pkg_id).one(&txn).await? {
-        let mut pkg = pkg.into_active_model();
-        pkg.status = Set(status);
-        if status == BuildStates::SUCCESSFUL_BUILD {
-            pkg.out_of_date = Set(0);
-        }
-        pkg.update(&txn).await?;
-    }
+    Packages::update_many()
+        .col_expr(packages::Column::Status, status.into())
+        .filter(packages::Column::Id.eq(build.pkg_id))
+        .exec(&txn)
+        .await?;
     txn.commit().await?;
-    Ok(build)
+    Ok(())
 }
 
 /// Take a finished build over from the worker that built it, to publish.
 ///
 /// The worker's artifacts are all uploaded and it has said so: from here on
 /// nothing it could do would change the outcome, so it is released. The build
-/// moves from `ACTIVE` to `PUBLISHING` and its lease ends -- which is also what
-/// takes it out of the reach of the heartbeat, the reaper and a revocation, all
-/// of which only look at `ACTIVE` builds. `worker_id` stays, as the record of
-/// who built it.
-///
-/// A compare-and-swap on `status = ACTIVE AND worker_id = ?`, like every other
-/// completion: a build this worker has already lost is not taken over.
+/// moves from `ACTIVE` to `PUBLISHING` -- which is also what takes it out of
+/// the reach of the heartbeat, the reaper and a revocation, all of which only
+/// look at `ACTIVE` builds.
 pub async fn accept_for_publishing<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    let build = Builds::find_by_id(build_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| DbErr::Custom(format!("build {build_id} not found")))?;
-
-    let txn = db.begin().await?;
-    let res = Builds::update_many()
-        .col_expr(builds::Column::Status, BuildStates::PUBLISHING.into())
-        .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
-        .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
-        .filter(builds::Column::WorkerId.eq(worker_id))
-        .exec(&txn)
-        .await?;
-    if res.rows_affected == 0 {
-        txn.rollback().await?;
-        return Err(lease_lost(build_id, worker_id));
-    }
-    if let Some(pkg) = Packages::find_by_id(build.pkg_id).one(&txn).await? {
-        let mut pkg = pkg.into_active_model();
-        pkg.status = Set(BuildStates::PUBLISHING);
-        pkg.update(&txn).await?;
-    }
-    txn.commit().await?;
-    Ok(())
+    release(db, build_id, worker_id, BuildStates::PUBLISHING, None).await
 }
 
 /// Mark a build (and its package) as failed. Deterministic failures reported by
@@ -251,8 +219,14 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    finish_build(db, build_id, worker_id, BuildStates::FAILED_BUILD).await?;
-    Ok(())
+    release(
+        db,
+        build_id,
+        worker_id,
+        BuildStates::FAILED_BUILD,
+        Some(now_secs()),
+    )
+    .await
 }
 
 /// After a successful build, promote any dependent whose dependencies are now
@@ -267,7 +241,8 @@ pub async fn trigger_dependents<C: ConnectionTrait>(
     let deps_by_dependent = load_dependencies_for_dependents_of(db, pkg_id).await?;
     let mut promoted = vec![];
     for (dependent_id, all_deps) in &deps_by_dependent {
-        if dependencies_ready(db, all_deps, platform).await?
+        if aurcache_db::helpers::builds::dependencies_satisfied(db, all_deps, platform.as_str())
+            .await?
             && let Some(build) = promote_dependent(db, *dependent_id, platform).await?
         {
             promoted.push(build);
@@ -320,7 +295,9 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
 
     for build in pending {
         let platform = build.platform;
-        let ready = dependencies_ready(db, &deps, platform).await?;
+        let ready =
+            aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform.as_str())
+                .await?;
         match (build.status, ready) {
             (Some(BuildStates::WAITING_FOR_DEPS), true) => {
                 if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {
@@ -332,7 +309,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
                 }
             }
             (Some(BuildStates::ENQUEUED_BUILD), false)
-                if demote_enqueued_build(db, pkg_id, platform).await? =>
+                if demote_enqueued_build(db, pkg_id, platform).await? == Demotion::Demoted =>
             {
                 tracing::info!(
                     "Build #{} on {platform} must wait: its dependencies changed and are not satisfied yet",
@@ -368,26 +345,6 @@ async fn load_dependencies_for_dependents_of<C: ConnectionTrait>(
         map.entry(dep.dependent_id).or_default().push(dep);
     }
     Ok(map)
-}
-
-async fn dependencies_ready<C: ConnectionTrait>(
-    db: &C,
-    all_deps: &[dependencies::Model],
-    platform: Platform,
-) -> Result<bool, DbErr> {
-    for dep in all_deps {
-        if !aurcache_db::helpers::builds::dependency_satisfied(
-            db,
-            dep.dependee_id,
-            platform.as_str(),
-            &dep.version_constraint,
-        )
-        .await?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 async fn promote_dependent<C: ConnectionTrait>(
@@ -427,8 +384,8 @@ mod tests {
     async fn pkg(db: &DatabaseConnection, id: i32) {
         db.execute_unprepared(&format!(
             "INSERT INTO packages \
-             (id, name, status, out_of_date, build_flags, platforms, source_type, source_data, directly_requested) \
-             VALUES ({id}, 'p{id}', 0, 0, '', 'x86_64', 'aur', '{{\"type\":\"aur\",\"name\":\"p{id}\"}}', 1)"
+             (id, name, status, out_of_date, build_flags, platforms, source_data, directly_requested) \
+             VALUES ({id}, 'p{id}', 0, 0, '', 'x86_64', '{{\"type\":\"aur\",\"name\":\"p{id}\"}}', 1)"
         ))
         .await
         .unwrap();
@@ -436,8 +393,8 @@ mod tests {
 
     async fn build(db: &DatabaseConnection, id: i32, pkg_id: i32, status: i32, worker: &str) {
         db.execute_unprepared(&format!(
-            "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, worker_id, attempt_count) \
-             VALUES ({id}, {pkg_id}, {status}, 0, 'x86_64', '1.0', {worker}, 0)"
+            "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, worker_id) \
+             VALUES ({id}, {pkg_id}, {status}, 0, 'x86_64', '1.0', {worker})"
         ))
         .await
         .unwrap();
@@ -686,7 +643,6 @@ mod tests {
         complete_failure(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
-        assert_eq!(b.attempt_count, 0);
         // A failed build produced nothing to measure. `None` says that; a `0`
         // would claim it produced an empty package.
         assert_eq!(b.size, None);

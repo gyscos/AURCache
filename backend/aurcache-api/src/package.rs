@@ -12,7 +12,6 @@ use crate::models::package::{
     CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
 };
 use crate::utils::error::{ApiError, err};
-use crate::utils::lists::split_delimited;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::build_state::{BuildStates, BuildTrigger};
@@ -21,10 +20,11 @@ use aurcache_db::helpers::builds::{
 };
 use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::helpers::operations;
+use aurcache_db::lists::ListColumn;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files, packages};
-use aurcache_utils::package::add::package_add;
+use aurcache_utils::package::add::{normalize_build_flags, package_add};
 use aurcache_utils::package::live_check::{live_check, package_remove};
 use aurcache_utils::package::update::{package_resync_dependencies, package_update, queued};
 use aurcache_utils::patch::SourcePatch;
@@ -50,16 +50,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use utoipa::OpenApi;
 
-/// Resolve an optional pkgbase to its row id, for endpoints whose per-package
-/// scope is optional (settings). `None` means "global", not "not found".
-pub(crate) async fn package_id_for(
-    db: &DatabaseConnection,
-    pkgbase: Option<&str>,
-) -> Result<Option<i32>, ApiError> {
-    match pkgbase {
-        Some(pkgbase) => Ok(Some(package_by_pkgbase(db, pkgbase).await?.id)),
-        None => Ok(None),
-    }
+/// The row id of the package named `pkgbase`.
+pub(crate) async fn package_id(db: &DatabaseConnection, pkgbase: &str) -> Result<i32, ApiError> {
+    Ok(package_by_pkgbase(db, pkgbase).await?.id)
 }
 
 /// Resolve a package by its pkgbase, the public identifier.
@@ -103,15 +96,6 @@ async fn package_by_pkgbase(
 ))]
 pub struct PackageApi;
 
-fn normalize_build_flags(build_flags: &[String]) -> Vec<String> {
-    build_flags
-        .iter()
-        .map(|flag| flag.trim())
-        .filter(|flag| !flag.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
 /// Parse the platform names a request carried, if any.
 fn parse_platforms(platforms: Option<Vec<String>>) -> Result<Option<Vec<Platform>>, ApiError> {
     platforms
@@ -151,7 +135,7 @@ pub async fn packages_add_endpoint(
         return Err(err(Status::BadRequest, "No sources given"));
     }
     let platforms = parse_platforms(input.platforms)?;
-    let build_flags = input.build_flags.as_deref().map(normalize_build_flags);
+    let build_flags = input.build_flags;
     let total = i32::try_from(input.sources.len()).unwrap_or(i32::MAX);
 
     let job_id = operations::create(&services.db, operations::KIND_BULK_ADD, total)
@@ -319,7 +303,7 @@ pub async fn package_add_endpoint(
     let new_pkg_name = package_add(
         services,
         platforms,
-        input.build_flags.as_deref().map(normalize_build_flags),
+        input.build_flags,
         input.source,
         input.patched_files,
     )
@@ -395,10 +379,9 @@ pub async fn package_update_entity_endpoint(
         status: input.status.map_or(NotSet, Set),
         out_of_date: input.out_of_date.map_or(NotSet, Set),
         latest_build: input.latest_build.map_or(NotSet, Set),
-        build_flags: input
-            .build_flags
-            .as_deref()
-            .map_or(NotSet, |v| Set(normalize_build_flags(v).join(";"))),
+        build_flags: input.build_flags.map_or(NotSet, |v| {
+            Set(ListColumn::Package.join(&normalize_build_flags(v)))
+        }),
         platforms: requested_platforms.map_or(NotSet, |v| Set(Platform::join_canonical(&v))),
         patch: input.patch.map_or(NotSet, Set),
         // Everything else is `NotSet`, left untouched, so a column added
@@ -791,12 +774,7 @@ async fn list_packages(
         .order_by(packages::Column::OutOfDate, Order::Desc)
         .order_by(packages::Column::Id, Order::Desc)
         .limit(limit)
-        // Saturating: user input must never reach unchecked arithmetic — a
-        // huge `page` would wrap the offset in release or panic in debug.
-        .offset(
-            page.zip(limit)
-                .map(|(page, limit)| page.saturating_mul(limit)),
-        )
+        .offset(crate::utils::pagination::page_offset(page, limit))
         .into_model::<SimplePackage>()
         .all(db)
         .await?;
@@ -877,9 +855,7 @@ enum RelationDirection {
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Get package details
-This requires 1 API call to the AUR (rate limited 4000 per day)
-https://wiki.archlinux.org/title/Aurweb_RPC_interface", body = ExtendedPackage),
+            (status = 200, description = "Get package details, read from the database alone", body = ExtendedPackage),
     ),
     params(
             ("pkgbase", description = "pkgbase of the package")
@@ -903,18 +879,14 @@ pub async fn get_package(
         list_package_relations(db, pkg.id, RelationDirection::Dependents),
         package_files(db, pkg.id),
     );
-    let latest_version = latest_version
-        .map_err(|e| err(Status::InternalServerError, e))?
-        // Same rule as the list query: an enqueued build's empty version is not
-        // a version.
-        .filter(|v| !v.is_empty());
+    let latest_version = latest_version.map_err(|e| err(Status::InternalServerError, e))?;
     let dependencies = dependencies.map_err(|e| err(Status::InternalServerError, e))?;
     let dependents = dependents.map_err(|e| err(Status::InternalServerError, e))?;
     let files = files.map_err(|e| err(Status::InternalServerError, e))?;
 
     let has_patch = pkg.patch.is_some();
 
-    let (package_source, upstream_version) = package_source_and_version(&pkg)?;
+    let package_source = package_source(&pkg)?;
 
     // Borrowed: the stored string is not used after this, only the parse.
     let split_packages: Option<Vec<String>> = pkg
@@ -938,9 +910,11 @@ pub async fn get_package(
         outofdate: pkg.out_of_date,
         latest_version,
         package_source,
-        selected_platforms: split_delimited(&pkg.platforms, ';'),
-        selected_build_flags: Some(split_delimited(&pkg.build_flags, ';')),
-        upstream_version,
+        selected_platforms: ListColumn::Package.split(&pkg.platforms),
+        selected_build_flags: Some(ListColumn::Package.split(&pkg.build_flags)),
+        // How current this is depends on the version-check interval; `None`
+        // means no check has run yet.
+        upstream_version: pkg.upstream_version,
         split_packages,
         files,
         dependencies,
@@ -951,33 +925,21 @@ pub async fn get_package(
     Ok(Json(ext_pkg))
 }
 
-/// The `PackageSource` and upstream version for a package row, resolved
-/// entirely from persisted fields — no AUR lookup happens on this path. The
-/// version-check scheduler mirrors the same assignment, and `package::add`
-/// fills the row in immediately, so the page cannot drift from either; the AUR
-/// call it used to make was ~128ms of a ~130ms response and one of the AUR's
-/// 4000 daily calls per page view.
-fn package_source_and_version(
-    pkg: &packages::Model,
-) -> Result<(PackageSource, Option<String>), ApiError> {
+/// The `PackageSource` for a package row, resolved entirely from persisted
+/// fields — no AUR lookup happens on this path. The version-check scheduler
+/// mirrors what it needs onto the row, and `package::add` fills it in
+/// immediately; the AUR call this used to make was ~128ms of a ~130ms response
+/// and one of the AUR's 4000 daily calls per page view.
+fn package_source(pkg: &packages::Model) -> Result<PackageSource, ApiError> {
     match &pkg.source_data {
-        SourceData::Aur { .. } => {
-            // The last check did not find it in the AUR. Its page still renders
-            // — the metadata comes from the checkout — but it says the package
-            // is gone from upstream.
-            let source = if pkg.aur_missing == Some(true) {
-                PackageSource::AurNotFound(AurNotFoundPackage {})
-            } else {
-                PackageSource::Aur(aur_source(pkg))
-            };
-            Ok((source, pkg.upstream_version.clone()))
+        // The last check did not find it in the AUR. Its page still renders --
+        // the metadata comes from the checkout -- but it says the package is
+        // gone from upstream.
+        SourceData::Aur { .. } if pkg.aur_missing == Some(true) => {
+            Ok(PackageSource::AurNotFound(AurNotFoundPackage {}))
         }
-        SourceData::Git { spec } => Ok((
-            PackageSource::Git(spec.clone()),
-            // How current this version is depends on the version-check
-            // interval; `None` means no check has run yet.
-            pkg.upstream_version.clone(),
-        )),
+        SourceData::Aur { .. } => Ok(PackageSource::Aur(aur_source(pkg))),
+        SourceData::Git { spec } => Ok(PackageSource::Git(spec.clone())),
         SourceData::Upload { .. } => Err(err(
             Status::NotImplemented,
             "Upload sources are not yet supported",
@@ -1052,7 +1014,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "visible-package".into(),
             }),
@@ -1072,7 +1033,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "hidden-dependency".into(),
             }),
@@ -1115,7 +1075,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1137,7 +1096,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1184,7 +1142,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "dependency".into(),
             }),
@@ -1206,7 +1163,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1261,8 +1217,8 @@ mod file_tests {
         for id in ids {
             db.execute_unprepared(&format!(
                 "INSERT INTO packages \
-                 (id, name, status, out_of_date, build_flags, platforms, source_type, source_data, directly_requested) \
-                 VALUES ({id}, 'p{id}', 0, 0, '', 'x86_64', 'aur', '{{\"type\":\"aur\",\"name\":\"p{id}\"}}', 1)"
+                 (id, name, status, out_of_date, build_flags, platforms, source_data, directly_requested) \
+                 VALUES ({id}, 'p{id}', 0, 0, '', 'x86_64', '{{\"type\":\"aur\",\"name\":\"p{id}\"}}', 1)"
             ))
             .await
             .unwrap();
@@ -1346,7 +1302,6 @@ mod file_tests {
                 latest_build: Set(None),
                 build_flags: Set(String::new()),
                 platforms: Set("x86_64".to_string()),
-                source_type: Set(packages::SourceType::Aur),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 directly_requested: Set(true),
                 split_packages: Set(None),
@@ -1404,12 +1359,10 @@ mod file_tests {
 /// This is what a replacement is measured against. A dependent's edge records
 /// the constraint but not which of these names it declared, so covering all of
 /// them is the only way to know a replacement covers a given dependent.
-/// The names a package answers to: its own name, its splits, and its provides
-/// (a versioned `provides` contributes the name, not the whole entry).
 ///
 /// Fields, not the row: the options dialog matches over a narrowed fetch
-/// that never loads the rest of the columns (source blobs, patches), and
-/// threading a whole `Model` through for three fields would keep it that way.
+/// ([`NamesRow`]) that never loads the rest of the columns -- source blobs,
+/// patches.
 fn provided_names(name: &str, split_packages: Option<&str>, provides: Option<&str>) -> Vec<String> {
     let mut names = vec![name.to_string()];
     names.extend(json_string_list(split_packages));
@@ -1424,6 +1377,26 @@ fn provided_names(name: &str, split_packages: Option<&str>, provides: Option<&st
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// The columns [`provided_names`] reads, for matching over every package
+/// without loading whole rows.
+#[derive(FromQueryResult)]
+struct NamesRow {
+    id: i32,
+    name: String,
+    split_packages: Option<String>,
+    provides: Option<String>,
+}
+
+impl NamesRow {
+    fn names(&self) -> Vec<String> {
+        provided_names(
+            &self.name,
+            self.split_packages.as_deref(),
+            self.provides.as_deref(),
+        )
+    }
 }
 
 fn json_string_list(raw: Option<&str>) -> Vec<String> {
@@ -1565,40 +1538,41 @@ pub async fn package_dependency_options(
     // name, and the two JSON name lists, and the rest (source blobs,
     // patches) would only ride along.
     let mut candidates = Vec::new();
-    let tracked: Vec<(i32, String, Option<String>, Option<String>)> = Packages::find()
+    let tracked: Vec<NamesRow> = Packages::find()
         .select_only()
         .column(packages::Column::Id)
         .column(packages::Column::Name)
         .column(packages::Column::SplitPackages)
         .column(packages::Column::Provides)
-        .into_tuple()
+        .into_model()
         .all(&services.db)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    let mut tracked_matches: Vec<&(i32, String, Option<String>, Option<String>)> = tracked
+    let mut tracked_matches: Vec<&NamesRow> = tracked
         .iter()
-        .filter(|package| package.0 != current.id && package.0 != dependent.id)
+        .filter(|package| package.id != current.id && package.id != dependent.id)
         .filter(|package| {
-            provided_names(&package.1, package.2.as_deref(), package.3.as_deref())
+            package
+                .names()
                 .iter()
                 .any(|name| declared_names.contains(name))
         })
         .collect();
-    tracked_matches.sort_by(|a, b| {
-        let carries = |package: &(i32, String, Option<String>, Option<String>)| {
-            !declared_names.contains(&package.1)
-        };
-        carries(a).cmp(&carries(b)).then_with(|| a.1.cmp(&b.1))
+    tracked_matches.sort_by_key(|package| {
+        (
+            !declared_names.contains(&package.name),
+            package.name.as_str(),
+        )
     });
     for package in tracked_matches {
         // One indexed point lookup per match, not a batched scan: matches
         // are a handful of rows, and "latest" means newest end time, which
         // no GROUP BY over ids reproduces.
-        let version = latest_successful_version_any_platform(&services.db, package.0)
+        let version = latest_successful_version_any_platform(&services.db, package.id)
             .await
             .map_err(|e| err(Status::InternalServerError, e))?;
         candidates.push(DependencyCandidate {
-            pkgbase: package.1.clone(),
+            pkgbase: package.name.clone(),
             source: CandidateSource::Tracked,
             verdict: candidate_verdict(version.as_deref(), &edge.version_constraint),
             version,
@@ -1607,8 +1581,10 @@ pub async fn package_dependency_options(
 
     // Then the AUR, in the order resolution itself would rank them, minus
     // everything already offered above.
-    let tracked_names: std::collections::HashSet<&str> =
-        tracked.iter().map(|package| package.1.as_str()).collect();
+    let tracked_names: std::collections::HashSet<&str> = tracked
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut aur_error = None;
     for name in &declared_names {
@@ -1776,9 +1752,15 @@ pub async fn package_dependency_replace(
     // up. This is what makes emptying a package's dependents remove it: patch
     // the last edge away and the package goes with it, without a second
     // endpoint that knows how to remove packages.
-    live_check(&services.db, &services.store, &services.repo, current.id)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+    live_check(
+        &services.db,
+        &services.store,
+        &services.repo,
+        &[current.id],
+        &[],
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))?;
 
     Ok(())
 }
@@ -1895,7 +1877,6 @@ mod dependency_tests {
             latest_build: Set(None),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur { name: name.into() }),
             directly_requested: Set(directly_requested),
             split_packages: Set(None),
@@ -2002,7 +1983,9 @@ mod dependency_tests {
         let checkouts = tempfile::tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
         let repo = Repository::new(checkouts.path().join("repo"));
-        live_check(&db, &store, &repo, old.id).await.unwrap();
+        live_check(&db, &store, &repo, &[old.id], &[])
+            .await
+            .unwrap();
 
         assert!(
             Packages::find_by_id(old.id)
@@ -2073,7 +2056,9 @@ mod dependency_tests {
         let checkouts = tempfile::tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
         let repo = Repository::new(checkouts.path().join("repo"));
-        live_check(&db, &store, &repo, old.id).await.unwrap();
+        live_check(&db, &store, &repo, &[old.id], &[])
+            .await
+            .unwrap();
 
         assert!(
             Packages::find_by_id(old.id)

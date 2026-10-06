@@ -20,7 +20,6 @@
 //! `severity` is the number its variants are ordered by, so "this severity and
 //! worse" is `severity >= n`.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -31,7 +30,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let statements: Vec<&str> = match database_type() {
+        let statements: Vec<&str> = match manager.get_database_backend() {
             DbBackend::Sqlite => vec![
                 "create table log (
                      id integer not null primary key autoincrement,

@@ -76,7 +76,7 @@ pub fn build_build_command(
 }
 
 /// Prefix the build with the job's rendered `makepkg.conf` / `pacman.conf`.
-#[must_use]
+///
 /// The written config `source`s `/etc/makepkg.conf` before applying the
 /// server's settings, and is passed to `makepkg --config`.
 ///
@@ -94,6 +94,7 @@ pub fn build_build_command(
 /// the build user passwordless sudo for exactly four commands — `pacman`,
 /// `pacman-key`, `chmod`, and `tee /etc/pacman.conf` — so `sudo tee` on any
 /// other path fails with "a password is required" and takes the build with it.
+#[must_use]
 pub fn wrap_with_config(
     makepkg_config: &str,
     makepkg_config_path: &str,

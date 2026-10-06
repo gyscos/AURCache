@@ -1,4 +1,4 @@
 pub mod general;
 mod parser;
 
-pub use parser::ByteSize;
+pub use parser::{ByteSize, Seconds};

@@ -1,5 +1,5 @@
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::SourceData;
@@ -994,7 +994,6 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "local-provider".into(),
         }),
@@ -1088,7 +1087,6 @@ async fn scenario_l_settled_states_still_link_as_dependencies() {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "local-dep".into(),
             }),
@@ -1373,7 +1371,6 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1395,7 +1392,6 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur { name: "mid".into() }),
         directly_requested: Set(false),
         split_packages: Set(None),
@@ -1415,7 +1411,6 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),
@@ -1496,7 +1491,6 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1518,7 +1512,6 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur { name: "mid".into() }),
         directly_requested: Set(false),
         split_packages: Set(None),
@@ -1538,7 +1531,6 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),
@@ -1638,7 +1630,6 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64;aarch64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1660,7 +1651,6 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64;aarch64".to_string()),
-        source_type: Set(packages::SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),

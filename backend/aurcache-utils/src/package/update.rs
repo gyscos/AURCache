@@ -2,75 +2,53 @@ use crate::package::add::{
     ensure_aur_package_exists_recursive, provides_json, split_packages_json,
 };
 use crate::services::Services;
-use crate::vcs_check::{
-    SourcesMoved, record_queued_vcs_sources, resolve_vcs_commits, vcs_sources_moved,
-};
-use alpm_types::Version;
+use crate::vcs_check::{SourcesMoved, resolve_vcs_commits, vcs_sources_moved};
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::events::{Event, QueueCause, RefreshTarget};
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::build_state::BuildTrigger;
-use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
-use aurcache_db::prelude::{Builds, Dependencies, PackageVcsSources, Packages};
-use aurcache_db::{builds, dependencies, package_vcs_sources, packages};
+use aurcache_db::prelude::{Dependencies, PackageVcsSources, Packages};
+use aurcache_db::{dependencies, package_vcs_sources, packages};
 use aurcache_deps::{DependencyResolution, PkgDeps};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use tokio::sync::broadcast::Sender;
 use tracing::{info, warn};
 
-/// Remove packages that have no remaining dependents and are not directly requested.
+/// The packages `pkg_id` depends on directly, as its edges stand now.
 ///
-/// Deleting through [`package_delete`] rather than row by row here. The
-/// hand-written version this replaced took the builds, the dependency links and
-/// the VCS sources and left the `files` rows behind, pointing at a package id
-/// that no longer existed. Nothing notices until the same package is added
-/// again and rebuilt: ingest finds a `files` row for the artifact owned by
-/// somebody else, cannot find a dependency edge to justify a transfer -- there
-/// is no owner left to have one -- and refuses to publish with "already
-/// produced by another package". That is terminal, and it repeats on every
-/// retry until the build's attempt budget is spent, so the package can never be
-/// built again. `files.package_id` has a foreign key now, which would have made
-/// this loud rather than silent, but the rows still have to go so their
-/// artifacts leave the repository with them.
-async fn remove_orphaned_packages(services: &Services, exclude_id: i32) -> anyhow::Result<()> {
-    let db = &services.db;
-    // Only ids: the rows are never read, only their keys collected.
-    let candidate_ids: Vec<i32> = Packages::find()
-        .select_only()
-        .column(packages::Column::Id)
-        .filter(packages::Column::DirectlyRequested.eq(false))
-        .filter(packages::Column::Id.ne(exclude_id))
-        .into_tuple::<i32>()
-        .all(db)
-        .await?;
-    if candidate_ids.is_empty() {
-        return Ok(());
-    }
-    // The dependees that still have edges, in one grouped query — not one
-    // `COUNT` per candidate.
-    let referenced: HashSet<i32> = Dependencies::find()
+/// Read before its graph is re-synced: those are what a re-sync can orphan,
+/// and [`live_check`](crate::package::live_check::live_check) collects what
+/// they reach once the new edges are in.
+async fn direct_dependees(db: &DatabaseConnection, pkg_id: i32) -> anyhow::Result<Vec<i32>> {
+    Ok(Dependencies::find()
         .select_only()
         .column(dependencies::Column::DependeeId)
-        .filter(dependencies::Column::DependeeId.is_in(candidate_ids.iter().copied()))
-        .group_by(dependencies::Column::DependeeId)
+        .filter(dependencies::Column::DependentId.eq(pkg_id))
         .into_tuple::<i32>()
         .all(db)
-        .await?
-        .into_iter()
-        .collect();
-    let orphaned: Vec<i32> = candidate_ids
-        .into_iter()
-        .filter(|id| !referenced.contains(id))
-        .collect();
-    crate::package::delete::package_delete(db, &services.store, &services.repo, &orphaned).await
+        .await?)
+}
+
+/// Collect what a re-sync of `pkg_id` left unneeded: what its former direct
+/// dependencies reach that no requested package needs, keeping `pkg_id`
+/// itself, which is mid-update.
+async fn collect_dropped(services: &Services, pkg_id: i32, former: &[i32]) -> anyhow::Result<()> {
+    crate::package::live_check::live_check(
+        &services.db,
+        &services.store,
+        &services.repo,
+        former,
+        &[pkg_id],
+    )
+    .await
 }
 
 /// Update every package currently marked as outdated.
@@ -166,29 +144,15 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
     Ok(ids_total)
 }
 
-/// Updates a single package for all required platforms.
+/// Queue a build of `pkg_model`'s current upstream version on every platform
+/// it is configured for, with any dependency rebuilds that needs.
 ///
-/// This function fetches the latest package metadata and updates it if necessary.
+/// Refused when the version is already built, unless `force`. `trigger` is
+/// recorded on each build row -- and on the rows of any dependency rebuilt
+/// along the way, which is part of the same request.
 ///
-/// # Arguments
-///
-/// * `store` - The process-wide [`SnapshotStore`]. It must be the shared instance
-///   (see `main.rs`), not a fresh one: a new store starts with an empty cache and
-///   re-resolves every source from scratch, and its cache never sees the
-///   refreshes the version-check scheduler performs.
-/// * `db` - A reference to the database connection.
-/// * `pkg_model` - The package model to update.
-/// * `force` - A boolean flag to force an update even if the package version is unchanged.
-/// * `trigger` - Why the builds are being queued, recorded on each build row --
-///   and on the rows of any dependency rebuilt along the way, which is part of
-///   the same request.
-/// * `tx` - A broadcast channel sender for triggering build actions.
-///
-/// # Returns
-///
-/// * `Ok(Vec<PlatformUpdateResult>)` - One entry per configured platform, describing the build
-///   that was enqueued/promoted or left waiting on dependencies.
-/// * `Err(anyhow::Error)` - If any error occurs during the update trigger.
+/// Returns one entry per configured platform: the build that was queued or
+/// promoted, or left waiting on dependencies.
 pub async fn package_update(
     services: &Services,
     pkg_model: packages::Model,
@@ -211,6 +175,20 @@ pub async fn package_resync_dependencies(
     services: &Services,
     pkg_model: &packages::Model,
 ) -> anyhow::Result<()> {
+    let former = direct_dependees(&services.db, pkg_model.id).await?;
+    resync_graph(services, pkg_model).await?;
+
+    // The dependency change may have made some previously-required
+    // dependency-only packages no longer needed.
+    collect_dropped(services, pkg_model.id, &former).await
+}
+
+/// Recompute and persist a package's dependency edges from its current source,
+/// adding missing dependencies but removing nothing.
+pub(crate) async fn resync_graph(
+    services: &Services,
+    pkg_model: &packages::Model,
+) -> anyhow::Result<()> {
     let sourceinfo = services
         .store
         .sourceinfo(&pkg_model.source_data, pkg_model.patch.as_deref())
@@ -222,11 +200,6 @@ pub async fn package_resync_dependencies(
     );
 
     sync_dependency_graph(services, pkg_model, &deps).await?;
-
-    // The dependency change may have made some previously-required
-    // dependency-only packages no longer needed.
-    remove_orphaned_packages(services, pkg_model.id).await?;
-
     Ok(())
 }
 
@@ -271,10 +244,11 @@ async fn package_update_inner(
         &crate::pkg::architectures_for_platforms(&pkg_model.platforms),
     );
 
+    let former = direct_dependees(&services.db, pkg_model.id).await?;
     let graph = sync_dependency_graph(services, &pkg_model, &deps).await?;
 
     // With the update, it's possible some dependencies are no longer needed.
-    remove_orphaned_packages(services, pkg_model.id).await?;
+    collect_dropped(services, pkg_model.id, &former).await?;
 
     // Only a *successful* build makes a version "already built". This used to
     // ask for the latest build of any outcome, which meant a failed attempt at
@@ -331,15 +305,22 @@ async fn package_update_inner(
 
     // What these builds are being made from, recorded against each of them, so
     // the next version check compares upstream with what was built rather than
-    // with whatever it last happened to look at. Resolving costs one
+    // with whatever it last happened to look at. Queue time rather than build
+    // time: recording the earlier commit errs toward one redundant rebuild
+    // rather than a missed one, and a worker that reports what it actually
+    // used overwrites this. Resolving costs one
     // `ls-remote` per VCS source and nothing at all for a package that has
     // none. Best-effort: an unrecorded build reads as unknown later, which
     // costs a redundant rebuild, where failing here would cost the build.
     let queued_commits = resolve_vcs_commits(&sourceinfo).await;
     if !queued_commits.is_empty() {
         for result in &platform_results {
-            if let Err(e) =
-                record_queued_vcs_sources(&services.db, result.build_id, &queued_commits).await
+            if let Err(e) = aurcache_db::helpers::builds::record_build_vcs_sources(
+                &services.db,
+                result.build_id,
+                &queued_commits,
+            )
+            .await
             {
                 services.activity.emit(Event::BuildRecordFailed {
                     build: aurcache_common::api::log::BuildRef {
@@ -467,10 +448,10 @@ async fn resolve_dependency_edges(
     // As on the add path: what the package answers to itself is never an edge.
     let self_provided =
         crate::pkg::self_provided_names(&pkg_model.name, &deps.pkgnames, &deps.provides);
-    let pairs: Vec<(String, String)> = declared
-        .to_pairs()
+    let wanted: Vec<crate::pkg::Declared> = declared
+        .declared()
         .into_iter()
-        .filter(|(name, _)| !self_provided.contains(name))
+        .filter(|dep| !self_provided.contains(&dep.name))
         .collect();
     // One package, one resolution, so the snapshot lives no longer than this
     // call.
@@ -479,7 +460,10 @@ async fn resolve_dependency_edges(
     let resolved_deps = aurcache_db::helpers::dependency_resolution::resolve_dependencies(
         &services.client,
         &tracked,
-        &crate::pkg::as_dependencies(&pairs),
+        &wanted
+            .iter()
+            .map(crate::pkg::Declared::as_dependency)
+            .collect::<Vec<_>>(),
         &[],
         &current_dependee_names(&services.db, pkg_model.id).await?,
     )
@@ -495,7 +479,7 @@ async fn resolve_dependency_edges(
     }
 
     let mut by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> = HashMap::new();
-    for (dep_name, _) in &pairs {
+    for crate::pkg::Declared { name: dep_name, .. } in &wanted {
         let Some(resolution) = resolved_deps.get(dep_name) else {
             continue;
         };
@@ -664,30 +648,6 @@ async fn sync_dependency_rows(
     Ok(())
 }
 
-/// Check whether a successful build of `dependee` satisfies the given version
-/// bounds: every one of them must hold.
-async fn dependency_satisfies_constraint(
-    db: &DatabaseConnection,
-    dependee_id: i32,
-    platform: &Platform,
-    constraint: &[crate::pkg::Constraint],
-) -> anyhow::Result<bool> {
-    let Some(version) =
-        aurcache_db::helpers::builds::latest_successful_version(db, dependee_id, platform.as_str())
-            .await?
-    else {
-        return Ok(false);
-    };
-
-    if constraint.is_empty() {
-        return Ok(true);
-    };
-    let Ok(version) = Version::from_str(&version) else {
-        return Ok(false);
-    };
-    Ok(constraint.iter().all(|bound| bound.is_satisfied(&version)))
-}
-
 /// Check whether every dependency in the graph is satisfied, or already has a
 /// pending build, on a single platform.
 ///
@@ -704,29 +664,26 @@ async fn dependencies_ready_for_platform(
     needed_by: &str,
 ) -> anyhow::Result<bool> {
     for dep_info in graph.deps.values() {
-        if dependency_satisfies_constraint(
+        // The same check the builder makes when this dependency's build
+        // lands, against the constraint as the edge stores it.
+        if aurcache_db::helpers::builds::dependency_satisfied(
             &services.db,
             dep_info.package.id,
-            platform,
-            &dep_info.constraint,
+            platform.as_str(),
+            &crate::pkg::join_constraints(&dep_info.constraint),
         )
         .await?
         {
             continue;
         }
 
-        let has_pending_build = Builds::find()
-            .filter(builds::Column::PkgId.eq(dep_info.package.id))
-            .filter(builds::Column::Platform.eq(platform.as_str()))
-            .filter(builds::Column::Status.is_in([
-                Some(BuildStates::ENQUEUED_BUILD),
-                Some(BuildStates::ACTIVE_BUILD),
-                Some(BuildStates::WAITING_FOR_DEPS),
-                Some(BuildStates::PUBLISHING),
-            ]))
-            .count(&services.db)
-            .await?
-            > 0;
+        let has_pending_build = aurcache_db::helpers::builds::pending_build(
+            &services.db,
+            dep_info.package.id,
+            platform.as_str(),
+        )
+        .await?
+        .is_some();
 
         // A dependency whose last build failed is not auto-retried.
         if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
@@ -857,7 +814,7 @@ async fn enqueue_platform_builds(
                 request.version,
                 start_time,
                 BuildStates::WAITING_FOR_DEPS,
-                request.trigger.as_i32(),
+                request.trigger,
             )
             .await?;
             txn.commit().await?;
@@ -905,7 +862,7 @@ pub async fn update_platform(
         &new_version,
         start_time,
         BuildStates::ENQUEUED_BUILD,
-        trigger.as_i32(),
+        trigger,
     )
     .await?;
     txn.commit().await?;
@@ -932,7 +889,7 @@ mod tests {
     }
     use crate::services::Services;
     use crate::snapshot::SnapshotStore;
-    use aurcache_common::builder::BuildStates;
+    use aurcache_common::build_state::BuildStates;
     use aurcache_db::action::Action;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
@@ -1233,7 +1190,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1255,7 +1211,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1424,7 +1379,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1446,7 +1400,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1468,7 +1421,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "grandchild".into(),
             }),
@@ -1655,7 +1607,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1677,7 +1628,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1699,7 +1649,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "grandchild".into(),
             }),
@@ -1862,7 +1811,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Git),
             source_data: Set(packages::SourceData::Git {
                 spec: packages::GitSourceSpec {
                     url: dir.path().to_string_lossy().to_string(),
@@ -1888,7 +1836,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "old-dep".into(),
             }),
@@ -1910,7 +1857,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "new-dep".into(),
             }),
@@ -2024,7 +1970,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Git),
             source_data: Set(packages::SourceData::Git {
                 spec: packages::GitSourceSpec {
                     url: repo_path.to_string_lossy().to_string(),
@@ -2051,7 +1996,6 @@ mod tests {
                 latest_build: Set(None),
                 build_flags: Set(String::new()),
                 platforms: Set("x86_64".to_string()),
-                source_type: Set(packages::SourceType::Aur),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 // Requested, so the loser is not swept as an orphan and the
                 // assertion is about the edge and nothing else.
@@ -2205,7 +2149,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "mypkg".into(),
             }),
@@ -2310,7 +2253,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "mypkg".into(),
             }),
@@ -2402,7 +2344,6 @@ mod tests {
                 latest_build: Set(None),
                 build_flags: Set(String::new()),
                 platforms: Set("x86_64".to_string()),
-                source_type: Set(packages::SourceType::Aur),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 directly_requested: Set(true),
                 split_packages: Set(None),
@@ -2507,7 +2448,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -2530,7 +2470,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm;--noprogressbar".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),

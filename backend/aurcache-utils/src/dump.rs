@@ -17,24 +17,12 @@ use aurcache_common::api::dump::{
 use aurcache_common::api::worker::ApprovalStatus;
 use aurcache_db::api_tokens;
 use aurcache_db::helpers::time::now_secs;
+use aurcache_db::lists::ListColumn;
 use aurcache_db::prelude::{ApiTokens, Packages, Settings, WorkerSettings, Workers};
 use aurcache_db::{packages, settings, workers};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
-
-/// Split one of the database's semicolon-delimited columns.
-///
-/// Empty entries are dropped rather than preserved: `""` and `"a;;b"` both mean
-/// the same set, and a dump should not carry the difference into a restore.
-fn split_list(value: &str) -> Vec<String> {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_string)
-        .collect()
-}
 
 /// Everything a dump carries, before it is packed into an archive.
 ///
@@ -83,8 +71,8 @@ pub async fn build_dump(
             row.name.clone(),
             DumpPackage {
                 source_data: row.source_data,
-                platforms: split_list(&row.platforms),
-                build_flags: split_list(&row.build_flags),
+                platforms: ListColumn::Package.split(&row.platforms),
+                build_flags: ListColumn::Package.split(&row.build_flags),
                 directly_requested: row.directly_requested,
                 has_patch: patches.contains_key(&row.name),
             },
@@ -127,10 +115,10 @@ async fn build_secrets(
 ) -> anyhow::Result<DumpSecrets> {
     // Async reads: this runs on the API executor, and blocking it on the
     // filesystem stalls every request sharing the thread.
-    let ca_cert_pem = tokio::fs::read_to_string(ca_dir.join(CA_CERT_FILE))
+    let ca_cert_pem = tokio::fs::read_to_string(aurcache_ca::cert_path(ca_dir))
         .await
         .with_context(|| format!("reading the CA certificate from {}", ca_dir.display()))?;
-    let ca_key_pem = tokio::fs::read_to_string(ca_dir.join(CA_KEY_FILE))
+    let ca_key_pem = tokio::fs::read_to_string(aurcache_ca::key_path(ca_dir))
         .await
         .with_context(|| format!("reading the CA key from {}", ca_dir.display()))?;
 
@@ -220,9 +208,9 @@ async fn build_workers(
             name: row.name,
             cert_fingerprint: row.cert_fingerprint,
             status: row.status.to_string(),
-            native_arches: split_list(&row.native_arches),
-            emulated_arches: split_list(&row.emulated_arches),
-            package_affinity: split_list(&row.package_affinity),
+            native_arches: ListColumn::Worker.split(&row.native_arches),
+            emulated_arches: ListColumn::Worker.split(&row.emulated_arches),
+            package_affinity: ListColumn::Worker.split(&row.package_affinity),
             priority: row.priority,
             concurrency: row.concurrency,
             // Only alongside the CA that signed them. On their own they would

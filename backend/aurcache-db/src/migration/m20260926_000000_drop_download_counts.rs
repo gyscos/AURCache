@@ -5,7 +5,6 @@
 //! the counts themselves are not recoverable, which is the point of dropping
 //! the feature.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -24,7 +23,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // The table as the migration that created it made it.
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "CREATE TABLE IF NOT EXISTS download_counts (\
                    file_name TEXT NOT NULL PRIMARY KEY, \

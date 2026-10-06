@@ -4,21 +4,27 @@ use aurcache_activitylog::events::Event;
 use aurcache_utils::job_config::{
     mirrorlist_dir, mirrorlist_path, native_arch, shared_mirrorlist_path,
 };
-use chrono::Local;
-use cron::Schedule;
+use aurcache_utils::scheduled::{Job, schedule};
 use pacman_mirrors::benchmark::{Bench, gen_mirrorlist};
 use pacman_mirrors::platforms::Platform;
 use std::env;
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::fs;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle<()>> {
-    let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * 1".to_string());
-    // This parses the string following this spec: https://www.quartz-scheduler.org/documentation/quartz-2.3.0/tutorials/crontrigger.html
-    let schedule = Schedule::from_str(cron_str.as_str())?;
+    // Sunday night, at a minute of its own: mirrors see every instance
+    // ranking them, and `H` keeps them from all doing it at 02:00 sharp.
+    let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "H 2 * * sun".to_string());
+    let schedule = schedule(Job::MirrorRanking, &cron_str).inspect_err(|e| {
+        // In the activity log as well as the error: a schedule left in the
+        // old syntax is otherwise only a startup log line, and ranking stops.
+        activity.emit(Event::ScheduleInvalid {
+            job: "mirror_ranking".to_string(),
+            error: e.to_string(),
+        });
+    })?;
 
     Ok(tokio::spawn(async move {
         // The scheduled job normally only runs on its cron cadence (e.g.
@@ -37,13 +43,10 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
             }
         }
 
-        let mut upcoming = schedule.upcoming(Local);
         let mut reported = false;
         loop {
-            // Get the next occurrence from now, or if the schedule has no
-            // future occurrence (unlikely with cron), wait a default duration
-            // before retrying.
-            if sleep_until_next_fire(&mut upcoming, "mirror ranking").await == Wake::Fired {
+            // A schedule with no next run (`0 0 31 2 *`) waits and says so.
+            if sleep_until_next_fire(&schedule, "mirror ranking").await == Wake::Fired {
                 match update_mirrorlist().await {
                     Ok(()) => {
                         info!("Mirror ranking finished");
@@ -100,7 +103,7 @@ async fn update_mirrorlist() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    info!("Executing mirror ranking job at: {}", Local::now());
+    info!("Executing mirror ranking job");
     let urls = pacman_mirrors::get_status(Platform::X86_64).await?.urls;
 
     info!("Ranking mirrorlist");

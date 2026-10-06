@@ -236,12 +236,10 @@ fn api_url_hint(api_url: &str) -> String {
     }
 }
 
-/// Walk the chain, stopping at the first fatal check.
-pub async fn run_doctor(
-    client: &AurCacheClient,
-    format: OutputFormat,
-    api_url: &str,
-) -> Result<()> {
+/// Walk the chain, stopping where a failure leaves nothing more to ask: an
+/// unreachable server, or a refused token. See the module docs.
+pub async fn run_doctor(client: &AurCacheClient, format: OutputFormat) -> Result<()> {
+    let api_url = client.base_url();
     let mut checks = Vec::new();
 
     match client.probe_api().await {

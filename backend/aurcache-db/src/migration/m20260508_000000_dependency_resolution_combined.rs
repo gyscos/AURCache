@@ -1,7 +1,6 @@
 use crate::builds;
 use crate::dependencies;
 use crate::files;
-use crate::helpers::dbtype::database_type;
 use crate::helpers::dependency_resolution::{TrackedPackages, resolve_dependencies};
 use crate::packages;
 use crate::settings;
@@ -28,14 +27,6 @@ const WAITING_FOR_DEPS_STATUS: i32 = 4;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
-
-fn schema_prefix() -> &'static str {
-    if database_type() == DbBackend::Postgres {
-        "public."
-    } else {
-        ""
-    }
-}
 
 fn normalize_build_flags(build_flags: &str) -> String {
     // Any paru-specific flag should go away.
@@ -94,10 +85,12 @@ async fn normalize_package_names_and_merge_duplicates(
     // Until now we could have separate rows for child packages of the same base package.
     // After the migration, rows refer to base packages only, so we should remove duplicates.
 
-    let aur_packages = packages::Entity::find()
-        .filter(packages::Column::SourceType.eq(packages::SourceType::Aur))
+    let aur_packages: Vec<packages::Model> = packages::Entity::find()
         .all(db)
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|pkg| matches!(pkg.source_data, packages::SourceData::Aur { .. }))
+        .collect();
 
     // First normalize all AUR package names to their canonical pkgbase.
     for pkg in &aur_packages {
@@ -180,7 +173,7 @@ async fn normalize_package_names_and_merge_duplicates(
 }
 async fn merge_files_package_links(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let db = manager.get_connection();
-    let schema = schema_prefix();
+    let schema = super::schema_prefix(manager.get_database_backend());
 
     add_column_if_missing(
         manager,
@@ -217,7 +210,7 @@ async fn merge_files_package_links(manager: &SchemaManager<'_>) -> Result<(), Db
             .await?;
     }
 
-    if database_type() == DbBackend::Postgres {
+    if manager.get_database_backend() == DbBackend::Postgres {
         db.execute_unprepared("ALTER TABLE public.files ALTER COLUMN package_id SET NOT NULL;")
             .await?;
     }
@@ -295,7 +288,7 @@ async fn mark_duplicate_pending_builds_failed(db: &impl ConnectionTrait) -> Resu
 
 async fn create_pending_build_unique_index(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let db = manager.get_connection();
-    let schema = schema_prefix();
+    let schema = super::schema_prefix(manager.get_database_backend());
     // SeaORM doesn't support partial indexes (indexes with a WHERE clause)
     let index_sql = format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_builds_pending_pkg_platform ON {schema}builds (pkg_id, platform) WHERE status IN ({ACTIVE_BUILD_STATUS}, {ENQUEUED_BUILD_STATUS}, {WAITING_FOR_DEPS_STATUS});"
@@ -577,10 +570,12 @@ pub async fn backfill_dependencies(
 ) -> Result<(), DbErr> {
     let mut visited = HashSet::new();
 
-    let all_pkgs = packages::Entity::find()
-        .filter(packages::Column::SourceType.eq(packages::SourceType::Aur))
+    let all_pkgs: Vec<packages::Model> = packages::Entity::find()
         .all(db)
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|pkg| matches!(pkg.source_data, packages::SourceData::Aur { .. }))
+        .collect();
 
     for pkg in &all_pkgs {
         let dep_count = dependencies::Entity::find()
@@ -632,7 +627,6 @@ async fn ensure_deps(
                 latest_build: Set(None),
                 build_flags: Set("--noconfirm;--noprogressbar;--nocolor".to_string()),
                 platforms: Set("x86_64".to_string()),
-                source_type: Set(packages::SourceType::Aur),
                 source_data: Set(packages::SourceData::Aur {
                     name: pkgbase.to_string(),
                 }),
@@ -680,11 +674,11 @@ async fn ensure_deps(
         .iter()
         .chain(deps.make_depends.iter())
         .map(|d| {
-            let (name, constraint) = parse_dep(d);
+            let dep = parse_dep(d);
             dep_constraints
-                .entry(name.to_string())
-                .or_insert_with(|| constraint.to_string());
-            name.to_string()
+                .entry(dep.name.to_string())
+                .or_insert_with(|| dep.constraint.to_string());
+            dep.name.to_string()
         })
         .collect();
 

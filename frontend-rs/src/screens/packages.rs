@@ -5,7 +5,6 @@
 //! here instead of a silent drift between two hand-maintained models.
 
 use crate::api::client;
-use crate::format::format_bytes;
 use crate::listing::{
     ListControls, ListHeader, Page, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
     filter_packages, paginate, sort_packages, use_url_search, use_url_view,
@@ -319,9 +318,7 @@ enum Rows {
 /// sends `None` for either, and the status column already says which of the two
 /// this row is.
 fn package_size(pkg: &SimplePackage) -> String {
-    pkg.total_size
-        .and_then(|size| u64::try_from(size).ok())
-        .map_or_else(|| "—".to_string(), format_bytes)
+    crate::format::format_size(pkg.total_size)
 }
 
 /// What a package's row offers to do about its current state.
@@ -422,7 +419,7 @@ fn RowAction(pkgbase: String, action: Option<Action>, on_changed: EventHandler<(
                             Ok(client) => client
                                 .update_package(
                                     &pkgbase,
-                                    &aurcache_client::UpdatePackageRequest { force: action.force() },
+                                    &aurcache_client::UpdatePackage { force: action.force() },
                                 )
                                 .await
                                 .map_err(|e| e.to_string()),

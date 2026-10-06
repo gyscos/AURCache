@@ -7,15 +7,13 @@
 
 pub mod api;
 pub mod build_state;
-/// Build-queue messages. Requires the `db` feature: they carry database models.
-#[cfg(feature = "db")]
-pub mod builder;
 /// Filesystem helpers. Requires the `fs` feature: `std::fs` is meaningless in
 /// a browser, so wasm consumers leave it off.
 #[cfg(feature = "fs")]
 pub mod fs;
 pub mod ports;
 pub mod repo;
+pub mod schedule;
 pub mod settings;
 pub mod source;
 /// Sizes and durations as configuration writes them (`40G`, `3h`).

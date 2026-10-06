@@ -10,17 +10,18 @@ use crate::repository::Repository;
 use crate::snapshot::SnapshotStore;
 
 /// What a package operation acts through: the database it writes, the build
-/// queue it enqueues onto, the source cache it resolves through, and the AUR
-/// client it resolves dependencies with.
+/// queue it enqueues onto, the source cache it resolves through, the AUR
+/// client it resolves dependencies with, the repository it publishes to and
+/// the log it records to.
 ///
-/// This is where those four live, rather than four values threaded separately
-/// from `main` and reassembled at every layer. A function that needs more than
-/// one of them takes this; a function that needs exactly one takes that one, so
-/// its signature still says what it touches.
+/// This is where those live, rather than values threaded separately from
+/// `main` and reassembled at every layer. A function that needs more than one
+/// of them takes this; a function that needs exactly one takes that one, so its
+/// signature still says what it touches.
 ///
-/// Cloning is four refcount bumps -- `DatabaseConnection` and `Sender` are
-/// handles and the other two are behind `Arc` -- so a spawned task takes a
-/// clone rather than borrowing, and no separate owned form is needed.
+/// Cloning is a few refcount bumps -- every member is a handle or behind an
+/// `Arc` -- so a spawned task takes a clone rather than borrowing, and no
+/// separate owned form is needed.
 #[derive(Clone)]
 pub struct Services {
     pub db: DatabaseConnection,

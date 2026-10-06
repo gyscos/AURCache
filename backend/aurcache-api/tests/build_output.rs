@@ -13,7 +13,7 @@ use aurcache_db::action::Action;
 use aurcache_db::builds;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
@@ -73,7 +73,6 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
 async fn seed(db: &DatabaseConnection) {
     let pkg_id = Packages::insert(packages::ActiveModel {
         name: Set("hello".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "hello".to_string(),
         }),

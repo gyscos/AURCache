@@ -339,23 +339,9 @@ fn explain_network_need(error: anyhow::Error, content: &str, network: bool) -> a
 /// real-world PKGBUILDs that makepkg accepts but `alpm-srcinfo` rejects.
 pub fn parse_pkgbuild(path: &Path, network: bool) -> anyhow::Result<SourceInfoV1> {
     let bridge = Bridge::from_env(network)?;
-    let error = match bridge.parse(path) {
-        Ok(info) => return Ok(info),
-        Err(error) => error,
-    };
-
-    let raw = std::fs::read_to_string(path)?;
-    let fixed = fix_source_urls(&raw);
-    if fixed == raw {
-        return Err(explain_network_need(error, &raw, network));
-    }
-
-    let dir = tempfile::tempdir()?;
-    let fixed_path = dir.path().join("PKGBUILD");
-    std::fs::write(&fixed_path, &fixed)?;
-    let result = bridge.parse(&fixed_path)?;
-    dir.close()?;
-    Ok(result)
+    bridge
+        .parse(path)
+        .or_else(|error| retry_fixed(&bridge, error, &std::fs::read_to_string(path)?, network))
 }
 
 /// Parse PKGBUILD content held in memory, applying the same workarounds as
@@ -365,21 +351,35 @@ pub fn parse_pkgbuild(path: &Path, network: bool) -> anyhow::Result<SourceInfoV1
 /// other part of this function touches disk.
 pub fn parse_pkgbuild_content(content: &str, network: bool) -> anyhow::Result<SourceInfoV1> {
     let bridge = Bridge::from_env(network)?;
+    parse_in_temp(&bridge, content).or_else(|error| retry_fixed(&bridge, error, content, network))
+}
+
+/// Parse `content` from a temporary `PKGBUILD`.
+fn parse_in_temp(bridge: &Bridge, content: &str) -> anyhow::Result<SourceInfoV1> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("PKGBUILD");
-
     std::fs::write(&path, content)?;
-    let result = bridge.parse(&path).or_else(|error| {
-        let fixed = fix_source_urls(content);
-        if fixed == content {
-            return Err(explain_network_need(error, content, network));
-        }
-        std::fs::write(&path, &fixed)?;
-        bridge.parse(&path)
-    });
-
+    let result = bridge.parse(&path);
     dir.close()?;
     result
+}
+
+/// Parse `content` again with its known-bad source URLs fixed, after the
+/// parse of it as written failed with `error`.
+///
+/// When there is nothing to fix, `error` stands -- explained, if the
+/// PKGBUILD wanted the network.
+fn retry_fixed(
+    bridge: &Bridge,
+    error: anyhow::Error,
+    content: &str,
+    network: bool,
+) -> anyhow::Result<SourceInfoV1> {
+    let fixed = fix_source_urls(content);
+    if fixed == content {
+        return Err(explain_network_need(error, content, network));
+    }
+    parse_in_temp(bridge, &fixed)
 }
 
 /// Render PKGBUILD content as `.SRCINFO`.

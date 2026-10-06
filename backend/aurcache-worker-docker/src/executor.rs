@@ -23,7 +23,6 @@ use bollard::query_parameters::{
     StartContainerOptions,
 };
 use futures::StreamExt;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -226,6 +225,12 @@ impl DockerExecutor {
             host_config: Some(HostConfig {
                 auto_remove: Some(false),
                 nano_cpus: cfg.nano_cpus(),
+                // Both, and equal: `MEMORY_LIMIT` is RAM and swap together,
+                // which Docker spells as a `MemorySwap` total equal to the
+                // `Memory` limit -- no swap beyond it. `MemorySwap` alone is
+                // refused ("you should always set the Memory limit when using
+                // Memoryswap limit"), which is how this limit went unapplied.
+                memory: cfg.memory_bytes(),
                 memory_swap: cfg.memory_bytes(),
                 binds: Some(binds),
                 network_mode: self.network.network_mode(),
@@ -413,32 +418,17 @@ impl DockerExecutor {
             return Ok(report::timeout_failure(started.elapsed().as_secs()));
         }
         if canceled {
-            return Ok(report::classify_exit_canceled());
+            return Ok(report::canceled());
         }
+        // The legacy container builder samples neither the build tree nor the
+        // sources it was made from, so nothing is measured on either path.
         Ok(match exit_code {
-            Some(0) => CompleteReport {
-                success: true,
-                exit_code: Some(0),
-                reason: None,
-                canceled: false,
-                // The legacy container builder samples neither the build tree
-                // nor the sources it was made from.
-                peak_memory_bytes: None,
-                disk_usage: None,
-                vcs_commits: BTreeMap::new(),
-                kept: None,
-            },
+            Some(0) => report::success(),
             Some(code) => CompleteReport {
                 success: false,
                 exit_code: i32::try_from(code).ok(),
                 reason: Some(report::exit_code_reason(code)),
-                canceled: false,
-                // The legacy container builder samples neither the build tree
-                // nor the sources it was made from.
-                peak_memory_bytes: None,
-                disk_usage: None,
-                vcs_commits: BTreeMap::new(),
-                kept: None,
+                ..CompleteReport::default()
             },
             None => report::setup_failure("build container exited without a status"),
         })
@@ -487,7 +477,8 @@ impl Executor for DockerExecutor {
     }
 }
 
-/// Best-effort `chmod 0777`; a failure surfaces as a build error, not silently.
+/// Best-effort `chmod 0777`. A failure is logged here; the build then fails on
+/// the write it could not make, with its own error.
 fn world_writable(path: &Path) {
     #[cfg(unix)]
     {

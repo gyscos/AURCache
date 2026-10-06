@@ -13,29 +13,29 @@
 DELETE FROM builds;
 DELETE FROM packages;
 
-INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, platforms, source_type, source_data, directly_requested) VALUES
-  ('hello',                  2, 0, '2.12.1-2',  '', 'x86_64', 'aur', '{"type":"aur","name":"hello"}',                  1),
-  ('neofetch',               1, 1, '7.1.0-2',   '--noconfirm;--nocolor', 'x86_64', 'aur', '{"type":"aur","name":"neofetch"}', 1),
-  ('yay',                    0, 0, '12.4.2-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"yay"}',                    1),
-  ('paru',                   2, 0, '2.0.4-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"paru"}',                   1),
-  ('visual-studio-code-bin', 3, 0, '1.92.0-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"visual-studio-code-bin"}', 1),
-  ('2048.c',                 4, 0, '1.0-3',     '', 'x86_64', 'aur', '{"type":"aur","name":"2048.c"}',                 1),
-  ('aewm++',                 1, 0, '1.1.6-4',   '', 'x86_64', 'aur', '{"type":"aur","name":"aewm++"}',                 1),
-  ('python-3.11',            1, 0, '3.11.9-1',  '', 'x86_64', 'aur', '{"type":"aur","name":"python-3.11"}',            1),
+INSERT INTO packages (name, status, out_of_date, upstream_version, build_flags, platforms, source_data, directly_requested) VALUES
+  ('hello',                  2, 0, '2.12.1-2',  '', 'x86_64', '{"type":"aur","name":"hello"}',                  1),
+  ('neofetch',               1, 1, '7.1.0-2',   '--noconfirm;--nocolor', 'x86_64', '{"type":"aur","name":"neofetch"}', 1),
+  ('yay',                    0, 0, '12.4.2-1',  '', 'x86_64', '{"type":"aur","name":"yay"}',                    1),
+  ('paru',                   2, 0, '2.0.4-1',   '', 'x86_64', '{"type":"aur","name":"paru"}',                   1),
+  ('visual-studio-code-bin', 3, 0, '1.92.0-1',  '', 'x86_64', '{"type":"aur","name":"visual-studio-code-bin"}', 1),
+  ('2048.c',                 4, 0, '1.0-3',     '', 'x86_64', '{"type":"aur","name":"2048.c"}',                 1),
+  ('aewm++',                 1, 0, '1.1.6-4',   '', 'x86_64', '{"type":"aur","name":"aewm++"}',                 1),
+  ('python-3.11',            1, 0, '3.11.9-1',  '', 'x86_64', '{"type":"aur","name":"python-3.11"}',            1),
   -- Deliberately gets no build below, and no upstream version either: this is
   -- a package that was just promoted from a dependency and has not been
   -- version-checked yet. Both "no version yet" placeholders end up on screen
   -- rather than only in a unit test.
-  ('never-built',            3, 0, NULL,        '', 'x86_64', 'aur', '{"type":"aur","name":"never-built"}',            1),
+  ('never-built',            3, 0, NULL,        '', 'x86_64', '{"type":"aur","name":"never-built"}',            1),
   -- Dependency-only packages: nobody asked for these, something else needs
   -- them. They are what the dashboard's second package count counts, and what
   -- the package list keeps behind its "Dependencies" checkbox.
-  ('libfoo',                 1, 0, '2.3.1-1',   '', 'x86_64', 'aur', '{"type":"aur","name":"libfoo"}',                 0),
-  ('libbar',                 1, 0, '0.9-2',     '', 'x86_64', 'aur', '{"type":"aur","name":"libbar"}',                 0),
+  ('libfoo',                 1, 0, '2.3.1-1',   '', 'x86_64', '{"type":"aur","name":"libfoo"}',                 0),
+  ('libbar',                 1, 0, '0.9-2',     '', 'x86_64', '{"type":"aur","name":"libbar"}',                 0),
   -- A git-sourced package. It has no AUR entry at all, so its description,
   -- licenses and maintainer can only come from its checkout — and its origin
   -- link has to point at the repository rather than at the AUR.
-  ('my-tool-git',            1, 0, 'r42.abc1234-1', '', 'x86_64', 'git',
+  ('my-tool-git',            1, 0, 'r42.abc1234-1', '', 'x86_64',
    '{"type":"git","url":"https://github.com/example/my-tool","ref":"main","subfolder":""}', 1);
 
 -- Timestamps are Unix *seconds*: `aurcache-api/src/stats.rs` compares

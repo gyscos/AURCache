@@ -57,7 +57,7 @@ fn note_poll_failure(
         update_job(jobs, id, |entry| {
             entry
                 .failed
-                .push((String::new(), format!("lost track of the {job}: {error}")));
+                .push(Failed::job(format!("lost track of the {job}: {error}")));
             entry.finished = true;
         });
         return Tracking::Lost;
@@ -106,6 +106,30 @@ pub struct Succeeded {
     pub pkgbase: Option<String>,
 }
 
+/// Something that did not land, and why.
+#[derive(Clone, PartialEq)]
+pub struct Failed {
+    /// The source it was; `None` when the job as a whole failed -- it could
+    /// not be sent, or was lost track of -- rather than one source in it.
+    pub label: Option<String>,
+    pub error: String,
+}
+
+impl Failed {
+    /// One source that failed.
+    fn of(label: String, error: String) -> Self {
+        Self {
+            label: Some(label),
+            error,
+        }
+    }
+
+    /// The job as a whole failed.
+    fn job(error: String) -> Self {
+        Self { label: None, error }
+    }
+}
+
 /// One add being watched.
 #[derive(Clone, PartialEq)]
 pub struct Job {
@@ -117,7 +141,7 @@ pub struct Job {
     /// "patch adopted" for a restore. Kept per item rather than as counters so
     /// the card can summarise in the kind's own vocabulary.
     pub succeeded: Vec<Succeeded>,
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<Failed>,
     /// The source being worked on, when the job reports one.
     pub current: Option<String>,
     pub finished: bool,
@@ -295,6 +319,20 @@ fn update_job(mut jobs: Signal<Vec<Job>>, id: u64, f: impl FnOnce(&mut Job)) {
     }
 }
 
+/// The API client, or `None` with the card marked failed for want of one.
+fn job_client(jobs: Signal<Vec<Job>>, id: u64) -> Option<aurcache_client::AurCacheClient> {
+    match crate::api::client() {
+        Ok(client) => Some(client),
+        Err(e) => {
+            update_job(jobs, id, |job| {
+                job.failed.push(Failed::job(e));
+                job.finished = true;
+            });
+            None
+        }
+    }
+}
+
 /// Whether a job is still being shown; a dismissed one should stop polling.
 fn still_watched(jobs: Signal<Vec<Job>>, id: u64) -> bool {
     jobs.read().iter().any(|job| job.id == id)
@@ -306,15 +344,8 @@ fn still_watched(jobs: Signal<Vec<Job>>, id: u64) -> bool {
 /// one call resolves the lot where adding them one at a time spends a request
 /// per package before fetching anything.
 async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
-    let client = match crate::api::client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_job(jobs, id, |job| {
-                job.failed.push((String::new(), e));
-                job.finished = true;
-            });
-            return;
-        }
+    let Some(client) = job_client(jobs, id) else {
+        return;
     };
 
     let labels: Vec<String> = request.sources.iter().map(source_label).collect();
@@ -330,100 +361,42 @@ async fn submit_bulk_add(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
         Ok(accepted) => accepted,
         Err(e) => {
             update_job(jobs, id, |job| {
-                job.failed.push((String::new(), e.to_string()));
+                job.failed.push(Failed::job(e.to_string()));
                 job.finished = true;
             });
             return;
         }
     };
 
-    let mut seen = 0_usize;
-    let mut failures = 0_u32;
-    loop {
-        // Dismissed: stop asking. The job carries on server-side.
-        if !still_watched(jobs, id) {
-            return;
-        }
-
-        let progress = match client.bulk_add_progress(accepted.job_id, seen).await {
-            Ok(progress) => {
-                failures = 0;
-                progress
-            }
-            // The job is still running and we have merely lost sight of it, so
-            // say that rather than reporting packages as failed, which they
-            // are not — but only after sustained failure, not one transient.
-            Err(e) => {
-                if note_poll_failure(jobs, id, "add", &mut failures, e.to_string())
-                    == Tracking::Lost
-                {
-                    return;
-                }
-                gloo_timers::future::sleep(POLL_INTERVAL * failures).await;
-                continue;
-            }
-        };
-
-        seen += progress.entries.len();
-        for entry in progress.entries {
-            let landed = !matches!(entry.outcome, BulkAddOutcome::Failed { .. });
-            let pkgbase = entry.pkgbase.clone();
-            update_job(jobs, id, |job| match entry.outcome {
-                BulkAddOutcome::Added => job.succeeded.push(Succeeded {
-                    label: entry.name,
-                    outcome: "added".to_string(),
-                    pkgbase,
-                }),
-                // Distinguished from added: nothing changed, which is a
-                // different answer to "did that work" than a fresh add.
-                BulkAddOutcome::Existed => job.succeeded.push(Succeeded {
-                    label: entry.name,
-                    outcome: "already here".to_string(),
-                    pkgbase,
-                }),
-                BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
-            });
-            if landed {
-                // A package the list, if someone has it open, does not know
-                // about yet. Let it re-fetch now rather than on its next tick.
-                crate::poll::packages_changed();
-            }
-        }
-
-        if progress.finished {
-            update_job(jobs, id, |job| {
-                job.current = None;
-                job.finished = true;
-            });
-            return;
-        }
-
-        // The job works through the list in order, so once N outcomes are in,
-        // the one in flight is the N-th.
-        let current = labels.get(seen).cloned();
-        update_job(jobs, id, |job| job.current = current);
-        gloo_timers::future::sleep(POLL_INTERVAL).await;
-    }
+    follow_bulk_add(jobs, id, &client, accepted.job_id, Some(&labels)).await;
 }
 
 /// Follow a job that is already running, from the beginning of its log.
 ///
-/// The same loop `submit_bulk_add` ends in, without the request that starts one. The
-/// entries are replayed from offset zero so a card opened halfway through shows
-/// what already happened -- which is the point of the log being a record rather
-/// than a stream.
+/// The entries are replayed from offset zero so a card opened halfway through
+/// shows what already happened -- which is the point of the log being a record
+/// rather than a stream.
 async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
-    let client = match crate::api::client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_job(jobs, id, |job| {
-                job.failed.push((String::new(), e));
-                job.finished = true;
-            });
-            return;
-        }
+    let Some(client) = job_client(jobs, id) else {
+        return;
     };
+    follow_bulk_add(jobs, id, &client, operation, None).await;
+}
 
+/// Follow bulk add `operation` from the start of its log until it finishes.
+///
+/// `labels` names the sources in the order this browser sent them, when it was
+/// this browser: the job works through them in order, so once N outcomes are
+/// in, the one in flight is the N-th. A job picked up from the operations list
+/// has none, and takes its total from the server instead -- a job can only be
+/// followed after it started, so the server is the authority on how big it is.
+async fn follow_bulk_add(
+    jobs: Signal<Vec<Job>>,
+    id: u64,
+    client: &aurcache_client::AurCacheClient,
+    operation: i32,
+    labels: Option<&[String]>,
+) {
     let mut seen = 0_usize;
     let mut failures = 0_u32;
     loop {
@@ -464,7 +437,7 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                     outcome: "already here".to_string(),
                     pkgbase,
                 }),
-                BulkAddOutcome::Failed { error } => job.failed.push((entry.name, error)),
+                BulkAddOutcome::Failed { error } => job.failed.push(Failed::of(entry.name, error)),
             });
             if landed {
                 // A package the list, if someone has it open, does not know
@@ -473,11 +446,10 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
             }
         }
 
-        // The total is whatever the job says, not what the list said when the
-        // card was opened: a job can only be followed after it started, so the
-        // server is the authority on how big it is.
-        let total = usize::try_from(progress.total).unwrap_or(0);
-        update_job(jobs, id, |job| job.total = total);
+        if labels.is_none() {
+            let total = usize::try_from(progress.total).unwrap_or(0);
+            update_job(jobs, id, |job| job.total = total);
+        }
 
         if progress.finished {
             update_job(jobs, id, |job| {
@@ -485,6 +457,10 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 job.finished = true;
             });
             return;
+        }
+        if let Some(labels) = labels {
+            let current = labels.get(seen).cloned();
+            update_job(jobs, id, |job| job.current = current);
         }
         gloo_timers::future::sleep(POLL_INTERVAL).await;
     }
@@ -497,15 +473,8 @@ async fn poll_bulk_add(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
 /// entry type: the two share a transport and nothing else, and one function
 /// covering both would be a match on the kind in every branch anyway.
 async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
-    let client = match crate::api::client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_job(jobs, id, |job| {
-                job.failed.push((String::new(), e));
-                job.finished = true;
-            });
-            return;
-        }
+    let Some(client) = job_client(jobs, id) else {
+        return;
     };
 
     let mut seen = 0_usize;
@@ -548,7 +517,9 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
                 RestoreOutcome::Skipped => job.succeeded.push(landed_as("skipped")),
                 RestoreOutcome::Overwritten => job.succeeded.push(landed_as("overwritten")),
                 RestoreOutcome::PatchAdopted => job.succeeded.push(landed_as("patch adopted")),
-                RestoreOutcome::Failed { error } => job.failed.push((entry.pkgbase, error)),
+                RestoreOutcome::Failed { error } => {
+                    job.failed.push(Failed::of(entry.pkgbase, error));
+                }
             });
             if landed {
                 crate::poll::packages_changed();
@@ -574,15 +545,8 @@ async fn poll_restore(jobs: Signal<Vec<Job>>, id: u64, operation: i32) {
 /// The bulk request has nowhere to put file edits, and there is only ever one
 /// source when there are any, so this is a single add by definition.
 async fn add_patched_sources(jobs: Signal<Vec<Job>>, id: u64, request: AddRequest) {
-    let client = match crate::api::client() {
-        Ok(client) => client,
-        Err(e) => {
-            update_job(jobs, id, |job| {
-                job.failed.push((String::new(), e));
-                job.finished = true;
-            });
-            return;
-        }
+    let Some(client) = job_client(jobs, id) else {
+        return;
     };
 
     for source in request.sources {
@@ -611,7 +575,7 @@ async fn add_patched_sources(jobs: Signal<Vec<Job>>, id: u64, request: AddReques
                 outcome: "added".to_string(),
                 pkgbase: None,
             }),
-            Err(e) => job.failed.push((label, e.to_string())),
+            Err(e) => job.failed.push(Failed::of(label, e.to_string())),
         });
         if landed {
             crate::poll::packages_changed();
@@ -759,12 +723,12 @@ fn JobCard(id: u64) -> Element {
                 // that did not add is something to act on.
                 if failed {
                     div { class: "text-xs space-y-1 max-h-32 overflow-y-auto",
-                        for (name , error) in &job.failed {
+                        for failure in &job.failed {
                             div { class: "text-error break-words",
-                                if name.is_empty() {
-                                    "{error}"
+                                if let Some(name) = &failure.label {
+                                    "{name}: {failure.error}"
                                 } else {
-                                    "{name}: {error}"
+                                    "{failure.error}"
                                 }
                             }
                         }
@@ -901,7 +865,7 @@ mod tests {
         j.succeeded.push(landed("one", "imported"));
         j.succeeded.push(landed("two", "imported"));
         j.succeeded.push(landed("three", "skipped"));
-        j.failed.push(("four".into(), "bad patch".into()));
+        j.failed.push(Failed::of("four".into(), "bad patch".into()));
 
         assert_eq!(j.summary(), "2 imported, 1 skipped, 1 failed");
     }
@@ -950,7 +914,7 @@ mod tests {
         with_failure.succeeded.push(landed_as("a", "added", "a"));
         with_failure
             .failed
-            .push(("b".to_string(), "no such package".to_string()));
+            .push(Failed::of("b".to_string(), "no such package".to_string()));
         with_failure.finished = true;
         assert_eq!(with_failure.landed_package(), None);
     }
@@ -974,7 +938,7 @@ mod tests {
         assert_eq!(j.resolved_count(), 0);
         j.succeeded.push(landed("a", "added"));
         j.failed
-            .push(("b".to_string(), "no such package".to_string()));
+            .push(Failed::of("b".to_string(), "no such package".to_string()));
         assert_eq!(j.resolved_count(), 2);
     }
 }

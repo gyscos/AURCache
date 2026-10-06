@@ -6,7 +6,7 @@ edition = "2024"
 workspace = true
 
 [dependencies]
-chrono = {workspace = true, features = ["serde"] }
+jiff = {workspace = true, features = ["serde"] }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 anyhow = {workspace = true}

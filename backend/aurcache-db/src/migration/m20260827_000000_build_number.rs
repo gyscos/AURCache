@@ -15,7 +15,6 @@
 //! than hoped for; it also turns a concurrent double-assignment into a failed
 //! insert the caller can retry, instead of two builds sharing a name.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -42,7 +41,7 @@ impl MigrationTrait for Migration {
         // `DEFAULT 0` only so the column can be NOT NULL on an existing table;
         // every row is given a real number below, and the unique index means a
         // second row left at the default cannot survive.
-        let add = match database_type() {
+        let add = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table builds add number INTEGER NOT NULL DEFAULT 0;",
             DbBackend::Postgres => {
                 "ALTER TABLE builds ADD COLUMN number INTEGER NOT NULL DEFAULT 0;"
@@ -63,7 +62,7 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_pkg_number;")
             .await?;
-        let drop = match database_type() {
+        let drop = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table builds drop column number;",
             DbBackend::Postgres => "ALTER TABLE builds DROP COLUMN number;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

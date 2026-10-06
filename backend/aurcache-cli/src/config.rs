@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{IsTerminal, stdin, stdout};
+use std::io::{IsTerminal, stderr, stdin};
 use std::path::PathBuf;
 
 const DEFAULT_URL: &str = "http://localhost:8080/api";
@@ -51,8 +51,27 @@ pub fn save_config(config: &ClientConfig) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     let body = serde_json::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(&path, format!("{body}\n"))
+    write_private(&path, format!("{body}\n").as_bytes())
         .with_context(|| format!("failed to write config file {}", path.display()))
+}
+
+/// Write `contents` readable by this user alone: the config holds the API
+/// token. Created that way rather than chmod'ed after, and an existing file's
+/// mode is tightened too -- one written before this was world-readable.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        open.mode(0o600);
+        let mut file = open.open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    open.open(path)?.write_all(contents)
 }
 
 pub fn resolve_runtime_config(
@@ -132,10 +151,11 @@ pub fn set_token(mut config: ClientConfig, token: Option<String>) -> Result<Clie
     Ok(config)
 }
 
-/// Whether both stdin and stdout are attached to a terminal, i.e. whether
-/// it's safe to prompt the user interactively.
+/// Whether there is a person to ask. The prompts are drawn on stderr, so
+/// output sent to a file or a pipe (`-o -`, `| jq`) can still be asked about;
+/// it is stdin and stderr that need a terminal.
 pub fn is_interactive() -> bool {
-    stdin().is_terminal() && stdout().is_terminal()
+    stdin().is_terminal() && stderr().is_terminal()
 }
 
 /// Prompts for a new API token and persists it to the config file.

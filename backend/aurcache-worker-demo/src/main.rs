@@ -27,21 +27,8 @@ async fn main() -> Result<()> {
     let core = Arc::new(CoreConfig::from_env());
     let identity = Identity::load_or_create(&core.data_dir)?;
 
-    // The server may not be reachable yet (e.g. still starting in the same
-    // compose stack) or may briefly go away. Retry enrollment with backoff
-    // instead of crashing, so the worker is resilient to server restarts.
-    let client = loop {
-        match enroll::ensure_enrolled(&core, &identity, DemoExecutor::KIND).await {
-            Ok(client) => break client,
-            Err(e) => {
-                tracing::warn!(
-                    "Enrollment not complete ({e:#}); retrying in {}s",
-                    core.poll_interval
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(core.poll_interval)).await;
-            }
-        }
-    };
+    // Waits out a server that is not up yet; see `enroll::enroll`.
+    let client = enroll::enroll(&core, &identity, DemoExecutor::KIND).await?;
 
     let executor = Arc::new(DemoExecutor::new());
     // What the runner registers again with when delivered values change what

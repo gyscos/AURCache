@@ -1,7 +1,7 @@
 //! What a removal collects, and what it leaves alone.
 
 use aurcache_db::migration::Migrator;
-use aurcache_db::packages::{self, SourceData, SourceType};
+use aurcache_db::packages::{self, SourceData};
 use aurcache_db::{dependencies, prelude::Dependencies};
 use aurcache_utils::package::delete::package_delete;
 use aurcache_utils::package::live_check::package_remove;
@@ -36,7 +36,6 @@ async fn package(db: &DatabaseConnection, name: &str, directly_requested: bool) 
         latest_build: Set(None),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur { name: name.into() }),
         directly_requested: Set(directly_requested),
         split_packages: Set(None),
@@ -231,4 +230,28 @@ async fn deleting_a_package_something_needs_is_refused() {
         .await
         .unwrap();
     assert!(remaining(&db).await.is_empty());
+}
+
+/// What an update re-synced away: its former dependencies are the starting
+/// points, and a cycle among them goes -- which the whole-table sweep this
+/// replaced could never collect, since every package in a cycle has a
+/// dependent. The package being updated is held, even when the cycle leads
+/// back to it.
+#[tokio::test]
+async fn an_update_collects_the_cycle_it_dropped_but_never_itself() {
+    let db = memory_db().await;
+    // `mid` is a dependency-only package being updated, its own dependent cut
+    // off; `a` and `b` need each other and `b` needs `mid` back.
+    let mid = package(&db, "mid", false).await;
+    let a = package(&db, "a", false).await;
+    let b = package(&db, "b", false).await;
+    needs(&db, a, b).await;
+    needs(&db, b, a).await;
+    needs(&db, b, mid).await;
+
+    aurcache_utils::package::live_check::live_check(&db, &store(), &repo(), &[a], &[mid])
+        .await
+        .unwrap();
+
+    assert_eq!(remaining(&db).await, ["mid"]);
 }

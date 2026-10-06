@@ -53,6 +53,14 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// A size the server may not know, as the API sends one: a dash for `None`,
+/// which is "nothing recorded" and never "zero bytes".
+pub fn format_size(bytes: Option<i64>) -> String {
+    bytes
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .map_or_else(|| "—".to_string(), format_bytes)
+}
+
 /// A span of seconds, for a duration that is already a number rather than two
 /// timestamps — an average, say.
 pub fn format_secs(secs: u32) -> String {

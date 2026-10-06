@@ -10,7 +10,6 @@
 //! row rather than a zero -- "never downloaded" and "downloaded zero times"
 //! are the same thing here, and the absent row is cheaper.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -24,7 +23,7 @@ impl MigrationTrait for Migration {
 
         // `count` is signed because both backends' INTEGER is, and a count
         // that could go negative through a bug is better than one that wraps.
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "CREATE TABLE IF NOT EXISTS download_counts (\
                    file_name TEXT NOT NULL PRIMARY KEY, \

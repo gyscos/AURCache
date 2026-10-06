@@ -16,10 +16,10 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// What `repo_init` names the repository, and therefore what pacman must call
+/// What the server names the repository, and therefore what pacman must call
 /// it: the database files are `repo.db` / `repo.files`, so the section header
 /// is not a free choice.
-pub const DEFAULT_REPO_NAME: &str = "repo";
+pub use aurcache_common::repo::REPO_NAME as DEFAULT_REPO_NAME;
 
 /// Matches the documented stanza. AURCache does not sign its packages, so a
 /// stricter level would refuse everything it serves.

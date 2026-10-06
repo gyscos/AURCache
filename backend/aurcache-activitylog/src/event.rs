@@ -12,6 +12,35 @@ use crate::events::Event;
 use aurcache_common::api::activity::Severity;
 use aurcache_common::api::log::{EntityRef, PackageRef};
 
+/// One entity an entry names, and the payload key -- the role -- it was found
+/// under.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Reference {
+    pub role: String,
+    pub entity: EntityRef,
+}
+
+impl Reference {
+    /// The index rows for `entity` named under `role`: the entity itself and,
+    /// for a build, its package too -- a build is part of its package's story,
+    /// and "everything about yay" that left out "publishing yay #7 failed"
+    /// would answer a narrower question than the one asked.
+    pub fn filed(role: &str, entity: EntityRef) -> Vec<Self> {
+        let mut rows = Vec::with_capacity(2);
+        if let EntityRef::Build(build) = &entity {
+            rows.push(Self {
+                role: role.to_string(),
+                entity: PackageRef::from(build.pkgbase.as_str()).into(),
+            });
+        }
+        rows.push(Self {
+            role: role.to_string(),
+            entity,
+        });
+        rows
+    }
+}
+
 /// Every entity a serialized payload refers to, with the role it played.
 ///
 /// Read out of the payload rather than declared a second time by each event:
@@ -22,9 +51,8 @@ use aurcache_common::api::log::{EntityRef, PackageRef};
 /// A role naming several entities (a `Vec<BuildRef>`) yields one entry per
 /// element, all under the same role.
 ///
-/// A build is also filed under its package, in the same role: a build is part
-/// of its package's story, and "everything about yay" that left out "publishing
-/// yay #7 failed" would be answering a narrower question than the one asked.
+/// A build is also filed under its package, in the same role; see
+/// [`Reference::filed`].
 ///
 /// Only values that are *entirely* a known reference are taken, so context
 /// values are left alone: `"connection refused: timeout"` has a colon but
@@ -33,7 +61,7 @@ use aurcache_common::api::log::{EntityRef, PackageRef};
 /// `build:…/<number>`; if that ever happens the field wanted to be typed
 /// anyway.
 #[must_use]
-pub fn references(payload: &serde_json::Value) -> Vec<(String, EntityRef)> {
+pub fn references(payload: &serde_json::Value) -> Vec<Reference> {
     let Some(fields) = payload.as_object() else {
         return Vec::new();
     };
@@ -48,13 +76,7 @@ pub fn references(payload: &serde_json::Value) -> Vec<(String, EntityRef)> {
             let Some(entity) = item.as_str().and_then(|raw| raw.parse::<EntityRef>().ok()) else {
                 continue;
             };
-            if let EntityRef::Build(build) = &entity {
-                found.push((
-                    role.clone(),
-                    PackageRef::from(build.pkgbase.as_str()).into(),
-                ));
-            }
-            found.push((role.clone(), entity));
+            found.extend(Reference::filed(role, entity));
         }
     }
     found
@@ -70,7 +92,7 @@ pub struct Rendered {
     pub severity: Severity,
     pub message: String,
     pub payload: serde_json::Value,
-    pub references: Vec<(String, EntityRef)>,
+    pub references: Vec<Reference>,
 }
 
 /// The column the payload is stored in, as serde writes it.
@@ -195,7 +217,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered.references,
-            vec![("pkg".to_string(), PackageRef::from("hello").into())]
+            Reference::filed("pkg", PackageRef::from("hello").into())
         );
     }
 
@@ -212,18 +234,21 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.payload["build"], "build:hello/7");
         // The build, and its package: a build is part of its package's story.
+        let build = BuildRef {
+            pkgbase: "hello".to_string(),
+            number: 7,
+        };
         assert_eq!(
             rendered.references,
             vec![
-                ("build".to_string(), PackageRef::from("hello").into()),
-                (
-                    "build".to_string(),
-                    BuildRef {
-                        pkgbase: "hello".to_string(),
-                        number: 7
-                    }
-                    .into()
-                ),
+                Reference {
+                    role: "build".to_string(),
+                    entity: PackageRef::from("hello").into(),
+                },
+                Reference {
+                    role: "build".to_string(),
+                    entity: build.into(),
+                },
             ]
         );
     }
@@ -235,7 +260,7 @@ mod tests {
         let found = references(&payload);
         // Each build, and each build's package.
         assert_eq!(found.len(), 4);
-        assert!(found.iter().all(|(role, _)| role == "builds"));
+        assert!(found.iter().all(|found| found.role == "builds"));
     }
 
     /// Context values are not references, even when they contain a colon.
@@ -247,6 +272,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rendered.references.len(), 1);
-        assert_eq!(rendered.references[0].0, "pkg");
+        assert_eq!(rendered.references[0].role, "pkg");
     }
 }

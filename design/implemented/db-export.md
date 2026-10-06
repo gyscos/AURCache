@@ -25,7 +25,7 @@ did AURCache work it out?*
 
 | Data | Source |
 |---|---|
-| Package identity and source | `packages.name`, `source_type`, `source_data` |
+| Package identity and source | `packages.name`, `source_data` |
 | Per-package build config | `packages.build_flags`, `platforms` |
 | Whether it was asked for directly | `packages.directly_requested` |
 | Source patches | `packages.patch` |

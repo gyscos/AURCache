@@ -72,14 +72,13 @@ pub struct Runner<E: Executor> {
     last_contact: AtomicU64,
     /// Bounds concurrent builds, and follows the `concurrency` setting.
     gate: Arc<ConcurrencyGate>,
-    /// Mirrorlists the server has sent, by architecture: `arch -> (checksum,
-    /// content)`. The checksums go out with each claim so the server can skip
+    /// Mirrorlists the server has sent, by architecture. The checksums go out with each claim so the server can skip
     /// resending what has not changed; the content is what a job then uses.
     ///
     /// Memory only. Losing it on restart costs one resend, and a restart is
     /// exactly when a worker should re-read the deployment's configuration
     /// anyway.
-    mirrorlists: Mutex<BTreeMap<String, (String, String)>>,
+    mirrorlists: Mutex<BTreeMap<String, HeldMirrorlist>>,
     /// What the server has been told this worker's settings resolved to.
     ///
     /// The report rides the heartbeat and is sent only when it differs from
@@ -91,6 +90,14 @@ pub struct Runner<E: Executor> {
     /// so a delivery that changes them is followed by registering again -- and
     /// one that fails is retried on the next heartbeat rather than forgotten.
     registered: Mutex<Routing>,
+}
+
+/// A mirrorlist the server sent, kept for the jobs it withholds it from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldMirrorlist {
+    /// The server's checksum of `content`, advertised with each claim.
+    checksum: String,
+    content: String,
 }
 
 fn now_secs() -> u64 {
@@ -109,7 +116,7 @@ fn now_secs() -> u64 {
 /// then nothing at all (the image's `/etc/pacman.d/mirrorlist`).
 fn resolve_job_mirrorlist(
     local: Option<&str>,
-    held: &mut BTreeMap<String, (String, String)>,
+    held: &mut BTreeMap<String, HeldMirrorlist>,
     job: &mut JobDescriptor,
 ) {
     if let Some(local) = local {
@@ -120,11 +127,17 @@ fn resolve_job_mirrorlist(
         // Sent afresh: use it, and remember it for the next claim.
         (Some(content), _) => {
             if let Some(checksum) = &job.mirrorlist_checksum {
-                held.insert(job.arch.clone(), (checksum.clone(), content.clone()));
+                held.insert(
+                    job.arch.clone(),
+                    HeldMirrorlist {
+                        checksum: checksum.clone(),
+                        content: content.clone(),
+                    },
+                );
             }
         }
         // Withheld because we already hold it.
-        (None, true) => job.mirrorlist = held.get(&job.arch).map(|(_, c)| c.clone()),
+        (None, true) => job.mirrorlist = held.get(&job.arch).map(|h| h.content.clone()),
         // The server has none for this arch. Drop anything stale rather than
         // reuse it, or a mirrorlist removed on the server would live on here.
         (None, false) => {
@@ -263,7 +276,7 @@ impl<E: Executor> Runner<E> {
                 .lock()
                 .await
                 .iter()
-                .map(|(arch, (checksum, _))| (arch.clone(), checksum.clone()))
+                .map(|(arch, held)| (arch.clone(), held.checksum.clone()))
                 .collect(),
         }
     }
@@ -320,10 +333,8 @@ impl<E: Executor> Runner<E> {
                 }
                 Err(e) => {
                     // `{e:#}` for the cause chain, not just the outermost
-                    // context: on its own "complete rejected" says nothing
-                    // about *why* the server refused, and the status code is
-                    // the whole difference between a lost lease and an ingest
-                    // that cannot publish.
+                    // context: the server's reason is what tells a lost lease
+                    // from an ingest that cannot publish.
                     tracing::warn!("reporting completion for {build_id} failed: {e:#}");
                     tokio::time::sleep(Duration::from_secs(2 * (attempt + 1))).await;
                 }
@@ -481,6 +492,7 @@ mod mirrorlist_tests {
     use aurcache_common::worker::{JobDescriptor, MirrorlistPreference};
     use std::collections::BTreeMap;
 
+    use super::HeldMirrorlist;
     use super::resolve_job_mirrorlist as apply;
 
     fn job(
@@ -507,6 +519,13 @@ mod mirrorlist_tests {
         }
     }
 
+    fn held_list(checksum: &str, content: &str) -> HeldMirrorlist {
+        HeldMirrorlist {
+            checksum: checksum.to_string(),
+            content: content.to_string(),
+        }
+    }
+
     /// Content that arrives is used and remembered, so the next claim can
     /// advertise it and the server can skip resending.
     #[test]
@@ -515,10 +534,7 @@ mod mirrorlist_tests {
         let mut j = job("x86_64", Some("Server = a\n"), Some("abc"), false);
         apply(None, &mut held, &mut j);
         assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
-        assert_eq!(
-            held["x86_64"],
-            ("abc".to_string(), "Server = a\n".to_string())
-        );
+        assert_eq!(held["x86_64"], held_list("abc", "Server = a\n"));
     }
 
     /// Withheld content is filled in from the cache: this is what makes the
@@ -526,10 +542,7 @@ mod mirrorlist_tests {
     #[test]
     fn unchanged_is_filled_from_the_cache() {
         let mut held = BTreeMap::new();
-        held.insert(
-            "x86_64".to_string(),
-            ("abc".to_string(), "Server = a\n".to_string()),
-        );
+        held.insert("x86_64".to_string(), held_list("abc", "Server = a\n"));
         let mut j = job("x86_64", None, None, true);
         apply(None, &mut held, &mut j);
         assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
@@ -540,10 +553,7 @@ mod mirrorlist_tests {
     #[test]
     fn no_server_mirrorlist_drops_the_cached_one() {
         let mut held = BTreeMap::new();
-        held.insert(
-            "x86_64".to_string(),
-            ("abc".to_string(), "Server = a\n".to_string()),
-        );
+        held.insert("x86_64".to_string(), held_list("abc", "Server = a\n"));
         let mut j = job("x86_64", None, None, false);
         apply(None, &mut held, &mut j);
         assert!(j.mirrorlist.is_none());
@@ -568,8 +578,8 @@ mod mirrorlist_tests {
         apply(None, &mut held, &mut x);
         let mut a = job("aarch64", Some("Server = a\n"), Some("ca"), false);
         apply(None, &mut held, &mut a);
-        assert_eq!(held["x86_64"].1, "Server = x\n");
-        assert_eq!(held["aarch64"].1, "Server = a\n");
+        assert_eq!(held["x86_64"].content, "Server = x\n");
+        assert_eq!(held["aarch64"].content, "Server = a\n");
     }
 
     /// The default preference is "I hold nothing", which is what a worker

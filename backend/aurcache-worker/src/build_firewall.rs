@@ -129,23 +129,6 @@ fn scope(worker: &Resolved, repo: Option<&Resolved>) -> Result<Scope> {
     Ok(Scope::Addresses(worker.addrs.to_vec()))
 }
 
-/// This process's own uid: the rule must never name it (see below).
-fn own_uid() -> Result<u32> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .context("running id -u")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "id -u failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .context("id -u printed no numeric uid")
-}
-
 /// Refuse a rule that would match this process itself.
 ///
 /// A `WORKER_BUILD_USER` naming the worker's own account (or root, via
@@ -168,20 +151,9 @@ fn check_not_self(build_uid: u32, own_uid: u32, build_user: &str) -> Result<()> 
 /// The build user's uid is assigned dynamically (systemd-sysusers `-`), so it
 /// must never be hardcoded: this host gave `builder` 967, another may not.
 fn uid_of_user(username: &str) -> Result<u32> {
-    let output = Command::new("id")
-        .arg("-u")
-        .arg(username)
-        .output()
-        .with_context(|| format!("running id -u {username}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "id -u {username} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .with_context(|| format!("id -u {username} printed no numeric uid"))
+    aurcache_chroot::Owner::of_user(username)
+        .map(|owner| owner.uid)
+        .with_context(|| format!("no user named {username:?}"))
 }
 
 /// The `OUTPUT` rule that confines the build user, as argv after the tool.
@@ -274,7 +246,7 @@ pub fn ensure(server_url: &str, repo_section: &str, build_user: &str) -> Result<
         return Ok(());
     }
     let uid = uid_of_user(build_user)?;
-    check_not_self(uid, own_uid()?, build_user)?;
+    check_not_self(uid, aurcache_chroot::Owner::current().uid, build_user)?;
     let worker = endpoint(server_url)
         .with_context(|| format!("no host and port to firewall in {server_url:?}"))?;
     let worker_addrs = resolve(&worker);

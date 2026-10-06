@@ -1,4 +1,14 @@
+use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
+
+/// What a raw statement prefixes table names with on `backend`.
+fn schema_prefix(backend: DbBackend) -> &'static str {
+    if backend == DbBackend::Postgres {
+        "public."
+    } else {
+        ""
+    }
+}
 
 mod create;
 mod m20240907_131839_platform_buildflags;
@@ -42,6 +52,9 @@ mod m20260926_000000_drop_download_counts;
 mod m20260927_000000_build_disk_usage;
 mod m20260928_000000_build_kept_chroot;
 mod m20260928_000001_build_kept_tree;
+mod m20261005_000000_drop_source_type;
+mod m20261005_000001_drop_attempt_count;
+mod m20261006_000000_crontab_schedule;
 
 pub struct Migrator;
 
@@ -98,6 +111,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260927_000000_build_disk_usage::Migration),
             Box::new(m20260928_000000_build_kept_chroot::Migration),
             Box::new(m20260928_000001_build_kept_tree::Migration),
+            Box::new(m20261005_000000_drop_source_type::Migration),
+            Box::new(m20261005_000001_drop_attempt_count::Migration),
+            Box::new(m20261006_000000_crontab_schedule::Migration),
         ]
     }
 }

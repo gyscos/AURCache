@@ -187,12 +187,13 @@ pub async fn approve_worker<C: ConnectionTrait>(
 
 /// Revoke a worker: it is immediately refused at the auth guard, its package
 /// affinity reservations are released (they only count *approved* workers), and
-/// any build it still holds is requeued for someone else.
+/// any build it still holds is abandoned, with a fresh attempt queued for
+/// someone else.
 ///
 /// Revoking is also how a machine is retired — worker rows are never deleted, so
 /// build history keeps resolving to the machine that produced it. Re-approving
 /// is the way back.
-pub async fn revoke_worker<C: ConnectionTrait>(
+pub async fn revoke_worker<C: ConnectionTrait + sea_orm::TransactionTrait>(
     db: &C,
     id: i32,
     max_attempts: i32,
@@ -206,8 +207,9 @@ pub async fn revoke_worker<C: ConnectionTrait>(
     // to build, not to come back still refusing work.
     active.paused = Set(false);
     let worker = active.update(db).await?;
-    let requeued = crate::helpers::worker_jobs::requeue_worker_builds(db, id, max_attempts).await?;
-    Ok(Some(Revoked { worker, requeued }))
+    let abandoned =
+        crate::helpers::worker_jobs::abandon_worker_builds(db, id, max_attempts).await?;
+    Ok(Some(Revoked { worker, abandoned }))
 }
 
 /// Ask a worker to take no new builds (`true`), or to take them again.
@@ -231,8 +233,9 @@ pub async fn set_paused<C: ConnectionTrait>(
 #[derive(Debug)]
 pub struct Revoked {
     pub worker: workers::Model,
-    /// Row ids of the builds it held, now requeued or failed.
-    pub requeued: Vec<i32>,
+    /// The builds it held, now failed, each with a fresh attempt in its place
+    /// unless its package is gone.
+    pub abandoned: Vec<crate::helpers::worker_jobs::Abandoned>,
 }
 
 /// List all workers in name order.
@@ -259,12 +262,11 @@ pub async fn store_effective_config<C: ConnectionTrait>(
     id: i32,
     effective: &str,
 ) -> Result<(), DbErr> {
-    let Some(worker) = Workers::find_by_id(id).one(db).await? else {
-        return Ok(());
-    };
-    let mut active: workers::ActiveModel = worker.into();
-    active.effective_config = Set(Some(effective.to_string()));
-    active.update(db).await?;
+    Workers::update_many()
+        .col_expr(workers::Column::EffectiveConfig, Some(effective).into())
+        .filter(workers::Column::Id.eq(id))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -653,37 +655,63 @@ mod tests {
     /// stranded until the lease reaper notices — the worker is refused from this
     /// moment and can never report those builds complete.
     #[tokio::test]
-    async fn revoke_requeues_builds_the_worker_still_holds() {
-        use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED};
+    async fn revoke_abandons_builds_the_worker_still_holds() {
+        use aurcache_common::build_state::BuildStates;
 
         let db = setup().await;
         let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
         approve_worker(&db, w.id).await.unwrap();
 
-        db.execute_unprepared("INSERT INTO packages (id, name) VALUES (1, 'p1')")
-            .await
-            .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO packages (id, name, status, out_of_date, build_flags, platforms, \
+                source_data, directly_requested) \
+             VALUES (1, 'p1', 0, 0, '', 'x86_64', '{\"type\":\"aur\",\"name\":\"p1\"}', 1)",
+        )
+        .await
+        .unwrap();
         db.execute_unprepared(&format!(
-            "INSERT INTO builds (id, pkg_id, status, platform, version, attempt_count, worker_id) \
-             VALUES (1, 1, {STATUS_ACTIVE}, 'x86_64', '1.0', 0, {})",
+            "INSERT INTO builds (id, pkg_id, number, status, platform, version, worker_id) \
+             VALUES (1, 1, 1, {}, 'x86_64', '1.0', {})",
+            BuildStates::ACTIVE_BUILD,
             w.id
         ))
         .await
         .unwrap();
 
-        revoke_worker(&db, w.id, 3).await.unwrap();
+        let revoked = revoke_worker(&db, w.id, 3).await.unwrap().unwrap();
+        // A revocation spends no retry, so the build always gets one.
+        let retry = revoked.abandoned[0].retry.expect("a fresh attempt");
 
         let row = db
             .query_one_raw(sea_orm::Statement::from_string(
                 db.get_database_backend(),
-                "SELECT status, worker_id FROM builds WHERE id = 1".to_string(),
+                "SELECT status, worker_id, end_reason FROM builds WHERE id = 1".to_string(),
             ))
             .await
             .unwrap()
             .expect("build exists");
         let status: i32 = row.try_get("", "status").unwrap();
         let worker_id: Option<i32> = row.try_get("", "worker_id").unwrap();
-        assert_eq!(status, STATUS_ENQUEUED);
+        let end_reason: Option<i32> = row.try_get("", "end_reason").unwrap();
+        assert_eq!(status, BuildStates::FAILED_BUILD);
+        // Kept: the record of who ran the attempt.
+        assert_eq!(worker_id, Some(w.id));
+        assert_eq!(
+            end_reason,
+            Some(aurcache_common::build_state::EndReasons::WORKER_REVOKED)
+        );
+
+        let fresh = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                format!("SELECT status, worker_id FROM builds WHERE id = {retry}"),
+            ))
+            .await
+            .unwrap()
+            .expect("the retry exists");
+        let status: i32 = fresh.try_get("", "status").unwrap();
+        let worker_id: Option<i32> = fresh.try_get("", "worker_id").unwrap();
+        assert_eq!(status, BuildStates::ENQUEUED_BUILD);
         assert_eq!(worker_id, None);
     }
 

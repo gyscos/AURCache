@@ -17,8 +17,10 @@ pub struct AddPackage {
     pub patched_files: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+/// Ask for a package's update check, and a build when it finds one.
+#[derive(Deserialize, Serialize, ToSchema, Clone, Debug, Default)]
 pub struct UpdatePackage {
+    /// Build even when the version did not change.
     pub force: bool,
 }
 
@@ -78,18 +80,52 @@ pub struct SourcePreviewFileRequest {
     pub path: String,
 }
 
-#[derive(Deserialize, ToSchema, Serialize, Default)]
-#[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
+/// A partial update of a package: every field left `None` is left as it is.
+///
+/// Absent fields are not sent, so a client builds one from `Default` and sets
+/// only what it changes. `name`, `status`, `out_of_date` and `latest_build`
+/// are server-managed and set by the add, build and version-check flows; they
+/// are accepted here, but no client of this crate sets them.
+#[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct PackagePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_of_date: Option<i32>,
+    /// `Some(None)` clears it, sent as `null`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "clearable"
+    )]
     pub latest_build: Option<Option<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_flags: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<String>>,
     /// Multi-file unified diff applied on top of the fetched source.
     /// `Some(None)` clears an existing patch, `None` leaves it untouched.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "clearable"
+    )]
     pub patch: Option<Option<String>>,
+}
+
+/// A field where `null` means "clear it" rather than "not given": absent is
+/// `None` (through `#[serde(default)]`), `null` is `Some(None)`.
+///
+/// Serde's own reading of `Option<Option<T>>` folds `null` into the outer
+/// `None`, which made a clear indistinguishable from leaving the field alone.
+fn clearable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -381,4 +417,38 @@ pub struct ReplaceDependency {
     /// accepted only when the official repositories publish every declared
     /// name behind it.
     pub replacement: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackagePatch;
+
+    /// Absent leaves a field alone, `null` clears it, and a patch built from
+    /// `Default` sends nothing it did not set.
+    #[test]
+    fn a_patch_tells_absent_from_cleared() {
+        let absent: PackagePatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.patch, None);
+        let cleared: PackagePatch = serde_json::from_str(r#"{"patch": null}"#).unwrap();
+        assert_eq!(cleared.patch, Some(None));
+        let set: PackagePatch = serde_json::from_str(r#"{"patch": "diff"}"#).unwrap();
+        assert_eq!(set.patch, Some(Some("diff".to_string())));
+
+        let only_platforms = PackagePatch {
+            platforms: Some(vec!["x86_64".to_string()]),
+            ..PackagePatch::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&only_platforms).unwrap(),
+            r#"{"platforms":["x86_64"]}"#
+        );
+        let clearing = PackagePatch {
+            patch: Some(None),
+            ..PackagePatch::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&clearing).unwrap(),
+            r#"{"patch":null}"#
+        );
+    }
 }

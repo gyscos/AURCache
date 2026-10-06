@@ -2,7 +2,7 @@
 
 use crate::prelude::Builds;
 use crate::{builds, packages};
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
@@ -12,8 +12,23 @@ use std::collections::BTreeMap;
 
 use aurcache_common::api::log::BuildRef;
 
-/// The most recent *successful* build row selection, newest by end time with
-/// start time as the tie-break, projecting one column.
+/// How recent a build is: when it ended, or when it started where it has no
+/// end. Every "newest successful build" query orders by this, descending, with
+/// the id as the final tie-break.
+///
+/// One expression rather than the two columns in turn, because a `NULL` end
+/// time sorts first under `DESC` on Postgres and last on SQLite: ordering by
+/// `end_time` then `start_time` picked different builds on the two backends.
+fn recency() -> Expr {
+    Func::coalesce([
+        Expr::col((builds::Entity, builds::Column::EndTime)),
+        Expr::col((builds::Entity, builds::Column::StartTime)),
+    ])
+    .into()
+}
+
+/// The most recent *successful* build row selection, by [`recency`],
+/// projecting one column.
 ///
 /// The column is a parameter rather than a second `select_only` at the call
 /// site: stacking `select_only` reads as resetting the projection, and the
@@ -24,9 +39,16 @@ fn newest_success_query(pkg_id: i32, column: builds::Column) -> Select<Builds> {
         .column(column)
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
-        .order_by(builds::Column::EndTime, Order::Desc)
-        .order_by(builds::Column::StartTime, Order::Desc)
+        .order_by(recency(), Order::Desc)
+        .order_by(builds::Column::Id, Order::Desc)
         .limit(1)
+}
+
+/// A version as read from `builds.version`, which is NOT NULL DEFAULT '': a
+/// build that has not determined its version yet holds an empty string, which
+/// means "not known", not "the empty version".
+fn known_version(version: String) -> Option<String> {
+    (!version.is_empty()).then_some(version)
 }
 
 /// The version of the most recently *successful* build of `pkg_id` on
@@ -47,7 +69,7 @@ pub async fn latest_successful_version<C: ConnectionTrait>(
         .into_tuple::<(String,)>()
         .one(db)
         .await
-        .map(|row| row.map(|(version,)| version))
+        .map(|row| row.and_then(|(version,)| known_version(version)))
 }
 
 /// Whether `dependee_id`'s newest successful build on `platform` satisfies
@@ -71,6 +93,38 @@ pub async fn dependency_satisfied<C: ConnectionTrait>(
         .is_some_and(|version| aurcache_deps::satisfies_constraint(&version, constraint)))
 }
 
+/// Whether every one of `deps` is satisfied on `platform`; see
+/// [`dependency_satisfied`].
+pub async fn dependencies_satisfied<C: ConnectionTrait>(
+    db: &C,
+    deps: &[crate::dependencies::Model],
+    platform: &str,
+) -> Result<bool, DbErr> {
+    for dep in deps {
+        if !dependency_satisfied(db, dep.dependee_id, platform, &dep.version_constraint).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The build of `pkg_id` on `platform` that has not settled yet, if any.
+///
+/// At most one exists: a partial unique index on `builds(pkg_id, platform)`
+/// covers these states.
+pub async fn pending_build<C: ConnectionTrait>(
+    db: &C,
+    pkg_id: i32,
+    platform: &str,
+) -> Result<Option<builds::Model>, DbErr> {
+    Builds::find()
+        .filter(builds::Column::PkgId.eq(pkg_id))
+        .filter(builds::Column::Platform.eq(platform))
+        .filter(builds::Column::Status.is_in(BuildStates::IN_PROGRESS.map(Some)))
+        .one(db)
+        .await
+}
+
 /// The version of the most recently *successful* build of `pkg_id` across all
 /// platforms.
 ///
@@ -85,7 +139,7 @@ pub async fn latest_successful_version_any_platform<C: ConnectionTrait>(
         .into_tuple::<(String,)>()
         .one(db)
         .await
-        .map(|row| row.map(|(version,)| version))
+        .map(|row| row.and_then(|(version,)| known_version(version)))
 }
 
 /// What the most recently *successful* build of `pkg_id` was made from:
@@ -152,12 +206,8 @@ pub async fn record_build_vcs_sources<C: ConnectionTrait>(
 /// expressed as a column so that a package listing reports it for every row
 /// without one query per package.
 ///
-/// Ordered by `COALESCE(end_time, start_time)` rather than by the two columns
-/// in turn: a finished build ranks by when it ended and an unfinished one by
-/// when it started, which is what "most recent" has to mean where the two are
-/// mixed. `NULLIF` because `builds.version` is NOT NULL DEFAULT '': a build
-/// that has been enqueued but has not determined a version yet holds an empty
-/// string, which means "not known", not "the empty version".
+/// Ordered by [`recency`] like every other "newest successful build" query,
+/// and `NULLIF` for the reason [`known_version`] gives.
 #[must_use]
 pub fn latest_successful_version_expr() -> Expr {
     Expr::from(
@@ -175,14 +225,8 @@ pub fn latest_successful_version_expr() -> Expr {
                 Expr::col((builds::Entity, builds::Column::Status))
                     .eq(BuildStates::SUCCESSFUL_BUILD),
             )
-            .order_by_expr(
-                Func::coalesce([
-                    (Expr::col((builds::Entity, builds::Column::EndTime))),
-                    Expr::col((builds::Entity, builds::Column::StartTime)),
-                ])
-                .into(),
-                Order::Desc,
-            )
+            .order_by_expr(recency(), Order::Desc)
+            .order_by((builds::Entity, builds::Column::Id), Order::Desc)
             .limit(1)
             .to_owned(),
     )
@@ -221,7 +265,7 @@ mod tests {
         record_build_vcs_sources,
     };
     use crate::migration::Migrator;
-    use aurcache_common::builder::BuildStates;
+    use aurcache_common::build_state::BuildStates;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
         QuerySelect,
@@ -433,5 +477,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Both forms of "newest successful build" order the same way on both
+    /// backends: by `COALESCE(end_time, start_time)` and the id, never by a
+    /// bare column whose `NULL`s Postgres and SQLite sort to opposite ends.
+    #[test]
+    fn newest_success_orders_alike_on_every_backend() {
+        use crate::builds;
+        use sea_orm::sea_query::{PostgresQueryBuilder, Query, SqliteQueryBuilder};
+        use sea_orm::{DatabaseBackend, QueryTrait};
+
+        for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+            let select = super::newest_success_query(1, builds::Column::Version)
+                .build(backend)
+                .to_string();
+            let subquery = match backend {
+                DatabaseBackend::Postgres => Query::select()
+                    .expr(super::latest_successful_version_expr())
+                    .to_string(PostgresQueryBuilder),
+                _ => Query::select()
+                    .expr(super::latest_successful_version_expr())
+                    .to_string(SqliteQueryBuilder),
+            };
+            for sql in [select, subquery] {
+                let order = &sql[sql.find("ORDER BY").expect("ordered")..];
+                assert!(order.contains("COALESCE"), "{backend:?}: {sql}");
+                assert!(order.contains("\"id\" DESC"), "{backend:?}: {sql}");
+            }
+        }
     }
 }

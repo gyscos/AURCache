@@ -54,6 +54,30 @@ struct SourceSnapshot {
     pkgbase: String,
 }
 
+impl SourceSnapshot {
+    /// The parsed `.SRCINFO`, or why there is none.
+    fn parsed(&self) -> anyhow::Result<SourceInfoV1> {
+        self.sourceinfo
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Source's .SRCINFO/PKGBUILD could not be parsed"))
+    }
+}
+
+/// What [`SnapshotStore::refresh`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refresh {
+    /// The source moved, or was not cached yet: the entry was rebuilt.
+    Changed,
+    /// The cached entry was already current.
+    Current,
+}
+
+/// A source's parsed `.SRCINFO` and the metadata read beside it.
+pub struct Resolved {
+    pub sourceinfo: SourceInfoV1,
+    pub metadata: crate::package::source_metadata::SourceMetadata,
+}
+
 struct CacheEntry {
     /// Resolved commit id of the raw (unpatched) checkout, used to detect
     /// whether a `refresh` actually changed anything.
@@ -116,6 +140,13 @@ pub(crate) fn default_checkout_root() -> PathBuf {
 pub struct SnapshotStore {
     /// Keyed by `SourceData::cache_key()`. At most one entry per source.
     cache: Mutex<LruCache<String, Arc<CacheEntry>>>,
+    /// One lock per checkout directory, by its name under `checkout_root`.
+    ///
+    /// Git cannot share a working tree between two operations, and the
+    /// archive is read out of it: two requests for one uncached source --
+    /// the version check and someone browsing its files -- would otherwise
+    /// clone or fetch into the same directory at once.
+    checkout_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     checkout_root: PathBuf,
     aur_git_base_url: String,
     /// Where the `parse_network` setting is read from, when there is one.
@@ -154,6 +185,7 @@ impl SnapshotStore {
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY must be non-zero"),
             )),
+            checkout_locks: std::sync::Mutex::default(),
             checkout_root,
             aur_git_base_url: aur_git_base_url.into(),
             db: None,
@@ -197,12 +229,7 @@ impl SnapshotStore {
         source_data: &SourceData,
         patch: Option<&str>,
     ) -> anyhow::Result<SourceInfoV1> {
-        let entry = self.get_or_fetch(source_data, patch).await?;
-        entry
-            .active
-            .sourceinfo
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Source's .SRCINFO/PKGBUILD could not be parsed"))
+        self.get_or_fetch(source_data, patch).await?.active.parsed()
     }
 
     /// Return the raw archive bytes for `source_data`, fetching it if not cached.
@@ -321,18 +348,12 @@ impl SnapshotStore {
         &self,
         source_data: &SourceData,
         patch: Option<&str>,
-    ) -> anyhow::Result<(
-        SourceInfoV1,
-        crate::package::source_metadata::SourceMetadata,
-    )> {
+    ) -> anyhow::Result<Resolved> {
         let entry = self.get_or_fetch(source_data, patch).await?;
-        let metadata = self.metadata_from_entry(&entry, source_data).await;
-        let sourceinfo = entry
-            .active
-            .sourceinfo
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Source's .SRCINFO/PKGBUILD could not be parsed"))?;
-        Ok((sourceinfo, metadata))
+        Ok(Resolved {
+            metadata: self.metadata_from_entry(&entry, source_data).await,
+            sourceinfo: entry.active.parsed()?,
+        })
     }
 
     async fn metadata_from_entry(
@@ -440,6 +461,8 @@ impl SnapshotStore {
         }
         self.cache.lock().await.pop(&cache_key);
 
+        let lock = self.checkout_lock(&dir_name);
+        let _checkout = lock.lock().await;
         let path = self.checkout_root.join(dir_name);
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
@@ -456,9 +479,7 @@ impl SnapshotStore {
     /// as a backstop for it. An add resolves its whole dependency graph --
     /// cloning each package it plans -- before `persist_plan` writes a single
     /// row, so an add that fails part-way leaves clones behind that no row ever
-    /// referred to and no delete path will ever visit. `remove_orphaned_
-    /// packages` likewise deletes rows directly, without going through
-    /// `package_delete`.
+    /// referred to and no delete path will ever visit.
     ///
     /// Directories are matched by sanitized cache key, the same name
     /// [`SnapshotStore`] checks out into. Sanitisation is many-to-one, so two
@@ -518,16 +539,14 @@ impl SnapshotStore {
 
     /// Proactively refresh the cache entry for `source_data`: fetch the
     /// latest state from the remote and, if the resolved ref actually moved
-    /// (or there was no cached entry yet), re-parse/re-tar it. Returns `true`
-    /// if the entry changed (i.e. the source was not up to date with what
-    /// was previously cached), `false` if it was already current.
+    /// (or there was no cached entry yet), re-parse/re-tar it.
     ///
     /// This is intended to be called from the periodic version-check loop so
     /// that staleness is detected (and long-lived caches kept honest) without
     /// unconditionally re-downloading/re-cloning on every check. If a patch
     /// was previously active for this source it is re-applied on top of the
     /// freshly fetched raw source, so the cache entry stays consistent.
-    pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<bool> {
+    pub async fn refresh(&self, source_data: &SourceData) -> anyhow::Result<Refresh> {
         let cache_key = source_data.cache_key();
         let previous = {
             let mut cache = self.cache.lock().await;
@@ -535,15 +554,10 @@ impl SnapshotStore {
         };
         let previous_commit = previous.as_ref().map(|entry| entry.commit);
 
-        let coordinates = self.git_coordinates(source_data)?;
-        let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
-
         // Read once (see the fetch path): both consumers below want the same
         // answer, and each call is a DB round trip.
         let network = self.parse_network().await;
-        let CheckedOutSource { commit, raw } = checkout_and_parse(coordinates, &path, network)
-            .await
-            .map_err(|e| explain_source_failure(source_data, e))?;
+        let CheckedOutSource { commit, raw } = self.checkout(source_data, network).await?;
 
         let changed = previous_commit != Some(commit);
         if changed {
@@ -557,7 +571,11 @@ impl SnapshotStore {
             .await??;
             self.cache.lock().await.put(cache_key, entry);
         }
-        Ok(changed)
+        Ok(if changed {
+            Refresh::Changed
+        } else {
+            Refresh::Current
+        })
     }
 
     async fn get_or_fetch(
@@ -581,14 +599,10 @@ impl SnapshotStore {
             }
         }
 
-        let coordinates = self.git_coordinates(source_data)?;
-        let path = self.checkout_root.join(sanitize_cache_key(&cache_key));
         // Read once: a DB round trip per call, and both consumers below want
         // the same answer.
         let network = self.parse_network().await;
-        let CheckedOutSource { commit, raw } = checkout_and_parse(coordinates, &path, network)
-            .await
-            .map_err(|e| explain_source_failure(source_data, e))?;
+        let CheckedOutSource { commit, raw } = self.checkout(source_data, network).await?;
 
         // Off the executor: patching unpacks, re-tars and re-parses the whole
         // archive with no `.await` in between.
@@ -625,6 +639,31 @@ impl SnapshotStore {
     /// application step.
     fn entry_matches_patch(entry: &CacheEntry, patch: Option<&SourcePatch>) -> bool {
         entry.patch.as_ref() == patch
+    }
+
+    /// Bring `source_data`'s persistent checkout up to date and read it,
+    /// holding that checkout's lock throughout.
+    async fn checkout(
+        &self,
+        source_data: &SourceData,
+        network: bool,
+    ) -> anyhow::Result<CheckedOutSource> {
+        let coordinates = self.git_coordinates(source_data)?;
+        let dir_name = sanitize_cache_key(&source_data.cache_key());
+        let lock = self.checkout_lock(&dir_name);
+        let _checkout = lock.lock().await;
+        checkout_and_parse(coordinates, &self.checkout_root.join(dir_name), network)
+            .await
+            .map_err(|e| explain_source_failure(source_data, e))
+    }
+
+    /// The lock of the checkout directory `dir_name`.
+    fn checkout_lock(&self, dir_name: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .checkout_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(locks.entry(dir_name.to_string()).or_default())
     }
 
     /// Map a `SourceData` to the git coordinates used to fetch it.
@@ -1659,6 +1698,31 @@ license=('MIT')
         );
     }
 
+    /// Requests for one uncached source arriving together all succeed. Each
+    /// clones or fetches into the same checkout directory, which git cannot
+    /// do twice at once; the checkout lock queues them instead.
+    #[tokio::test]
+    async fn concurrent_first_reads_of_one_source_all_succeed() {
+        let aur_root = tempfile::tempdir().unwrap();
+        create_aur_git_repo(aur_root.path(), "bar", "1.0");
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let store = Arc::new(store);
+        let source = SourceData::Aur {
+            name: "bar".to_string(),
+        };
+
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let source = source.clone();
+                tokio::spawn(async move { store.refresh(&source).await })
+            })
+            .collect();
+        for read in reads {
+            read.await.unwrap().expect("a concurrent read failed");
+        }
+    }
+
     /// Regression test for a bug introduced (and fixed) while reworking the
     /// cache to hold a single entry per source: `list_files`/`read_file`
     /// must reuse whatever is already cached for a source - regardless of
@@ -1787,8 +1851,12 @@ license=('MIT')
         // this would come back as 1.0 instead of 2.0).
         commit_to_repo(&repo, "v2", "bump");
 
-        let changed = store.refresh(&source).await.unwrap();
-        assert!(changed, "refresh should detect the new upstream commit");
+        let refreshed = store.refresh(&source).await.unwrap();
+        assert_eq!(
+            refreshed,
+            Refresh::Changed,
+            "refresh should detect the new upstream commit"
+        );
 
         let after_refresh = store.sourceinfo(&source, Some(&patch)).await.unwrap();
         assert_eq!(after_refresh.base.version.to_string(), "2.0-1");
@@ -1834,8 +1902,12 @@ license=('MIT')
         repo.commit(Some("HEAD"), &sig, &sig, "bump", &tree, &[&parent])
             .unwrap();
 
-        let changed = store.refresh(&source).await.unwrap();
-        assert!(changed, "refresh should detect the bumped PKGBUILD");
+        let refreshed = store.refresh(&source).await.unwrap();
+        assert_eq!(
+            refreshed,
+            Refresh::Changed,
+            "refresh should detect the bumped PKGBUILD"
+        );
 
         let second = store.sourceinfo(&source, None).await.unwrap();
         assert_eq!(second.base.version.to_string(), "1.1-1");

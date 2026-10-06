@@ -17,7 +17,6 @@
 //! gone is the leftover this constraint exists to prevent, and the constraint
 //! cannot be added while one is present.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::{ConnectionTrait, DbBackend};
 use sea_orm_migration::prelude::*;
 
@@ -28,7 +27,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Postgres => {
                 db.execute_unprepared(
                     "DELETE FROM files f \
@@ -89,7 +88,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Postgres => {
                 db.execute_unprepared(
                     "ALTER TABLE files DROP CONSTRAINT IF EXISTS files_package_id_fkey;",

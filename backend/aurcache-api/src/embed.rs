@@ -45,19 +45,16 @@ impl Handler for CustomHandler {
             return Outcome::Error(Status::BadRequest);
         };
 
-        if path.is_dir() || path.to_str() == Some("") {
-            path = path.join("index.html");
-        }
-
         // A frontend route matches no file. Answering it with the app shell is
         // what makes a reload or a pasted deep link work; see `crate::spa`.
-        if <Asset as RustEmbed>::get(path.to_string_lossy().as_ref()).is_none()
-            && crate::spa::serves_app_shell(&path)
-        {
+        // The root is the shell too, so it needs no case of its own.
+        let mut file = Asset::get(path.to_string_lossy().as_ref());
+        if file.is_none() && crate::spa::serves_app_shell(&path) {
             path = PathBuf::from("index.html");
+            file = Asset::get("index.html");
         }
 
-        match <Asset as RustEmbed>::get(path.to_string_lossy().as_ref()) {
+        match file {
             None => Outcome::Error(Status::NotFound),
             Some(file_content) => {
                 let content_type: ContentType = path

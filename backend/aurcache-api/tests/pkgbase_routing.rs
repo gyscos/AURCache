@@ -20,7 +20,7 @@ use aurcache_db::builds;
 use aurcache_db::dependencies;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
@@ -73,7 +73,6 @@ async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
         upstream_version: Set(Some("1.0-1".to_string())),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),
@@ -398,7 +397,6 @@ async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
         upstream_version: Set(None),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "promoted-dep".to_string(),
         }),
@@ -714,9 +712,8 @@ async fn insert_worker_build(
     use sea_orm::ConnectionTrait;
     let worker = worker.map_or_else(|| "NULL".to_string(), |w| w.to_string());
     db.execute_unprepared(&format!(
-        "INSERT INTO builds (pkg_id, number, status, start_time, platform, version, \
-         attempt_count, worker_id) \
-         VALUES ({pkg_id}, {number}, {status}, {number}, 'x86_64', '1.0-1', 0, {worker})"
+        "INSERT INTO builds (pkg_id, number, status, start_time, platform, version, worker_id) \
+         VALUES ({pkg_id}, {number}, {status}, {number}, 'x86_64', '1.0-1', {worker})"
     ))
     .await
     .expect("insert build");

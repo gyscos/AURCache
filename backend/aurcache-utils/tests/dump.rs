@@ -4,7 +4,7 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_common::api::dump::{DUMP_SCHEMA_VERSION, MANIFEST_FILE, PACKAGES_FILE};
 use aurcache_common::source::GitSourceSpec;
 use aurcache_db::migration::Migrator;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings, workers};
 use aurcache_utils::dump::{build_dump, write_archive};
@@ -43,7 +43,6 @@ async fn package(
         latest_build: Set(None),
         build_flags: Set("--noconfirm;;--nocolor".to_string()),
         platforms: Set("x86_64;aarch64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),
@@ -284,7 +283,6 @@ async fn a_git_source_is_carried_whole() {
         out_of_date: Set(0),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Git),
         source_data: Set(SourceData::Git {
             spec: GitSourceSpec {
                 url: "https://example.com/mine.git".to_string(),
@@ -429,9 +427,9 @@ async fn an_imported_row_is_visible_to_dependency_resolution() {
     let row = Packages::find().one(&target).await.unwrap().unwrap();
     // The set `resolve_local_dependency_resolutions` filters on.
     let visible = [
-        aurcache_common::builder::BuildStates::ACTIVE_BUILD,
-        aurcache_common::builder::BuildStates::SUCCESSFUL_BUILD,
-        aurcache_common::builder::BuildStates::ENQUEUED_BUILD,
+        aurcache_common::build_state::BuildStates::ACTIVE_BUILD,
+        aurcache_common::build_state::BuildStates::SUCCESSFUL_BUILD,
+        aurcache_common::build_state::BuildStates::ENQUEUED_BUILD,
     ];
     assert!(
         visible.contains(&row.status),
@@ -623,7 +621,6 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
         out_of_date: Set(0),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Git),
         source_data: Set(SourceData::Git {
             spec: GitSourceSpec {
                 // Unroutable by construction, so this needs no network to fail.
@@ -797,6 +794,42 @@ async fn workers_are_restored_by_fingerprint() {
         .await
         .unwrap();
     assert_eq!(values.get("build_timeout").map(String::as_str), Some("6h"));
+}
+
+/// A worker's list columns are comma-joined, and the dump writes them as
+/// real lists: one entry per architecture, in both directions. Splitting them
+/// as the package columns are once dumped `["x86_64,aarch64"]`, and a dump
+/// written by hand in the documented shape restored as one unknown arch.
+#[tokio::test]
+async fn a_workers_lists_travel_as_lists() {
+    let source = db().await;
+    workers::ActiveModel {
+        name: Set("builder".to_string()),
+        status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
+        cert_fingerprint: Set("fp-1".to_string()),
+        native_arches: Set("x86_64,aarch64".to_string()),
+        emulated_arches: Set("armv7h".to_string()),
+        package_affinity: Set("big-one,other".to_string()),
+        priority: Set(0),
+        concurrency: Set(1),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+
+    let dump = build_dump(&source, "test", None).await.unwrap();
+    assert_eq!(dump.workers[0].native_arches, ["x86_64", "aarch64"]);
+    assert_eq!(dump.workers[0].package_affinity, ["big-one", "other"]);
+
+    let target = db().await;
+    let loaded = load_dump(&dump_bytes(&source).await).unwrap();
+    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
+        .await
+        .unwrap();
+    let restored = workers::Entity::find().one(&target).await.unwrap().unwrap();
+    assert_eq!(restored.native_arches, "x86_64,aarch64");
+    assert_eq!(restored.package_affinity, "big-one,other");
 }
 
 /// A worker already trusted here keeps the routing this instance gave it. The
@@ -1237,4 +1270,124 @@ async fn a_preview_names_the_conflicting_packages() {
         .collect();
     assert!(matches!(by_name["clash"], RestoreOutcome::Failed { .. }));
     assert!(matches!(by_name["fine"], RestoreOutcome::Imported));
+}
+
+/// A one-commit git repository holding a package's PKGBUILD and `.SRCINFO`,
+/// as a source a restore can read without the network.
+fn git_package(dir: &std::path::Path, name: &str, depends: &[&str]) -> GitSourceSpec {
+    let repo = git2::Repository::init(dir).unwrap();
+    let depends_srcinfo: String = depends
+        .iter()
+        .map(|dep| format!("    depends = {dep}\n"))
+        .collect();
+    std::fs::write(
+        dir.join(".SRCINFO"),
+        format!(
+            "pkgbase = {name}\n    pkgver = 1.0\n    pkgrel = 1\n    arch = x86_64\n\
+             {depends_srcinfo}\npkgname = {name}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("PKGBUILD"),
+        format!("pkgname={name}\npkgver=1.0\npkgrel=1\narch=('x86_64')\n"),
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new(".SRCINFO")).unwrap();
+    index.add_path(std::path::Path::new("PKGBUILD")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .unwrap();
+    GitSourceSpec {
+        url: dir.to_string_lossy().into_owned(),
+        r#ref: "HEAD".to_string(),
+        subfolder: String::new(),
+    }
+}
+
+/// A dependency-only package the dump carries survives the restore, and is
+/// what its dependent ends up depending on.
+///
+/// Edges are not exported, so until pass 3 reaches its dependent such a
+/// package has nothing pointing at it. Resyncing one package at a time with an
+/// orphan sweep after each deleted it the moment an earlier package -- by name
+/// order -- was resynced, and the dependent then went looking for it in the
+/// AUR.
+#[tokio::test]
+async fn a_dependency_only_package_survives_the_restore() {
+    let source = db().await;
+    let sources = tempfile::tempdir().unwrap();
+    for (name, requested, depends) in [
+        ("aaa", true, &[][..]),
+        ("mylib", false, &[][..]),
+        ("zzz", true, &["mylib"][..]),
+    ] {
+        let dir = sources.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = git_package(&dir, name, depends);
+        packages::ActiveModel {
+            name: Set(name.to_string()),
+            status: Set(0),
+            out_of_date: Set(0),
+            build_flags: Set(String::new()),
+            platforms: Set("x86_64".to_string()),
+            source_data: Set(SourceData::Git { spec }),
+            directly_requested: Set(requested),
+            ..Default::default()
+        }
+        .insert(&source)
+        .await
+        .unwrap();
+    }
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let (client, _official) = client_with_empty_official_repos().await;
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
+    aurcache_utils::restore::apply(
+        &Services::new(
+            target.clone(),
+            tx,
+            Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+            Arc::new(client),
+            Arc::new(test_repo()),
+            ActivityLog::discarding(),
+        ),
+        &tempfile::tempdir().unwrap().keep(),
+        load_dump(&bytes).unwrap(),
+        RestoreOptions::default(),
+        progress_tx,
+    )
+    .await;
+    let mut failures = Vec::new();
+    while let Ok(entry) = progress_rx.try_recv() {
+        if matches!(entry.outcome, RestoreOutcome::Failed { .. }) {
+            failures.push(entry);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let rows = Packages::find().all(&target).await.unwrap();
+    let id_of = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("{name} was not restored, or was removed again"))
+            .id
+    };
+    let edges = aurcache_db::prelude::Dependencies::find()
+        .all(&target)
+        .await
+        .unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge.dependent_id == id_of("zzz") && edge.dependee_id == id_of("mylib")),
+        "zzz does not depend on the restored mylib: {edges:?}"
+    );
 }

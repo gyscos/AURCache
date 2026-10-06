@@ -9,7 +9,6 @@
 //! See `design/implemented/worker-configuration.md` ("Drain", which shipped
 //! as pause).
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -20,7 +19,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table workers add paused BOOLEAN NOT NULL DEFAULT 0;",
             DbBackend::Postgres => {
                 "ALTER TABLE workers ADD COLUMN paused BOOLEAN NOT NULL DEFAULT FALSE;"
@@ -33,7 +32,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table workers drop column paused;",
             DbBackend::Postgres => "ALTER TABLE workers DROP COLUMN paused;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

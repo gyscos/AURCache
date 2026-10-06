@@ -79,7 +79,9 @@ impl ChrootExecutor {
             Ok(h) => Some(h),
             Err(e) => {
                 tracing::warn!(
-                    "No per-build cgroup, so builds will not report peak memory ({e:#}).                      A container needs `privileged`; a native install needs                      `Delegate=yes` on the unit."
+                    "No per-build cgroup, so builds will not report peak memory ({e:#}). \
+                     A container needs `privileged`; a native install needs \
+                     `Delegate=yes` on the unit."
                 );
                 None
             }
@@ -129,10 +131,7 @@ impl ChrootExecutor {
             } else {
                 let describe = |l: &crate::cgroup::BuildLimits| {
                     let gib = |bytes: Option<u64>| {
-                        bytes.map_or_else(
-                            || "unlimited".to_string(),
-                            |b| format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30)),
-                        )
+                        bytes.map_or_else(|| "unlimited".to_string(), crate::chroots::gib)
                     };
                     format!(
                         "memory {}, swap {}, CPUs {}",
@@ -160,7 +159,7 @@ impl ChrootExecutor {
         });
         // Before anything can claim work: no build of ours is running yet, so
         // whatever a build left in the pool belongs to a run that is over.
-        if shared.chroots.open().await {
+        if shared.chroots.open().await.is_ok() {
             let cleared = shared
                 .chroots
                 .sweep(&std::collections::HashSet::new())

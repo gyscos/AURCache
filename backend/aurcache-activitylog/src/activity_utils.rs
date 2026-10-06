@@ -3,6 +3,7 @@
 //!
 //! See `design/implemented/structured-logs.md`.
 
+use crate::event::Reference;
 use crate::events::Event;
 use aurcache_db::prelude::LogEntities;
 use aurcache_db::{log_entities, logs};
@@ -28,7 +29,7 @@ pub(crate) struct LogRecord {
     pub(crate) scope: Option<EntityRef>,
     pub(crate) user: Option<String>,
     pub(crate) timestamp: i64,
-    pub(crate) references: Vec<(String, EntityRef)>,
+    pub(crate) references: Vec<Reference>,
 }
 
 impl LogRecord {
@@ -177,13 +178,6 @@ impl ActivityLog {
     }
 }
 
-/// Timestamps older than this are pruned. Saturating: the clock is trusted
-/// here, and a far-future `now` must prune everything rather than wrap to
-/// keeping it all.
-pub(crate) fn prune_cutoff(now: i64, keep_secs: u64) -> i64 {
-    now.saturating_sub(i64::try_from(keep_secs).unwrap_or(i64::MAX))
-}
-
 /// Start the one task that writes the log, and hand back a handle to it.
 ///
 /// The task ends when the last handle is dropped, draining what is queued
@@ -211,17 +205,9 @@ pub(crate) async fn write(db: &DatabaseConnection, record: LogRecord) -> anyhow:
 
     // The scope is indexed like any other reference, under a role of its own,
     // so one query answers both "about this build" and "during it".
-    // A build scope is filed under its package too, as a build named in a
-    // payload is (see `event::references`).
-    let mut refs: Vec<(String, EntityRef)> = record.references;
+    let mut refs = record.references;
     if let Some(scope) = &record.scope {
-        if let EntityRef::Build(build) = scope {
-            refs.push((
-                SCOPE_ROLE.to_string(),
-                aurcache_common::api::log::PackageRef::from(build.pkgbase.as_str()).into(),
-            ));
-        }
-        refs.push((SCOPE_ROLE.to_string(), scope.clone()));
+        refs.extend(Reference::filed(SCOPE_ROLE, scope.clone()));
     }
     // A role may legitimately name one entity twice -- a list with a repeat --
     // and the index keys on the three together.
@@ -245,7 +231,7 @@ pub(crate) async fn write(db: &DatabaseConnection, record: LogRecord) -> anyhow:
     if !refs.is_empty() {
         let rows = refs
             .into_iter()
-            .map(|(role, entity)| log_entities::ActiveModel {
+            .map(|Reference { role, entity }| log_entities::ActiveModel {
                 log_id: Set(entry.id),
                 role: Set(role),
                 ns: Set(entity.namespace().to_string()),

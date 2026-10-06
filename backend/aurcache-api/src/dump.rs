@@ -45,9 +45,9 @@ pub struct DumpArchive {
 /// A filename a browser will save sensibly, and that sorts by date in a
 /// directory of backups.
 fn dump_file_name(created_at: i64) -> String {
-    let stamp = chrono::DateTime::from_timestamp(created_at, 0).map_or_else(
-        || created_at.to_string(),
-        |t| t.format("%Y%m%d").to_string(),
+    let stamp = jiff::Timestamp::from_second(created_at).map_or_else(
+        |_| created_at.to_string(),
+        |t| t.strftime("%Y%m%d").to_string(),
     );
     format!("aurcache-dump-{stamp}.tar.gz")
 }
@@ -111,19 +111,16 @@ pub async fn dump(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::dump_file_name;
-
-    /// Dated, so a directory of backups sorts chronologically and two dumps
-    /// taken on different days do not overwrite each other.
-    #[test]
-    fn the_file_name_carries_the_date() {
-        assert_eq!(
-            dump_file_name(1_756_684_800),
-            "aurcache-dump-20250901.tar.gz"
-        );
-    }
+/// A policy from the query string, its default when absent.
+fn parse_policy<P>(value: Option<&str>) -> Result<P, ApiError>
+where
+    P: std::str::FromStr<Err = String> + Default,
+{
+    value
+        .map(str::parse)
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .map_err(|e| err(Status::BadRequest, e))
 }
 
 /// The restore route's query string, taken as one parameter.
@@ -131,8 +128,6 @@ mod tests {
 /// Four options that arrive together and are consumed together, as
 /// [`RestoreOptions`] -- a `FromForm` keeps them that way instead of spreading
 /// them across the signature.
-// Rocket's request guards, the three query parameters and the body are each an
-// independent input; bundling them into a struct would only move the same list.
 #[derive(FromForm)]
 pub struct RestoreQuery {
     dry_run: Option<bool>,
@@ -180,27 +175,8 @@ pub async fn restore(
     let options = RestoreOptions {
         dry_run: dry_run.unwrap_or(false),
         clear: clear.unwrap_or(false),
-        secrets: match secrets.as_deref() {
-            None | Some("ignore") => SecretsPolicy::Ignore,
-            Some("copy") => SecretsPolicy::Copy,
-            Some(other) => {
-                return Err(err(
-                    Status::BadRequest,
-                    format!("unknown secrets policy '{other}'"),
-                ));
-            }
-        },
-        on_existing: match on_existing.as_deref() {
-            None | Some("skip") => ExistingPackagePolicy::Skip,
-            Some("overwrite") => ExistingPackagePolicy::Overwrite,
-            Some("merge-patches") => ExistingPackagePolicy::MergePatches,
-            Some(other) => {
-                return Err(err(
-                    Status::BadRequest,
-                    format!("unknown on_existing policy '{other}'"),
-                ));
-            }
-        },
+        secrets: parse_policy::<SecretsPolicy>(secrets.as_deref())?,
+        on_existing: parse_policy::<ExistingPackagePolicy>(on_existing.as_deref())?,
     };
 
     // A dump that cannot be read is the caller's problem, and saying so before
@@ -332,4 +308,19 @@ pub async fn restore_progress(
         finished: job.finished_at.is_some(),
         entries: operations::entries_after(&job.log, after.unwrap_or(0)),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dump_file_name;
+
+    /// Dated, so a directory of backups sorts chronologically and two dumps
+    /// taken on different days do not overwrite each other.
+    #[test]
+    fn the_file_name_carries_the_date() {
+        assert_eq!(
+            dump_file_name(1_756_684_800),
+            "aurcache-dump-20250901.tar.gz"
+        );
+    }
 }

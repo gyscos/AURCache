@@ -10,7 +10,7 @@
 use crate::dates::{Clock, DateOrder, DateParts, DateStyle, render};
 use crate::listing::ListHeader;
 use crate::routes::Route;
-use aurcache_client::{ApplicationSettings, Setting, SettingSource, Timezone};
+use aurcache_client::{ApplicationSettings, SchedulePreview, Setting, SettingSource, Timezone};
 use dioxus::prelude::*;
 
 #[component]
@@ -119,10 +119,11 @@ fn SettingsSections(
             SettingRow {
                 setting: Setting::VersionCheckInterval,
                 label: "Version check interval",
-                description: "How often to look for new AUR and git versions, in seconds.",
-                value: settings.version_check_interval.value.to_string(),
+                description: "How often to look for new AUR and git versions, such as 1h or 30m.",
+                // Written back as it is typed, like the size below.
+                value: aurcache_common::units::format_duration(u64::from(settings.version_check_interval.value)),
                 source: settings.version_check_interval.source,
-                editor: Editor::Number,
+                editor: Editor::Text { placeholder: "1h".to_string(), wide: false },
                 save,
             }
             SettingRow {
@@ -135,7 +136,7 @@ fn SettingsSections(
                 // source badge is what tells the two apart.
                 value: settings.auto_update_interval.value.clone().unwrap_or_default(),
                 source: settings.auto_update_interval.source,
-                editor: Editor::Text { placeholder: "0 0 3 * * *".to_string(), wide: false },
+                editor: Editor::Schedule { placeholder: "H 3 * * *".to_string() },
                 save,
             }
             SettingRow {
@@ -173,10 +174,10 @@ fn SettingsSections(
             SettingRow {
                 setting: Setting::JobTimeout,
                 label: "Job timeout",
-                description: "How long a single build may run before the server abandons it, in seconds.",
-                value: settings.job_timeout.value.to_string(),
+                description: "How long a single build may run before the server abandons it, such as 3h.",
+                value: aurcache_common::units::format_duration(u64::from(settings.job_timeout.value)),
                 source: settings.job_timeout.source,
-                editor: Editor::Number,
+                editor: Editor::Text { placeholder: "1h".to_string(), wide: false },
                 save,
             }
             SettingRow {
@@ -225,7 +226,11 @@ enum Editor {
         placeholder: String,
         wide: bool,
     },
-    Number,
+    /// A schedule: a text field, with when it would run underneath, so a
+    /// mistake shows while it is being typed rather than at 3 am.
+    Schedule {
+        placeholder: String,
+    },
     Toggle,
 }
 
@@ -404,35 +409,13 @@ fn SettingRow(
                             },
                         }
                     },
-                    Editor::Number => rsx! {
-                        input {
-                            r#type: "number",
-                            class: "input input-bordered input-sm w-40",
-                            disabled: locked,
-                            value: "{draft}",
-                            oninput: move |e| draft.set(e.value()),
-                            // Enter saves, because a field with a visible Save
-                            // button next to it still gets Enter pressed at it.
-                            onkeydown: move |e: KeyboardEvent| {
-                                if e.key() == Key::Enter {
-                                    save.call((setting, Some(draft())));
-                                }
-                            },
-                        }
-                    },
                     Editor::Text { placeholder, wide } => rsx! {
-                        input {
-                            r#type: "text",
-                            class: "input input-bordered input-sm max-w-full font-mono text-xs {text_width(wide)}",
-                            disabled: locked,
-                            placeholder: "{placeholder}",
-                            value: "{draft}",
-                            oninput: move |e| draft.set(e.value()),
-                            onkeydown: move |e: KeyboardEvent| {
-                                if e.key() == Key::Enter {
-                                    save.call((setting, Some(draft())));
-                                }
-                            },
+                        TextField { setting, draft, placeholder, wide, locked, save }
+                    },
+                    Editor::Schedule { placeholder } => rsx! {
+                        div { class: "flex flex-col gap-1",
+                            TextField { setting, draft, placeholder, wide: false, locked, save }
+                            ScheduleRuns { setting, value: draft() }
                         }
                     },
                 };
@@ -453,6 +436,86 @@ fn SettingRow(
             }
         }
     }
+}
+
+/// A one-line text control that saves on Enter.
+#[component]
+fn TextField(
+    setting: Setting,
+    draft: Signal<String>,
+    placeholder: String,
+    wide: bool,
+    locked: bool,
+    save: EventHandler<(Setting, Option<String>)>,
+) -> Element {
+    rsx! {
+        input {
+            r#type: "text",
+            class: "input input-bordered input-sm max-w-full font-mono text-xs {text_width(wide)}",
+            disabled: locked,
+            placeholder: "{placeholder}",
+            value: "{draft}",
+            oninput: move |e| draft.set(e.value()),
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() == Key::Enter {
+                    save.call((setting, Some(draft())));
+                }
+            },
+        }
+    }
+}
+
+/// When the schedule being typed would run, as the server works it out: only
+/// it knows its own timezone and what `H` resolves to on this instance. Asked
+/// again on every edit; the answer is a parse and a few date steps.
+#[component]
+fn ScheduleRuns(setting: Setting, value: String) -> Element {
+    let style = crate::dates::use_date_style();
+    let preview = use_resource(use_reactive(&value, move |value| async move {
+        crate::api::client()
+            .ok()?
+            .preview_schedule(setting.meta().key, &value)
+            .await
+            .ok()
+    }));
+    // A failed request says nothing, rather than calling a valid schedule
+    // invalid; the save is what reports a server that cannot be reached.
+    let Some(Some(answer)) = preview() else {
+        return rsx! {};
+    };
+    let note = schedule_note(&answer, |ts| crate::dates::absolute(Some(ts), style()));
+    rsx! {
+        p { class: if note.invalid { "text-xs text-error max-w-xs" } else { "text-xs opacity-60 max-w-xs" },
+            "{note.text}"
+        }
+    }
+}
+
+/// What [`ScheduleRuns`] says.
+#[derive(Debug, PartialEq, Eq)]
+struct ScheduleNote {
+    text: String,
+    /// Shown as an error: the value would be refused on save.
+    invalid: bool,
+}
+
+/// [`ScheduleRuns`]'s line for an answer, with `date` rendering a timestamp.
+/// The runs are in the viewer's own time, which is the one they can check
+/// against; the expression's hours are the server's, as the description says.
+fn schedule_note(preview: &SchedulePreview, date: impl Fn(i64) -> String) -> ScheduleNote {
+    let (text, invalid) = match preview {
+        SchedulePreview::Runs { at } => {
+            let runs: Vec<String> = at.iter().map(|&ts| date(ts)).collect();
+            (
+                format!("Next runs, your time: {}", runs.join(", then ")),
+                false,
+            )
+        }
+        SchedulePreview::Never => ("No date ever matches this schedule.".to_string(), false),
+        SchedulePreview::Disabled => ("Off: nothing is rebuilt on a schedule.".to_string(), false),
+        SchedulePreview::Invalid { reason } => (reason.clone(), true),
+    };
+    ScheduleNote { text, invalid }
 }
 
 /// The Reset button, in a slot that is held open whether or not this row has
@@ -681,8 +744,9 @@ struct ScheduleZone {
 /// compare. Two zones that agree now but switch to summer time on different
 /// dates are the price, and they disagree by an hour for a few weeks at most.
 fn schedule_zone(server: Option<&Timezone>, viewer: &Timezone) -> ScheduleZone {
-    const BASE: &str =
-        "Cron expression, including seconds, for scheduled rebuilds. Empty disables it.";
+    const BASE: &str = "When to rebuild what is out of date, as crontab: minute hour \
+        day-of-month month day-of-week. H picks a fixed value of this server's own, \
+        so H 3 * * * is some minute past 3. Empty disables it.";
     let Some(server) = server else {
         return ScheduleZone {
             description: BASE.to_string(),
@@ -716,9 +780,19 @@ fn schedule_zone(server: Option<&Timezone>, viewer: &Timezone) -> ScheduleZone {
 
 #[cfg(test)]
 mod tests {
-    use super::{Editor, ScheduleZone, SettingRow, is_stored, schedule_zone};
-    use aurcache_client::{Setting, SettingSource, Timezone};
+    use super::{
+        Editor, ScheduleNote, ScheduleZone, SettingRow, is_stored, schedule_note, schedule_zone,
+    };
+    use aurcache_client::{SchedulePreview, Setting, SettingSource, Timezone};
     use dioxus::prelude::*;
+
+    /// The editor the duration settings use.
+    fn duration_editor() -> Editor {
+        Editor::Text {
+            placeholder: "1h".to_string(),
+            wide: false,
+        }
+    }
 
     /// An `EventHandler` can only be built inside a running runtime, so the row
     /// is rendered through a host component rather than by handing it props
@@ -729,8 +803,8 @@ mod tests {
             SettingRow {
                 setting: Setting::VersionCheckInterval,
                 label: "Version check interval",
-                description: "seconds",
-                value: "3600",
+                description: "how often",
+                value: "1h",
                 source,
                 editor,
                 save: move |_| {},
@@ -826,7 +900,7 @@ mod tests {
     /// would take a change that the next read silently discards.
     #[test]
     fn an_env_locked_setting_cannot_be_edited() {
-        let html = row(SettingSource::Env, Editor::Number);
+        let html = row(SettingSource::Env, duration_editor());
         assert!(
             html.contains("disabled"),
             "input should be disabled: {html}"
@@ -848,7 +922,7 @@ mod tests {
     /// set this".
     #[test]
     fn an_unset_setting_says_it_is_the_default() {
-        let html = row(SettingSource::Default, Editor::Number);
+        let html = row(SettingSource::Default, duration_editor());
         assert!(html.contains("default"), "{html}");
         assert!(!html.contains(">Reset<"), "nothing stored to reset: {html}");
     }
@@ -864,7 +938,7 @@ mod tests {
             SettingSource::Global,
             SettingSource::Package,
         ] {
-            let html = row(source, Editor::Number);
+            let html = row(source, duration_editor());
             assert!(
                 html.contains(
                     r#"title="Set $VERSION_CHECK_INTERVAL to pin this from the environment""#
@@ -881,7 +955,7 @@ mod tests {
     /// A stored value is the only case with something to undo.
     #[test]
     fn a_stored_setting_offers_a_reset() {
-        let html = row(SettingSource::Global, Editor::Number);
+        let html = row(SettingSource::Global, duration_editor());
         assert!(html.contains(">Reset<"), "{html}");
         assert!(!html.contains("disabled"), "{html}");
     }
@@ -899,11 +973,31 @@ mod tests {
         );
         assert!(text.contains("0 0 3 * * *"), "{text}");
 
-        let number = row(SettingSource::Global, Editor::Number);
-        assert!(number.contains(r#"type="number""#), "{number}");
-
         let toggle = row(SettingSource::Global, Editor::Toggle);
         assert!(toggle.contains("toggle"), "{toggle}");
         assert!(toggle.contains(r#"type="checkbox""#), "{toggle}");
+    }
+
+    /// Each answer reads as itself, and only a refused value as an error.
+    #[test]
+    fn the_schedule_line_says_when_or_why_not() {
+        let date = |ts: i64| format!("<{ts}>");
+        assert_eq!(
+            schedule_note(&SchedulePreview::Runs { at: vec![60, 120] }, date),
+            ScheduleNote {
+                text: "Next runs, your time: <60>, then <120>".to_string(),
+                invalid: false,
+            }
+        );
+        assert!(!schedule_note(&SchedulePreview::Never, date).invalid);
+        assert!(!schedule_note(&SchedulePreview::Disabled, date).invalid);
+        let refused = schedule_note(
+            &SchedulePreview::Invalid {
+                reason: "\"* * *\" has 3 fields".to_string(),
+            },
+            date,
+        );
+        assert!(refused.invalid);
+        assert!(refused.text.contains("3 fields"));
     }
 }

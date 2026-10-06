@@ -24,7 +24,7 @@ substituting the architecture. It has to be configured separately.
 ## Env Config
 | Variable               | Type         | Description                                                                    | Default                   |
 |------------------------|--------------|--------------------------------------------------------------------------------|---------------------------|
-| MIRROR_RANK_SCHEDULE                | String(CRON) | Auto mirrorlist rank schedule in cronjob syntax with seconds (null to disable) | 0 0 2 * * 0 (once a week) |
+| MIRROR_RANK_SCHEDULE                | String (crontab) | When to re-rank the mirrors, as a [schedule](environment-variables.md#schedules) | H 2 * * sun (Sunday, some minute past 2) |
 | MIRRORLIST_PATH_X86_64                | String       | directory containing mirrorlist inside aurcache container                 | /app/config/pacman_x86_64 |
 | MIRRORLIST_SERVERS_X86_64                | String       | semicolon-separated list of mirror URLs (disables auto ranking)                 | null |
 | MIRRORLIST_SERVERS_AARCH64                | String       | the same, for aarch64 workers (no auto ranking for this arch)                 | null |
@@ -48,7 +48,7 @@ When this env var is set, automatic mirror ranking is disabled.
 
 ## Manually set mirrorlist via file mount
 
-To enable auto mirror ranking set `MIRROR_RANK_SCHEDULE` to your desired cron schedule and it will automatically rerank the mirrors based on their download speed.
+To enable auto mirror ranking set `MIRROR_RANK_SCHEDULE` to your desired [schedule](environment-variables.md#schedules) and it will automatically rerank the mirrors based on their download speed.
 
 ## Manually set mirrorlist
 To manually set a mirrorlist mount a directory containing your `mirrorlist` to the same path as `MIRRORLIST_PATH_X86_64` with a volume or bind mount.
@@ -71,7 +71,7 @@ services:
       - DB_PWD=YOUR_SECURE_PWD
       - DB_HOST=dbhost
       ## HERE
-      - MIRROR_RANK_SCHEDULE=0 0 2 * * 0
+      - MIRROR_RANK_SCHEDULE=H 2 * * sun
       ## END HERE
     networks:
       aurcache_network:

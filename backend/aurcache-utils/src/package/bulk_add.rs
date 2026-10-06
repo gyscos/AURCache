@@ -101,17 +101,11 @@ pub async fn bulk_add(
     for source in sources {
         let name = source_label(&source);
         let resolved = apply_resolved_base(source, &bases);
-        let (outcome, pkgbase) = add_one(services, &context, resolved).await;
+        let entry = add_one(services, &context, name, resolved).await;
         // Ignore a closed channel: the observer left, the work has not.
         // Awaiting the send is the backpressure: with a bounded channel the
         // producer waits for the recorder rather than queueing without limit.
-        let _ = progress
-            .send(BulkAddEntry {
-                name,
-                pkgbase,
-                outcome,
-            })
-            .await;
+        let _ = progress.send(entry).await;
     }
 }
 
@@ -126,36 +120,44 @@ fn apply_resolved_base(source: SourceData, bases: &HashMap<String, String>) -> S
     }
 }
 
-/// One package's add, with its result turned into an outcome rather than an
+/// One package's add, reported as the entry for `name` rather than as an
 /// error, so the caller can record it and carry on.
 ///
-/// Returns the pkgbase alongside the outcome. It is only known once the add has
-/// resolved the source -- a git URL does not carry it, and an AUR name need not
-/// match it -- and it is what a caller needs to link to the package it just
-/// made.
+/// The entry carries the pkgbase once the add has resolved the source -- a git
+/// URL does not carry it, and an AUR name need not match it -- since it is
+/// what a caller needs to link to the package it just made.
 async fn add_one(
     services: &Services,
     context: &AddContext,
+    name: String,
     source: SourceData,
-) -> (BulkAddOutcome, Option<String>) {
+) -> BulkAddEntry {
     // No probe up front: `add_resolved_source` reports whether the package
     // was already tracked, from the check inside its own finalize — one query
     // for one fact, and no race with a concurrent add in between.
-    match add_resolved_source(services, context, source, None).await {
+    let (outcome, pkgbase) = match add_resolved_source(services, context, source, None).await {
         Ok(AddedSource {
             pkgbase,
-            already_tracked: true,
-        }) => (BulkAddOutcome::Existed, Some(pkgbase)),
-        Ok(AddedSource {
-            pkgbase,
-            already_tracked: false,
-        }) => (BulkAddOutcome::Added, Some(pkgbase)),
+            already_tracked,
+        }) => (
+            if already_tracked {
+                BulkAddOutcome::Existed
+            } else {
+                BulkAddOutcome::Added
+            },
+            Some(pkgbase),
+        ),
         Err(e) => (
             BulkAddOutcome::Failed {
                 error: format!("{e:#}"),
             },
             None,
         ),
+    };
+    BulkAddEntry {
+        name,
+        pkgbase,
+        outcome,
     }
 }
 

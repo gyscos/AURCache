@@ -42,8 +42,9 @@ pub struct Chroots {
     /// Owner of the cache subvolume made when the pool opens.
     cache_owner: aurcache_chroot::Owner,
     pool: RwLock<Option<Pool>>,
-    /// When opening the pool last failed, so retries are spaced out.
-    last_failure: std::sync::Mutex<Option<Instant>>,
+    /// When opening the pool last failed, and why, so retries are spaced out
+    /// and a caller in between still hears the reason.
+    last_failure: std::sync::Mutex<Option<OpenFailure>>,
     /// When the base chroot was last brought up to date, and the lock that
     /// serialises doing so. One lock for both, because "is it due" and "make
     /// it current" have to be one decision or two builds starting together
@@ -91,23 +92,30 @@ impl Chroots {
         }
     }
 
-    /// Open the pool if it is not open yet. Returns whether it is.
+    /// Open the pool if it is not open yet.
     ///
     /// A failure is logged and retried no sooner than [`REOPEN_AFTER`]: a host
     /// without btrfs support or a free loop device does not start having one
-    /// between two claims.
-    pub async fn open(&self) -> bool {
+    /// between two claims. Asked again within that window, this answers with
+    /// the last failure rather than trying again.
+    pub async fn open(&self) -> Result<()> {
         if self.pool.read().await.is_some() {
-            return true;
+            return Ok(());
         }
         let mut pool = self.pool.write().await;
         if pool.is_some() {
-            return true;
+            return Ok(());
         }
         {
             let last = self.last_failure.lock().expect("not poisoned");
-            if last.is_some_and(|at| at.elapsed() < REOPEN_AFTER) {
-                return false;
+            if let Some(failure) = last.as_ref()
+                && failure.at.elapsed() < REOPEN_AFTER
+            {
+                bail!(
+                    "the storage pool could not be opened ({}); trying again within {}s",
+                    failure.error,
+                    REOPEN_AFTER.saturating_sub(failure.at.elapsed()).as_secs()
+                );
             }
         }
         let config = self.config.lock().expect("not poisoned").clone();
@@ -133,7 +141,7 @@ impl Chroots {
                     ))
                 );
                 *pool = Some(opened);
-                true
+                Ok(())
             }
             Err(e) => {
                 tracing::error!(
@@ -141,10 +149,19 @@ impl Chroots {
                      builds until it can, because a build without its disk quota could \
                      fill the host"
                 );
-                *self.last_failure.lock().expect("not poisoned") = Some(Instant::now());
-                false
+                self.note_failure(&e);
+                Err(e.context("opening the storage pool"))
             }
         }
+    }
+
+    /// Remember a failure to open (or make again) the pool, for
+    /// [`Self::open`] to space its retries by.
+    fn note_failure(&self, error: &anyhow::Error) {
+        *self.last_failure.lock().expect("not poisoned") = Some(OpenFailure {
+            at: Instant::now(),
+            error: format!("{error:#}"),
+        });
     }
 
     /// Whether a build limited to `build_limit` can start: once the pool is
@@ -158,11 +175,17 @@ impl Chroots {
     /// shared with whatever else runs there -- and a host that fills up anyway
     /// fails the builds writing at that moment, not the pool.
     pub async fn ready_for_work(&self, build_limit: u64, claimed: usize) -> bool {
-        if !self.open().await {
+        // Both log their own failures, once each.
+        if self.open().await.is_err() {
             return false;
         }
-        if !self.shrink_when_idle(claimed).await {
-            return false;
+        match self.shrink_when_idle(claimed).await {
+            Ok(PoolSize::Fits) => {}
+            Ok(PoolSize::Draining) => return false,
+            Err(e) => {
+                tracing::error!("{e:#}");
+                return false;
+            }
         }
         let free = self.pool.read().await.as_ref().and_then(Pool::host_free);
         let short = free.is_some_and(|free| free < build_limit);
@@ -220,7 +243,7 @@ impl Chroots {
     }
 
     /// Whether the pool is the size its total asks for, making it again if it
-    /// is not and nothing is building.
+    /// is not and nothing is building. An error is a failure to make it again.
     ///
     /// An image holding more than fits in its new size cannot shrink online,
     /// and the only way down is to delete it and make a new one. That throws
@@ -235,11 +258,11 @@ impl Chroots {
     /// onto the host beneath the unmounted mountpoint. `claimed` counts
     /// those; no claim can happen meanwhile, since the same loop that asks
     /// this is the one that claims.
-    async fn shrink_when_idle(&self, claimed: usize) -> bool {
+    async fn shrink_when_idle(&self, claimed: usize) -> Result<PoolSize> {
         let oversized = self.pool.read().await.as_ref().and_then(Pool::oversized);
         let Some(wanted) = oversized else {
             self.draining.store(false, Ordering::Relaxed);
-            return true;
+            return Ok(PoolSize::Fits);
         };
         let active = claimed.max(self.active.load(Ordering::SeqCst));
         if active > 0 {
@@ -251,30 +274,31 @@ impl Chroots {
                     gib(wanted)
                 );
             }
-            return false;
+            return Ok(PoolSize::Draining);
         }
         let mut guard = self.pool.write().await;
-        // A lease may have been taken between the check and the lock.
+        // A lease may have been taken between the check and the lock, or
+        // another caller made the pool again meanwhile.
         if self.active.load(Ordering::SeqCst) > 0 {
-            return false;
+            return Ok(PoolSize::Draining);
         }
         let Some(pool) = guard.take() else {
-            return false;
+            return Ok(PoolSize::Draining);
         };
         tracing::error!(
             "making the storage pool again at {}: its caches and base chroot start over",
             gib(wanted)
         );
         if let Err(e) = pool.destroy().await {
-            tracing::error!("could not remove the oversized pool ({e:#}); retrying later");
-            *self.last_failure.lock().expect("not poisoned") = Some(Instant::now());
-            return false;
+            self.note_failure(&e);
+            return Err(e.context("removing the oversized pool; retrying later"));
         }
         *self.last_refresh.lock().await = None;
         self.draining.store(false, Ordering::Relaxed);
         drop(guard);
         // Made again the way a first start makes it.
-        self.open().await
+        self.open().await?;
+        Ok(PoolSize::Fits)
     }
 
     /// The cache subvolume's entries, for [`crate::cache::Cache`] to make each
@@ -476,9 +500,7 @@ impl Chroots {
     /// between the open and the lock.
     async fn open_pool(&self) -> Result<tokio::sync::RwLockReadGuard<'_, Option<Pool>>> {
         loop {
-            if !self.open().await {
-                bail!("the storage pool is not available; see the worker's log");
-            }
+            self.open().await?;
             let guard = self.pool.read().await;
             if guard.is_some() {
                 return Ok(guard);
@@ -581,6 +603,23 @@ async fn warn_refresh(report_to: Option<(&WorkerClient, i32)>, e: &anyhow::Error
     }
 }
 
+/// Why opening the pool last failed, and when.
+struct OpenFailure {
+    at: Instant,
+    error: String,
+}
+
+/// Whether the pool is the size its total asks for; see
+/// [`Chroots::shrink_when_idle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolSize {
+    /// It fits: builds may start.
+    Fits,
+    /// It holds more than its total allows and is waiting for the builds
+    /// running now to finish before it is made again; nothing new starts.
+    Draining,
+}
+
 /// See [`Chroots::disk_reason`].
 fn disk_reason(build: Option<Usage>, total: Option<Usage>, slack: u64) -> Option<String> {
     if let Some(usage) = build.filter(|u| u.at_limit(slack)) {
@@ -604,7 +643,8 @@ fn refresh_due(since_last: Option<Duration>, interval: Duration) -> bool {
     since_last.is_none_or(|elapsed| elapsed >= interval)
 }
 
-fn gib(bytes: u64) -> String {
+/// A byte count in GiB, for the log.
+pub(crate) fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / f64::from(1u32 << 30))
 }
 

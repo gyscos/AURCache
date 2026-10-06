@@ -115,7 +115,7 @@ impl Setting {
             Self::VersionCheckInterval => SettingsMeta {
                 key: "version_check_interval",
                 env_name: Some("VERSION_CHECK_INTERVAL"),
-                default: "3600",
+                default: "1h",
             },
             Self::AutoUpdateInterval => SettingsMeta {
                 key: "auto_update_interval",
@@ -163,7 +163,7 @@ impl Setting {
             Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
                 env_name: Some("JOB_TIMEOUT"),
-                default: "3600",
+                default: "1h",
             },
             // Largest package file a worker may upload, checked per package so
             // one outsized package (an engine, a game) can be allowed more
@@ -224,6 +224,22 @@ impl Setting {
                 .ok_or_else(|| {
                     format!("{value:?} is not a size (expected e.g. 20G, 512M or a byte count)")
                 }),
+            // Zero is refused rather than stored: a check every zero seconds
+            // spins, and a zero timeout reclaims every build as it starts.
+            Self::VersionCheckInterval | Self::JobTimeout => crate::units::parse_duration(value)
+                .filter(|&seconds| seconds > 0)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    format!(
+                        "{value:?} is not a duration (expected e.g. 1h, 90m or a number of seconds)"
+                    )
+                }),
+            // Empty is "off". The seed only moves `H` around, never makes a
+            // schedule valid or not, so any will do here.
+            Self::AutoUpdateInterval if value.trim().is_empty() => Ok(()),
+            Self::AutoUpdateInterval => crate::schedule::Schedule::parse(value, 0)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
             _ => Ok(()),
         }
     }
@@ -232,6 +248,27 @@ impl Setting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duration is checked before it is stored, and zero is refused: it
+    /// would spin the version check, or reclaim every build as it starts.
+    #[test]
+    fn duration_settings_are_validated() {
+        for setting in [Setting::VersionCheckInterval, Setting::JobTimeout] {
+            assert_eq!(setting.validate("1h"), Ok(()));
+            assert_eq!(setting.validate("3600"), Ok(()));
+            assert!(setting.validate("0").is_err());
+            assert!(setting.validate("an hour").is_err());
+        }
+    }
+
+    #[test]
+    fn the_schedule_setting_is_validated() {
+        let setting = Setting::AutoUpdateInterval;
+        assert_eq!(setting.validate(""), Ok(()));
+        assert_eq!(setting.validate("H 3 * * *"), Ok(()));
+        assert!(setting.validate("0 0 3 * * *").is_err());
+        assert!(setting.validate("daily").is_err());
+    }
 
     /// The guard on the drift described on [`Setting::ALL`]: a variant left out
     /// of that list is unreachable by key, which is exactly how two settings

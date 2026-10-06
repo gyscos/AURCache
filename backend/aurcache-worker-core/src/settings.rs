@@ -291,7 +291,7 @@ impl WorkerSettings {
     #[must_use]
     pub fn list(&self, key: &str) -> Vec<String> {
         self.raw(key)
-            .map(crate::config::parse_arches)
+            .map(crate::config::parse_list)
             .unwrap_or_default()
     }
 

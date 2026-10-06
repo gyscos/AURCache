@@ -41,6 +41,19 @@ pub struct Cache {
     volumes: Option<aurcache_chroot::CacheVolumes>,
 }
 
+/// What [`Cache::discard_builddir`] did with a package's build tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Discard {
+    /// The tree was there and is gone.
+    Removed,
+    /// There was no tree: the build failed before making one, or a keep took
+    /// it.
+    #[default]
+    Absent,
+    /// The tree was there and could not be removed.
+    Failed,
+}
+
 /// A per-pkgbase source cache entry considered for eviction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -142,11 +155,7 @@ impl Cache {
     /// when there is neither. Never walks or creates anything.
     #[must_use]
     pub fn build_tree_size(&self, platform: &str, pkgbase: &str) -> Option<u64> {
-        let tree = self
-            .root
-            .join("builddir")
-            .join(sanitize(platform))
-            .join(sanitize(pkgbase));
+        let tree = self.builddir_tree_path(platform, pkgbase);
         self.entry_size(&tree).or_else(|| {
             std::fs::read_to_string(self.size_stamp(platform, pkgbase))
                 .ok()?
@@ -376,18 +385,21 @@ impl Cache {
     /// Best-effort, like every other wipe here: the next build rebuilds over
     /// -- or without -- whatever this leaves. Blocking: run it off the async
     /// runtime.
-    pub fn discard_builddir(&self, platform: &str, pkgbase: &str) -> bool {
+    pub fn discard_builddir(&self, platform: &str, pkgbase: &str) -> Discard {
         // The stamp goes whether or not a tree is left: a keep may have taken
         // the tree already, and the stamp describes a tree that is gone.
         let _ = std::fs::remove_file(self.size_stamp(platform, pkgbase));
         let tree = self.builddir_tree_path(platform, pkgbase);
         if tree.symlink_metadata().is_err() {
-            return false;
+            return Discard::Absent;
         }
-        if let Err(e) = self.remove_entry(&tree) {
-            tracing::warn!("could not discard build tree {}: {e}", tree.display());
+        match self.remove_entry(&tree) {
+            Ok(()) => Discard::Removed,
+            Err(e) => {
+                tracing::warn!("could not discard build tree {}: {e}", tree.display());
+                Discard::Failed
+            }
         }
-        true
     }
 
     /// Where a package's persistent tree is, whether or not it exists; never
@@ -423,12 +435,7 @@ impl Cache {
 
     /// Discard a job's keyring replica when its build ends.
     pub fn wipe_gnupg_job(&self, label: &str) {
-        let path = self.root.join(format!("gnupg-{label}"));
-        if let Err(e) = std::fs::remove_dir_all(&path)
-            && path.exists()
-        {
-            tracing::warn!("could not wipe job keyring {}: {e}", path.display());
-        }
+        wipe_dir(&self.root.join(format!("gnupg-{label}")), "job keyring");
     }
 
     /// Shared pacman package cache, bound **read-only** into every chroot as
@@ -450,12 +457,10 @@ impl Cache {
 
     /// Discard a job's private pacman cache once its packages are promoted.
     pub fn wipe_pacman_pkg_job(&self, label: &str) {
-        let path = self.root.join(format!("pacman-pkg-{label}"));
-        if let Err(e) = std::fs::remove_dir_all(&path)
-            && path.exists()
-        {
-            tracing::warn!("could not wipe job pkg cache {}: {e}", path.display());
-        }
+        wipe_dir(
+            &self.root.join(format!("pacman-pkg-{label}")),
+            "job pkg cache",
+        );
     }
 
     /// Move a job's freshly downloaded packages into the shared cache so the
@@ -596,27 +601,27 @@ impl Cache {
                 .collect()
         };
         let mut removed = 0;
-        let mut suspects: Vec<(String, String)> = Vec::new();
-        let mut absent: Vec<(String, String)> = Vec::new();
+        let mut suspects: Vec<Suspect> = Vec::new();
+        let mut absent: Vec<Suspect> = Vec::new();
         let mut stale: Vec<String> = Vec::new();
         for (name, RepoDbEntry { csize, sha256: sha }) in todo {
             match std::fs::metadata(shared.join(&name)) {
                 // Nothing cached; nothing to verify until some promote
                 // actually lands the file.
-                Err(_) => absent.push((name, sha)),
+                Err(_) => absent.push(Suspect { name, sha256: sha }),
                 Ok(meta) if meta.len() != csize => {
                     if remove_cached(&shared, &name) {
                         removed += 1;
                     }
                     stale.push(name);
                 }
-                Ok(_) => suspects.push((name, sha)),
+                Ok(_) => suspects.push(Suspect { name, sha256: sha }),
             }
         }
         {
             let mut known = verified_lock();
-            for (name, sha) in absent {
-                known.insert((shared.clone(), name), sha);
+            for suspect in absent {
+                known.insert((shared.clone(), suspect.name), suspect.sha256);
             }
             for name in stale {
                 known.remove(&(shared.clone(), name));
@@ -628,11 +633,11 @@ impl Cache {
         let verdicts = hash_suspects(&shared, &suspects);
         {
             let mut known = verified_lock();
-            for ((name, sha), matches) in verdicts {
-                let key = (shared.clone(), name.clone());
+            for Verdict { suspect, matches } in verdicts {
+                let key = (shared.clone(), suspect.name.clone());
                 if matches {
-                    known.insert(key, sha.clone());
-                } else if remove_cached(&shared, name) {
+                    known.insert(key, suspect.sha256.clone());
+                } else if remove_cached(&shared, &suspect.name) {
                     removed += 1;
                     known.remove(&key);
                 }
@@ -674,14 +679,6 @@ impl Cache {
         plan
     }
 
-    /// Create a cache directory, group-writable.
-    ///
-    /// These directories are created by the worker but written by *builds*,
-    /// which run as a different user (see `Config::build_user`). The parent is
-    /// setgid so the group is inherited, but the mode is not: with a default
-    /// umask the new directory would be `rwxr-xr-x` and owned by the worker,
-    /// and devtools would fail with "You do not have write permission for the
-    /// directory $SRCDEST". Group write is what bridges the two users.
     /// Like [`Self::ensured`], but for a directory the build user reads rather
     /// than writes: `0755` instead of group-writable.
     fn ensured_readable(path: PathBuf) -> Option<PathBuf> {
@@ -705,6 +702,14 @@ impl Cache {
         }
     }
 
+    /// Create a cache directory, group-writable.
+    ///
+    /// These directories are created by the worker but written by *builds*,
+    /// which run as a different user (see `Config::build_user`). The parent is
+    /// setgid so the group is inherited, but the mode is not: with a default
+    /// umask the new directory would be `rwxr-xr-x` and owned by the worker,
+    /// and devtools would fail with "You do not have write permission for the
+    /// directory $SRCDEST". Group write is what bridges the two users.
     fn ensured(path: PathBuf) -> Option<PathBuf> {
         match std::fs::create_dir_all(&path) {
             Ok(()) => {
@@ -868,6 +873,15 @@ impl Cache {
     }
 }
 
+/// Remove a per-job directory, warning only if it is still there afterwards.
+fn wipe_dir(path: &Path, what: &str) {
+    if let Err(e) = std::fs::remove_dir_all(path)
+        && path.exists()
+    {
+        tracing::warn!("could not wipe {what} {}: {e}", path.display());
+    }
+}
+
 /// True for a finished package archive (not an in-flight `.part` download,
 /// and not a detached signature, which is evicted with its package).
 fn is_package_artifact(name: &str) -> bool {
@@ -909,16 +923,10 @@ const PARALLEL_HASH_THRESHOLD: usize = 8;
 /// positional answer would then shift every later one onto the wrong file --
 /// removing a good archive, or vouching for a stale one. Paired, a lost verdict
 /// is only a file left unverified until the next pass.
-fn hash_suspects<'a>(
-    shared: &Path,
-    suspects: &'a [(String, String)],
-) -> Vec<(&'a (String, String), bool)> {
-    let verdict = |suspect: &'a (String, String)| {
-        let (name, sha) = suspect;
-        (
-            suspect,
-            sha256_file(&shared.join(name)).is_ok_and(|got| &got == sha),
-        )
+fn hash_suspects<'a>(shared: &Path, suspects: &'a [Suspect]) -> Vec<Verdict<'a>> {
+    let verdict = |suspect: &'a Suspect| Verdict {
+        suspect,
+        matches: sha256_file(&shared.join(&suspect.name)).is_ok_and(|got| got == suspect.sha256),
     };
     if suspects.len() < PARALLEL_HASH_THRESHOLD {
         return suspects.iter().map(verdict).collect();
@@ -940,6 +948,19 @@ fn hash_suspects<'a>(
             .flat_map(|t| t.join().unwrap_or_default())
             .collect()
     })
+}
+
+/// A cached archive whose `repo.db` entry has not been verified against it.
+struct Suspect {
+    name: String,
+    /// What `repo.db` says its sha256 is.
+    sha256: String,
+}
+
+/// Whether a [`Suspect`]'s bytes hash to what `repo.db` says.
+struct Verdict<'a> {
+    suspect: &'a Suspect,
+    matches: bool,
 }
 
 /// A package archive whose stored bytes no longer match its `repo.db` entry.
@@ -999,8 +1020,8 @@ pub fn parse_repo_db(db: &[u8]) -> anyhow::Result<RepoDb> {
         }
         let mut text = String::new();
         entry.read_to_string(&mut text)?;
-        if let Some((filename, entry)) = parse_desc(&text) {
-            out.insert(filename, entry);
+        if let Some(desc) = parse_desc(&text) {
+            out.insert(desc.filename, desc.entry);
         }
     }
     Ok(out)
@@ -1010,7 +1031,7 @@ pub fn parse_repo_db(db: &[u8]) -> anyhow::Result<RepoDb> {
 /// `desc` file. A field is
 /// one line plus one following value line, so values use the same `i+1` shape
 /// as every other field parser in this repository.
-fn parse_desc(desc: &str) -> Option<(String, RepoDbEntry)> {
+fn parse_desc(desc: &str) -> Option<Desc> {
     // Peeking, not indexing: the value is the line after the field header,
     // and collecting every line only to index `i + 1` is one allocation per
     // package entry in every `repo.db` parse.
@@ -1027,13 +1048,19 @@ fn parse_desc(desc: &str) -> Option<(String, RepoDbEntry)> {
             _ => {}
         }
     }
-    Some((
-        filename?,
-        RepoDbEntry {
+    Some(Desc {
+        filename: filename?,
+        entry: RepoDbEntry {
             csize: size?,
             sha256: sha?,
         },
-    ))
+    })
+}
+
+/// One package's `desc` in a `repo.db`, as far as the cache needs it.
+struct Desc {
+    filename: String,
+    entry: RepoDbEntry,
 }
 
 /// One cache entry per package file. `last_used` is the file's mtime, which for
@@ -1378,20 +1405,21 @@ mod pkgcache_tests {
         write(&tree.join("src/deep/blob"), 10);
         c.write_size_stamp("x86_64", "gone", 1000);
 
-        assert!(c.discard_builddir("x86_64", "gone"));
+        assert_eq!(c.discard_builddir("x86_64", "gone"), Discard::Removed);
         assert!(!tree.exists(), "the tree goes");
         assert!(
             !c.size_stamp("x86_64", "gone").exists(),
             "its stamp goes with it"
         );
-        assert!(
-            !c.discard_builddir("x86_64", "never-there"),
+        assert_eq!(
+            c.discard_builddir("x86_64", "never-there"),
+            Discard::Absent,
             "nothing there, nothing discarded"
         );
 
         // A tree a keep already took leaves its stamp behind: it goes too.
         c.write_size_stamp("x86_64", "taken", 1000);
-        assert!(!c.discard_builddir("x86_64", "taken"));
+        assert_eq!(c.discard_builddir("x86_64", "taken"), Discard::Absent);
         assert!(!c.size_stamp("x86_64", "taken").exists());
     }
 

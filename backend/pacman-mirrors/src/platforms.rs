@@ -104,18 +104,6 @@ impl FromStr for Platform {
     }
 }
 
-/// A wrapper type that can be iterated over to yield all Platform variants.
-pub struct Platforms;
-
-impl IntoIterator for Platforms {
-    type Item = Platform;
-    type IntoIter = std::array::IntoIter<Platform, 3>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        [Platform::X86_64, Platform::Aarch64, Platform::Armv7h].into_iter()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::Platform;

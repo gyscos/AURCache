@@ -1,6 +1,7 @@
 use anyhow::Context;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
+use aurcache_common::api::stats::ApiTokenResponse;
 use aurcache_db::api_tokens;
 use aurcache_db::prelude::ApiTokens;
 use rand::rngs::SysRng;
@@ -16,7 +17,6 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use sha2::{Digest, Sha256};
 use tracing::{debug, error};
 use utoipa::OpenApi;
-use utoipa::ToSchema;
 
 use crate::models::authenticated::Authenticated;
 use crate::utils::config::{allowed_users, is_user_allowed};
@@ -35,11 +35,6 @@ pub struct OauthUserInfo {
     /// allowlist has no use for it. When a list *is* configured, an absent
     /// address is refused -- see [`is_user_allowed`].
     pub email: Option<String>,
-}
-
-#[derive(serde::Serialize, ToSchema)]
-pub struct ApiTokenResponse {
-    pub token: String,
 }
 
 // Intentionally unsalted: unlike passwords, API tokens are generated
@@ -146,11 +141,6 @@ pub async fn oauth_callback(
     cookies: &CookieJar<'_>,
     al: &State<ActivityLog>,
 ) -> Result<Redirect, Unauthorized<String>> {
-    // Nothing is written to the cookie jar until the user has been identified
-    // *and* allowed. Rocket applies jar changes to the response whatever this
-    // function returns, and `Authenticated` treats the mere presence of the
-    // `token` cookie as a valid session -- so setting it before the check would
-    // hand a refused user a working session along with their rejection.
     // One process-wide client: building one per login buys nothing (no
     // per-request configuration) and costs a connection pool each time.
     static OAUTH_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -174,6 +164,11 @@ pub async fn oauth_callback(
     let real_name = user_info.name;
     let email = user_info.email.as_deref();
 
+    // Nothing is written to the cookie jar until the user has been identified
+    // *and* allowed. Rocket applies jar changes to the response whatever this
+    // function returns, and `Authenticated` treats the mere presence of the
+    // `token` cookie as a valid session -- so setting it before the check would
+    // hand a refused user a working session along with their rejection.
     if !is_user_allowed(allowed_users().as_deref(), email) {
         // Logged at warn: on a server that restricts sign-in, someone being
         // turned away is worth seeing, and the operator locking themselves out

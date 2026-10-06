@@ -36,8 +36,6 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'\\')
     .add(b'%');
 
-use crate::identity::spki_fingerprint;
-
 /// How long to wait for a TCP+TLS connection to establish before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a request may wait for its answer. A silently stalled connection
@@ -54,6 +52,36 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often an idle connection is probed. What notices a dead server during
 /// an artifact upload, which has no response deadline to do it.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// Sending a request and requiring a success.
+trait SendChecked {
+    /// Send, failing on a transport error or a status other than success.
+    ///
+    /// A refusal carries the server's own reason: the server explains what it
+    /// refuses in the body, and `error_for_status` would drop that, leaving a
+    /// bare "403 Forbidden" with nothing about which check failed.
+    async fn send_checked(self, what: &str) -> Result<reqwest::Response>;
+}
+
+impl SendChecked for reqwest::RequestBuilder {
+    async fn send_checked(self, what: &str) -> Result<reqwest::Response> {
+        let response = self
+            .send()
+            .await
+            .with_context(|| format!("{what} request"))?;
+        let status = response.status();
+        if status.is_success() || status == StatusCode::NOT_MODIFIED {
+            return Ok(response);
+        }
+        // The body read can fail too (connection dropped mid-error); say that
+        // instead of blaming the server with an empty reason.
+        let reason = match response.text().await {
+            Ok(body) => body.trim().to_string(),
+            Err(e) => format!("<error body unreadable: {e}>"),
+        };
+        bail!("{what} rejected: {status}: {reason}")
+    }
+}
 
 /// A configured protocol client bound to a base URL.
 pub struct WorkerClient {
@@ -88,18 +116,15 @@ pub async fn fetch_and_pin_ca(base: &str, pin: Option<&str>) -> Result<String> {
 
     let ca_pem = insecure
         .get(format!("{base}/api/worker/ca"))
-        .send()
-        .await
-        .context("fetching CA certificate")?
-        .error_for_status()
-        .context("CA endpoint returned error")?
+        .send_checked("CA certificate")
+        .await?
         .text()
         .await
         .context("reading CA certificate")?;
 
     let actual = ca_fingerprint(&ca_pem)?;
     if let Some(expected) = pin {
-        let expected = expected.to_lowercase().replace([':', ' '], "");
+        let expected = aurcache_ca::normalize_fingerprint(expected);
         if actual != expected {
             bail!(
                 "server CA fingerprint mismatch: expected {expected}, got {actual} \
@@ -116,28 +141,10 @@ pub async fn fetch_and_pin_ca(base: &str, pin: Option<&str>) -> Result<String> {
     Ok(ca_pem)
 }
 
-/// SHA-256 fingerprint of a PEM certificate's DER body.
-///
-/// This hashes the whole certificate DER (matching the server's
-/// `ca_cert_fingerprint`, which also hashes the full DER — not the SPKI).
-/// [`spki_fingerprint`] simply hashes the bytes it is given, so passing the
-/// full cert DER yields the certificate fingerprint.
+/// SHA-256 fingerprint of a PEM certificate: the same function the server
+/// logs its CA fingerprint with, so a pinned value always matches.
 fn ca_fingerprint(pem: &str) -> Result<String> {
-    let der = pem_to_der(pem).context("decoding CA PEM")?;
-    Ok(spki_fingerprint(&der))
-}
-
-/// Decode the first CERTIFICATE block with an established PEM parser.
-///
-/// The label matters: the previous hand-rolled scan accepted *any* block, so
-/// a private-key file decoded fine and failed obscurely downstream in
-/// `ca_fingerprint` instead of here.
-fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
-    use rustls_pki_types::CertificateDer;
-    use rustls_pki_types::pem::PemObject;
-    let cert = CertificateDer::from_pem_slice(pem.as_bytes())
-        .map_err(|e| anyhow::anyhow!("no CERTIFICATE block in the CA PEM: {e}"))?;
-    Ok(cert.to_vec())
+    aurcache_ca::cert_fingerprint(pem).context("decoding CA PEM")
 }
 
 impl WorkerClient {
@@ -212,11 +219,8 @@ impl WorkerClient {
             .http
             .post(self.url("/register"))
             .json(req)
-            .send()
-            .await
-            .context("register request")?
-            .error_for_status()
-            .context("register rejected")?;
+            .send_checked("register")
+            .await?;
         resp.json().await.context("decoding register status")
     }
 
@@ -225,11 +229,8 @@ impl WorkerClient {
         let resp = self
             .http
             .get(self.url(&format!("/register/{fingerprint}/status")))
-            .send()
-            .await
-            .context("status request")?
-            .error_for_status()
-            .context("status rejected")?;
+            .send_checked("status")
+            .await?;
         resp.json().await.context("decoding register status")
     }
 
@@ -263,11 +264,8 @@ impl WorkerClient {
         let resp = self
             .http
             .get(self.url(&format!("/jobs/{build_id}/source")))
-            .send()
-            .await
-            .context("source request")?
-            .error_for_status()
-            .context("source rejected")?;
+            .send_checked("source")
+            .await?;
         Ok(resp.bytes().await.context("reading source")?.to_vec())
     }
 
@@ -276,11 +274,8 @@ impl WorkerClient {
         self.http
             .post(self.url(&format!("/jobs/{build_id}/logs")))
             .body(text.to_string())
-            .send()
-            .await
-            .context("log request")?
-            .error_for_status()
-            .context("log rejected")?;
+            .send_checked("log")
+            .await?;
         Ok(())
     }
 
@@ -303,11 +298,8 @@ impl WorkerClient {
                 build_id,
                 message: message.to_string(),
             })
-            .send()
-            .await
-            .context("worker log request")?
-            .error_for_status()
-            .context("worker log rejected")?;
+            .send_checked("worker log")
+            .await?;
         Ok(())
     }
 
@@ -342,17 +334,7 @@ impl WorkerClient {
         if let Some(len) = len {
             request = request.header(reqwest::header::CONTENT_LENGTH, len);
         }
-        let response = request.send().await.context("artifact request")?;
-        let status = response.status();
-        if !status.is_success() {
-            // The body read can fail too (connection dropped mid-error);
-            // say that instead of blaming the server with an empty reason.
-            let reason = match response.text().await {
-                Ok(body) => body.trim().to_string(),
-                Err(e) => format!("<error body unreadable: {e}>"),
-            };
-            anyhow::bail!("artifact rejected: {status}: {reason}");
-        }
+        request.send_checked("artifact").await?;
         Ok(())
     }
 
@@ -361,11 +343,8 @@ impl WorkerClient {
         self.http
             .post(self.url(&format!("/jobs/{build_id}/complete")))
             .json(report)
-            .send()
-            .await
-            .context("complete request")?
-            .error_for_status()
-            .context("complete rejected")?;
+            .send_checked("complete")
+            .await?;
         Ok(())
     }
 
@@ -382,11 +361,8 @@ impl WorkerClient {
             .http
             .post(self.url("/heartbeat"))
             .json(hb)
-            .send()
-            .await
-            .context("heartbeat request")?
-            .error_for_status()
-            .context("heartbeat rejected")?;
+            .send_checked("heartbeat")
+            .await?;
         // A transport failure here is not "the server said nothing": an empty
         // answer from an old server still parses as healthy (see the test),
         // but a body we failed to read must not refresh the lease watchdog.
@@ -399,11 +375,8 @@ impl WorkerClient {
         let resp = self
             .http
             .get(self.url(&format!("/jobs/{build_id}/status")))
-            .send()
-            .await
-            .context("job status request")?
-            .error_for_status()
-            .context("job status rejected")?;
+            .send_checked("job status")
+            .await?;
         resp.json().await.context("decoding job status")
     }
 
@@ -428,12 +401,7 @@ impl WorkerClient {
         if let Some(last_modified) = last_modified {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
         }
-        let resp = req
-            .send()
-            .await
-            .context("conditional GET request")?
-            .error_for_status()
-            .context("conditional GET rejected")?;
+        let resp = req.send_checked("conditional GET").await?;
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(ConditionalGet {
                 body: None,
@@ -499,23 +467,23 @@ mod tests {
         assert_eq!(parse_heartbeat_response(br#"{"cancel":[3]}"#).cancel, [3]);
     }
 
+    /// A CA fingerprint is the hash of the certificate block's body.
     #[test]
-    fn pem_decodes_single_block() {
+    fn a_ca_fingerprint_hashes_the_certificate_block() {
         // "foobar" base64 wrapped as a fake cert block.
         let pem = "-----BEGIN CERTIFICATE-----\nZm9vYmFy\n-----END CERTIFICATE-----\n";
-        assert_eq!(pem_to_der(pem).unwrap(), b"foobar");
+        assert_eq!(
+            ca_fingerprint(pem).unwrap(),
+            "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2"
+        );
     }
 
-    /// The label is the point: a private-key block must not decode as a
-    /// certificate and fail obscurely downstream.
+    /// The label is the point: a private-key block must not be fingerprinted
+    /// as a certificate and fail obscurely when the pin never matches.
     #[test]
-    fn pem_rejects_non_certificate_blocks() {
+    fn a_ca_fingerprint_refuses_other_blocks() {
         let key = "-----BEGIN PRIVATE KEY-----\nZm9vYmFy\n-----END PRIVATE KEY-----\n";
-        assert!(pem_to_der(key).is_err());
-    }
-
-    #[test]
-    fn pem_without_block_errors() {
-        assert!(pem_to_der("not a pem").is_err());
+        assert!(ca_fingerprint(key).is_err());
+        assert!(ca_fingerprint("not a pem").is_err());
     }
 }

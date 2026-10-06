@@ -9,12 +9,6 @@ pub use aurcache_deps::{parse_dep, satisfies_constraint};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraint(pub VersionRequirement);
 
-impl Constraint {
-    pub fn is_satisfied(&self, version: &Version) -> bool {
-        self.0.is_satisfied_by(version)
-    }
-}
-
 impl std::fmt::Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -243,7 +237,7 @@ pub fn self_provided_names(
     names.extend(
         provides
             .iter()
-            .map(|provide| parse_dep(provide).0)
+            .map(|provide| parse_dep(provide).name)
             .filter(|name| !name.is_empty())
             .map(str::to_string),
     );
@@ -286,46 +280,53 @@ impl DependencySet {
             constraints: HashMap::new(),
         };
         for dep in deps {
-            let (name, constraint) = parse_dep(dep);
+            let dep = parse_dep(dep);
             // The constraint map's keys are exactly the dependency set, so a
             // membership check there is the dedupe.
-            if !set.constraints.contains_key(name) {
-                set.names.push(name.to_string());
+            if !set.constraints.contains_key(dep.name) {
+                set.names.push(dep.name.to_string());
             }
-            merge_constraint_into(&mut set.constraints, name, parse_dep_constraint(constraint))?;
+            merge_constraint_into(
+                &mut set.constraints,
+                dep.name,
+                parse_dep_constraint(dep.constraint),
+            )?;
         }
         Ok(set)
     }
 
-    /// The constraint recorded for `name`, in the plain string form that both
-    /// resolution and the `dependencies` rows use: comma-joined when a range
-    /// was declared. Empty means unversioned.
+    /// Every dependency in declared order, with its constraint in the plain
+    /// string form that both resolution and the `dependencies` rows use.
     #[must_use]
-    pub fn constraint_of(&self, name: &str) -> String {
-        self.constraints
-            .get(name)
-            .map(|bounds| join_constraints(bounds))
-            .unwrap_or_default()
-    }
-
-    /// Name/constraint pairs in declared order, ready to borrow
-    /// [`aurcache_deps::Dependency`] values from.
-    #[must_use]
-    pub fn to_pairs(&self) -> Vec<(String, String)> {
+    pub fn declared(&self) -> Vec<Declared> {
         self.names
             .iter()
-            .map(|name| (name.clone(), self.constraint_of(name)))
+            .map(|name| Declared {
+                name: name.clone(),
+                constraint: self
+                    .constraints
+                    .get(name)
+                    .map(|bounds| join_constraints(bounds))
+                    .unwrap_or_default(),
+            })
             .collect()
     }
 }
 
-/// Borrow a [`DependencySet::to_pairs`] result as resolver input.
-#[must_use]
-pub fn as_dependencies(pairs: &[(String, String)]) -> Vec<aurcache_deps::Dependency<'_>> {
-    pairs
-        .iter()
-        .map(|(name, constraint)| aurcache_deps::Dependency::new(name, constraint))
-        .collect()
+/// One declared dependency, owning what an [`aurcache_deps::Dependency`]
+/// borrows.
+pub struct Declared {
+    pub name: String,
+    /// Comma-joined when a range was declared; empty when unversioned.
+    pub constraint: String,
+}
+
+impl Declared {
+    /// This dependency as resolver input.
+    #[must_use]
+    pub fn as_dependency(&self) -> aurcache_deps::Dependency<'_> {
+        aurcache_deps::Dependency::new(&self.name, &self.constraint)
+    }
 }
 
 pub fn parse_dep_constraint(constraint: &str) -> Option<Constraint> {
@@ -484,30 +485,24 @@ mod tests {
 /// platforms that *are* valid.
 #[must_use]
 pub fn architectures_for_platforms(platforms: &str) -> Vec<alpm_types::SystemArchitecture> {
-    use alpm_types::SystemArchitecture;
-    use pacman_mirrors::platforms::Platform;
-
-    Platform::parse_many(platforms)
+    pacman_mirrors::platforms::Platform::parse_many(platforms)
         .filter_map(Result::ok)
-        .map(|platform| match platform {
-            Platform::X86_64 => SystemArchitecture::X86_64,
-            Platform::Aarch64 => SystemArchitecture::Aarch64,
-            Platform::Armv7h => SystemArchitecture::Armv7h,
-        })
+        .map(architecture)
         .collect()
 }
 
-/// The platform names in a stored `platforms` string.
-///
-/// Dependency resolution scopes AURCache's own repository by these, since it
-/// is stored one directory per platform and another platform's build cannot
-/// satisfy this one's.
+/// The alpm architecture a platform builds for.
 #[must_use]
-pub fn platform_names(platforms: &str) -> Vec<String> {
-    pacman_mirrors::platforms::Platform::parse_many(platforms)
-        .filter_map(Result::ok)
-        .map(|platform| platform.as_str().to_string())
-        .collect()
+pub const fn architecture(
+    platform: pacman_mirrors::platforms::Platform,
+) -> alpm_types::SystemArchitecture {
+    use alpm_types::SystemArchitecture;
+    use pacman_mirrors::platforms::Platform;
+    match platform {
+        Platform::X86_64 => SystemArchitecture::X86_64,
+        Platform::Aarch64 => SystemArchitecture::Aarch64,
+        Platform::Armv7h => SystemArchitecture::Armv7h,
+    }
 }
 
 #[cfg(test)]

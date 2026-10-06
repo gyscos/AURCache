@@ -10,7 +10,6 @@
 //! `post_startup_tasks` fills those in from the filesystem; until it does, the
 //! page shows the size as unknown instead of claiming the file is empty.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -24,7 +23,7 @@ impl MigrationTrait for Migration {
         // Signed because both backends' integers are signed, and a bad value
         // is better read as negative than wrapped into a plausible-looking
         // huge one.
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table files add size BIGINT;",
             DbBackend::Postgres => "ALTER TABLE files ADD COLUMN size BIGINT;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -35,7 +34,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table files drop column size;",
             DbBackend::Postgres => "ALTER TABLE files DROP COLUMN size;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

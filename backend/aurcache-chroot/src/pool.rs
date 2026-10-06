@@ -86,8 +86,41 @@ impl Owner {
         }
     }
 
+    /// A user's uid and primary gid, by name.
+    ///
+    /// Through the passwd *database*, not `/etc/passwd`: the file is only one
+    /// source, and accounts that come from LDAP, sssd or systemd-homed have no
+    /// line in it. `None` when there is no such user.
+    #[must_use]
+    pub fn of_user(name: &str) -> Option<Self> {
+        let name = std::ffi::CString::new(name).ok()?;
+        // SAFETY: `passwd` is plain data, and all-zero is a valid value of it.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        // Generous enough for any real entry; `getpwnam_r` reports ERANGE
+        // rather than overrunning it, and that reads as "no such user".
+        let mut buf = vec![0 as libc::c_char; 16 * 1024];
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and outlives the call, `pwd` and
+        // `found` are valid out-parameters, and `buf` is the scratch space the
+        // call is told the length of. The `_r` form keeps its result in ours
+        // rather than in static storage, so concurrent callers do not race.
+        let rc = unsafe {
+            libc::getpwnam_r(
+                name.as_ptr(),
+                &raw mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut found,
+            )
+        };
+        (rc == 0 && !found.is_null()).then_some(Self {
+            uid: pwd.pw_uid,
+            gid: pwd.pw_gid,
+        })
+    }
+
     /// `uid:gid`, as `chown` takes it.
-    fn chown_spec(self) -> String {
+    pub(crate) fn chown_spec(self) -> String {
         format!("{}:{}", self.uid, self.gid)
     }
 }
@@ -1049,7 +1082,7 @@ impl Pool {
             if self.fits_under_total(need) {
                 return;
             }
-            if self.remove_oldest_kept().await {
+            if self.remove_oldest_kept().await.is_some() {
                 self.settle_quotas().await;
                 continue;
             }
@@ -1087,8 +1120,9 @@ impl Pool {
         let _ = self.btrfs(&["filesystem", "sync"]).await;
     }
 
-    /// Delete the oldest kept failure. `false` when there is none.
-    async fn remove_oldest_kept(&self) -> bool {
+    /// Delete the oldest kept failure, returning its build id; `None` when
+    /// there is none.
+    async fn remove_oldest_kept(&self) -> Option<i32> {
         // By when it was kept, then by id so the choice is stable. One whose
         // time cannot be read counts as oldest.
         let oldest = self.pool_builds().kept.into_iter().min_by_key(|&id| {
@@ -1097,12 +1131,10 @@ impl Pool {
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             (touched, id)
         });
-        let Some(id) = oldest else {
-            return false;
-        };
+        let id = oldest?;
         tracing::info!("reclaiming kept failure {id} for room");
         self.remove_kept(id).await;
-        true
+        Some(id)
     }
 
     /// The builds named at the pool's top: live ones (`job-*`, from entries

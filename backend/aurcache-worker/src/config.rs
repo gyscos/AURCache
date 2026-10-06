@@ -112,6 +112,7 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| core.data_dir.join("chroot"));
 
+        let pool = env_opt("WORKER_POOL").map(PathBuf::from);
         let mut cfg = Self {
             git_ssh_key: env_opt("WORKER_GIT_SSH_KEY").map(PathBuf::from),
             ssh_known_hosts: env_opt("WORKER_SSH_KNOWN_HOSTS").map(PathBuf::from),
@@ -119,18 +120,14 @@ impl Config {
                 .map(|raw| crate::credentials::parse_bind_mounts(&raw))
                 .unwrap_or_default(),
             chroot_dir: chroot_dir.clone(),
-            cache_dir: pool_mountpoint(env_opt("WORKER_POOL").map(PathBuf::from), &chroot_dir)
-                .join(CACHE_SUBVOLUME),
+            cache_dir: pool_mountpoint(pool.clone(), &chroot_dir).join(CACHE_SUBVOLUME),
             build_user: env_opt("WORKER_BUILD_USER").unwrap_or_else(|| "builder".to_string()),
             pool_backing: pool_backing(
-                env_opt("WORKER_POOL").map(PathBuf::from),
+                pool.clone(),
                 env_opt("WORKER_DISK_RESERVE").is_some_and(|v| truthy(&v)),
                 &chroot_dir,
             ),
-            pool_mountpoint: pool_mountpoint(
-                env_opt("WORKER_POOL").map(PathBuf::from),
-                &chroot_dir,
-            ),
+            pool_mountpoint: pool_mountpoint(pool, &chroot_dir),
             // Filled in from the settings just below, by the same code that
             // fills them in again whenever the server delivers new values.
             keyserver: String::new(),
@@ -167,7 +164,8 @@ impl Config {
     /// sources into it as that user, and the worker through the group.
     #[must_use]
     pub fn cache_owner(&self) -> aurcache_chroot::Owner {
-        user_ids(&self.build_user).unwrap_or_else(aurcache_chroot::Owner::current)
+        aurcache_chroot::Owner::of_user(&self.build_user)
+            .unwrap_or_else(aurcache_chroot::Owner::current)
     }
 
     /// How to open the storage pool, with the current total.
@@ -270,29 +268,6 @@ fn pool_mountpoint(pool: Option<PathBuf>, chroot_dir: &Path) -> PathBuf {
 
 /// The subvolume the caches live in, at the pool's top.
 pub const CACHE_SUBVOLUME: &str = "cache";
-
-/// A user's uid and primary gid.
-fn user_ids(name: &str) -> Option<aurcache_chroot::Owner> {
-    let name = std::ffi::CString::new(name).ok()?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: every pointer is valid for the call, `buf` outlives it, and
-    // `result` is only read after it returns.
-    let rc = unsafe {
-        libc::getpwnam_r(
-            name.as_ptr(),
-            &raw mut pwd,
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            &raw mut result,
-        )
-    };
-    (rc == 0 && !result.is_null()).then_some(aurcache_chroot::Owner {
-        uid: pwd.pw_uid,
-        gid: pwd.pw_gid,
-    })
-}
 
 fn truthy(value: &str) -> bool {
     matches!(
@@ -504,10 +479,13 @@ mod tests {
     #[test]
     fn a_users_ids_are_looked_up_by_name() {
         assert_eq!(
-            user_ids("root"),
+            aurcache_chroot::Owner::of_user("root"),
             Some(aurcache_chroot::Owner { uid: 0, gid: 0 })
         );
-        assert_eq!(user_ids("no-such-user-aurcache-test"), None);
+        assert_eq!(
+            aurcache_chroot::Owner::of_user("no-such-user-aurcache-test"),
+            None
+        );
     }
 
     #[test]

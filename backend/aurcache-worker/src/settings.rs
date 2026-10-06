@@ -14,7 +14,7 @@
 //! choosing what runs where. See `design/implemented/worker-configuration.md`.
 
 use aurcache_common::worker_config::{Applies, ValueKind};
-use aurcache_worker_core::settings::{Builtin, SettingSpec, WorkerSettings};
+use aurcache_worker_core::settings::{Builtin, SettingSpec};
 
 /// Keys of the settings this executor accepts.
 pub mod keys {
@@ -232,13 +232,6 @@ pub fn chroot_settings() -> Vec<SettingSpec> {
             default: Builtin::Unset,
         },
     ]
-}
-
-/// Everything this worker declares: the protocol settings plus its own.
-#[must_use]
-pub fn declared() -> WorkerSettings {
-    WorkerSettings::from_env(aurcache_worker_core::settings::protocol_settings())
-        .extended(chroot_settings())
 }
 
 #[cfg(test)]

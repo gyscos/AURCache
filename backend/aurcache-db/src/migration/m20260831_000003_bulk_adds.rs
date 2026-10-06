@@ -10,7 +10,6 @@
 //! way a build log is. Storing outcomes as lines rather than as rows keeps
 //! the reader a single query and matches how build output already works.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -23,7 +22,7 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
         // `finished_at` NULL means still running. A job whose server died is
         // closed out at startup rather than left claiming to be running.
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "CREATE TABLE IF NOT EXISTS bulk_adds (\
                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, \

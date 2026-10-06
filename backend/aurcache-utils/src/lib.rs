@@ -10,8 +10,13 @@ pub mod pkgbuild;
 pub mod publish;
 pub mod repository;
 pub mod restore;
+pub mod scheduled;
 pub mod services;
 pub mod settings;
 pub mod snapshot;
 pub mod vcs_check;
 pub mod worker_complete;
+/// Telling the logs about builds taken back from their workers.
+pub mod abandoned;
+/// How the server polices remote workers, read once from its environment.
+pub mod worker_policy;

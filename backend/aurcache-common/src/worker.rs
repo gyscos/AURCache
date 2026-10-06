@@ -265,7 +265,7 @@ pub struct HeartbeatResponse {
 ///
 /// A report with `success == false` (including OOM / non-zero exit) is a
 /// deterministic failure and marks the build FAILED without re-enqueue.
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct CompleteReport {
     pub success: bool,
     /// Exit code of the build process (e.g. 137 for an OOM kill), when known.

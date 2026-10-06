@@ -5,7 +5,7 @@
 //! backup, or putting one back.
 
 use crate::screens::settings::Section;
-use aurcache_client::{RestoreEntry, RestoreOutcome};
+use aurcache_client::{ExistingPackagePolicy, RestoreEntry, RestoreOutcome, SecretsPolicy};
 use dioxus::html::{FileData, HasFileData};
 use dioxus::prelude::*;
 
@@ -122,32 +122,6 @@ fn DumpDialog(open: Signal<bool>) -> Element {
     }
 }
 
-/// What an import should do about packages that are already here.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnExisting {
-    Skip,
-    Overwrite,
-    MergePatches,
-}
-
-impl OnExisting {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Skip => "skip",
-            Self::Overwrite => "overwrite",
-            Self::MergePatches => "merge-patches",
-        }
-    }
-
-    fn from_str(value: &str) -> Self {
-        match value {
-            "overwrite" => Self::Overwrite,
-            "merge-patches" => Self::MergePatches,
-            _ => Self::Skip,
-        }
-    }
-}
-
 /// Choosing a file and what to do with it.
 #[component]
 fn RestoreDialog(open: Signal<bool>) -> Element {
@@ -156,7 +130,7 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
     // reads then cost a refcount bump rather than a copy, and the client
     // streams them into the request body without copying either.
     let mut bytes = use_signal(bytes::Bytes::new);
-    let on_existing = use_signal(|| OnExisting::Skip);
+    let on_existing = use_signal(ExistingPackagePolicy::default);
     let clear = use_signal(|| false);
     let secrets = use_signal(|| false);
     let mut hovering = use_signal(|| false);
@@ -226,15 +200,13 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
                 return;
             }
         };
-        let secrets_policy = if secrets() { "copy" } else { "ignore" };
+        let secrets_policy = if secrets() {
+            SecretsPolicy::Copy
+        } else {
+            SecretsPolicy::Ignore
+        };
         match client
-            .restore(
-                bytes(),
-                dry_run,
-                on_existing().as_str(),
-                clear(),
-                secrets_policy,
-            )
+            .restore(bytes(), dry_run, on_existing(), clear(), secrets_policy)
             .await
         {
             Ok(accepted) => {
@@ -347,7 +319,7 @@ fn RestoreDialog(open: Signal<bool>) -> Element {
 
 #[component]
 fn RestoreOptionsForm(
-    on_existing: Signal<OnExisting>,
+    on_existing: Signal<ExistingPackagePolicy>,
     clear: Signal<bool>,
     secrets: Signal<bool>,
 ) -> Element {
@@ -359,10 +331,13 @@ fn RestoreOptionsForm(
                     class: "select select-bordered select-sm",
                     disabled: clear(),
                     value: on_existing().as_str(),
-                    onchange: move |e| on_existing.set(OnExisting::from_str(&e.value())),
-                    option { value: "skip", "Leave them alone" }
-                    option { value: "overwrite", "Replace with the dump's" }
-                    option { value: "merge-patches", "Leave them, but take patches they lack" }
+                    onchange: move |e| on_existing.set(e.value().parse().unwrap_or_default()),
+                    option { value: ExistingPackagePolicy::Skip.as_str(), "Leave them alone" }
+                    option { value: ExistingPackagePolicy::Overwrite.as_str(), "Replace with the dump's" }
+                    option {
+                        value: ExistingPackagePolicy::MergePatches.as_str(),
+                        "Leave them, but take patches they lack"
+                    }
                 }
                 // With nothing left to collide with, the choice above is not a
                 // choice; saying so beats leaving a control that does nothing.
@@ -426,11 +401,11 @@ fn RestoreReport(entries: Vec<RestoreEntry>, blocked: bool) -> Element {
                     // Indexed as well as named: nothing stops two entries
                     // sharing a package and an outcome, and duplicate keys
                     // make the framework reuse the wrong row.
-                    li { key: "{index}-{entry.pkgbase}-{outcome_label(&entry.outcome)}",
+                    li { key: "{index}-{entry.pkgbase}-{entry.outcome.label()}",
                         div { class: "flex flex-col items-start gap-0.5",
                             div { class: "flex items-baseline gap-2",
                                 span { class: "badge badge-xs {outcome_class(&entry.outcome)}",
-                                    {outcome_label(&entry.outcome)}
+                                    {entry.outcome.label()}
                                 }
                                 span { class: "font-mono text-sm break-all", "{entry.pkgbase}" }
                             }
@@ -442,16 +417,6 @@ fn RestoreReport(entries: Vec<RestoreEntry>, blocked: bool) -> Element {
                 }
             }
         }
-    }
-}
-
-fn outcome_label(outcome: &RestoreOutcome) -> &'static str {
-    match outcome {
-        RestoreOutcome::Imported => "imported",
-        RestoreOutcome::Skipped => "skipped",
-        RestoreOutcome::Overwritten => "overwritten",
-        RestoreOutcome::PatchAdopted => "patched",
-        RestoreOutcome::Failed { .. } => "failed",
     }
 }
 

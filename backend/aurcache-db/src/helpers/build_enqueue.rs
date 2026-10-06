@@ -1,7 +1,6 @@
 use crate::builds;
-use crate::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use crate::prelude::Builds;
-use aurcache_common::build_state::{BuildStates, BuildTriggers};
+use aurcache_common::build_state::{BuildStates, BuildTrigger};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{
@@ -12,16 +11,6 @@ use sea_orm::{
 pub struct EnqueueBuildResult {
     pub build: builds::Model,
     pub inserted: bool,
-}
-
-/// What each caller wanted the row to mean: `user`, `auto_update`, or the
-/// reaper's `timeout_retry` (`BuildTriggers::*`). The retry budget for
-/// abandoned builds reads this column, so every creation path has to say.
-fn valid_trigger(trigger: i32) -> bool {
-    matches!(
-        trigger,
-        BuildTriggers::USER | BuildTriggers::AUTO_UPDATE | BuildTriggers::TIMEOUT_RETRY
-    )
 }
 
 // See the race explanation in `enqueue_build_if_missing`.
@@ -48,7 +37,7 @@ fn next_build_number_expr(pkg_id: i32) -> Expr {
 /// Insert a new pending build with the given `initial_status` if no pending build already exists
 /// for `(pkg_id, platform)`.
 ///
-/// `initial_status` must be one of [`STATUS_ENQUEUED`] or [`STATUS_WAITING_FOR_DEPS`].
+/// `initial_status` must be one of [`BuildStates::ENQUEUED_BUILD`] or [`BuildStates::WAITING_FOR_DEPS`].
 /// The partial unique index on `builds(pkg_id, platform)` covering all pending
 /// states (ACTIVE, ENQUEUED, WAITING_FOR_DEPS) ensures at most one pending row
 /// per `(pkg_id, platform)` at any time.
@@ -62,15 +51,10 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     version: &str,
     start_time: i64,
     initial_status: i32,
-    trigger: i32,
+    // What the row is for. The retry budget for abandoned builds reads this
+    // column, so every creation path has to say.
+    trigger: BuildTrigger,
 ) -> Result<EnqueueBuildResult, DbErr> {
-    // An error, not an assert: this runs in the server on caller-supplied
-    // values, and a panic would take the process down for a bad row.
-    if !valid_trigger(trigger) {
-        return Err(DbErr::Custom(format!(
-            "enqueue with unknown trigger {trigger}: a row whose purpose the budget walk cannot read"
-        )));
-    }
     let platform_str = platform.as_str();
 
     // Two conflicts can stop this insert, and they mean opposite things.
@@ -107,7 +91,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
                 platform_str.to_owned().into(),
                 version.to_owned().into(),
                 next_number,
-                trigger.into(),
+                trigger.as_i32().into(),
             ])
             .map_err(|e| DbErr::Custom(e.to_string()))?
             .on_conflict(OnConflict::new().do_nothing().to_owned())
@@ -115,17 +99,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
 
         let result = db.execute(&insert).await?;
 
-        let existing = Builds::find()
-            .filter(builds::Column::PkgId.eq(pkg_id))
-            .filter(builds::Column::Platform.eq(platform_str))
-            .filter(builds::Column::Status.is_in([
-                Some(STATUS_ACTIVE),
-                Some(STATUS_ENQUEUED),
-                Some(STATUS_WAITING_FOR_DEPS),
-                Some(BuildStates::PUBLISHING),
-            ]))
-            .one(db)
-            .await?;
+        let existing = crate::helpers::builds::pending_build(db, pkg_id, platform_str).await?;
 
         if let Some(build) = existing {
             return Ok(EnqueueBuildResult {
@@ -155,7 +129,7 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     let Some(build) = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(STATUS_WAITING_FOR_DEPS)))
+        .filter(builds::Column::Status.eq(Some(BuildStates::WAITING_FOR_DEPS)))
         .one(db)
         .await?
     else {
@@ -163,7 +137,7 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     };
 
     let mut active = build.into_active_model();
-    active.status = Set(Some(STATUS_ENQUEUED));
+    active.status = Set(Some(BuildStates::ENQUEUED_BUILD));
     let updated = active.update(db).await?;
     Ok(Some(updated))
 }
@@ -183,20 +157,35 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
 /// worker is already running and put it back in the queue. Pinning the update to
 /// `status = ENQUEUED` makes that a no-op instead.
 ///
-/// Returns whether a build was demoted.
 pub async fn demote_enqueued_build<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
     platform: Platform,
-) -> Result<bool, DbErr> {
+) -> Result<Demotion, DbErr> {
     let res = Builds::update_many()
-        .col_expr(builds::Column::Status, Expr::value(STATUS_WAITING_FOR_DEPS))
+        .col_expr(
+            builds::Column::Status,
+            Expr::value(BuildStates::WAITING_FOR_DEPS),
+        )
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(STATUS_ENQUEUED)))
+        .filter(builds::Column::Status.eq(Some(BuildStates::ENQUEUED_BUILD)))
         .exec(db)
         .await?;
-    Ok(res.rows_affected > 0)
+    Ok(if res.rows_affected > 0 {
+        Demotion::Demoted
+    } else {
+        Demotion::Unchanged
+    })
+}
+
+/// What [`demote_enqueued_build`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demotion {
+    /// The queued build is back to waiting for its dependencies.
+    Demoted,
+    /// There was no queued build: none existed, or a worker claimed it first.
+    Unchanged,
 }
 
 #[cfg(test)]

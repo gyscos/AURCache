@@ -13,11 +13,23 @@ use rcgen::{
     KeyPair, KeyUsagePurpose,
 };
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::{Duration, OffsetDateTime};
 
 const CA_CERT_FILE: &str = "ca-cert.pem";
 const CA_KEY_FILE: &str = "ca-key.pem";
+
+/// Where the CA certificate is stored in `dir`.
+#[must_use]
+pub fn cert_path(dir: &Path) -> PathBuf {
+    dir.join(CA_CERT_FILE)
+}
+
+/// Where the CA private key is stored in `dir`.
+#[must_use]
+pub fn key_path(dir: &Path) -> PathBuf {
+    dir.join(CA_KEY_FILE)
+}
 
 /// A loaded (or freshly created) internal CA: its certificate and private key.
 pub struct Ca {
@@ -48,8 +60,8 @@ impl Ca {
     /// with `0600` permissions on Unix.
     pub fn load_or_create(dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir).context("creating CA directory")?;
-        let cert_path = dir.join(CA_CERT_FILE);
-        let key_path = dir.join(CA_KEY_FILE);
+        let cert_path = cert_path(dir);
+        let key_path = key_path(dir);
 
         if cert_path.exists() && key_path.exists() {
             let cert_pem = std::fs::read_to_string(&cert_path).context("reading CA cert")?;
@@ -60,7 +72,7 @@ impl Ca {
         }
 
         let ca = Self::generate_ca()?;
-        write_secret(&key_path, &ca.key_pem)?;
+        write_private(&key_path, &ca.key_pem)?;
         std::fs::write(&cert_path, &ca.cert_pem).context("writing CA cert")?;
         tracing::info!("Generated new AURCache internal CA at {}", dir.display());
 
@@ -120,8 +132,7 @@ impl Ca {
 
     /// SHA-256 fingerprint of the CA certificate (hex, lowercase).
     pub fn ca_cert_fingerprint(&self) -> anyhow::Result<String> {
-        let der = pem_to_der(&self.cert_pem)?;
-        Ok(sha256_hex(&der))
+        cert_fingerprint(&self.cert_pem)
     }
 
     /// Reconstruct an issuer usable for signing from the persisted CA material.
@@ -177,12 +188,33 @@ impl Ca {
     }
 }
 
+/// A fingerprint as an operator may write it -- `AB:CD:…`, spaced, either
+/// case -- in the form this crate computes them, so the two compare equal.
+#[must_use]
+pub fn normalize_fingerprint(fingerprint: &str) -> String {
+    fingerprint.to_lowercase().replace([':', ' '], "")
+}
+
+/// SHA-256 fingerprint (hex, lowercase) of a whole certificate PEM: what a
+/// worker pins the server's CA by.
+///
+/// Lowercase hex without separators; see [`normalize_fingerprint`] for
+/// comparing one an operator typed.
+///
+/// The PEM must be a `CERTIFICATE` block: a private key handed in by mistake
+/// fails here rather than producing a fingerprint nothing will ever match.
+pub fn cert_fingerprint(cert_pem: &str) -> anyhow::Result<String> {
+    let (_, doc) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|e| anyhow!("parsing PEM: {e}"))?;
+    if doc.label != "CERTIFICATE" {
+        anyhow::bail!("expected a CERTIFICATE block, found {}", doc.label);
+    }
+    Ok(sha256_hex(&doc.contents))
+}
+
 /// SHA-256 fingerprint (hex, lowercase) of the public key in a certificate PEM.
 pub fn fingerprint_from_cert_pem(cert_pem: &str) -> anyhow::Result<String> {
-    let der = pem_to_der(cert_pem)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(&der)
-        .map_err(|e| anyhow!("parsing certificate: {e}"))?;
-    Ok(sha256_hex(cert.tbs_certificate.subject_pki.raw))
+    fingerprint_from_cert_der(&pem_to_der(cert_pem)?)
 }
 
 /// SHA-256 fingerprint (hex, lowercase) of the public key in a certificate's DER.
@@ -221,14 +253,30 @@ pub fn fingerprint_from_spki_der(spki_der: &[u8]) -> String {
     sha256_hex(spki_der)
 }
 
-fn write_secret(path: &Path, contents: &str) -> anyhow::Result<()> {
-    std::fs::write(path, contents).context("writing secret")?;
+/// Write key material readable only by its owner.
+///
+/// The mode is set as the file is created, so there is no moment at which
+/// the key is on disk and readable by anyone else.
+pub fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .context("setting secret permissions")?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        // An existing file keeps its mode through `open`.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -283,6 +331,15 @@ mod tests {
         let ca = Ca::load_or_create(dir.path()).unwrap();
         assert!(!ca.issued(""));
         assert!(!ca.issued("-----BEGIN CERTIFICATE-----\nnonsense\n-----END CERTIFICATE-----\n"));
+    }
+
+    /// A key is not a certificate, whatever bytes it hashes to.
+    #[test]
+    fn only_a_certificate_has_a_certificate_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        assert!(cert_fingerprint(ca.ca_cert_pem()).is_ok());
+        assert!(cert_fingerprint(&ca.key_pem).is_err());
     }
 
     #[test]

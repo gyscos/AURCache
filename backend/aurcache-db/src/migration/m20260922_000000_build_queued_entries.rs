@@ -19,7 +19,7 @@
 
 use crate::prelude::{Builds, LogEntities, Logs, Packages};
 use crate::{builds, log_entities, logs, packages};
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
@@ -182,7 +182,7 @@ mod tests {
     use crate::migration::Migrator;
     use crate::prelude::{LogEntities, Logs};
     use crate::{builds, log_entities, logs, packages};
-    use aurcache_common::builder::BuildStates;
+    use aurcache_common::build_state::BuildStates;
     use aurcache_common::source::SourceData;
     use pacman_mirrors::platforms::Platform;
     use sea_orm::ActiveValue::Set;
@@ -230,7 +230,6 @@ mod tests {
             out_of_date: Set(0),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(crate::packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "hello".into(),
             }),

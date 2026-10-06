@@ -199,9 +199,9 @@ pub fn worker_run(spec: &WorkerRunSpec) -> DockerRun {
 
     args.push("-e".into());
     args.push(format!("RUST_LOG={log_level}"));
-    for (key, value) in env.to_pairs() {
+    for var in env.variables() {
         args.push("-e".into());
-        args.push(format!("{key}={value}"));
+        args.push(var.to_string());
     }
 
     args.push("-v".into());

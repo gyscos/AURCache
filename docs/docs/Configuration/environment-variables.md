@@ -38,11 +38,11 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 
 | Variable               | Type          | Description                                                           | Default |
 |------------------------|---------------|-----------------------------------------------------------------------|---------|
-| VERSION_CHECK_INTERVAL | Integer       | Interval in seconds for checking package versions                     | 3600    |
-| AUTO_UPDATE_SCHEDULE   | String (CRON) | Auto update schedule in cronjob syntax with seconds (null to disable) | null    |
+| VERSION_CHECK_INTERVAL | Duration      | How often to check package versions (`1h`, `30m`, or seconds)         | `1h`    |
+| AUTO_UPDATE_SCHEDULE   | String (crontab) | When to rebuild out-of-date packages, as a [schedule](#schedules) (empty to disable) | empty   |
 | TZ                     | String        | Timezone cron schedules (`AUTO_UPDATE_SCHEDULE`, `MIRROR_RANK_SCHEDULE`) are read in, e.g. `Europe/Paris`. The compose files forward the host's `/etc/localtime` and pass `TZ` through when it is set where compose runs | the host's, else UTC |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
-| JOB_TIMEOUT            | Integer       | Longest a build may run before the server reclaims it, in seconds     | 3600    |
+| JOB_TIMEOUT            | Duration      | Longest a build may run before the server reclaims it (`3h`, seconds) | `1h`    |
 | MAX_ARTIFACT_SIZE      | Size          | Largest package file a worker may upload, e.g. `20G`; also a setting, per package or global | `20G` |
 | RETIRED_PACKAGE_GRACE  | Integer       | How long a package file stays downloadable after a newer build or a removal takes it out of the repository database, in seconds, so clients that synced just before can still fetch it | 86400 |
 | ACTIVITY_RETENTION     | Integer       | How long an entry stays in the **Logs** page, in seconds. `0` keeps everything | 7776000 (90 days) |
@@ -80,6 +80,34 @@ own environment. See [Build Workers](../workers/index.md).
 |-------------------------|---------|--------------------------------------------------------------|---------|
 | AURCACHE_WORKER_PORT    | Integer | Port for the worker protocol listener                        | 8083    |
 | AURCACHE_TLS_SANS       | String  | Hostnames the worker listener's certificate is valid for     | localhost |
-| WORKER_SPILL_DELAY      | Integer | Seconds before worker priority stops holding a job back      | 60      |
-| WORKER_LIVENESS_TIMEOUT | Integer | Seconds before a quiet worker stops counting as available    | 60      |
+| WORKER_SPILL_DELAY      | Duration | How long before worker priority stops holding a job back      | `60s`      |
+| WORKER_LIVENESS_TIMEOUT | Duration | How long before a quiet worker stops counting as available    | `60s`      |
 | MAX_ATTEMPTS            | Integer | Requeues before a build is failed for good                   | 3       |
+
+## Schedules
+
+`AUTO_UPDATE_SCHEDULE` and `MIRROR_RANK_SCHEDULE` are written as in crontab:
+five fields, `minute hour day-of-month month day-of-week`, read in the server's
+timezone (`TZ`). Each field is `*`, a number, a range `1-5`, a step `*/15`, or
+a list `1,15`; months and weekdays take names (`jan`, `mon`), and Sunday is 0
+or 7. When both day fields are restricted, a day matching either one runs.
+
+`H` stands for a value picked by a hash of the server and the job, so that
+servers -- and the AUR and the mirrors they all reach -- are not hit at the
+top of the same hour. It is the same value every time:
+
+| Schedule      | Runs                                                  |
+|---------------|-------------------------------------------------------|
+| `H 3 * * *`   | every day, at a fixed minute past 3                   |
+| `H H(1-5) * * *` | every day, at a fixed time between 01:00 and 05:59 |
+| `H/15 * * * *`| every 15 minutes, from a fixed offset                 |
+| `0 3 * * 1-5` | at 03:00 sharp on weekdays                            |
+| `@daily`      | `H H * * *`; also `@hourly`, `@weekly`, `@monthly`, `@yearly` |
+
+The settings page shows the next runs as a schedule is typed.
+
+Schedules used to be written with a leading seconds field and Sunday as 1
+(`0 0 2 * * 1`). A stored schedule is rewritten on upgrade; one set in the
+environment is refused, and the activity log gives the same schedule in the
+new form.
+

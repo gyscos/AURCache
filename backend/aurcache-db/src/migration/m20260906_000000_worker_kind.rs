@@ -10,7 +10,6 @@
 //! NULL for a worker that enrolled before the column existed, which the page
 //! shows as unknown rather than guessing at `chroot`.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -21,7 +20,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table workers add kind TEXT;",
             DbBackend::Postgres => "ALTER TABLE workers ADD COLUMN kind TEXT;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -32,7 +31,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table workers drop column kind;",
             DbBackend::Postgres => "ALTER TABLE workers DROP COLUMN kind;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

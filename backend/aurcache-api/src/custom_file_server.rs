@@ -6,7 +6,6 @@ use rocket::route::{Handler, Outcome};
 use rocket::{Data, Request, Response, Route, async_trait, figment};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use tokio::fs::File;
 use tokio::io::AsyncSeekExt;
 
 #[derive(Debug, Clone)]
@@ -76,10 +75,16 @@ impl Handler for CustomFileServer {
             return Outcome::forward(data, Status::NotFound);
         }
         let file_size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-        let last_modified = metadata.and_then(|m| m.modified().ok()).map(|mtime| {
-            let datetime: chrono::DateTime<chrono::Utc> = mtime.into();
-            datetime.to_rfc2822()
-        });
+        // HTTP's own date form (`Mon, 06 Oct 2026 10:00:00 GMT`, RFC 9110),
+        // which is what `If-Modified-Since` comes back in.
+        let last_modified = metadata
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| jiff::Timestamp::try_from(mtime).ok())
+            .and_then(|mtime| {
+                jiff::fmt::rfc2822::DateTimePrinter::new()
+                    .timestamp_to_rfc9110_string(&mtime)
+                    .ok()
+            });
 
         // A range starting past the end is 416 with `Content-Range: bytes */size`,
         // which resuming clients (pacman) expect, rather than a silent 200. A
@@ -95,8 +100,13 @@ impl Handler for CustomFileServer {
                 Err(_) => return Outcome::error(Status::InternalServerError),
             },
             RangeRequest::Satisfiable(start, end) => {
-                match range_body(&file_path, start, end).await {
-                    Ok((len, body)) => {
+                // The file already open, not the path again: `repo.db` is
+                // renamed over on every commit, and a second open could stream
+                // a newer file than the size above was read from.
+                let len = usize::try_from(end - start);
+                let mut body = named_file.take_file();
+                match (len, body.seek(SeekFrom::Start(start)).await) {
+                    (Ok(len), Ok(_)) => {
                         // Build a 206 Partial Content response. The builder
                         // methods return `&mut Builder`, so this cannot be a
                         // returned chain.
@@ -110,7 +120,7 @@ impl Handler for CustomFileServer {
                             .sized_body(len, body);
                         builder
                     }
-                    Err(_) => return Outcome::error(Status::InternalServerError),
+                    _ => return Outcome::error(Status::InternalServerError),
                 }
             }
             RangeRequest::Unsatisfiable => {
@@ -130,16 +140,6 @@ impl Handler for CustomFileServer {
 
         Outcome::Success(builder.finalize())
     }
-}
-
-/// Open the requested byte range as a streaming body.
-///
-/// The file is seeked and handed to the response unread: a `bytes=0-` over a
-/// multi-GB package must never become a gigabyte `Vec` in RAM.
-async fn range_body(file_path: &Path, start: u64, end: u64) -> anyhow::Result<(usize, File)> {
-    let mut file = File::open(file_path).await?;
-    file.seek(SeekFrom::Start(start)).await?;
-    Ok((usize::try_from(end - start)?, file))
 }
 
 /// What a `Range` header asks of a file of a given size.

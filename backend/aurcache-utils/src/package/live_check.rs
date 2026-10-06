@@ -9,8 +9,8 @@ use sea_orm::{
 };
 use std::collections::{HashMap, HashSet};
 
-/// Live-check what `pkg_id` was holding up: delete everything it reaches that
-/// no directly requested package still needs.
+/// Live-check what `from` was holding up: delete everything those packages
+/// reach that no directly requested package still needs.
 ///
 /// Reachability from the requested packages, rather than a per-package "does
 /// anything still depend on me": that question cannot collect a dependency
@@ -19,9 +19,13 @@ use std::collections::{HashMap, HashSet};
 /// me" forever and stay in the database with nothing above them, which is what
 /// this walks past.
 ///
-/// The candidate set is still only what `pkg_id` reaches, so a removal collects
+/// The candidate set is still only what `from` reaches, so a change collects
 /// what it orphaned and nothing else. Sweeping the whole graph would also pick
 /// up rows an unrelated concurrent add has inserted but not yet linked up.
+///
+/// `hold` counts as needed beside the requested packages: a package in the
+/// middle of an update is never collected from under it, even when a cycle
+/// leads back to it.
 ///
 /// Everything collected goes in one [`package_delete`], which is what lets a
 /// chain or a cycle go at once: each member is still depended on, but only by
@@ -30,12 +34,16 @@ pub async fn live_check(
     db: &DatabaseConnection,
     store: &SnapshotStore,
     repo: &Repository,
-    pkg_id: i32,
+    from: &[i32],
+    hold: &[i32],
 ) -> anyhow::Result<()> {
+    if from.is_empty() {
+        return Ok(());
+    }
     let dependees = dependency_edges(db).await?;
 
-    // What this removal could possibly have orphaned.
-    let candidates = reachable_from(&dependees, [pkg_id]);
+    // What this change could possibly have orphaned.
+    let candidates = reachable_from(&dependees, from.iter().copied());
 
     // What the packages users actually asked for still need.
     let roots = Packages::find()
@@ -45,7 +53,7 @@ pub async fn live_check(
         .into_tuple::<i32>()
         .all(db)
         .await?;
-    let needed = reachable_from(&dependees, roots);
+    let needed = reachable_from(&dependees, roots.into_iter().chain(hold.iter().copied()));
 
     let orphaned: Vec<i32> = candidates.difference(&needed).copied().collect();
     package_delete(db, store, repo, &orphaned).await
@@ -105,5 +113,5 @@ pub async fn package_remove(
     active.directly_requested = Set(false);
     active.save(db).await?;
 
-    live_check(db, store, repo, pkg_id).await
+    live_check(db, store, repo, &[pkg_id], &[]).await
 }

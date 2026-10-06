@@ -217,41 +217,13 @@ fn as_user(build_user: &str, argv: &[&str]) -> Command {
 /// not send us through `sudo` to become ourselves.
 #[cfg(unix)]
 fn is_current_user(name: &str) -> bool {
-    // SAFETY: `getuid` reads process state and cannot fail.
-    let me = unsafe { libc::getuid() };
-    user_id(name) == Some(me)
+    user_id(name) == Some(aurcache_chroot::Owner::current().uid)
 }
 
-/// Resolve a user name through the passwd *database*, not `/etc/passwd`.
-///
-/// The file is only one source: this host resolves its own login through nss
-/// and has no line for it, and the same is true wherever accounts come from
-/// LDAP, sssd or systemd-homed. Reading the file would report those users as
-/// nonexistent -- here, as "not us", sending the worker through `sudo` to
-/// become the user it already is.
-#[cfg(unix)]
+/// A user's uid, through the passwd database (see
+/// [`aurcache_chroot::Owner::of_user`]).
 fn user_id(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found: *mut libc::passwd = std::ptr::null_mut();
-    // Generous enough for any real entry; `getpwnam_r` reports ERANGE rather
-    // than overrunning it, and we treat that as "no such user" like any other
-    // failure.
-    let mut buf = vec![0 as libc::c_char; 4096];
-    // SAFETY: `c_name` is NUL-terminated and outlives the call, `pwd` and
-    // `found` are valid out-parameters, and `buf` is the scratch space the
-    // call is told the length of. The `_r` form keeps its result in ours
-    // rather than in static storage, so concurrent callers do not race.
-    let rc = unsafe {
-        libc::getpwnam_r(
-            c_name.as_ptr(),
-            &raw mut pwd,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut found,
-        )
-    };
-    (rc == 0 && !found.is_null()).then_some(pwd.pw_uid)
+    aurcache_chroot::Owner::of_user(name).map(|owner| owner.uid)
 }
 
 /// How long to wait for ssh-agent's socket (100 polls × 50 ms): it creates

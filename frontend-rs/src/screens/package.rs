@@ -17,7 +17,7 @@ use crate::platforms::PlatformChecklist;
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
 use aurcache_client::{
-    Build, ExtendedPackage, PackageFile, PackageSource, PatchPackageRequest, Setting, SettingSource,
+    Build, ExtendedPackage, PackageFile, PackagePatch, PackageSource, Setting, SettingSource,
 };
 use aurcache_common::build_state::BuildState;
 use dioxus::prelude::*;
@@ -1603,7 +1603,7 @@ fn RebuildButton(pkgbase: String, on_changed: EventHandler<()>) -> Element {
                         error.set(None);
                         let outcome = match client() {
                             Ok(client) => client
-                                .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest {
+                                .update_package(&pkgbase, &aurcache_client::UpdatePackage {
                                     force: true,
                                 })
                                 .await
@@ -1687,7 +1687,7 @@ pub fn PlatformField(
                                             error.set(None);
                                             let outcome = match client() {
                                                 Ok(client) => client
-                                                    .patch_package(&pkgbase, &aurcache_client::PatchPackageRequest {
+                                                    .patch_package(&pkgbase, &aurcache_client::PackagePatch {
                                                         platforms: Some(draft()),
                                                         ..Default::default()
                                                     })
@@ -2390,7 +2390,7 @@ fn BuildFlagsField(pkgbase: String, flags: Vec<String>, on_changed: EventHandler
             Ok(client) => client
                 .patch_package(
                     &current_pkgbase(),
-                    &PatchPackageRequest {
+                    &PackagePatch {
                         build_flags: Some(next),
                         ..Default::default()
                     },

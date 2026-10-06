@@ -17,6 +17,22 @@ macro_rules! impl_parse_setting {
 
 impl_parse_setting!(u32, i32, u64, i64);
 
+/// A span of time written as a duration (`1h`, `90m`, `1h30m`, or plain
+/// seconds), held as seconds.
+///
+/// Its own type for the reason [`ByteSize`] is: a plain number parse would
+/// read `1h` as garbage and quietly fall back to the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seconds(pub u64);
+
+impl ParseSetting for Seconds {
+    fn parse_setting(s: &str) -> Result<Self, String> {
+        aurcache_common::units::parse_duration(s)
+            .map(Seconds)
+            .ok_or_else(|| format!("expected a duration such as 1h or 90m, got {s:?}"))
+    }
+}
+
 /// A byte count written as a size (`20G`, `512M`, `1024`).
 ///
 /// Its own type rather than `u64`, whose plain number parse would read `20G`
@@ -66,7 +82,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ParseSetting;
+    use super::{ParseSetting, Seconds};
+
+    /// A duration setting reads what the worker's do: units, or plain seconds
+    /// as it always took.
+    #[test]
+    fn durations_take_units_and_plain_seconds() {
+        assert_eq!(Seconds::parse_setting("1h"), Ok(Seconds(3600)));
+        assert_eq!(Seconds::parse_setting("90m"), Ok(Seconds(5400)));
+        assert_eq!(Seconds::parse_setting("3600"), Ok(Seconds(3600)));
+        assert!(Seconds::parse_setting("an hour").is_err());
+    }
 
     /// Settings can come from environment variables, where `1` and `yes` are
     /// as idiomatic as `true`. Rejecting them would silently disable a feature

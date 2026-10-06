@@ -8,14 +8,28 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-/// Run a command, returning combined stdout+stderr and the exit status.
-pub async fn run_capture(mut cmd: Command) -> Result<(String, std::process::ExitStatus)> {
+/// What a finished command printed, and how it exited.
+pub struct Captured {
+    /// stdout, then stderr.
+    pub log: String,
+    pub status: std::process::ExitStatus,
+}
+
+/// Run a command, capturing its combined output and its exit status.
+pub async fn run_capture(mut cmd: Command) -> Result<Captured> {
     let output = cmd.output().await.context("spawning command")?;
     let mut log = String::new();
     log.push_str(&String::from_utf8_lossy(&output.stdout));
     log.push_str(&String::from_utf8_lossy(&output.stderr));
-    Ok((log, output.status))
+    Ok(Captured {
+        log,
+        status: output.status,
+    })
 }
+
+/// The variables `sudo` must pass through to devtools; see [`devtools`].
+const DEVTOOLS_ENV: &str =
+    "--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN,AURCACHE_NSPAWN_KEEP_UNIT";
 
 /// Build a `Command` that runs a privileged `devtools` program via `sudo`.
 ///
@@ -37,8 +51,7 @@ pub fn devtools(program: &str) -> Command {
     // `SRCDEST` is how `makechrootpkg` is told where to keep downloaded
     // sources; sudo would otherwise strip it and devtools would silently fall
     // back to the PKGBUILD directory, losing the cache.
-    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN,AURCACHE_NSPAWN_KEEP_UNIT")
-        .arg(program);
+    cmd.arg(DEVTOOLS_ENV).arg(program);
     cmd
 }
 
@@ -56,7 +69,7 @@ pub fn devtools(program: &str) -> Command {
 /// which is why this sets the directory `WORKDIR` is made in, not `WORKDIR`.
 pub fn devtools_in(program: &str, tmpdir: &Path) -> Command {
     let mut cmd = Command::new("sudo");
-    cmd.arg("--preserve-env=GNUPGHOME,SRCDEST,AURCACHE_DROPIN,AURCACHE_NSPAWN_KEEP_UNIT")
+    cmd.arg(DEVTOOLS_ENV)
         .arg("env")
         .arg(format!("TMPDIR={}", tmpdir.display()))
         .arg(program);
@@ -97,7 +110,7 @@ pub(crate) async fn create_base(root: &Path, pacman_conf: &Path) -> Result<()> {
         // base-devel carries neither git nor an ssh client.
         .arg("git")
         .arg("openssh");
-    let (log, status) = run_capture(cmd).await?;
+    let Captured { log, status } = run_capture(cmd).await?;
     if !status.success() {
         bail!("mkarchroot failed:\n{log}");
     }
@@ -111,7 +124,7 @@ pub(crate) async fn create_base(root: &Path, pacman_conf: &Path) -> Result<()> {
 pub(crate) async fn upgrade_candidate(next: &Path) -> Result<()> {
     let mut cmd = devtools("arch-nspawn");
     cmd.arg(next).args(["pacman", "-Syu", "--noconfirm"]);
-    let (log, status) = run_capture(cmd).await?;
+    let Captured { log, status } = run_capture(cmd).await?;
     if !status.success() {
         bail!("chroot upgrade returned non-zero:\n{log}");
     }
@@ -131,7 +144,7 @@ pub(crate) async fn check_candidate(next: &Path) -> Result<()> {
     for args in checks {
         let mut cmd = devtools("arch-nspawn");
         cmd.arg(next).args(args.iter().copied());
-        let (log, status) = run_capture(cmd).await?;
+        let Captured { log, status } = run_capture(cmd).await?;
         if !status.success() {
             bail!("chroot check `{}` failed:\n{log}", args.join(" "));
         }
@@ -171,8 +184,8 @@ pub(crate) async fn ensure_multilib(root: &Path) {
         "multilib-devel",
     ]);
     match run_capture(cmd).await {
-        Ok((_, status)) if status.success() => {}
-        Ok((log, _)) => tracing::debug!(
+        Ok(Captured { status, .. }) if status.success() => {}
+        Ok(Captured { log, .. }) => tracing::debug!(
             "multilib-devel not installed (expected off x86_64); \
              lib32-* packages will not build here:\n{log}"
         ),
@@ -241,10 +254,10 @@ pub async fn prepare_job_keyring(
             key,
         ]);
         match run_capture(cmd).await {
-            Ok((_, status)) if status.success() => {
+            Ok(Captured { status, .. }) if status.success() => {
                 tracing::info!("imported pgp key {key}");
             }
-            Ok((log, _)) => tracing::warn!("could not import pgp key {key}:\n{log}"),
+            Ok(Captured { log, .. }) => tracing::warn!("could not import pgp key {key}:\n{log}"),
             Err(e) => tracing::warn!("gpg failed for key {key}: {e}"),
         }
     }
@@ -254,7 +267,7 @@ pub async fn prepare_job_keyring(
     let mut cmd = Command::new("gpg");
     cmd.env("GNUPGHOME", shared)
         .args(["--batch", "--check-trustdb"]);
-    if let Ok((log, status)) = run_capture(cmd).await
+    if let Ok(Captured { log, status }) = run_capture(cmd).await
         && !status.success()
     {
         tracing::warn!("could not prepare the shared trustdb:\n{log}");
@@ -271,7 +284,7 @@ async fn has_key(gnupg_home: &Path, key: &str) -> bool {
     let mut cmd = Command::new("gpg");
     cmd.env("GNUPGHOME", gnupg_home)
         .args(["--batch", "--list-keys", key]);
-    matches!(run_capture(cmd).await, Ok((_, status)) if status.success())
+    matches!(run_capture(cmd).await, Ok(Captured { status, .. }) if status.success())
 }
 
 /// Copy the shared keyring into a home the build user can read and nothing can
@@ -312,21 +325,6 @@ fn set_readable(path: &Path) {
     }
 }
 
-/// Install the job's makepkg overrides into the chroot's `makepkg.conf.d/`.
-///
-/// `makepkg` sources `$MAKEPKG_CONF` and then every `$MAKEPKG_CONF.d/*.conf`
-/// (see `source_makepkg_config` in `/usr/share/makepkg/util/config.sh`), so a
-/// drop-in wins over the base without replacing it. That is what lets the
-/// chroot keep its own complete, architecture-correct defaults while this
-/// worker still forces `PKGDEST`, `MAKEFLAGS`, `PACKAGER` and the operator's
-/// own `makepkg_conf` setting.
-///
-/// Written to the *base* chroot before each build: `makechrootpkg` copies the
-/// base into a per-job chroot when it runs, so the drop-in travels with it.
-/// Rewriting it per build is also what makes a per-package `makepkg_conf`
-/// setting take effect at all -- the previous arrangement only reached the
-/// chroot when it was first created, so a setting changed afterwards was
-/// silently ignored until the chroot was rebuilt.
 /// Settings `makechrootpkg` chooses for itself, which a drop-in must not touch.
 ///
 /// It appends `BUILDDIR=/build PKGDEST=/pkgdest ...` to the chroot's
@@ -409,13 +407,13 @@ fn with_cache_dirs(pacman_conf: &str, shared_pkg_cache: Option<&Path>) -> String
     out
 }
 
-/// Mount point a job's private pacman cache is bound over. Matches pacman's
-/// default so nothing else has to change.
 /// Where `makechrootpkg` points `BUILDDIR` inside the chroot. A persistent
 /// build tree is bound here, so makepkg's own layout is unchanged and only the
 /// lifetime differs.
 pub const BUILDDIR_MOUNT: &str = "/build";
 
+/// Mount point a job's private pacman cache is bound over. Matches pacman's
+/// default so nothing else has to change.
 pub const PER_JOB_CACHE_MOUNT: &str = "/var/cache/pacman/pkg";
 
 /// Where [`write_configs`] put the files the caller goes on to install.
@@ -429,8 +427,9 @@ pub struct StagedConfigs {
 /// staging directory the caller seeds the base chroot from.
 ///
 /// The makepkg file here is *only* the overrides, not a whole `makepkg.conf`:
-/// [`install_makepkg_dropin`] puts it in the chroot's `makepkg.conf.d/`, so the
-/// chroot keeps its own defaults rather than having them replaced.
+/// [`stage_makepkg_dropin`] filters it into the drop-in `makechrootpkg`
+/// installs in the job's chroot copy, so the chroot keeps its own defaults
+/// rather than having them replaced.
 pub fn write_configs(
     dir: &Path,
     makepkg_conf: &str,

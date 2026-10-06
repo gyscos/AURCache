@@ -15,7 +15,6 @@
 //! a worker version that does not report its configuration -- different from a
 //! worker with no settings.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -26,7 +25,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let statements: [&str; 2] = match database_type() {
+        let statements: [&str; 2] = match manager.get_database_backend() {
             DbBackend::Sqlite => [
                 "alter table workers add settings_declaration TEXT;",
                 "alter table workers add effective_config TEXT;",
@@ -45,7 +44,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let statements: [&str; 2] = match database_type() {
+        let statements: [&str; 2] = match manager.get_database_backend() {
             DbBackend::Sqlite => [
                 "alter table workers drop column settings_declaration;",
                 "alter table workers drop column effective_config;",

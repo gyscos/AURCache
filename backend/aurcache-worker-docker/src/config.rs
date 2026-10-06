@@ -119,7 +119,8 @@ impl Config {
         })
     }
 
-    /// Docker's `MemorySwap` in bytes, or `None` for unlimited.
+    /// The limit in bytes, for Docker's `Memory` and `MemorySwap` alike, or
+    /// `None` for unlimited.
     #[must_use]
     pub fn memory_bytes(&self) -> Option<i64> {
         (self.memory_limit > 0).then(|| self.memory_limit.saturating_mul(1024 * 1024))

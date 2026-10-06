@@ -6,38 +6,31 @@ pub mod official_repos;
 pub mod retired_packages;
 pub mod update_version_check;
 
-use chrono::{DateTime, Local};
+use aurcache_common::schedule::Schedule;
 use std::time::Duration;
 use tracing::info;
 
-/// Sleep until the next cron fire, logging how long that is.
+/// Sleep until the schedule's next run, logging how long that is.
 ///
 /// Schedules are read in the server's local timezone (`TZ`, else
-/// `/etc/localtime`), so `0 0 3 * * *` means 3 am where the server is, which
+/// `/etc/localtime`), so `0 3 * * *` means 3 am where the server is, which
 /// is what someone writing it expects. The settings page says which timezone
 /// that is.
 ///
-/// A negative delta (clock jump) just means "run now".
-pub(crate) async fn sleep_until_next_fire(
-    upcoming: &mut impl Iterator<Item = DateTime<Local>>,
-    what: &str,
-) -> Wake {
-    match upcoming.next() {
-        Some(next_time) => {
-            let duration = next_time
-                .signed_duration_since(Local::now())
-                .to_std()
-                .unwrap_or(Duration::ZERO);
-            info!(
-                "Waiting for scheduled {what} until {} ({} seconds)",
-                next_time,
-                duration.as_secs()
-            );
-            tokio::time::sleep(duration).await;
-            Wake::Fired
-        }
-        None => Wake::Exhausted,
-    }
+/// The next run is worked out from the clock each time rather than carried
+/// over, so a clock that jumped is followed rather than slept through.
+pub(crate) async fn sleep_until_next_fire(schedule: &Schedule, what: &str) -> Wake {
+    let now = jiff::Zoned::now();
+    let Some(next) = schedule.next_after(&now) else {
+        return Wake::Exhausted;
+    };
+    let duration = Duration::try_from(now.duration_until(&next)).unwrap_or(Duration::ZERO);
+    info!(
+        "Waiting for scheduled {what} until {next} ({} seconds)",
+        duration.as_secs()
+    );
+    tokio::time::sleep(duration).await;
+    Wake::Fired
 }
 
 /// Why [`sleep_until_next_fire`] returned.

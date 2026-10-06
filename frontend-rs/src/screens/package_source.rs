@@ -318,7 +318,7 @@ pub fn SourceEditor(pkgbase: String, initial_path: Option<String>) -> Element {
                                 match client.put_source_file(&pkgbase, &path, &draft()).await {
                                     Err(e) => status.set(Some((e.to_string(), false))),
                                     Ok(()) => match client
-                                        .update_package(&pkgbase, &aurcache_client::UpdatePackageRequest { force: true })
+                                        .update_package(&pkgbase, &aurcache_client::UpdatePackage { force: true })
                                         .await
                                     {
                                         // To the build just queued, not back to

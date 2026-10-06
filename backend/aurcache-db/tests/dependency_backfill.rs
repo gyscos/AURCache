@@ -2,7 +2,7 @@ use aurcache_db::migration::m20260508_000000_dependency_resolution_combined::bac
 use aurcache_db::{
     dependencies,
     migration::Migrator,
-    packages::{self, SourceData, SourceType},
+    packages::{self, SourceData},
 };
 use aurcache_deps::AurClient;
 use flate2::Compression;
@@ -105,7 +105,6 @@ async fn backfill_creates_dependency_links() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -250,7 +249,6 @@ async fn backfill_multi_dep_package() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "turso".into(),
         }),
@@ -406,7 +404,6 @@ async fn backfill_resolves_provider_dependencies() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -530,7 +527,6 @@ async fn backfill_prefers_existing_local_provider() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -551,7 +547,6 @@ async fn backfill_prefers_existing_local_provider() {
         latest_build: Set(None),
         build_flags: Set("--noconfirm;--noprogressbar".to_string()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: "local-provider".into(),
         }),

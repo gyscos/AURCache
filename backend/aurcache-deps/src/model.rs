@@ -75,7 +75,7 @@ pub enum DependencyResolution {
 }
 
 /// One dependency to resolve: the name, and the version it was declared with.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dependency<'a> {
     pub name: &'a str,
     /// A pacman constraint such as `">=2.0"`, or empty for an unversioned

@@ -13,7 +13,7 @@ use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::http::Status;
@@ -74,7 +74,6 @@ async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
         out_of_date: Set(0),
         build_flags: Set(String::new()),
         platforms: Set("x86_64".to_string()),
-        source_type: Set(SourceType::Aur),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),

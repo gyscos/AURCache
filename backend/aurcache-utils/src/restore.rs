@@ -22,6 +22,7 @@
 //! either -- an imported graph could disagree with today's AUR -- so the depends
 //! lists have to be rediscovered from the sources regardless.
 
+use aurcache_db::lists::ListColumn;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
@@ -31,8 +32,7 @@ use aurcache_common::api::dump::{
     PACKAGES_FILE, PATCH_DIR, RestoreEntry, RestoreOptions, RestoreOutcome, SETTINGS_FILE,
     SecretsPolicy, TOKENS_FILE, WORKERS_FILE,
 };
-use aurcache_common::builder::BuildStates;
-use aurcache_db::packages::{SourceData, SourceType};
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings};
 use flate2::read::GzDecoder;
@@ -209,11 +209,6 @@ fn parse<T: serde::de::DeserializeOwned>(
     serde_json::from_str(content).map_err(|e| anyhow::anyhow!("{name} is not valid: {e}"))
 }
 
-/// Join a dump's list back into the database's semicolon-delimited column.
-fn join_list(values: &[String]) -> String {
-    values.join(";")
-}
-
 /// What a dump would do to one package, without doing it.
 ///
 /// A dry run answers the only question worth asking before an import: which of
@@ -324,12 +319,7 @@ pub async fn apply(
     progress: Sender<RestoreEntry>,
 ) {
     let Services {
-        client: _,
-        store,
-        db,
-        tx: _,
-        repo,
-        ..
+        store, db, repo, ..
     } = services;
     // PASS 1: rows. One transaction, because a half-applied dump is neither
     // what the instance was nor what the dump describes.
@@ -405,6 +395,7 @@ pub async fn apply(
     }
 
     // PASS 3: the graph, and the builds it makes possible.
+    let mut restored: Vec<i32> = Vec::new();
     for pkgbase in &applied.touched {
         // Its source could not be read, so its dependency list cannot be
         // either. Trying anyway would fail identically and report it twice.
@@ -414,7 +405,11 @@ pub async fn apply(
         let Ok(Some(row)) = package_row(db, pkgbase).await else {
             continue;
         };
-        if let Err(e) = crate::package::update::package_resync_dependencies(services, &row).await {
+        restored.push(row.id);
+        // Edges only: removing orphans now would take a dependency-only
+        // package whose dependent this pass has not reached yet -- nothing
+        // points at it until then. They are collected once, below.
+        if let Err(e) = crate::package::update::resync_graph(services, &row).await {
             services.activity.emit(Event::RestorePackageFailed {
                 pkg: pkgbase.as_str().into(),
                 step: RestoreStep::Dependencies,
@@ -432,6 +427,16 @@ pub async fn apply(
                 })
                 .await;
         }
+    }
+
+    // What the dump carried and nothing now needs, once every edge is known.
+    // Only what this restore wrote is a candidate: a package some concurrent
+    // add has inserted but not linked yet is not the restore's to judge.
+    if let Err(e) =
+        crate::package::live_check::live_check(db, &services.store, &services.repo, &restored, &[])
+            .await
+    {
+        tracing::warn!("restore could not remove packages nothing needs: {e:#}");
     }
 }
 
@@ -462,20 +467,9 @@ fn write_secrets(
     std::fs::create_dir_all(ca_dir)?;
     // The certificate first: a reader that finds a key without a certificate
     // has half a CA, and this narrows that window to a single write.
-    std::fs::write(ca_dir.join(CA_CERT_FILE), &secrets.ca_cert_pem)?;
-    write_private(&ca_dir.join(CA_KEY_FILE), &secrets.ca_key_pem)?;
+    std::fs::write(aurcache_ca::cert_path(ca_dir), &secrets.ca_cert_pem)?;
+    aurcache_ca::write_private(&aurcache_ca::key_path(ca_dir), &secrets.ca_key_pem)?;
     Ok(true)
-}
-
-/// Write key material readable only by its owner.
-fn write_private(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
-    std::fs::write(path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 /// What pass 1 did.
@@ -679,9 +673,9 @@ async fn write_workers<C: sea_orm::ConnectionTrait>(
             name: Set(worker.name.clone()),
             status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
             cert_fingerprint: Set(worker.cert_fingerprint.clone()),
-            native_arches: Set(join_list(&worker.native_arches)),
-            emulated_arches: Set(join_list(&worker.emulated_arches)),
-            package_affinity: Set(join_list(&worker.package_affinity)),
+            native_arches: Set(ListColumn::Worker.join(&worker.native_arches)),
+            emulated_arches: Set(ListColumn::Worker.join(&worker.emulated_arches)),
+            package_affinity: Set(ListColumn::Worker.join(&worker.package_affinity)),
             priority: Set(worker.priority),
             concurrency: Set(worker.concurrency),
             signed_cert: Set(with_certificates
@@ -748,24 +742,11 @@ async fn write_tokens<C: sea_orm::ConnectionTrait>(
 /// The columns a dump owns. Everything else on the row is derived and is left
 /// to the passes that follow.
 fn apply_config(active: &mut packages::ActiveModel, package: &DumpPackage, patch: Option<String>) {
-    active.platforms = Set(join_list(&package.platforms));
-    active.build_flags = Set(join_list(&package.build_flags));
+    active.platforms = Set(ListColumn::Package.join(&package.platforms));
+    active.build_flags = Set(ListColumn::Package.join(&package.build_flags));
     active.directly_requested = Set(package.directly_requested);
-    active.source_type = Set(source_type_of(&package.source_data));
     active.source_data = Set(package.source_data.clone());
     active.patch = Set(patch);
-}
-
-/// The [`SourceType`] a [`SourceData`] carries.
-///
-/// One spelling shared by restore and the add path, so a new source variant
-/// cannot update one and miss the other.
-pub(crate) const fn source_type_of(source_data: &SourceData) -> SourceType {
-    match source_data {
-        SourceData::Aur { .. } => SourceType::Aur,
-        SourceData::Git { .. } => SourceType::Git,
-        SourceData::Upload { .. } => SourceType::Upload,
-    }
 }
 
 async fn insert_row<C: sea_orm::ConnectionTrait>(
@@ -776,16 +757,12 @@ async fn insert_row<C: sea_orm::ConnectionTrait>(
 ) -> anyhow::Result<i32> {
     Ok(packages::ActiveModel {
         name: Set(pkgbase.to_string()),
-        // Enqueued, not some neutral state: `resolve_local_dependency_resolutions`
-        // only considers packages that are active, successful or enqueued, so a
-        // row in any other state is invisible to resolution -- and a dependency
-        // on it would fall through to the AUR, which is exactly what importing
-        // the package was meant to prevent.
+        // Nothing is built for it here yet, which is what the add path
+        // records for a new package too.
         status: Set(BuildStates::ENQUEUED_BUILD),
         out_of_date: Set(0),
-        platforms: Set(join_list(&package.platforms)),
-        build_flags: Set(join_list(&package.build_flags)),
-        source_type: Set(source_type_of(&package.source_data)),
+        platforms: Set(ListColumn::Package.join(&package.platforms)),
+        build_flags: Set(ListColumn::Package.join(&package.build_flags)),
         source_data: Set(package.source_data.clone()),
         directly_requested: Set(package.directly_requested),
         patch: Set(patch),
@@ -1019,7 +996,7 @@ mod tests {
     #[tokio::test]
     async fn a_rolled_back_clear_puts_everything_back() {
         use aurcache_db::migration::Migrator;
-        use aurcache_db::packages::{SourceData, SourceType};
+        use aurcache_db::packages::SourceData;
         use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set, TransactionTrait};
         use sea_orm_migration::MigratorTrait;
 
@@ -1031,7 +1008,6 @@ mod tests {
             out_of_date: Set(0),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "precious".to_string(),
             }),

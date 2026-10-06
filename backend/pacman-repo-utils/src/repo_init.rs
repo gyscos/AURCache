@@ -7,32 +7,18 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 use tracing::info;
 
+/// Create the repository `name` at `path`: its empty `db` and `files`
+/// archives and the symlinks pacman reads them through.
+///
+/// Only what is missing is created. An archive that exists is never touched,
+/// even when its symlink is gone: recreating it would empty a repository that
+/// only lost a link.
 pub fn init_repo(path: &Path, name: &str) -> anyhow::Result<()> {
-    if repo_exists(path, name) {
-        info!(
-            "Pacman repo '{}' archive already exists at path '{}'",
-            name,
-            path.display()
-        );
-        return Ok(());
-    }
-
-    // create repo folder
-    info!("Initializing empty pacman Repo archive");
     fs::create_dir_all(path)?;
-
-    create_empty_archive(path, name, "db")?;
-    create_empty_archive(path, name, "files")?;
+    for suffix in ["db", "files"] {
+        create_missing(path, name, suffix)?;
+    }
     Ok(())
-}
-
-/// check if every repo archive and its symlink already exist
-fn repo_exists(path: &Path, name: &str) -> bool {
-    ["db", "files"].into_iter().all(|suffix| {
-        get_archive_names(name, suffix)
-            .into_iter()
-            .all(|file| path.join(file).exists())
-    })
 }
 
 /// assembles the filenames of the archive and its symlink, in that order
@@ -43,16 +29,49 @@ fn get_archive_names(name: &str, suffix: &str) -> [String; 2] {
     ]
 }
 
-/// create empty archive and corresponding symlink
-fn create_empty_archive(path: &Path, name: &str, suffix: &str) -> anyhow::Result<()> {
+/// Create one archive, empty, and its symlink -- each only if it is missing.
+fn create_missing(path: &Path, name: &str, suffix: &str) -> anyhow::Result<()> {
     let [archive_file_name, symlink_name] = get_archive_names(name, suffix);
     let archive_path = path.join(&archive_file_name);
     let symlink_path = path.join(&symlink_name);
 
-    let tar_gz = File::create(archive_path)?;
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar = tar::Builder::new(enc);
-    tar.finish().context("failed to create repo archive")?;
-    symlink(archive_file_name, symlink_path).context("failed to create repo symlink")?;
+    if !archive_path.exists() {
+        info!(
+            "Creating empty repository archive {}",
+            archive_path.display()
+        );
+        let tar_gz = File::create(&archive_path)?;
+        let enc = GzEncoder::new(tar_gz, Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        tar.finish().context("failed to create repo archive")?;
+    }
+    // `symlink_metadata`, so a dangling link counts as present rather than
+    // making `symlink` fail on an existing name.
+    if symlink_path.symlink_metadata().is_err() {
+        symlink(archive_file_name, symlink_path).context("failed to create repo symlink")?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repository that lost one symlink gets it back, and keeps its
+    /// database: recreating the archives would have emptied it.
+    #[test]
+    fn a_missing_link_does_not_empty_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path(), "repo").unwrap();
+        fs::write(tmp.path().join("repo.db.tar.gz"), b"populated").unwrap();
+        fs::remove_file(tmp.path().join("repo.files")).unwrap();
+
+        init_repo(tmp.path(), "repo").unwrap();
+
+        assert_eq!(
+            fs::read(tmp.path().join("repo.db.tar.gz")).unwrap(),
+            b"populated"
+        );
+        assert!(tmp.path().join("repo.files").exists());
+    }
 }

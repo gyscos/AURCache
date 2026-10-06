@@ -228,7 +228,7 @@ async fn run_job_inner(
     }
 
     if cancel.load(Ordering::SeqCst) {
-        return Ok(report::classify_exit_canceled());
+        return Ok(report::canceled());
     }
 
     // 4. Build in the build's own cgroup, honoring cancel.
@@ -372,14 +372,16 @@ async fn run_job_inner(
     // A failed build's chroot is kept for inspection when keeping is on and
     // the failure is keepable. The keep consumes the lease; anything else
     // releases it.
-    let keep_for = cfg.keep_failed.map(Duration::from_secs);
-    let keepable = match keep_for {
-        Some(_) => {
-            should_keep(build_id, &report) && shared.chroots.disk_reason(&lease).await.is_none()
-        }
-        None => false,
+    let keep_for = match cfg.keep_failed.map(Duration::from_secs) {
+        Some(keep_for) if should_keep(build_id, &report) => shared
+            .chroots
+            .disk_reason(&lease)
+            .await
+            .is_none()
+            .then_some(keep_for),
+        _ => None,
     };
-    if keepable && let Some(keep_for) = keep_for {
+    if let Some(keep_for) = keep_for {
         // The persistent tree goes with the keep: the pool moves it beside the
         // kept chroot, after the chroot itself, so the operator gets the state
         // the build failed in and the package's next build finds no tree.
@@ -428,7 +430,7 @@ async fn run_job_inner(
         )
         .await
         .unwrap_or_default();
-        if discarded {
+        if discarded == crate::cache::Discard::Removed {
             log(
                 client,
                 build_id,
@@ -586,14 +588,6 @@ fn agent_socket() -> Option<PathBuf> {
     sock.exists().then_some(sock)
 }
 
-/// Spawn `makechrootpkg`, stream its output as logs, and poll for local
-/// self-abort, a remote cancel request, and the build timeout — killing the
-/// child in any of those cases.
-///
-/// The output really is streamed: stdout and stderr are piped and forwarded in
-/// batches. Letting the child inherit the worker's stdio instead sends the
-/// build's output to the worker's own container logs, where the user reading
-/// the build page cannot see it.
 /// What this worker brings to a build, as against what the job describes.
 ///
 /// Grouped because they travel together and are both "how this machine builds"
@@ -616,6 +610,14 @@ struct WorkerContext<'a> {
 /// so reaching this means something escaped the kill, not that it was slow.
 const KILLED_OUTPUT_GRACE: Duration = Duration::from_secs(30);
 
+/// Spawn `makechrootpkg`, stream its output as logs, and poll for local
+/// self-abort, a remote cancel request, and the build timeout — killing the
+/// child in any of those cases.
+///
+/// The output really is streamed: stdout and stderr are piped and forwarded in
+/// batches. Letting the child inherit the worker's stdio instead sends the
+/// build's output to the worker's own container logs, where the user reading
+/// the build page cannot see it.
 async fn run_build(
     ctx: &WorkerContext<'_>,
     client: &Arc<WorkerClient>,
@@ -880,6 +882,7 @@ async fn run_build(
         report.vcs_commits =
             crate::built_sources::resolve(&job.vcs_sources, srcdest.as_deref()).await;
     }
+    let mut out_of_memory = false;
     // A process the kernel killed for memory looks, from makepkg's exit code,
     // like any other failure -- a compiler "terminated by signal", an error
     // several screens up the log. Say what happened where it is looked for.
@@ -907,6 +910,7 @@ async fn run_build(
         );
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
         report.reason = Some(reason);
+        out_of_memory = true;
     }
     // Running out of disk looks like any other failure too: whichever write
     // hit the quota fails with "Disk quota exceeded", somewhere in the log.
@@ -914,10 +918,7 @@ async fn run_build(
     if !report.success
         && !canceled
         && !timed_out
-        && report
-            .reason
-            .as_deref()
-            .is_none_or(|r| !r.starts_with("out of memory"))
+        && !out_of_memory
         && let Some(reason) = ctx.chroots.disk_reason(ctx.lease).await
     {
         log(client, build_id, &format!("\n[worker] {reason}\n")).await;
@@ -1005,7 +1006,7 @@ fn oom_reason(kills: u64, cause: crate::cgroup::OomCause, cfg: &Config) -> Strin
     } else {
         format!("{kills} processes")
     };
-    let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+    use crate::chroots::gib;
     match (
         cause,
         cfg.build_limits.memory_max,
@@ -1013,12 +1014,12 @@ fn oom_reason(kills: u64, cause: crate::cgroup::OomCause, cfg: &Config) -> Strin
     ) {
         (OomCause::BuildLimit, Some(bytes), _) => format!(
             "out of memory: the kernel killed {processes} at the build's memory limit of \
-             {:.1} GiB (WORKER_BUILD_MEMORY_MAX)",
+             {} (WORKER_BUILD_MEMORY_MAX)",
             gib(bytes)
         ),
         (OomCause::TotalLimit, _, Some(bytes)) => format!(
             "out of memory: the kernel killed {processes} when the builds on this worker \
-             together reached {:.1} GiB (WORKER_TOTAL_BUILD_MEMORY_MAX); this build may \
+             together reached {} (WORKER_TOTAL_BUILD_MEMORY_MAX); this build may \
              have been under its own limit",
             gib(bytes)
         ),

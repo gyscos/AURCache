@@ -10,37 +10,29 @@
 //! synchronously in the `complete` endpoint and are never seen here.
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::{Event, QueueCause};
-use aurcache_common::api::log::{BuildRef, WorkerRef};
-use aurcache_common::build_state::EndReasons;
+use aurcache_activitylog::events::Event;
+use aurcache_common::api::log::WorkerRef;
 use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
 use aurcache_db::prelude::Workers;
 use aurcache_db::workers;
-use aurcache_utils::build_logger::append_build_output;
+use aurcache_utils::settings::Seconds;
 use aurcache_utils::settings::general::SettingsTraits;
 use sea_orm::DatabaseConnection;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-use std::env;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-fn env_i64(key: &str, default: i64) -> i64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
 /// Spawn the reaper loop. Runs every `REAP_INTERVAL` seconds (default 20s).
 pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> JoinHandle<()> {
-    let interval = Duration::from_secs(env_i64("REAP_INTERVAL", 20).max(1) as u64);
-    let max_attempts = env_i64("MAX_ATTEMPTS", 3) as i32;
+    let policy = aurcache_utils::worker_policy::worker_policy();
+    let interval = Duration::from_secs(policy.reap_interval_secs);
+    let max_attempts = policy.max_attempts;
     // Backstop grace beyond a build's own timeout before we forcibly reclaim a
     // still-heartbeating but hung build.
-    let grace = env_i64("REAP_BACKSTOP_GRACE", 300);
+    let grace = policy.reap_backstop_grace_secs;
 
     tokio::spawn(async move {
         info!(
@@ -51,98 +43,37 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
             tokio::time::sleep(interval).await;
 
             // `MAX_BUILD_DURATION` reuses the configurable JobTimeout setting.
-            let job_timeout: SettingsEntry<u32> =
+            let job_timeout: SettingsEntry<Seconds> =
                 ApplicationSettings::get(Setting::JobTimeout, None, &db).await;
-            let max_build_age = i64::from(job_timeout.value) + grace;
+            let max_build_age = i64::try_from(job_timeout.value.0)
+                .unwrap_or(i64::MAX)
+                .saturating_add(grace);
 
             match reap_expired_builds(&db, now_secs(), max_attempts, max_build_age).await {
                 Ok(out) => {
-                    if !out.retried.is_empty() || !out.failed.is_empty() {
+                    if !out.abandoned.is_empty() {
                         warn!(
                             "Lease reaper: retried {:?}, gave up on {:?} (silent/hung workers)",
-                            out.retried, out.failed
+                            out.retried(),
+                            out.failed()
                         );
                         // One entry for the pass, not one per build: the reaper
-                        // finds them together and they have one cause.
-                        // Named as the operator knows them, package and
-                        // number. The build they were watching, not the fresh
-                        // row standing in for it: the replacement is a number
-                        // they have never seen. A build whose package is gone
-                        // cannot be named, and is left out.
-                        let named = |ids: &mut dyn Iterator<Item = i32>| -> Vec<BuildRef> {
-                            ids.filter_map(|id| {
-                                let abandoned = out.abandoned.iter().find(|a| a.build_id == id)?;
-                                Some(BuildRef {
-                                    pkgbase: abandoned.pkgbase.clone()?,
-                                    number: abandoned.number,
-                                })
-                            })
-                            .collect()
-                        };
+                        // finds them together and they have one cause. Named
+                        // as the operator knows them -- the build they were
+                        // watching, not the fresh row standing in for it.
+                        let named = aurcache_utils::abandoned::named(&out.abandoned);
                         activity.emit(Event::WorkerReaped {
                             workers: worker_names(&db, &out.abandoned).await,
-                            retried: named(
-                                &mut out.retried.iter().map(|&(abandoned, _)| abandoned),
-                            ),
-                            failed: named(&mut out.failed.iter().copied()),
+                            retried: named.retried,
+                            failed: named.failed,
                         });
-                        // Each replacement is a build queued like any other,
-                        // and says which one it repeats.
-                        for &(abandoned, replacement) in &out.retried {
-                            let Some(retried) = named(&mut std::iter::once(abandoned)).pop() else {
-                                continue;
-                            };
-                            let builds =
-                                aurcache_db::helpers::builds::build_refs(&db, &[replacement])
-                                    .await
-                                    .unwrap_or_default();
-                            activity.emit(Event::BuildQueued {
-                                pkg: retried.pkgbase.as_str().into(),
-                                cause: QueueCause::Retry,
-                                builds,
-                                version: None,
-                                retried: Some(retried),
-                                needed_by: None,
-                            });
-                        }
                     }
-
-                    // Explain each abandoned build in its own log. The row is
-                    // terminal, so this is the last line it ever gets.
-                    for abandoned in &out.abandoned {
-                        explain_abandoned(&activity, abandoned).await;
-                    }
+                    aurcache_utils::abandoned::report(&db, &activity, &out.abandoned).await;
                 }
                 Err(e) => warn!("Lease reaper pass failed: {e}"),
             }
         }
     })
-}
-
-/// Append why a build was abandoned to its log file. Best-effort by design:
-/// the row is already terminal, so nothing downstream depends on this
-/// succeeding, and a deleted package simply yields no line.
-async fn explain_abandoned(activity: &ActivityLog, abandoned: &Abandoned) {
-    let Some(pkgbase) = &abandoned.pkgbase else {
-        return;
-    };
-    let reason = match abandoned.end_reason {
-        EndReasons::MAX_DURATION => "build exceeded its maximum duration",
-        EndReasons::LEASE_EXPIRED => "owner worker stopped heartbeating",
-        // The reaper records only the two above; anything else still reads as
-        // an abandonment, so the log says something truthful.
-        _ => "abandoned by the lease reaper",
-    };
-    let text = format!("Timeout: {reason}.\n");
-    if let Err(e) = append_build_output(pkgbase, abandoned.number, &text).await {
-        activity.emit(Event::BuildLogAppendFailed {
-            build: BuildRef {
-                pkgbase: pkgbase.clone(),
-                number: abandoned.number,
-            },
-            error: e.to_string(),
-        });
-    }
 }
 
 /// The names of the workers that held these builds, for the entry that says
@@ -166,29 +97,4 @@ async fn worker_names(db: &DatabaseConnection, abandoned: &[Abandoned]) -> Vec<W
         .into_iter()
         .map(WorkerRef::from)
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Env values with surrounding whitespace still parse: env files and
-    /// container runtimes add it more often than anyone admits, and without
-    /// the trim the value silently falls back to the default.
-    #[test]
-    fn env_i64_tolerates_surrounding_whitespace() {
-        // Unique to this test: nothing else in the process reads it, so the
-        // set/remove cannot race a parallel test.
-        let key = "AURCACHE_TEST_TRIM_PROBE_LEASE_REAPER";
-        // SAFETY: the key is unique to this test (see above).
-        unsafe {
-            std::env::set_var(key, "  42\t");
-        }
-        assert_eq!(env_i64(key, 3), 42);
-        // SAFETY: same key, same reasoning.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        assert_eq!(env_i64(key, 3), 3);
-    }
 }

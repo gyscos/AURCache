@@ -4,9 +4,9 @@
 //! "is anyone using this source cache?" so it never evicts a live one; a job
 //! about to build asks "may I use it?", because `SRCDEST` is keyed by pkgbase
 //! and *not* by platform -- downloads are architecture-independent, so an
-//! x86_64 and an aarch64 build of one package share a single directory. Two
-//! makepkg runs fetching that git mirror to different commits at once is a
-//! race the mirror cannot survive: one build checks out what the other fetched.
+//! x86_64 and an aarch64 build of one package share a single directory, and
+//! two makepkg runs downloading into it at once race on the same files (see
+//! the last paragraph for which ones).
 //!
 //! A guard answers both. Holding one grants the exclusive use *and* keeps the
 //! pkgbase in the in-use set, so the two can never disagree -- which is what a

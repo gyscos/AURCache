@@ -15,7 +15,7 @@
 //! See `design/implemented/structured-logs.md`.
 
 use aurcache_common::api::activity::Severity;
-use aurcache_common::api::log::{EntityRef, LogEntry, LogPage, NS_BUILD, NS_PACKAGE, NS_WORKER};
+use aurcache_common::api::log::{LogEntry, LogPage, NS_BUILD, NS_PACKAGE, NS_WORKER};
 use aurcache_db::prelude::{LogEntities, Logs};
 use aurcache_db::{log_entities, logs};
 use sea_orm::{
@@ -23,22 +23,7 @@ use sea_orm::{
     QueryOrder, QuerySelect, QueryTrait,
 };
 
-/// What to narrow the log to. Every field is "show me less".
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LogFilter {
-    /// This severity and worse. Stored as an ordered number, so this is one
-    /// comparison rather than a list of kinds the query would have to know.
-    pub severity: Option<Severity>,
-    /// Only what happened since the server last started.
-    pub since_boot: bool,
-    /// Only this kind of entry.
-    pub kind: Option<String>,
-    /// Only entries naming this entity, in any role.
-    pub entity: Option<EntityRef>,
-    /// Narrow [`Self::entity`] to one role: the dependent, rather than any of
-    /// the three packages a dependency replacement names.
-    pub role: Option<String>,
-}
+pub use aurcache_common::api::log::LogFilter;
 
 /// Reading the log.
 #[derive(Debug, Clone)]
@@ -155,13 +140,20 @@ impl LogStore {
         if keep_secs == 0 {
             return Ok(0);
         }
-        let cutoff = crate::activity_utils::prune_cutoff(now, keep_secs);
+        let cutoff = prune_cutoff(now, keep_secs);
         let deleted = Logs::delete_many()
             .filter(logs::Column::Timestamp.lt(cutoff))
             .exec(&self.db)
             .await?;
         Ok(deleted.rows_affected)
     }
+}
+
+/// Timestamps older than this are pruned. Saturating: the clock is trusted
+/// here, and a far-future `now` must prune everything rather than wrap to
+/// keeping it all.
+fn prune_cutoff(now: i64, keep_secs: u64) -> i64 {
+    now.saturating_sub(i64::try_from(keep_secs).unwrap_or(i64::MAX))
 }
 
 /// A stored row as the API returns it.

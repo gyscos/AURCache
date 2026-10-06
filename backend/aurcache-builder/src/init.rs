@@ -12,12 +12,11 @@
 
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::build_state::EndReasons;
-use aurcache_common::builder::BuildStates;
 use aurcache_db::action::Action;
 use aurcache_db::builds;
 use aurcache_db::helpers::time::now_secs;
-use aurcache_db::helpers::worker_jobs::{STATUS_ACTIVE, STATUS_ENQUEUED, STATUS_WAITING_FOR_DEPS};
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::package::enqueue::enqueue_missing_buildable_packages;
@@ -71,7 +70,7 @@ pub fn init_build_queue(
 ///   attempt, which a later `complete` ack checks against.
 /// * It is CAS-guarded on `status IN (ACTIVE, ENQUEUED, WAITING_FOR_DEPS)` so a
 ///   cancel racing a completion can never retroactively fail a finished build:
-///   a successful completion's `ACTIVE -> STATUS_SUCCESS` in the gap makes this
+///   a successful completion's `ACTIVE -> SUCCESSFUL` in the gap makes this
 ///   a no-op (0 rows) and everything rolls back.
 /// * The package mirror happens in the same transaction, and only when the
 ///   package still points at this build (`latest_build`), exactly like
@@ -87,7 +86,9 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
     };
     if !matches!(
         build.status,
-        Some(STATUS_ACTIVE | STATUS_ENQUEUED | STATUS_WAITING_FOR_DEPS)
+        Some(
+            BuildStates::ACTIVE_BUILD | BuildStates::ENQUEUED_BUILD | BuildStates::WAITING_FOR_DEPS
+        )
     ) {
         anyhow::bail!(
             "build #{build_id} is not cancellable (status {:?})",
@@ -104,9 +105,9 @@ async fn cancel_build(db: &DatabaseConnection, build_id: i32) -> anyhow::Result<
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
         .filter(builds::Column::Id.eq(build_id))
         .filter(builds::Column::Status.is_in([
-            Some(STATUS_ACTIVE),
-            Some(STATUS_ENQUEUED),
-            Some(STATUS_WAITING_FOR_DEPS),
+            Some(BuildStates::ACTIVE_BUILD),
+            Some(BuildStates::ENQUEUED_BUILD),
+            Some(BuildStates::WAITING_FOR_DEPS),
         ]))
         .exec(&txn)
         .await?;

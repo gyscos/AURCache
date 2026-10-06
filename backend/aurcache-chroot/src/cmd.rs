@@ -17,56 +17,51 @@ fn is_root() -> bool {
 }
 
 /// The command line for `args`, as root.
-fn command<S: AsRef<OsStr>>(args: &[S]) -> Command {
-    let (program, rest) = args.split_first().expect("a command to run");
+fn root_command<S: AsRef<OsStr>>(args: &[S]) -> std::process::Command {
     if is_root() {
-        let mut cmd = Command::new(program);
-        cmd.args(rest);
-        cmd
-    } else {
-        let mut cmd = Command::new("sudo");
-        // `-n`: a missing grant is an error to report, never a password prompt
-        // that hangs a worker with no terminal.
-        cmd.arg("-n").args(args);
-        cmd
+        return user_command(args);
     }
+    let mut cmd = std::process::Command::new("sudo");
+    // `-n`: a missing grant is an error to report, never a password prompt
+    // that hangs a worker with no terminal.
+    cmd.arg("-n").args(args);
+    cmd
+}
+
+/// The command line for `args`, as this process's own user.
+fn user_command<S: AsRef<OsStr>>(args: &[S]) -> std::process::Command {
+    let (program, rest) = args.split_first().expect("a command to run");
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(rest);
+    cmd
+}
+
+/// A finished command's stdout, or an error carrying its stderr.
+fn stdout_of(shown: &str, output: std::io::Result<std::process::Output>) -> Result<String> {
+    let output = output.with_context(|| format!("running {shown}"))?;
+    if !output.status.success() {
+        bail!(
+            "{shown} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run `args` as root and return its stdout, or an error carrying its stderr.
 pub async fn privileged<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
     let shown = display(args);
     tracing::debug!("$ {shown}");
-    let output = command(args)
-        .output()
-        .await
-        .with_context(|| format!("running {shown}"))?;
-    if !output.status.success() {
-        bail!(
-            "{shown} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    stdout_of(&shown, Command::from(root_command(args)).output().await)
 }
 
 /// Run an unprivileged query and return its stdout.
 pub async fn query<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
-    let shown = display(args);
-    let (program, rest) = args.split_first().expect("a command to run");
-    let output = Command::new(program)
-        .args(rest)
-        .output()
-        .await
-        .with_context(|| format!("running {shown}"))?;
-    if !output.status.success() {
-        bail!(
-            "{shown} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    stdout_of(
+        &display(args),
+        Command::from(user_command(args)).output().await,
+    )
 }
 
 fn display<S: AsRef<OsStr>>(args: &[S]) -> String {
@@ -80,41 +75,10 @@ fn display<S: AsRef<OsStr>>(args: &[S]) -> String {
 pub fn privileged_blocking<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
     let shown = display(args);
     tracing::debug!("$ {shown}");
-    let (program, rest) = args.split_first().expect("a command to run");
-    let mut cmd = if is_root() {
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(rest);
-        cmd
-    } else {
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg("-n").args(args);
-        cmd
-    };
-    let output = cmd.output().with_context(|| format!("running {shown}"))?;
-    if !output.status.success() {
-        bail!(
-            "{shown} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    stdout_of(&shown, root_command(args).output())
 }
 
 /// [`query`], blocking.
 pub fn query_blocking<S: AsRef<OsStr>>(args: &[S]) -> Result<String> {
-    let shown = display(args);
-    let (program, rest) = args.split_first().expect("a command to run");
-    let output = std::process::Command::new(program)
-        .args(rest)
-        .output()
-        .with_context(|| format!("running {shown}"))?;
-    if !output.status.success() {
-        bail!(
-            "{shown} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    stdout_of(&display(args), user_command(args).output())
 }

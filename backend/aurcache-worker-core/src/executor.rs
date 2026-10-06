@@ -38,7 +38,7 @@ pub trait Executor: Send + Sync + 'static {
     /// panic as a failure, but a clean report carries a far better message.
     /// `cancel` is set when the worker has decided to abandon the build (the
     /// server became unreachable past the lease); implementations should stop
-    /// promptly and return [`classify_exit_canceled`](crate::report::classify_exit_canceled).
+    /// promptly and return [`canceled`](crate::report::canceled).
     fn run_job(
         &self,
         client: Arc<WorkerClient>,

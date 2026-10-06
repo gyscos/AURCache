@@ -316,6 +316,26 @@ pub struct LogPage {
     pub total: u64,
 }
 
+/// What to narrow the log to: what a client asks `/log` for, and what the
+/// server queries by. Every field is "show me less"; the default is the whole
+/// log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    /// This severity and worse. Stored as an ordered number, so this is one
+    /// comparison rather than a list of kinds the query would have to know.
+    pub severity: Option<crate::api::activity::Severity>,
+    /// Only what happened since the server last started.
+    pub since_boot: bool,
+    /// Only entries of this kind.
+    pub kind: Option<String>,
+    /// Only entries naming this entity, in any role -- or, for a build, also
+    /// recorded during it.
+    pub entity: Option<EntityRef>,
+    /// Narrow [`Self::entity`] to one role: the dependent, rather than any of
+    /// the three packages a dependency replacement names.
+    pub role: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

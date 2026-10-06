@@ -6,7 +6,6 @@
 //! the executor's business.
 
 use aurcache_common::worker::{CompleteReport, JobDescriptor};
-use std::collections::BTreeMap;
 use std::process::ExitStatus;
 
 /// Map a build process exit status into a terminal report.
@@ -16,16 +15,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         return canceled_report(status.code());
     }
     if status.success() {
-        return CompleteReport {
-            success: true,
-            exit_code: Some(0),
-            reason: None,
-            canceled: false,
-            peak_memory_bytes: None,
-            disk_usage: None,
-            vcs_commits: BTreeMap::new(),
-            kept: None,
-        };
+        return success();
     }
     let code = status.code();
     let reason = match code {
@@ -34,15 +24,16 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
         Some(c) => exit_code_reason(i64::from(c)),
         None => "build terminated by signal".to_string(),
     };
+    failure(code, reason)
+}
+
+/// A terminal report for a build that succeeded, with nothing measured.
+#[must_use]
+pub fn success() -> CompleteReport {
     CompleteReport {
-        success: false,
-        exit_code: code,
-        reason: Some(reason),
-        canceled: false,
-        peak_memory_bytes: None,
-        disk_usage: None,
-        vcs_commits: BTreeMap::new(),
-        kept: None,
+        success: true,
+        exit_code: Some(0),
+        ..CompleteReport::default()
     }
 }
 
@@ -65,51 +56,37 @@ pub fn exit_code_reason(code: i64) -> String {
 /// (source download, workspace preparation, artifact upload).
 #[must_use]
 pub fn setup_failure(reason: impl std::fmt::Display) -> CompleteReport {
-    CompleteReport {
-        success: false,
-        exit_code: None,
-        reason: Some(reason.to_string()),
-        canceled: false,
-        peak_memory_bytes: None,
-        disk_usage: None,
-        vcs_commits: BTreeMap::new(),
-        kept: None,
-    }
+    failure(None, reason.to_string())
 }
 
 /// A terminal report for a build aborted before it started (cancel observed
 /// during setup, so there is no process exit status).
 #[must_use]
-pub fn classify_exit_canceled() -> CompleteReport {
+pub fn canceled() -> CompleteReport {
     canceled_report(None)
 }
 
 /// The shared "build canceled" shape, with whatever exit code is available.
 fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
     CompleteReport {
-        success: false,
-        exit_code,
-        reason: Some("build canceled".to_string()),
         canceled: true,
-        peak_memory_bytes: None,
-        disk_usage: None,
-        vcs_commits: BTreeMap::new(),
-        kept: None,
+        ..failure(exit_code, "build canceled".to_string())
     }
 }
 
 /// A terminal report for a build the worker killed after exceeding its timeout.
 #[must_use]
 pub fn timeout_failure(secs: u64) -> CompleteReport {
+    failure(Some(124), format!("build timed out after {secs}s"))
+}
+
+/// A failed build with nothing measured about it.
+fn failure(exit_code: Option<i32>, reason: String) -> CompleteReport {
     CompleteReport {
         success: false,
-        exit_code: Some(124),
-        reason: Some(format!("build timed out after {secs}s")),
-        canceled: false,
-        peak_memory_bytes: None,
-        disk_usage: None,
-        vcs_commits: BTreeMap::new(),
-        kept: None,
+        exit_code,
+        reason: Some(reason),
+        ..CompleteReport::default()
     }
 }
 

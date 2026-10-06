@@ -8,25 +8,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Build the `makechrootpkg` argv for a per-package build.
-///
-/// No `systemd-run` wrapper: the worker places the build in a cgroup of its own
-/// (see `crate::cgroup`), which is where its limits are set, its memory is
-/// measured and a timeout or a Stop kills it.
-///
-/// `makechrootpkg` copies the built packages into its **current working
-/// directory**, so the caller sets `cwd` to the desired destination (there is
-/// no `--pkgdest` flag on `makepkg`). Any `build_flags` are forwarded to
-/// `makepkg` after the `--` separator.
-///
-/// Builds run as `build_user`, which must not be the user the worker itself
-/// runs as: file ownership is what keeps the worker's identity and credentials
-/// out of reach of the code a PKGBUILD executes.
-///
-/// `binds` become `-d src:dest` arguments. devtools appends these *after* its
-/// own binds, so a bind here overrides one devtools made for the same target —
-/// which is how the per-job pacman cache replaces the shared one. There is no
-/// supported flag for that; `SRCDEST`, which does have one, uses it instead.
 /// Where to find the sandbox-wrapping `makechrootpkg`.
 ///
 /// An absolute path, not a name on `PATH`. The worker runs devtools through
@@ -47,6 +28,25 @@ fn makechrootpkg_path() -> String {
         .unwrap_or_else(|| "/usr/lib/aurcache/bin/makechrootpkg".to_string())
 }
 
+/// Build the `makechrootpkg` argv for a per-package build.
+///
+/// No `systemd-run` wrapper: the worker places the build in a cgroup of its own
+/// (see `crate::cgroup`), which is where its limits are set, its memory is
+/// measured and a timeout or a Stop kills it.
+///
+/// `makechrootpkg` copies the built packages into its **current working
+/// directory**, so the caller sets `cwd` to the desired destination (there is
+/// no `--pkgdest` flag on `makepkg`). Any `build_flags` are forwarded to
+/// `makepkg` after the `--` separator.
+///
+/// Builds run as `build_user`, which must not be the user the worker itself
+/// runs as: file ownership is what keeps the worker's identity and credentials
+/// out of reach of the code a PKGBUILD executes.
+///
+/// `binds` become `-d src:dest` arguments. devtools appends these *after* its
+/// own binds, so a bind here overrides one devtools made for the same target —
+/// which is how the per-job pacman cache replaces the shared one. There is no
+/// supported flag for that; `SRCDEST`, which does have one, uses it instead.
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,

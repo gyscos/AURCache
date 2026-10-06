@@ -2,7 +2,7 @@
 //! what the database records, and what a failure leaves untouched.
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_db::migration::Migrator;
 use aurcache_db::prelude::{Builds, Files, Packages};
 use aurcache_utils::publish::{interrupted, publish_build};
@@ -55,8 +55,8 @@ async fn db() -> DatabaseConnection {
 async fn package(db: &DatabaseConnection, id: i32, name: &str) {
     db.execute_unprepared(&format!(
         "INSERT INTO packages \
-         (id, name, status, out_of_date, build_flags, platforms, source_type, source_data, directly_requested) \
-         VALUES ({id}, '{name}', {}, 1, '', 'x86_64', 'aur', '{{\"type\":\"aur\",\"name\":\"{name}\"}}', 1)",
+         (id, name, status, out_of_date, build_flags, platforms, source_data, directly_requested) \
+         VALUES ({id}, '{name}', {}, 1, '', 'x86_64', '{{\"type\":\"aur\",\"name\":\"{name}\"}}', 1)",
         BuildStates::PUBLISHING
     ))
     .await

@@ -34,9 +34,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         cfg.keep_failed.map(std::time::Duration::from_secs),
         cfg.cache_owner(),
     );
-    if !chroots.open().await {
-        bail!("the storage pool could not be opened; see the log above");
-    }
+    chroots.open().await?;
     chroots
         .refresh(&pacman_conf, None)
         .await

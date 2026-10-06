@@ -1,17 +1,11 @@
 //! Which package satisfies a dependency name.
 //!
-//! Three different sources can answer that question -- the packages AURCache
-//! tracks, the repository databases on disk, and an AUR `provides` search --
-//! and they used to answer it three different ways: the database ranked an
-//! exact name above a split package above a `provides` entry, the repository
-//! check returned a bare `bool` that could not name a winner at all, and the
-//! AUR search picked whichever pkgbase sorted first. A dependency could
-//! therefore resolve to different packages depending only on which source
-//! happened to hold it.
-//!
-//! [`SatisfyIndex`] is the one implementation. A source builds an index by
-//! declaring what its packages provide; [`SatisfyIndex::best_match`] is the
-//! only function that decides which candidate wins.
+//! Used for the packages AURCache tracks: the caller declares what each one
+//! answers to, and [`SatisfyIndex::best_match`] is the only function that
+//! decides which candidate wins -- an exact name above a split package above a
+//! `provides` entry. (The official repositories only ever answer yes or no,
+//! through `OfficialRepos::holds`; an AUR `provides` search ranks with
+//! `provider_rank`.)
 
 use std::collections::{HashMap, HashSet};
 
@@ -76,11 +70,6 @@ impl SatisfyIndex {
         Self::default()
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
-    }
-
     /// Record that `pkgbase` provides `name`.
     ///
     /// Callers add every name a package answers to; nothing is deduplicated
@@ -102,11 +91,8 @@ impl SatisfyIndex {
     /// Record everything one package claims: the name it is published under,
     /// and each entry in its `provides`.
     ///
-    /// The single place that turns "a package" into index entries, so a
-    /// repository `desc` and an AUR search result are read identically. Only
-    /// names in `wanted` are kept, which is what keeps an index over
-    /// `extra.db` proportional to the dependency list rather than to the
-    /// 15,000 packages in it.
+    /// Only names in `wanted` are kept, which keeps the index proportional to
+    /// the dependency list rather than to everything tracked.
     ///
     /// `pkgbase` is what a match is attributed to, since a dependency
     /// ultimately resolves to a package base. A `name` differing from it is
@@ -140,18 +126,6 @@ impl SatisfyIndex {
             if wanted.contains(provided) {
                 self.insert(provided, pkgbase, MatchKind::Provides, provided_version);
             }
-        }
-    }
-
-    /// Fold another index into this one.
-    ///
-    /// Used to read several repositories as one. Which repository an entry
-    /// came from is deliberately not tracked: every repository hit means the
-    /// same thing to a caller -- a binary exists, build nothing -- so keeping
-    /// them apart would only invite a precedence rule that changes no outcome.
-    pub fn extend(&mut self, other: Self) {
-        for (name, matches) in other.by_name {
-            self.by_name.entry(name).or_default().extend(matches);
         }
     }
 

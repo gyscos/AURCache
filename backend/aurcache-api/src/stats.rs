@@ -1,5 +1,4 @@
 use crate::auth::has_api_token;
-use anyhow::bail;
 use bigdecimal::ToPrimitive;
 
 use rocket::serde::json::Json;
@@ -17,11 +16,10 @@ use aurcache_common::api::builds::BuildSummary;
 use aurcache_common::api::log::LogEntry;
 use aurcache_common::api::package::SimplePackage;
 use aurcache_common::api::stats::{LONGEST_WINDOW_DAYS, RECENT_DAYS};
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::fs::dir_size;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_db::builds;
-use aurcache_db::helpers::dbtype::database_type;
 use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{packages, workers};
@@ -29,13 +27,10 @@ use aurcache_utils::settings::general::SettingsTraits;
 use rocket::http::Status;
 use rocket::{State, get};
 use sea_orm::prelude::BigDecimal;
-use sea_orm::sea_query::{Expr, ExprTrait, Func};
+use sea_orm::sea_query::{Alias, CaseStatement, Expr, ExprTrait, Func};
 use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
 use sea_orm::{DatabaseConnection, EntityTrait};
-use sea_orm::{
-    DbBackend, FromQueryResult, JoinType, Order, PaginatorTrait, QueryOrder, RelationTrait,
-    Statement,
-};
+use sea_orm::{FromQueryResult, JoinType, Order, PaginatorTrait, QueryOrder, RelationTrait};
 use std::collections::HashSet;
 use utoipa::OpenApi;
 
@@ -102,56 +97,107 @@ pub async fn dashboard_graph_data(
         .map(Json)
 }
 
+/// One month the build graph plots: its calendar name and its first second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphMonth {
+    year: i32,
+    month: i32,
+    /// Unix seconds at the start of the month, UTC.
+    start: i64,
+}
+
+/// The twelve months ending with `now`'s, newest first, in `now`'s zone.
+///
+/// Computed here rather than in SQL: date arithmetic is the one thing the two
+/// backends spell differently, and they did not even agree on it -- SQLite
+/// bucketed by UTC month and Postgres by the session's time zone. The server
+/// passes its local time, the zone its schedules run in and `/version`
+/// reports, so a build at 00:30 on the 1st counts in the month the operator
+/// would say it ran in.
+///
+/// A month starts at the start of its first day in that zone, which jiff
+/// resolves where a daylight-saving change skips or repeats midnight.
+fn graph_months(now: &jiff::Zoned) -> Vec<GraphMonth> {
+    let first = now.date().first_of_month();
+    (0_i8..12)
+        .filter_map(|back| {
+            let day = first.checked_sub(jiff::Span::new().months(back)).ok()?;
+            let start = day.to_zoned(now.time_zone().clone()).ok()?;
+            Some(GraphMonth {
+                year: i32::from(day.year()),
+                month: i32::from(day.month()),
+                start: start.timestamp().as_second(),
+            })
+        })
+        .collect()
+}
+
+/// Builds per month over the last twelve, and how many of them succeeded.
+///
+/// One grouped query: a `CASE` puts each build in the month whose start it is
+/// past, the month boundaries bound as values, so nothing in it is
+/// backend-specific. Months with no builds are left out, as they always were.
 async fn get_graph_datapoints(db: &DatabaseConnection) -> anyhow::Result<Vec<GraphDataPoint>> {
-    // The success predicate is built from the enum rather than written as a
-    // literal, so a renumbered state cannot silently turn this into a count of
-    // something else.
-    let succeeded = format!("status = {}", BuildStates::SUCCESSFUL_BUILD);
-    let backend = database_type();
-    let query = match backend {
-        DbBackend::Sqlite => {
-            format!(
-                "SELECT
-    CAST(strftime('%Y', datetime(start_time, 'unixepoch')) AS INTEGER) AS year,
-    CAST(strftime('%m', datetime(start_time, 'unixepoch')) AS INTEGER) AS month,
-    COUNT(*) AS count,
-    CAST(SUM(CASE WHEN {succeeded} THEN 1 ELSE 0 END) AS INTEGER) AS successful
-FROM
-    builds
-WHERE
-    start_time >= strftime('%s', 'now', 'start of month', '-11 months')
-GROUP BY
-    year, month
-ORDER BY
-    year DESC, month DESC;"
-            )
-        }
-        DbBackend::Postgres => {
-            format!(
-                "SELECT
-    EXTRACT(YEAR FROM to_timestamp(start_time))::INTEGER AS year,
-    EXTRACT(MONTH FROM to_timestamp(start_time))::INTEGER AS month,
-    COUNT(*)::INTEGER AS count,
-    SUM(CASE WHEN {succeeded} THEN 1 ELSE 0 END)::INTEGER AS successful
-FROM
-    builds
-WHERE
-    start_time >= EXTRACT(EPOCH FROM date_trunc('month', now()) - interval '11 months')
-GROUP BY
-    year, month
-ORDER BY
-    year DESC, month DESC;"
-            )
-        }
-        _ => bail!("Unsupported database type"),
+    #[derive(FromQueryResult)]
+    struct MonthRow {
+        bucket: i64,
+        count: i64,
+        successful: i64,
+    }
+
+    let months = graph_months(&jiff::Zoned::now());
+    let Some(oldest) = months.last() else {
+        return Ok(Vec::new());
     };
+    let mut bucket = CaseStatement::new();
+    for (index, month) in (0_i64..).zip(&months) {
+        bucket = bucket.case(Expr::col(builds::Column::StartTime).gte(month.start), index);
+    }
+    let bucket: Expr = bucket.into();
+    let succeeded: Expr = CaseStatement::new()
+        .case(
+            Expr::col(builds::Column::Status).eq(BuildStates::SUCCESSFUL_BUILD),
+            1,
+        )
+        .finally(0)
+        .into();
+    // Cast to `BIGINT`: Postgres sums an integer into `numeric` and types a
+    // `CASE` of small literals as `int4`, neither of which decodes into an
+    // `i64`. SQLite reads the cast as its own INTEGER affinity.
+    let rows = Builds::find()
+        .select_only()
+        .column_as(bucket.cast_as(Alias::new("BIGINT")), "bucket")
+        .column_as(
+            Expr::col(builds::Column::Id)
+                .count()
+                .cast_as(Alias::new("BIGINT")),
+            "count",
+        )
+        .column_as(succeeded.sum().cast_as(Alias::new("BIGINT")), "successful")
+        .filter(builds::Column::StartTime.gte(oldest.start))
+        // By the output column's name rather than by repeating the `CASE`:
+        // Postgres binds each boundary as its own parameter, so a second copy
+        // of the expression is not "the same expression" to it, and it then
+        // refuses the ungrouped `start_time`.
+        .group_by(Expr::col(Alias::new("bucket")))
+        .into_model::<MonthRow>()
+        .all(db)
+        .await?;
 
-    let result =
-        GraphDataPoint::find_by_statement(Statement::from_sql_and_values(backend, &query, vec![]))
-            .all(db)
-            .await?;
-
-    Ok(result)
+    let mut points: Vec<GraphDataPoint> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let month = months.get(usize::try_from(row.bucket).ok()?)?;
+            Some(GraphDataPoint {
+                year: month.year,
+                month: month.month,
+                count: i32::try_from(row.count).unwrap_or(i32::MAX),
+                successful: i32::try_from(row.successful).unwrap_or(i32::MAX),
+            })
+        })
+        .collect();
+    points.sort_by_key(|point| std::cmp::Reverse((point.year, point.month)));
+    Ok(points)
 }
 
 /// Packages someone asked for (`requested`), or ones present only as
@@ -204,81 +250,87 @@ struct BuildTrends {
     duration: f32,
 }
 
-/// The 60-day windowed aggregate behind [`BuildTrends`], per SQL dialect.
-fn build_trends_query() -> anyhow::Result<&'static str> {
-    Ok(match database_type() {
-        DbBackend::Sqlite => "
-WITH build_stats AS (
-    SELECT
-        CASE
-            WHEN start_time >= strftime('%s', 'now', '-30 days') THEN 'last_30_days'
-            WHEN start_time >= strftime('%s', 'now', '-60 days') THEN 'prev_30_days'
-            END AS period,
-        COUNT(*) AS build_count,
-        AVG(end_time - start_time) AS avg_build_duration
-    FROM builds
-    WHERE start_time >= strftime('%s', 'now', '-60 days') -- Only consider last 60 days
-    GROUP BY period
-)
-SELECT
-    COALESCE((SELECT build_count FROM build_stats WHERE period = 'last_30_days'), 0) AS last_30_days_builds,
-    COALESCE((SELECT avg_build_duration FROM build_stats WHERE period = 'last_30_days'), 0.0) AS last_30_days_avg_duration,
-    COALESCE((SELECT build_count FROM build_stats WHERE period = 'prev_30_days'), 0) AS prev_30_days_builds,
-    COALESCE((SELECT avg_build_duration FROM build_stats WHERE period = 'prev_30_days'), 0.0) AS prev_30_days_avg_duration;
-    ",
-        DbBackend::Postgres => "
-WITH build_stats AS (
-    SELECT
-        CASE
-            WHEN start_time >= EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') THEN 'last_30_days'
-            WHEN start_time >= EXTRACT(EPOCH FROM NOW() - INTERVAL '60 days') THEN 'prev_30_days'
-        END AS period,
-        COUNT(*) AS build_count,
-        AVG(end_time - start_time)::FLOAT4 AS avg_build_duration
-    FROM builds
-    WHERE start_time >= EXTRACT(EPOCH FROM NOW() - INTERVAL '60 days')
-    GROUP BY period
-)
-SELECT
-    COALESCE((SELECT build_count FROM build_stats WHERE period = 'last_30_days'), 0) AS last_30_days_builds,
-    COALESCE((SELECT avg_build_duration FROM build_stats WHERE period = 'last_30_days'), 0.0) AS last_30_days_avg_duration,
-    COALESCE((SELECT build_count FROM build_stats WHERE period = 'prev_30_days'), 0) AS prev_30_days_builds,
-    COALESCE((SELECT avg_build_duration FROM build_stats WHERE period = 'prev_30_days'), 0.0) AS prev_30_days_avg_duration;
-",
-        _ => bail!("Unsupported database type"),
+/// How many builds started in a window, and how long they took on average.
+struct WindowStats {
+    count: i64,
+    /// `None` when none of them has finished.
+    avg_duration: Option<f64>,
+}
+
+/// [`WindowStats`] for builds started in `[from, until)`; no `until` is open
+/// ended.
+///
+/// The bounds are computed in Rust and bound as values: `start_time` is written
+/// from the server's clock, so the server's clock is the one to measure
+/// windows by, and neither backend's `now()` spelling is needed.
+async fn window_stats(
+    db: &DatabaseConnection,
+    from: i64,
+    until: Option<i64>,
+) -> anyhow::Result<WindowStats> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        count: i64,
+        avg_duration: Option<f64>,
+    }
+    let mut query = Builds::find()
+        .select_only()
+        .column_as(
+            Expr::col(builds::Column::Id)
+                .count()
+                .cast_as(Alias::new("BIGINT")),
+            "count",
+        )
+        // A build that has not ended has a NULL difference, which `AVG`
+        // leaves out. Cast because Postgres averages integers into `numeric`.
+        .column_as(
+            Expr::from(Func::avg(
+                Expr::col(builds::Column::EndTime).sub(Expr::col(builds::Column::StartTime)),
+            ))
+            .cast_as(Alias::new("DOUBLE PRECISION")),
+            "avg_duration",
+        )
+        .filter(builds::Column::StartTime.gte(from));
+    if let Some(until) = until {
+        query = query.filter(builds::Column::StartTime.lt(until));
+    }
+    let row = query
+        .into_model::<Row>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("an aggregate without GROUP BY returned no row"))?;
+    Ok(WindowStats {
+        count: row.count,
+        avg_duration: row.avg_duration,
     })
 }
 
+/// The last 30 days against the 30 before them.
 async fn build_trends(db: &DatabaseConnection) -> anyhow::Result<BuildTrends> {
-    #[derive(Debug, FromQueryResult)]
-    struct LastBuildsStruct {
-        last_30_days_builds: i64,
-        prev_30_days_builds: i64,
-        last_30_days_avg_duration: f32,
-        prev_30_days_avg_duration: f32,
+    const WINDOW: i64 = 30 * 24 * 60 * 60;
+    let now = aurcache_db::helpers::time::now_secs();
+    let (last, prev) = tokio::join!(
+        window_stats(db, now - WINDOW, None),
+        window_stats(db, now - 2 * WINDOW, Some(now - WINDOW)),
+    );
+    let (last, prev) = (last?, prev?);
+    Ok(BuildTrends {
+        count: change(last.count as f64, prev.count as f64),
+        duration: change(
+            last.avg_duration.unwrap_or(0.0),
+            prev.avg_duration.unwrap_or(0.0),
+        ),
+    })
+}
+
+/// `now` relative to `before`, as a fraction: `0.5` is up 50%. `0.0` when
+/// there is nothing to compare against.
+fn change(now: f64, before: f64) -> f32 {
+    if before == 0.0 {
+        0.0
+    } else {
+        (now / before - 1.0) as f32
     }
-
-    let last_build_cnt: LastBuildsStruct = LastBuildsStruct::find_by_statement(
-        Statement::from_sql_and_values(database_type(), build_trends_query()?, []),
-    )
-    .one(db)
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("No last build cnts"))?;
-
-    let count = if last_build_cnt.prev_30_days_builds == 0 {
-        0.0
-    } else {
-        (last_build_cnt.last_30_days_builds as f32 / last_build_cnt.prev_30_days_builds as f32)
-            - 1.0
-    };
-
-    let duration = if last_build_cnt.prev_30_days_avg_duration == 0.0 {
-        0.0
-    } else {
-        (last_build_cnt.last_30_days_avg_duration / last_build_cnt.prev_30_days_avg_duration) - 1.0
-    };
-
-    Ok(BuildTrends { count, duration })
 }
 
 /// Count builds, optionally in one state and optionally only recent ones.
@@ -331,6 +383,9 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
     );
 
     let trends = trends?;
+    // Off the executor: it walks every file in the repository.
+    let repo_size =
+        tokio::task::spawn_blocking(|| dir_size(aurcache_utils::repository::REPO_ROOT)).await?;
     Ok(ListStats {
         total_builds: total_builds?,
         successful_builds: successful_builds?,
@@ -341,7 +396,7 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
         recent_failed: recent_failed?,
 
         avg_build_time: avg_build_time?,
-        repo_size: dir_size("repo/"),
+        repo_size,
         requested_packages: requested_packages?,
         dependency_packages: dependency_packages?,
         total_build_trend: trends.count,
@@ -467,26 +522,16 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     let auto_rebuild_configured =
         build_on_new_version.value || auto_update_interval.value.is_some();
 
-    let active: HashSet<i32> = if pkg_ids.is_empty() {
-        HashSet::new()
-    } else {
-        Builds::find()
-            .select_only()
-            .column(builds::Column::PkgId)
-            .filter(builds::Column::PkgId.is_in(pkg_ids.clone()))
-            .filter(builds::Column::Status.is_in([
-                BuildStates::ACTIVE_BUILD,
-                BuildStates::ENQUEUED_BUILD,
-                BuildStates::WAITING_FOR_DEPS,
-                BuildStates::PUBLISHING,
-            ]))
-            .into_tuple::<(i32,)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .map(|(pkg_id,)| pkg_id)
-            .collect()
-    };
+    let active: HashSet<i32> = Builds::find()
+        .select_only()
+        .column(builds::Column::PkgId)
+        .filter(builds::Column::PkgId.is_in(pkg_ids))
+        .filter(builds::Column::Status.is_in(BuildStates::IN_PROGRESS))
+        .into_tuple::<i32>()
+        .all(db)
+        .await?
+        .into_iter()
+        .collect();
 
     let mut needs_hand = Vec::new();
     let mut handled = 0u64;
@@ -603,14 +648,14 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let previous_secs = match (row.start_time, row.pkg_id, row.platform.clone()) {
-            (Some(started), pkg_id, platform) => {
+        let previous_secs = match row.start_time {
+            Some(started) => {
                 let prev: Option<(Option<i64>, Option<i64>)> = Builds::find()
                     .select_only()
                     .column(builds::Column::StartTime)
                     .column(builds::Column::EndTime)
-                    .filter(builds::Column::PkgId.eq(pkg_id))
-                    .filter(builds::Column::Platform.eq(platform.as_str()))
+                    .filter(builds::Column::PkgId.eq(row.pkg_id))
+                    .filter(builds::Column::Platform.eq(row.platform.as_str()))
                     .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
                     .filter(builds::Column::StartTime.lt(started))
                     .order_by(builds::Column::StartTime, Order::Desc)
@@ -620,12 +665,12 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
                     .await?;
                 match prev {
                     Some((Some(prev_start), Some(prev_end))) => {
-                        Some(std::cmp::max(prev_end.saturating_sub(prev_start), 0))
+                        Some(Ord::max(prev_end.saturating_sub(prev_start), 0))
                     }
                     _ => None,
                 }
             }
-            _ => None,
+            None => None,
         };
         out.push(LongBuild {
             build: BuildSummary {
@@ -653,11 +698,12 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
 #[cfg(test)]
 mod tests {
     use super::{
-        count_packages, failed_packages, largest_packages, longest_builds, out_of_date_slice,
-        problem_entries, queue_slice, recent_builds, recent_packages,
+        GraphMonth, build_trends, count_packages, failed_packages, get_graph_datapoints,
+        graph_months, largest_packages, longest_builds, out_of_date_slice, problem_entries,
+        queue_slice, recent_builds, recent_packages,
     };
     use aurcache_common::api::activity::Severity;
-    use aurcache_common::builder::BuildStates;
+    use aurcache_common::build_state::BuildStates;
     use aurcache_common::settings::{ApplicationSettings, Setting};
     use aurcache_db::helpers::time::now_secs;
     use aurcache_db::migration::Migrator;
@@ -682,7 +728,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: name.to_string(),
             }),
@@ -732,7 +777,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "top-level".into(),
             }),
@@ -752,7 +796,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set("--noconfirm".to_string()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "transitive-dependency".into(),
             }),
@@ -902,7 +945,6 @@ mod tests {
             latest_build: Set(None),
             build_flags: Set(String::new()),
             platforms: Set("x86_64".to_string()),
-            source_type: Set(packages::SourceType::Aur),
             source_data: Set(SourceData::Aur {
                 name: "stale-and-broken".to_string(),
             }),
@@ -1079,5 +1121,108 @@ mod tests {
         let back: super::DashboardView = serde_json::from_str(&json).unwrap();
         assert!(back.problems.is_none());
         assert!(back.recent_packages.is_some());
+    }
+
+    /// Twelve months back from the current one, newest first, across a year
+    /// boundary, each starting at its first second UTC.
+    #[test]
+    fn the_graph_covers_the_last_twelve_months() {
+        let now = jiff::civil::date(2026, 2, 15)
+            .at(12, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        let months = graph_months(&now);
+        assert_eq!(months.len(), 12);
+        assert_eq!(
+            months[0],
+            GraphMonth {
+                year: 2026,
+                month: 2,
+                start: "2026-02-01T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
+                    .unwrap()
+                    .as_second(),
+            }
+        );
+        assert_eq!((months[1].year, months[1].month), (2026, 1));
+        assert_eq!((months[2].year, months[2].month), (2025, 12));
+        assert_eq!((months[11].year, months[11].month), (2025, 3));
+    }
+
+    /// Months are the server's, not UTC's: two hours east of UTC, February
+    /// starts at 22:00 UTC on January 31st, so a build then counts in
+    /// February, as the operator would say it ran.
+    #[test]
+    fn a_month_starts_at_local_midnight() {
+        let zone = jiff::tz::TimeZone::fixed(jiff::tz::offset(2));
+        let now = jiff::civil::date(2026, 2, 15)
+            .at(12, 0, 0, 0)
+            .to_zoned(zone)
+            .unwrap();
+        let february = graph_months(&now)[0];
+        assert_eq!((february.year, february.month), (2026, 2));
+        assert_eq!(
+            february.start,
+            "2026-01-31T22:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_second()
+        );
+    }
+
+    /// The builder queries count what they used to: builds per month with
+    /// their successes, and the trend of the last 30 days against the 30
+    /// before.
+    #[tokio::test]
+    async fn graph_and_trends_count_builds_by_when_they_started() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let pkg = insert_package(&db, "p", 0, true).await;
+        let now = now_secs();
+        const DAY: i64 = 24 * 60 * 60;
+        // Two in the last 30 days, one before that; one failed.
+        insert_build(
+            &db,
+            pkg,
+            1,
+            BuildStates::SUCCESSFUL_BUILD,
+            Some(now - DAY),
+            Some(now - DAY + 100),
+        )
+        .await;
+        insert_build(
+            &db,
+            pkg,
+            2,
+            BuildStates::FAILED_BUILD,
+            Some(now - 2 * DAY),
+            Some(now - 2 * DAY + 300),
+        )
+        .await;
+        insert_build(
+            &db,
+            pkg,
+            3,
+            BuildStates::SUCCESSFUL_BUILD,
+            Some(now - 40 * DAY),
+            Some(now - 40 * DAY + 100),
+        )
+        .await;
+
+        let points = get_graph_datapoints(&db).await.unwrap();
+        assert_eq!(points.iter().map(|p| p.count).sum::<i32>(), 3);
+        assert_eq!(points.iter().map(|p| p.successful).sum::<i32>(), 2);
+        // Newest month first.
+        assert!(
+            points
+                .windows(2)
+                .all(|w| (w[0].year, w[0].month) > (w[1].year, w[1].month))
+        );
+
+        let trends = build_trends(&db).await.unwrap();
+        // Two builds against one: up 100%.
+        assert!((trends.count - 1.0).abs() < 1e-6, "{}", trends.count);
+        // Average 200s against 100s: up 100%.
+        assert!((trends.duration - 1.0).abs() < 1e-6, "{}", trends.duration);
     }
 }

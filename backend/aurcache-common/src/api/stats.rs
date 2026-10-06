@@ -61,6 +61,14 @@ pub struct UserInfo {
     pub has_api_token: bool,
 }
 
+/// A personal API token, as regenerating one answers.
+#[derive(Deserialize, ToSchema, Serialize, Debug)]
+pub struct ApiTokenResponse {
+    /// The new token, in plain text. Only ever returned here: the server keeps
+    /// its hash.
+    pub token: String,
+}
+
 /// How many days of successful builds the longest-builds card ranks.
 ///
 /// A window, not all time: an all-time list barely changes and prompts

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use alpm_srcinfo::SourceInfoV1;
 
-use crate::model::{Package, PkgDeps};
+use crate::model::{Dependency, Package, PkgDeps};
 
 /// Extract dependencies and sub-package names from a parsed .SRCINFO, for the
 /// architectures the package is actually built for.
@@ -57,22 +57,19 @@ pub fn deps_from_srcinfo(
     }
 }
 
-/// Split a pacman-style dependency string into `(name, version_constraint)`.
-/// e.g. "glibc>=2.35" -> ("glibc", ">=2.35")
-/// e.g. "python" -> ("python", "")
+/// Split a pacman-style dependency string into its name and constraint:
+/// `glibc>=2.35` is `glibc` with `>=2.35`, `python` is unversioned.
 ///
 /// This parser only recognizes the standard pacman comparison operators
 /// `>=`, `<=`, `=`, `>`, and `<`.
-pub fn parse_dep(dep: &str) -> (&str, &str) {
+pub fn parse_dep(dep: &str) -> Dependency<'_> {
     let dep = dep.trim();
     for &op in &[">=", "<=", "=", ">", "<"] {
         if let Some(pos) = dep.find(op) {
-            let name = dep[..pos].trim();
-            let constraint = dep[pos..].trim();
-            return (name, constraint);
+            return Dependency::new(dep[..pos].trim(), dep[pos..].trim());
         }
     }
-    (dep, "")
+    Dependency::unversioned(dep)
 }
 
 pub(crate) fn deps_from_packages(packages: &[Package]) -> PkgDeps {
@@ -112,20 +109,25 @@ mod tests {
     use crate::model::Package;
 
     use super::{deps_from_packages, parse_dep};
+    use crate::model::Dependency;
 
     #[test]
     fn test_parse_dep_no_constraint() {
-        assert_eq!(parse_dep("glibc"), ("glibc", ""));
-        assert_eq!(parse_dep("  python  "), ("python", ""));
+        assert_eq!(parse_dep("glibc"), Dependency::unversioned("glibc"));
+        assert_eq!(parse_dep("  python  "), Dependency::unversioned("python"));
     }
 
     #[test]
     fn test_parse_dep_with_constraint() {
-        assert_eq!(parse_dep("glibc>=2.35"), ("glibc", ">=2.35"));
-        assert_eq!(parse_dep("cmake<=3.20"), ("cmake", "<=3.20"));
-        assert_eq!(parse_dep("pkg=1.5"), ("pkg", "=1.5"));
-        assert_eq!(parse_dep("lib>2.0"), ("lib", ">2.0"));
-        assert_eq!(parse_dep("libfoo<3"), ("libfoo", "<3"));
+        for (raw, name, constraint) in [
+            ("glibc>=2.35", "glibc", ">=2.35"),
+            ("cmake<=3.20", "cmake", "<=3.20"),
+            ("pkg=1.5", "pkg", "=1.5"),
+            ("lib>2.0", "lib", ">2.0"),
+            ("libfoo<3", "libfoo", "<3"),
+        ] {
+            assert_eq!(parse_dep(raw), Dependency::new(name, constraint));
+        }
     }
 
     #[test]

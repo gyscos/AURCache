@@ -4,21 +4,21 @@ use std::env;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use aurcache_common::builder::BuildStates;
+use aurcache_common::build_state::BuildStates;
 use aurcache_common::source::SourceData;
 use aurcache_db::helpers::operations;
 use aurcache_db::prelude::{Builds, Files, Packages};
 use aurcache_db::{builds, files};
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use aurcache_utils::publish;
-use aurcache_utils::repository::Repository;
+use aurcache_utils::repository::{REPO_ROOT, Repository};
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::benchmark::gen_mirrorlist;
-use pacman_mirrors::platforms::{Platform, Platforms};
+use pacman_mirrors::platforms::Platform;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
 use sea_orm::{QueryFilter, QueryOrder};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const START_BANNER: &str = r"
           _    _ _____   _____           _
@@ -29,22 +29,12 @@ const START_BANNER: &str = r"
  /_/    \_\____/|_|  \_\\_____\__,_|\___|_| |_|\___|
 ";
 
-pub fn pre_startup_tasks() {
+pub fn pre_startup_tasks(version: &str) {
     info!("{START_BANNER}");
-    info!(
-        "Version: {}",
-        aurcache_common::version::full_version(env!("CARGO_PKG_VERSION"))
-    );
+    info!("Version: {version}");
 
     #[cfg(debug_assertions)]
     warn!("This is a dev build! Consider using a stable release.");
-
-    for platform in Platforms {
-        let repo_dir = Path::new("./repo").join(platform.to_string());
-        if let Err(e) = pacman_repo_utils::repo_init::init_repo(&repo_dir, "repo") {
-            error!("Failed to initialize pacman repo: {e:?}");
-        }
-    }
 
     warn_about_ephemeral_data();
 }
@@ -80,7 +70,7 @@ fn warn_about_ephemeral_data() {
         };
 
         let ephemeral: Vec<String> = [
-            PathBuf::from("./repo"),
+            PathBuf::from(REPO_ROOT),
             aurcache_common::fs::build_log_root(),
             aurcache_common::fs::ca_dir(),
         ]
@@ -243,7 +233,7 @@ async fn backfill_file_sizes(db: &DatabaseConnection) {
     info!("Backfilling size for {} package files", rows.len());
     let mut filled = 0;
     for row in rows {
-        let path = Path::new("./repo")
+        let path = Path::new(REPO_ROOT)
             .join(row.platform.to_string())
             .join(&row.filename);
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -325,8 +315,6 @@ async fn backfill_build_sizes(db: &DatabaseConnection) {
     }
 }
 
-/// Close out operations that were running when the server stopped.
-///
 /// Remove source checkouts left behind by packages that no longer exist.
 ///
 /// Run at boot, before the build queue, the schedulers and the API are

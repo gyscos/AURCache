@@ -9,7 +9,6 @@
 //! builds for, so the two agree for a single-platform package and the package's
 //! total is the sum across platforms otherwise.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -20,7 +19,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table builds add size BIGINT;",
             DbBackend::Postgres => "ALTER TABLE builds ADD COLUMN size BIGINT;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -31,7 +30,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => "alter table builds drop column size;",
             DbBackend::Postgres => "ALTER TABLE builds DROP COLUMN size;",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

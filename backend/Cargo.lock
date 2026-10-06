@@ -661,10 +661,9 @@ dependencies = [
  "aurcache-deps",
  "aurcache-utils",
  "bigdecimal",
- "chrono",
  "hex",
- "iana-time-zone",
  "itertools 0.15.0",
+ "jiff",
  "pacman-mirrors",
  "rand 0.10.2",
  "rand_core 0.10.1",
@@ -731,12 +730,12 @@ dependencies = [
  "anyhow",
  "aurcache-client",
  "aurcache-common",
- "chrono",
  "clap",
  "clap_complete",
  "dialoguer",
  "dirs",
  "getrandom 0.4.3",
+ "jiff",
  "serde",
  "serde_json",
  "tempfile",
@@ -762,6 +761,7 @@ name = "aurcache-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jiff",
  "sea-orm",
  "serde",
  "serde_json",
@@ -832,8 +832,7 @@ dependencies = [
  "aurcache-db",
  "aurcache-deps",
  "aurcache-utils",
- "chrono",
- "cron",
+ "jiff",
  "pacman-mirrors",
  "sea-orm",
  "serde_json",
@@ -852,6 +851,7 @@ dependencies = [
  "anyhow",
  "async-recursion",
  "aurcache-activitylog",
+ "aurcache-ca",
  "aurcache-common",
  "aurcache-db",
  "aurcache-deps",
@@ -859,6 +859,7 @@ dependencies = [
  "flate2",
  "futures",
  "git2",
+ "jiff",
  "libc",
  "lru",
  "pacman-mirrors",
@@ -919,15 +920,12 @@ dependencies = [
  "aurcache-ca",
  "aurcache-common",
  "flate2",
- "hex",
  "libc",
  "percent-encoding",
  "rcgen",
  "reqwest",
- "rustls-pki-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tar",
  "tempfile",
  "tokio",
@@ -1283,10 +1281,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1535,18 +1531,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8498c871161e1742aaa9d52551b2d6ebdd4c3d45a3be423e3728f33b955be550"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "cron"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5dcd6f69605c2956916ce24e8af637b754964c9a83f4662d3a2361654cdba09"
-dependencies = [
- "chrono",
- "once_cell",
- "phf",
- "winnow 0.7.15",
 ]
 
 [[package]]
@@ -3788,7 +3772,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "backon",
- "chrono",
+ "jiff",
  "reqwest",
  "sea-orm",
  "serde",
@@ -3887,48 +3871,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "phf"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
-dependencies = [
- "phf_macros",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared",
- "rand 0.8.8",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
-dependencies = [
- "phf_generator",
- "phf_shared",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
 ]
 
 [[package]]
@@ -5175,12 +5117,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "siphasher"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"

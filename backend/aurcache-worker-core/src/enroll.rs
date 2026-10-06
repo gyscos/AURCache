@@ -49,6 +49,41 @@ pub fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> Regist
     }
 }
 
+/// The server has revoked this worker: the one enrollment failure that waiting
+/// does not fix.
+#[derive(Debug)]
+pub struct Revoked;
+
+impl std::fmt::Display for Revoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this worker was revoked by the server; approve it again to resume")
+    }
+}
+
+impl std::error::Error for Revoked {}
+
+/// [`ensure_enrolled`], retried every poll interval until it succeeds.
+///
+/// The server may not be reachable yet -- still starting in the same compose
+/// stack -- or may briefly go away, and a worker waits for it rather than
+/// exiting. Except when it was revoked: that is returned, so the process exits
+/// loudly for the operator instead of retrying forever.
+pub async fn enroll(cfg: &CoreConfig, identity: &Identity, kind: &str) -> Result<WorkerClient> {
+    loop {
+        match ensure_enrolled(cfg, identity, kind).await {
+            Ok(client) => return Ok(client),
+            Err(e) if e.downcast_ref::<Revoked>().is_some() => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "Enrollment not complete ({e:#}); retrying in {}s",
+                    cfg.poll_interval
+                );
+                tokio::time::sleep(Duration::from_secs(cfg.poll_interval)).await;
+            }
+        }
+    }
+}
+
 /// Ensure the worker is enrolled and return an authenticated mTLS client.
 ///
 /// The worker registers on **every** startup, not only the first. Registration
@@ -87,10 +122,9 @@ pub async fn ensure_enrolled(
                     // Revocation is terminal, like on the fresh path below: a
                     // revoked worker that carried on would run forever failing
                     // every claim, instead of exiting loudly for the operator.
-                    anyhow::ensure!(
-                        status.status != ApprovalStatus::Revoked,
-                        "worker is revoked"
-                    );
+                    if status.status == ApprovalStatus::Revoked {
+                        return Err(Revoked.into());
+                    }
                     // Adopt a certificate the server has re-issued instead of
                     // discarding it. The server re-issues when the one it had
                     // on file was signed by a CA it no longer has, and a worker
@@ -144,10 +178,9 @@ pub async fn ensure_enrolled(
             tracing::info!("Worker approved and enrolled");
             return Ok(client);
         }
-        anyhow::ensure!(
-            status.status != ApprovalStatus::Revoked,
-            "worker was revoked by the server"
-        );
+        if status.status == ApprovalStatus::Revoked {
+            return Err(Revoked.into());
+        }
         tracing::info!("Awaiting approval (status: {})…", status.status);
         tokio::time::sleep(Duration::from_secs(cfg.poll_interval)).await;
         status = enroll_client

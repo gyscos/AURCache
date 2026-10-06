@@ -105,35 +105,19 @@ fn main() -> std::process::ExitCode {
                 build_env = true;
                 args.next();
             }
-            Some("--allow") => {
+            Some(flag @ ("--allow" | "--read" | "--read-except")) => {
+                let list = match flag {
+                    "--allow" => &mut allow,
+                    "--read" => &mut read,
+                    _ => &mut read_except,
+                };
+                let flag = flag.to_string();
                 args.next();
-                match args.next() {
-                    Some(dir) => allow.push(PathBuf::from(dir)),
-                    None => {
-                        eprintln!("aurcache-sandbox: --allow needs a directory");
-                        return std::process::ExitCode::from(2);
-                    }
-                }
-            }
-            Some("--read") => {
-                args.next();
-                match args.next() {
-                    Some(dir) => read.push(PathBuf::from(dir)),
-                    None => {
-                        eprintln!("aurcache-sandbox: --read needs a directory");
-                        return std::process::ExitCode::from(2);
-                    }
-                }
-            }
-            Some("--read-except") => {
-                args.next();
-                match args.next() {
-                    Some(dir) => read_except.push(PathBuf::from(dir)),
-                    None => {
-                        eprintln!("aurcache-sandbox: --read-except needs a directory");
-                        return std::process::ExitCode::from(2);
-                    }
-                }
+                let Some(dir) = args.next() else {
+                    eprintln!("aurcache-sandbox: {flag} needs a directory");
+                    return std::process::ExitCode::from(2);
+                };
+                list.push(PathBuf::from(dir));
             }
             Some("--") => {
                 args.next();
@@ -179,12 +163,7 @@ fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             }
         }
-        read.extend(read_grants_excluding(&read_except, |dir| {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return Vec::new();
-            };
-            entries.flatten().map(|e| e.path()).collect()
-        }));
+        read.extend(read_grants_excluding(&read_except, list_dir));
     }
 
     if let Err(e) = restrict(&allow, &read) {
@@ -278,6 +257,14 @@ fn protected_paths(file: &Path) -> Vec<PathBuf> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(PathBuf::from)
         .collect()
+}
+
+/// The entries of `dir`; none when it cannot be read.
+fn list_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|e| e.path()).collect()
 }
 
 /// Expand exclusions into the positive read grants Landlock needs.

@@ -10,7 +10,6 @@
 //! `kind` distinguishes them. Existing rows are bulk adds by definition -- they
 //! were written before anything else could produce one.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -40,7 +39,7 @@ ALTER TABLE operations RENAME TO bulk_adds;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => SQLITE_UP,
             DbBackend::Postgres => POSTGRES_UP,
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -50,7 +49,7 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => SQLITE_DOWN,
             DbBackend::Postgres => POSTGRES_DOWN,
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

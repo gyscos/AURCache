@@ -30,7 +30,8 @@ mod startup;
 async fn main() {
     _ = dotenv();
     init_logger();
-    pre_startup_tasks();
+    let version = aurcache_common::version::full_version(env!("CARGO_PKG_VERSION"));
+    pre_startup_tasks(&version);
 
     let (tx, _) = broadcast::channel::<Action>(32);
     let db = init_db().await.expect("failed to initialize database");
@@ -56,7 +57,7 @@ async fn main() {
     // what lines a deploy up against whatever happened after it -- and it is
     // the marker the "since the last restart" view counts back to.
     activity.emit(Event::ServerStarted {
-        version: aurcache_common::version::full_version(env!("CARGO_PKG_VERSION")),
+        version: version.clone(),
     });
 
     // Load (or create on first run) the internal CA used to authenticate remote
@@ -95,6 +96,9 @@ async fn main() {
     // changes to it from interleaving: the worker protocol publishing builds,
     // package removals and restores all go through this one.
     let repo = Arc::new(Repository::new(REPO_ROOT).with_log(activity.clone()));
+    if let Err(e) = repo.init() {
+        tracing::error!("Failed to initialize the pacman repository: {e:#}");
+    }
 
     // The things a package operation acts through, from here on passed as one.
     // Cloning is a few refcount bumps, so a job or a request handler takes its
@@ -139,9 +143,7 @@ async fn main() {
 
     let api_handle = init_api(
         services.clone(),
-        ServerVersion(aurcache_common::version::full_version(env!(
-            "CARGO_PKG_VERSION"
-        ))),
+        ServerVersion(version),
         CaDirectory(ca_dir.clone()),
     );
     let worker_api_handle = init_worker_api(db, ca, store, Arc::clone(&repo), activity);

@@ -245,12 +245,6 @@ fn queue_reason(build: &Build) -> Option<String> {
     }
 }
 
-fn format_total_size(total_size: Option<i64>) -> String {
-    total_size
-        .and_then(|size| u64::try_from(size).ok())
-        .map_or_else(|| "—".to_string(), format_bytes)
-}
-
 #[component]
 fn RecentPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
     let Some(packages) = packages else {
@@ -533,7 +527,7 @@ fn LargestPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 shrink-0",
-                            "{format_total_size(pkg.total_size)}"
+                            "{crate::format::format_size(pkg.total_size)}"
                         }
                     }
                 }
@@ -592,7 +586,7 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
                                 "{item.build.platform}"
                             }
                             span { class: "opacity-60",
-                                "{format_duration_secs(item.build.start_time, item.build.end_time)}"
+                                "{crate::format::format_duration(item.build.start_time, item.build.end_time)}"
                             }
                             if let Some(previous) = item.previous_secs {
                                 span { class: "opacity-60", ", was {format_duration_secs_raw(previous)}" }
@@ -605,14 +599,6 @@ fn LongestBuildsCard(builds: Option<Vec<LongBuild>>) -> Element {
                 }
             }
         }
-    }
-}
-
-/// A finished build's duration from its timestamps.
-fn format_duration_secs(start_time: Option<i64>, end_time: Option<i64>) -> String {
-    match (start_time, end_time) {
-        (Some(start), Some(end)) => format_duration_secs_raw(end.saturating_sub(start).max(0)),
-        _ => "—".to_string(),
     }
 }
 

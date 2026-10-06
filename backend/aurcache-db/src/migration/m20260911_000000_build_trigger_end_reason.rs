@@ -14,7 +14,6 @@
 //! NULL; "nothing structured recorded" and "it failed for a worker-reported
 //! reason" are different answers and this column says the second.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::{ConnectionTrait, DbBackend};
 use sea_orm_migration::prelude::*;
 
@@ -25,7 +24,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "alter table builds add trigger INTEGER NOT NULL DEFAULT 0; \
                  alter table builds add end_reason INTEGER NULL;"
@@ -42,7 +41,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 "alter table builds drop column trigger; \
                  alter table builds drop column end_reason;"

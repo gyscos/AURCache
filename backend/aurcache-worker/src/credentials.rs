@@ -42,10 +42,9 @@ use crate::config::Config;
 /// are already fetched by the time the chroot is entered, so exposing it there
 /// would buy nothing.
 ///
-/// The path is stable across jobs: `GIT_SSH_COMMAND` is written into the *base*
-/// chroot's `makepkg.conf` when that chroot is created, and every later build
-/// reads a copy of it, so a per-job path would be stale for every job after the
-/// first.
+/// The path is stable across jobs: [`stage_for_job`] overwrites what is there
+/// for each one, and the `known_hosts` path it puts in `GIT_SSH_COMMAND` stays
+/// the same.
 pub fn secrets_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("secrets")
 }

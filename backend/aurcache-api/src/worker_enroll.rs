@@ -68,7 +68,9 @@ pub fn parse_preapproved(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|entry| entry.split(':').next())
-        .map(|fp| fp.trim().to_string())
+        // Case-insensitively, like the worker's own pin: fingerprints are
+        // computed lowercase, and one pasted in capitals is the same one.
+        .map(|fp| fp.trim().to_ascii_lowercase())
         .filter(|fp| !fp.is_empty())
         .collect()
 }

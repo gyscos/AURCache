@@ -1,4 +1,4 @@
-use crate::settings::parser::{ByteSize, ParseSetting};
+use crate::settings::parser::{ByteSize, ParseSetting, Seconds};
 use aurcache_common::settings::{
     ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
@@ -207,19 +207,24 @@ impl SettingsTraits for ApplicationSettings {
             persistent_builddir,
             parse_network,
         ) = tokio::join!(
-            get_setting(Setting::VersionCheckInterval, pkgid, db),
+            get_setting::<Seconds>(Setting::VersionCheckInterval, pkgid, db),
             get_setting(Setting::AutoUpdateInterval, pkgid, db),
-            get_setting(Setting::JobTimeout, pkgid, db),
+            get_setting::<Seconds>(Setting::JobTimeout, pkgid, db),
             get_setting::<ByteSize>(Setting::MaxArtifactSize, pkgid, db),
             get_setting(Setting::DateFormat, pkgid, db),
             get_setting(Setting::BuildOnNewVersion, pkgid, db),
             get_setting(Setting::PersistentBuilddir, pkgid, db),
             get_setting(Setting::ParseNetwork, pkgid, db),
         );
+        // Seconds on the wire, as they always were; written as durations.
+        let seconds = |entry: SettingsEntry<Seconds>| SettingsEntry {
+            value: u32::try_from(entry.value.0).unwrap_or(u32::MAX),
+            source: entry.source,
+        };
         Ok(Self {
-            version_check_interval,
+            version_check_interval: seconds(version_check_interval),
             auto_update_interval,
-            job_timeout,
+            job_timeout: seconds(job_timeout),
             max_artifact_size: SettingsEntry {
                 value: max_artifact_size.value.0,
                 source: max_artifact_size.source,

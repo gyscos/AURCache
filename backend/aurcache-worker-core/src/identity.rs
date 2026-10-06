@@ -8,7 +8,6 @@
 
 use anyhow::{Context, Result};
 use rcgen::{CertificateParams, KeyPair, PublicKeyData};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const KEY_FILE: &str = "worker-key.pem";
@@ -21,13 +20,6 @@ pub struct Identity {
     key: KeyPair,
     /// SHA-256 hex of the SubjectPublicKeyInfo DER.
     pub fingerprint: String,
-}
-
-/// Compute the SPKI fingerprint (SHA-256 hex) from a DER public key.
-pub fn spki_fingerprint(spki_der: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(spki_der);
-    hex::encode(hasher.finalize())
 }
 
 impl Identity {
@@ -43,14 +35,14 @@ impl Identity {
             KeyPair::from_pem(&pem).context("parsing persisted worker key")?
         } else {
             let key = KeyPair::generate().context("generating worker key")?;
-            write_private(&key_path, &key.serialize_pem())?;
+            aurcache_ca::write_private(&key_path, &key.serialize_pem())?;
             key
         };
 
         // `subject_public_key_info` is rcgen 0.14's name for what 0.13 called
         // `public_key_der`: the same SPKI DER, so the fingerprint -- which is
         // every worker's stable identity -- is unchanged by the upgrade.
-        let fingerprint = spki_fingerprint(&key.subject_public_key_info());
+        let fingerprint = aurcache_ca::fingerprint_from_spki_der(&key.subject_public_key_info());
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             key,
@@ -108,27 +100,6 @@ impl Identity {
         std::fs::read_to_string(self.ca_path())
             .with_context(|| format!("reading {}", self.ca_path().display()))
     }
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(contents.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

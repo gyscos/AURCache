@@ -6,19 +6,19 @@
 use anyhow::{Context, Result};
 use reqwest::Url;
 // The API shapes are defined once, in aurcache-common, and used by the server,
-// this client, and the browser frontend alike. Types still declared below are
-// ones whose server-side counterpart has a different shape or name; converging
-// those is the remaining half of the job.
+// this client, and the browser frontend alike. What is declared below is the
+// client's own: how it builds requests and reports failures.
 pub use aurcache_common::api::activity::Severity;
 pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::dump::{
-    RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
+    ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,
+    SecretsPolicy,
 };
 pub use aurcache_common::api::events::{Event, KINDS, Kind, Segment, kind_label};
 pub use aurcache_common::api::info::{ServerInfo, Timezone};
 pub use aurcache_common::api::log::{
-    BuildRef, EntityRef, LogEntry, LogPage, PackageRef, WorkerRef,
+    BuildRef, EntityRef, LogEntry, LogFilter, LogPage, PackageRef, WorkerRef,
 };
 pub use aurcache_common::api::operations::{ActiveOperation, kind as operation_kind};
 pub use aurcache_common::api::package::{
@@ -26,7 +26,7 @@ pub use aurcache_common::api::package::{
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, SimplePackage,
 };
 pub use aurcache_common::api::package::{
-    AurNotFoundPackage, AurPackage, PackageSource, UploadPackage,
+    AurNotFoundPackage, AurPackage, PackagePatch, PackageSource, UpdatePackage, UploadPackage,
 };
 pub use aurcache_common::api::package::{
     CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
@@ -39,9 +39,10 @@ pub use aurcache_common::api::package::{
 };
 pub use aurcache_common::api::package::{SourceFileContent, SourceFileList, SourceFileUpdate};
 pub use aurcache_common::api::repo::RepoInfo;
-pub use aurcache_common::api::settings::{SettingResponse, SettingValue};
+pub use aurcache_common::api::settings::{SchedulePreview, SettingResponse, SettingValue};
 pub use aurcache_common::api::stats::{
-    DashboardView, GraphDataPoint, ListStats, LongBuild, OutOfDateSlice, QueueSlice, UserInfo,
+    ApiTokenResponse, DashboardView, GraphDataPoint, ListStats, LongBuild, OutOfDateSlice,
+    QueueSlice, UserInfo,
 };
 pub use aurcache_common::api::waiting::WaitingReason;
 pub use aurcache_common::api::worker::{
@@ -52,60 +53,19 @@ pub use aurcache_common::settings::{
 };
 pub use aurcache_common::source::{GitSourceSpec, SourceData, looks_like_git_url, source_label};
 use reqwest::Response;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
 /// Re-export of [`reqwest::Method`] for generic request helpers.
 pub use reqwest::Method;
 
-/// Response returned when a personal API token is regenerated.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ApiTokenResponse {
-    /// Newly generated plaintext token.
-    ///
-    /// The server only returns this value at generation time.
-    pub token: String,
-}
-
 /// Search result returned from the AUR search proxy endpoint.
 ///
 /// The server's own shape rather than a copy of it: this was a duplicate
 /// declaration, so a field added to one silently did not exist on the other.
 pub use aurcache_common::api::aur::ApiPackage as SearchResult;
-
-/// Request payload for triggering a package update check.
-#[derive(Debug, Serialize)]
-pub struct UpdatePackageRequest {
-    /// Whether to force the update even when the version did not change.
-    pub force: bool,
-}
-
-/// Request payload for partially updating package metadata.
-#[derive(Debug, Default, Serialize)]
-pub struct PatchPackageRequest {
-    /// Replacement package name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Replacement status code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<i32>,
-    /// Replacement out-of-date flag.
-    #[serde(rename = "out_of_date", skip_serializing_if = "Option::is_none")]
-    pub out_of_date: Option<i32>,
-    /// Replacement latest-build reference.
-    ///
-    /// `Some(None)` explicitly clears the latest-build value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_build: Option<Option<i32>>,
-    /// Replacement build flag selection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub build_flags: Option<Vec<String>>,
-    /// Replacement platform selection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platforms: Option<Vec<String>>,
-}
 
 /// Where a request for the API actually landed.
 ///
@@ -134,23 +94,6 @@ const CLIENT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// How long a dump may take to travel either way, the restore upload and the
 /// download alike: up to 64 MiB on a slow link.
 const CLIENT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// What to narrow the log to. Every field is "show me less"; the default is
-/// the whole log.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LogQuery {
-    /// This severity and worse.
-    pub severity: Option<Severity>,
-    /// Only what happened since the server last started.
-    pub since_boot: bool,
-    /// Only entries of this kind.
-    pub kind: Option<String>,
-    /// Only entries naming this entity, in any role -- or, for a build, also
-    /// recorded during it.
-    pub entity: Option<EntityRef>,
-    /// With `entity`: only where it played this role.
-    pub role: Option<String>,
-}
 
 /// Async HTTP client for the AURCache API.
 ///
@@ -350,7 +293,7 @@ impl AurCacheClient {
         .await
     }
 
-    /// Fetches details for a single package id.
+    /// Fetches the details of one package, by pkgbase.
     pub async fn get_package(&self, pkgbase: &str) -> Result<ExtendedPackage> {
         self.request_json::<ExtendedPackage, Value>(
             Method::GET,
@@ -400,11 +343,7 @@ impl AurCacheClient {
     ///
     /// Returns the build number, within that package, of each build queued as
     /// a result of the update — one per platform that got one.
-    pub async fn update_package(
-        &self,
-        pkgbase: &str,
-        body: &UpdatePackageRequest,
-    ) -> Result<Vec<i32>> {
+    pub async fn update_package(&self, pkgbase: &str, body: &UpdatePackage) -> Result<Vec<i32>> {
         self.request_json(
             Method::POST,
             &format!("/package/{pkgbase}/update"),
@@ -415,7 +354,7 @@ impl AurCacheClient {
     }
 
     /// Partially updates package metadata.
-    pub async fn patch_package(&self, pkgbase: &str, body: &PatchPackageRequest) -> Result<()> {
+    pub async fn patch_package(&self, pkgbase: &str, body: &PackagePatch) -> Result<()> {
         self.request_empty(
             Method::PATCH,
             &format!("/package/{pkgbase}"),
@@ -468,7 +407,7 @@ impl AurCacheClient {
             .await
     }
 
-    /// Lists builds, optionally filtered by package id.
+    /// Lists builds, newest first, optionally of one package only.
     pub async fn list_builds(
         &self,
         pkgbase: Option<&str>,
@@ -735,6 +674,21 @@ impl AurCacheClient {
         .await
     }
 
+    /// When `value` would run, for a setting that holds a schedule; nothing is
+    /// stored. The server answers because only it knows its timezone and what
+    /// `H` resolves to on this instance.
+    pub async fn preview_schedule(&self, key: &str, value: &str) -> Result<SchedulePreview> {
+        self.request_json(
+            Method::POST,
+            &format!("{}/schedule", self.settings_path(None, Some(key))),
+            &[],
+            Some(&SettingValue {
+                value: value.to_string(),
+            }),
+        )
+        .await
+    }
+
     /// Drops this scope's stored value, so the setting inherits again.
     pub async fn reset_setting(&self, pkgbase: Option<&str>, key: &str) -> Result<()> {
         self.request_empty::<Value>(
@@ -769,7 +723,7 @@ impl AurCacheClient {
         &self,
         limit: Option<u64>,
         offset: Option<u64>,
-        filter: &LogQuery,
+        filter: &LogFilter,
     ) -> Result<LogPage> {
         let query = Query::default()
             .opt("limit", limit)
@@ -953,16 +907,16 @@ impl AurCacheClient {
         &self,
         archive: bytes::Bytes,
         dry_run: bool,
-        on_existing: &str,
+        on_existing: ExistingPackagePolicy,
         clear: bool,
-        secrets: &str,
+        secrets: SecretsPolicy,
     ) -> Result<RestoreAccepted> {
         let mut url = self.base.join("restore").context("invalid restore URL")?;
         url.query_pairs_mut()
             .append_pair("dry_run", &dry_run.to_string())
-            .append_pair("on_existing", on_existing)
+            .append_pair("on_existing", on_existing.as_str())
             .append_pair("clear", &clear.to_string())
-            .append_pair("secrets", secrets);
+            .append_pair("secrets", secrets.as_str());
         let response = self
             .client
             .post(url)
@@ -1064,13 +1018,12 @@ impl AurCacheClient {
     /// `on_unauthorized` callback when the failure was the server refusing the
     /// session.
     ///
-    /// `probe_api` and friends build raw requests rather than going through
-    /// [`Self::send`], so this is what every call site of the free
-    /// [`ensure_success`] uses instead of it.
+    /// Every response goes through this rather than the free
+    /// [`ensure_success`], so no call can miss the callback.
     async fn success_or_notify(&self, response: Response) -> Result<Response> {
         match ensure_success(response).await {
             Ok(response) => Ok(response),
-            Err(error) if is_unauthorized_error(&error) => {
+            Err(error) if is_unauthorized(&error) => {
                 if let Some(on_unauthorized) = &self.on_unauthorized {
                     on_unauthorized();
                 }
@@ -1081,11 +1034,15 @@ impl AurCacheClient {
     }
 }
 
-/// Whether the error is the API answering 401 — i.e. the session or token it
-/// was presented with was refused.
-fn is_unauthorized_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ApiError>()
-        .is_some_and(ApiError::is_unauthorized)
+/// Whether a failed call failed because the API refused the session or token
+/// it was presented with: the server answered 401.
+#[must_use]
+pub fn is_unauthorized(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ApiError>()
+            .is_some_and(ApiError::is_unauthorized)
+    })
 }
 
 /// Whether a response came back from the endpoint that was asked for.
@@ -1343,7 +1300,7 @@ mod tests {
             message: "session refused".to_string(),
         }
         .into();
-        assert!(super::is_unauthorized_error(&unauthorized));
+        assert!(super::is_unauthorized(&unauthorized));
 
         for status in [
             reqwest::StatusCode::FORBIDDEN,
@@ -1356,7 +1313,7 @@ mod tests {
             }
             .into();
             assert!(
-                !super::is_unauthorized_error(&error),
+                !super::is_unauthorized(&error),
                 "{status} should not count as refused"
             );
         }

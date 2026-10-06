@@ -72,12 +72,6 @@ fn worker_tls_config(ca: &aurcache_ca::Ca) -> Option<rocket::config::TlsConfig> 
     Some(tls)
 }
 
-/// Start the human-facing API/UI listener.
-///
-/// `store` is the process-wide [`SnapshotStore`]; it must be the same instance
-/// handed to the schedulers and the worker listener so every path shares one set
-/// of on-disk git checkouts (see `main.rs`).
-#[must_use]
 /// Where the worker CA lives, supplied by the binary.
 ///
 /// The CA is files on disk rather than rows, and only the binary resolves where
@@ -94,6 +88,12 @@ pub struct CaDirectory(pub std::path::PathBuf);
 #[derive(Debug, Clone)]
 pub struct ServerVersion(pub String);
 
+/// Start the human-facing API/UI listener.
+///
+/// `services` carries the process-wide [`SnapshotStore`]; it must be the same
+/// instance handed to the schedulers and the worker listener so every path
+/// shares one set of on-disk git checkouts (see `main.rs`).
+#[must_use]
 pub fn init_api(services: Services, version: ServerVersion, ca_dir: CaDirectory) -> JoinHandle<()> {
     tokio::spawn(async move {
         let config = Config {
@@ -255,10 +255,7 @@ pub fn init_worker_api(
             return;
         };
 
-        let port = env::var("AURCACHE_WORKER_PORT")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT);
+        let port = worker_port();
 
         let config = Config {
             address: Ipv4Addr::UNSPECIFIED.into(),
@@ -285,6 +282,15 @@ pub fn init_worker_api(
             Err(err) => error!("Worker protocol listener had an error: {err}"),
         }
     })
+}
+
+/// The port the worker protocol listens on: `AURCACHE_WORKER_PORT`, else the
+/// default.
+pub(crate) fn worker_port() -> u16 {
+    env::var("AURCACHE_WORKER_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(aurcache_common::ports::AURCACHE_WORKER_PORT)
 }
 
 #[must_use]

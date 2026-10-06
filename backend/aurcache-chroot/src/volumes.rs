@@ -66,7 +66,7 @@ impl CacheVolumes {
         let made = (|| {
             privileged_blocking(&[
                 "chown".as_ref(),
-                format!("{}:{}", owner.uid, owner.gid).as_ref(),
+                owner.chown_spec().as_ref(),
                 path.as_os_str(),
             ])?;
             privileged_blocking(&[

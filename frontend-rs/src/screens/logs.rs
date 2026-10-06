@@ -18,7 +18,7 @@ use crate::dates::AbsoluteDate;
 use crate::listing::{ListHeader, PAGE_SIZE, Pager, ViewParams, use_url_view};
 use crate::routes::Route;
 use aurcache_client::{
-    ActiveOperation, EntityRef, Event, KINDS, LogEntry, LogQuery, PackageRef, Segment, Severity,
+    ActiveOperation, EntityRef, Event, KINDS, LogEntry, LogFilter, PackageRef, Segment, Severity,
     WorkerRef, kind_label, operation_kind,
 };
 use dioxus::prelude::*;
@@ -64,12 +64,12 @@ pub fn Logs(view: ViewParams) -> Element {
 
     let entries = use_resource(move || async move {
         let offset = page() as u64 * PAGE;
-        let query = LogQuery {
+        let query = LogFilter {
             severity: severity(),
             since_boot: since_boot(),
             entity: about(),
             kind: kind(),
-            ..LogQuery::default()
+            ..LogFilter::default()
         };
         crate::api::client()?
             .log(Some(PAGE), Some(offset), &query)
@@ -312,9 +312,9 @@ const RECENT: u64 = 10;
 #[component]
 pub fn RecentActivity(about: EntityRef) -> Element {
     let entries = use_resource(use_reactive(&about, |about| async move {
-        let query = LogQuery {
+        let query = LogFilter {
             entity: Some(about),
-            ..LogQuery::default()
+            ..LogFilter::default()
         };
         crate::api::client()?
             .log(Some(RECENT), None, &query)

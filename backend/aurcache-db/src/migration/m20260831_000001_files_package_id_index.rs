@@ -5,7 +5,6 @@
 //! by `package_id`, which was previously unindexed and meant a full table scan
 //! per package on the list.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -16,7 +15,7 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Sqlite | DbBackend::Postgres => {
                 db.execute_unprepared(
                     "CREATE INDEX IF NOT EXISTS idx_files_package_id ON files (package_id);",

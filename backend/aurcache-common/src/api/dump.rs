@@ -189,6 +189,54 @@ pub enum ExistingPackagePolicy {
     MergePatches,
 }
 
+impl SecretsPolicy {
+    /// The spelling the restore route's query string takes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+impl std::str::FromStr for SecretsPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ignore" => Ok(Self::Ignore),
+            "copy" => Ok(Self::Copy),
+            other => Err(format!("unknown secrets policy '{other}'")),
+        }
+    }
+}
+
+impl ExistingPackagePolicy {
+    /// The spelling the restore route's query string takes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Overwrite => "overwrite",
+            Self::MergePatches => "merge-patches",
+        }
+    }
+}
+
+impl std::str::FromStr for ExistingPackagePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "skip" => Ok(Self::Skip),
+            "overwrite" => Ok(Self::Overwrite),
+            "merge-patches" => Ok(Self::MergePatches),
+            other => Err(format!("unknown on_existing policy '{other}'")),
+        }
+    }
+}
+
 /// How an import should behave.
 #[derive(Serialize, Deserialize, ToSchema, Debug, Clone, Default)]
 pub struct RestoreOptions {
@@ -231,6 +279,20 @@ pub enum RestoreOutcome {
     Failed { error: String },
 }
 
+impl RestoreOutcome {
+    /// The outcome in one word, as a report line shows it.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Imported => "imported",
+            Self::Skipped => "skipped",
+            Self::Overwritten => "overwritten",
+            Self::PatchAdopted => "patched",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// One line of an import's report.
 #[derive(Serialize, Deserialize, ToSchema, Debug, Clone, PartialEq, Eq)]
 pub struct RestoreEntry {
@@ -261,4 +323,25 @@ pub struct RestoreAccepted {
     /// Populated only for a dry run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preview: Vec<RestoreEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExistingPackagePolicy, SecretsPolicy};
+
+    /// Every policy parses back from the spelling it is sent as.
+    #[test]
+    fn policies_round_trip_through_the_query_string() {
+        for policy in [
+            ExistingPackagePolicy::Skip,
+            ExistingPackagePolicy::Overwrite,
+            ExistingPackagePolicy::MergePatches,
+        ] {
+            assert_eq!(policy.as_str().parse(), Ok(policy));
+        }
+        for policy in [SecretsPolicy::Ignore, SecretsPolicy::Copy] {
+            assert_eq!(policy.as_str().parse(), Ok(policy));
+        }
+        assert!("merge_patches".parse::<ExistingPackagePolicy>().is_err());
+    }
 }

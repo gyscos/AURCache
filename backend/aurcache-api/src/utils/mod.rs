@@ -1,6 +1,5 @@
 pub mod config;
 pub mod error;
-pub mod lists;
 pub mod pagination;
 
 /// Depth of the progress channels behind the bulk-add and restore jobs.

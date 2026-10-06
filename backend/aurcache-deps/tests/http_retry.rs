@@ -69,3 +69,25 @@ async fn a_failed_query_does_not_list_its_packages() {
     assert!(message.contains("/rpc/v5/info"), "{message}");
     assert!(!message.contains("first-package"), "{message}");
 }
+
+/// Every name having left the AUR is an answer: an empty one. Treated as an
+/// error, it failed the whole version-check pass -- git-sourced packages
+/// included -- and the packages were never recorded as gone from the AUR.
+#[tokio::test]
+async fn names_the_aur_does_not_know_are_an_empty_answer() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                r#"{"version":5,"type":"multiinfo","resultcount":0,"results":[]}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+
+    let found = client_for(&server)
+        .multi_info_of(&["gone-from-the-aur"])
+        .await
+        .expect("an empty result is not an error");
+    assert!(found.is_empty());
+}

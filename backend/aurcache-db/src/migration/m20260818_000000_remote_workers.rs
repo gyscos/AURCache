@@ -1,4 +1,3 @@
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -10,7 +9,7 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 db.execute_unprepared(
                     r"
@@ -117,7 +116,7 @@ ALTER TABLE builds ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Sqlite => {
                 db.execute_unprepared("DROP INDEX IF EXISTS idx_builds_worker_id;")
                     .await?;
@@ -161,6 +160,16 @@ mod tests {
     async fn workers_table_and_build_lease_columns_exist() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
+        // `attempt_count` is dropped by a later migration; this one's schema
+        // is what is under test.
+        Migrator::down(
+            &db,
+            Some(crate::migration::steps_back_to(
+                "m20261005_000001_drop_attempt_count",
+            )),
+        )
+        .await
+        .unwrap();
 
         // workers table with expected columns.
         for col in &[
@@ -194,6 +203,16 @@ mod tests {
     async fn build_lease_defaults_applied() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
+        // `attempt_count` is dropped by a later migration; this one's schema
+        // is what is under test.
+        Migrator::down(
+            &db,
+            Some(crate::migration::steps_back_to(
+                "m20261005_000001_drop_attempt_count",
+            )),
+        )
+        .await
+        .unwrap();
 
         db.execute_unprepared("INSERT INTO packages (id, name) VALUES (1, 'testpkg');")
             .await
@@ -224,6 +243,16 @@ mod tests {
     async fn worker_status_defaults_to_pending() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
+        // `attempt_count` is dropped by a later migration; this one's schema
+        // is what is under test.
+        Migrator::down(
+            &db,
+            Some(crate::migration::steps_back_to(
+                "m20261005_000001_drop_attempt_count",
+            )),
+        )
+        .await
+        .unwrap();
 
         db.execute_unprepared(
             "INSERT INTO workers (id, name, cert_fingerprint) VALUES (1, 'w1', 'fp1');",
@@ -249,6 +278,16 @@ mod tests {
     async fn hot_path_indexes_exist() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
+        // `attempt_count` is dropped by a later migration; this one's schema
+        // is what is under test.
+        Migrator::down(
+            &db,
+            Some(crate::migration::steps_back_to(
+                "m20261005_000001_drop_attempt_count",
+            )),
+        )
+        .await
+        .unwrap();
 
         for idx in &["idx_builds_status_platform", "idx_builds_worker_id"] {
             let row = db

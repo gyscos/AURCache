@@ -2,7 +2,7 @@
 
 use crate::api::client;
 use crate::dates::DateOnly;
-use crate::format::{format_bytes, format_duration};
+use crate::format::format_duration;
 use crate::listing::{
     ListControls, ListHeader, Page, Pager, Sort, SortDir, SortKey, SortableHeader, ViewParams,
     filter_builds, paginate, sort_builds, use_url_search, use_url_view,
@@ -248,10 +248,7 @@ enum Rows {
 ///
 /// Shared with the package builds list, which shows the same columns.
 pub(crate) fn build_size(build: &Build) -> String {
-    build
-        .size
-        .and_then(|size| u64::try_from(size).ok())
-        .map_or_else(|| "—".to_string(), format_bytes)
+    crate::format::format_size(build.size)
 }
 
 /// How much memory a build needed at its peak.
@@ -263,8 +260,5 @@ pub(crate) fn build_size(build: &Build) -> String {
 ///
 /// Shared with the package builds list, which shows the same columns.
 pub(crate) fn build_peak_memory(build: &Build) -> String {
-    build
-        .peak_memory
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .map_or_else(|| "—".to_string(), format_bytes)
+    crate::format::format_size(build.peak_memory)
 }

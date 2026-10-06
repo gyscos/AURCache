@@ -108,10 +108,10 @@ mod tests {
     /// is always this crate's release, with at most a commit appended.
     #[test]
     fn the_reported_version_is_this_crates_release() {
-        let version = full_version(env!("CARGO_PKG_VERSION"));
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
+        let release = env!("CARGO_PKG_VERSION");
+        let version = full_version(release);
         assert!(
-            version == "0.1.0" || version.starts_with("0.1.0+g"),
+            version == release || version.starts_with(&format!("{release}+g")),
             "{version}"
         );
     }

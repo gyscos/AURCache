@@ -6,7 +6,6 @@
 //! nobody, and concurrency 1 is the most conservative capacity assumption for a
 //! worker that predates the field.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -26,7 +25,7 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        let keyword = match database_type() {
+        let keyword = match manager.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => "COLUMN ",
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -43,7 +42,7 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        match database_type() {
+        match manager.get_database_backend() {
             DbBackend::Sqlite | DbBackend::Postgres => {
                 for col in ["concurrency", "priority", "package_affinity"] {
                     db.execute_unprepared(&format!("ALTER TABLE workers DROP COLUMN {col};"))

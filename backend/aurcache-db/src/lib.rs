@@ -10,6 +10,7 @@ pub mod dependencies;
 pub mod files;
 pub mod helpers;
 pub mod init;
+pub mod lists;
 pub mod log_entities;
 pub mod logs;
 pub mod migration;

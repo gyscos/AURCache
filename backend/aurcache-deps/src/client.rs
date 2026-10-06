@@ -274,7 +274,7 @@ impl AurClient {
     /// Resolve a list of package names to their pkgbase names via the AUR RPC.
     pub async fn resolve_bases(&self, names: &[&str]) -> Result<HashMap<String, String>, Error> {
         Ok(self
-            .rpc_info_all(names)
+            .multi_info_of(names)
             .await?
             .into_iter()
             .map(|pkg| (pkg.name, pkg.package_base))
@@ -293,22 +293,17 @@ impl AurClient {
         Ok(packages.into_iter().next())
     }
 
-    /// Fetch metadata for multiple AUR packages in a single RPC call.
+    /// Fetch metadata for several AUR packages at once.
+    ///
+    /// A name the AUR does not know is absent from the result, not an error:
+    /// the version check asks about every tracked package together, and one
+    /// that left the AUR -- or all of them -- must not cost the others their
+    /// check.
+    ///
+    /// Chunked across URLs by [`Self::rpc_info_urls`], since a whole
+    /// dependency list or repository can outgrow the server's URL limit. Only
+    /// a request that fails outright aborts.
     pub async fn multi_info_of(&self, names: &[&str]) -> Result<Vec<Package>, Error> {
-        let packages = self.rpc_info_all(names).await?;
-        if packages.is_empty() && !names.is_empty() {
-            return Err(Error::Rpc("package not found via RPC".into()));
-        }
-        Ok(packages)
-    }
-
-    /// Fetch an `/info` query for every name, chunked across URLs as required
-    /// by `rpc_info_urls` and concatenated. Chunked because this is handed a
-    /// whole dependency list, which for a large package can outgrow the
-    /// server's URL limit. An individual chunk returning nothing is fine —
-    /// those packages are simply not in the AUR any more. Only a request that
-    /// fails outright aborts.
-    async fn rpc_info_all(&self, names: &[&str]) -> Result<Vec<Package>, Error> {
         let mut packages = Vec::new();
         for url in self.rpc_info_urls(names)? {
             packages.extend(self.rpc_fetch(url).await?);

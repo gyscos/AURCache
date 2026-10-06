@@ -1,9 +1,10 @@
 use crate::models::aur::ApiPackage;
 use crate::models::authenticated::Authenticated;
 use aurcache_utils::aur::api::{get_package_info, query_aur};
-use rocket::get;
+use aurcache_utils::services::Services;
 use rocket::response::status::BadRequest;
 use rocket::serde::json::Json;
+use rocket::{State, get};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -22,6 +23,7 @@ pub struct AURApi;
 #[get("/search?<query>")]
 pub async fn search(
     query: &str,
+    services: &State<Services>,
     _a: Authenticated,
 ) -> Result<Json<Vec<ApiPackage>>, BadRequest<String>> {
     // Chars, not bytes: a byte length miscounts non-ASCII queries against the
@@ -29,11 +31,11 @@ pub async fn search(
     // cannot drift apart again.
     let result = if query.chars().count() < 3 {
         // Iterate over the Option, giving either a single result or an empty list.
-        get_package_info(query)
+        get_package_info(&services.client, query)
             .await
             .map(|pkg| pkg.into_iter().collect::<Vec<_>>())
     } else {
-        query_aur(query).await
+        query_aur(&services.client, query).await
     };
     let packages = result.map_err(|e| BadRequest(e.to_string()))?;
     Ok(Json(packages.into_iter().map(ApiPackage::from).collect()))

@@ -9,16 +9,15 @@ mod url;
 use anyhow::{Context, Result, anyhow, bail};
 use aurcache_client::{
     AddPackageRequest, AddPackagesRequest, AurCacheClient, Build, BuildQuery, BulkAddAccepted,
-    BulkAddOutcome, BulkAddProgress, CandidateSource, DependencyOptions, ExtendedPackage,
-    GitSourceSpec, GraphDataPoint, ListStats, Method, PackageDependency, PackageSource,
-    PatchPackageRequest, ReplacementVerdict, RestoreOutcome, SearchResult, ServerInfo,
-    SimplePackage, SourceData, UpdatePackageRequest, UserInfo, Worker, WorkerConfigUpdate,
+    BulkAddOutcome, BulkAddProgress, CandidateSource, DependencyOptions, ExistingPackagePolicy,
+    ExtendedPackage, GitSourceSpec, GraphDataPoint, ListStats, Method, PackageDependency,
+    PackagePatch, PackageSource, ReplacementVerdict, RestoreOutcome, SearchResult, SecretsPolicy,
+    ServerInfo, SimplePackage, SourceData, UpdatePackage, UserInfo, Worker, WorkerConfigUpdate,
     WorkerConfigView, looks_like_git_url,
 };
 use aurcache_common::api::build_log::{Alignment, align};
 use aurcache_common::build_state::{BuildState, BuildStates};
 use aurcache_common::repo::host_from_url;
-use chrono::{DateTime, Local};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use config::{
     load_config, resolve_runtime_config, save_config, set_token, set_url, summarize_config,
@@ -27,7 +26,7 @@ use dialoguer::{Confirm, Select};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -914,7 +913,7 @@ async fn main() -> Result<()> {
             let used_token = runtime.token.clone();
             let client = AurCacheClient::new(runtime.url.clone(), runtime.token)?;
             match run(&client, format, command.clone()).await {
-                Err(err) if is_unauthorized(&err) && config::is_interactive() => {
+                Err(err) if aurcache_client::is_unauthorized(&err) && config::is_interactive() => {
                     eprintln!("{err}");
                     warn_if_token_from_env(used_token.as_deref());
                     eprintln!("Please re-enter your AURCache API token to continue.");
@@ -946,16 +945,10 @@ fn warn_if_token_from_env(used_token: Option<&str>) {
     }
 }
 
-/// Whether the given error is an HTTP 401 Unauthorized response from the API.
-fn is_unauthorized(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<aurcache_client::ApiError>()
-        .is_some_and(aurcache_client::ApiError::is_unauthorized)
-}
-
 async fn run(client: &AurCacheClient, format: OutputFormat, command: Command) -> Result<()> {
     match command {
         Command::Health => run_health(client, format).await,
-        Command::Doctor => doctor::run_doctor(client, format, client.base_url()).await,
+        Command::Doctor => doctor::run_doctor(client, format).await,
         Command::Repo { .. } | Command::Completions { .. } | Command::Setup { .. } => {
             unreachable!("offline commands are handled before client setup")
         }
@@ -1003,7 +996,7 @@ fn run_setup_command(format: OutputFormat, command: SetupCommand) -> Result<()> 
 }
 
 fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
-    let database = compose_database(&args, can_prompt())?;
+    let database = compose_database(&args, config::is_interactive())?;
     let defaults = compose::ComposeParams::default();
     let params = compose::ComposeParams {
         role: args.role,
@@ -1013,7 +1006,9 @@ fn run_setup_compose(format: OutputFormat, args: ComposeArgs) -> Result<()> {
         public_url: args.public_url.unwrap_or(defaults.public_url),
         log_level: args.common.log_level,
         tls_sans: args.tls_sans.unwrap_or(defaults.tls_sans),
-        worker: args.worker.to_env(args.role.has_worker() && can_prompt())?,
+        worker: args
+            .worker
+            .to_env(args.role.has_worker() && config::is_interactive())?,
     };
     let rendered = compose::render_compose(&params);
 
@@ -1099,7 +1094,9 @@ fn run_setup_worker(format: OutputFormat, args: SetupWorkerArgs) -> Result<()> {
         Some(url) => host_from_url(url).is_some_and(setup::is_local_host),
     };
 
-    let mut env = args.worker.to_env(can_prompt() && !args.dry_run)?;
+    let mut env = args
+        .worker
+        .to_env(config::is_interactive() && !args.dry_run)?;
     env.ca_fingerprint.clone_from(&args.ca_fingerprint);
     let env = if local {
         setup::local_worker_env(env)
@@ -1492,12 +1489,6 @@ async fn render_package(
     render(format, &package, print_package)
 }
 
-/// Show what `--from-installed` found, and get a yes before submitting it.
-///
-/// A machine with a long AUR history produces a long list, and adding it is not
-/// a quiet operation: every entry resolves its dependencies and enqueues builds
-/// for them. So the list is printed and confirmed rather than acted on from one
-/// flag.
 /// The database a compose file's server uses: the one named on the command
 /// line, or the one picked at a prompt when `interactive`.
 ///
@@ -1558,13 +1549,6 @@ fn compose_database(args: &ComposeArgs, interactive: bool) -> Result<compose::Co
     }
 }
 
-/// Whether there is a person to ask. The prompts are drawn on stderr, so a
-/// file written to stdout (`-o -`) can still be asked about; it is stdin and
-/// stderr that need a terminal.
-fn can_prompt() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
-}
-
 fn prompt_postgres_upgrade() -> Result<bool> {
     eprintln!(
         "An upgrade step runs {} before the database: when you raise PostgreSQL's\n\
@@ -1614,6 +1598,12 @@ fn generate_password() -> Result<String> {
     Ok(password)
 }
 
+/// Show what `--from-installed` found, and get a yes before submitting it.
+///
+/// A machine with a long AUR history produces a long list, and adding it is not
+/// a quiet operation: every entry resolves its dependencies and enqueues builds
+/// for them. So the list is printed and confirmed rather than acted on from one
+/// flag.
 fn confirm_bulk_add(packages: &[String], yes: bool) -> Result<()> {
     println!("{} package(s) to add:", packages.len());
     for name in packages {
@@ -1775,11 +1765,11 @@ enum Secrets {
     Copy,
 }
 
-impl Secrets {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ignore => "ignore",
-            Self::Copy => "copy",
+impl From<Secrets> for SecretsPolicy {
+    fn from(value: Secrets) -> Self {
+        match value {
+            Secrets::Ignore => Self::Ignore,
+            Secrets::Copy => Self::Copy,
         }
     }
 }
@@ -1796,12 +1786,12 @@ enum OnExisting {
     MergePatches,
 }
 
-impl OnExisting {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Skip => "skip",
-            Self::Overwrite => "overwrite",
-            Self::MergePatches => "merge-patches",
+impl From<OnExisting> for ExistingPackagePolicy {
+    fn from(value: OnExisting) -> Self {
+        match value {
+            OnExisting::Skip => Self::Skip,
+            OnExisting::Overwrite => Self::Overwrite,
+            OnExisting::MergePatches => Self::MergePatches,
         }
     }
 }
@@ -1823,9 +1813,9 @@ async fn restore_command(
         .restore(
             bytes.into(),
             dry_run,
-            on_existing.as_str(),
+            on_existing.into(),
             clear,
-            secrets.as_str(),
+            secrets.into(),
         )
         .await?;
 
@@ -1840,7 +1830,7 @@ async fn restore_command(
             }
             println!("would apply {} package(s):", accepted.total);
             for entry in &accepted.preview {
-                println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);
+                println!("  {:<10} {}", entry.outcome.label(), entry.pkgbase);
                 if let RestoreOutcome::Failed { error } = &entry.outcome {
                     println!("             {error}");
                 }
@@ -1881,7 +1871,7 @@ async fn restore_command(
     loop {
         let progress = client.restore_progress(job_id, seen).await?;
         for entry in &progress.entries {
-            println!("  {:<10} {}", outcome_label(&entry.outcome), entry.pkgbase);
+            println!("  {:<10} {}", entry.outcome.label(), entry.pkgbase);
             if let RestoreOutcome::Failed { error } = &entry.outcome {
                 println!("             {error}");
             }
@@ -1895,16 +1885,6 @@ async fn restore_command(
             return restore_result(progress.failed);
         }
         tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_POLL_INTERVAL_SECS)).await;
-    }
-}
-
-fn outcome_label(outcome: &RestoreOutcome) -> &'static str {
-    match outcome {
-        RestoreOutcome::Imported => "imported",
-        RestoreOutcome::Skipped => "skipped",
-        RestoreOutcome::Overwritten => "overwritten",
-        RestoreOutcome::PatchAdopted => "patched",
-        RestoreOutcome::Failed { .. } => "failed",
     }
 }
 
@@ -1934,7 +1914,7 @@ async fn dump_command(
     let path = output.unwrap_or_else(|| {
         PathBuf::from(format!(
             "aurcache-dump-{}.tar.gz",
-            Local::now().format("%Y%m%d")
+            jiff::Zoned::now().strftime("%Y%m%d")
         ))
     });
 
@@ -2055,7 +2035,7 @@ async fn follow_bulk_add(
     }
 }
 
-/// A run with failures exits non-zero, naming how many, so a restore that only
+/// A run with failures exits non-zero, naming how many, so a bulk add that only
 /// partly worked is not mistaken for a clean one by whatever called it.
 fn bulk_add_result(progress: &BulkAddProgress) -> Result<()> {
     if progress.failed > 0 {
@@ -2116,7 +2096,7 @@ async fn update_package_command(
         None
     };
     let queued = client
-        .update_package(&args.pkgbase, &UpdatePackageRequest { force: args.force })
+        .update_package(&args.pkgbase, &UpdatePackage { force: args.force })
         .await?;
     render(format, &queued, |numbers| {
         print_queued_builds(&args.pkgbase, numbers);
@@ -2163,8 +2143,9 @@ async fn patch_package_command(
     }
 
     if has_metadata {
-        let (pkgbase, body) = build_patch_package_request(args.clone())?;
-        client.patch_package(&pkgbase, &body).await?;
+        client
+            .patch_package(&args.pkgbase, &patch_request(&args))
+            .await?;
     }
 
     if has_patches {
@@ -2181,28 +2162,16 @@ async fn patch_package_command(
     Ok(())
 }
 
-fn build_patch_package_request(args: PatchPackageArgs) -> Result<(String, PatchPackageRequest)> {
-    let body = PatchPackageRequest {
-        // `name`, `status`, `out_of_date`, and `latest_build` are internal,
-        // server-managed fields (set by the add/build/version-check flows),
-        // so they are intentionally not exposed as CLI flags here even
-        // though the underlying API technically accepts them.
-        name: None,
-        status: None,
-        out_of_date: None,
-        latest_build: None,
-        build_flags: some_vec(args.build_flags),
-        platforms: some_vec(args.platforms),
-    };
-    ensure_patch_has_changes(&body)?;
-    Ok((args.pkgbase, body))
-}
-
-fn ensure_patch_has_changes(body: &PatchPackageRequest) -> Result<()> {
-    if body.build_flags.is_none() && body.platforms.is_none() {
-        bail!("no changes specified");
+/// The metadata half of a `pkg patch`: the platforms and build flags given.
+fn patch_request(args: &PatchPackageArgs) -> PackagePatch {
+    // Only what the CLI exposes: the server-managed fields (`name`, `status`,
+    // `out_of_date`, `latest_build`) are set by the add, build and
+    // version-check flows, not by hand.
+    PackagePatch {
+        build_flags: some_vec(args.build_flags.clone()),
+        platforms: some_vec(args.platforms.clone()),
+        ..PackagePatch::default()
     }
-    Ok(())
 }
 
 async fn run_dependency_command(
@@ -2993,29 +2962,18 @@ fn print_package_summary(package: &ExtendedPackage) {
         "upstream_version: {}",
         option_text(package.upstream_version.as_deref())
     );
+    println!("platforms: {}", join_or_dash(&package.selected_platforms));
     println!(
-        "platforms: {}",
-        join_or_dash(
-            &package
-                .selected_platforms
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        )
+        "build_flags: {}",
+        join_or_dash(package.selected_build_flags.as_deref().unwrap_or_default())
     );
-    let build_flags = package
-        .selected_build_flags
-        .as_ref()
-        .map(|flags| flags.iter().map(String::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
-    println!("build_flags: {}", join_or_dash(&build_flags));
     println!("source: {}", describe_source(&package.package_source));
     println!(
         "split_packages: {}",
         package
             .split_packages
             .as_ref()
-            .map(|packages| join_or_dash(&packages.iter().map(String::as_str).collect::<Vec<_>>()))
+            .map(|packages| join_or_dash(packages))
             .unwrap_or_else(|| "-".to_string())
     );
 }
@@ -3259,14 +3217,13 @@ async fn follow_builds(
         let (watched, rest): (Vec<&Build>, Vec<&Build>) =
             builds.iter().partition(|b| scope.includes(b));
 
-        const STATUS_ENQUEUED: i32 = BuildStates::ENQUEUED_BUILD;
         let mut changed = false;
         for build in &watched {
             let key = build_key(build);
             if seen.get(&key) != Some(&build.status) {
                 if args.fail_on_requeue
                     && seen.get(&key) == Some(&BuildStates::ACTIVE_BUILD)
-                    && build.status == STATUS_ENQUEUED
+                    && build.status == BuildStates::ENQUEUED_BUILD
                 {
                     bail!(
                         "{}/{} was requeued after running: the server refused the \
@@ -3417,11 +3374,15 @@ fn option_text(value: Option<&str>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn join_or_dash(values: &[&str]) -> String {
+fn join_or_dash<S: AsRef<str>>(values: &[S]) -> String {
     if values.is_empty() {
         "-".to_string()
     } else {
-        values.join(", ")
+        values
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -3441,9 +3402,12 @@ fn describe_source(source: &PackageSource) -> String {
 
 fn format_timestamp(timestamp: Option<i64>) -> String {
     timestamp
-        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
-        .map(|timestamp| timestamp.with_timezone(&Local))
-        .map(|timestamp| timestamp.to_rfc3339())
+        .and_then(|timestamp| jiff::Timestamp::from_second(timestamp).ok())
+        // RFC 3339 in the local offset, without jiff's `[zone]` suffix.
+        .map(|timestamp| {
+            let local = timestamp.to_zoned(jiff::tz::TimeZone::system());
+            timestamp.display_with_offset(local.offset()).to_string()
+        })
         .unwrap_or_else(|| "-".to_string())
 }
 

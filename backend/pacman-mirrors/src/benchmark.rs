@@ -1,6 +1,5 @@
 use crate::Mirror;
 use crate::mirror::Mirrors;
-use chrono::Utc;
 use reqwest::Client;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -33,7 +32,7 @@ pub fn gen_mirrorlist(mirrors: &[Mirror]) -> String {
 ## Generated on {}
 ##
 ",
-        Utc::now().date_naive()
+        jiff::Timestamp::now().strftime("%Y-%m-%d")
     );
 
     for mirror in mirrors.iter().take(10) {

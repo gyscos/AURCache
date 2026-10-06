@@ -1,9 +1,7 @@
 //! Build states, free of any database dependency.
 //!
-//! Kept out of [`crate::builder`] because that module's `Action` carries
-//! database models, which pulls sea-orm and sqlx in with it. A browser
-//! frontend needs the states and nothing else, so they live here and the
-//! database half of this crate is an optional feature.
+//! The build-queue `Action` that once sat beside them carries database models,
+//! so it lives in `aurcache-db`; these stay usable from a browser.
 
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +142,14 @@ impl BuildStates {
     pub const WAITING_FOR_DEPS: i32 = BuildState::WaitingForDeps.as_i32();
     /// Built, and being put in the repository by the server.
     pub const PUBLISHING: i32 = BuildState::Publishing.as_i32();
+    /// Every state [`BuildState::is_in_progress`] holds for: a build that has
+    /// not settled. A package has at most one such build per platform.
+    pub const IN_PROGRESS: [i32; 4] = [
+        Self::ACTIVE_BUILD,
+        Self::ENQUEUED_BUILD,
+        Self::WAITING_FOR_DEPS,
+        Self::PUBLISHING,
+    ];
 }
 
 /// Why a build row was created.
@@ -202,7 +208,7 @@ impl BuildTriggers {
 ///
 /// `None` on the row means the worker reported a terminal outcome and its
 /// `CompleteReport.reason` text is the record; these codes cover the cases only
-/// the server can produce: a manual cancel and the two abandonment paths.
+/// the server can produce: a manual cancel, and the ways a build is abandoned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(i32)]
 pub enum EndReason {
@@ -212,6 +218,11 @@ pub enum EndReason {
     LeaseExpired = 1,
     /// The build ran past the backstop deadline while still heartbeating.
     MaxDuration = 2,
+    /// The owning worker kept heartbeating but stopped listing the build: it
+    /// lost it -- restarted, or the build process died -- without saying so.
+    Dropped = 3,
+    /// An operator revoked the worker that was running it.
+    WorkerRevoked = 4,
 }
 
 impl EndReason {
@@ -228,7 +239,33 @@ impl EndReason {
             0 => Some(Self::Canceled),
             1 => Some(Self::LeaseExpired),
             2 => Some(Self::MaxDuration),
+            3 => Some(Self::Dropped),
+            4 => Some(Self::WorkerRevoked),
             _ => None,
+        }
+    }
+
+    /// Whether an abandonment for this reason counts against the build's retry
+    /// budget.
+    ///
+    /// The build's own doing -- a worker that went silent, a build that would
+    /// not end, one lost on the worker -- repeats if retried forever, so it is
+    /// counted. A revocation is the operator's decision about the machine, not
+    /// about the build, and a cancel is not retried at all.
+    #[must_use]
+    pub const fn spends_retry(self) -> bool {
+        matches!(self, Self::LeaseExpired | Self::MaxDuration | Self::Dropped)
+    }
+
+    /// Why the build was abandoned, as its log's last line says it.
+    #[must_use]
+    pub const fn explanation(self) -> &'static str {
+        match self {
+            Self::Canceled => "cancelled by an operator",
+            Self::LeaseExpired => "its worker stopped heartbeating",
+            Self::MaxDuration => "it exceeded its maximum duration",
+            Self::Dropped => "its worker stopped reporting it",
+            Self::WorkerRevoked => "its worker was revoked",
         }
     }
 }
@@ -240,6 +277,8 @@ impl EndReasons {
     pub const CANCELED: i32 = EndReason::Canceled.as_i32();
     pub const LEASE_EXPIRED: i32 = EndReason::LeaseExpired.as_i32();
     pub const MAX_DURATION: i32 = EndReason::MaxDuration.as_i32();
+    pub const DROPPED: i32 = EndReason::Dropped.as_i32();
+    pub const WORKER_REVOKED: i32 = EndReason::WorkerRevoked.as_i32();
 }
 
 #[cfg(test)]
@@ -281,6 +320,17 @@ mod tests {
     }
 
     #[test]
+    fn in_progress_lists_exactly_the_unsettled_states() {
+        for state in BuildState::ALL {
+            assert_eq!(
+                BuildStates::IN_PROGRESS.contains(&state.as_i32()),
+                state.is_in_progress(),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_unknown_value_is_not_guessed() {
         assert_eq!(BuildState::from_i32(99), None);
         assert_eq!(BuildState::from_i32(-1), None);
@@ -317,6 +367,8 @@ mod tests {
             (EndReasons::CANCELED, EndReason::Canceled),
             (EndReasons::LEASE_EXPIRED, EndReason::LeaseExpired),
             (EndReasons::MAX_DURATION, EndReason::MaxDuration),
+            (EndReasons::DROPPED, EndReason::Dropped),
+            (EndReasons::WORKER_REVOKED, EndReason::WorkerRevoked),
         ] {
             assert_eq!(EndReason::from_i32(value), Some(reason));
             assert_eq!(reason.as_i32(), value);

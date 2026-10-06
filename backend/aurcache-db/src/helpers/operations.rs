@@ -26,10 +26,11 @@ use sea_orm::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Adding several packages in one request.
-pub const KIND_BULK_ADD: &str = "bulk_add";
-/// Restoring an instance from a dump.
-pub const KIND_RESTORE: &str = "restore";
+/// The kinds the `kind` column holds, named once for the server and its
+/// clients alike.
+pub use aurcache_common::api::operations::kind::{
+    BULK_ADD as KIND_BULK_ADD, RESTORE as KIND_RESTORE,
+};
 
 /// Start an operation, returning its id.
 ///

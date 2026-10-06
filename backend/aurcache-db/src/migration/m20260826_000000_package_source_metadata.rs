@@ -13,7 +13,6 @@
 //! is not `packages.out_of_date`: that one means upstream is newer than what we
 //! last built, and is computed here rather than reported by the AUR.
 
-use crate::helpers::dbtype::database_type;
 use sea_orm::DbBackend;
 use sea_orm_migration::prelude::*;
 
@@ -71,7 +70,7 @@ ALTER TABLE packages DROP COLUMN aur_missing;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => SQLITE_UP,
             DbBackend::Postgres => POSTGRES_UP,
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),
@@ -82,7 +81,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        let sql = match database_type() {
+        let sql = match manager.get_database_backend() {
             DbBackend::Sqlite => SQLITE_DOWN,
             DbBackend::Postgres => POSTGRES_DOWN,
             _ => return Err(DbErr::Migration("Unsupported database type".to_string())),

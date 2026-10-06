@@ -263,12 +263,7 @@ fn restrict_with_landlock(dir: &Path, private: &[PathBuf], network: bool) -> Res
             )
         })?;
 
-    let mut grants = crate::read_grants_excluding(&private, |dir| {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        entries.flatten().map(|e| e.path()).collect()
-    });
+    let mut grants = crate::read_grants_excluding(&private, crate::list_dir);
     grants.push(dir.to_path_buf());
 
     let mut ruleset = created;

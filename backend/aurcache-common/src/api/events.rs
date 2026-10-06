@@ -251,10 +251,11 @@ pub enum Event {
         requeued: Vec<BuildRef>,
     },
 
-    /// Builds taken back from a worker that stopped answering.
+    /// Builds taken back from a worker that stopped answering, or that kept
+    /// answering but stopped reporting them.
     ///
-    /// One entry per pass rather than per build: the reaper finds them
-    /// together, and they have one cause.
+    /// One entry per pass rather than per build: the reaper (or the heartbeat)
+    /// finds them together, and they have one cause.
     #[serde(rename = "worker.reaped")]
     WorkerReaped {
         /// The workers that stopped answering. Absent from entries written

@@ -7,24 +7,15 @@
 //! yet, and letting a second build be queued beside it would have two builds of
 //! the same package racing to publish. So the index covers it too.
 
-use crate::helpers::dbtype::database_type;
-use sea_orm::{ConnectionTrait, DbBackend};
+use sea_orm::ConnectionTrait;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-fn schema_prefix() -> &'static str {
-    if database_type() == DbBackend::Postgres {
-        "public."
-    } else {
-        ""
-    }
-}
-
 async fn recreate(manager: &SchemaManager<'_>, statuses: &str) -> Result<(), DbErr> {
     let db = manager.get_connection();
-    let schema = schema_prefix();
+    let schema = super::schema_prefix(manager.get_database_backend());
     db.execute_unprepared(&format!(
         "DROP INDEX IF EXISTS {schema}idx_builds_pending_pkg_platform;"
     ))
