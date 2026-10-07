@@ -1,7 +1,7 @@
 //! Database helpers for the remote-worker job lifecycle: atomic claim, lease
 //! renewal via heartbeat, and abandoning the builds a worker lost.
 
-use crate::helpers::build_enqueue::Pending;
+use crate::helpers::build_enqueue::{Pending, Queued};
 use crate::helpers::builds::refresh_package_status;
 use crate::helpers::time::now_secs;
 use crate::lists::WorkerList;
@@ -601,7 +601,7 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
     // 4. Insert (or adopt) the fresh build, while the budget allows. An
     //    existing pending build -- a concurrent auto-update queued one once
     //    this row stopped conflicting -- stands in for it.
-    let mut retry = None;
+    let mut retry = Retry::Spent;
     if futile_run < max_attempts
         && let Some(pkg) = &pkg
     {
@@ -615,9 +615,10 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
             BuildTrigger::TimeoutRetry,
         )
         .await?;
-        if enqueue.inserted {
-            retry = Some(enqueue.build.id);
-        }
+        retry = match enqueue.queued {
+            Queued::Inserted | Queued::Promoted => Retry::Queued(enqueue.build.id),
+            Queued::Existing => Retry::Adopted(enqueue.build.id),
+        };
     }
     refresh_package_status(&txn, observed.pkg_id).await?;
 
@@ -767,8 +768,20 @@ pub struct Abandoned {
     pub end_reason: EndReason,
     /// The worker that held it, if any did.
     pub worker_id: Option<i32>,
-    /// Id of the fresh build queued in its place, when the budget allowed one.
-    pub retry: Option<i32>,
+    /// What takes its place.
+    pub retry: Retry,
+}
+
+/// What takes an abandoned build's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// A fresh build, queued for this.
+    Queued(i32),
+    /// A build already pending for the same package and platform -- queued
+    /// meanwhile by something else -- which stands in for the retry.
+    Adopted(i32),
+    /// No further attempt: the retry budget is spent, or the package is gone.
+    Spent,
 }
 
 /// Reaper pass: reclaim `ACTIVE` builds whose owning worker went silent, and
@@ -854,7 +867,7 @@ mod tests {
     fn failed(abandoned: &[Abandoned]) -> Vec<i32> {
         abandoned
             .iter()
-            .filter(|a| a.retry.is_none())
+            .filter(|a| a.retry == Retry::Spent)
             .map(|a| a.build_id)
             .collect()
     }
@@ -863,7 +876,7 @@ mod tests {
     fn retried(abandoned: &[Abandoned]) -> Vec<i32> {
         abandoned
             .iter()
-            .filter(|a| a.retry.is_some())
+            .filter(|a| a.retry != Retry::Spent)
             .map(|a| a.build_id)
             .collect()
     }
@@ -1829,7 +1842,10 @@ mod tests {
             out.dropped.iter().map(|a| a.build_id).collect::<Vec<_>>(),
             vec![31]
         );
-        assert!(out.dropped[0].retry.is_some(), "a first loss is retried");
+        assert!(
+            matches!(out.dropped[0].retry, Retry::Queued(_)),
+            "a first loss is retried"
+        );
         assert!(
             out.cancel_requested.is_empty(),
             "a reported, owned-ACTIVE build has nothing to cancel"

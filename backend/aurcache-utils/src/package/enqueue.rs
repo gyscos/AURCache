@@ -4,7 +4,7 @@ use aurcache_common::api::log::BuildRef;
 use aurcache_common::build_state::BuildState;
 use aurcache_db::dependencies;
 use aurcache_db::helpers::build_enqueue::{
-    Pending, enqueue_build_if_missing, promote_waiting_build,
+    Pending, Queued, enqueue_build_if_missing, promote_waiting_build,
 };
 use aurcache_db::helpers::builds::pending_build;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
@@ -202,7 +202,7 @@ async fn trigger_build_for_package(
             aurcache_common::build_state::BuildTrigger::User,
         )
         .await?;
-        if enqueue_result.inserted {
+        if enqueue_result.queued == Queued::Inserted {
             inserted.push(BuildRef {
                 pkgbase: pkg.name.clone(),
                 number: enqueue_result.build.number,

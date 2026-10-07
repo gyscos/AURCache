@@ -6,9 +6,21 @@ use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
 
+/// The pending build for a `(package, platform)`, and how it came to be.
 pub struct EnqueueBuildResult {
     pub build: builds::Model,
-    pub inserted: bool,
+    pub queued: Queued,
+}
+
+/// How a call left the pending build it returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Queued {
+    /// Inserted by this call.
+    Inserted,
+    /// Moved from `WAITING_FOR_DEPS` to `ENQUEUED` by this call.
+    Promoted,
+    /// Already pending, and left as it was.
+    Existing,
 }
 
 /// The states a new build can be queued in.
@@ -59,8 +71,8 @@ fn next_build_number_expr(pkg_id: i32) -> Expr {
 /// in [`BuildState::IN_PROGRESS`] ensures at most one pending row per
 /// `(pkg_id, platform)` at any time.
 ///
-/// If a pending build already exists the insert is skipped (`inserted = false`) and the existing
-/// row is returned, regardless of its status.
+/// If a pending build already exists the insert is skipped ([`Queued::Existing`]) and the
+/// existing row is returned, regardless of its status.
 pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
@@ -117,11 +129,13 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
         let existing = crate::helpers::builds::pending_build(db, pkg_id, platform).await?;
 
         if let Some(build) = existing {
-            let inserted = result.rows_affected() == 1;
-            if inserted {
+            let queued = if result.rows_affected() == 1 {
                 refresh_package_status(db, pkg_id).await?;
-            }
-            return Ok(EnqueueBuildResult { build, inserted });
+                Queued::Inserted
+            } else {
+                Queued::Existing
+            };
+            return Ok(EnqueueBuildResult { build, queued });
         }
         // Nothing inserted and nothing pending: the number was taken. Try again
         // with a freshly read maximum.

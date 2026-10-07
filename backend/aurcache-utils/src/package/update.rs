@@ -8,7 +8,7 @@ use aurcache_activitylog::events::{Event, QueueCause, RefreshTarget};
 use aurcache_common::build_state::BuildState;
 use aurcache_common::build_state::BuildTrigger;
 use aurcache_db::helpers::build_enqueue::{
-    Pending, enqueue_build_if_missing, promote_waiting_build,
+    EnqueueBuildResult, Pending, Queued, enqueue_build_if_missing, promote_waiting_build,
 };
 use aurcache_db::prelude::{Dependencies, PackageVcsSources, Packages};
 use aurcache_db::{dependencies, package_vcs_sources, packages};
@@ -131,7 +131,7 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
                 ids_total.extend(
                     results
                         .into_iter()
-                        .filter(|r| r.enqueued)
+                        .filter(|r| r.dispatch == Dispatch::Enqueued)
                         .map(|r| r.build_id),
                 );
             }
@@ -662,12 +662,30 @@ pub struct PlatformUpdateResult {
     /// The same build's public number within its package. Callers that report
     /// back to a user want this rather than `build_id`, which is internal.
     pub build_number: i32,
-    /// `true` if the build was enqueued/promoted and dispatched to the builder;
-    /// `false` if it was left `WAITING_FOR_DEPS` pending an unfinished
-    /// dependency rebuild.
-    pub enqueued: bool,
+    /// Where this call left it.
+    pub dispatch: Dispatch,
     /// The version the build is of.
     pub version: String,
+}
+
+/// Where a platform's update left its build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Queued for a worker by this call: inserted, or promoted from waiting.
+    Enqueued,
+    /// A build was already pending, and is left as it was.
+    AlreadyPending,
+    /// Queued to wait for a dependency that is being rebuilt first.
+    WaitingForDeps,
+}
+
+impl From<Queued> for Dispatch {
+    fn from(queued: Queued) -> Self {
+        match queued {
+            Queued::Inserted | Queued::Promoted => Self::Enqueued,
+            Queued::Existing => Self::AlreadyPending,
+        }
+    }
 }
 
 /// The log entry for builds `results` queued for `pkgbase`, and why.
@@ -722,18 +740,18 @@ async fn enqueue_platform_builds(
 
         if ready {
             let result = update_platform(
-                platform,
+                &services.db,
                 request.pkg_model.id,
+                platform,
                 request.version,
                 request.trigger,
-                &services.db,
             )
             .await?;
             results.push(PlatformUpdateResult {
                 platform,
                 build_id: result.build.id,
                 build_number: result.build.number,
-                enqueued: result.inserted,
+                dispatch: result.queued.into(),
                 version: request.version.to_string(),
             });
         } else {
@@ -751,7 +769,10 @@ async fn enqueue_platform_builds(
                 platform,
                 build_id: waiting.build.id,
                 build_number: waiting.build.number,
-                enqueued: false,
+                dispatch: match waiting.queued {
+                    Queued::Inserted => Dispatch::WaitingForDeps,
+                    queued => queued.into(),
+                },
                 version: request.version.to_string(),
             });
         }
@@ -765,17 +786,17 @@ async fn enqueue_platform_builds(
 /// If a `WAITING_FOR_DEPS` build already exists for this `(pkg, platform)`, it is promoted to
 /// `ENQUEUED` rather than inserting a duplicate.  This happens when a dependency
 /// finishes and the dependent was already in the pending queue waiting for it.
-pub async fn update_platform(
-    platform: Platform,
+async fn update_platform(
+    db: &DatabaseConnection,
     pkg_id: i32,
+    platform: Platform,
     new_version: &str,
     trigger: BuildTrigger,
-    db: &DatabaseConnection,
-) -> anyhow::Result<aurcache_db::helpers::build_enqueue::EnqueueBuildResult> {
+) -> anyhow::Result<EnqueueBuildResult> {
     if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {
-        return Ok(aurcache_db::helpers::build_enqueue::EnqueueBuildResult {
+        return Ok(EnqueueBuildResult {
             build: promoted,
-            inserted: true,
+            queued: Queued::Promoted,
         });
     }
 
@@ -1195,7 +1216,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            results.iter().all(|r| !r.enqueued),
+            results
+                .iter()
+                .all(|r| r.dispatch != super::Dispatch::Enqueued),
             "parent should wait for dependency rebuild"
         );
 
@@ -1538,7 +1561,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            results.iter().all(|r| !r.enqueued),
+            results
+                .iter()
+                .all(|r| r.dispatch != super::Dispatch::Enqueued),
             "parent should wait for transitive dependency rebuilds"
         );
 
@@ -1761,7 +1786,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            results.iter().all(|r| !r.enqueued),
+            results
+                .iter()
+                .all(|r| r.dispatch != super::Dispatch::Enqueued),
             "forced rebuild should still wait for transitive dependency rebuilds"
         );
 

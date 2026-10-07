@@ -668,7 +668,9 @@ mod tests {
 
         let revoked = revoke_worker(&db, w.id, 3).await.unwrap().unwrap();
         // A revocation spends no retry, so the build always gets one.
-        let retry = revoked.abandoned[0].retry.expect("a fresh attempt");
+        let crate::helpers::worker_jobs::Retry::Queued(retry) = revoked.abandoned[0].retry else {
+            panic!("a fresh attempt");
+        };
 
         let row = db
             .query_one_raw(sea_orm::Statement::from_string(

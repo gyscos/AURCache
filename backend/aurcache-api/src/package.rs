@@ -26,7 +26,9 @@ use aurcache_db::{dependencies, files, packages};
 use aurcache_utils::package::add::package_add;
 use aurcache_utils::package::live_check::package_remove;
 use aurcache_utils::package::replace::{self, ReplaceError};
-use aurcache_utils::package::update::{package_resync_dependencies, package_update, queued};
+use aurcache_utils::package::update::{
+    Dispatch, package_resync_dependencies, package_update, queued,
+};
 use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::pkg::satisfies_constraint;
 use aurcache_utils::services::Services;
@@ -630,7 +632,7 @@ pub async fn package_update_endpoint(
     Ok(Json(
         results
             .into_iter()
-            .filter(|r| r.enqueued)
+            .filter(|r| r.dispatch == Dispatch::Enqueued)
             .map(|r| r.build_number)
             .collect(),
     ))

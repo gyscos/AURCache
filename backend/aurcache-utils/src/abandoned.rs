@@ -10,7 +10,7 @@ use crate::build_logger::append_build_output;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::BuildRef;
-use aurcache_db::helpers::worker_jobs::Abandoned;
+use aurcache_db::helpers::worker_jobs::{Abandoned, Retry};
 use sea_orm::DatabaseConnection;
 
 /// The builds named as the activity log names them, split by whether they got
@@ -26,8 +26,8 @@ pub struct Named {
 /// Name `abandoned` for an activity entry; see [`Named`].
 #[must_use]
 pub fn named(abandoned: &[Abandoned]) -> Named {
-    let (retried, failed): (Vec<&Abandoned>, Vec<&Abandoned>) =
-        abandoned.iter().partition(|a| a.retry.is_some());
+    let (failed, retried): (Vec<&Abandoned>, Vec<&Abandoned>) =
+        abandoned.iter().partition(|a| a.retry == Retry::Spent);
     Named {
         retried: retried.iter().filter_map(|a| a.build_ref()).collect(),
         failed: failed.iter().filter_map(|a| a.build_ref()).collect(),
@@ -62,9 +62,11 @@ async fn explain(activity: &ActivityLog, abandoned: &Abandoned) {
 }
 
 /// A replacement is a build queued like any other, and says which one it
-/// repeats -- named as the operator knows it, not as the fresh row.
+/// repeats -- named as the operator knows it, not as the fresh row. An adopted
+/// build was announced when it was queued, so only a fresh one is.
 async fn announce_retry(db: &DatabaseConnection, activity: &ActivityLog, abandoned: &Abandoned) {
-    let (Some(retried), Some(replacement)) = (abandoned.build_ref(), abandoned.retry) else {
+    let (Some(retried), Retry::Queued(replacement)) = (abandoned.build_ref(), abandoned.retry)
+    else {
         return;
     };
     let builds = aurcache_db::helpers::builds::build_refs(db, &[replacement])
