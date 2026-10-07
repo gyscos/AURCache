@@ -24,8 +24,15 @@ mod tests;
 
 use sea_orm_migration::prelude::*;
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+/// Named by hand: `DeriveMigrationName` takes the source file's name, which
+/// for a module in a directory is `mod`.
+impl MigrationName for Migration {
+    fn name(&self) -> &'static str {
+        "m20261008_000000_from_0_5"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {

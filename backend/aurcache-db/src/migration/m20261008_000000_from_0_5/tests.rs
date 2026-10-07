@@ -204,6 +204,14 @@ async fn the_new_constraints_hold() {
     }
 }
 
+/// The name is what `seaql_migrations` records and what an instance that ran
+/// the old chain had its rows replaced with, so it must not drift.
+#[test]
+fn the_migration_is_recorded_under_its_own_name() {
+    use sea_orm_migration::MigrationName;
+    assert_eq!(super::Migration.name(), "m20261008_000000_from_0_5");
+}
+
 /// There is no way back to 0.5.0's schema, and the migration says so rather
 /// than leaving a half-reverted database.
 #[tokio::test]
