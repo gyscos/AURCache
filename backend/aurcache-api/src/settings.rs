@@ -4,7 +4,7 @@ use crate::utils::error::{ApiError, err};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_common::api::settings::SchedulePreview;
-use aurcache_common::settings::{ApplicationSettings, Setting};
+use aurcache_common::settings::{ApplicationSettings, Scope, Setting};
 use aurcache_utils::scheduled::{Job, preview};
 use aurcache_utils::settings as store;
 use rocket::http::Status;
@@ -68,6 +68,13 @@ async fn setting_patch_impl(
     value: String,
 ) -> Result<(), ApiError> {
     let setting = parse_setting(key)?;
+    // Removing such a value stays allowed below: it is how a stray row goes.
+    if pkg_id.is_some() && setting.meta().scope == Scope::Global {
+        return Err(err(
+            Status::BadRequest,
+            format!("{key} applies to the whole server and cannot be set per package"),
+        ));
+    }
     setting
         .validate(&value)
         .map_err(|e| err(Status::BadRequest, e))?;
@@ -196,7 +203,7 @@ pub async fn setting_patch(
 #[utoipa::path(
     responses(
         (status = 200, description = "Update a single setting for a package"),
-        (status = 400, description = "Value not valid for this setting"),
+        (status = 400, description = "Value not valid for this setting, or the setting applies to the whole server"),
         (status = 404, description = "Unknown setting key or package"),
     ),
     params(

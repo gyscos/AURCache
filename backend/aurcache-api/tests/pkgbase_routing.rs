@@ -147,6 +147,26 @@ async fn sub_resources_accept_a_plus_in_the_pkgbase() {
     }
 }
 
+/// A setting with one value for the whole server is refused per package --
+/// stored, it would be ignored -- while one a package may override is taken.
+#[rocket::async_test]
+async fn only_package_scoped_settings_can_be_set_per_package() {
+    use rocket::http::ContentType;
+    let TestApi { client, db } = test_api("test", identity).await;
+    seed(&db, "hello").await;
+
+    let patch = |key: &'static str, value: &'static str| {
+        client
+            .patch(format!("/api/package/hello/settings/{key}"))
+            .header(ContentType::JSON)
+            .body(format!(r#"{{"value":"{value}"}}"#))
+    };
+    let refused = patch("job_timeout", "2h").dispatch().await;
+    assert_eq!(refused.status(), Status::BadRequest);
+    let taken = patch("max_artifact_size", "40G").dispatch().await;
+    assert_eq!(taken.status(), Status::Ok);
+}
+
 /// An unknown pkgbase is a 404, not a wrong package.
 #[rocket::async_test]
 async fn an_unknown_pkgbase_is_not_found() {

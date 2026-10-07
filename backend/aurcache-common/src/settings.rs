@@ -49,6 +49,16 @@ pub struct SettingsMeta {
     pub key: &'static str,
     pub env_name: Option<&'static str>,
     pub default: &'static str,
+    pub scope: Scope,
+}
+
+/// Where a setting can be set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// One value for the whole server.
+    Global,
+    /// A server-wide value that a package may override.
+    Package,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +119,8 @@ impl Setting {
         Self::ParseNetwork,
     ];
 
-    /// This setting's stable key, environment variable, and built-in default.
+    /// This setting's stable key, environment variable, built-in default and
+    /// scope.
     #[must_use]
     pub const fn meta(&self) -> SettingsMeta {
         match self {
@@ -117,11 +128,13 @@ impl Setting {
                 key: "version_check_interval",
                 env_name: Some("VERSION_CHECK_INTERVAL"),
                 default: "1h",
+                scope: Scope::Global,
             },
             Self::AutoUpdateSchedule => SettingsMeta {
                 key: "auto_update_schedule",
                 env_name: Some("AUTO_UPDATE_SCHEDULE"),
                 default: "", // parses to None
+                scope: Scope::Global,
             },
             // How the web UI writes absolute dates: field order, zero
             // padding, and a 12- or 24-hour clock, e.g. `dmy-nopad-12`. A
@@ -131,6 +144,7 @@ impl Setting {
                 key: "date_format",
                 env_name: Some("DATE_FORMAT"),
                 default: "ymd-pad-24",
+                scope: Scope::Global,
             },
             // Queue the rebuild the moment a new version is detected, rather
             // than waiting for the `auto_update_schedule` window. The version
@@ -144,6 +158,7 @@ impl Setting {
                 key: "build_on_new_version",
                 env_name: Some("BUILD_ON_NEW_VERSION"),
                 default: "false",
+                scope: Scope::Global,
             },
             // On by default. This is what an AUR helper on a workstation
             // already does -- paru and yay keep their build trees between
@@ -160,11 +175,13 @@ impl Setting {
                 key: "persistent_builddir",
                 env_name: Some("PERSISTENT_BUILDDIR"),
                 default: "true",
+                scope: Scope::Package,
             },
             Self::JobTimeout => SettingsMeta {
                 key: "job_timeout",
                 env_name: Some("JOB_TIMEOUT"),
                 default: "1h",
+                scope: Scope::Global,
             },
             // Largest package file a worker may upload, checked per package so
             // one outsized package (an engine, a game) can be allowed more
@@ -176,16 +193,19 @@ impl Setting {
                 key: "max_artifact_size",
                 env_name: Some("MAX_ARTIFACT_SIZE"),
                 default: "20G",
+                scope: Scope::Package,
             },
             Self::MakepkgConf => SettingsMeta {
                 key: "makepkg_conf",
                 env_name: None,
                 default: "",
+                scope: Scope::Package,
             },
             Self::PacmanConf => SettingsMeta {
                 key: "pacman_conf",
                 env_name: None,
                 default: "",
+                scope: Scope::Package,
             },
             // Parsing a PKGBUILD runs it, so the parse is confined and denied
             // TCP. A small minority of packages compute `pkgver` from the
@@ -198,6 +218,7 @@ impl Setting {
                 key: "parse_network",
                 env_name: Some("PARSE_NETWORK"),
                 default: "false",
+                scope: Scope::Global,
             },
         }
     }

@@ -10,7 +10,7 @@ mod parser;
 pub use parser::{ByteSize, ParseSetting, Seconds};
 
 use aurcache_common::settings::{
-    ApplicationSettings, Setting, SettingSource, SettingsEntry, SettingsMeta,
+    ApplicationSettings, Scope, Setting, SettingSource, SettingsEntry, SettingsMeta,
 };
 use aurcache_db::settings;
 use sea_orm::{ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -80,8 +80,10 @@ pub async fn get<T: ParseSetting>(
     };
 
     // 1. The value set for the package: explicit intent for one package wins
-    //    over the deployment-wide environment.
+    //    over the deployment-wide environment. Only for a setting a package
+    //    can override; anything else has one value for the whole server.
     if let Some(pid) = pkg_id
+        && setting.scope == Scope::Package
         && let Some(v) = stored(db, setting.key, Some(pid)).await
     {
         return SettingsEntry {
@@ -259,4 +261,56 @@ pub async fn write(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Change, get, key, write};
+    use aurcache_common::settings::{Setting, SettingSource};
+    use aurcache_db::migration::Migrator;
+    use sea_orm::{Database, DatabaseConnection};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    /// A package value for a setting packages cannot override is not read,
+    /// so the answer is the one the server actually uses.
+    #[tokio::test]
+    async fn a_global_setting_ignores_a_package_value() {
+        let db = db().await;
+        write(
+            &db,
+            [Change {
+                setting: Setting::JobTimeout,
+                pkg_id: Some(1),
+                value: Some("2h".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+        let entry = get(&db, key::JOB_TIMEOUT, Some(1)).await;
+        assert_eq!(entry.source, SettingSource::Default);
+    }
+
+    /// One a package may override is read for it.
+    #[tokio::test]
+    async fn a_package_setting_reads_the_package_value() {
+        let db = db().await;
+        write(
+            &db,
+            [Change {
+                setting: Setting::MaxArtifactSize,
+                pkg_id: Some(1),
+                value: Some("40G".to_string()),
+            }],
+        )
+        .await
+        .unwrap();
+        let entry = get(&db, key::MAX_ARTIFACT_SIZE, Some(1)).await;
+        assert_eq!(entry.source, SettingSource::Package);
+    }
 }

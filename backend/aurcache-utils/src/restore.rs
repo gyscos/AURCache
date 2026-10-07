@@ -33,6 +33,7 @@ use aurcache_common::api::dump::{
     SecretsPolicy, TOKENS_FILE, WORKERS_FILE,
 };
 use aurcache_common::build_state::BuildState;
+use aurcache_common::settings::{Scope, Setting};
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings};
 use flate2::read::GzDecoder;
@@ -851,6 +852,12 @@ async fn write_settings<C: sea_orm::ConnectionTrait>(
     // A dump from before a setting was retired still carries it; restoring it
     // would bring back a row the migration removed and nothing reads.
     desired.retain(|d| !aurcache_common::settings::RETIRED_SETTING_KEYS.contains(&d.key));
+    // Nor a package value for a setting packages cannot override: nothing
+    // would read it.
+    desired.retain(|d| {
+        d.scope == settings::scope(None)
+            || Setting::from_key(d.key).is_none_or(|s| s.meta().scope == Scope::Package)
+    });
 
     let scopes: HashSet<i32> = desired.iter().map(|d| d.scope).collect();
     let mut existing: BTreeMap<(i32, String), settings::Model> = settings::Entity::find()
