@@ -572,24 +572,22 @@ pub(crate) fn print_package_list(packages: &[SimplePackage]) {
         .iter()
         .map(|package| {
             vec![
-                package.id.to_string(),
                 package.name.clone(),
                 package.status.label().to_string(),
                 bool_label(package.directly_requested).to_string(),
-                bool_label(package.outofdate).to_string(),
-                option_text(package.latest_version.as_deref()),
+                bool_label(package.out_of_date).to_string(),
+                option_text(package.built_version.as_deref()),
                 option_text(package.upstream_version.as_deref()),
             ]
         })
         .collect::<Vec<_>>();
     print_table(
         &[
-            "id",
             "name",
             "status",
             "requested",
             "out_of_date",
-            "latest_version",
+            "built_version",
             "upstream_version",
         ],
         &rows,
@@ -605,14 +603,13 @@ pub(crate) fn print_package(package: &ExtendedPackage) {
 }
 
 pub(crate) fn print_package_summary(package: &ExtendedPackage) {
-    println!("id: {}", package.id);
     println!("name: {}", package.name);
     println!("directly_requested: {}", package.directly_requested);
     println!("status: {}", package.status.label());
-    println!("out_of_date: {}", package.outofdate);
+    println!("out_of_date: {}", package.out_of_date);
     println!(
-        "latest_version: {}",
-        option_text(package.latest_version.as_deref())
+        "built_version: {}",
+        option_text(package.built_version.as_deref())
     );
     println!(
         "upstream_version: {}",
@@ -650,8 +647,8 @@ pub(crate) fn print_dependency_section(title: &str, dependencies: &[PackageDepen
             }
         };
         println!(
-            "  - {} ({}) [id={}]{}",
-            dependency.name, dependency.version_constraint, dependency.id, state
+            "  - {} ({}){}",
+            dependency.name, dependency.version_constraint, state
         );
     }
 }

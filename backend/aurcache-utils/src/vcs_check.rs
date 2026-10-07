@@ -174,8 +174,7 @@ fn git_vcs_source_from(source: &Source) -> Option<VcsSource> {
 ///
 /// A newly-seen source (no prior row) also counts as "changed", so the
 /// first check after a VCS source is added/discovered is flagged out of
-/// date, matching the existing `latest_version.is_none() => outdated`
-/// convention used for pkgver checks.
+/// date, as a package that has never been built is for pkgver checks.
 pub async fn sync_vcs_sources(
     db: &DatabaseConnection,
     package_id: i32,

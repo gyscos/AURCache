@@ -33,10 +33,10 @@ pub fn BuildStatusBadge(status: BuildState) -> Element {
 
 /// A package's status as a coloured badge.
 #[component]
-pub fn StatusBadge(status: BuildState, outofdate: bool) -> Element {
+pub fn StatusBadge(status: BuildState, out_of_date: bool) -> Element {
     // A package whose last build succeeded but that has newer sources upstream
     // is its own thing: successful, yet needing attention.
-    let outdated = status == BuildState::Successful && outofdate;
+    let outdated = status == BuildState::Successful && out_of_date;
     // Worded for a package where that differs: its build succeeding means
     // it is up to date, or would be but for newer sources.
     let label = match status {
@@ -57,9 +57,14 @@ mod tests {
     use super::*;
 
     /// Render the badge to HTML so its output can be asserted on.
-    fn render(status: BuildState, outofdate: bool) -> String {
-        let mut dom =
-            VirtualDom::new_with_props(StatusBadge, StatusBadgeProps { status, outofdate });
+    fn render(status: BuildState, out_of_date: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            StatusBadge,
+            StatusBadgeProps {
+                status,
+                out_of_date,
+            },
+        );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
@@ -117,11 +122,11 @@ mod tests {
             BuildState::WaitingForDeps,
             BuildState::Publishing,
         ] {
-            for outofdate in [false, true] {
-                let html = render(status, outofdate);
+            for out_of_date in [false, true] {
+                let html = render(status, out_of_date);
                 assert!(
                     !html.contains("badge-ghost"),
-                    "status {status:?} (outofdate {outofdate}) renders invisibly: {html}"
+                    "status {status:?} (out_of_date {out_of_date}) renders invisibly: {html}"
                 );
             }
         }

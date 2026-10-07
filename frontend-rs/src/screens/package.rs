@@ -330,7 +330,7 @@ pub fn PackageHeader(
                             }
                         }
                         div { class: "flex items-center gap-3 flex-wrap mt-1",
-                            StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
+                            StatusBadge { status: pkg.status, out_of_date: pkg.out_of_date }
                             if pkg.has_patch {
                                 span { class: "badge badge-warning badge-sm", "patched" }
                             }
@@ -375,7 +375,7 @@ pub fn PackageHeader(
 /// reason to show both is the comparison between them.
 #[component]
 fn VersionLine(pkg: ExtendedPackage) -> Element {
-    let built = pkg.latest_version.clone();
+    let built = pkg.built_version.clone();
     let upstream = pkg.upstream_version;
 
     rsx! {
@@ -569,7 +569,7 @@ fn RelationList(
                                         // On the loop child, where the diff needs it:
                                         // the key inside `RelationRow`'s own template
                                         // cannot tell sibling rows apart.
-                                        key: "{item.id}",
+                                        key: "{item.name}",
                                         item: item.clone(),
                                         show_blocking,
                                         replace_for: replace_for.clone(),
@@ -602,7 +602,7 @@ fn RelationRow(
     let nav_pkgbase = pkgbase.clone();
 
     rsx! {
-        tr { key: "{item.id}", class: "hover cursor-pointer",
+        tr { key: "{item.name}", class: "hover cursor-pointer",
             // The whole row is the target, but the name stays a real link so
             // the address is copyable, middle-click opens a tab, and keyboard
             // users have something to focus — none of which a bare row
@@ -1985,12 +1985,11 @@ mod tests {
 
     fn package() -> ExtendedPackage {
         ExtendedPackage {
-            id: 1,
             name: "hello".to_string(),
             directly_requested: true,
             status: BuildState::Successful,
-            outofdate: false,
-            latest_version: Some("1.0-1".to_string()),
+            out_of_date: false,
+            built_version: Some("1.0-1".to_string()),
             selected_platforms: vec!["x86_64".to_string()],
             selected_build_flags: None,
             upstream_version: Some("1.0-1".to_string()),

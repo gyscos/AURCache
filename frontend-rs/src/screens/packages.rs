@@ -253,7 +253,7 @@ pub fn Packages(
                                                 }
                                             }
                                             td { class: "font-mono text-sm",
-                                                {pkg.latest_version.clone().unwrap_or_else(|| "—".into())}
+                                                {pkg.built_version.clone().unwrap_or_else(|| "—".into())}
                                             }
                                             td { class: "{WIDE_ONLY} font-mono text-sm opacity-70",
                                                 {pkg.upstream_version.clone().unwrap_or_else(|| "—".into())}
@@ -261,11 +261,11 @@ pub fn Packages(
                                             td { class: "{WIDE_ONLY} text-right font-mono text-sm opacity-70",
                                                 {package_size(pkg)}
                                             }
-                                            td { StatusBadge { status: pkg.status, outofdate: pkg.outofdate } }
+                                            td { StatusBadge { status: pkg.status, out_of_date: pkg.out_of_date } }
                                             td { class: "{WIDE_ONLY} text-right",
                                                 RowAction {
                                                     pkgbase: pkg.name.clone(),
-                                                    action: row_action(pkg.status, pkg.outofdate),
+                                                    action: row_action(pkg.status, pkg.out_of_date),
                                                     on_changed: move |()| packages.restart(),
                                                 }
                                             }
@@ -367,13 +367,13 @@ impl Action {
 /// happening; a second request would either be refused or queue a duplicate,
 /// and a button cannot say which.
 #[must_use]
-pub fn row_action(status: BuildState, outofdate: bool) -> Option<Action> {
+pub fn row_action(status: BuildState, out_of_date: bool) -> Option<Action> {
     match status {
         BuildState::Active
         | BuildState::Enqueued
         | BuildState::WaitingForDeps
         | BuildState::Publishing => None,
-        _ if outofdate => Some(Action::Update),
+        _ if out_of_date => Some(Action::Update),
         BuildState::Failed => Some(Action::Retry),
         BuildState::Successful => Some(Action::Rebuild),
     }

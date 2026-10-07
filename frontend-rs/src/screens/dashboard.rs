@@ -273,11 +273,11 @@ fn RecentPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
             div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
-                        key: "{pkg.id}",
+                        key: "{pkg.name}",
                         class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
-                        StatusBadge { status: pkg.status, outofdate: pkg.outofdate }
+                        StatusBadge { status: pkg.status, out_of_date: pkg.out_of_date }
                     }
                 }
             }
@@ -352,12 +352,12 @@ fn FailedPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
             div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
-                        key: "{pkg.id}",
+                        key: "{pkg.name}",
                         class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
-                            "{pkg.latest_version.as_deref().unwrap_or(\"—\")}"
+                            "{pkg.built_version.as_deref().unwrap_or(\"—\")}"
                         }
                     }
                 }
@@ -388,12 +388,12 @@ fn OutOfDateCard(slice: Option<OutOfDateSlice>) -> Element {
             div { class: "divide-y divide-base-300",
                 for pkg in slice.needs_hand {
                     Link {
-                        key: "{pkg.id}",
+                        key: "{pkg.name}",
                         class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }
                         span { class: "text-sm opacity-60 truncate",
-                            "{pkg.latest_version.as_deref().unwrap_or(\"—\")} → {pkg.upstream_version.as_deref().unwrap_or(\"—\")}"
+                            "{pkg.built_version.as_deref().unwrap_or(\"—\")} → {pkg.upstream_version.as_deref().unwrap_or(\"—\")}"
                         }
                     }
                 }
@@ -522,7 +522,7 @@ fn LargestPackagesCard(packages: Option<Vec<SimplePackage>>) -> Element {
             div { class: "divide-y divide-base-300",
                 for pkg in packages {
                     Link {
-                        key: "{pkg.id}",
+                        key: "{pkg.name}",
                         class: "py-2 px-2 -mx-2 rounded flex justify-between items-center gap-2 even:bg-base-200/50 hover:bg-base-200",
                         to: Route::Package { pkgbase: pkg.name.clone() },
                         span { class: "text-sm font-medium truncate", "{pkg.name}" }

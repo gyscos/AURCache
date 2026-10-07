@@ -707,15 +707,14 @@ pub(crate) fn package_row_select() -> Select<Packages> {
     Packages::find()
         .select_only()
         .column(packages::Column::Name)
-        .column(packages::Column::Id)
         .column(packages::Column::Status)
-        .column_as(packages::Column::OutOfDate, "outofdate")
-        .column_as(packages::Column::UpstreamVersion, "upstream_version")
+        .column(packages::Column::OutOfDate)
+        .column(packages::Column::UpstreamVersion)
         .column(packages::Column::DirectlyRequested)
         // No COALESCE to an empty string: a package with no build has no
         // version, and `null` says that where `""` is indistinguishable from a
         // build that produced a blank one.
-        .column_as(latest_successful_version_expr(), "latest_version")
+        .column_as(latest_successful_version_expr(), "built_version")
         .column_as(total_artifact_size_expr(), "total_size")
 }
 
@@ -772,7 +771,6 @@ async fn list_package_relations(
 
     let rows = Dependencies::find()
         .select_only()
-        .column_as(packages::Column::Id, "id")
         .column_as(packages::Column::Name, "name")
         .column(dependencies::Column::VersionConstraint)
         .column_as(packages::Column::Status, "status")
@@ -798,7 +796,6 @@ async fn list_package_relations(
                 .as_deref()
                 .is_some_and(|built| satisfies_constraint(built, &row.version_constraint));
             PackageDependency {
-                id: row.id,
                 name: row.name,
                 version_constraint: row.version_constraint,
                 status: row.status,
@@ -812,7 +809,6 @@ async fn list_package_relations(
 /// The columns behind [`PackageDependency`]; `satisfied` is derived, not stored.
 #[derive(FromQueryResult)]
 struct DependencyRow {
-    id: i32,
     name: String,
     version_constraint: String,
     status: BuildState,
@@ -845,13 +841,13 @@ pub async fn get_package(
 
     // Independent reads over one pooled connection: serial awaits would pay
     // each round trip in turn for queries that share only the package id.
-    let (latest_version, dependencies, dependents, files) = tokio::join!(
+    let (built_version, dependencies, dependents, files) = tokio::join!(
         latest_successful_version_any_platform(db, pkg.id),
         list_package_relations(db, pkg.id, RelationDirection::Dependencies),
         list_package_relations(db, pkg.id, RelationDirection::Dependents),
         package_files(db, pkg.id),
     );
-    let latest_version = latest_version.map_err(|e| err(Status::InternalServerError, e))?;
+    let built_version = built_version.map_err(|e| err(Status::InternalServerError, e))?;
     let dependencies = dependencies.map_err(|e| err(Status::InternalServerError, e))?;
     let dependents = dependents.map_err(|e| err(Status::InternalServerError, e))?;
     let files = files.map_err(|e| err(Status::InternalServerError, e))?;
@@ -875,12 +871,11 @@ pub async fn get_package(
         maintainer: pkg.source_maintainer.clone(),
         first_submitted: pkg.source_first_submitted,
         last_modified: pkg.source_last_modified,
-        id: pkg.id,
         name: pkg.name,
         directly_requested: pkg.directly_requested,
         status: pkg.status,
-        outofdate: pkg.out_of_date,
-        latest_version,
+        out_of_date: pkg.out_of_date,
+        built_version,
         package_source,
         selected_platforms: pkg.platforms.names(),
         selected_build_flags: Some(pkg.build_flags.as_slice().to_vec()),
@@ -1093,7 +1088,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].id, child.id);
         assert_eq!(deps[0].name, "child");
         assert_eq!(deps[0].version_constraint, ">=2.0");
     }
@@ -1158,7 +1152,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(dependents.len(), 1);
-        assert_eq!(dependents[0].id, parent.id);
         assert_eq!(dependents[0].name, "parent");
         assert_eq!(dependents[0].version_constraint, ">=1.0");
     }

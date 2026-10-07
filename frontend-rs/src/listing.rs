@@ -152,7 +152,7 @@ impl StateSet {
 /// How a status filter is expressed: a set of build states, plus the packages
 /// with something newer available upstream. The last is not a build state --
 /// a package's last build is still `Successful` when it is out of date -- so
-/// it is a flag of its own, backed by `SimplePackage` `outofdate` rather than
+/// it is a flag of its own, backed by `SimplePackage` `out_of_date` rather than
 /// by the `status` column. The builds list has no such flag, so the dropdown
 /// only offers it where it means something.
 ///
@@ -279,7 +279,7 @@ impl StatusFilter {
     }
 
     /// Whether the underlying state and out-of-date flag answer to this filter.
-    fn matches(self, status: BuildState, outofdate: bool) -> bool {
+    fn matches(self, status: BuildState, out_of_date: bool) -> bool {
         if self.is_any() {
             return true;
         }
@@ -287,7 +287,7 @@ impl StatusFilter {
         // build that newer sources are ahead of. The flag is only ever
         // meaningful for such a package in practice, but matching the badge
         // keeps a filter result and a row's label from disagreeing.
-        if self.out_of_date && status == BuildState::Successful && outofdate {
+        if self.out_of_date && status == BuildState::Successful && out_of_date {
             return true;
         }
         self.states.contains(status)
@@ -355,7 +355,7 @@ pub fn filter_packages<'a>(
         .into_iter()
         .filter(|pkg| {
             (query.is_empty() || pkg.name.to_lowercase().contains(&query))
-                && status.matches(pkg.status, pkg.outofdate)
+                && status.matches(pkg.status, pkg.out_of_date)
         })
         .cloned()
         .collect()
@@ -382,9 +382,8 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
         let ordering = match sort.key {
             // An out-of-date package is a package needing attention, so it
             // ranks with the unhealthy ones rather than with the successes.
-            SortKey::Status => {
-                (status_rank(a.status), !a.outofdate).cmp(&(status_rank(b.status), !b.outofdate))
-            }
+            SortKey::Status => (status_rank(a.status), !a.out_of_date)
+                .cmp(&(status_rank(b.status), !b.out_of_date)),
             // `Option`'s own ordering is what this wants: `None` sorts below
             // every `Some`, so unrecorded sizes group at one end rather than
             // among the small ones, and land last under the descending order a
@@ -649,16 +648,15 @@ mod tests {
     }
     use super::*;
 
-    fn package(name: &str, status: BuildState, outofdate: bool) -> SimplePackage {
+    fn package(name: &str, status: BuildState, out_of_date: bool) -> SimplePackage {
         SimplePackage {
-            id: 1,
             name: name.to_string(),
             // These tests are about the search and sort helpers, which do not
             // look at it; the packages screen owns the dependency filter.
             directly_requested: true,
             status,
-            outofdate,
-            latest_version: None,
+            out_of_date,
+            built_version: None,
             upstream_version: None,
             total_size: None,
         }

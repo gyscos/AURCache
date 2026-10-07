@@ -117,7 +117,6 @@ where
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "db", derive(sea_orm::FromQueryResult))]
 pub struct SimplePackage {
-    pub id: i32,
     pub name: String,
     /// False for a package that is only here because something else needs it.
     ///
@@ -125,8 +124,8 @@ pub struct SimplePackage {
     /// apart once they are asked for together.
     pub directly_requested: bool,
     pub status: crate::build_state::BuildState,
-    pub outofdate: bool,
-    pub latest_version: Option<String>,
+    pub out_of_date: bool,
+    pub built_version: Option<String>,
     /// `None` until a version check has determined it. The column is nullable
     /// and rows land in this list before their first check — the dependency
     /// migration inserts them without one, and adding such a package
@@ -146,15 +145,13 @@ pub struct SimplePackage {
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ExtendedPackage {
-    pub id: i32,
     pub name: String,
     pub directly_requested: bool,
     pub status: crate::build_state::BuildState,
-    pub outofdate: bool,
-    pub latest_version: Option<String>,
+    pub out_of_date: bool,
+    pub built_version: Option<String>,
     pub selected_platforms: Vec<String>,
     pub selected_build_flags: Option<Vec<String>>,
-    // todo this should be renamed to "latest_upstream_version" or sth
     /// `None` while it is still unknown, matching [`SimplePackage`]. Coercing
     /// it to `""` here would make one field mean two things depending on the
     /// route, which is what it used to do.
@@ -277,7 +274,6 @@ pub struct PackageFile {
 
 #[derive(Deserialize, ToSchema, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct PackageDependency {
-    pub id: i32,
     pub name: String,
     /// What this relation requires, e.g. `>=1.3`. Empty when unconstrained.
     pub version_constraint: String,

@@ -239,7 +239,7 @@ fn a_git_source_round_trips_through_json() {
     assert_eq!(back, source);
 }
 
-/// `latest_version` must mean the same thing on both routes.
+/// `built_version` must mean the same thing on both routes.
 ///
 /// The list query used to wrap the lookup in `COALESCE(..., '')` while the
 /// detail route returned the column as-is, so a package with no build was `""`
@@ -258,7 +258,7 @@ async fn a_package_with_no_build_has_no_version_on_either_route() {
         .await
         .expect("list body");
     assert!(
-        listed.contains(r#""latest_version":null"#),
+        listed.contains(r#""built_version":null"#),
         "list should report no version as null: {listed}"
     );
 
@@ -270,7 +270,7 @@ async fn a_package_with_no_build_has_no_version_on_either_route() {
         .await
         .expect("detail body");
     assert!(
-        detail.contains(r#""latest_version":null"#),
+        detail.contains(r#""built_version":null"#),
         "detail should report no version as null: {detail}"
     );
 }
@@ -306,7 +306,7 @@ async fn an_enqueued_builds_empty_version_is_not_a_version() {
             .await
             .expect("body");
         assert!(
-            body.contains(r#""latest_version":null"#),
+            body.contains(r#""built_version":null"#),
             "GET {path} reported an empty version as a version: {body}"
         );
     }
@@ -342,7 +342,7 @@ async fn a_completed_builds_version_is_reported() {
             .await
             .expect("body");
         assert!(
-            body.contains(r#""latest_version":"2.12.1-1""#),
+            body.contains(r#""built_version":"2.12.1-1""#),
             "GET {path} lost the build version: {body}"
         );
     }
@@ -393,7 +393,7 @@ async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
 
 /// A failed build is not a version that got built.
 ///
-/// `latest_version` is read everywhere as "what is in the repository". Taking
+/// `built_version` is read everywhere as "what is in the repository". Taking
 /// the newest build regardless of outcome meant a failed build of a new
 /// version reported that version as built — and since the version check
 /// compares upstream against this field, an upstream release whose first build
@@ -442,11 +442,11 @@ async fn a_failed_build_does_not_become_the_reported_version() {
             .await
             .expect("body");
         assert!(
-            body.contains(r#""latest_version":"2.12.1-1""#),
+            body.contains(r#""built_version":"2.12.1-1""#),
             "GET {path} should report the version in the repo: {body}"
         );
         assert!(
-            !body.contains(r#""latest_version":"2.12.1-2""#),
+            !body.contains(r#""built_version":"2.12.1-2""#),
             "GET {path} reported a version whose build failed: {body}"
         );
     }
@@ -494,7 +494,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
             .await
             .expect("body");
         assert!(
-            body.contains(r#""latest_version":"1.0-1""#),
+            body.contains(r#""built_version":"1.0-1""#),
             "GET {path}: a running build must not count as built: {body}"
         );
     }

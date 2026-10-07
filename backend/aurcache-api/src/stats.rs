@@ -489,7 +489,7 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
             handled: 0,
         });
     }
-    let pkg_ids: Vec<i32> = outdated.iter().map(|pkg| pkg.id).collect();
+    let names: Vec<&str> = outdated.iter().map(|pkg| pkg.name.as_str()).collect();
 
     // Both auto-rebuild paths -- the version checker's immediate rebuild and
     // the scheduled auto-update job -- call `package_update_all_outdated`,
@@ -508,12 +508,14 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     let auto_rebuild_configured =
         build_on_new_version.value || auto_update_schedule.value.is_some();
 
-    let active: HashSet<i32> = Builds::find()
+    // By name, which is unique and all the rows carry.
+    let active: HashSet<String> = Builds::find()
         .select_only()
-        .column(builds::Column::PkgId)
-        .filter(builds::Column::PkgId.is_in(pkg_ids))
+        .column(packages::Column::Name)
+        .join(JoinType::InnerJoin, builds::Relation::Packages.def())
+        .filter(packages::Column::Name.is_in(names))
         .filter(builds::Column::Status.is_in(BuildState::IN_PROGRESS))
-        .into_tuple::<i32>()
+        .into_tuple::<String>()
         .all(db)
         .await?
         .into_iter()
@@ -526,7 +528,7 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
         // above), so whether either auto-rebuild job will pick it up comes
         // down to the settings alone -- unless one already has, which the
         // active-build check catches.
-        if !auto_rebuild_configured && !active.contains(&pkg.id) {
+        if !auto_rebuild_configured && !active.contains(&pkg.name) {
             if needs_hand.len() < DASHBOARD_LIMIT as usize {
                 needs_hand.push(pkg);
             }
