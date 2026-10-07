@@ -20,7 +20,8 @@ use aurcache_common::api::worker::{
 use aurcache_common::build_state::BuildState;
 use aurcache_common::worker::{
     BuildOutcome, ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor,
-    JobStatus, MirrorlistPreference, RegisterRequest, RegisterStatus, WorkerLogReport,
+    JobStatus, MirrorlistOffer, MirrorlistPreference, RegisterRequest, RegisterStatus,
+    WorkerLogReport,
 };
 use aurcache_common::worker_config::{
     ConfigSnapshot, EffectiveConfig, SettingDecl, SettingStatus, validate_value,
@@ -113,35 +114,6 @@ fn config_revision(values: &BTreeMap<String, String>) -> String {
     use sha2::{Digest, Sha256};
     let canonical = serde_json::to_string(values).unwrap_or_default();
     hex::encode(Sha256::digest(canonical.as_bytes()))
-}
-
-/// What a job descriptor tells the worker about the mirrorlist.
-#[derive(Debug, PartialEq, Eq)]
-enum MirrorlistOffer {
-    /// Use this list, and echo its checksum back on the next claim.
-    Send { content: String, checksum: String },
-    /// The worker's copy is current: keep it.
-    Keep,
-    /// Nothing: the server has no mirrorlist for this arch, so the worker
-    /// drops whatever it cached and falls back to its image's own -- or the
-    /// worker keeps its own and would discard anything sent anyway.
-    Nothing,
-}
-
-impl MirrorlistOffer {
-    /// Set the descriptor's mirrorlist fields, whose three values are how the
-    /// wire spells these variants.
-    fn write_to(self, job: &mut JobDescriptor) {
-        (
-            job.mirrorlist,
-            job.mirrorlist_checksum,
-            job.mirrorlist_unchanged,
-        ) = match self {
-            Self::Send { content, checksum } => (Some(content), Some(checksum), false),
-            Self::Keep => (None, None, true),
-            Self::Nothing => (None, None, false),
-        };
-    }
 }
 
 /// Decide what to put in a job descriptor for the mirrorlist.
@@ -560,7 +532,7 @@ async fn build_descriptor(
 
     // Before `pkg.name` moves into the descriptor below.
     let packages = aurcache_utils::publish::expected_pkgnames(&pkg);
-    let mut job = JobDescriptor {
+    Ok(JobDescriptor {
         build_id: build.id,
         pkgbase: pkg.name,
         packages,
@@ -570,14 +542,10 @@ async fn build_descriptor(
         persistent_builddir,
         makepkg_conf,
         pacman_conf,
-        mirrorlist: None,
-        mirrorlist_checksum: None,
-        mirrorlist_unchanged: false,
+        mirrorlist,
         pgp_keys,
         vcs_sources,
-    };
-    mirrorlist.write_to(&mut job);
-    Ok(job)
+    })
 }
 
 /// Stream the (server-patched) source archive for a claimed job.
@@ -1550,7 +1518,7 @@ pub async fn revoke_worker(
 #[cfg(test)]
 mod repo_template_tests {
     use super::{MirrorlistOffer, render_repo_template};
-    use aurcache_common::worker::{JobDescriptor, MirrorlistPreference};
+    use aurcache_common::worker::MirrorlistPreference;
     use std::collections::BTreeMap;
 
     fn holding(arch: &str, checksum: &str) -> MirrorlistPreference {
@@ -1629,49 +1597,6 @@ mod repo_template_tests {
             Some("Server = http://mirror/\n".to_string()),
         );
         assert_eq!(offer, MirrorlistOffer::Nothing);
-    }
-
-    /// A descriptor carrying `offer`, and nothing else of note.
-    fn job_with(offer: MirrorlistOffer) -> JobDescriptor {
-        let mut job = JobDescriptor {
-            build_id: 1,
-            pkgbase: "hello".into(),
-            packages: vec!["hello".into()],
-            version: "1.0-1".into(),
-            arch: "x86_64".into(),
-            build_flags: Vec::new(),
-            persistent_builddir: false,
-            makepkg_conf: String::new(),
-            pacman_conf: String::new(),
-            mirrorlist: None,
-            mirrorlist_checksum: None,
-            mirrorlist_unchanged: false,
-            pgp_keys: Vec::new(),
-            vcs_sources: Vec::new(),
-        };
-        offer.write_to(&mut job);
-        job
-    }
-
-    /// Each outcome keeps its wire spelling, which workers already rely on:
-    /// in particular "keep" and "nothing" differ only in `mirrorlist_unchanged`.
-    #[test]
-    fn offers_keep_their_wire_encoding() {
-        let sent = job_with(MirrorlistOffer::Send {
-            content: "list".to_string(),
-            checksum: "sum".to_string(),
-        });
-        assert_eq!(sent.mirrorlist.as_deref(), Some("list"));
-        assert_eq!(sent.mirrorlist_checksum.as_deref(), Some("sum"));
-        assert!(!sent.mirrorlist_unchanged);
-
-        let kept = job_with(MirrorlistOffer::Keep);
-        assert!(kept.mirrorlist.is_none() && kept.mirrorlist_checksum.is_none());
-        assert!(kept.mirrorlist_unchanged);
-
-        let nothing = job_with(MirrorlistOffer::Nothing);
-        assert!(nothing.mirrorlist.is_none() && nothing.mirrorlist_checksum.is_none());
-        assert!(!nothing.mirrorlist_unchanged);
     }
 
     use aurcache_common::worker::REPO_HOST_PLACEHOLDER;

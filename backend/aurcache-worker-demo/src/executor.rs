@@ -51,6 +51,7 @@ impl Executor for DemoExecutor {
         &self,
         client: Arc<WorkerClient>,
         job: JobDescriptor,
+        _mirrorlist: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> CompleteReport {
         let build_id = job.build_id;

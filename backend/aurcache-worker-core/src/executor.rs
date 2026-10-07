@@ -36,6 +36,8 @@ pub trait Executor: Send + Sync + 'static {
     ///
     /// Implementations must not panic — the runner wraps the call and reports a
     /// panic as a failure, but a clean report carries a far better message.
+    /// `mirrorlist` is the one to build with, already resolved from what the
+    /// server offered; `None` leaves the build environment's own.
     /// `cancel` is set when the worker has decided to abandon the build (the
     /// server became unreachable past the lease); implementations should stop
     /// promptly and return [`canceled`](crate::report::canceled).
@@ -43,6 +45,7 @@ pub trait Executor: Send + Sync + 'static {
         &self,
         client: Arc<WorkerClient>,
         job: JobDescriptor,
+        mirrorlist: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> impl Future<Output = CompleteReport> + Send;
 

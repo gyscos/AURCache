@@ -54,16 +54,13 @@ pub async fn run_job(
     cgroups: Option<&Hierarchy>,
     client: &Arc<WorkerClient>,
     job: JobDescriptor,
+    mirrorlist: Option<&str>,
     cancel: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) -> CompleteReport {
-    let workdir = cfg
-        .core
-        .data_dir
-        .join("work")
-        .join(job.build_id.to_string());
-
-    let report = match run_job_inner(cfg, cgroups, client, &job, &cancel, &shared, &workdir).await {
+    let workdir = workdir(cfg, job.build_id);
+    let report = match run_job_inner(cfg, cgroups, client, &job, mirrorlist, &cancel, &shared).await
+    {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("build setup failed: {e:#}");
@@ -83,16 +80,22 @@ pub async fn run_job(
     report
 }
 
+/// The per-job workspace of build `build_id`.
+fn workdir(cfg: &Config, build_id: i32) -> PathBuf {
+    cfg.core.data_dir.join("work").join(build_id.to_string())
+}
+
 async fn run_job_inner(
     cfg: &Config,
     cgroups: Option<&Hierarchy>,
     client: &Arc<WorkerClient>,
     job: &JobDescriptor,
+    mirrorlist: Option<&str>,
     cancel: &AtomicBool,
     shared: &Shared,
-    workdir: &Path,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;
+    let workdir = &workdir(cfg, build_id);
     let cache = Cache::new(
         &cfg.cache_dir,
         cfg.cache_max_size,
@@ -196,7 +199,7 @@ async fn run_job_inner(
             parallelism_cpus(&cfg.build_limits, &cfg.total_build_limits),
         ),
         &pacman_conf,
-        job.mirrorlist.as_deref(),
+        mirrorlist,
         cache.pacman_pkg().as_deref(),
     )
     .context("writing job configs")?;

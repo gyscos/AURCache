@@ -150,6 +150,7 @@ impl DockerExecutor {
         cfg: &Config,
         client: &Arc<WorkerClient>,
         job: &JobDescriptor,
+        mirrorlist: Option<&str>,
         cancel: &AtomicBool,
     ) -> Result<CompleteReport> {
         let dirs = self.job_dirs(cfg, job.build_id);
@@ -170,7 +171,9 @@ impl DockerExecutor {
         // Removed on every path, not just the happy one: any early return in
         // `build_in` -- a failed download, pull, container or upload -- would
         // otherwise leave the whole directory behind.
-        let outcome = self.build_in(cfg, client, job, cancel, &dirs).await;
+        let outcome = self
+            .build_in(cfg, client, job, mirrorlist, cancel, &dirs)
+            .await;
         let _ = std::fs::remove_dir_all(&dirs.local);
         outcome
     }
@@ -181,6 +184,7 @@ impl DockerExecutor {
         cfg: &Config,
         client: &Arc<WorkerClient>,
         job: &JobDescriptor,
+        mirrorlist: Option<&str>,
         cancel: &AtomicBool,
         dirs: &BuildDirs,
     ) -> Result<CompleteReport> {
@@ -201,7 +205,7 @@ impl DockerExecutor {
 
         // Bind-mounted rather than written in: see wrap_with_config.
         let mut binds = vec![format!("{}:{CONTAINER_PKGDEST}", host_dir.display())];
-        if let Some(list) = job.mirrorlist.as_deref() {
+        if let Some(list) = mirrorlist {
             let path = local_dir.join("mirrorlist");
             std::fs::write(&path, list).with_context(|| format!("writing {}", path.display()))?;
             binds.push(format!(
@@ -429,11 +433,15 @@ impl Executor for DockerExecutor {
         &self,
         client: Arc<WorkerClient>,
         job: JobDescriptor,
+        mirrorlist: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> CompleteReport {
         // Once, here: everything this build does reads this copy.
         let cfg = self.current();
-        match self.build(&cfg, &client, &job, &cancel).await {
+        match self
+            .build(&cfg, &client, &job, mirrorlist.as_deref(), &cancel)
+            .await
+        {
             Ok(report) => report,
             Err(e) => {
                 let msg = format!("build setup failed: {e:#}");

@@ -95,6 +95,20 @@ pub enum MirrorlistPreference {
     },
 }
 
+/// What the server says about a build's mirrorlist.
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "offer")]
+pub enum MirrorlistOffer {
+    /// Use this list, and echo its checksum back on the next claim.
+    Send { content: String, checksum: String },
+    /// The copy the worker advertised is current: keep using it.
+    Keep,
+    /// Nothing: the server has no mirrorlist for this arch, so the worker
+    /// drops whatever it cached and falls back to its image's own -- or the
+    /// worker keeps its own and would discard anything sent anyway.
+    Nothing,
+}
+
 /// A worker's request to claim a job.
 ///
 /// What it can build is not in here: routing reads the worker's arches,
@@ -126,17 +140,8 @@ pub struct JobDescriptor {
     pub makepkg_conf: String,
     /// Rendered `pacman.conf` for the build.
     pub pacman_conf: String,
-    /// Per-arch mirrorlist content when the server has one for this arch and
-    /// the worker does not already hold it. `None` together with
-    /// `mirrorlist_unchanged == false` means the server has none, and the
-    /// worker falls back to its image's built-in mirrorlist.
-    pub mirrorlist: Option<String>,
-    /// Checksum of the `mirrorlist` sent above, for the worker to echo back on
-    /// its next claim. Absent whenever no content was sent.
-    pub mirrorlist_checksum: Option<String>,
-    /// The server has a mirrorlist for this arch and it matches the checksum
-    /// the worker sent, so the content was omitted; keep using what you have.
-    pub mirrorlist_unchanged: bool,
+    /// What to build with for a mirrorlist; see [`MirrorlistOffer`].
+    pub mirrorlist: MirrorlistOffer,
     /// `validpgpkeys` the worker must trust before building.
     pub pgp_keys: Vec<String>,
     /// The `git+` sources whose commit the worker should report back, so the
@@ -299,9 +304,10 @@ mod tests {
             build_flags: vec!["--nocheck".into()],
             makepkg_conf: "PACKAGER=x".into(),
             pacman_conf: "[repo]".into(),
-            mirrorlist: Some("Server = https://example/\\$repo".into()),
-            mirrorlist_checksum: Some("abc123".into()),
-            mirrorlist_unchanged: false,
+            mirrorlist: MirrorlistOffer::Send {
+                content: "Server = https://example/\\$repo".into(),
+                checksum: "abc123".into(),
+            },
             packages: vec!["hello".into(), "hello-docs".into()],
             version: "1.0-1".into(),
             pgp_keys: vec!["ABCDEF".into()],
@@ -316,7 +322,6 @@ mod tests {
         assert_eq!(job.vcs_sources, back.vcs_sources);
         assert_eq!(job.pgp_keys, back.pgp_keys);
         assert_eq!(job.mirrorlist, back.mirrorlist);
-        assert_eq!(job.mirrorlist_checksum, back.mirrorlist_checksum);
         assert_eq!(job.packages, back.packages);
         assert_eq!(job.version, back.version);
     }

@@ -231,6 +231,7 @@ impl Executor for ChrootExecutor {
         &self,
         client: Arc<WorkerClient>,
         job: JobDescriptor,
+        mirrorlist: Option<String>,
         cancel: Arc<AtomicBool>,
     ) -> CompleteReport {
         // Taken before building, and held until the report is on its way: it
@@ -249,6 +250,7 @@ impl Executor for ChrootExecutor {
             self.cgroups.as_ref(),
             &client,
             job,
+            mirrorlist.as_deref(),
             cancel,
             Arc::clone(&self.shared),
         )

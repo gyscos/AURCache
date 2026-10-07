@@ -155,18 +155,13 @@ the worker side digests anything, so the two ends cannot disagree about the
 algorithm, and changing it later costs one resend per worker rather than a
 coordinated upgrade.
 
-`#[serde(default)]` resolving to `Server { checksum: None }` makes an older
-worker behave exactly as today: it sends nothing, the server reads "holds
-none", and the content is included every time. An older *server* ignores the
-new field and always sends content, which a newer worker simply accepts. Safe
-in both directions.
-
-`JobDescriptor` correspondingly becomes three-valued — unchanged, new content,
-or none configured. Encoded as the existing `mirrorlist: Option<String>` plus
-`mirrorlist_checksum` and a `mirrorlist_unchanged` flag rather than as an enum,
-so an older worker still deserializes it. `unchanged` is only ever true in
-answer to a claim that carried a checksum, which an older worker never sends, so
-such a worker keeps receiving the content in full.
+`JobDescriptor` correspondingly carries a three-valued `MirrorlistOffer`:
+`Send` (new content and its checksum), `Keep` (the copy the worker advertised
+is current) or `Nothing` (none configured). It was first encoded as three
+loose fields, so that a worker from before the change could still read it;
+workers and servers ship together, so it is now the enum itself, and the
+worker resolves it into the content the build uses before an executor sees
+the job.
 
 Distinguishing "keep what you have" from "the server has none" matters: the
 second has to make the worker *drop* its cached list, or a mirrorlist removed on

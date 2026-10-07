@@ -9,7 +9,8 @@
 
 use anyhow::Result;
 use aurcache_common::worker::{
-    BuildOutcome, ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistPreference,
+    BuildOutcome, ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistOffer,
+    MirrorlistPreference,
 };
 use aurcache_common::worker_config::{ConfigSnapshot, EffectiveConfig};
 use std::collections::{BTreeMap, HashMap};
@@ -106,42 +107,42 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Resolve `job.mirrorlist` to the content the build should actually use, and
-/// keep `held` in step with what the server has said.
+/// The mirrorlist a build of `arch` uses, given what the server offered, and
+/// `held` kept in step with it.
 ///
 /// A free function rather than a method so the rule can be tested without a
 /// server, a client or an executor -- and so there is exactly one copy of it.
 ///
 /// Precedence: the worker's own mirrorlist, then the server's for this arch,
 /// then nothing at all (the image's `/etc/pacman.d/mirrorlist`).
-fn resolve_job_mirrorlist(
+fn resolve_mirrorlist(
     local: Option<&str>,
     held: &mut BTreeMap<String, HeldMirrorlist>,
-    job: &mut JobDescriptor,
-) {
+    arch: &str,
+    offer: &MirrorlistOffer,
+) -> Option<String> {
     if let Some(local) = local {
-        job.mirrorlist = Some(local.to_string());
-        return;
+        return Some(local.to_string());
     }
-    match (&job.mirrorlist, job.mirrorlist_unchanged) {
+    match offer {
         // Sent afresh: use it, and remember it for the next claim.
-        (Some(content), _) => {
-            if let Some(checksum) = &job.mirrorlist_checksum {
-                held.insert(
-                    job.arch.clone(),
-                    HeldMirrorlist {
-                        checksum: checksum.clone(),
-                        content: content.clone(),
-                    },
-                );
-            }
+        MirrorlistOffer::Send { content, checksum } => {
+            held.insert(
+                arch.to_string(),
+                HeldMirrorlist {
+                    checksum: checksum.clone(),
+                    content: content.clone(),
+                },
+            );
+            Some(content.clone())
         }
         // Withheld because we already hold it.
-        (None, true) => job.mirrorlist = held.get(&job.arch).map(|h| h.content.clone()),
+        MirrorlistOffer::Keep => held.get(arch).map(|h| h.content.clone()),
         // The server has none for this arch. Drop anything stale rather than
         // reuse it, or a mirrorlist removed on the server would live on here.
-        (None, false) => {
-            held.remove(&job.arch);
+        MirrorlistOffer::Nothing => {
+            held.remove(arch);
+            None
         }
     }
 }
@@ -232,9 +233,9 @@ impl<E: Executor> Runner<E> {
                 mirrorlist: self.mirrorlist_preference(&cfg).await,
             };
             match self.client.claim(&claim).await {
-                Ok(Some(mut job)) => {
+                Ok(Some(job)) => {
                     self.mark_contact();
-                    self.apply_mirrorlist(&cfg, &mut job).await;
+                    let mirrorlist = self.job_mirrorlist(&cfg, &job).await;
                     // Counted here rather than in the task: the next
                     // readiness check may run before the task does, and
                     // must see this job.
@@ -245,7 +246,7 @@ impl<E: Executor> Runner<E> {
                         .insert(job.build_id, Arc::clone(&cancel));
                     let this = Arc::clone(&self);
                     tokio::spawn(async move {
-                        this.run_one(job, cancel).await;
+                        this.run_one(job, mirrorlist, cancel).await;
                         drop(permit);
                     });
                 }
@@ -279,19 +280,27 @@ impl<E: Executor> Runner<E> {
         }
     }
 
-    /// Resolve `job.mirrorlist` to the content the build should actually use.
+    /// The mirrorlist `job` builds with; see [`resolve_mirrorlist`].
     ///
-    /// Done here so everything downstream -- the executor, the chroot -- keeps
-    /// seeing one field holding the final content, and none of them has to know
-    /// that it may have arrived on an earlier job. The precedence lives on
-    /// [`resolve_job_mirrorlist`], which owns the rule.
-    async fn apply_mirrorlist(&self, cfg: &CoreConfig, job: &mut JobDescriptor) {
+    /// Resolved here so the executors get the content itself, and none of them
+    /// has to know that it may have arrived on an earlier job.
+    async fn job_mirrorlist(&self, cfg: &CoreConfig, job: &JobDescriptor) -> Option<String> {
         let mut held = self.mirrorlists.lock().await;
-        resolve_job_mirrorlist(cfg.mirrorlist.as_deref(), &mut held, job);
+        resolve_mirrorlist(
+            cfg.mirrorlist.as_deref(),
+            &mut held,
+            &job.arch,
+            &job.mirrorlist,
+        )
     }
 
     /// Execute a single job with panic-safe, always-emitted completion.
-    async fn run_one(self: &Arc<Self>, job: JobDescriptor, cancel: Arc<AtomicBool>) {
+    async fn run_one(
+        self: &Arc<Self>,
+        job: JobDescriptor,
+        mirrorlist: Option<String>,
+        cancel: Arc<AtomicBool>,
+    ) {
         let build_id = job.build_id;
         tracing::info!("Building {}", report::describe(&job));
 
@@ -299,9 +308,12 @@ impl<E: Executor> Runner<E> {
         let executor = Arc::clone(&self.executor);
         let client = Arc::clone(&self.client);
         let cancel_for_build = Arc::clone(&cancel);
-        let result =
-            tokio::spawn(async move { executor.run_job(client, job, cancel_for_build).await })
-                .await;
+        let result = tokio::spawn(async move {
+            executor
+                .run_job(client, job, mirrorlist, cancel_for_build)
+                .await
+        })
+        .await;
 
         let report = match result {
             Ok(report) => report,
@@ -490,33 +502,16 @@ impl<E: Executor> Runner<E> {
 
 #[cfg(test)]
 mod mirrorlist_tests {
-    use aurcache_common::worker::JobDescriptor;
+    use aurcache_common::worker::MirrorlistOffer;
     use std::collections::BTreeMap;
 
     use super::HeldMirrorlist;
-    use super::resolve_job_mirrorlist as apply;
+    use super::resolve_mirrorlist as resolve;
 
-    fn job(
-        arch: &str,
-        mirrorlist: Option<&str>,
-        checksum: Option<&str>,
-        unchanged: bool,
-    ) -> JobDescriptor {
-        JobDescriptor {
-            build_id: 1,
-            persistent_builddir: false,
-            pkgbase: "hello".into(),
-            arch: arch.into(),
-            build_flags: vec![],
-            makepkg_conf: String::new(),
-            pacman_conf: String::new(),
-            mirrorlist: mirrorlist.map(ToString::to_string),
-            mirrorlist_checksum: checksum.map(ToString::to_string),
-            mirrorlist_unchanged: unchanged,
-            packages: vec![],
-            version: String::new(),
-            pgp_keys: vec![],
-            vcs_sources: vec![],
+    fn send(content: &str, checksum: &str) -> MirrorlistOffer {
+        MirrorlistOffer::Send {
+            content: content.to_string(),
+            checksum: checksum.to_string(),
         }
     }
 
@@ -532,21 +527,19 @@ mod mirrorlist_tests {
     #[test]
     fn content_is_used_and_cached() {
         let mut held = BTreeMap::new();
-        let mut j = job("x86_64", Some("Server = a\n"), Some("abc"), false);
-        apply(None, &mut held, &mut j);
-        assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
+        let used = resolve(None, &mut held, "x86_64", &send("Server = a\n", "abc"));
+        assert_eq!(used.as_deref(), Some("Server = a\n"));
         assert_eq!(held["x86_64"], held_list("abc", "Server = a\n"));
     }
 
     /// Withheld content is filled in from the cache: this is what makes the
     /// build see a mirrorlist that arrived on an earlier job.
     #[test]
-    fn unchanged_is_filled_from_the_cache() {
+    fn keep_is_filled_from_the_cache() {
         let mut held = BTreeMap::new();
         held.insert("x86_64".to_string(), held_list("abc", "Server = a\n"));
-        let mut j = job("x86_64", None, None, true);
-        apply(None, &mut held, &mut j);
-        assert_eq!(j.mirrorlist.as_deref(), Some("Server = a\n"));
+        let used = resolve(None, &mut held, "x86_64", &MirrorlistOffer::Keep);
+        assert_eq!(used.as_deref(), Some("Server = a\n"));
     }
 
     /// "The server has none" must clear the cache rather than reuse it, or a
@@ -555,9 +548,8 @@ mod mirrorlist_tests {
     fn no_server_mirrorlist_drops_the_cached_one() {
         let mut held = BTreeMap::new();
         held.insert("x86_64".to_string(), held_list("abc", "Server = a\n"));
-        let mut j = job("x86_64", None, None, false);
-        apply(None, &mut held, &mut j);
-        assert!(j.mirrorlist.is_none());
+        let used = resolve(None, &mut held, "x86_64", &MirrorlistOffer::Nothing);
+        assert!(used.is_none());
         assert!(held.is_empty(), "a stale entry would outlive the server's");
     }
 
@@ -565,9 +557,13 @@ mod mirrorlist_tests {
     #[test]
     fn a_local_mirrorlist_wins() {
         let mut held = BTreeMap::new();
-        let mut j = job("x86_64", Some("Server = server\n"), Some("abc"), false);
-        apply(Some("Server = mine\n"), &mut held, &mut j);
-        assert_eq!(j.mirrorlist.as_deref(), Some("Server = mine\n"));
+        let used = resolve(
+            Some("Server = mine\n"),
+            &mut held,
+            "x86_64",
+            &send("Server = server\n", "abc"),
+        );
+        assert_eq!(used.as_deref(), Some("Server = mine\n"));
     }
 
     /// Caches are per architecture: a worker building two of them must not
@@ -575,10 +571,8 @@ mod mirrorlist_tests {
     #[test]
     fn caches_do_not_cross_architectures() {
         let mut held = BTreeMap::new();
-        let mut x = job("x86_64", Some("Server = x\n"), Some("cx"), false);
-        apply(None, &mut held, &mut x);
-        let mut a = job("aarch64", Some("Server = a\n"), Some("ca"), false);
-        apply(None, &mut held, &mut a);
+        resolve(None, &mut held, "x86_64", &send("Server = x\n", "cx"));
+        resolve(None, &mut held, "aarch64", &send("Server = a\n", "ca"));
         assert_eq!(held["x86_64"].content, "Server = x\n");
         assert_eq!(held["aarch64"].content, "Server = a\n");
     }
