@@ -2,7 +2,6 @@
 
 pub mod prelude;
 
-pub mod action;
 pub mod activities;
 pub mod api_tokens;
 pub mod builds;

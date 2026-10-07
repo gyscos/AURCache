@@ -1,17 +1,18 @@
 //! Database helpers for the remote-worker job lifecycle: atomic claim, lease
 //! renewal via heartbeat, and abandoning the builds a worker lost.
 
+use crate::helpers::build_enqueue::Pending;
+use crate::helpers::builds::refresh_package_status;
 use crate::helpers::time::now_secs;
-use crate::lists::ListColumn;
+use crate::lists::WorkerList;
 use crate::prelude::{Builds, Packages, Workers};
 use crate::{builds, packages, workers};
 use aurcache_common::api::worker::ApprovalStatus;
-use aurcache_common::build_state::BuildStates;
-use aurcache_common::build_state::{BuildTrigger, BuildTriggers, EndReason, EndReasons};
+use aurcache_common::build_state::{BuildState, BuildTrigger, EndReason};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, TransactionSession, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, TransactionSession, TransactionTrait,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -37,7 +38,7 @@ impl QueuedBuild {
             .column(builds::Column::PkgId)
             .column(builds::Column::Platform)
             .column(builds::Column::StartTime)
-            .filter(builds::Column::Status.eq(BuildStates::ENQUEUED_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Enqueued))
             .into_model::<Self>()
             .all(db)
             .await
@@ -108,9 +109,9 @@ struct WorkerRow {
     name: String,
     priority: i32,
     concurrency: i32,
-    native_arches: String,
-    emulated_arches: String,
-    package_affinity: String,
+    native_arches: WorkerList,
+    emulated_arches: WorkerList,
+    package_affinity: WorkerList,
     last_seen: Option<i64>,
     paused: bool,
 }
@@ -138,7 +139,7 @@ impl Fleet {
             .select_only()
             .column(builds::Column::WorkerId)
             .column_as(builds::Column::Id.count(), "cnt")
-            .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Active))
             .group_by(builds::Column::WorkerId)
             .into_tuple()
             .all(db)
@@ -150,9 +151,9 @@ impl Fleet {
 
         let mut fleet = Self::default();
         for row in rows {
-            let native = ListColumn::Worker.split(&row.native_arches);
+            let native = row.native_arches.into_vec();
             fleet.native_arches.extend(native.iter().cloned());
-            for pkg in ListColumn::Worker.split(&row.package_affinity) {
+            for pkg in row.package_affinity.into_vec() {
                 fleet.affinity.entry(pkg).or_default().insert(row.id);
             }
             fleet.workers.push(WorkerCap {
@@ -161,7 +162,7 @@ impl Fleet {
                 priority: row.priority,
                 concurrency: row.concurrency,
                 native,
-                emulated: ListColumn::Worker.split(&row.emulated_arches),
+                emulated: row.emulated_arches.into_vec(),
                 last_seen: row.last_seen,
                 active: active.get(&row.id).copied().unwrap_or(0),
                 paused: row.paused,
@@ -316,7 +317,7 @@ pub async fn claim_job<C: ConnectionTrait>(
     let busy_pkgs: HashSet<i32> = Builds::find()
         .select_only()
         .column(builds::Column::PkgId)
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Active))
         .filter(builds::Column::WorkerId.eq(worker_id))
         .into_tuple::<i32>()
         .all(db)
@@ -360,7 +361,7 @@ pub async fn claim_job<C: ConnectionTrait>(
 
     for (_, _, _, id) in ranked {
         let res = Builds::update_many()
-            .col_expr(builds::Column::Status, BuildStates::ACTIVE_BUILD.into())
+            .col_expr(builds::Column::Status, BuildState::Active.into())
             .col_expr(builds::Column::WorkerId, worker_id.into())
             .col_expr(
                 builds::Column::LeaseExpiresAt,
@@ -368,27 +369,15 @@ pub async fn claim_job<C: ConnectionTrait>(
             )
             .col_expr(builds::Column::StartTime, now.into())
             .filter(builds::Column::Id.eq(id))
-            .filter(builds::Column::Status.eq(BuildStates::ENQUEUED_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Enqueued))
             .exec(db)
             .await?;
         if res.rows_affected == 1 {
-            // The package row keeps its own copy of the status, and that is
-            // what the packages list shows. Without this it goes on saying
-            // "enqueued" -- or "waiting for deps" -- for the whole build,
-            // while the builds list beside it says "building": the same fact
-            // reported two ways, one of them wrong. `worker_complete` writes
-            // the terminal status at the other end of the build; this is the
-            // start of it.
-            //
-            // Only after the claim above has actually won. That update is the
+            // Only after the claim above has actually won: that update is the
             // compare-and-swap deciding which worker gets the build, so doing
             // this first would announce a build that another worker took.
             if let Some(pkg_id) = candidates.iter().find(|b| b.id == id).map(|b| b.pkg_id) {
-                Packages::update_many()
-                    .col_expr(packages::Column::Status, BuildStates::ACTIVE_BUILD.into())
-                    .filter(packages::Column::Id.eq(pkg_id))
-                    .exec(db)
-                    .await?;
+                refresh_package_status(db, pkg_id).await?;
             }
             return Builds::find_by_id(id).one(db).await;
         }
@@ -429,7 +418,7 @@ pub async fn heartbeat<C: ConnectionTrait + TransactionTrait>(
     // Every build this worker currently owns in the ACTIVE state.
     let owned: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::WorkerId.eq(worker_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Active))
         .all(db)
         .await?;
 
@@ -443,10 +432,9 @@ pub async fn heartbeat<C: ConnectionTrait + TransactionTrait>(
         if active_build_ids.contains(&id) {
             renew.push(id);
         } else {
-            let abandonment = abandon_build(db, &build, EndReasons::DROPPED, max_attempts).await?;
             outcome
                 .dropped
-                .extend(Abandoned::of(&build, EndReasons::DROPPED, abandonment));
+                .extend(abandon_build(db, &build, EndReason::Dropped, max_attempts).await?);
         }
     }
     if !renew.is_empty() {
@@ -458,7 +446,7 @@ pub async fn heartbeat<C: ConnectionTrait + TransactionTrait>(
             )
             .filter(builds::Column::Id.is_in(renew))
             .filter(builds::Column::WorkerId.eq(worker_id))
-            .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Active))
             .exec(db)
             .await?;
     }
@@ -481,9 +469,7 @@ pub async fn heartbeat<C: ConnectionTrait + TransactionTrait>(
         for id in active_build_ids {
             let cancel = match reported_rows.get(id) {
                 None => true,
-                Some(b) => {
-                    b.status != Some(BuildStates::ACTIVE_BUILD) || b.worker_id != Some(worker_id)
-                }
+                Some(b) => b.status != BuildState::Active || b.worker_id != Some(worker_id),
             };
             if cancel {
                 outcome.cancel_requested.push(*id);
@@ -509,26 +495,9 @@ fn still_held(observed: &builds::Model) -> sea_orm::Condition {
     };
     sea_orm::Condition::all()
         .add(builds::Column::Id.eq(observed.id))
-        .add(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .add(builds::Column::Status.eq(BuildState::Active))
         .add(owner)
         .add(lease)
-}
-
-/// What an [`abandon_build`] attempt actually did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Abandonment {
-    /// The row moved on (renewed, completed, or reclaimed) between the
-    /// caller's read and this write; nothing was changed.
-    Unchanged,
-    /// The row is now terminal `FAILED`.
-    Failed {
-        /// The id of the fresh build queued in its place, when the budget
-        /// allowed one.
-        retry: Option<i32>,
-        /// The package name, for appending to the build log. `None` when the
-        /// package row is already gone.
-        pkgbase: Option<String>,
-    },
 }
 
 /// Fail a build for good and queue a *fresh* build in its place, in one
@@ -554,14 +523,8 @@ pub enum Abandonment {
 ///    and its write must make this a no-op (0 rows), or a healthy worker's live
 ///    build would be terminally failed. `worker_id` is kept — the record of
 ///    who ran the attempt — and only the lease is cleared.
-/// 2. **Mirror the package status** to `FAILED` (claiming set it to `ACTIVE`,
-///    and only `worker_complete` otherwise writes it back; left
-///    alone the package would be stuck "Building" forever) -- but only while
-///    the package still points at this build, exactly like `cancel_build`. A
-///    package that has moved on to a newer build, on this platform or another,
-///    is describing that build, and this failure is not its news. When a retry is
-///    queued, this same package row is then repointed at it, exactly like the
-///    normal enqueue path (`trigger_build_for_package`).
+/// 2. **The package's status follows** ([`refresh_package_status`]): the
+///    failure, or the retry queued in its place.
 /// 3. **Decide the budget** by walking the package's most recent build rows
 ///    *on the same platform*: count the trailing consecutive `TimeoutRetry`
 ///    rows whose `end_reason` spends a retry ([`EndReason::spends_retry`]). Per platform because each
@@ -572,25 +535,25 @@ pub enum Abandonment {
 /// 4. **Insert the retry** (`ENQUEUED`, trigger `TimeoutRetry`, version from
 ///    the *current* package metadata) while the count is below `max_attempts`;
 ///    if a pending build already exists — a concurrent auto-update queued one —
-///    the insert is skipped and the package is repointed at that existing
-///    build instead.
+///    the insert is skipped and that build stands in for it.
 ///
 /// If the CAS wins no row, everything rolls back and nothing downstream runs:
-/// there is no "row failed but package still Building" and no "retry queued
-/// while the package points at the failed attempt".
+/// there is no "row failed but package still Building". That is the `None`: the row
+/// moved on (renewed, completed, or reclaimed) between the caller's read and
+/// this write.
 pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     observed: &builds::Model,
-    end_reason: i32,
+    end_reason: EndReason,
     max_attempts: i32,
-) -> Result<Abandonment, DbErr> {
+) -> Result<Option<Abandoned>, DbErr> {
     let now = now_secs();
     let txn = db.begin().await?;
 
     // 1. The CAS. 0 rows is "someone else resolved it in the gap" and the whole
     //    thing stops here.
     let cas = Builds::update_many()
-        .col_expr(builds::Column::Status, BuildStates::FAILED_BUILD.into())
+        .col_expr(builds::Column::Status, BuildState::Failed.into())
         .col_expr(builds::Column::EndTime, Some(now).into())
         .col_expr(builds::Column::EndReason, Some(end_reason).into())
         .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
@@ -599,7 +562,7 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
         .await?;
     if cas.rows_affected == 0 {
         txn.rollback().await?;
-        return Ok(Abandonment::Unchanged);
+        return Ok(None);
     }
 
     let pkg = Packages::find_by_id(observed.pkg_id).one(&txn).await?;
@@ -616,11 +579,8 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
         .all(&txn)
         .await?;
     for row in &recent {
-        if row.trigger == BuildTriggers::TIMEOUT_RETRY
-            && row
-                .end_reason
-                .and_then(EndReason::from_i32)
-                .is_some_and(EndReason::spends_retry)
+        if row.trigger == BuildTrigger::TimeoutRetry
+            && row.end_reason.is_some_and(EndReason::spends_retry)
         {
             futile_run += 1;
         } else {
@@ -628,47 +588,38 @@ pub async fn abandon_build<C: ConnectionTrait + TransactionTrait>(
         }
     }
 
+    // 4. Insert (or adopt) the fresh build, while the budget allows. An
+    //    existing pending build -- a concurrent auto-update queued one once
+    //    this row stopped conflicting -- stands in for it.
     let mut retry = None;
-    if futile_run < max_attempts {
-        if let Some(pkg) = &pkg {
-            let version = pkg.upstream_version.clone().unwrap_or_default();
-            // 4. Insert (or adopt) the fresh build.
-            let enqueue = crate::helpers::build_enqueue::enqueue_build_if_missing(
-                &txn,
-                observed.pkg_id,
-                observed.platform,
-                &version,
-                now,
-                BuildStates::ENQUEUED_BUILD,
-                BuildTrigger::TimeoutRetry,
-            )
-            .await?;
-            // Pointed at the build either way. When the insert was skipped a
-            // pending build already exists (a concurrent auto-update queued one
-            // once this row stopped conflicting), and pointing the package at
-            // it is what keeps the just-failed mirror from sticking.
-            let mut pkg_active: packages::ActiveModel = pkg.clone().into();
-            pkg_active.latest_build = Set(Some(enqueue.build.id));
-            pkg_active.status = Set(enqueue.build.status.unwrap_or(BuildStates::ENQUEUED_BUILD));
-            pkg_active.save(&txn).await?;
-            if enqueue.inserted {
-                retry = Some(enqueue.build);
-            }
-        }
-    } else if let Some(pkg) = &pkg
-        && pkg.latest_build == Some(observed.id)
+    if futile_run < max_attempts
+        && let Some(pkg) = &pkg
     {
-        // Budget spent: the mirror to FAILED stands.
-        let mut pkg_active: packages::ActiveModel = pkg.clone().into();
-        pkg_active.status = Set(BuildStates::FAILED_BUILD);
-        pkg_active.save(&txn).await?;
+        let enqueue = crate::helpers::build_enqueue::enqueue_build_if_missing(
+            &txn,
+            observed.pkg_id,
+            observed.platform,
+            pkg.upstream_version.as_deref().unwrap_or_default(),
+            now,
+            Pending::Enqueued,
+            BuildTrigger::TimeoutRetry,
+        )
+        .await?;
+        if enqueue.inserted {
+            retry = Some(enqueue.build.id);
+        }
     }
+    refresh_package_status(&txn, observed.pkg_id).await?;
 
     txn.commit().await?;
-    Ok(Abandonment::Failed {
-        retry: retry.map(|build| build.id),
+    Ok(Some(Abandoned {
+        build_id: observed.id,
+        number: observed.number,
         pkgbase: pkg.map(|p| p.name),
-    })
+        end_reason,
+        worker_id: observed.worker_id,
+        retry,
+    }))
 }
 
 /// Why an `ENQUEUED` build is not being picked up by anyone.
@@ -768,7 +719,7 @@ pub async fn abandon_worker_builds<C: ConnectionTrait + TransactionTrait>(
 ) -> Result<Vec<Abandoned>, DbErr> {
     let owned: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::WorkerId.eq(worker_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Active))
         .all(db)
         .await?;
 
@@ -776,13 +727,7 @@ pub async fn abandon_worker_builds<C: ConnectionTrait + TransactionTrait>(
     for build in owned {
         // The same pinned write as the reaper's, so a build that completed
         // between the select above and this write is left alone.
-        let abandonment =
-            abandon_build(db, &build, EndReasons::WORKER_REVOKED, max_attempts).await?;
-        abandoned.extend(Abandoned::of(
-            &build,
-            EndReasons::WORKER_REVOKED,
-            abandonment,
-        ));
+        abandoned.extend(abandon_build(db, &build, EndReason::WorkerRevoked, max_attempts).await?);
     }
     Ok(abandoned)
 }
@@ -794,23 +739,6 @@ pub struct ReapOutcome {
 }
 
 impl Abandoned {
-    /// What [`abandon_build`] did to `build`, as an [`Abandoned`] when it was
-    /// abandoned; `None` when the row had moved on and nothing was written.
-    #[must_use]
-    pub fn of(build: &builds::Model, end_reason: i32, abandonment: Abandonment) -> Option<Self> {
-        let Abandonment::Failed { retry, pkgbase } = abandonment else {
-            return None;
-        };
-        Some(Self {
-            build_id: build.id,
-            number: build.number,
-            pkgbase,
-            end_reason,
-            worker_id: build.worker_id,
-            retry,
-        })
-    }
-
     /// The build as everything outside the database names it; `None` once its
     /// package is gone.
     #[must_use]
@@ -853,8 +781,8 @@ pub struct Abandoned {
     pub number: i32,
     /// `None` when the package row is already gone, and its logs with it.
     pub pkgbase: Option<String>,
-    /// The `EndReasons::*` code recorded on the row.
-    pub end_reason: i32,
+    /// Why the server ended it, as recorded on the row.
+    pub end_reason: EndReason,
     /// The worker that held it, if any did.
     pub worker_id: Option<i32>,
     /// Id of the fresh build queued in its place, when the budget allowed one.
@@ -873,7 +801,7 @@ pub struct Abandoned {
 ///
 /// Each reaped build goes through [`abandon_build`]: one transaction fails the
 /// row for good (keeping the `worker_id` that ran it) and queues a *fresh*
-/// build while the derived [`BuildTriggers::TIMEOUT_RETRY`] budget allows —
+/// build while the derived [`BuildTrigger::TimeoutRetry`] budget allows —
 /// never a requeue of the same row. The fresh row's version comes from the
 /// current package metadata, matching every other enqueue path.
 ///
@@ -887,7 +815,7 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
 ) -> Result<ReapOutcome, DbErr> {
     let backstop_before = now - max_build_age;
     let candidates: Vec<builds::Model> = Builds::find()
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Active))
         .filter(
             sea_orm::Condition::any()
                 .add(builds::Column::LeaseExpiresAt.lt(now))
@@ -907,14 +835,13 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
         // too long whether or not it was still heartbeating.
         let over_backstop = build.start_time.is_some_and(|t| t < backstop_before);
         let end_reason = if over_backstop {
-            EndReasons::MAX_DURATION
+            EndReason::MaxDuration
         } else {
-            EndReasons::LEASE_EXPIRED
+            EndReason::LeaseExpired
         };
-        let abandonment = abandon_build(db, &build, end_reason, max_attempts).await?;
         outcome
             .abandoned
-            .extend(Abandoned::of(&build, end_reason, abandonment));
+            .extend(abandon_build(db, &build, end_reason, max_attempts).await?);
     }
     Ok(outcome)
 }
@@ -927,10 +854,10 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     // Spelled out for the SQL fixtures, which interpolate them by name.
-    const ACTIVE_BUILD: i32 = BuildStates::ACTIVE_BUILD;
-    const ENQUEUED_BUILD: i32 = BuildStates::ENQUEUED_BUILD;
-    const FAILED_BUILD: i32 = BuildStates::FAILED_BUILD;
-    const SUCCESSFUL_BUILD: i32 = BuildStates::SUCCESSFUL_BUILD;
+    const ACTIVE_BUILD: i32 = BuildState::Active.as_i32();
+    const ENQUEUED_BUILD: i32 = BuildState::Enqueued.as_i32();
+    const FAILED_BUILD: i32 = BuildState::Failed.as_i32();
+    const SUCCESSFUL_BUILD: i32 = BuildState::Successful.as_i32();
 
     const LEASE: i64 = 60;
     const SPILL: i64 = 60;
@@ -978,8 +905,9 @@ mod tests {
             .map_or_else(|| "NULL".to_string(), |t| t.to_string());
         db.execute_unprepared(&format!(
             "INSERT INTO workers (id, name, status, cert_fingerprint, native_arches, \
-             emulated_arches, package_affinity, priority, concurrency, last_seen) \
-             VALUES ({}, 'w{}', '{}', 'fp{}', '{}', '{}', '{}', {}, {}, {last_seen})",
+             emulated_arches, package_affinity, priority, concurrency, last_seen, \
+             settings_declaration) \
+             VALUES ({}, 'w{}', '{}', 'fp{}', '{}', '{}', '{}', {}, {}, {last_seen}, '[]')",
             w.id, w.id, w.status, w.id, w.native, w.emulated, w.affinity, w.priority, w.concurrency
         ))
         .await
@@ -1013,11 +941,11 @@ mod tests {
     /// A package's status, without loading the rest of the row: the fixtures
     /// here insert only `(id, name)`, so the other columns are NULL and
     /// decoding a full model fails on them.
-    async fn pkg_status(db: &DatabaseConnection, id: i32) -> Option<i32> {
+    async fn pkg_status(db: &DatabaseConnection, id: i32) -> BuildState {
         Packages::find_by_id(id)
             .select_only()
             .column(packages::Column::Status)
-            .into_tuple::<Option<i32>>()
+            .into_tuple::<BuildState>()
             .one(db)
             .await
             .unwrap()
@@ -1127,7 +1055,7 @@ mod tests {
         claim(&db, 1).await.expect("the first platform");
         db.execute_unprepared(&format!(
             "UPDATE builds SET status = {} WHERE id = 10",
-            BuildStates::PUBLISHING
+            BuildState::Publishing.as_i32()
         ))
         .await
         .unwrap();
@@ -1155,11 +1083,11 @@ mod tests {
         .unwrap();
 
         let claimed = claim(&db, 1).await.unwrap();
-        assert_eq!(claimed.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(claimed.status, BuildState::Active);
 
         assert_eq!(
             pkg_status(&db, 10).await,
-            Some(BuildStates::ACTIVE_BUILD),
+            BuildState::Active,
             "the package still reports the status it had before the build started"
         );
     }
@@ -1183,7 +1111,7 @@ mod tests {
         let claimed = claim(&db, 1).await.unwrap();
         assert_eq!(claimed.pkg_id, 10);
 
-        assert_eq!(pkg_status(&db, 11).await, Some(BuildStates::ENQUEUED_BUILD));
+        assert_eq!(pkg_status(&db, 11).await, BuildState::Enqueued);
     }
 
     // ---------------------------------------------------------------- arches
@@ -1199,7 +1127,7 @@ mod tests {
         let claimed = claim(&db, 1).await.unwrap();
         // Oldest x86_64 job wins; the older aarch64 job is not buildable.
         assert_eq!(claimed.id, 11);
-        assert_eq!(claimed.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(claimed.status, BuildState::Active);
         assert_eq!(claimed.worker_id, Some(1));
         assert!(claimed.lease_expires_at.is_some());
     }
@@ -1909,8 +1837,8 @@ mod tests {
         );
 
         let b31 = Builds::find_by_id(31).one(&db).await.unwrap().unwrap();
-        assert_eq!(b31.status, Some(BuildStates::FAILED_BUILD));
-        assert_eq!(b31.end_reason, Some(EndReasons::DROPPED));
+        assert_eq!(b31.status, BuildState::Failed);
+        assert_eq!(b31.end_reason, Some(EndReason::Dropped));
         // Kept: the record of who ran the attempt.
         assert_eq!(b31.worker_id, Some(5));
     }
@@ -1934,7 +1862,7 @@ mod tests {
         enqueue(&db, 40, "x86_64", 100).await;
         claim_job(&db, 5, 60, SPILL, LIVENESS).await.unwrap();
         Builds::update_many()
-            .col_expr(builds::Column::Status, BuildStates::PUBLISHING.into())
+            .col_expr(builds::Column::Status, BuildState::Publishing.into())
             .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
             .filter(builds::Column::Id.eq(40))
             .exec(&db)
@@ -1953,7 +1881,7 @@ mod tests {
         );
 
         let b = Builds::find_by_id(40).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::PUBLISHING));
+        assert_eq!(b.status, BuildState::Publishing);
         assert_eq!(b.worker_id, Some(5));
     }
 
@@ -1986,7 +1914,7 @@ mod tests {
         enqueue(&db, 33, "x86_64", 100).await;
         claim_job(&db, 5, 60, SPILL, LIVENESS).await.unwrap();
         Builds::update_many()
-            .col_expr(builds::Column::Status, BuildStates::FAILED_BUILD.into())
+            .col_expr(builds::Column::Status, BuildState::Failed.into())
             .filter(builds::Column::Id.eq(33))
             .exec(&db)
             .await
@@ -2030,13 +1958,13 @@ mod tests {
 
         for old_id in [60, 61] {
             let b = Builds::find_by_id(old_id).one(&db).await.unwrap().unwrap();
-            assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
+            assert_eq!(b.status, BuildState::Failed);
             assert_eq!(
                 b.worker_id,
                 Some(3),
                 "the failed row must still name the worker that ran it"
             );
-            assert_eq!(b.end_reason, Some(EndReasons::LEASE_EXPIRED));
+            assert_eq!(b.end_reason, Some(EndReason::LeaseExpired));
             assert_eq!(b.lease_expires_at, None);
             assert!(b.end_time.is_some());
 
@@ -2048,8 +1976,8 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("a fresh build must be queued in the abandoned row's place");
-            assert_eq!(fresh.status, Some(BuildStates::ENQUEUED_BUILD));
-            assert_eq!(fresh.trigger, BuildTriggers::TIMEOUT_RETRY);
+            assert_eq!(fresh.status, BuildState::Enqueued);
+            assert_eq!(fresh.trigger, BuildTrigger::TimeoutRetry);
             assert!(fresh.worker_id.is_none());
 
             // Package repointed at it, moving off "Building".
@@ -2058,8 +1986,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(pkg.status, BuildStates::ENQUEUED_BUILD);
-            assert_eq!(pkg.latest_build, Some(fresh.id));
+            assert_eq!(pkg.status, BuildState::Enqueued);
         }
     }
 
@@ -2084,7 +2011,7 @@ mod tests {
 
         // ...meanwhile the owning worker completes the build.
         Builds::update_many()
-            .col_expr(builds::Column::Status, BuildStates::SUCCESSFUL_BUILD.into())
+            .col_expr(builds::Column::Status, BuildState::Successful.into())
             .col_expr(builds::Column::WorkerId, Option::<i32>::None.into())
             .col_expr(builds::Column::LeaseExpiresAt, Option::<i64>::None.into())
             .filter(builds::Column::Id.eq(90))
@@ -2093,13 +2020,13 @@ mod tests {
             .unwrap();
 
         // The stale observation must not clobber the SUCCESS row.
-        let outcome = abandon_build(&db, &observed, EndReasons::LEASE_EXPIRED, 3)
+        let outcome = abandon_build(&db, &observed, EndReason::LeaseExpired, 3)
             .await
             .unwrap();
-        assert_eq!(outcome, Abandonment::Unchanged);
+        assert_eq!(outcome, None);
 
         let b = Builds::find_by_id(90).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::SUCCESSFUL_BUILD));
+        assert_eq!(b.status, BuildState::Successful);
         assert_eq!(b.end_reason, None);
     }
 
@@ -2122,13 +2049,13 @@ mod tests {
         // Worker heartbeats: lease pushed out, build still ACTIVE and owned.
         heartbeat(&db, 8, &[91], 600, 3).await.unwrap();
 
-        let outcome = abandon_build(&db, &observed, EndReasons::LEASE_EXPIRED, 3)
+        let outcome = abandon_build(&db, &observed, EndReason::LeaseExpired, 3)
             .await
             .unwrap();
-        assert_eq!(outcome, Abandonment::Unchanged);
+        assert_eq!(outcome, None);
 
         let b = Builds::find_by_id(91).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(b.status, BuildState::Active);
         assert_eq!(b.worker_id, Some(8));
     }
 
@@ -2153,7 +2080,7 @@ mod tests {
         assert!(out.retried().is_empty());
         assert!(out.failed().is_empty());
         let b = Builds::find_by_id(70).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(b.status, BuildState::Active);
     }
 
     #[tokio::test]
@@ -2177,8 +2104,8 @@ mod tests {
         let out = reap_expired_builds(&db, now, 3, 1).await.unwrap();
         assert_eq!(out.retried().len(), 1, "80 must get a fresh attempt");
         let b = Builds::find_by_id(80).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
-        assert_eq!(b.end_reason, Some(EndReasons::MAX_DURATION));
+        assert_eq!(b.status, BuildState::Failed);
+        assert_eq!(b.end_reason, Some(EndReason::MaxDuration));
     }
 
     /// The retry budget is derived from the history, not counted: three
@@ -2211,8 +2138,8 @@ mod tests {
                     number, trigger, end_reason, worker_id) \
                  VALUES ({id}, 90, {FAILED_BUILD}, 0, 'x86_64', '1.0', {number}, \
                     {t}, {reason}, 2)",
-                t = BuildTriggers::TIMEOUT_RETRY,
-                reason = EndReasons::LEASE_EXPIRED
+                t = BuildTrigger::TimeoutRetry.as_i32(),
+                reason = EndReason::LeaseExpired.as_i32()
             ))
             .await
             .unwrap();
@@ -2226,15 +2153,12 @@ mod tests {
                 number, trigger, worker_id, lease_expires_at) \
              VALUES (90, 90, {ACTIVE_BUILD}, {now}, 'x86_64', '1.0', 3, \
                 {t}, 2, 0)",
-            t = BuildTriggers::TIMEOUT_RETRY,
+            t = BuildTrigger::TimeoutRetry.as_i32(),
             now = now_secs()
         ))
         .await
         .unwrap();
         // Claiming pointed the package at the attempt it is running.
-        db.execute_unprepared("UPDATE packages SET latest_build = 90 WHERE id = 90")
-            .await
-            .unwrap();
 
         let far = now_secs() + 10_000;
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
@@ -2242,8 +2166,8 @@ mod tests {
         assert!(out.retried().is_empty());
 
         let b = Builds::find_by_id(90).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
-        assert_eq!(b.end_reason, Some(EndReasons::LEASE_EXPIRED));
+        assert_eq!(b.status, BuildState::Failed);
+        assert_eq!(b.end_reason, Some(EndReason::LeaseExpired));
         assert_eq!(
             b.worker_id,
             Some(2),
@@ -2259,7 +2183,7 @@ mod tests {
             3
         );
         let pkg = Packages::find_by_id(90).one(&db).await.unwrap().unwrap();
-        assert_eq!(pkg.status, BuildStates::FAILED_BUILD);
+        assert_eq!(pkg.status, BuildState::Failed);
     }
 
     /// An abandonment is pinned to the lease revision the reaper observed: a
@@ -2285,17 +2209,13 @@ mod tests {
         // lease moves on, the observed pin no longer matches.
         heartbeat(&db, 8, &[91], 600, 3).await.unwrap();
 
-        let outcome = abandon_build(&db, &observed, EndReasons::LEASE_EXPIRED, 3)
+        let outcome = abandon_build(&db, &observed, EndReason::LeaseExpired, 3)
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            Abandonment::Unchanged,
-            "a renewed lease must make the CAS a no-op"
-        );
+        assert_eq!(outcome, None, "a renewed lease must make the CAS a no-op");
 
         let b = Builds::find_by_id(91).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(b.status, BuildState::Active);
         assert_eq!(b.worker_id, Some(8));
         assert_eq!(b.end_reason, None);
         // No fresh build was queued and the package was not touched.
@@ -2307,7 +2227,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(pkg_status(&db, 91).await, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(pkg_status(&db, 91).await, BuildState::Active);
     }
 
     /// Seed package 95 with an abandoned `ACTIVE` build (#95, number 10,
@@ -2336,8 +2256,8 @@ mod tests {
                     number, trigger, end_reason, worker_id) \
                  VALUES ({id}, 95, {FAILED_BUILD}, 0, '{platform}', '1.0', {number}, \
                     {t}, {reason}, 2)",
-                t = BuildTriggers::TIMEOUT_RETRY,
-                reason = EndReasons::LEASE_EXPIRED
+                t = BuildTrigger::TimeoutRetry.as_i32(),
+                reason = EndReason::LeaseExpired.as_i32()
             ))
             .await
             .unwrap();
@@ -2346,14 +2266,11 @@ mod tests {
             "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, \
                 number, trigger, worker_id, lease_expires_at) \
              VALUES (95, 95, {ACTIVE_BUILD}, {now}, 'x86_64', '1.0', 10, {t}, 2, 0)",
-            t = BuildTriggers::TIMEOUT_RETRY,
+            t = BuildTrigger::TimeoutRetry.as_i32(),
             now = now_secs()
         ))
         .await
         .unwrap();
-        db.execute_unprepared("UPDATE packages SET latest_build = 95 WHERE id = 95")
-            .await
-            .unwrap();
     }
 
     /// Each platform has its own chain of retries. Another platform's
@@ -2377,23 +2294,17 @@ mod tests {
         assert_eq!(out.retried().len(), 1);
     }
 
-    /// A spent budget fails the package only while the package still points at
-    /// the abandoned build. One that has moved on to a newer build is reporting
-    /// on that build, and must not be overwritten with this old failure.
+    /// A package shows every platform it builds for: a spent budget on one
+    /// fails the package even though another platform's newest build worked,
+    /// and it would read as fine only once that one is retried successfully.
     #[tokio::test]
-    async fn a_spent_budget_leaves_a_package_that_moved_on_alone() {
+    async fn a_spent_budget_fails_the_package_whatever_its_other_platforms_did() {
         let db = setup().await;
         seed_abandonment(&db, &[(93, 8, "x86_64"), (94, 9, "x86_64")]).await;
-        // Meanwhile a newer build of the package succeeded on aarch64.
         db.execute_unprepared(&format!(
             "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, number, trigger) \
              VALUES (96, 95, {SUCCESSFUL_BUILD}, 0, 'aarch64', '1.0', 11, {t})",
-            t = BuildTriggers::USER
-        ))
-        .await
-        .unwrap();
-        db.execute_unprepared(&format!(
-            "UPDATE packages SET latest_build = 96, status = {SUCCESSFUL_BUILD} WHERE id = 95"
+            t = BuildTrigger::User.as_i32()
         ))
         .await
         .unwrap();
@@ -2402,8 +2313,19 @@ mod tests {
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
 
         assert_eq!(out.failed(), vec![95], "the budget is spent");
-        let pkg = Packages::find_by_id(95).one(&db).await.unwrap().unwrap();
-        assert_eq!(pkg.status, BuildStates::SUCCESSFUL_BUILD);
-        assert_eq!(pkg.latest_build, Some(96));
+        assert_eq!(pkg_status(&db, 95).await, BuildState::Failed);
+    }
+
+    /// The package's status is its builds' -- the newest per configured
+    /// platform -- whatever path changed a build.
+    #[test]
+    fn the_most_active_state_leads_then_failure() {
+        use crate::helpers::builds::combined_status;
+        use BuildState::*;
+        assert_eq!(combined_status([]), None);
+        assert_eq!(combined_status([Successful, Enqueued]), Some(Enqueued));
+        assert_eq!(combined_status([WaitingForDeps, Active]), Some(Active));
+        assert_eq!(combined_status([Successful, Failed]), Some(Failed));
+        assert_eq!(combined_status([Successful, Successful]), Some(Successful));
     }
 }

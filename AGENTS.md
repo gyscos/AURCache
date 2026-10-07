@@ -121,16 +121,15 @@ defect this frontend has had was of that kind.
 ## High-level architecture
 
 - `backend/` is a Cargo workspace. `backend/aurcache` is the composition root: it loads env, initializes
-  the database and migrations, runs startup cleanup, starts the build queue and schedulers, then launches
-  the API server and the repository file server.
+  the database and migrations, runs startup cleanup, queues whatever should be building and has no build,
+  starts the schedulers, then launches the API server and the repository file server.
 - `backend/aurcache-api` owns the Rocket HTTP surface. Route registration is centralized in
   `src/backend.rs`, OpenAPI docs are assembled in `src/init.rs`, and the app serves docs at `/docs` and
   `/redoc`.
 - `backend/aurcache-utils` holds most package/business logic. Package add/update flows resolve AUR or git
-  sources, create package and dependency rows, and send build actions onto the broadcast queue instead of
-  building inline.
-- `backend/aurcache-builder` executes containerized builds, streams logs, updates build/package status,
-  and triggers dependent rebuilds only after dependency versions satisfy recorded constraints.
+  sources, create package and dependency rows, and insert build rows (`ENQUEUED`, or `WAITING_FOR_DEPS`)
+  that workers poll for and claim; the server never builds itself. Completion, publishing and promoting
+  dependents live here too (`worker_complete`, `publish`).
 - `backend/aurcache-db` owns SeaORM entities and migrations. `init_db()` applies migrations on startup;
   SQLite uses `./db` plus WAL pragmas, while Postgres is selected from env vars.
 - `backend/aurcache-scheduler` contains background jobs such as auto-update, mirror ranking, and version
@@ -169,18 +168,23 @@ defect this frontend has had was of that kind.
 ## Key conventions
 
 - Keep changes in the owning crate instead of piling logic into `backend/aurcache`: HTTP schema/handlers
-  belong in `aurcache-api`, persistence and migrations in `aurcache-db`, build orchestration in
-  `aurcache-builder`, schedulers in `aurcache-scheduler`, and package/settings helpers in `aurcache-utils`.
+  belong in `aurcache-api`, persistence and migrations in `aurcache-db`, schedulers in
+  `aurcache-scheduler`, and package, build and settings logic in `aurcache-utils`.
 - Package addition is dependency-first. `aurcache_utils::package::add` recursively resolves AUR `depends`
   and `make_depends`, inserts dependency links, marks only the originally requested package as
   `directly_requested`, and initially enqueues only leaf packages.
-- Successful builds fan out through the dependency graph. `aurcache-builder` checks recorded dependency
-  constraints and only triggers dependents when all dependency builds are ready and version-compatible.
-- Several persisted fields are encoded strings rather than richer DB types: `platforms` and `build_flags`
-  are semicolon-delimited, while `source_data` and `split_packages` are JSON strings. Preserve those
-  encodings when touching DB, API, or model conversion code.
-- Settings are resolved through `ApplicationSettings` helpers, not by reading env vars ad hoc. The
-  effective precedence in code is `Package -> Env -> Global -> Default`.
+- Successful builds fan out through the dependency graph. Once a build is published,
+  `aurcache_utils::worker_complete::trigger_dependents` checks recorded dependency constraints and only
+  promotes dependents when all dependency builds are ready and version-compatible.
+- List columns are strings in the database but typed in the entities: `packages.platforms`
+  (`Platforms`) and `build_flags` (`BuildFlags`) are `;`-joined, a worker's arches and affinity
+  (`WorkerList`) `,`-joined, all in `aurcache_db::lists`; `source_data` and `split_packages` are JSON.
+  Build and package statuses are `BuildState` (an integer column). Go through those types rather than
+  joining or splitting by hand.
+- A package's `status` is derived, never written directly: whatever changes a build's status calls
+  `aurcache_db::helpers::builds::refresh_package_status` in the same transaction.
+- Settings are read through `aurcache_utils::settings::get` with a typed `settings::key::*`, not by
+  reading env vars ad hoc. The effective precedence in code is `Package -> Env -> Global -> Default`.
 - API shapes live in `aurcache-common` and are shared, never re-declared. A field added to a response is
   added once and the CLI, the client library and the frontend all see it; mirroring a struct by hand is
   how the two ends drift apart.

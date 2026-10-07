@@ -17,7 +17,6 @@ alpm-srcinfo = {workspace = true}
 
 pacman-mirrors = {path = "../pacman-mirrors"}
 aurcache-deps = {path = "../aurcache-deps"}
-aurcache-builder = {path = "../aurcache-builder"}
 aurcache-db = {path = "../aurcache-db"}
 aurcache-activitylog = {path = "../aurcache-activitylog"}
 aurcache-utils = {path = "../aurcache-utils"}

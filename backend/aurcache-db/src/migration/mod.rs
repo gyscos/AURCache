@@ -55,6 +55,10 @@ mod m20260928_000001_build_kept_tree;
 mod m20261005_000000_drop_source_type;
 mod m20261005_000001_drop_attempt_count;
 mod m20261006_000000_crontab_schedule;
+mod m20261007_000000_package_status_from_builds;
+mod m20261007_000001_out_of_date_boolean;
+mod m20261007_000002_auto_update_schedule_key;
+mod m20261007_000003_worker_declaration_required;
 
 pub struct Migrator;
 
@@ -114,6 +118,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000000_drop_source_type::Migration),
             Box::new(m20261005_000001_drop_attempt_count::Migration),
             Box::new(m20261006_000000_crontab_schedule::Migration),
+            Box::new(m20261007_000000_package_status_from_builds::Migration),
+            Box::new(m20261007_000001_out_of_date_boolean::Migration),
+            Box::new(m20261007_000002_auto_update_schedule_key::Migration),
+            Box::new(m20261007_000003_worker_declaration_required::Migration),
         ]
     }
 }

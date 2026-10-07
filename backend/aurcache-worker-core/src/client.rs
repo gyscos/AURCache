@@ -352,10 +352,7 @@ impl WorkerClient {
     /// the server's answer: the builds it wants this worker to stop (abandoned,
     /// or cancelled by an operator).
     ///
-    /// An accepted heartbeat is a success whatever its body says. The body is
-    /// advisory, and a server older than the abort list answers with an empty
-    /// one: failing on that would stop the worker counting the server as
-    /// reachable, and past the lease it would abort every build it holds.
+    /// Send a heartbeat, and read what the server wants stopped or changed.
     pub async fn heartbeat(&self, hb: &Heartbeat) -> Result<HeartbeatResponse> {
         let resp = self
             .http
@@ -363,11 +360,9 @@ impl WorkerClient {
             .json(hb)
             .send_checked("heartbeat")
             .await?;
-        // A transport failure here is not "the server said nothing": an empty
-        // answer from an old server still parses as healthy (see the test),
-        // but a body we failed to read must not refresh the lease watchdog.
-        let body = resp.bytes().await.context("reading heartbeat answer")?;
-        Ok(parse_heartbeat_response(&body))
+        // An answer that cannot be read is a failed heartbeat: it must not
+        // refresh the lease watchdog.
+        resp.json().await.context("decoding heartbeat answer")
     }
 
     /// Poll whether a build has been asked to cancel.
@@ -443,29 +438,9 @@ pub struct ConditionalGet {
     pub last_modified: Option<String>,
 }
 
-/// Read a heartbeat answer, taking anything unreadable as "nothing to stop".
-fn parse_heartbeat_response(body: &[u8]) -> HeartbeatResponse {
-    if body.is_empty() {
-        return HeartbeatResponse::default();
-    }
-    serde_json::from_slice(body).unwrap_or_else(|e| {
-        tracing::warn!("ignoring an unreadable heartbeat response: {e}");
-        HeartbeatResponse::default()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A server that predates the abort list answers a heartbeat with nothing,
-    /// and that must still read as an accepted heartbeat.
-    #[test]
-    fn an_empty_heartbeat_answer_means_nothing_to_stop() {
-        assert!(parse_heartbeat_response(b"").cancel.is_empty());
-        assert!(parse_heartbeat_response(b"not json").cancel.is_empty());
-        assert_eq!(parse_heartbeat_response(br#"{"cancel":[3]}"#).cancel, [3]);
-    }
 
     /// A CA fingerprint is the hash of the certificate block's body.
     #[test]

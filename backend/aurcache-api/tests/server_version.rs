@@ -5,12 +5,10 @@
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use rocket::tokio::sync::broadcast;
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
 
@@ -26,7 +24,6 @@ async fn test_client() -> Client {
     let rocket = rocket::build()
         .manage(db.clone())
         .manage(ActivityLog::discarding())
-        .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; this test never reaches
         // one, but Rocket refuses to launch with an unmanaged type.
         .manage(Arc::new(SnapshotStore::with_checkout_root(
@@ -34,7 +31,6 @@ async fn test_client() -> Client {
         )))
         .manage(aurcache_utils::services::Services::new(
             db.clone(),
-            broadcast::channel::<Action>(16).0,
             Arc::new(SnapshotStore::with_checkout_root(
                 checkouts.path().to_path_buf(),
             )),

@@ -39,7 +39,6 @@ pub struct WorkerSummary {
     ///
     /// Free-form rather than a closed set: the server stores and shows whatever
     /// a worker calls itself, so a new executor needs no change here.
-    #[serde(default)]
     pub kind: Option<String>,
     /// Whether it has checked in recently enough to be considered connected.
     ///
@@ -79,11 +78,7 @@ pub struct WorkerSummary {
 pub struct WorkerConfigView {
     pub worker_id: i32,
     /// What this worker declared it accepts, at its last registration.
-    ///
-    /// `None` from a worker version that does not declare its settings, which
-    /// the page says outright -- it is a different statement from a worker that
-    /// declares none.
-    pub settings: Option<Vec<crate::worker_config::SettingDecl>>,
+    pub settings: Vec<crate::worker_config::SettingDecl>,
     /// What those settings resolved to on the machine, as last reported.
     ///
     /// `None` until a worker has been up long enough to send one heartbeat, so
@@ -96,14 +91,12 @@ pub struct WorkerConfigView {
     /// have picked the save up yet -- and the page has to be able to show both.
     /// Includes values for keys the worker no longer declares, which are kept
     /// rather than dropped when a worker is upgraded.
-    #[serde(default)]
     pub values: std::collections::BTreeMap<String, String>,
     /// The revision of those values as the worker is sent them.
     ///
     /// Compared with `effective.received_revision` to tell a save the worker has
     /// taken from one it has not been reached with yet.
-    #[serde(default)]
-    pub revision: Option<String>,
+    pub revision: String,
 }
 
 /// A save of several of one worker's settings at once.

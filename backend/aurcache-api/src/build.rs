@@ -13,25 +13,24 @@ use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::builds::{DiskUsage, KeptBuild};
 use aurcache_common::api::log::BuildRef;
 use aurcache_common::api::waiting::WaitingReason;
-use aurcache_common::build_state::{BuildState, BuildStates, BuildTrigger};
-use aurcache_db::action::Action;
+use aurcache_common::build_state::{BuildState, BuildTrigger};
 use aurcache_db::helpers::worker_jobs;
 use aurcache_db::prelude::Builds;
 use aurcache_db::{builds, packages, workers};
 use aurcache_utils::build_logger::{
     build_log_path, build_log_size, read_build_output, remove_build_log,
 };
+use aurcache_utils::cancel::Cancel;
 use aurcache_utils::package::update::{package_update, queued};
 use rocket::fs::NamedFile;
 use rocket::http::{ContentType, Header};
 use rocket::response::Responder;
 use sea_orm::FromQueryResult;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait, Order, QueryFilter,
-    QueryOrder, QuerySelect, RelationTrait, Select,
+    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, Order, QueryFilter, QueryOrder,
+    QuerySelect, RelationTrait, Select,
 };
 use std::collections::HashMap;
-use tokio::sync::broadcast::Sender;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -319,7 +318,7 @@ pub(crate) struct BuildRow {
     number: i32,
     pkg_name: String,
     version: String,
-    status: i32,
+    status: BuildState,
     start_time: Option<i64>,
     end_time: Option<i64>,
     platform: String,
@@ -489,7 +488,7 @@ pub async fn get_build(
     // Waiting reasons only exist for queued builds, and computing them scans
     // the whole queue plus the fleet — skip that for a build whose status
     // already says the annotation would be `None`.
-    let reason = if row.status == BuildStates::ENQUEUED_BUILD {
+    let reason = if row.status == BuildState::Enqueued {
         waiting_reasons(db).await.remove(&row.id)
     } else {
         None
@@ -525,18 +524,14 @@ pub async fn delete_build(
     // A worker holds an active build's lease and a publishing one is being
     // moved into the repository; removing the row under either leaves that
     // work pointing at nothing.
-    if matches!(
-        build.status,
-        Some(BuildStates::ACTIVE_BUILD | BuildStates::PUBLISHING)
-    ) {
+    if matches!(build.status, BuildState::Active | BuildState::Publishing) {
         return Err(err(
             Status::Conflict,
             format!("build {pkgbase}/{number} is running; cancel it first"),
         ));
     }
 
-    build
-        .delete(db)
+    aurcache_db::helpers::builds::delete_build(db, &build)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     remove_build_log(pkgbase, number).await;
@@ -555,7 +550,9 @@ pub async fn delete_build(
 
 #[utoipa::path(
     responses(
-            (status = 200, description = "Cancel build job"),
+            (status = 200, description = "Cancelled"),
+            (status = 404, description = "No such build"),
+            (status = 409, description = "The build has already finished, or is being published"),
     ),
     params(
             ("pkgbase", description = "pkgbase of the package"),
@@ -565,19 +562,24 @@ pub async fn delete_build(
 #[post("/package/<pkgbase>/build/<number>/cancel")]
 pub async fn cancel_build(
     db: &State<DatabaseConnection>,
-    tx: &State<Sender<Action>>,
     pkgbase: &str,
     number: i32,
     a: Authenticated,
     al: &State<ActivityLog>,
 ) -> Result<(), ApiError> {
-    // Cancellation still travels by row id on the internal queue; only the way
-    // the caller names the build has changed.
-    let build_id = build_by_number(db.inner(), pkgbase, number).await?.id;
-    // A send failure means no receiver, i.e. the coordinator is gone and the
-    // process is shutting down — nothing a 500 could fix, and every other
-    // broadcast send ignores it the same way.
-    let _ = tx.send(Action::Cancel(build_id));
+    let build = build_by_number(db.inner(), pkgbase, number).await?;
+    match aurcache_utils::cancel::cancel_build(db.inner(), pkgbase, &build)
+        .await
+        .map_err(|e| err(Status::InternalServerError, e))?
+    {
+        Cancel::Cancelled => {}
+        Cancel::Settled => {
+            return Err(err(
+                Status::Conflict,
+                format!("build {pkgbase}/{number} has already finished"),
+            ));
+        }
+    }
     al.emit_by(
         Event::BuildCancelled {
             build: BuildRef {
@@ -638,7 +640,7 @@ pub async fn retry_build(
     al.emit_by(
         queued(
             pkgbase,
-            QueueCause::after(old_build.status == Some(BuildStates::FAILED_BUILD)),
+            QueueCause::after(old_build.status == BuildState::Failed),
             &platform_results,
             Some(BuildRef {
                 pkgbase: pkgbase.to_string(),

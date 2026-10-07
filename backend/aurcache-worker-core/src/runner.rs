@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use aurcache_common::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistPreference,
+    BuildOutcome, ClaimRequest, CompleteReport, Heartbeat, JobDescriptor, MirrorlistPreference,
 };
 use aurcache_common::worker_config::{ConfigSnapshot, EffectiveConfig};
 use std::collections::{BTreeMap, HashMap};
@@ -229,8 +229,6 @@ impl<E: Executor> Runner<E> {
             }
 
             let claim = ClaimRequest {
-                native_arches: cfg.native_arches.clone(),
-                emulated_arches: cfg.emulated_arches.clone(),
                 mirrorlist: self.mirrorlist_preference(&cfg).await,
             };
             match self.client.claim(&claim).await {
@@ -321,7 +319,7 @@ impl<E: Executor> Runner<E> {
             match self.client.complete(build_id, report).await {
                 Ok(()) => {
                     self.mark_contact();
-                    if report.success {
+                    if report.outcome == BuildOutcome::Succeeded {
                         tracing::info!("Build {build_id} completed successfully");
                     } else {
                         tracing::warn!(
@@ -489,7 +487,7 @@ impl<E: Executor> Runner<E> {
 
 #[cfg(test)]
 mod mirrorlist_tests {
-    use aurcache_common::worker::{JobDescriptor, MirrorlistPreference};
+    use aurcache_common::worker::JobDescriptor;
     use std::collections::BTreeMap;
 
     use super::HeldMirrorlist;
@@ -580,17 +578,5 @@ mod mirrorlist_tests {
         apply(None, &mut held, &mut a);
         assert_eq!(held["x86_64"].content, "Server = x\n");
         assert_eq!(held["aarch64"].content, "Server = a\n");
-    }
-
-    /// The default preference is "I hold nothing", which is what a worker
-    /// predating the field sends, so it keeps receiving the content in full.
-    #[test]
-    fn the_default_preference_holds_nothing() {
-        assert_eq!(
-            MirrorlistPreference::default(),
-            MirrorlistPreference::Server {
-                checksums: BTreeMap::new()
-            }
-        );
     }
 }

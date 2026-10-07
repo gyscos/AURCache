@@ -16,6 +16,7 @@ use aurcache_deps::{AurClient, Dependency, Resolutions, SatisfyIndex};
 use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QuerySelect};
 use std::collections::HashSet;
 
+use crate::lists::json_list;
 use crate::packages;
 
 /// A package that can satisfy a dependency: either a row already in the
@@ -105,10 +106,10 @@ impl TrackedPackages {
                 // records the constraint for the build queue to check against
                 // real builds.
                 None,
-                parse_json_list(candidate.provides.as_deref()),
+                json_list(candidate.provides.as_deref()),
                 wanted,
             );
-            for split in parse_json_list(candidate.split_packages.as_deref()) {
+            for split in json_list(candidate.split_packages.as_deref()) {
                 index.insert_package(&split, &candidate.name, None, Vec::<String>::new(), wanted);
             }
         }
@@ -140,9 +141,4 @@ pub async fn resolve_dependencies(
     client
         .resolve_dependencies(deps, &tracked.index(planned, &wanted), preferred)
         .await
-}
-
-fn parse_json_list(json: Option<&str>) -> Vec<String> {
-    json.and_then(|value| serde_json::from_str(value).ok())
-        .unwrap_or_default()
 }

@@ -1,17 +1,16 @@
 //! Server-side handling of a worker's build completion: terminal status
 //! transitions, version reconciliation, and promotion of dependent builds.
 //!
-//! This is the Docker-free counterpart of the logic that used to live in the
-//! in-process builder (`aurcache-builder`'s `post_build`/`trigger_dependents`).
 //! Workers poll for enqueued jobs, so promoting a dependent from
 //! `WAITING_FOR_DEPS` to `ENQUEUED` is all that is required to dispatch it.
 
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::helpers::build_enqueue::{Demotion, demote_enqueued_build, promote_waiting_build};
+use aurcache_db::helpers::builds::refresh_package_status;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_db::{builds, dependencies, packages};
+use aurcache_db::{builds, dependencies};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QuerySelect, TransactionSession,
@@ -62,7 +61,7 @@ pub async fn assert_owned<C: ConnectionTrait>(
 /// hottest worker endpoint for a row that cannot usefully change between the
 /// two reads (a concurrent state change fails the CAS further down anyway).
 pub fn check_owned_active(worker_id: i32, build: &builds::Model) -> Result<(), DbErr> {
-    if build.status != Some(BuildStates::ACTIVE_BUILD) {
+    if build.status != BuildState::Active {
         return Err(DbErr::Custom(format!("build {} is not active", build.id)));
     }
     check_owned(worker_id, build)
@@ -148,9 +147,9 @@ fn lease_lost(build_id: i32, worker_id: i32) -> DbErr {
     ))
 }
 
-/// End `worker_id`'s lease on `build_id`, moving the build and its package
-/// from `ACTIVE` to `status`, in one transaction; `ended_at` is the build's
-/// end time when it is over.
+/// End `worker_id`'s lease on `build_id`, moving the build from `ACTIVE` to
+/// `status` -- and its package's status with it -- in one transaction;
+/// `ended_at` is the build's end time when it is over.
 ///
 /// A compare-and-swap on `status = ACTIVE AND worker_id = ?`, so a completion
 /// arriving after the reaper reclaimed the build is discarded rather than
@@ -165,7 +164,7 @@ async fn release<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     build_id: i32,
     worker_id: i32,
-    status: i32,
+    status: BuildState,
     ended_at: Option<i64>,
 ) -> Result<(), DbErr> {
     let build = find_build(db, build_id).await?;
@@ -179,7 +178,7 @@ async fn release<C: ConnectionTrait + TransactionTrait>(
     }
     let res = update
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(BuildStates::ACTIVE_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Active))
         .filter(builds::Column::WorkerId.eq(worker_id))
         .exec(&txn)
         .await?;
@@ -188,11 +187,7 @@ async fn release<C: ConnectionTrait + TransactionTrait>(
         return Err(lease_lost(build_id, worker_id));
     }
 
-    Packages::update_many()
-        .col_expr(packages::Column::Status, status.into())
-        .filter(packages::Column::Id.eq(build.pkg_id))
-        .exec(&txn)
-        .await?;
+    refresh_package_status(&txn, build.pkg_id).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -209,7 +204,7 @@ pub async fn accept_for_publishing<C: ConnectionTrait + TransactionTrait>(
     build_id: i32,
     worker_id: i32,
 ) -> Result<(), DbErr> {
-    release(db, build_id, worker_id, BuildStates::PUBLISHING, None).await
+    release(db, build_id, worker_id, BuildState::Publishing, None).await
 }
 
 /// Mark a build (and its package) as failed. Deterministic failures reported by
@@ -223,7 +218,7 @@ pub async fn complete_failure<C: ConnectionTrait + TransactionTrait>(
         db,
         build_id,
         worker_id,
-        BuildStates::FAILED_BUILD,
+        BuildState::Failed,
         Some(now_secs()),
     )
     .await
@@ -277,10 +272,10 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
 ) -> Result<Vec<i32>, DbErr> {
     let pending: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(builds::Column::Status.is_in([
-            Some(BuildStates::ENQUEUED_BUILD),
-            Some(BuildStates::WAITING_FOR_DEPS),
-        ]))
+        .filter(
+            builds::Column::Status
+                .is_in([Some(BuildState::Enqueued), Some(BuildState::WaitingForDeps)]),
+        )
         .all(db)
         .await?;
     if pending.is_empty() {
@@ -299,7 +294,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
             aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform.as_str())
                 .await?;
         match (build.status, ready) {
-            (Some(BuildStates::WAITING_FOR_DEPS), true) => {
+            (BuildState::WaitingForDeps, true) => {
                 if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {
                     tracing::info!(
                         "Build #{} on {platform} can start: its dependencies changed and are now satisfied",
@@ -308,7 +303,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
                     unblocked.push(promoted.id);
                 }
             }
-            (Some(BuildStates::ENQUEUED_BUILD), false)
+            (BuildState::Enqueued, false)
                 if demote_enqueued_build(db, pkg_id, platform).await? == Demotion::Demoted =>
             {
                 tracing::info!(
@@ -355,9 +350,7 @@ async fn promote_dependent<C: ConnectionTrait>(
     let Some(pkg) = Packages::find_by_id(dependent_id).one(db).await? else {
         return Ok(None);
     };
-    if !pkg.platforms.trim().is_empty()
-        && !Platform::parse_many(&pkg.platforms).any(|r| r.is_ok_and(|p| p == platform))
-    {
+    if !pkg.platforms.as_slice().is_empty() && !pkg.platforms.contains(platform) {
         return Ok(None);
     }
     Ok(promote_waiting_build(db, pkg.id, platform)
@@ -391,10 +384,17 @@ mod tests {
         .unwrap();
     }
 
-    async fn build(db: &DatabaseConnection, id: i32, pkg_id: i32, status: i32, worker: &str) {
+    async fn build(
+        db: &DatabaseConnection,
+        id: i32,
+        pkg_id: i32,
+        status: BuildState,
+        worker: &str,
+    ) {
         db.execute_unprepared(&format!(
             "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, worker_id) \
-             VALUES ({id}, {pkg_id}, {status}, 0, 'x86_64', '1.0', {worker})"
+             VALUES ({id}, {pkg_id}, {}, 0, 'x86_64', '1.0', {worker})",
+            status.as_i32()
         ))
         .await
         .unwrap();
@@ -413,7 +413,7 @@ mod tests {
     async fn peak_memory_is_recorded_for_a_failed_build() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+        build(&db, 1, 1, BuildState::Active, "1").await;
 
         record_peak_memory(&db, 1, 6 * 1024 * 1024 * 1024)
             .await
@@ -422,7 +422,7 @@ mod tests {
 
         let row = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
         assert_eq!(row.peak_memory, Some(6 * 1024 * 1024 * 1024));
-        assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
+        assert_eq!(row.status, BuildState::Failed);
     }
 
     /// A build's disk usage is kept part by part, and a part the worker did
@@ -431,7 +431,7 @@ mod tests {
     async fn disk_usage_is_recorded_part_by_part() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+        build(&db, 1, 1, BuildState::Active, "1").await;
 
         let usage = aurcache_common::api::builds::DiskUsage {
             chroot: Some(700),
@@ -454,7 +454,7 @@ mod tests {
     async fn a_kept_failure_records_where_and_until_when() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 1, 1, BuildStates::ACTIVE_BUILD, "1").await;
+        build(&db, 1, 1, BuildState::Active, "1").await;
 
         let kept = aurcache_common::api::builds::KeptBuild {
             path: "/pool/kept-1".to_string(),
@@ -468,19 +468,19 @@ mod tests {
         assert_eq!(row.kept_path.as_deref(), Some("/pool/kept-1"));
         assert_eq!(row.kept_until, Some(1_800_000_000));
         assert_eq!(row.kept_tree.as_deref(), Some("/pool/kept-1.build"));
-        assert_eq!(row.status, Some(BuildStates::FAILED_BUILD));
+        assert_eq!(row.status, BuildState::Failed);
     }
 
     #[tokio::test]
     async fn a_finished_build_still_names_the_worker_that_ran_it() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        build(&db, 10, 1, BuildState::Active, "5").await;
 
         accept_for_publishing(&db, 10, 5).await.unwrap();
 
         let finished = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(finished.status, Some(BuildStates::PUBLISHING));
+        assert_eq!(finished.status, BuildState::Publishing);
         assert_eq!(
             finished.worker_id,
             Some(5),
@@ -499,7 +499,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn status_of(db: &DatabaseConnection, build_id: i32) -> Option<i32> {
+    async fn status_of(db: &DatabaseConnection, build_id: i32) -> BuildState {
         Builds::find_by_id(build_id)
             .one(db)
             .await
@@ -515,13 +515,13 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await; // the dependent
         pkg(&db, 2).await; // the replacement, already built
-        build(&db, 20, 2, BuildStates::SUCCESSFUL_BUILD, "1").await;
-        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+        build(&db, 20, 2, BuildState::Successful, "1").await;
+        build(&db, 10, 1, BuildState::WaitingForDeps, "NULL").await;
         dep(&db, 1, 2).await;
 
         resync_pending_builds(&db, 1).await.unwrap();
 
-        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
+        assert_eq!(status_of(&db, 10).await, BuildState::Enqueued);
     }
 
     /// A promotion is an all-of, not a check of the edge that just changed.
@@ -536,8 +536,8 @@ mod tests {
         pkg(&db, 1).await; // the dependent
         pkg(&db, 2).await; // the repointed dependency, built
         pkg(&db, 3).await; // a second dependency, never built
-        build(&db, 20, 2, BuildStates::SUCCESSFUL_BUILD, "1").await;
-        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+        build(&db, 20, 2, BuildState::Successful, "1").await;
+        build(&db, 10, 1, BuildState::WaitingForDeps, "NULL").await;
         dep(&db, 1, 2).await;
         dep(&db, 1, 3).await;
 
@@ -545,14 +545,14 @@ mod tests {
 
         assert_eq!(
             status_of(&db, 10).await,
-            Some(BuildStates::WAITING_FOR_DEPS),
+            BuildState::WaitingForDeps,
             "promoted on one satisfied dependency while another is unbuilt"
         );
 
         // ... and it goes as soon as the last one lands.
-        build(&db, 30, 3, BuildStates::SUCCESSFUL_BUILD, "1").await;
+        build(&db, 30, 3, BuildState::Successful, "1").await;
         resync_pending_builds(&db, 1).await.unwrap();
-        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
+        assert_eq!(status_of(&db, 10).await, BuildState::Enqueued);
     }
 
     /// And the other direction, which is the one a promotion-only pass misses:
@@ -563,15 +563,12 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         pkg(&db, 2).await; // the replacement, never built
-        build(&db, 10, 1, BuildStates::ENQUEUED_BUILD, "NULL").await;
+        build(&db, 10, 1, BuildState::Enqueued, "NULL").await;
         dep(&db, 1, 2).await;
 
         resync_pending_builds(&db, 1).await.unwrap();
 
-        assert_eq!(
-            status_of(&db, 10).await,
-            Some(BuildStates::WAITING_FOR_DEPS)
-        );
+        assert_eq!(status_of(&db, 10).await, BuildState::WaitingForDeps);
     }
 
     /// A build a worker is already running is none of the queue's business.
@@ -580,12 +577,12 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         pkg(&db, 2).await;
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        build(&db, 10, 1, BuildState::Active, "5").await;
         dep(&db, 1, 2).await;
 
         resync_pending_builds(&db, 1).await.unwrap();
 
-        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(status_of(&db, 10).await, BuildState::Active);
     }
 
     /// Dropping the last dependency leaves nothing to wait for.
@@ -593,18 +590,18 @@ mod tests {
     async fn a_waiting_build_starts_when_its_last_dependency_is_dropped() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, BuildStates::WAITING_FOR_DEPS, "NULL").await;
+        build(&db, 10, 1, BuildState::WaitingForDeps, "NULL").await;
 
         resync_pending_builds(&db, 1).await.unwrap();
 
-        assert_eq!(status_of(&db, 10).await, Some(BuildStates::ENQUEUED_BUILD));
+        assert_eq!(status_of(&db, 10).await, BuildState::Enqueued);
     }
 
     #[tokio::test]
     async fn owned_active_guard() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        build(&db, 10, 1, BuildState::Active, "5").await;
         assert!(assert_owned_active(&db, 5, 10).await.is_ok());
         assert!(assert_owned_active(&db, 6, 10).await.is_err());
     }
@@ -616,7 +613,7 @@ mod tests {
     async fn an_accepted_build_is_published_without_its_worker() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        build(&db, 10, 1, BuildState::Active, "5").await;
         db.execute_unprepared("UPDATE builds SET lease_expires_at = 999 WHERE id = 10")
             .await
             .unwrap();
@@ -624,12 +621,12 @@ mod tests {
         accept_for_publishing(&db, 10, 5).await.unwrap();
 
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::PUBLISHING));
+        assert_eq!(b.status, BuildState::Publishing);
         assert_eq!(b.lease_expires_at, None);
         assert_eq!(b.worker_id, Some(5));
         assert_eq!(b.end_time, None, "not finished until published");
         let p = Packages::find_by_id(1).one(&db).await.unwrap().unwrap();
-        assert_eq!(p.status, BuildStates::PUBLISHING);
+        assert_eq!(p.status, BuildState::Publishing);
 
         // Accepted once: a repeat is no longer an ACTIVE build of this worker.
         assert!(accept_for_publishing(&db, 10, 5).await.is_err());
@@ -639,10 +636,10 @@ mod tests {
     async fn failure_is_terminal_not_requeued() {
         let db = setup().await;
         pkg(&db, 1).await;
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "5").await;
+        build(&db, 10, 1, BuildState::Active, "5").await;
         complete_failure(&db, 10, 5).await.unwrap();
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::FAILED_BUILD));
+        assert_eq!(b.status, BuildState::Failed);
         // A failed build produced nothing to measure. `None` says that; a `0`
         // would claim it produced an empty package.
         assert_eq!(b.size, None);
@@ -653,12 +650,12 @@ mod tests {
         let db = setup().await;
         pkg(&db, 1).await;
         // Build reclaimed and re-handed to worker 6.
-        build(&db, 10, 1, BuildStates::ACTIVE_BUILD, "6").await;
+        build(&db, 10, 1, BuildState::Active, "6").await;
         // Late completion from the original owner (worker 5) must not clobber it.
         assert!(accept_for_publishing(&db, 10, 5).await.is_err());
         assert!(complete_failure(&db, 10, 5).await.is_err());
         let b = Builds::find_by_id(10).one(&db).await.unwrap().unwrap();
-        assert_eq!(b.status, Some(BuildStates::ACTIVE_BUILD));
+        assert_eq!(b.status, BuildState::Active);
         assert_eq!(b.worker_id, Some(6));
     }
 }

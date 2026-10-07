@@ -3,6 +3,7 @@
 use crate::init::{CaDirectory, ServerVersion};
 use crate::models::authenticated::Authenticated;
 use crate::utils::error::{ApiError, err};
+use crate::utils::operation::{self, Counts, Recorder};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_common::api::dump::{
@@ -19,7 +20,6 @@ use rocket::serde::json::Json;
 use rocket::{Responder, State, get, post};
 use sea_orm::DatabaseConnection;
 use std::collections::HashSet;
-use tokio::sync::mpsc;
 use tracing::warn;
 use utoipa::OpenApi;
 
@@ -201,79 +201,73 @@ pub async fn restore(
         .map_err(|e| err(Status::InternalServerError, e))?;
 
     let services_task = services.inner().clone();
-    let db_task = services_task.db.clone();
-    let log_task = services_task.activity.clone();
-    let username = a.username.clone();
     let ca_dir_task = ca_dir.inner().clone();
-
-    tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::channel(crate::utils::PROGRESS_CHANNEL_CAPACITY);
-        let worker = {
-            tokio::spawn(async move {
-                aurcache_utils::restore::apply(
-                    &services_task,
-                    &ca_dir_task.0,
-                    loaded,
-                    options,
-                    progress_tx,
-                )
-                .await;
-            })
-        };
-
-        // Counted per package rather than per entry, because a package can be
-        // reported twice: imported by the first pass, then failed by a later
-        // one when its source turned out to be unreadable. The later word is
-        // the true one, so it moves out of `completed` rather than adding to
-        // both. The log keeps both lines -- the sequence is what explains what
-        // happened.
-        let mut succeeded: HashSet<String> = HashSet::new();
-        let mut failed: HashSet<String> = HashSet::new();
-        while let Some(entry) = progress_rx.recv().await {
-            match &entry.outcome {
-                RestoreOutcome::Failed { .. } => {
-                    succeeded.remove(&entry.pkgbase);
-                    failed.insert(entry.pkgbase.clone());
-                }
-                _ => {
-                    succeeded.insert(entry.pkgbase.clone());
-                }
-            }
-            let completed = i32::try_from(succeeded.len()).unwrap_or(i32::MAX);
-            let failures = i32::try_from(failed.len()).unwrap_or(i32::MAX);
-            if let Err(e) =
-                operations::append(&db_task, job_id, completed, failures, &[entry], false).await
-            {
-                warn!("could not record restore {job_id} progress: {e}");
-            }
-        }
-        log_task.emit_by(
-            Event::RestoreApplied {
-                packages: succeeded.len(),
-            },
-            username,
-        );
-        let completed = i32::try_from(succeeded.len()).unwrap_or(i32::MAX);
-        let failed = i32::try_from(failed.len()).unwrap_or(i32::MAX);
-        if let Err(e) = worker.await {
-            log_task.emit(Event::OperationAborted {
-                operation: "restore".to_string(),
-                error: e.to_string(),
-            });
-        }
-        if let Err(e) =
-            operations::append::<_, RestoreEntry>(&db_task, job_id, completed, failed, &[], true)
-                .await
-        {
-            warn!("could not close restore {job_id}: {e}");
-        }
-    });
+    operation::spawn(
+        services.db.clone(),
+        services.activity.clone(),
+        job_id,
+        operations::KIND_RESTORE,
+        move |progress| async move {
+            aurcache_utils::restore::apply(
+                &services_task,
+                &ca_dir_task.0,
+                loaded,
+                options,
+                progress,
+            )
+            .await;
+        },
+        RestoreRecorder {
+            activity: services.activity.clone(),
+            username: a.username.clone(),
+            succeeded: HashSet::new(),
+            failed: HashSet::new(),
+        },
+    );
 
     Ok(status::Accepted(Json(RestoreAccepted {
         job_id: Some(job_id),
         total,
         preview: Vec::new(),
     })))
+}
+
+/// Counts a restore's packages, and logs how many it brought in.
+///
+/// Counted per package rather than per entry, because a package can be
+/// reported twice: imported by the first pass, then failed by a later one when
+/// its source turned out to be unreadable. The later word is the true one, so
+/// it moves out of `completed` rather than adding to both. The log keeps both
+/// lines -- the sequence is what explains what happened.
+struct RestoreRecorder {
+    activity: ActivityLog,
+    username: Option<String>,
+    succeeded: HashSet<String>,
+    failed: HashSet<String>,
+}
+
+impl Recorder<RestoreEntry> for RestoreRecorder {
+    fn record(&mut self, entry: &RestoreEntry) -> Counts {
+        if let RestoreOutcome::Failed { .. } = entry.outcome {
+            self.succeeded.remove(&entry.pkgbase);
+            self.failed.insert(entry.pkgbase.clone());
+        } else {
+            self.succeeded.insert(entry.pkgbase.clone());
+        }
+        Counts {
+            completed: i32::try_from(self.succeeded.len()).unwrap_or(i32::MAX),
+            failed: i32::try_from(self.failed.len()).unwrap_or(i32::MAX),
+        }
+    }
+
+    fn finish(self) {
+        self.activity.emit_by(
+            Event::RestoreApplied {
+                packages: self.succeeded.len(),
+            },
+            self.username,
+        );
+    }
 }
 
 #[utoipa::path(

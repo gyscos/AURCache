@@ -6,7 +6,7 @@ use aurcache_activitylog::events::Event;
 use aurcache_common::api::settings::SchedulePreview;
 use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_utils::scheduled::{Job, preview};
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings as store;
 use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post};
@@ -45,10 +45,7 @@ async fn settings_impl(
     db: &DatabaseConnection,
     pkg_id: Option<i32>,
 ) -> Result<Json<ApplicationSettings>, ApiError> {
-    ApplicationSettings::get_all(db, pkg_id)
-        .await
-        .map(Json)
-        .map_err(|e| err(Status::InternalServerError, e))
+    Ok(Json(store::all(db, pkg_id).await))
 }
 
 async fn setting_get_impl(
@@ -57,7 +54,7 @@ async fn setting_get_impl(
     pkg_id: Option<i32>,
 ) -> Result<Json<SettingResponse>, ApiError> {
     let setting = parse_setting(key)?;
-    let entry = ApplicationSettings::get::<String>(setting, pkg_id, db).await;
+    let entry = store::raw(db, setting, pkg_id).await;
     Ok(Json(SettingResponse {
         value: entry.value,
         source: entry.source,
@@ -74,9 +71,16 @@ async fn setting_patch_impl(
     setting
         .validate(&value)
         .map_err(|e| err(Status::BadRequest, e))?;
-    ApplicationSettings::patch(db, [(setting, pkg_id, Some(value))])
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))
+    store::write(
+        db,
+        [store::Change {
+            setting,
+            pkg_id,
+            value: Some(value),
+        }],
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))
 }
 
 async fn setting_reset_impl(
@@ -85,9 +89,16 @@ async fn setting_reset_impl(
     pkg_id: Option<i32>,
 ) -> Result<(), ApiError> {
     let setting = parse_setting(key)?;
-    ApplicationSettings::patch(db, [(setting, pkg_id, None)])
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))
+    store::write(
+        db,
+        [store::Change {
+            setting,
+            pkg_id,
+            value: None,
+        }],
+    )
+    .await
+    .map_err(|e| err(Status::InternalServerError, e))
 }
 
 /// Fetch every setting with its effective value and source.
@@ -290,7 +301,7 @@ pub async fn setting_schedule_preview(
     _a: Authenticated,
 ) -> Result<Json<SchedulePreview>, ApiError> {
     let job = match parse_setting(key)? {
-        Setting::AutoUpdateInterval => Job::AutoUpdate,
+        Setting::AutoUpdateSchedule => Job::AutoUpdate,
         _ => return Err(err(Status::NotFound, format!("{key} is not a schedule"))),
     };
     Ok(Json(preview(job, &input.value, 2)))

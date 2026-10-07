@@ -15,21 +15,10 @@
 //! Nth one, which measured 6x slower than slicing bytes even before the
 //! transfer cost. And it removes the one dialect branch that lived in a query
 //! path rather than a migration.
-//!
-//! Appends are still buffered by [`BuildLogger`] so a build emitting many short
-//! lines costs one write per flush window rather than one syscall per line.
 
 use std::io::SeekFrom;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, Notify};
-use tracing::{debug, error, warn};
-
-/// How long the flush task waits after the first buffered append before
-/// writing, so a burst of lines collapses into a single write.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
+use tracing::warn;
 
 /// Maximum bytes a single [`read_build_output`] call may return, whatever
 /// limit is asked for: the bound of an absent limit, and the clamp of any
@@ -146,151 +135,9 @@ pub async fn remove_all_logs() {
     }
 }
 
-/// State shared between every [`BuildLogger`] handle and its flush task.
-#[derive(Debug)]
-struct Shared {
-    pkgbase: String,
-    number: i32,
-    buffer: Mutex<Vec<String>>,
-    /// Raised when text is buffered, and once more when the last handle drops.
-    wake: Notify,
-    /// Set once the last handle has dropped: drain the buffer, then stop.
-    shutdown: AtomicBool,
-}
-
-impl Shared {
-    fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-    }
-
-    /// Write out everything buffered so far.
-    ///
-    /// The buffer is swapped out under one short hold and written without
-    /// the lock: holding it across the write serialises every logging handle
-    /// behind a slow disk. On a write error the swapped lines go back at the
-    /// front — lines logged during the write are newer — so the next flush
-    /// still retries them, as before.
-    async fn flush(&self) -> anyhow::Result<()> {
-        let pending: Vec<String> = {
-            let mut buffer = self.buffer.lock().await;
-            std::mem::take(&mut *buffer)
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        let result = append_build_output(&self.pkgbase, self.number, &pending.concat()).await;
-        if result.is_err() {
-            let mut buffer = self.buffer.lock().await;
-            buffer.splice(..0, pending);
-        } else {
-            debug!("Log buffer flushed!");
-        }
-        result
-    }
-
-    async fn flush_or_log(&self) {
-        if let Err(e) = self.flush().await {
-            error!(
-                "Failed to flush log buffer for build {}/{}: {e}",
-                self.pkgbase, self.number
-            );
-        }
-    }
-}
-
-/// Signals shutdown when the last [`BuildLogger`] handle drops.
-///
-/// Deliberately *not* held by the flush task: if the task held it, the
-/// reference count could never reach zero and this `Drop` would never run.
-#[derive(Debug)]
-struct ShutdownOnDrop(Arc<Shared>);
-
-impl Drop for ShutdownOnDrop {
-    fn drop(&mut self) {
-        self.0.shutdown.store(true, Ordering::Release);
-        // `notify_one` leaves a permit behind when the task is not currently
-        // parked, so this wakeup cannot be missed whatever the task is doing.
-        self.0.wake.notify_one();
-    }
-}
-
-/// A cloneable handle for appending to one build's output.
-///
-/// The background flush task lives exactly as long as the handles do: when the
-/// last clone is dropped it drains whatever is left and exits.
-#[derive(Debug, Clone)]
-pub struct BuildLogger {
-    shared: Arc<Shared>,
-    /// Kept only so its `Drop` fires when the last handle goes.
-    _shutdown: Arc<ShutdownOnDrop>,
-}
-
-impl BuildLogger {
-    /// Create a logger and start its flush task. Must be called from within a
-    /// tokio runtime.
-    #[must_use]
-    pub fn new(pkgbase: &str, number: i32) -> Self {
-        let shared = Arc::new(Shared {
-            pkgbase: pkgbase.to_string(),
-            number,
-            buffer: Mutex::new(Vec::new()),
-            wake: Notify::new(),
-            shutdown: AtomicBool::new(false),
-        });
-
-        let task_shared = Arc::clone(&shared);
-        tokio::spawn(async move {
-            loop {
-                task_shared.wake.notified().await;
-                if task_shared.is_shutdown() {
-                    break;
-                }
-                // Debounce, so a burst of appends becomes a single write --
-                // but a shutdown (which notifies the same `wake`) cuts the
-                // sleep short, so dropping the last handle during the window
-                // drains promptly instead of waiting it out. An append also
-                // notifies `wake`, and must not cut it short: it keeps
-                // sleeping, since the flush below covers it anyway.
-                let window = tokio::time::sleep(FLUSH_INTERVAL);
-                tokio::pin!(window);
-                loop {
-                    tokio::select! {
-                        () = &mut window => break,
-                        () = task_shared.wake.notified() => {
-                            if task_shared.is_shutdown() {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if task_shared.is_shutdown() {
-                    break;
-                }
-                task_shared.flush_or_log().await;
-            }
-            // The last handle is gone: drain the remainder and stop.
-            task_shared.flush_or_log().await;
-        });
-
-        Self {
-            _shutdown: Arc::new(ShutdownOnDrop(Arc::clone(&shared))),
-            shared,
-        }
-    }
-
-    /// Buffer `text` for the next flush.
-    pub async fn append(&self, text: String) {
-        debug!("{text}");
-        self.shared.buffer.lock().await.push(text);
-        self.shared.wake.notify_one();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// The log root is read from the environment on every call, so tests that
     /// set it must not run concurrently.
@@ -308,16 +155,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("AURCACHE_BUILD_LOG_PATH", dir.path()) };
         TempRoot { dir, _guard: guard }
-    }
-
-    async fn eventually(mut f: impl AsyncFnMut() -> bool) {
-        for _ in 0..100 {
-            if f().await {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("condition never became true");
     }
 
     #[tokio::test]
@@ -532,52 +369,5 @@ mod tests {
 
         assert!(read_build_output("a", 1, 0, None).await.unwrap().is_none());
         assert!(read_build_output("b", 1, 0, None).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn logger_flushes_buffered_output() {
-        let _root = temp_root();
-        let logger = BuildLogger::new("buffered", 1);
-        logger.append("hello\n".to_string()).await;
-        logger.append("world\n".to_string()).await;
-
-        eventually(async || {
-            read_build_output("buffered", 1, 0, None)
-                .await
-                .unwrap()
-                .is_some()
-        })
-        .await;
-        assert_eq!(
-            read_build_output("buffered", 1, 0, None)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(b"hello\nworld\n".as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_the_last_handle_drains_the_buffer() {
-        let _root = temp_root();
-        {
-            let logger = BuildLogger::new("drained", 1);
-            let clone = logger.clone();
-            clone.append("from the clone\n".to_string()).await;
-        }
-        eventually(async || {
-            read_build_output("drained", 1, 0, None)
-                .await
-                .unwrap()
-                .is_some()
-        })
-        .await;
-        assert_eq!(
-            read_build_output("drained", 1, 0, None)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(b"from the clone\n".as_slice())
-        );
     }
 }

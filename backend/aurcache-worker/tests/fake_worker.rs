@@ -22,14 +22,14 @@
 use std::io::Write;
 use std::time::Duration;
 
-use aurcache_common::build_state::BuildStates;
-use aurcache_common::settings::{ApplicationSettings, Setting};
-use aurcache_common::worker::{ClaimRequest, CompleteReport};
+use aurcache_common::build_state::BuildState;
+use aurcache_common::settings::Setting;
+use aurcache_common::worker::{BuildOutcome, ClaimRequest, CompleteReport, MirrorlistPreference};
 use aurcache_db::builds;
 use aurcache_db::files;
 use aurcache_db::helpers::worker_store;
 use aurcache_db::migration::Migrator;
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use aurcache_worker_core::client::{WorkerClient, fetch_and_pin_ca};
 use aurcache_worker_core::config::CoreConfig;
 use aurcache_worker_core::enroll::ensure_enrolled;
@@ -91,10 +91,10 @@ async fn seed_build(db: &DatabaseConnection, id: i32, platform: &str, start: i64
 }
 
 /// The build's status once it is no longer being published.
-async fn settled_status(db: &DatabaseConnection, id: i32) -> i32 {
+async fn settled_status(db: &DatabaseConnection, id: i32) -> BuildState {
     for _ in 0..100 {
         let status = build_status(db, id).await;
-        if status != BuildStates::PUBLISHING {
+        if status != BuildState::Publishing {
             return status;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -102,14 +102,13 @@ async fn settled_status(db: &DatabaseConnection, id: i32) -> i32 {
     panic!("build {id} is still publishing");
 }
 
-async fn build_status(db: &DatabaseConnection, id: i32) -> i32 {
+async fn build_status(db: &DatabaseConnection, id: i32) -> BuildState {
     builds::Entity::find_by_id(id)
         .one(db)
         .await
         .unwrap()
         .unwrap()
         .status
-        .unwrap()
 }
 
 #[tokio::test]
@@ -186,13 +185,9 @@ async fn fake_worker_protocol_roundtrip() {
             .await
             .unwrap()
             .expect("the enrolled worker should have a row");
-        let declared: Vec<aurcache_common::worker_config::SettingDecl> = serde_json::from_str(
-            stored
-                .settings_declaration
-                .as_deref()
-                .expect("registration should have carried a declaration"),
-        )
-        .expect("the stored declaration should read back");
+        let declared: Vec<aurcache_common::worker_config::SettingDecl> =
+            serde_json::from_str(&stored.settings_declaration)
+                .expect("the stored declaration should read back");
         assert!(
             declared.iter().any(|decl| decl.key == "concurrency"),
             "the protocol settings should be declared: {declared:?}"
@@ -319,10 +314,10 @@ async fn fake_worker_protocol_roundtrip() {
     }
 
     let claim_req = ClaimRequest {
-        native_arches: vec!["x86_64".to_string()],
-        emulated_arches: vec![],
         // Holds nothing, so the server sends any mirrorlist in full.
-        mirrorlist: Default::default(),
+        mirrorlist: MirrorlistPreference::Server {
+            checksums: Default::default(),
+        },
     };
 
     // --- Happy path: claim build 1 (oldest), upload a good artifact, complete.
@@ -341,9 +336,13 @@ async fn fake_worker_protocol_roundtrip() {
     // --- The artifact limit is the package's setting, and an artifact over it
     // is refused -- before a byte is read when the size is declared, and at the
     // limit when it is not -- with the server's reason, and nothing staged.
-    ApplicationSettings::patch(
+    settings::write(
         &db,
-        [(Setting::MaxArtifactSize, Some(1), Some("1K".to_string()))],
+        [settings::Change {
+            setting: Setting::MaxArtifactSize,
+            pkg_id: Some(1),
+            value: Some("1K".to_string()),
+        }],
     )
     .await
     .unwrap();
@@ -374,9 +373,16 @@ async fn fake_worker_protocol_roundtrip() {
             "a refused artifact left a partial file behind ({declared:?})"
         );
     }
-    ApplicationSettings::patch(&db, [(Setting::MaxArtifactSize, Some(1), None)])
-        .await
-        .unwrap();
+    settings::write(
+        &db,
+        [settings::Change {
+            setting: Setting::MaxArtifactSize,
+            pkg_id: Some(1),
+            value: None,
+        }],
+    )
+    .await
+    .unwrap();
 
     let (fname, bytes) = make_pkg("p1", "1.0-1");
     client
@@ -387,10 +393,9 @@ async fn fake_worker_protocol_roundtrip() {
         .complete(
             1,
             &CompleteReport {
-                success: true,
+                outcome: BuildOutcome::Succeeded,
                 exit_code: Some(0),
                 reason: None,
-                canceled: false,
                 peak_memory_bytes: Some(512 * 1024 * 1024),
                 disk_usage: None,
                 vcs_commits: Default::default(),
@@ -401,7 +406,7 @@ async fn fake_worker_protocol_roundtrip() {
         .expect("complete{success} should be accepted");
 
     // Accepted, then published in the background.
-    assert_eq!(settled_status(&db, 1).await, BuildStates::SUCCESSFUL_BUILD);
+    assert_eq!(settled_status(&db, 1).await, BuildState::Successful);
     let repo_db = repo_root.join("x86_64").join("repo.db.tar.gz");
     assert!(repo_db.exists(), "repo db should be written at {repo_db:?}");
     let file_rows = files::Entity::find()
@@ -421,10 +426,9 @@ async fn fake_worker_protocol_roundtrip() {
         .complete(
             1,
             &CompleteReport {
-                success: true,
+                outcome: BuildOutcome::Succeeded,
                 exit_code: Some(0),
                 reason: None,
-                canceled: false,
                 peak_memory_bytes: None,
                 disk_usage: None,
                 vcs_commits: Default::default(),
@@ -433,7 +437,7 @@ async fn fake_worker_protocol_roundtrip() {
         )
         .await
         .expect("a repeated completion is acknowledged");
-    assert_eq!(build_status(&db, 1).await, BuildStates::SUCCESSFUL_BUILD);
+    assert_eq!(build_status(&db, 1).await, BuildState::Successful);
 
     // --- Safety rail: a wrong-named artifact is never published.
     let job2 = client
@@ -452,10 +456,9 @@ async fn fake_worker_protocol_roundtrip() {
         .complete(
             2,
             &CompleteReport {
-                success: true,
+                outcome: BuildOutcome::Succeeded,
                 exit_code: Some(0),
                 reason: None,
-                canceled: false,
                 peak_memory_bytes: Some(512 * 1024 * 1024),
                 disk_usage: None,
                 vcs_commits: Default::default(),
@@ -466,7 +469,7 @@ async fn fake_worker_protocol_roundtrip() {
         .expect("the worker's part is done either way");
     // Refused at publishing, which is the server's: the build fails, and
     // nothing of it reaches the repository.
-    assert_eq!(settled_status(&db, 2).await, BuildStates::FAILED_BUILD);
+    assert_eq!(settled_status(&db, 2).await, BuildState::Failed);
     let evil_rows = files::Entity::find()
         .filter(files::Column::PackageId.eq(2))
         .all(&db)

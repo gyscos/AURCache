@@ -1,16 +1,13 @@
 use aurcache_activitylog::activity_utils::ActivityLog;
 use std::sync::Arc;
 
-use aurcache_db::action::Action;
 use aurcache_deps::AurClient;
 use sea_orm::DatabaseConnection;
-use tokio::sync::broadcast::Sender;
 
 use crate::repository::Repository;
 use crate::snapshot::SnapshotStore;
 
-/// What a package operation acts through: the database it writes, the build
-/// queue it enqueues onto, the source cache it resolves through, the AUR
+/// What a package operation acts through: the database it writes, the source cache it resolves through, the AUR
 /// client it resolves dependencies with, the repository it publishes to and
 /// the log it records to.
 ///
@@ -25,8 +22,6 @@ use crate::snapshot::SnapshotStore;
 #[derive(Clone)]
 pub struct Services {
     pub db: DatabaseConnection,
-    /// The build queue.
-    pub tx: Sender<Action>,
     /// Resolves and caches package sources.
     pub store: Arc<SnapshotStore>,
     /// Resolves dependency names against the official repositories and the AUR.
@@ -43,7 +38,6 @@ impl Services {
     #[must_use]
     pub fn new(
         db: DatabaseConnection,
-        tx: Sender<Action>,
         store: Arc<SnapshotStore>,
         client: Arc<AurClient>,
         repo: Arc<Repository>,
@@ -51,7 +45,6 @@ impl Services {
     ) -> Self {
         Self {
             db,
-            tx,
             store,
             client,
             repo,

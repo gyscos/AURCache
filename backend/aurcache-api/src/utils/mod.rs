@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub(crate) mod operation;
 pub mod pagination;
 
 /// Depth of the progress channels behind the bulk-add and restore jobs.

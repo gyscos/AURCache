@@ -6,10 +6,10 @@
 //! CLI fetch lives in its failure handler — so the read path needs pinning
 //! down here.
 
+use aurcache_common::build_state::BuildState;
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::action::Action;
 use aurcache_db::builds;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
@@ -19,7 +19,6 @@ use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use rocket::tokio::sync::broadcast;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -41,7 +40,6 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
     let rocket = rocket::build()
         .manage(db.clone())
         .manage(ActivityLog::discarding())
-        .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
         // one, but Rocket refuses to launch with an unmanaged type.
         .manage(Arc::new(SnapshotStore::with_checkout_root(
@@ -49,7 +47,6 @@ async fn test_client(log_root: &std::path::Path) -> (Client, DatabaseConnection)
         )))
         .manage(aurcache_utils::services::Services::new(
             db.clone(),
-            broadcast::channel::<Action>(16).0,
             Arc::new(SnapshotStore::with_checkout_root(
                 checkouts.path().to_path_buf(),
             )),
@@ -86,7 +83,7 @@ async fn seed(db: &DatabaseConnection) {
     Builds::insert(builds::ActiveModel {
         number: Set(1),
         pkg_id: Set(pkg_id),
-        status: Set(Some(2)),
+        status: Set(BuildState::Failed),
         platform: Set(Platform::X86_64),
         version: Set("1.0".to_string()),
         ..Default::default()
@@ -211,4 +208,32 @@ async fn the_output_aligns_after_a_mid_character_offset() {
     assert_eq!(aligned, expected);
     let text = String::from_utf8_lossy(&body[aligned.front_skip..]);
     assert_eq!(text, "-fno_char8_t’\n");
+}
+
+/// Cancelling answers for what happened: a queued build is ended, and one that
+/// had already finished is refused rather than reported as cancelled.
+#[rocket::async_test]
+async fn cancel_ends_a_queued_build_and_refuses_a_finished_one() {
+    use aurcache_common::build_state::{BuildState, EndReason};
+    use sea_orm::{ColumnTrait, QueryFilter};
+
+    let _guard = ENV_LOCK.lock().await;
+    let root = tempfile::tempdir().unwrap();
+    let (client, db) = test_client(root.path()).await;
+    seed(&db).await;
+
+    let url = "/api/package/hello/build/1/cancel";
+    let finished = client.post(url).dispatch().await.status();
+    assert_eq!(finished, Status::Conflict, "the seeded build has failed");
+
+    Builds::update_many()
+        .col_expr(builds::Column::Status, BuildState::Enqueued.into())
+        .filter(builds::Column::Number.eq(1))
+        .exec(&db)
+        .await
+        .unwrap();
+    assert_eq!(client.post(url).dispatch().await.status(), Status::Ok);
+    let build = Builds::find().one(&db).await.unwrap().unwrap();
+    assert_eq!(build.status, BuildState::Failed);
+    assert_eq!(build.end_reason, Some(EndReason::Canceled));
 }

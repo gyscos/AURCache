@@ -3,8 +3,6 @@ use crate::startup::{post_startup_tasks, pre_startup_tasks};
 use aurcache_activitylog::activity_utils as activitylog;
 use aurcache_activitylog::events::Event;
 use aurcache_api::init::{CaDirectory, ServerVersion, init_api, init_repo, init_worker_api};
-use aurcache_builder::init::init_build_queue;
-use aurcache_db::action::Action;
 use aurcache_db::init::init_db;
 use aurcache_deps::AurClient;
 use aurcache_scheduler::activity_retention::start_activity_retention;
@@ -20,7 +18,6 @@ use aurcache_utils::snapshot::SnapshotStore;
 use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing::warn;
 
 mod logger;
@@ -33,7 +30,6 @@ async fn main() {
     let version = aurcache_common::version::full_version(env!("CARGO_PKG_VERSION"));
     pre_startup_tasks(&version);
 
-    let (tx, _) = broadcast::channel::<Action>(32);
     let db = init_db().await.expect("failed to initialize database");
 
     if let Err(e) = post_startup_tasks(&db).await {
@@ -105,7 +101,6 @@ async fn main() {
     // own handle on the same instances.
     let services = Services::new(
         db.clone(),
-        tx.clone(),
         Arc::clone(&store),
         client,
         Arc::clone(&repo),
@@ -119,7 +114,16 @@ async fn main() {
     // clone in flight from a stranded one.
     startup::prune_source_checkouts(&db, &store).await;
 
-    let build_queue_handle = init_build_queue(db.clone(), tx.clone(), activity.clone());
+    // Anything that should be building and has no build -- a package added
+    // while the server was down, or whose build row was lost -- gets one.
+    if let Err(e) =
+        aurcache_utils::package::enqueue::enqueue_missing_buildable_packages(&db, &activity).await
+    {
+        activity.emit(Event::StartupEnqueueFailed {
+            error: format!("{e:#}"),
+        });
+    }
+
     let version_check_handle = start_update_version_checking(services.clone());
     let auto_update_handle = start_auto_update_job(services.clone());
 
@@ -155,9 +159,6 @@ async fn main() {
         }
         _ = auto_update_handle => {
             warn!("Auto update handle exited");
-        }
-        _ = build_queue_handle => {
-            warn!("Build queue handle exited");
         }
         _ = lease_reaper_handle => {
             warn!("Lease reaper handle exited");

@@ -613,7 +613,6 @@ dependencies = [
  "anyhow",
  "aurcache-activitylog",
  "aurcache-api",
- "aurcache-builder",
  "aurcache-ca",
  "aurcache-common",
  "aurcache-db",
@@ -653,14 +652,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "aurcache-activitylog",
- "aurcache-builder",
  "aurcache-ca",
  "aurcache-client",
  "aurcache-common",
  "aurcache-db",
  "aurcache-deps",
  "aurcache-utils",
- "bigdecimal",
  "hex",
  "itertools 0.15.0",
  "jiff",
@@ -677,26 +674,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
  "utoipa",
  "utoipa-redoc",
  "utoipa-scalar",
-]
-
-[[package]]
-name = "aurcache-builder"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "aurcache-activitylog",
- "aurcache-common",
- "aurcache-db",
- "aurcache-utils",
- "sea-orm",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -787,7 +771,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "utoipa",
  "wiremock",
 ]
 
@@ -827,7 +810,6 @@ dependencies = [
  "alpm-srcinfo",
  "anyhow",
  "aurcache-activitylog",
- "aurcache-builder",
  "aurcache-common",
  "aurcache-db",
  "aurcache-deps",

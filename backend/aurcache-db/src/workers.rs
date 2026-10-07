@@ -1,11 +1,10 @@
 //! `SeaORM` Entity for remote build workers.
 
+use crate::lists::WorkerList;
 use aurcache_common::api::worker::ApprovalStatus;
 use sea_orm::entity::prelude::*;
-use serde::Serialize;
-use utoipa::ToSchema;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "workers")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -24,10 +23,10 @@ pub struct Model {
     pub signed_cert: Option<String>,
     /// Epoch seconds when the signed certificate expires.
     pub not_after: Option<i64>,
-    /// Comma-separated architectures the worker builds natively.
-    pub native_arches: String,
-    /// Comma-separated architectures the worker can build via emulation.
-    pub emulated_arches: String,
+    /// Architectures the worker builds natively.
+    pub native_arches: WorkerList,
+    /// Architectures the worker can build via emulation.
+    pub emulated_arches: WorkerList,
     /// Epoch seconds of the last heartbeat/contact.
     pub last_seen: Option<i64>,
     /// Worker software version reported at enrollment/heartbeat.
@@ -36,10 +35,10 @@ pub struct Model {
     /// so a new executor needs no migration. `None` for a worker that enrolled
     /// before the column existed.
     pub kind: Option<String>,
-    /// Comma-separated exact pkgbase names this worker is specially provisioned
+    /// Exact pkgbase names this worker is specially provisioned
     /// for (credentials, licensed toolchain, scratch space). A package named by
     /// *any* approved worker may only be built by workers that name it.
-    pub package_affinity: String,
+    pub package_affinity: WorkerList,
     /// Scheduling preference; higher wins. A worker declines a job only while a
     /// *strictly* higher-priority worker could take it, so the default of 0
     /// means nothing is ever held back.
@@ -52,9 +51,8 @@ pub struct Model {
     /// registration.
     ///
     /// A string rather than a richer type for the same reason `source_data` is
-    /// one: the server stores and forwards it without interpreting it. `None`
-    /// from a worker version that does not declare its settings.
-    pub settings_declaration: Option<String>,
+    /// one: the server stores and forwards it without interpreting it.
+    pub settings_declaration: String,
     /// JSON of what those settings resolved to on the worker
     /// (`aurcache_common::worker_config::EffectiveConfig`), as last reported
     /// over the heartbeat. `None` until a worker has reported one.

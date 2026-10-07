@@ -2,6 +2,7 @@
 //! and fingerprint lookup used by the mTLS auth guard.
 
 use crate::helpers::time::now_secs;
+use crate::lists::WorkerList;
 use crate::prelude::{WorkerSettings, Workers};
 use crate::{worker_settings, workers};
 use aurcache_common::api::worker::ApprovalStatus;
@@ -21,23 +22,21 @@ use std::collections::BTreeMap;
 pub struct WorkerRegistration<'a> {
     pub name: &'a str,
     pub fingerprint: &'a str,
-    pub native_arches: &'a str,
-    pub emulated_arches: &'a str,
+    pub native_arches: &'a [String],
+    pub emulated_arches: &'a [String],
     pub version: &'a str,
-    /// Build strategy the worker runs (`chroot`, `docker`); empty from a worker
-    /// predating the field, which is stored as `None`.
+    /// Build strategy the worker runs (`chroot`, `docker`).
     pub kind: &'a str,
-    /// Comma-separated exact pkgbase names this worker is provisioned for.
-    pub package_affinity: &'a str,
+    /// Exact pkgbase names this worker is provisioned for.
+    pub package_affinity: &'a [String],
     /// Scheduling preference; higher wins.
     pub priority: i32,
     /// Maximum concurrent builds the worker will run.
     pub concurrency: i32,
     /// JSON array of the settings the worker declares it accepts, exactly as it
-    /// sent them. `None` from a worker version that declares none, which
-    /// replaces any declaration stored for it: a worker that stopped declaring
-    /// a setting no longer accepts it.
-    pub settings_declaration: Option<&'a str>,
+    /// sent them. Replaces the stored one: a worker that stopped declaring a
+    /// setting no longer accepts it.
+    pub settings_declaration: &'a str,
 }
 
 /// Register a worker on first contact, or refresh the existing row when a worker
@@ -52,10 +51,6 @@ pub async fn register_worker<C: ConnectionTrait>(
     reg: &WorkerRegistration<'_>,
 ) -> Result<workers::Model, DbErr> {
     let now = now_secs();
-    // Empty means the worker predates the field, which is "unknown" rather than
-    // any particular strategy -- so it is stored as NULL and shown as unknown,
-    // not guessed at.
-    let kind: Option<&str> = Some(reg.kind).filter(|k| !k.is_empty());
     // Insert-if-absent keyed on the unique cert_fingerprint. On conflict we keep
     // the existing row (status/approval preserved) and refresh what the worker
     // reported.
@@ -79,12 +74,12 @@ pub async fn register_worker<C: ConnectionTrait>(
             reg.name.into(),
             ApprovalStatus::Pending.into(),
             reg.fingerprint.into(),
-            reg.native_arches.into(),
-            reg.emulated_arches.into(),
+            WorkerList::new(reg.native_arches).to_string().into(),
+            WorkerList::new(reg.emulated_arches).to_string().into(),
             now.into(),
             reg.version.into(),
-            kind.into(),
-            reg.package_affinity.into(),
+            reg.kind.into(),
+            WorkerList::new(reg.package_affinity).to_string().into(),
             reg.priority.into(),
             reg.concurrency.into(),
             reg.settings_declaration.into(),
@@ -380,15 +375,18 @@ pub async fn upsert_worker_setting<C: ConnectionTrait>(
 /// still writes through immediately — the version is data, not liveness.
 const TOUCH_THROTTLE_SECS: i64 = 10;
 
-/// Update a worker's `last_seen` (and optionally its reported version).
+/// Update a worker's `last_seen` (and optionally its reported version), and
+/// `worker` with it.
+///
+/// Decided against `worker` as the caller read it rather than a fresh read:
+/// the auth guard has just loaded the row, and every worker request -- a
+/// heartbeat every few seconds, every log chunk -- would otherwise read it
+/// twice more.
 pub async fn touch_last_seen<C: ConnectionTrait>(
     db: &C,
-    id: i32,
+    worker: &mut workers::Model,
     version: Option<&str>,
 ) -> Result<(), DbErr> {
-    let Some(worker) = Workers::find_by_id(id).one(db).await? else {
-        return Ok(());
-    };
     let now = now_secs();
     let version_changed = version.is_some_and(|v| worker.version.as_deref() != Some(v));
     let fresh = worker
@@ -397,12 +395,15 @@ pub async fn touch_last_seen<C: ConnectionTrait>(
     if fresh && !version_changed {
         return Ok(());
     }
-    let mut active: workers::ActiveModel = worker.into();
-    active.last_seen = Set(Some(now));
+    let mut update = Workers::update_many()
+        .col_expr(workers::Column::LastSeen, Some(now).into())
+        .filter(workers::Column::Id.eq(worker.id));
     if let Some(v) = version {
-        active.version = Set(Some(v.to_string()));
+        update = update.col_expr(workers::Column::Version, Some(v).into());
+        worker.version = Some(v.to_string());
     }
-    active.update(db).await?;
+    update.exec(db).await?;
+    worker.last_seen = Some(now);
     Ok(())
 }
 
@@ -419,19 +420,24 @@ mod tests {
         db
     }
 
+    /// A list column's entries, for as long as the test runs.
+    fn names(entries: &[&str]) -> &'static [String] {
+        Box::leak(entries.iter().map(ToString::to_string).collect())
+    }
+
     /// A minimal registration; tests override the fields they care about.
     fn reg<'a>(name: &'a str, fingerprint: &'a str) -> WorkerRegistration<'a> {
         WorkerRegistration {
             name,
             fingerprint,
-            native_arches: "x86_64",
-            emulated_arches: "",
+            native_arches: names(&["x86_64"]),
+            emulated_arches: names(&[]),
             version: "0.1.0",
             kind: "chroot",
-            package_affinity: "",
+            package_affinity: names(&[]),
             priority: 0,
             concurrency: 1,
-            settings_declaration: None,
+            settings_declaration: "[]",
         }
     }
 
@@ -446,26 +452,26 @@ mod tests {
         let w = register_worker(
             &db,
             &WorkerRegistration {
-                settings_declaration: Some(first),
+                settings_declaration: first,
                 ..reg("w1", "fp-1")
             },
         )
         .await
         .unwrap();
-        assert_eq!(w.settings_declaration.as_deref(), Some(first));
+        assert_eq!(w.settings_declaration, first);
         assert!(w.effective_config.is_none());
 
         let second = r#"[{"key":"build_timeout"}]"#;
         let w = register_worker(
             &db,
             &WorkerRegistration {
-                settings_declaration: Some(second),
+                settings_declaration: second,
                 ..reg("w1", "fp-1")
             },
         )
         .await
         .unwrap();
-        assert_eq!(w.settings_declaration.as_deref(), Some(second));
+        assert_eq!(w.settings_declaration, second);
     }
 
     /// The effective configuration arrives on the heartbeat, so it is stored
@@ -476,7 +482,7 @@ mod tests {
         let w = register_worker(
             &db,
             &WorkerRegistration {
-                settings_declaration: Some("[]"),
+                settings_declaration: "[]",
                 ..reg("w1", "fp-1")
             },
         )
@@ -489,7 +495,7 @@ mod tests {
         let w = register_worker(
             &db,
             &WorkerRegistration {
-                settings_declaration: Some("[]"),
+                settings_declaration: "[]",
                 ..reg("w1", "fp-1")
             },
         )
@@ -519,24 +525,6 @@ mod tests {
         assert_eq!(w.kind.as_deref(), Some("docker"));
     }
 
-    /// A worker predating the field reports nothing, which is "unknown" rather
-    /// than any particular strategy -- stored as NULL so the page can say so
-    /// instead of guessing at the default.
-    #[tokio::test]
-    async fn an_unreported_kind_is_stored_as_unknown() {
-        let db = setup().await;
-        let w = register_worker(
-            &db,
-            &WorkerRegistration {
-                kind: "",
-                ..reg("w1", "fp-1")
-            },
-        )
-        .await
-        .unwrap();
-        assert!(w.kind.is_none());
-    }
-
     #[tokio::test]
     async fn register_is_idempotent_by_fingerprint() {
         let db = setup().await;
@@ -544,7 +532,7 @@ mod tests {
         let b = register_worker(
             &db,
             &WorkerRegistration {
-                emulated_arches: "aarch64",
+                emulated_arches: names(&["aarch64"]),
                 version: "0.2.0",
                 ..reg("w1", "fp-1")
             },
@@ -553,7 +541,7 @@ mod tests {
         .unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(b.status, ApprovalStatus::Pending);
-        assert_eq!(b.emulated_arches, "aarch64");
+        assert_eq!(b.emulated_arches.to_string(), "aarch64");
         assert_eq!(b.version.as_deref(), Some("0.2.0"));
         assert_eq!(list_workers(&db).await.unwrap().len(), 1);
     }
@@ -572,10 +560,10 @@ mod tests {
         let updated = register_worker(
             &db,
             &WorkerRegistration {
-                native_arches: "aarch64",
-                emulated_arches: "armv7h",
+                native_arches: names(&["aarch64"]),
+                emulated_arches: names(&["armv7h"]),
                 version: "9.9.9",
-                package_affinity: "unreal-engine",
+                package_affinity: names(&["unreal-engine"]),
                 priority: 10,
                 concurrency: 8,
                 ..reg("new-name", "fp-1")
@@ -586,9 +574,9 @@ mod tests {
 
         assert_eq!(updated.id, w.id);
         assert_eq!(updated.name, "new-name");
-        assert_eq!(updated.native_arches, "aarch64");
-        assert_eq!(updated.emulated_arches, "armv7h");
-        assert_eq!(updated.package_affinity, "unreal-engine");
+        assert_eq!(updated.native_arches.to_string(), "aarch64");
+        assert_eq!(updated.emulated_arches.to_string(), "armv7h");
+        assert_eq!(updated.package_affinity.to_string(), "unreal-engine");
         assert_eq!(updated.priority, 10);
         assert_eq!(updated.concurrency, 8);
         // Refreshing configuration must not disturb the approval decision.
@@ -656,7 +644,7 @@ mod tests {
     /// moment and can never report those builds complete.
     #[tokio::test]
     async fn revoke_abandons_builds_the_worker_still_holds() {
-        use aurcache_common::build_state::BuildStates;
+        use aurcache_common::build_state::BuildState;
 
         let db = setup().await;
         let w = register_worker(&db, &reg("w1", "fp-1")).await.unwrap();
@@ -672,7 +660,7 @@ mod tests {
         db.execute_unprepared(&format!(
             "INSERT INTO builds (id, pkg_id, number, status, platform, version, worker_id) \
              VALUES (1, 1, 1, {}, 'x86_64', '1.0', {})",
-            BuildStates::ACTIVE_BUILD,
+            BuildState::Active.as_i32(),
             w.id
         ))
         .await
@@ -690,15 +678,16 @@ mod tests {
             .await
             .unwrap()
             .expect("build exists");
-        let status: i32 = row.try_get("", "status").unwrap();
+        let status: BuildState = row.try_get("", "status").unwrap();
         let worker_id: Option<i32> = row.try_get("", "worker_id").unwrap();
-        let end_reason: Option<i32> = row.try_get("", "end_reason").unwrap();
-        assert_eq!(status, BuildStates::FAILED_BUILD);
+        let end_reason: Option<aurcache_common::build_state::EndReason> =
+            row.try_get("", "end_reason").unwrap();
+        assert_eq!(status, BuildState::Failed);
         // Kept: the record of who ran the attempt.
         assert_eq!(worker_id, Some(w.id));
         assert_eq!(
             end_reason,
-            Some(aurcache_common::build_state::EndReasons::WORKER_REVOKED)
+            Some(aurcache_common::build_state::EndReason::WorkerRevoked)
         );
 
         let fresh = db
@@ -709,9 +698,9 @@ mod tests {
             .await
             .unwrap()
             .expect("the retry exists");
-        let status: i32 = fresh.try_get("", "status").unwrap();
+        let status: BuildState = fresh.try_get("", "status").unwrap();
         let worker_id: Option<i32> = fresh.try_get("", "worker_id").unwrap();
-        assert_eq!(status, BuildStates::ENQUEUED_BUILD);
+        assert_eq!(status, BuildState::Enqueued);
         assert_eq!(worker_id, None);
     }
 
@@ -759,16 +748,18 @@ mod tests {
             .into();
         stale.last_seen = Set(Some(now_secs() - 30));
         stale.update(&db).await.unwrap();
-        touch_last_seen(&db, w.id, None).await.unwrap();
+        let mut row = Workers::find_by_id(w.id).one(&db).await.unwrap().unwrap();
+        touch_last_seen(&db, &mut row, None).await.unwrap();
         let touched = last_seen(&db, w.id).await.unwrap();
+        assert_eq!(row.last_seen, Some(touched), "the caller's row follows");
         assert!(now_secs() - touched < TOUCH_THROTTLE_SECS);
 
         // A fresh row is left alone.
-        touch_last_seen(&db, w.id, None).await.unwrap();
+        touch_last_seen(&db, &mut row, None).await.unwrap();
         assert_eq!(last_seen(&db, w.id).await, Some(touched));
 
         // A changed version writes through even when fresh.
-        touch_last_seen(&db, w.id, Some("9.9.9")).await.unwrap();
+        touch_last_seen(&db, &mut row, Some("9.9.9")).await.unwrap();
         let bumped = Workers::find_by_id(w.id).one(&db).await.unwrap().unwrap();
         assert_eq!(bumped.version.as_deref(), Some("9.9.9"));
     }

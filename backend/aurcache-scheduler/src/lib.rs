@@ -8,9 +8,9 @@ pub mod update_version_check;
 
 use aurcache_common::schedule::Schedule;
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, info};
 
-/// Sleep until the schedule's next run, logging how long that is.
+/// Sleep until the schedule's next run, or for `at_most` if that comes first.
 ///
 /// Schedules are read in the server's local timezone (`TZ`, else
 /// `/etc/localtime`), so `0 3 * * *` means 3 am where the server is, which
@@ -18,13 +18,25 @@ use tracing::info;
 /// that is.
 ///
 /// The next run is worked out from the clock each time rather than carried
-/// over, so a clock that jumped is followed rather than slept through.
-pub(crate) async fn sleep_until_next_fire(schedule: &Schedule, what: &str) -> Wake {
+/// over, so a clock that jumped is followed rather than slept through. A job
+/// whose schedule can change while it waits passes a bound, and reads the
+/// schedule again on [`Wake::Recheck`]: sleeping until the old one's next run
+/// would leave a weekly schedule edited to hourly waiting out the week.
+pub(crate) async fn sleep_until_next_fire(
+    schedule: &Schedule,
+    what: &str,
+    at_most: Duration,
+) -> Wake {
     let now = jiff::Zoned::now();
     let Some(next) = schedule.next_after(&now) else {
         return Wake::Exhausted;
     };
     let duration = Duration::try_from(now.duration_until(&next)).unwrap_or(Duration::ZERO);
+    if duration > at_most {
+        debug!("Next scheduled {what} at {next}; checking the schedule again first");
+        tokio::time::sleep(at_most).await;
+        return Wake::Recheck;
+    }
     info!(
         "Waiting for scheduled {what} until {next} ({} seconds)",
         duration.as_secs()
@@ -38,6 +50,8 @@ pub(crate) async fn sleep_until_next_fire(schedule: &Schedule, what: &str) -> Wa
 pub(crate) enum Wake {
     /// The schedule's next occurrence is now: run the job.
     Fired,
+    /// The bound passed first: read the schedule again.
+    Recheck,
     /// The schedule has no upcoming occurrence, so there was nothing to sleep
     /// until.
     Exhausted,

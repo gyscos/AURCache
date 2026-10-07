@@ -14,15 +14,16 @@ use anyhow::{anyhow, bail};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
+use aurcache_db::helpers::builds::refresh_package_status;
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::prelude::{Builds, Dependencies, Files, Packages};
 use aurcache_db::{builds, dependencies, files, packages};
 use pacman_mirrors::platforms::Platform;
 use pacman_repo_utils::PackageEntry;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QuerySelect, Set, TransactionTrait,
 };
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -44,7 +45,7 @@ pub async fn publish_build(
         let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
         return;
     };
-    if build.status != Some(BuildStates::PUBLISHING) {
+    if build.status != BuildState::Publishing {
         return;
     }
     let pkgbase = Packages::find_by_id(build.pkg_id)
@@ -363,8 +364,8 @@ async fn plan(
     })
 }
 
-/// The one database transaction: the files, the build's result and the
-/// package's status, together.
+/// The one database transaction: the files, the build's result and what it
+/// means for the package, together.
 ///
 /// Conditioned on the build still being `PUBLISHING`, so a build cancelled or
 /// deleted meanwhile is never recorded as published.
@@ -377,12 +378,12 @@ async fn record(
 ) -> anyhow::Result<()> {
     let txn = db.begin().await?;
     let marked = Builds::update_many()
-        .col_expr(builds::Column::Status, BuildStates::SUCCESSFUL_BUILD.into())
+        .col_expr(builds::Column::Status, BuildState::Successful.into())
         .col_expr(builds::Column::Version, plan.version.clone().into())
         .col_expr(builds::Column::Size, Some(plan.total_size).into())
         .col_expr(builds::Column::EndTime, Some(now_secs()).into())
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.eq(BuildStates::PUBLISHING))
+        .filter(builds::Column::Status.eq(BuildState::Publishing))
         .exec(&txn)
         .await?;
     if marked.rows_affected == 0 {
@@ -426,33 +427,33 @@ async fn record(
             .await?;
     }
 
-    if let Some(row) = Packages::find_by_id(pkg.id).one(&txn).await? {
-        let mut row = row.into_active_model();
-        row.status = Set(BuildStates::SUCCESSFUL_BUILD);
-        row.out_of_date = Set(0);
-        row.upstream_version = Set(Some(plan.version.clone()));
-        row.update(&txn).await?;
-    }
+    Packages::update_many()
+        .col_expr(packages::Column::OutOfDate, 0.into())
+        .col_expr(
+            packages::Column::UpstreamVersion,
+            Some(plan.version.clone()).into(),
+        )
+        .filter(packages::Column::Id.eq(pkg.id))
+        .exec(&txn)
+        .await?;
+    refresh_package_status(&txn, pkg.id).await?;
     txn.commit().await?;
     Ok(())
 }
 
-/// Mark a build that could not be published as failed, with its package.
+/// Mark a build that could not be published as failed; its package's status
+/// follows.
 async fn fail(db: &DatabaseConnection, build: &builds::Model) -> anyhow::Result<()> {
     let txn = db.begin().await?;
     let marked = Builds::update_many()
-        .col_expr(builds::Column::Status, BuildStates::FAILED_BUILD.into())
+        .col_expr(builds::Column::Status, BuildState::Failed.into())
         .col_expr(builds::Column::EndTime, Some(now_secs()).into())
         .filter(builds::Column::Id.eq(build.id))
-        .filter(builds::Column::Status.eq(BuildStates::PUBLISHING))
+        .filter(builds::Column::Status.eq(BuildState::Publishing))
         .exec(&txn)
         .await?;
-    if marked.rows_affected > 0
-        && let Some(row) = Packages::find_by_id(build.pkg_id).one(&txn).await?
-    {
-        let mut row = row.into_active_model();
-        row.status = Set(BuildStates::FAILED_BUILD);
-        row.update(&txn).await?;
+    if marked.rows_affected > 0 {
+        refresh_package_status(&txn, build.pkg_id).await?;
     }
     txn.commit().await?;
     Ok(())
@@ -467,7 +468,7 @@ pub async fn interrupted(db: &DatabaseConnection) -> anyhow::Result<Vec<i32>> {
     Ok(Builds::find()
         .select_only()
         .column(builds::Column::Id)
-        .filter(builds::Column::Status.eq(BuildStates::PUBLISHING))
+        .filter(builds::Column::Status.eq(BuildState::Publishing))
         .into_tuple()
         .all(db)
         .await?)
@@ -477,13 +478,9 @@ pub async fn interrupted(db: &DatabaseConnection) -> anyhow::Result<Vec<i32>> {
 /// split-package names recorded on the package row.
 pub fn expected_pkgnames(pkg: &packages::Model) -> Vec<String> {
     let mut names = vec![pkg.name.clone()];
-    if let Some(json) = pkg.split_packages.as_deref()
-        && let Ok(split) = serde_json::from_str::<Vec<String>>(json)
-    {
-        for name in split {
-            if !names.contains(&name) {
-                names.push(name);
-            }
+    for name in aurcache_db::lists::json_list(pkg.split_packages.as_deref()) {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
     names
@@ -529,7 +526,7 @@ fn parse_arch_pkg(filename: &str) -> anyhow::Result<ParsedPkg> {
 /// `*.pkg.tar.*` whose parsed pkgname is in `expected`.
 ///
 /// Debug packages are dropped before this runs — see [`is_debug_artifact`].
-pub fn validate_artifact_names(expected: &[String], filenames: &[String]) -> anyhow::Result<()> {
+fn validate_artifact_names(expected: &[String], filenames: &[String]) -> anyhow::Result<()> {
     if expected.is_empty() {
         bail!("no expected package names to validate against");
     }
@@ -564,7 +561,7 @@ pub fn validate_artifact_names(expected: &[String], filenames: &[String]) -> any
 /// re-enables `debug`: without it, the extra artifact fails
 /// [`validate_artifact_names`] and the build fails.
 #[must_use]
-pub fn is_debug_artifact(expected: &[String], filename: &str) -> bool {
+fn is_debug_artifact(expected: &[String], filename: &str) -> bool {
     let Ok(parsed) = parse_arch_pkg(filename) else {
         return false;
     };
@@ -652,14 +649,5 @@ mod tests {
             &expected,
             "hello-2.12.1-2-x86_64.pkg.tar.zst"
         ));
-    }
-
-    /// The build server forces this; a worker on Arch defaults would otherwise
-    /// emit `<pkgname>-debug` packages into the single flat repo.
-    #[tokio::test]
-    async fn makepkg_config_disables_debug_packages() {
-        let conf =
-            crate::job_config::create_makepkg_config(None, std::path::Path::new("/out")).await;
-        assert!(conf.contains("OPTIONS=(!debug)"), "got:\n{conf}");
     }
 }

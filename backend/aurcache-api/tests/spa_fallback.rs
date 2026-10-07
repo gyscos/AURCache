@@ -7,10 +7,10 @@
 
 #![cfg(feature = "static")]
 
+use aurcache_common::build_state::BuildState;
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::action::Action;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::SourceData;
@@ -18,7 +18,6 @@ use aurcache_db::prelude::Packages;
 use aurcache_utils::snapshot::SnapshotStore;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use rocket::tokio::sync::broadcast;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -34,7 +33,6 @@ async fn test_client() -> (Client, DatabaseConnection) {
     let rocket = rocket::build()
         .manage(db.clone())
         .manage(ActivityLog::discarding())
-        .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
         // one, but Rocket refuses to launch with an unmanaged type.
         .manage(Arc::new(SnapshotStore::with_checkout_root(
@@ -42,7 +40,6 @@ async fn test_client() -> (Client, DatabaseConnection) {
         )))
         .manage(aurcache_utils::services::Services::new(
             db.clone(),
-            broadcast::channel::<Action>(16).0,
             Arc::new(SnapshotStore::with_checkout_root(
                 checkouts.path().to_path_buf(),
             )),
@@ -70,10 +67,10 @@ async fn test_client() -> (Client, DatabaseConnection) {
 async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
     let model = packages::ActiveModel {
         name: Set(name.to_string()),
-        status: Set(0),
-        out_of_date: Set(0),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        status: Set(BuildState::Active),
+        out_of_date: Set(false),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),

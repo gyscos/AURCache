@@ -5,7 +5,7 @@
 //! constructors are the vocabulary for that report; how the build itself ran is
 //! the executor's business.
 
-use aurcache_common::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{BuildOutcome, CompleteReport, JobDescriptor};
 use std::process::ExitStatus;
 
 /// Map a build process exit status into a terminal report.
@@ -31,7 +31,7 @@ pub fn classify_exit(status: ExitStatus, canceled: bool) -> CompleteReport {
 #[must_use]
 pub fn success() -> CompleteReport {
     CompleteReport {
-        success: true,
+        outcome: BuildOutcome::Succeeded,
         exit_code: Some(0),
         ..CompleteReport::default()
     }
@@ -69,7 +69,7 @@ pub fn canceled() -> CompleteReport {
 /// The shared "build canceled" shape, with whatever exit code is available.
 fn canceled_report(exit_code: Option<i32>) -> CompleteReport {
     CompleteReport {
-        canceled: true,
+        outcome: BuildOutcome::Canceled,
         ..failure(exit_code, "build canceled".to_string())
     }
 }
@@ -83,7 +83,7 @@ pub fn timeout_failure(secs: u64) -> CompleteReport {
 /// A failed build with nothing measured about it.
 fn failure(exit_code: Option<i32>, reason: String) -> CompleteReport {
     CompleteReport {
-        success: false,
+        outcome: BuildOutcome::Failed,
         exit_code,
         reason: Some(reason),
         ..CompleteReport::default()
@@ -103,24 +103,22 @@ mod tests {
     #[test]
     fn classifies_success() {
         let r = classify_exit(fake_status(0), false);
-        assert!(r.success);
+        assert_eq!(r.outcome, BuildOutcome::Succeeded);
         assert_eq!(r.exit_code, Some(0));
     }
 
     #[test]
     fn classifies_oom_as_terminal_failure() {
         let r = classify_exit(fake_status(137), false);
-        assert!(!r.success);
+        assert_eq!(r.outcome, BuildOutcome::Failed);
         assert_eq!(r.exit_code, Some(137));
         assert!(r.reason.unwrap().contains("OOM"));
-        assert!(!r.canceled);
     }
 
     #[test]
     fn classifies_cancel() {
         let r = classify_exit(fake_status(1), true);
-        assert!(!r.success);
-        assert!(r.canceled);
+        assert_eq!(r.outcome, BuildOutcome::Canceled);
     }
 
     #[cfg(unix)]

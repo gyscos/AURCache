@@ -304,21 +304,18 @@ pub enum SourcesMoved {
     Unknown,
 }
 
-/// Whether any tracked VCS source has moved since the last successful build.
+/// Whether any tracked VCS source has moved since the last successful build,
+/// given where they are `now` (from [`resolve_vcs_commits`]).
 pub async fn vcs_sources_moved(
     db: &DatabaseConnection,
     package_id: i32,
-    sourceinfo: &SourceInfoV1,
+    now: &BTreeMap<String, String>,
 ) -> anyhow::Result<SourcesMoved> {
-    if extract_git_vcs_sources(sourceinfo).is_empty() {
+    if now.is_empty() {
         return Ok(SourcesMoved::Unknown);
     }
     let built = latest_successful_build_vcs_sources(db, package_id).await?;
     if built.is_empty() {
-        return Ok(SourcesMoved::Unknown);
-    }
-    let now = resolve_vcs_commits(sourceinfo).await;
-    if now.is_empty() {
         return Ok(SourcesMoved::Unknown);
     }
     // A source with nothing recorded for it is a source we cannot vouch for,

@@ -4,7 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_common::source::SourceData;
 use aurcache_db::helpers::operations;
 use aurcache_db::prelude::{Builds, Files, Packages};
@@ -287,7 +287,7 @@ async fn backfill_build_sizes(db: &DatabaseConnection) {
         let newest = Builds::find()
             .filter(builds::Column::PkgId.eq(pkg_id))
             .filter(builds::Column::Platform.eq(platform))
-            .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Successful))
             .filter(builds::Column::Size.is_null())
             .order_by_desc(builds::Column::Number)
             .one(db)

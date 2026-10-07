@@ -36,7 +36,7 @@ pub fn Builds(view: ViewParams, q: String) -> Element {
     // it fresh on a timer — quick while a build is active or queued, a minute
     // otherwise — and re-fetch at once when an add enqueues new builds.
     let building = matches!(&*builds.read_unchecked(), Some(Ok(list))
-        if list.iter().any(|b| BuildState::from_i32(b.status).is_some_and(BuildState::is_in_progress)));
+        if list.iter().any(|b| Some(b.status).is_some_and(BuildState::is_in_progress)));
     crate::poll::use_poll(builds, building);
     crate::poll::use_refetch_on_package_change(builds);
 

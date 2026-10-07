@@ -14,8 +14,7 @@
 use std::sync::Arc;
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_common::build_state::BuildStates;
-use aurcache_db::action::Action;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
 use aurcache_db::migration::Migrator;
@@ -26,7 +25,6 @@ use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use rocket::tokio::sync::broadcast;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{Database, DatabaseConnection, EntityTrait};
@@ -47,11 +45,11 @@ const NAMES: [&str; 6] = [
 /// Every caller seeds a single build per package, so build number 1 is right
 /// for all of them; `UNIQUE (pkg_id, number)` means it cannot be left to the
 /// column default.
-async fn insert_build(db: &DatabaseConnection, pkg_id: i32, status: i32, version: &str) {
+async fn insert_build(db: &DatabaseConnection, pkg_id: i32, status: BuildState, version: &str) {
     Builds::insert(builds::ActiveModel {
         number: Set(1),
         pkg_id: Set(pkg_id),
-        status: Set(Some(status)),
+        status: Set(status),
         platform: Set(Platform::X86_64),
         version: Set(version.to_string()),
         start_time: Set(Some(100)),
@@ -66,13 +64,13 @@ async fn insert_build(db: &DatabaseConnection, pkg_id: i32, status: i32, version
 async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
     let model = packages::ActiveModel {
         name: Set(name.to_string()),
-        status: Set(0),
-        out_of_date: Set(0),
+        status: Set(BuildState::Active),
+        out_of_date: Set(false),
         // `package::add` always records this, and `SimplePackage` types it as a
         // plain String — a row without it makes the list route fail to decode.
         upstream_version: Set(Some("1.0-1".to_string())),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),
@@ -98,7 +96,6 @@ async fn test_client() -> (Client, DatabaseConnection) {
     let rocket = rocket::build()
         .manage(db.clone())
         .manage(ActivityLog::discarding())
-        .manage(broadcast::channel::<Action>(16).0)
         // Routes that act on packages take the bundle; these tests never reach
         // one, but Rocket refuses to launch with an unmanaged type.
         .manage(Arc::new(SnapshotStore::with_checkout_root(
@@ -106,7 +103,6 @@ async fn test_client() -> (Client, DatabaseConnection) {
         )))
         .manage(aurcache_utils::services::Services::new(
             db.clone(),
-            broadcast::channel::<Action>(16).0,
             Arc::new(SnapshotStore::with_checkout_root(
                 checkouts.path().to_path_buf(),
             )),
@@ -316,7 +312,7 @@ async fn an_enqueued_builds_empty_version_is_not_a_version() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(1),
-        status: Set(Some(BuildStates::ENQUEUED_BUILD)),
+        status: Set(BuildState::Enqueued),
         platform: Set(Platform::X86_64),
         version: Set(String::new()),
         start_time: Set(Some(1)),
@@ -351,7 +347,7 @@ async fn a_completed_builds_version_is_reported() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(1),
-        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        status: Set(BuildState::Successful),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-1".to_string()),
         start_time: Set(Some(1)),
@@ -392,11 +388,11 @@ async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
 
     Packages::insert(packages::ActiveModel {
         name: Set("promoted-dep".to_string()),
-        status: Set(0),
-        out_of_date: Set(0),
+        status: Set(BuildState::Active),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "promoted-dep".to_string(),
         }),
@@ -436,7 +432,7 @@ async fn a_failed_build_does_not_become_the_reported_version() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(1),
-        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        status: Set(BuildState::Successful),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-1".to_string()),
         start_time: Set(Some(100)),
@@ -451,7 +447,7 @@ async fn a_failed_build_does_not_become_the_reported_version() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(2),
-        status: Set(Some(BuildStates::FAILED_BUILD)),
+        status: Set(BuildState::Failed),
         platform: Set(Platform::X86_64),
         version: Set("2.12.1-2".to_string()),
         start_time: Set(Some(300)),
@@ -490,7 +486,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(1),
-        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        status: Set(BuildState::Successful),
         platform: Set(Platform::X86_64),
         version: Set("1.0-1".to_string()),
         start_time: Set(Some(100)),
@@ -504,7 +500,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
     Builds::insert(builds::ActiveModel {
         pkg_id: Set(pkg_id),
         number: Set(2),
-        status: Set(Some(BuildStates::ACTIVE_BUILD)),
+        status: Set(BuildState::Active),
         platform: Set(Platform::X86_64),
         version: Set("2.0-1".to_string()),
         start_time: Set(Some(300)),
@@ -544,9 +540,9 @@ async fn dependencies_report_whether_they_are_satisfied() {
     let unbuilt = seed(&db, "unbuilt-dep").await;
 
     // Built at a version that meets the constraint.
-    insert_build(&db, ready, BuildStates::SUCCESSFUL_BUILD, "2.0-1").await;
+    insert_build(&db, ready, BuildState::Successful, "2.0-1").await;
     // Built, but too old for what `app` requires.
-    insert_build(&db, stale, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
+    insert_build(&db, stale, BuildState::Successful, "1.0-1").await;
     // `unbuilt` has no build at all.
 
     for (dependee, constraint) in [(ready, ">=2.0"), (stale, ">=2.0"), (unbuilt, ">=2.0")] {
@@ -605,7 +601,7 @@ async fn an_unconstrained_dependency_only_needs_to_have_built() {
     let (client, db) = test_client().await;
     let app = seed(&db, "app").await;
     let dep = seed(&db, "any-version").await;
-    insert_build(&db, dep, BuildStates::SUCCESSFUL_BUILD, "0.0.1-1").await;
+    insert_build(&db, dep, BuildState::Successful, "0.0.1-1").await;
 
     Dependencies::insert(dependencies::ActiveModel {
         dependent_id: Set(app),
@@ -706,14 +702,15 @@ async fn insert_worker_build(
     db: &DatabaseConnection,
     pkg_id: i32,
     number: i32,
-    status: i32,
+    status: BuildState,
     worker: Option<i32>,
 ) {
     use sea_orm::ConnectionTrait;
     let worker = worker.map_or_else(|| "NULL".to_string(), |w| w.to_string());
     db.execute_unprepared(&format!(
         "INSERT INTO builds (pkg_id, number, status, start_time, platform, version, worker_id) \
-         VALUES ({pkg_id}, {number}, {status}, {number}, 'x86_64', '1.0-1', {worker})"
+         VALUES ({pkg_id}, {number}, {}, {number}, 'x86_64', '1.0-1', {worker})",
+        status.as_i32()
     ))
     .await
     .expect("insert build");
@@ -723,8 +720,8 @@ async fn insert_worker(db: &DatabaseConnection, id: i32) {
     use sea_orm::ConnectionTrait;
     db.execute_unprepared(&format!(
         "INSERT INTO workers (id, name, status, cert_fingerprint, native_arches, \
-         emulated_arches, package_affinity, priority, concurrency) \
-         VALUES ({id}, 'w{id}', 'approved', 'fp{id}', 'x86_64', '', '', 0, 1)"
+         emulated_arches, package_affinity, priority, concurrency, settings_declaration) \
+         VALUES ({id}, 'w{id}', 'approved', 'fp{id}', 'x86_64', '', '', 0, 1, '[]')"
     ))
     .await
     .expect("insert worker");
@@ -770,10 +767,10 @@ async fn builds_filter_by_worker_and_state() {
     let queued = seed(&db, "queued").await;
     insert_worker(&db, 1).await;
     insert_worker(&db, 2).await;
-    insert_worker_build(&db, hello, 1, BuildStates::SUCCESSFUL_BUILD, Some(1)).await;
-    insert_worker_build(&db, hello, 2, BuildStates::ACTIVE_BUILD, Some(1)).await;
-    insert_worker_build(&db, world, 1, BuildStates::PUBLISHING, Some(2)).await;
-    insert_worker_build(&db, queued, 1, BuildStates::ENQUEUED_BUILD, None).await;
+    insert_worker_build(&db, hello, 1, BuildState::Successful, Some(1)).await;
+    insert_worker_build(&db, hello, 2, BuildState::Active, Some(1)).await;
+    insert_worker_build(&db, world, 1, BuildState::Publishing, Some(2)).await;
+    insert_worker_build(&db, queued, 1, BuildState::Enqueued, None).await;
 
     let h = |n| listed_build("hello", n);
     let w = |n| listed_build("world", n);
@@ -818,8 +815,8 @@ async fn a_builds_disk_usage_is_listed_with_it() {
     let (client, db) = test_client().await;
     let hello = seed(&db, "hello").await;
     let world = seed(&db, "world").await;
-    insert_build(&db, hello, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
-    insert_build(&db, world, BuildStates::SUCCESSFUL_BUILD, "1.0-1").await;
+    insert_build(&db, hello, BuildState::Successful, "1.0-1").await;
+    insert_build(&db, world, BuildState::Successful, "1.0-1").await;
     db.execute_unprepared(&format!(
         "UPDATE builds SET disk_chroot = 700, disk_workdir = 50, disk_sources = 9 \
          WHERE pkg_id = {hello}"

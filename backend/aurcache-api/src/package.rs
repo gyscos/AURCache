@@ -8,24 +8,24 @@ use crate::models::package::{
     AddPackages, AurNotFoundPackage, AurPackage, BulkAddAccepted, BulkAddEntry, BulkAddOutcome,
     BulkAddProgress, ExtendedPackage, PackageDependency, PackageFile, PackageSource, SimplePackage,
 };
-use crate::models::package::{
-    CandidateSource, DependencyCandidate, DependencyOptions, ReplaceDependency, ReplacementVerdict,
-};
+use crate::models::package::{DependencyOptions, ReplaceDependency};
 use crate::utils::error::{ApiError, err};
+use crate::utils::operation::{self, Counts, Recorder};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
-use aurcache_common::build_state::{BuildStates, BuildTrigger};
+use aurcache_common::build_state::{BuildState, BuildTrigger};
 use aurcache_db::helpers::builds::{
     latest_successful_version_any_platform, latest_successful_version_expr,
 };
 use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::helpers::operations;
-use aurcache_db::lists::ListColumn;
+use aurcache_db::lists::{BuildFlags, Platforms};
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Files, Packages};
 use aurcache_db::{dependencies, files, packages};
-use aurcache_utils::package::add::{normalize_build_flags, package_add};
-use aurcache_utils::package::live_check::{live_check, package_remove};
+use aurcache_utils::package::add::package_add;
+use aurcache_utils::package::live_check::package_remove;
+use aurcache_utils::package::replace::{self, ReplaceError};
 use aurcache_utils::package::update::{package_resync_dependencies, package_update, queued};
 use aurcache_utils::patch::SourcePatch;
 use aurcache_utils::pkg::satisfies_constraint;
@@ -35,16 +35,13 @@ use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::response::status;
 use sea_orm::FromQueryResult;
-use tokio::sync::mpsc;
-use tracing::warn;
 
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post, put};
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, JoinType, Order, Select};
 use sea_orm::{
-    ColumnTrait, EntityTrait, ModelTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
-    RelationTrait,
+    ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -110,6 +107,38 @@ fn parse_platforms(platforms: Option<Vec<String>>) -> Result<Option<Vec<Platform
         .transpose()
 }
 
+/// Counts a bulk add's entries, and logs each package it added.
+struct BulkAddRecorder {
+    activity: ActivityLog,
+    username: Option<String>,
+    counts: Counts,
+}
+
+impl Recorder<BulkAddEntry> for BulkAddRecorder {
+    fn record(&mut self, entry: &BulkAddEntry) -> Counts {
+        match &entry.outcome {
+            BulkAddOutcome::Failed { .. } => self.counts.failed += 1,
+            BulkAddOutcome::Added => {
+                self.counts.completed += 1;
+                // The pkgbase it landed under, which is what the link opens;
+                // the name as typed where there is none.
+                self.activity.emit_by(
+                    Event::PackageAdded {
+                        pkg: entry
+                            .pkgbase
+                            .clone()
+                            .unwrap_or_else(|| entry.name.clone())
+                            .into(),
+                    },
+                    self.username.clone(),
+                );
+            }
+            BulkAddOutcome::Existed => self.counts.completed += 1,
+        }
+        self.counts
+    }
+}
+
 #[utoipa::path(
     responses(
             (status = 202, description = "Bulk add started", body = BulkAddAccepted),
@@ -142,77 +171,28 @@ pub async fn packages_add_endpoint(
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
 
-    // Everything the task needs is cloned in: it outlives this request by
-    // design, so it cannot borrow from it.
     let services_task = services.inner().clone();
-    let db_task = services_task.db.clone();
-    let al_task = al.inner().clone();
-    let username = a.username.clone();
-
-    tokio::spawn(async move {
-        let (progress_tx, mut progress_rx) = mpsc::channel(crate::utils::PROGRESS_CHANNEL_CAPACITY);
-        let worker = {
-            tokio::spawn(async move {
-                aurcache_utils::package::bulk_add::bulk_add(
-                    &services_task,
-                    platforms,
-                    build_flags,
-                    input.sources,
-                    progress_tx,
-                )
-                .await;
-            })
-        };
-
-        // Each outcome is written as it arrives rather than batched to the end.
-        // A restore runs for minutes; a job that reports nothing until it
-        // finishes reports nothing at all for the whole time anyone would want
-        // to watch it. The writes are trivial next to the checkout each entry
-        // represents.
-        let mut completed = 0_i32;
-        let mut failed = 0_i32;
-        while let Some(entry) = progress_rx.recv().await {
-            match &entry.outcome {
-                BulkAddOutcome::Failed { .. } => failed += 1,
-                _ => completed += 1,
-            }
-            if matches!(entry.outcome, BulkAddOutcome::Added) {
-                // The pkgbase it landed under, which is what the link opens;
-                // the name as typed where there is none.
-                al_task.emit_by(
-                    Event::PackageAdded {
-                        pkg: entry
-                            .pkgbase
-                            .clone()
-                            .unwrap_or_else(|| entry.name.clone())
-                            .into(),
-                    },
-                    username.clone(),
-                );
-            }
-            if let Err(e) =
-                operations::append(&db_task, job_id, completed, failed, &[entry], false).await
-            {
-                warn!("could not record bulk add {job_id} progress: {e}");
-            }
-        }
-
-        // The channel closed, so the run is over one way or another -- including
-        // if it panicked, which is exactly when a job must not be left claiming
-        // to be running.
-        if let Err(e) = worker.await {
-            al_task.emit(Event::OperationAborted {
-                operation: "bulk_add".to_string(),
-                error: e.to_string(),
-            });
-        }
-        if let Err(e) =
-            operations::append::<_, BulkAddEntry>(&db_task, job_id, completed, failed, &[], true)
-                .await
-        {
-            warn!("could not close bulk add {job_id}: {e}");
-        }
-    });
+    operation::spawn(
+        services.db.clone(),
+        al.inner().clone(),
+        job_id,
+        operations::KIND_BULK_ADD,
+        move |progress| async move {
+            aurcache_utils::package::bulk_add::bulk_add(
+                &services_task,
+                platforms,
+                build_flags,
+                input.sources,
+                progress,
+            )
+            .await;
+        },
+        BulkAddRecorder {
+            activity: al.inner().clone(),
+            username: a.username,
+            counts: Counts::default(),
+        },
+    );
 
     Ok(status::Accepted(Json(BulkAddAccepted {
         job_id,
@@ -345,10 +325,6 @@ pub async fn package_update_entity_endpoint(
     let patch_changed = input.patch.is_some();
     // What the request touched, for the log, named as a reader would.
     let fields: Vec<String> = [
-        (input.name.is_some(), "name"),
-        (input.status.is_some(), "status"),
-        (input.out_of_date.is_some(), "out-of-date flag"),
-        (input.latest_build.is_some(), "latest build"),
         (input.build_flags.is_some(), "build flags"),
         (input.platforms.is_some(), "platforms"),
         (patch_changed, "source patch"),
@@ -363,26 +339,26 @@ pub async fn package_update_entity_endpoint(
     // `depends_aarch64` separately — and the graph is the union across the
     // platforms a package is built for. Changing that set therefore changes
     // which dependencies are required, so it needs the same resync a patch
-    // gets. Compared canonically against the stored value so a no-op write
-    // (including the same set in a different order) does not trigger a
-    // needless source checkout. Validated like the add endpoints: storing an
+    // gets. Compared as sets, so a no-op write (including the same set in a
+    // different order) does not trigger a needless source checkout. Validated like the add endpoints: storing an
     // unknown name would fail every later build that reads the set.
-    let requested_platforms = parse_platforms(input.platforms.clone())?;
-    let platforms_changed = requested_platforms.as_ref().is_some_and(|requested| {
-        Platform::join_canonical(requested) != Platform::canonicalize_joined(&pkg.platforms)
-    });
+    let requested_platforms = parse_platforms(input.platforms.clone())?.map(Platforms::new);
+    // Stored as a `SourcePatch`; a value that is not one would fail every
+    // later read of the package's source.
+    if let Some(Some(patch)) = &input.patch {
+        SourcePatch::parse(patch).map_err(|e| err(Status::BadRequest, e))?;
+    }
+    let platforms_changed = requested_platforms
+        .as_ref()
+        .is_some_and(|requested| *requested != pkg.platforms);
 
     // Start building the update operation
     let update_pkg = packages::ActiveModel {
         id: Set(pkg.id),
-        name: input.name.map_or(NotSet, Set),
-        status: input.status.map_or(NotSet, Set),
-        out_of_date: input.out_of_date.map_or(NotSet, Set),
-        latest_build: input.latest_build.map_or(NotSet, Set),
-        build_flags: input.build_flags.map_or(NotSet, |v| {
-            Set(ListColumn::Package.join(&normalize_build_flags(v)))
-        }),
-        platforms: requested_platforms.map_or(NotSet, |v| Set(Platform::join_canonical(&v))),
+        build_flags: input
+            .build_flags
+            .map_or(NotSet, |flags| Set(BuildFlags::new(flags))),
+        platforms: requested_platforms.map_or(NotSet, Set),
         patch: input.patch.map_or(NotSet, Set),
         // Everything else is `NotSet`, left untouched, so a column added
         // later cannot be cleared by a patch that never mentions it. The
@@ -641,7 +617,7 @@ pub async fn package_update_endpoint(
     // is an update, and with it a rebuild of a build that worked or a retry of
     // one that failed.
     let cause = if forced {
-        QueueCause::after(pkg_model.status == BuildStates::FAILED_BUILD)
+        QueueCause::after(pkg_model.status == BuildState::Failed)
     } else {
         QueueCause::Update
     };
@@ -843,7 +819,7 @@ struct DependencyRow {
     id: i32,
     name: String,
     version_constraint: String,
-    status: i32,
+    status: BuildState,
     built_version: Option<String>,
 }
 
@@ -910,8 +886,8 @@ pub async fn get_package(
         outofdate: pkg.out_of_date,
         latest_version,
         package_source,
-        selected_platforms: ListColumn::Package.split(&pkg.platforms),
-        selected_build_flags: Some(ListColumn::Package.split(&pkg.build_flags)),
+        selected_platforms: pkg.platforms.names(),
+        selected_build_flags: Some(pkg.build_flags.as_slice().to_vec()),
         // How current this is depends on the version-check interval; `None`
         // means no check has run yet.
         upstream_version: pkg.upstream_version,
@@ -995,6 +971,7 @@ fn aur_source(pkg: &packages::Model) -> AurPackage {
 #[cfg(test)]
 mod tests {
     use super::{RelationDirection, list_package_relations, list_packages};
+    use aurcache_common::build_state::BuildState;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
     use aurcache_db::{dependencies, packages};
@@ -1008,12 +985,11 @@ mod tests {
 
         packages::ActiveModel {
             name: Set("visible-package".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "visible-package".into(),
             }),
@@ -1027,12 +1003,11 @@ mod tests {
 
         packages::ActiveModel {
             name: Set("hidden-dependency".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "hidden-dependency".into(),
             }),
@@ -1069,12 +1044,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1090,12 +1064,11 @@ mod tests {
 
         let child = packages::ActiveModel {
             name: Set("child".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("2.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1136,12 +1109,11 @@ mod tests {
 
         let dependency = packages::ActiveModel {
             name: Set("dependency".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "dependency".into(),
             }),
@@ -1157,12 +1129,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("2.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1200,6 +1171,7 @@ mod tests {
 #[cfg(test)]
 mod file_tests {
     use super::package_files;
+    use aurcache_common::build_state::BuildState;
     use aurcache_db::files;
     use aurcache_db::migration::Migrator;
     use pacman_mirrors::platforms::Platform;
@@ -1296,12 +1268,11 @@ mod file_tests {
         for name in ["complete", "partial", "unbuilt"] {
             let row = packages::ActiveModel {
                 name: Set(name.to_string()),
-                status: Set(1),
-                out_of_date: Set(0),
+                status: Set(BuildState::Successful),
+                out_of_date: Set(false),
                 upstream_version: Set(Some("1.0.0".to_string())),
-                latest_build: Set(None),
-                build_flags: Set(String::new()),
-                platforms: Set("x86_64".to_string()),
+                build_flags: Set(Default::default()),
+                platforms: Set("x86_64".parse().unwrap()),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 directly_requested: Set(true),
                 split_packages: Set(None),
@@ -1353,151 +1324,15 @@ mod file_tests {
     }
 }
 
-/// Every name a package answers to: its own, its split packages, and its
-/// `provides` with any `=version` dropped.
-///
-/// This is what a replacement is measured against. A dependent's edge records
-/// the constraint but not which of these names it declared, so covering all of
-/// them is the only way to know a replacement covers a given dependent.
-///
-/// Fields, not the row: the options dialog matches over a narrowed fetch
-/// ([`NamesRow`]) that never loads the rest of the columns -- source blobs,
-/// patches.
-fn provided_names(name: &str, split_packages: Option<&str>, provides: Option<&str>) -> Vec<String> {
-    let mut names = vec![name.to_string()];
-    names.extend(json_string_list(split_packages));
-    names.extend(
-        json_string_list(provides)
-            .into_iter()
-            .map(|entry| match entry.split_once('=') {
-                Some((name, _version)) => name.to_string(),
-                None => entry,
-            }),
-    );
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
-/// The columns [`provided_names`] reads, for matching over every package
-/// without loading whole rows.
-#[derive(FromQueryResult)]
-struct NamesRow {
-    id: i32,
-    name: String,
-    split_packages: Option<String>,
-    provides: Option<String>,
-}
-
-impl NamesRow {
-    fn names(&self) -> Vec<String> {
-        provided_names(
-            &self.name,
-            self.split_packages.as_deref(),
-            self.provides.as_deref(),
-        )
-    }
-}
-
-fn json_string_list(raw: Option<&str>) -> Vec<String> {
-    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
-        .unwrap_or_default()
-}
-
-async fn official_holds(services: &Services, name: &str) -> Result<bool, ApiError> {
-    services
-        .client
-        .official
-        .holds(name)
-        .await
-        .map_err(|e| err(Status::BadGateway, e))
-}
-
-/// One dependency edge and the packages on its ends.
-struct DependencyEdge {
-    dependent: packages::Model,
-    /// The package currently satisfying the dependency.
-    current: packages::Model,
-    edge: dependencies::Model,
-}
-
-/// Resolve one dependency edge by the two package names on its ends.
-async fn dependency_edge(
-    db: &DatabaseConnection,
-    dependent: &str,
-    dependency: &str,
-) -> Result<DependencyEdge, ApiError> {
-    // The two endpoints are independent point lookups; the edge query below is
-    // what genuinely depends on both.
-    let (dependent, current) = tokio::join!(
-        package_by_pkgbase(db, dependent),
-        package_by_pkgbase(db, dependency),
-    );
-    let (dependent, current) = (dependent?, current?);
-    let edge = Dependencies::find()
-        .filter(dependencies::Column::DependentId.eq(dependent.id))
-        .filter(dependencies::Column::DependeeId.eq(current.id))
-        .one(db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| {
-            err(
-                Status::NotFound,
-                format!("{} does not depend on {}", dependent.name, current.name),
-            )
-        })?;
-    Ok(DependencyEdge {
-        dependent,
-        current,
-        edge,
-    })
-}
-
-/// The names `dependent` declares that `current` answers to.
-///
-/// The edge records the constraint but not the name behind it, so this reads
-/// the dependent's source to recover it -- one source, already cached, for the
-/// package whose page is asking. Empty means nothing the dependent declares
-/// matches any more, which is a stale edge: droppable, but with nothing to
-/// search for a replacement by.
-async fn declared_names_for_edge(
-    services: &Services,
-    dependent: &packages::Model,
-    current: &packages::Model,
-) -> Result<Vec<String>, ApiError> {
-    let sourceinfo = services
-        .store
-        .sourceinfo(&dependent.source_data, dependent.patch.as_deref())
-        .await
-        .map_err(|e| err(Status::BadGateway, e))?;
-    let deps = aurcache_deps::deps_from_srcinfo(
-        &sourceinfo,
-        &aurcache_utils::pkg::architectures_for_platforms(&dependent.platforms),
-    );
-    let declared = aurcache_utils::pkg::DependencySet::of(&deps)
-        .map_err(|e| err(Status::InternalServerError, e))?;
-
-    let answers = provided_names(
-        &current.name,
-        current.split_packages.as_deref(),
-        current.provides.as_deref(),
-    );
-    Ok(declared
-        .names
-        .into_iter()
-        .filter(|name| answers.contains(name))
-        .collect())
-}
-
-fn candidate_verdict(version: Option<&str>, constraint: &str) -> ReplacementVerdict {
-    if constraint.is_empty() {
-        return ReplacementVerdict::Satisfied;
-    }
-    match version {
-        Some(version) if satisfies_constraint(version, constraint) => ReplacementVerdict::Satisfied,
-        Some(_) => ReplacementVerdict::Unsatisfied,
-        None => ReplacementVerdict::Unknown,
-    }
+/// The status a [`ReplaceError`] answers with.
+fn replace_error(e: ReplaceError) -> ApiError {
+    let status = match &e {
+        ReplaceError::NotFound(_) => Status::NotFound,
+        ReplaceError::Refused(_) => Status::BadRequest,
+        ReplaceError::Unreachable(_) => Status::BadGateway,
+        ReplaceError::Internal(_) => Status::InternalServerError,
+    };
+    err(status, e)
 }
 
 #[utoipa::path(
@@ -1516,113 +1351,10 @@ pub async fn package_dependency_options(
     dependency: &str,
     _a: Authenticated,
 ) -> Result<Json<DependencyOptions>, ApiError> {
-    let DependencyEdge {
-        dependent,
-        current,
-        edge,
-    } = dependency_edge(&services.db, pkgbase, dependency).await?;
-    let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
-
-    let mut official = Vec::new();
-    for name in &declared_names {
-        if official_holds(services, name).await? {
-            official.push(name.clone());
-        }
-    }
-
-    // Tracked first: they are already here, so choosing one builds nothing new.
-    // A package carrying a declared name outright leads one that merely
-    // provides it, on the same rule resolution ranks by.
-    //
-    // Four narrowed columns, not whole rows: matching needs the id, the
-    // name, and the two JSON name lists, and the rest (source blobs,
-    // patches) would only ride along.
-    let mut candidates = Vec::new();
-    let tracked: Vec<NamesRow> = Packages::find()
-        .select_only()
-        .column(packages::Column::Id)
-        .column(packages::Column::Name)
-        .column(packages::Column::SplitPackages)
-        .column(packages::Column::Provides)
-        .into_model()
-        .all(&services.db)
+    replace::options(services, pkgbase, dependency)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
-    let mut tracked_matches: Vec<&NamesRow> = tracked
-        .iter()
-        .filter(|package| package.id != current.id && package.id != dependent.id)
-        .filter(|package| {
-            package
-                .names()
-                .iter()
-                .any(|name| declared_names.contains(name))
-        })
-        .collect();
-    tracked_matches.sort_by_key(|package| {
-        (
-            !declared_names.contains(&package.name),
-            package.name.as_str(),
-        )
-    });
-    for package in tracked_matches {
-        // One indexed point lookup per match, not a batched scan: matches
-        // are a handful of rows, and "latest" means newest end time, which
-        // no GROUP BY over ids reproduces.
-        let version = latest_successful_version_any_platform(&services.db, package.id)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-        candidates.push(DependencyCandidate {
-            pkgbase: package.name.clone(),
-            source: CandidateSource::Tracked,
-            verdict: candidate_verdict(version.as_deref(), &edge.version_constraint),
-            version,
-        });
-    }
-
-    // Then the AUR, in the order resolution itself would rank them, minus
-    // everything already offered above.
-    let tracked_names: std::collections::HashSet<&str> = tracked
-        .iter()
-        .map(|package| package.name.as_str())
-        .collect();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut aur_error = None;
-    for name in &declared_names {
-        let providers = match services.client.aur_providers(name).await {
-            Ok(providers) => providers,
-            // Best-effort: an unreachable AUR must not take the tracked
-            // candidates down with it, and the caller is told which half of
-            // the answer is missing rather than left to read an empty list as
-            // "nothing exists".
-            Err(e) => {
-                aur_error = Some(e.to_string());
-                break;
-            }
-        };
-        for package in providers {
-            if tracked_names.contains(package.package_base.as_str())
-                || !seen.insert(package.package_base.clone())
-            {
-                continue;
-            }
-            candidates.push(DependencyCandidate {
-                pkgbase: package.package_base,
-                source: CandidateSource::Aur,
-                verdict: candidate_verdict(Some(&package.version), &edge.version_constraint),
-                version: Some(package.version),
-            });
-        }
-    }
-
-    Ok(Json(DependencyOptions {
-        dependent: dependent.name,
-        current: current.name,
-        version_constraint: edge.version_constraint,
-        declared_names,
-        official,
-        candidates,
-        aur_error,
-    }))
+        .map(Json)
+        .map_err(replace_error)
 }
 
 #[utoipa::path(
@@ -1642,430 +1374,13 @@ pub async fn package_dependency_replace(
     input: Json<ReplaceDependency>,
     a: Authenticated,
 ) -> Result<(), ApiError> {
-    let DependencyEdge {
-        dependent,
-        current,
-        edge,
-    } = dependency_edge(&services.db, pkgbase, dependency).await?;
-    let declared_names = declared_names_for_edge(services, &dependent, &current).await?;
-
-    match input.into_inner().replacement {
-        None => {
-            // Dropping is only honest when nothing has to be built for the
-            // name any more. Otherwise the edge would come straight back the
-            // next time the dependent is resolved, and the button would look
-            // like it had failed.
-            for name in &declared_names {
-                if !official_holds(services, name).await? {
-                    return Err(err(
-                        Status::BadRequest,
-                        format!(
-                            "'{name}' is not published by the official repositories, so this dependency cannot be dropped"
-                        ),
-                    ));
-                }
-            }
-            edge.delete(&services.db)
-                .await
-                .map_err(|e| err(Status::InternalServerError, e))?;
-            services.activity.emit_by(
-                Event::DepsDropped {
-                    dependent: dependent.name.as_str().into(),
-                    dependency: current.name.as_str().into(),
-                },
-                a.username.clone(),
-            );
-        }
-        Some(replacement) => {
-            if replacement == current.name {
-                return Err(err(
-                    Status::BadRequest,
-                    format!("{} already depends on {replacement}", dependent.name),
-                ));
-            }
-            if replacement == dependent.name {
-                return Err(err(
-                    Status::BadRequest,
-                    "a package cannot depend on itself".to_string(),
-                ));
-            }
-            if declared_names.is_empty() {
-                return Err(err(
-                    Status::BadRequest,
-                    format!(
-                        "{} no longer declares anything {} answers to, so there is nothing to replace -- drop the dependency instead",
-                        dependent.name, current.name
-                    ),
-                ));
-            }
-
-            let package = ensure_replacement_exists(services, &dependent, &replacement).await?;
-            let answers = provided_names(
-                &package.name,
-                package.split_packages.as_deref(),
-                package.provides.as_deref(),
-            );
-            if !declared_names.iter().any(|name| answers.contains(name)) {
-                return Err(err(
-                    Status::BadRequest,
-                    format!(
-                        "{replacement} answers to none of {}, so the edge would be undone at the next update",
-                        declared_names.join(", ")
-                    ),
-                ));
-            }
-
-            repoint_edge(&services.db, edge, dependent.id, package.id)
-                .await
-                .map_err(|e| err(Status::InternalServerError, e))?;
-            services.activity.emit_by(
-                Event::DepsReplaced {
-                    dependent: dependent.name.as_str().into(),
-                    old: current.name.as_str().into(),
-                    new: package.name.as_str().into(),
-                },
-                a.username.clone(),
-            );
-        }
-    }
-
-    // The dependent's queue entry was made against the edge that just changed,
-    // so it may now be wrong in either direction: free to start because what
-    // held it up is no longer its dependency, or obliged to wait because the
-    // replacement has not been built yet. Before `live_check`, which may delete
-    // the old dependency and everything that hung off it.
-    let unblocked =
-        aurcache_utils::worker_complete::resync_pending_builds(&services.db, dependent.id)
-            .await
-            .map_err(|e| err(Status::InternalServerError, e))?;
-    for build in aurcache_db::helpers::builds::build_refs(&services.db, &unblocked)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-    {
-        services.activity.emit_by(
-            Event::BuildUnblocked { build, by: None },
-            a.username.clone(),
-        );
-    }
-
-    // The usual collection, now that the old dependency may be holding nothing
-    // up. This is what makes emptying a package's dependents remove it: patch
-    // the last edge away and the package goes with it, without a second
-    // endpoint that knows how to remove packages.
-    live_check(
-        &services.db,
-        &services.store,
-        &services.repo,
-        &[current.id],
-        &[],
-    )
-    .await
-    .map_err(|e| err(Status::InternalServerError, e))?;
-
-    Ok(())
-}
-
-/// Move `edge` onto `replacement_id`.
-///
-/// There is one row per (dependent, dependency) pair, and the dependent may
-/// already depend on the replacement under some other name, so an edge that
-/// would collide is merged into the one already there rather than duplicated.
-/// Neither constraint is merged into the other: both are recomputed from the
-/// dependent's declarations at its next resync, and guessing here would only
-/// disagree with that in the meantime.
-async fn repoint_edge(
-    db: &DatabaseConnection,
-    edge: dependencies::Model,
-    dependent_id: i32,
-    replacement_id: i32,
-) -> Result<(), sea_orm::DbErr> {
-    let collides = Dependencies::find()
-        .filter(dependencies::Column::DependentId.eq(dependent_id))
-        .filter(dependencies::Column::DependeeId.eq(replacement_id))
-        .one(db)
-        .await?
-        .is_some();
-
-    if collides {
-        edge.delete(db).await?;
-    } else {
-        let mut active: dependencies::ActiveModel = edge.into();
-        active.dependee_id = Set(replacement_id);
-        active.save(db).await?;
-    }
-    Ok(())
-}
-
-/// The row to point an edge at, adding it from the AUR if it is not here yet.
-///
-/// Added the way resolution would have added it -- as a dependency, on the
-/// dependent's own platforms and build flags -- so a replacement chosen by
-/// hand is indistinguishable from one resolution picked itself. That includes
-/// its builds: it is queued like any added package, and the dependent's own
-/// build then waits on it rather than on a package nothing will ever build.
-async fn ensure_replacement_exists(
-    services: &Services,
-    dependent: &packages::Model,
-    replacement: &str,
-) -> Result<packages::Model, ApiError> {
-    if let Some(package) = Packages::find()
-        .filter(packages::Column::Name.eq(replacement))
-        .one(&services.db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-    {
-        return Ok(package);
-    }
-
-    aurcache_utils::package::add::add_dependency_package(
+    replace::replace(
         services,
-        replacement,
-        &dependent.platforms,
-        &dependent.build_flags,
+        pkgbase,
+        dependency,
+        input.into_inner().replacement,
+        a.username,
     )
     .await
-    .map_err(|e| err(Status::BadGateway, e))?;
-
-    Packages::find()
-        .filter(packages::Column::Name.eq(replacement))
-        .one(&services.db)
-        .await
-        .map_err(|e| err(Status::InternalServerError, e))?
-        .ok_or_else(|| {
-            err(
-                Status::NotFound,
-                format!("'{replacement}' could not be added from the AUR"),
-            )
-        })
-}
-
-#[cfg(test)]
-mod dependency_tests {
-    use super::{
-        ReplacementVerdict, candidate_verdict, dependency_edge, provided_names, repoint_edge,
-    };
-    use aurcache_db::migration::Migrator;
-    use aurcache_db::packages::SourceData;
-    use aurcache_db::prelude::{Dependencies, Packages};
-    use aurcache_db::{dependencies, packages};
-    use aurcache_utils::package::live_check::live_check;
-    use aurcache_utils::repository::Repository;
-    use aurcache_utils::snapshot::SnapshotStore;
-    use sea_orm::{
-        ActiveModelTrait, ColumnTrait, Database, DatabaseConnection, EntityTrait, PaginatorTrait,
-        QueryFilter, Set, TryIntoModel,
-    };
-    use sea_orm_migration::MigratorTrait;
-    use serde_json::json;
-
-    async fn memory_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        db
-    }
-
-    async fn package(
-        db: &DatabaseConnection,
-        name: &str,
-        directly_requested: bool,
-    ) -> packages::Model {
-        packages::ActiveModel {
-            name: Set(name.to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
-            upstream_version: Set(None),
-            latest_build: Set(None),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
-            source_data: Set(SourceData::Aur { name: name.into() }),
-            directly_requested: Set(directly_requested),
-            split_packages: Set(None),
-            ..Default::default()
-        }
-        .save(db)
-        .await
-        .unwrap()
-        .try_into_model()
-        .unwrap()
-    }
-
-    async fn edge(db: &DatabaseConnection, dependent: i32, dependee: i32, constraint: &str) {
-        dependencies::ActiveModel {
-            dependent_id: Set(dependent),
-            dependee_id: Set(dependee),
-            version_constraint: Set(constraint.to_string()),
-            ..Default::default()
-        }
-        .save(db)
-        .await
-        .unwrap();
-    }
-
-    /// A replacement is judged against every name the package answers to, so
-    /// all three sources of them have to be here -- and a versioned `provides`
-    /// contributes the name, not the whole entry.
-    #[tokio::test]
-    async fn provided_names_covers_the_name_the_splits_and_the_provides() {
-        let db = memory_db().await;
-        let package = package(&db, "libfoo", true).await;
-        assert_eq!(
-            provided_names(
-                &package.name,
-                package.split_packages.as_deref(),
-                package.provides.as_deref()
-            ),
-            vec!["libfoo"]
-        );
-
-        let split_packages = Some(json!(["libfoo-docs"]).to_string());
-        let provides = Some(json!(["libfoo.so=1", "foo-compat"]).to_string());
-        assert_eq!(
-            provided_names(
-                &package.name,
-                split_packages.as_deref(),
-                provides.as_deref()
-            ),
-            vec!["foo-compat", "libfoo", "libfoo-docs", "libfoo.so"],
-            "a versioned `provides` contributes the name, not the whole entry"
-        );
-    }
-
-    /// An unbuilt candidate is `Unknown`, not `Unsatisfied`: the queue checks
-    /// the constraint against each real build, so there is nothing to conclude
-    /// yet and saying "no" would hide a usable option.
-    #[test]
-    fn a_candidate_is_judged_on_the_version_it_is_known_to_be_at() {
-        assert_eq!(
-            candidate_verdict(None, ""),
-            ReplacementVerdict::Satisfied,
-            "an unconstrained edge is met by anything"
-        );
-        assert_eq!(
-            candidate_verdict(Some("2.0.0-1"), ">=2.0"),
-            ReplacementVerdict::Satisfied
-        );
-        assert_eq!(
-            candidate_verdict(Some("1.0.0-1"), ">=2.0"),
-            ReplacementVerdict::Unsatisfied
-        );
-        assert_eq!(
-            candidate_verdict(None, ">=2.0"),
-            ReplacementVerdict::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn an_edge_that_does_not_exist_is_not_found() {
-        let db = memory_db().await;
-        package(&db, "dependent", true).await;
-        package(&db, "stranger", false).await;
-
-        assert!(dependency_edge(&db, "dependent", "stranger").await.is_err());
-        assert!(dependency_edge(&db, "dependent", "nonesuch").await.is_err());
-    }
-
-    /// Repointing the last edge onto something else leaves the old dependency
-    /// holding nothing up, and the collection that follows takes it. This is
-    /// what lets emptying a package's dependents remove it, with no second
-    /// endpoint that knows how to remove packages.
-    #[tokio::test]
-    async fn repointing_the_last_edge_collects_the_old_dependency() {
-        let db = memory_db().await;
-        let dependent = package(&db, "dependent", true).await;
-        let old = package(&db, "old-provider", false).await;
-        let new = package(&db, "new-provider", false).await;
-        edge(&db, dependent.id, old.id, ">=1.0").await;
-
-        let moving = Dependencies::find().one(&db).await.unwrap().unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
-        let checkouts = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
-        let repo = Repository::new(checkouts.path().join("repo"));
-        live_check(&db, &store, &repo, &[old.id], &[])
-            .await
-            .unwrap();
-
-        assert!(
-            Packages::find_by_id(old.id)
-                .one(&db)
-                .await
-                .unwrap()
-                .is_none(),
-            "nothing needs the old dependency any more"
-        );
-        let remaining = Dependencies::find().all(&db).await.unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].dependee_id, new.id);
-        assert_eq!(
-            remaining[0].version_constraint, ">=1.0",
-            "the constraint travels with the edge"
-        );
-    }
-
-    /// A dependent that already depends on the replacement under some other
-    /// name would collide, since there is one row per pair. The edge is merged
-    /// into the one already there rather than duplicated.
-    #[tokio::test]
-    async fn repointing_onto_an_edge_that_already_exists_merges() {
-        let db = memory_db().await;
-        let dependent = package(&db, "dependent", true).await;
-        let old = package(&db, "old-provider", false).await;
-        let new = package(&db, "new-provider", false).await;
-        edge(&db, dependent.id, old.id, ">=1.0").await;
-        edge(&db, dependent.id, new.id, ">=3.0").await;
-
-        let moving = Dependencies::find()
-            .filter(dependencies::Column::DependeeId.eq(old.id))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
-
-        assert_eq!(Dependencies::find().count(&db).await.unwrap(), 1);
-        let remaining = Dependencies::find().one(&db).await.unwrap().unwrap();
-        assert_eq!(remaining.dependee_id, new.id);
-        assert_eq!(remaining.version_constraint, ">=3.0");
-    }
-
-    /// A dependency something else still needs survives the repoint: the
-    /// collection is reachability, not "did an edge just move".
-    #[tokio::test]
-    async fn a_dependency_another_package_still_needs_is_kept() {
-        let db = memory_db().await;
-        let dependent = package(&db, "dependent", true).await;
-        let other = package(&db, "other", true).await;
-        let old = package(&db, "old-provider", false).await;
-        let new = package(&db, "new-provider", false).await;
-        edge(&db, dependent.id, old.id, "").await;
-        edge(&db, other.id, old.id, "").await;
-
-        let moving = Dependencies::find()
-            .filter(dependencies::Column::DependentId.eq(dependent.id))
-            .one(&db)
-            .await
-            .unwrap()
-            .unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
-        let checkouts = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
-        let repo = Repository::new(checkouts.path().join("repo"));
-        live_check(&db, &store, &repo, &[old.id], &[])
-            .await
-            .unwrap();
-
-        assert!(
-            Packages::find_by_id(old.id)
-                .one(&db)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
+    .map_err(replace_error)
 }

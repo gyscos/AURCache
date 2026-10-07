@@ -63,7 +63,7 @@ impl SrcdestLocks {
     /// Waiting rather than refusing: a job that reaches this point has already
     /// been claimed, and the server excludes a package this worker is already
     /// building when it hands out work, so a wait here means something upstream
-    /// let a second one through -- an older server, a one-shot build, a bug.
+    /// let a second one through -- a one-shot build, a bug.
     /// Waiting costs that build some of its timeout; fetching over a sibling's
     /// sources costs both builds their correctness.
     pub async fn acquire(self: &Arc<Self>, pkgbase: &str) -> SrcdestGuard {

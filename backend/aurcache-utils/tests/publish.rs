@@ -2,7 +2,7 @@
 //! what the database records, and what a failure leaves untouched.
 
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::migration::Migrator;
 use aurcache_db::prelude::{Builds, Files, Packages};
 use aurcache_utils::publish::{interrupted, publish_build};
@@ -57,7 +57,7 @@ async fn package(db: &DatabaseConnection, id: i32, name: &str) {
         "INSERT INTO packages \
          (id, name, status, out_of_date, build_flags, platforms, source_data, directly_requested) \
          VALUES ({id}, '{name}', {}, 1, '', 'x86_64', '{{\"type\":\"aur\",\"name\":\"{name}\"}}', 1)",
-        BuildStates::PUBLISHING
+        BuildState::Publishing.as_i32()
     ))
     .await
     .unwrap();
@@ -68,7 +68,7 @@ async fn publishing_build(db: &DatabaseConnection, id: i32, pkg_id: i32) {
     db.execute_unprepared(&format!(
         "INSERT INTO builds (id, pkg_id, status, start_time, platform, version, number, worker_id) \
          VALUES ({id}, {pkg_id}, {}, 1, 'x86_64', '', {id}, 7)",
-        BuildStates::PUBLISHING
+        BuildState::Publishing.as_i32()
     ))
     .await
     .unwrap();
@@ -101,7 +101,7 @@ fn listed(root: &Path) -> Vec<String> {
     dirs
 }
 
-async fn status(db: &DatabaseConnection, build_id: i32) -> Option<i32> {
+async fn status(db: &DatabaseConnection, build_id: i32) -> BuildState {
     Builds::find_by_id(build_id)
         .one(db)
         .await
@@ -122,7 +122,7 @@ async fn a_published_build_is_in_the_repository_and_recorded() {
 
     publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Successful);
     let build = Builds::find_by_id(1).one(&db).await.unwrap().unwrap();
     // The version comes from the package file, the server's authority on what
     // was actually built.
@@ -132,8 +132,8 @@ async fn a_published_build_is_in_the_repository_and_recorded() {
     assert_eq!(build.worker_id, Some(7), "still names who built it");
 
     let pkg = Packages::find_by_id(1).one(&db).await.unwrap().unwrap();
-    assert_eq!(pkg.status, BuildStates::SUCCESSFUL_BUILD);
-    assert_eq!(pkg.out_of_date, 0);
+    assert_eq!(pkg.status, BuildState::Successful);
+    assert!(!pkg.out_of_date);
     assert_eq!(pkg.upstream_version.as_deref(), Some("2.12.1-1"));
 
     let rows = Files::find().all(&db).await.unwrap();
@@ -168,7 +168,7 @@ async fn a_new_version_replaces_the_old_one() {
     stage(&repo, 2, "hello", "1.1-1");
     publish_build(&db, &repo, &ActivityLog::discarding(), 2).await;
 
-    assert_eq!(status(&db, 2).await, Some(BuildStates::SUCCESSFUL_BUILD));
+    assert_eq!(status(&db, 2).await, BuildState::Successful);
     assert_eq!(listed(tmp.path()), ["hello-1.1-1"]);
     let rows = Files::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -206,9 +206,9 @@ async fn a_file_owned_by_a_live_package_fails_the_build_and_changes_nothing() {
 
     publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Failed);
     let pkg = Packages::find_by_id(2).one(&db).await.unwrap().unwrap();
-    assert_eq!(pkg.status, BuildStates::FAILED_BUILD);
+    assert_eq!(pkg.status, BuildState::Failed);
     let rows = Files::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].package_id, 1, "the other package keeps its file");
@@ -250,7 +250,7 @@ async fn a_file_whose_owner_is_gone_is_claimed() {
 
     publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Successful);
     let rows = Files::find().all(&db).await.unwrap();
     assert_eq!(rows.len(), 1, "claimed, not duplicated");
     assert_eq!(rows[0].package_id, 2);
@@ -268,7 +268,7 @@ async fn a_wrong_named_artifact_fails_the_build() {
 
     publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Failed);
     assert!(Files::find().all(&db).await.unwrap().is_empty());
     assert!(listed(tmp.path()).is_empty());
 }
@@ -289,7 +289,7 @@ async fn an_interrupted_publication_is_resumed_from_staging() {
         publish_build(&db, &repo, &ActivityLog::discarding(), build_id).await;
     }
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::SUCCESSFUL_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Successful);
     assert!(interrupted(&db).await.unwrap().is_empty());
     assert_eq!(listed(tmp.path()), ["hello-1.0-1"]);
 }
@@ -305,7 +305,7 @@ async fn a_build_not_publishing_is_left_alone() {
     publishing_build(&db, 1, 1).await;
     db.execute_unprepared(&format!(
         "UPDATE builds SET status = {} WHERE id = 1",
-        BuildStates::FAILED_BUILD
+        BuildState::Failed.as_i32()
     ))
     .await
     .unwrap();
@@ -313,7 +313,7 @@ async fn a_build_not_publishing_is_left_alone() {
 
     publish_build(&db, &repo, &ActivityLog::discarding(), 1).await;
 
-    assert_eq!(status(&db, 1).await, Some(BuildStates::FAILED_BUILD));
+    assert_eq!(status(&db, 1).await, BuildState::Failed);
     assert!(staged.exists());
     assert!(listed(tmp.path()).is_empty());
 }

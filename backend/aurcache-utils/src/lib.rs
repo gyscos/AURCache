@@ -1,5 +1,8 @@
+/// Telling the logs about builds taken back from their workers.
+pub mod abandoned;
 pub mod aur;
 pub mod build_logger;
+pub mod cancel;
 pub mod dump;
 pub mod git;
 pub mod job_config;
@@ -16,7 +19,5 @@ pub mod settings;
 pub mod snapshot;
 pub mod vcs_check;
 pub mod worker_complete;
-/// Telling the logs about builds taken back from their workers.
-pub mod abandoned;
 /// How the server polices remote workers, read once from its environment.
 pub mod worker_policy;

@@ -1,5 +1,4 @@
-use crate::settings::general::SettingsTraits;
-use aurcache_common::settings::{ApplicationSettings, Setting};
+use crate::settings::{self, key};
 use sea_orm::DatabaseConnection;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -14,13 +13,13 @@ pub use aurcache_deps::paths::{
     mirrorlist_dir, mirrorlist_file_name, mirrorlist_path, native_arch, shared_mirrorlist_path,
 };
 
-/// Build the makepkg.conf for a build.
+/// The makepkg.conf for a build, from the `makepkg_conf` setting's `user_conf`.
 ///
-/// User-provided content (from the `makepkg_conf` setting) is written first.
-/// PKGDEST, MAKEFLAGS, PACKAGER, and OPTIONS are always appended at the end so
-/// the user cannot accidentally override them — without the right PKGDEST the
-/// build can't be collected from the shared mount, and without a valid
-/// PACKAGER the generated `desc` file cannot be parsed by libalpm.
+/// The user's content is written first. PKGDEST, MAKEFLAGS, PACKAGER, and
+/// OPTIONS are always appended at the end so the user cannot accidentally
+/// override them — without the right PKGDEST the build can't be collected from
+/// the shared mount, and without a valid PACKAGER the generated `desc` file
+/// cannot be parsed by libalpm.
 ///
 /// `OPTIONS=(!debug)` suppresses makepkg's split `<pkgname>-debug` packages.
 /// Arch's stock `makepkg.conf` enables `debug`, so a worker on distro defaults
@@ -29,42 +28,23 @@ pub use aurcache_deps::paths::{
 /// keeps them out of `core`/`extra` and ships them in separate opt-in `*-debug`
 /// repos. Publishing debug symbols would mean a second repo, not extra entries
 /// in this one.
-///
-/// Pass `None` for `db_ctx` when no database is available (e.g. the
-/// test-builder binary); user config is then skipped.
-pub async fn create_makepkg_config(
-    db_ctx: Option<(&DatabaseConnection, i32)>,
-    pkgdest_dir_base: &Path,
-) -> String {
+fn makepkg_config(user_conf: &str, pkgdest_dir: &Path) -> String {
     let mut config = String::new();
-
-    if let Some((db, pkg_id)) = db_ctx {
-        let user_conf = ApplicationSettings::get::<String>(Setting::MakepkgConf, Some(pkg_id), db)
-            .await
-            .value;
-        if !user_conf.trim().is_empty() {
-            config.push_str(&user_conf);
-            if !config.ends_with('\n') {
-                config.push('\n');
-            }
+    if !user_conf.trim().is_empty() {
+        config.push_str(user_conf);
+        if !config.ends_with('\n') {
+            config.push('\n');
         }
     }
-
     let _ = write!(
         config,
         "MAKEFLAGS=-j$(nproc)\nPKGDEST={}\nPACKAGER='AURCache <aurcache@localhost>'\nOPTIONS=(!debug)\n",
-        pkgdest_dir_base.display()
+        pkgdest_dir.display()
     );
-
     config
 }
 
-/// Generate the standard pacman.conf written inside a build container.
-///
-/// When `aurcache_repo_url` is `Some`, a `[repo]` section pointing at the
-/// AURCache package server is appended so makepkg can resolve previously built
-/// packages.  Pass `None` for standalone builds (e.g. the test-builder) where
-/// no AURCache server is running.
+/// The standard pacman.conf written inside a build container.
 ///
 /// `DisableSandbox`: pacman 7's Landlock download sandbox needs syscalls that
 /// some runtimes block or do not implement (older seccomp profiles, qemu
@@ -79,16 +59,13 @@ pub fn base_pacman_config() -> String {
         .to_string()
 }
 
-/// Build the pacman.conf written inside the build container.
+/// The pacman.conf written inside the build container, from the `pacman_conf`
+/// setting's `user_conf`: that in place of the standard one, when it is set.
 ///
 /// No `[repo]` section is emitted: the worker appends one rendered from the
 /// template it received at registration, because only the worker knows which
 /// address it reaches this server on.
-pub async fn create_pacman_config(db: &DatabaseConnection, pkg_id: i32) -> String {
-    let user_conf = ApplicationSettings::get::<String>(Setting::PacmanConf, Some(pkg_id), db)
-        .await
-        .value;
-
+fn pacman_config(user_conf: &str) -> String {
     if user_conf.trim().is_empty() {
         base_pacman_config()
     } else {
@@ -121,15 +98,19 @@ pub struct JobConfig {
     pub pacman_conf: String,
 }
 
-/// Assemble the self-contained build configuration for a [`JobDescriptor`].
+/// Assemble the self-contained build configuration for one of `pkg_id`'s builds.
 pub async fn build_job_config(
     db: &DatabaseConnection,
     pkg_id: i32,
     pkgdest_dir: &Path,
 ) -> JobConfig {
+    let (makepkg, pacman) = tokio::join!(
+        settings::get(db, key::MAKEPKG_CONF, Some(pkg_id)),
+        settings::get(db, key::PACMAN_CONF, Some(pkg_id)),
+    );
     JobConfig {
-        makepkg_conf: create_makepkg_config(Some((db, pkg_id)), pkgdest_dir).await,
-        pacman_conf: create_pacman_config(db, pkg_id).await,
+        makepkg_conf: makepkg_config(&makepkg.value, pkgdest_dir),
+        pacman_conf: pacman_config(&pacman.value),
     }
 }
 
@@ -146,6 +127,17 @@ mod tests {
         assert!(conf.contains("SigLevel = Never"));
         assert!(conf.contains("Include = /etc/pacman.d/mirrorlist"));
         assert!(!conf.contains("[repo]"));
+    }
+
+    /// The build server forces this; a worker on Arch defaults would otherwise
+    /// emit `<pkgname>-debug` packages into the single flat repo -- whatever
+    /// the user's own configuration says.
+    #[test]
+    fn makepkg_config_disables_debug_packages() {
+        for user_conf in ["", "OPTIONS=(debug)"] {
+            let conf = makepkg_config(user_conf, Path::new("/out"));
+            assert!(conf.ends_with("OPTIONS=(!debug)\n"), "got:\n{conf}");
+        }
     }
 
     #[tokio::test]

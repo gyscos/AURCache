@@ -1,13 +1,15 @@
 use crate::{Wake, sleep_until_next_fire};
 use aurcache_activitylog::events::Event;
-use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::scheduled::{Job, schedule};
 use aurcache_utils::services::Services;
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::info;
+
+/// How long a change to the schedule may take to be noticed.
+const RECHECK: Duration = Duration::from_mins(5);
 
 #[must_use]
 pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
@@ -26,30 +28,32 @@ pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
             }
         };
         loop {
-            // check everytime in loop since it may change per user setting
-            let interval: SettingsEntry<Option<String>> =
-                ApplicationSettings::get(Setting::AutoUpdateInterval, None, &services.db).await;
+            // Read on every turn: it is a setting, and may have changed.
+            let interval =
+                settings::get(&services.db, settings::key::AUTO_UPDATE_SCHEDULE, None).await;
             let expr = interval.value.filter(|expr| !expr.trim().is_empty());
             match expr.as_deref().map(|expr| schedule(Job::AutoUpdate, expr)) {
-                None => {
-                    // Auto update disabled
-                    tokio::time::sleep(Duration::from_hours(1)).await;
-                }
+                // Off.
+                None => tokio::time::sleep(RECHECK).await,
                 Some(Err(e)) => {
                     report(e.to_string());
-                    tokio::time::sleep(Duration::from_mins(15)).await;
+                    tokio::time::sleep(RECHECK).await;
                 }
                 Some(Ok(schedule)) => {
-                    if sleep_until_next_fire(&schedule, "update").await == Wake::Fired {
-                        info!("Executing scheduled auto-update");
-                        if let Err(e) = package_update_all_outdated(&services).await {
-                            services.activity.emit(Event::UpdateQueueFailed {
-                                error: format!("{e:#}"),
-                            });
+                    match sleep_until_next_fire(&schedule, "update", RECHECK).await {
+                        Wake::Fired => {
+                            info!("Executing scheduled auto-update");
+                            if let Err(e) = package_update_all_outdated(&services).await {
+                                services.activity.emit(Event::UpdateQueueFailed {
+                                    error: format!("{e:#}"),
+                                });
+                            }
                         }
-                    } else {
-                        report("the schedule never fires again".to_string());
-                        tokio::time::sleep(Duration::from_mins(30)).await;
+                        Wake::Recheck => {}
+                        Wake::Exhausted => {
+                            report("the schedule never fires again".to_string());
+                            tokio::time::sleep(RECHECK).await;
+                        }
                     }
                 }
             }

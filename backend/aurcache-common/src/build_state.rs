@@ -1,30 +1,84 @@
-//! Build states, free of any database dependency.
+//! Build states, triggers and end reasons: what the `builds` and `packages`
+//! columns hold and the API sends.
 //!
-//! The build-queue `Action` that once sat beside them carries database models,
-//! so it lives in `aurcache-db`; these stay usable from a browser.
+//! Each is stored and sent as its `i32` discriminant, so the schema and the
+//! wire format are plain integers, while every consumer matches on the enum.
+//! The sea-orm derives are behind the `db` feature, so a browser gets the same
+//! types without a database driver.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// The state of a build, as stored in the database and sent over the API.
+/// Serde and schema impls writing a type as its `i32` discriminant, through
+/// its `as_i32` and `from_i32`.
 ///
-/// Persisted and serialized as its `i32` discriminant, so the wire format and
-/// the schema are unchanged — but consumers can match on it exhaustively
-/// instead of on bare integers. A new state then becomes a compile error in
-/// every caller that has to handle it, rather than a number nobody recognises
-/// silently falling into an "unknown" arm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// An unknown number is a deserialization error rather than a guess: a value
+/// from a newer server is refused instead of being shown as something it is
+/// not.
+macro_rules! as_integer {
+    ($($t:ty => $what:literal),* $(,)?) => {$(
+        impl Serialize for $t {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_i32(self.as_i32())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $t {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let value = i32::deserialize(d)?;
+                Self::from_i32(value).ok_or_else(|| {
+                    serde::de::Error::custom(format!("{value} is not a {}", $what))
+                })
+            }
+        }
+
+        impl utoipa::PartialSchema for $t {
+            fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+                use utoipa::openapi::schema::{ObjectBuilder, Type};
+                ObjectBuilder::new()
+                    .schema_type(Type::Integer)
+                    .description(Some(concat!("A ", $what, ", as its number.")))
+                    .into()
+            }
+        }
+
+        impl utoipa::ToSchema for $t {}
+    )*};
+}
+
+as_integer! {
+    BuildState => "build state",
+    BuildTrigger => "build trigger",
+    EndReason => "end reason",
+}
+
+/// The state of a build -- and of a package, which shows its latest build's.
+///
+/// Matched exhaustively wherever it is handled: a new state is a compile
+/// error in every caller that has to decide about it, rather than a number
+/// nobody recognises silently falling into an "unknown" arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "db",
+    derive(sea_orm::DeriveActiveEnum, sea_orm::EnumIter),
+    sea_orm(rs_type = "i32", db_type = "Integer")
+)]
 #[repr(i32)]
 pub enum BuildState {
     /// Currently building.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 0))]
     Active = 0,
     /// Built successfully.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 1))]
     Successful = 1,
     /// The build failed.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 2))]
     Failed = 2,
     /// Waiting for a worker to claim it.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 3))]
     Enqueued = 3,
     /// Queued, but cannot start yet: one or more dependency builds have not
     /// completed successfully.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 4))]
     WaitingForDeps = 4,
     /// Built: the worker handed its artifacts over and is done with it, and
     /// the server is putting them in the repository.
@@ -34,6 +88,7 @@ pub enum BuildState {
     /// polices leases -- the heartbeat, the reaper, revoking a worker, claim
     /// capacity -- finds builds by that state. A build being published has no
     /// lease and no worker left to lose it.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 5))]
     Publishing = 5,
 }
 
@@ -62,6 +117,15 @@ impl BuildState {
         }
     }
 
+    /// Every state [`Self::is_in_progress`] holds for: a build that has not
+    /// settled. A package has at most one such build per platform.
+    pub const IN_PROGRESS: [Self; 4] = [
+        Self::Active,
+        Self::Enqueued,
+        Self::WaitingForDeps,
+        Self::Publishing,
+    ];
+
     /// Every state, in discriminant order.
     pub const ALL: [Self; 6] = [
         Self::Active,
@@ -83,6 +147,20 @@ impl BuildState {
             Self::Failed => "failed",
             Self::Enqueued => "enqueued",
             Self::WaitingForDeps => "waiting-for-deps",
+            Self::Publishing => "publishing",
+        }
+    }
+
+    /// The state as a person reads it, in a list or on a badge: lowercase,
+    /// and worded for a build (`building`, `waiting for deps`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Active => "building",
+            Self::Successful => "successful",
+            Self::Failed => "failed",
+            Self::Enqueued => "enqueued",
+            Self::WaitingForDeps => "waiting for deps",
             Self::Publishing => "publishing",
         }
     }
@@ -127,46 +205,28 @@ impl BuildState {
     }
 }
 
-pub struct BuildStates;
-
-/// The integer constants remain, defined in terms of the enum so there is a
-/// single source of truth, for the many call sites that compare raw `i32`s
-/// against the database column.
-impl BuildStates {
-    pub const ACTIVE_BUILD: i32 = BuildState::Active.as_i32();
-    pub const SUCCESSFUL_BUILD: i32 = BuildState::Successful.as_i32();
-    pub const FAILED_BUILD: i32 = BuildState::Failed.as_i32();
-    pub const ENQUEUED_BUILD: i32 = BuildState::Enqueued.as_i32();
-    /// Build is queued but cannot start yet because one or more dependency
-    /// builds have not completed successfully.
-    pub const WAITING_FOR_DEPS: i32 = BuildState::WaitingForDeps.as_i32();
-    /// Built, and being put in the repository by the server.
-    pub const PUBLISHING: i32 = BuildState::Publishing.as_i32();
-    /// Every state [`BuildState::is_in_progress`] holds for: a build that has
-    /// not settled. A package has at most one such build per platform.
-    pub const IN_PROGRESS: [i32; 4] = [
-        Self::ACTIVE_BUILD,
-        Self::ENQUEUED_BUILD,
-        Self::WAITING_FOR_DEPS,
-        Self::PUBLISHING,
-    ];
-}
-
 /// Why a build row was created.
 ///
-/// Persisted and serialized as its `i32` discriminant, like [`BuildState`]. The
-/// retry budget for builds the reaper abandons is *derived* from this column —
+/// The retry budget for builds the reaper abandons is *derived* from this column —
 /// the count of consecutive `TimeoutRetry` rows — rather than tracked in a
 /// mutable counter, so the reason a build exists has to live somewhere a build
 /// history can walk, and the rows themselves are the only history.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "db",
+    derive(sea_orm::DeriveActiveEnum, sea_orm::EnumIter),
+    sea_orm(rs_type = "i32", db_type = "Integer")
+)]
 #[repr(i32)]
 pub enum BuildTrigger {
     /// Operator add or explicit rebuild (button, CLI).
+    #[cfg_attr(feature = "db", sea_orm(num_value = 0))]
     User = 0,
     /// A version check found the package outdated and requeued it.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 1))]
     AutoUpdate = 1,
     /// Automatic retry of a build the server abandoned (this design).
+    #[cfg_attr(feature = "db", sea_orm(num_value = 2))]
     TimeoutRetry = 2,
 }
 
@@ -193,35 +253,35 @@ impl BuildTrigger {
     }
 }
 
-pub struct BuildTriggers;
-
-/// The integer constants for [`BuildTrigger`], for call sites comparing raw
-/// `i32`s against the database column.
-impl BuildTriggers {
-    pub const USER: i32 = BuildTrigger::User.as_i32();
-    pub const AUTO_UPDATE: i32 = BuildTrigger::AutoUpdate.as_i32();
-    pub const TIMEOUT_RETRY: i32 = BuildTrigger::TimeoutRetry.as_i32();
-}
-
 /// Why a build stopped, when the stop was decided by the server rather than
 /// reported by the worker.
 ///
 /// `None` on the row means the worker reported a terminal outcome and its
 /// `CompleteReport.reason` text is the record; these codes cover the cases only
 /// the server can produce: a manual cancel, and the ways a build is abandoned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "db",
+    derive(sea_orm::DeriveActiveEnum, sea_orm::EnumIter),
+    sea_orm(rs_type = "i32", db_type = "Integer")
+)]
 #[repr(i32)]
 pub enum EndReason {
-    /// An operator cancelled the build (`Action::Cancel`).
+    /// An operator cancelled the build (`aurcache_utils::cancel`).
+    #[cfg_attr(feature = "db", sea_orm(num_value = 0))]
     Canceled = 0,
     /// The owning worker went silent past its lease.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 1))]
     LeaseExpired = 1,
     /// The build ran past the backstop deadline while still heartbeating.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 2))]
     MaxDuration = 2,
     /// The owning worker kept heartbeating but stopped listing the build: it
     /// lost it -- restarted, or the build process died -- without saying so.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 3))]
     Dropped = 3,
     /// An operator revoked the worker that was running it.
+    #[cfg_attr(feature = "db", sea_orm(num_value = 4))]
     WorkerRevoked = 4,
 }
 
@@ -270,35 +330,25 @@ impl EndReason {
     }
 }
 
-pub struct EndReasons;
-
-/// The integer constants for [`EndReason`].
-impl EndReasons {
-    pub const CANCELED: i32 = EndReason::Canceled.as_i32();
-    pub const LEASE_EXPIRED: i32 = EndReason::LeaseExpired.as_i32();
-    pub const MAX_DURATION: i32 = EndReason::MaxDuration.as_i32();
-    pub const DROPPED: i32 = EndReason::Dropped.as_i32();
-    pub const WORKER_REVOKED: i32 = EndReason::WorkerRevoked.as_i32();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The constants and the enum must not drift apart.
+    /// Each is written as its number, and reads back as itself.
     #[test]
-    fn constants_match_the_enum() {
-        for (value, state) in [
-            (BuildStates::ACTIVE_BUILD, BuildState::Active),
-            (BuildStates::SUCCESSFUL_BUILD, BuildState::Successful),
-            (BuildStates::FAILED_BUILD, BuildState::Failed),
-            (BuildStates::ENQUEUED_BUILD, BuildState::Enqueued),
-            (BuildStates::WAITING_FOR_DEPS, BuildState::WaitingForDeps),
-            (BuildStates::PUBLISHING, BuildState::Publishing),
-        ] {
-            assert_eq!(BuildState::from_i32(value), Some(state));
-            assert_eq!(state.as_i32(), value);
+    fn values_travel_as_their_numbers() {
+        for state in BuildState::ALL {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, state.as_i32().to_string());
+            assert_eq!(serde_json::from_str::<BuildState>(&json).unwrap(), state);
         }
+        assert_eq!(
+            serde_json::to_string(&EndReason::Dropped).unwrap(),
+            "3",
+            "the wire form is the stored number"
+        );
+        assert!(serde_json::from_str::<BuildState>("99").is_err());
+        assert!(serde_json::from_str::<BuildTrigger>("\"user\"").is_err());
     }
 
     /// Keys are what people type, so every state has one, they round-trip,
@@ -323,7 +373,7 @@ mod tests {
     fn in_progress_lists_exactly_the_unsettled_states() {
         for state in BuildState::ALL {
             assert_eq!(
-                BuildStates::IN_PROGRESS.contains(&state.as_i32()),
+                BuildState::IN_PROGRESS.contains(&state),
                 state.is_in_progress(),
                 "{state:?}"
             );
@@ -336,42 +386,26 @@ mod tests {
         assert_eq!(BuildState::from_i32(-1), None);
     }
 
+    /// Triggers and end reasons read back from their numbers, and an unknown
+    /// number is not guessed (which would silently count it as `user`).
     #[test]
-    fn only_running_queued_and_waiting_count_as_in_progress() {
-        assert!(BuildState::Active.is_in_progress());
-        assert!(BuildState::Enqueued.is_in_progress());
-        assert!(BuildState::WaitingForDeps.is_in_progress());
-        assert!(!BuildState::Successful.is_in_progress());
-        assert!(!BuildState::Failed.is_in_progress());
-    }
-
-    /// Triggers round-trip through their wire representation, and unknown
-    /// values are not guessed (which would silently count them as `user`).
-    #[test]
-    fn triggers_round_trip() {
-        for (value, trigger) in [
-            (BuildTriggers::USER, BuildTrigger::User),
-            (BuildTriggers::AUTO_UPDATE, BuildTrigger::AutoUpdate),
-            (BuildTriggers::TIMEOUT_RETRY, BuildTrigger::TimeoutRetry),
+    fn triggers_and_end_reasons_round_trip() {
+        for trigger in [
+            BuildTrigger::User,
+            BuildTrigger::AutoUpdate,
+            BuildTrigger::TimeoutRetry,
         ] {
-            assert_eq!(BuildTrigger::from_i32(value), Some(trigger));
-            assert_eq!(trigger.as_i32(), value);
+            assert_eq!(BuildTrigger::from_i32(trigger.as_i32()), Some(trigger));
         }
         assert_eq!(BuildTrigger::from_i32(99), None);
-    }
-
-    /// Same for end reasons; an unparsed value must not read as a known one.
-    #[test]
-    fn end_reasons_round_trip() {
-        for (value, reason) in [
-            (EndReasons::CANCELED, EndReason::Canceled),
-            (EndReasons::LEASE_EXPIRED, EndReason::LeaseExpired),
-            (EndReasons::MAX_DURATION, EndReason::MaxDuration),
-            (EndReasons::DROPPED, EndReason::Dropped),
-            (EndReasons::WORKER_REVOKED, EndReason::WorkerRevoked),
+        for reason in [
+            EndReason::Canceled,
+            EndReason::LeaseExpired,
+            EndReason::MaxDuration,
+            EndReason::Dropped,
+            EndReason::WorkerRevoked,
         ] {
-            assert_eq!(EndReason::from_i32(value), Some(reason));
-            assert_eq!(reason.as_i32(), value);
+            assert_eq!(EndReason::from_i32(reason.as_i32()), Some(reason));
         }
         assert_eq!(EndReason::from_i32(99), None);
     }

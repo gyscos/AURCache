@@ -279,7 +279,7 @@ impl StatusFilter {
     }
 
     /// Whether the underlying state and out-of-date flag answer to this filter.
-    fn matches(self, status: i32, outofdate: i32) -> bool {
+    fn matches(self, status: BuildState, outofdate: bool) -> bool {
         if self.is_any() {
             return true;
         }
@@ -287,13 +287,10 @@ impl StatusFilter {
         // build that newer sources are ahead of. The flag is only ever
         // meaningful for such a package in practice, but matching the badge
         // keeps a filter result and a row's label from disagreeing.
-        if self.out_of_date
-            && BuildState::from_i32(status) == Some(BuildState::Successful)
-            && outofdate != 0
-        {
+        if self.out_of_date && Some(status) == Some(BuildState::Successful) && outofdate {
             return true;
         }
-        if let Some(state) = BuildState::from_i32(status)
+        if let Some(state) = Some(status)
             && self.states.contains(state)
         {
             return true;
@@ -343,8 +340,8 @@ fn lowered_query(query: &str) -> String {
 /// Not the numeric order of the enum, which is an implementation detail:
 /// sorting by status is asking "what needs me", so failures lead and
 /// up-to-date packages trail.
-fn status_rank(status: i32) -> u8 {
-    match BuildState::from_i32(status) {
+fn status_rank(status: BuildState) -> u8 {
+    match Some(status) {
         Some(BuildState::Failed) => 0,
         Some(BuildState::Active | BuildState::Publishing) => 1,
         Some(BuildState::WaitingForDeps) => 2,
@@ -391,8 +388,9 @@ pub fn sort_packages(packages: &mut [SimplePackage], sort: Sort) {
         let ordering = match sort.key {
             // An out-of-date package is a package needing attention, so it
             // ranks with the unhealthy ones rather than with the successes.
-            SortKey::Status => (status_rank(a.status), a.outofdate == 0)
-                .cmp(&(status_rank(b.status), b.outofdate == 0)),
+            SortKey::Status => {
+                (status_rank(a.status), !a.outofdate).cmp(&(status_rank(b.status), !b.outofdate))
+            }
             // `Option`'s own ordering is what this wants: `None` sorts below
             // every `Some`, so unrecorded sizes group at one end rather than
             // among the small ones, and land last under the descending order a
@@ -415,7 +413,7 @@ pub fn filter_builds(builds: &[Build], query: &str, status: StatusFilter) -> Vec
             // The identity string is only built when something is typed: it
             // allocates per row, and an empty query matches everything anyway.
             (query.is_empty() || build_id(build).to_lowercase().contains(&query))
-                && status.matches(build.status, 0)
+                && status.matches(build.status, false)
         })
         .cloned()
         .collect()
@@ -657,14 +655,14 @@ mod tests {
     }
     use super::*;
 
-    fn package(name: &str, status: BuildState, outofdate: i32) -> SimplePackage {
+    fn package(name: &str, status: BuildState, outofdate: bool) -> SimplePackage {
         SimplePackage {
             id: 1,
             name: name.to_string(),
             // These tests are about the search and sort helpers, which do not
             // look at it; the packages screen owns the dependency filter.
             directly_requested: true,
-            status: status.as_i32(),
+            status,
             outofdate,
             latest_version: None,
             upstream_version: None,
@@ -675,7 +673,7 @@ mod tests {
     fn sized(name: &str, total_size: Option<i64>) -> SimplePackage {
         SimplePackage {
             total_size,
-            ..package(name, BuildState::Successful, 0)
+            ..package(name, BuildState::Successful, false)
         }
     }
 
@@ -813,7 +811,7 @@ mod tests {
             number,
             pkg_name: pkg.to_string(),
             version: "1.0-1".to_string(),
-            status: status.as_i32(),
+            status,
             start_time: start,
             end_time: None,
             platform: "x86_64".to_string(),
@@ -832,9 +830,9 @@ mod tests {
     #[test]
     fn searching_matches_anywhere_in_the_name() {
         let packages = vec![
-            package("gtk3", BuildState::Successful, 0),
-            package("lib32-gtk3", BuildState::Successful, 0),
-            package("firefox", BuildState::Successful, 0),
+            package("gtk3", BuildState::Successful, false),
+            package("lib32-gtk3", BuildState::Successful, false),
+            package("firefox", BuildState::Successful, false),
         ];
         let found = filter_packages(&packages, "gtk", StatusFilter::ANY);
         assert_eq!(found.len(), 2);
@@ -843,7 +841,7 @@ mod tests {
 
     #[test]
     fn searching_ignores_case_and_surrounding_space() {
-        let packages = vec![package("Firefox", BuildState::Successful, 0)];
+        let packages = vec![package("Firefox", BuildState::Successful, false)];
         for query in ["firefox", "FIREFOX", "  fire  "] {
             assert_eq!(
                 filter_packages(&packages, query, StatusFilter::ANY).len(),
@@ -857,8 +855,8 @@ mod tests {
     #[test]
     fn an_empty_query_keeps_everything() {
         let packages = vec![
-            package("a", BuildState::Successful, 0),
-            package("b", BuildState::Failed, 0),
+            package("a", BuildState::Successful, false),
+            package("b", BuildState::Failed, false),
         ];
         assert_eq!(filter_packages(&packages, "", StatusFilter::ANY).len(), 2);
         assert_eq!(
@@ -870,9 +868,9 @@ mod tests {
     #[test]
     fn the_status_filter_selects_one_state() {
         let packages = vec![
-            package("a", BuildState::Successful, 0),
-            package("b", BuildState::Failed, 0),
-            package("c", BuildState::Failed, 0),
+            package("a", BuildState::Successful, false),
+            package("b", BuildState::Failed, false),
+            package("c", BuildState::Failed, false),
         ];
         let failed = filter_packages(&packages, "", StatusFilter::with_state(BuildState::Failed));
         assert_eq!(failed.len(), 2);
@@ -882,10 +880,10 @@ mod tests {
     #[test]
     fn the_status_filter_selects_any_of_several_states() {
         let packages = vec![
-            package("a", BuildState::Successful, 0),
-            package("b", BuildState::Failed, 0),
-            package("c", BuildState::Enqueued, 0),
-            package("d", BuildState::Active, 0),
+            package("a", BuildState::Successful, false),
+            package("b", BuildState::Failed, false),
+            package("c", BuildState::Enqueued, false),
+            package("d", BuildState::Active, false),
         ];
         // The stuck queue spans two states; both answer to one filter.
         let queued = filter_packages(
@@ -911,9 +909,9 @@ mod tests {
     #[test]
     fn the_out_of_date_filter_selects_packages_behind_upstream() {
         let packages = vec![
-            package("stale", BuildState::Successful, 1),
-            package("current", BuildState::Successful, 0),
-            package("broken", BuildState::Failed, 1),
+            package("stale", BuildState::Successful, true),
+            package("current", BuildState::Successful, false),
+            package("broken", BuildState::Failed, true),
         ];
         let filtered = filter_packages(&packages, "", StatusFilter::OUTDATED);
         assert_eq!(
@@ -937,9 +935,9 @@ mod tests {
     #[test]
     fn the_out_of_date_flag_combines_with_the_states() {
         let packages = vec![
-            package("stale", BuildState::Successful, 1),
-            package("current", BuildState::Successful, 0),
-            package("broken", BuildState::Failed, 0),
+            package("stale", BuildState::Successful, true),
+            package("current", BuildState::Successful, false),
+            package("broken", BuildState::Failed, false),
         ];
         let combined = filter_packages(
             &packages,
@@ -960,9 +958,9 @@ mod tests {
     #[test]
     fn sorting_by_status_puts_problems_first() {
         let mut packages = vec![
-            package("ok", BuildState::Successful, 0),
-            package("broken", BuildState::Failed, 0),
-            package("running", BuildState::Active, 0),
+            package("ok", BuildState::Successful, false),
+            package("broken", BuildState::Failed, false),
+            package("running", BuildState::Active, false),
         ];
         sort_packages(
             &mut packages,
@@ -980,8 +978,8 @@ mod tests {
     #[test]
     fn an_out_of_date_package_outranks_a_current_one() {
         let mut packages = vec![
-            package("current", BuildState::Successful, 0),
-            package("stale", BuildState::Successful, 1),
+            package("current", BuildState::Successful, false),
+            package("stale", BuildState::Successful, true),
         ];
         sort_packages(
             &mut packages,
@@ -996,8 +994,8 @@ mod tests {
     #[test]
     fn sorting_by_name_is_case_insensitive() {
         let mut packages = vec![
-            package("zlib", BuildState::Successful, 0),
-            package("Apache", BuildState::Successful, 0),
+            package("zlib", BuildState::Successful, false),
+            package("Apache", BuildState::Successful, false),
         ];
         sort_packages(
             &mut packages,

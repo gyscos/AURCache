@@ -5,10 +5,8 @@
 //! as anything but a string, and the worker parses it on delivery.
 
 use sea_orm::entity::prelude::*;
-use serde::Serialize;
-use utoipa::ToSchema;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "worker_settings")]
 pub struct Model {
     #[sea_orm(primary_key)]

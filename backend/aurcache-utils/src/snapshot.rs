@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use alpm_srcinfo::SourceInfoV1;
 use aurcache_common::api::package::SourceFileContent;
-use aurcache_common::settings::{ApplicationSettings, Setting};
 use aurcache_db::packages::SourceData;
 use git2::Oid;
 use lru::LruCache;
@@ -16,7 +15,6 @@ use tokio::sync::Mutex;
 use crate::git::checkout::EmptyRepository;
 use crate::patch::SourcePatch;
 use crate::pkgbuild::fix_source_urls;
-use crate::settings::general::SettingsTraits;
 
 /// Base URL for AUR git repositories. AUR packages are unified with git
 /// sources: `https://aur.archlinux.org/{pkgbase}.git`, ref `HEAD`, no
@@ -40,6 +38,7 @@ const CACHE_CAPACITY: usize = 1000;
 
 /// A single rendered view of a source: either the pristine upstream fetch,
 /// or the result of applying a patch on top of it.
+#[derive(Clone)]
 struct SourceSnapshot {
     archive_bytes: Vec<u8>,
     /// `None` when this snapshot's `.SRCINFO`/`PKGBUILD` could not be parsed
@@ -99,6 +98,9 @@ struct CacheEntry {
     /// `refresh` can re-apply the same patch on top of a freshly fetched
     /// raw source instead of silently dropping it.
     patch: Option<SourcePatch>,
+    /// The checkout's commit history, read the first time anyone asks: it is
+    /// the same until `commit` moves, which replaces this entry.
+    history: tokio::sync::OnceCell<PackagingHistory>,
 }
 
 impl CacheEntry {
@@ -208,7 +210,7 @@ impl SnapshotStore {
         let Some(db) = &self.db else {
             return false;
         };
-        ApplicationSettings::get::<bool>(Setting::ParseNetwork, None, db)
+        crate::settings::get(db, crate::settings::key::PARSE_NETWORK, None)
             .await
             .value
     }
@@ -380,15 +382,20 @@ impl SnapshotStore {
             metadata.maintainer = maintainer_from_pkgbuild(&pkgbuild);
         }
 
-        // Off the executor: walking the full git history holds no `.await`.
+        // Off the executor: walking the git history holds no `.await`.
         // Best-effort stays best-effort — a panicked walk still yields an
         // empty history, like an unreadable repository.
         let history_path = self
             .checkout_root
             .join(sanitize_cache_key(&source_data.cache_key()));
-        let history = tokio::task::spawn_blocking(move || Self::history_at(&history_path))
-            .await
-            .unwrap_or_default();
+        let history = *entry
+            .history
+            .get_or_init(|| async move {
+                tokio::task::spawn_blocking(move || Self::history_at(&history_path))
+                    .await
+                    .unwrap_or_default()
+            })
+            .await;
         metadata.first_submitted = history.first_submitted;
         metadata.last_modified = history.last_modified;
         metadata
@@ -412,21 +419,16 @@ impl SnapshotStore {
         if walk.push_head().is_err() {
             return PackagingHistory::default();
         }
-
-        let mut newest = None;
-        let mut oldest = None;
-        for oid in walk.flatten() {
-            let Ok(commit) = repo.find_commit(oid) else {
-                continue;
-            };
-            let time = commit.time().seconds();
-            // The walk starts at HEAD and goes back, so the first commit seen
-            // is the newest and the last is the initial one.
-            if newest.is_none() {
-                newest = Some(time);
-            }
-            oldest = Some(time);
-        }
+        // The initial commit is at the end of the first-parent chain; merged
+        // branches only add commits that are neither the first nor the last.
+        walk.simplify_first_parent().ok();
+        let time = |oid| repo.find_commit(oid).ok().map(|c| c.time().seconds());
+        let newest = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(time);
+        let oldest = walk.flatten().last().and_then(time);
 
         PackagingHistory {
             first_submitted: oldest,
@@ -590,19 +592,27 @@ impl SnapshotStore {
         };
 
         // Fast path: already cached with the exact same patch state.
+        let cached = self.cache.lock().await.get(&cache_key).cloned();
+        if let Some(entry) = &cached
+            && Self::entry_matches_patch(entry, patch.as_ref())
         {
-            let mut cache = self.cache.lock().await;
-            if let Some(entry) = cache.get(&cache_key)
-                && Self::entry_matches_patch(entry, patch.as_ref())
-            {
-                return Ok(Arc::clone(entry));
-            }
+            return Ok(Arc::clone(entry));
         }
 
         // Read once: a DB round trip per call, and both consumers below want
         // the same answer.
         let network = self.parse_network().await;
-        let CheckedOutSource { commit, raw } = self.checkout(source_data, network).await?;
+        // Cached under another patch: the pristine snapshot is already here,
+        // and only the patch has to be applied again. Fetching is `refresh`'s
+        // job; doing it here too cost a round trip to the remote and a fresh
+        // parse every time a package's patch was edited or previewed.
+        let CheckedOutSource { commit, raw } = match cached {
+            Some(entry) => CheckedOutSource {
+                commit: entry.commit,
+                raw: entry.original().clone(),
+            },
+            None => self.checkout(source_data, network).await?,
+        };
 
         // Off the executor: patching unpacks, re-tars and re-parses the whole
         // archive with no `.await` in between.
@@ -780,7 +790,7 @@ fn sanitize_cache_key(cache_key: &str) -> String {
 }
 
 /// Unix timestamps of the first and latest commit of a packaging checkout.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct PackagingHistory {
     first_submitted: Option<i64>,
     last_modified: Option<i64>,
@@ -1025,6 +1035,7 @@ fn build_cache_entry(
             active: raw,
             original: None,
             patch: None,
+            history: tokio::sync::OnceCell::new(),
         }),
         Some(patch) => {
             let (patched_bytes, patched_sourceinfo) =
@@ -1039,6 +1050,7 @@ fn build_cache_entry(
                 active: patched,
                 original: Some(raw),
                 patch: Some(patch),
+                history: tokio::sync::OnceCell::new(),
             })
         }
     })
@@ -1615,6 +1627,34 @@ license=('MIT')
         patch
     }
 
+    /// First submitted is the initial commit, last modified is HEAD -- with a
+    /// merged branch in between, whose commits are neither.
+    #[test]
+    fn history_is_the_initial_commit_and_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let tree = {
+            let mut index = repo.index().unwrap();
+            repo.find_tree(index.write_tree().unwrap()).unwrap()
+        };
+        let commit = |at: i64, parents: &[&git2::Commit<'_>], update: Option<&str>| {
+            let sig = Signature::new("Test", "test@example.com", &git2::Time::new(at, 0)).unwrap();
+            let oid = repo
+                .commit(update, &sig, &sig, "c", &tree, parents)
+                .unwrap();
+            repo.find_commit(oid).unwrap()
+        };
+        let root = commit(1_000, &[], None);
+        // Older than the root by its clock: a side branch is not ordered.
+        let side = commit(500, &[&root], None);
+        let main = commit(2_000, &[&root], None);
+        commit(3_000, &[&main, &side], Some("HEAD"));
+
+        let history = SnapshotStore::history_at(tmp.path());
+        assert_eq!(history.first_submitted, Some(1_000));
+        assert_eq!(history.last_modified, Some(3_000));
+    }
+
     /// Commit a PKGBUILD (with a fixed pkgbase of `bar`, version `1.0`) plus
     /// a matching `.SRCINFO` to `main` in `repo`, creating the branch on the
     /// first call and extending its history thereafter. `marker` is added as
@@ -1815,6 +1855,30 @@ license=('MIT')
         let cleared = store.sourceinfo(&source, None).await.unwrap();
         assert_eq!(cleared.base.version.to_string(), "1.0-1");
         assert_eq!(store.cache.lock().await.len(), 1);
+    }
+
+    /// A new patch is applied to the pristine snapshot already held: keeping
+    /// up with upstream is `refresh`'s job, so editing a patch never waits on
+    /// the remote -- here, one that is gone.
+    #[tokio::test]
+    async fn changing_the_patch_does_not_fetch_again() {
+        if !pkgbuild_bridge_available() {
+            eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
+            return;
+        }
+
+        let aur_root = tempfile::tempdir().unwrap();
+        let remote = create_aur_git_repo(aur_root.path(), "bar", "1.0");
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        let source = SourceData::Aur {
+            name: "bar".to_string(),
+        };
+        store.sourceinfo(&source, None).await.unwrap();
+
+        std::fs::remove_dir_all(remote).unwrap();
+        let patch = some_patch("2.0").to_json().unwrap();
+        let patched = store.sourceinfo(&source, Some(&patch)).await.unwrap();
+        assert_eq!(patched.base.version.to_string(), "2.0-1");
     }
 
     /// `refresh` must re-apply whichever patch was active before the

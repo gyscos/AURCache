@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use crate::settings::general::GLOBAL_PKG_ID;
 use anyhow::Context;
 use aurcache_common::api::dump::{
     CA_CERT_FILE, CA_KEY_FILE, DUMP_SCHEMA_VERSION, DumpManifest, DumpPackage, DumpPackages,
@@ -17,7 +16,6 @@ use aurcache_common::api::dump::{
 use aurcache_common::api::worker::ApprovalStatus;
 use aurcache_db::api_tokens;
 use aurcache_db::helpers::time::now_secs;
-use aurcache_db::lists::ListColumn;
 use aurcache_db::prelude::{ApiTokens, Packages, Settings, WorkerSettings, Workers};
 use aurcache_db::{packages, settings, workers};
 use flate2::Compression;
@@ -71,8 +69,8 @@ pub async fn build_dump(
             row.name.clone(),
             DumpPackage {
                 source_data: row.source_data,
-                platforms: ListColumn::Package.split(&row.platforms),
-                build_flags: ListColumn::Package.split(&row.build_flags),
+                platforms: row.platforms.names(),
+                build_flags: row.build_flags.as_slice().to_vec(),
                 directly_requested: row.directly_requested,
                 has_patch: patches.contains_key(&row.name),
             },
@@ -158,10 +156,8 @@ async fn build_settings(
         // A setting with no value is the absence of a setting; carrying it
         // would restore a row that means nothing.
         let Some(value) = row.value else { continue };
-        // Global settings are stored against a sentinel id, not NULL: the
-        // column is NOT NULL so the `UNIQUE (pkg_id, key)` constraint holds.
-        match row.pkg_id {
-            None | Some(GLOBAL_PKG_ID) => {
+        match settings::package_of(row.pkg_id) {
+            None => {
                 dumped.global.insert(row.key, value);
             }
             Some(pkg_id) => {
@@ -207,10 +203,10 @@ async fn build_workers(
             settings: values.remove(&row.id).unwrap_or_default(),
             name: row.name,
             cert_fingerprint: row.cert_fingerprint,
-            status: row.status.to_string(),
-            native_arches: ListColumn::Worker.split(&row.native_arches),
-            emulated_arches: ListColumn::Worker.split(&row.emulated_arches),
-            package_affinity: ListColumn::Worker.split(&row.package_affinity),
+            status: row.status,
+            native_arches: row.native_arches.into_vec(),
+            emulated_arches: row.emulated_arches.into_vec(),
+            package_affinity: row.package_affinity.into_vec(),
             priority: row.priority,
             concurrency: row.concurrency,
             // Only alongside the CA that signed them. On their own they would

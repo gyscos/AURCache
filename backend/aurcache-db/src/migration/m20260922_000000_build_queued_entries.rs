@@ -19,7 +19,7 @@
 
 use crate::prelude::{Builds, LogEntities, Logs, Packages};
 use crate::{builds, log_entities, logs, packages};
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
@@ -110,7 +110,7 @@ async fn failed_before<C: ConnectionTrait>(db: &C, pkgbase: &str, at: i64) -> Re
         .into_tuple::<(Option<i32>,)>()
         .one(db)
         .await?;
-    Ok(matches!(status, Some((Some(BuildStates::FAILED_BUILD),))))
+    Ok(matches!(status, Some((Some(code),)) if code == BuildState::Failed.as_i32()))
 }
 
 #[async_trait::async_trait]
@@ -182,7 +182,7 @@ mod tests {
     use crate::migration::Migrator;
     use crate::prelude::{LogEntities, Logs};
     use crate::{builds, log_entities, logs, packages};
-    use aurcache_common::build_state::BuildStates;
+    use aurcache_common::build_state::BuildState;
     use aurcache_common::source::SourceData;
     use pacman_mirrors::platforms::Platform;
     use sea_orm::ActiveValue::Set;
@@ -226,10 +226,10 @@ mod tests {
 
         let pkg = packages::ActiveModel {
             name: Set("hello".to_string()),
-            status: Set(BuildStates::FAILED_BUILD),
-            out_of_date: Set(0),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            status: Set(BuildState::Failed),
+            out_of_date: Set(false),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "hello".into(),
             }),
@@ -242,7 +242,7 @@ mod tests {
         builds::ActiveModel {
             pkg_id: Set(pkg.id),
             number: Set(1),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(100)),
             platform: Set(Platform::X86_64),
             version: Set("1-1".to_string()),
@@ -254,7 +254,7 @@ mod tests {
         builds::ActiveModel {
             pkg_id: Set(pkg.id),
             number: Set(2),
-            status: Set(Some(BuildStates::FAILED_BUILD)),
+            status: Set(BuildState::Failed),
             start_time: Set(Some(300)),
             platform: Set(Platform::X86_64),
             version: Set("1-1".to_string()),

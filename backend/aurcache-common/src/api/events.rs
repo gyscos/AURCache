@@ -400,11 +400,6 @@ pub enum Event {
     #[serde(rename = "build.deleted")]
     BuildDeleted { build: BuildRef },
 
-    /// A package could not be queued at startup, and will not build until it
-    /// is fixed.
-    #[serde(rename = "build.enqueue_skipped")]
-    EnqueueSkipped { pkg: PackageRef, error: String },
-
     /// Nothing waiting was queued at startup, so builds that should have
     /// resumed did not.
     #[serde(rename = "build.startup_enqueue_failed")]
@@ -651,11 +646,6 @@ pub const KINDS: &[Kind] = &[
         kind: "build.unblocked",
         group: "Builds",
         label: "Build unblocked",
-    },
-    Kind {
-        kind: "build.enqueue_skipped",
-        group: "Builds",
-        label: "Not queued at startup",
     },
     Kind {
         kind: "build.startup_enqueue_failed",
@@ -1136,7 +1126,6 @@ impl Event {
             Self::BuildRecordFailed { .. } => "build.record_failed",
             Self::BuildCancelled { .. } => "build.cancelled",
             Self::BuildDeleted { .. } => "build.deleted",
-            Self::EnqueueSkipped { .. } => "build.enqueue_skipped",
             Self::StartupEnqueueFailed { .. } => "build.startup_enqueue_failed",
             Self::PackageChanged { .. } => "package.changed",
             Self::SourceEdited { .. } => "source.edited",
@@ -1218,7 +1207,6 @@ impl Event {
             | Self::BuildFailed { .. }
             | Self::BuildCompletionRejected { .. }
             | Self::BuildRecordFailed { .. }
-            | Self::EnqueueSkipped { .. }
             | Self::SourceMetadataFailed { .. }
             | Self::CheckoutRemoveFailed { .. }
             | Self::DepsUnresolved { .. }
@@ -1542,11 +1530,6 @@ impl Event {
             ],
             Self::BuildCancelled { build } => vec![text("stopped "), entity(build)],
             Self::BuildDeleted { build } => vec![text("deleted "), entity(build)],
-            Self::EnqueueSkipped { pkg, error } => vec![
-                text("could not queue "),
-                entity(pkg),
-                text(format!(" at startup: {error}")),
-            ],
             Self::StartupEnqueueFailed { error } => vec![text(format!(
                 "could not queue the waiting builds at startup: {error}"
             ))],
@@ -1862,10 +1845,6 @@ mod tests {
             },
             Event::BuildCancelled { build: build() },
             Event::BuildDeleted { build: build() },
-            Event::EnqueueSkipped {
-                pkg: pkg(),
-                error: error(),
-            },
             Event::StartupEnqueueFailed { error: error() },
             Event::PackageChanged {
                 pkg: pkg(),

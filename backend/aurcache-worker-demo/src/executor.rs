@@ -61,25 +61,14 @@ impl Executor for DemoExecutor {
         )
         .await;
 
-        // Empty from a server predating the fields: a lone pkgbase is the
-        // only shape such a server could have meant.
-        let names = if job.packages.is_empty() {
-            vec![job.pkgbase.clone()]
-        } else {
-            job.packages.clone()
-        };
-        if job.version.is_empty() {
-            return report::setup_failure(
-                "server sent no version for this build; \
-                     the demo worker needs a server that sends one",
-            );
-        }
+        let names = job.packages.clone();
 
         // The visible beat, in slices so a cancel lands promptly rather
         // than after the whole wait.
         let deadline = std::time::Instant::now() + Duration::from_secs(fake_build_secs());
         while std::time::Instant::now() < deadline {
-            if cancel.load(Ordering::Relaxed) || protocol::remote_cancel(&client, build_id).await {
+            if cancel.load(Ordering::Relaxed) || protocol::cancel_requested(&client, build_id).await
+            {
                 return report::canceled();
             }
             tokio::time::sleep(Duration::from_millis(500)).await;

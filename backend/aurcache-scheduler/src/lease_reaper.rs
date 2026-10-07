@@ -12,13 +12,11 @@
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::Event;
 use aurcache_common::api::log::WorkerRef;
-use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::worker_jobs::{Abandoned, reap_expired_builds};
 use aurcache_db::prelude::Workers;
 use aurcache_db::workers;
-use aurcache_utils::settings::Seconds;
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use sea_orm::DatabaseConnection;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use std::time::Duration;
@@ -43,8 +41,7 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
             tokio::time::sleep(interval).await;
 
             // `MAX_BUILD_DURATION` reuses the configurable JobTimeout setting.
-            let job_timeout: SettingsEntry<Seconds> =
-                ApplicationSettings::get(Setting::JobTimeout, None, &db).await;
+            let job_timeout = settings::get(&db, settings::key::JOB_TIMEOUT, None).await;
             let max_build_age = i64::try_from(job_timeout.value.0)
                 .unwrap_or(i64::MAX)
                 .saturating_add(grace);

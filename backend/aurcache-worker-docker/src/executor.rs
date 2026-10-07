@@ -10,10 +10,10 @@
 //! credential handling. New deployments should use `aurcache-worker`.
 
 use anyhow::{Context, Result, anyhow};
-use aurcache_common::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{BuildOutcome, CompleteReport, JobDescriptor};
 use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::executor::Executor;
-use aurcache_worker_core::protocol::{log, remote_cancel, upload_artifacts};
+use aurcache_worker_core::protocol::{Stop, StopWatch, log, upload_artifacts};
 use aurcache_worker_core::settings::WorkerSettings;
 use aurcache_worker_core::{artifacts, report};
 use bollard::Docker;
@@ -24,9 +24,9 @@ use bollard::query_parameters::{
 };
 use futures::StreamExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::commands;
 use crate::config::{BuildDirs, Config};
@@ -281,7 +281,7 @@ impl DockerExecutor {
         // whole directory behind.
         let outcome = async {
             let report = result?;
-            if report.success {
+            if report.outcome == BuildOutcome::Succeeded {
                 upload_artifacts(client, build_id, &local_dir).await?;
             }
             Ok(report)
@@ -329,20 +329,12 @@ impl DockerExecutor {
             }
         });
 
-        let started = Instant::now();
-        let timeout = cfg.core.build_timeout;
-        // The server is asked about remote cancellation at most every 30 s:
-        // with N concurrent builds a per-tick round trip is N requests per
-        // 5 s for no extra responsiveness, since cancel latency is already
-        // dominated by build granularity. Same throttle as the chroot path.
-        let remote_poll = Duration::from_secs(30);
-        let mut last_remote_poll = std::time::Instant::now();
+        let mut watch = StopWatch::start(cfg.core.build_timeout, cancel, build_id);
         let mut wait = self.docker.wait_container(
             container_id,
             None::<bollard::query_parameters::WaitContainerOptions>,
         );
-        let mut canceled = false;
-        let mut timed_out = false;
+        let mut stopped = None;
         let mut exit_code: Option<i64> = None;
 
         loop {
@@ -362,26 +354,9 @@ impl DockerExecutor {
                     }
                     None => break,
                 },
-                () = tokio::time::sleep(Duration::from_secs(5)) => {
-                    // `>=`: a timeout of N means N seconds, not N+1. (The
-                    // 5 s poll quantum dominates either way; this is about
-                    // saying what is meant.)
-                    let hit_timeout =
-                        timeout > 0 && started.elapsed().as_secs() >= timeout;
-                    if cancel.load(Ordering::SeqCst) {
-                        canceled = true;
-                    } else if !hit_timeout && last_remote_poll.elapsed() >= remote_poll {
-                        last_remote_poll = std::time::Instant::now();
-                        if remote_cancel(client, build_id).await {
-                            canceled = true;
-                        }
-                    }
-                    // A cancel wins, as it did before the poll was throttled:
-                    // the build is reported as what the user asked for.
-                    if hit_timeout && !canceled {
-                        timed_out = true;
-                    }
-                    if !(canceled || timed_out) {
+                () = tokio::time::sleep(StopWatch::TICK) => {
+                    stopped = watch.check(client).await;
+                    if stopped.is_none() {
                         continue;
                     }
                     let _ = self.docker.kill_container(
@@ -399,7 +374,7 @@ impl DockerExecutor {
         // bounded time — the same shape as the chroot path's
         // `KILLED_OUTPUT_GRACE`.
         const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(30);
-        if canceled || timed_out {
+        if stopped.is_some() {
             if tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut pump)
                 .await
                 .is_err()
@@ -414,10 +389,10 @@ impl DockerExecutor {
             let _ = pump.await;
         }
 
-        if timed_out {
-            return Ok(report::timeout_failure(started.elapsed().as_secs()));
+        if stopped == Some(Stop::TimedOut) {
+            return Ok(report::timeout_failure(watch.elapsed().as_secs()));
         }
-        if canceled {
+        if stopped == Some(Stop::Canceled) {
             return Ok(report::canceled());
         }
         // The legacy container builder samples neither the build tree nor the
@@ -425,7 +400,7 @@ impl DockerExecutor {
         Ok(match exit_code {
             Some(0) => report::success(),
             Some(code) => CompleteReport {
-                success: false,
+                outcome: BuildOutcome::Failed,
                 exit_code: i32::try_from(code).ok(),
                 reason: Some(report::exit_code_reason(code)),
                 ..CompleteReport::default()

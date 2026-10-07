@@ -382,6 +382,10 @@ proves to be the painful part, a `tokio::task_local` that `emit` consults when
 the handle carries no scope is a drop-in upgrade. A `tracing` Layer is the only
 option that needs the dynamic round trip, and is not planned.
 
+The handle, storage and index are built; no production code emits through a
+scoped handle yet, and no page shows a build's entries. That remainder is
+`design/proposed/build-scoped-logs.md`.
+
 ## Links, and the deleted-entity case
 
 1. **The record is pure.** An event says `old: PackageRef("foo")` and never says

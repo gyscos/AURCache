@@ -64,7 +64,7 @@ pub struct BuildSummary {
     pub number: i32,
     pub pkg_name: String,
     pub version: String,
-    pub status: i32,
+    pub status: crate::build_state::BuildState,
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub platform: String,
@@ -80,12 +80,13 @@ pub struct BuildSummary {
     /// Exact rather than sampled: the build runs in a cgroup of its own and
     /// this is that cgroup's `memory.peak`, covering every process in the tree.
     ///
-    /// `None` where no figure was reported -- an older worker, the deprecated
-    /// container builder (Docker exposes no peak on cgroup v2), or a worker
+    /// `None` where no figure was reported -- a build from before figures were
+    /// recorded, the deprecated container builder (Docker exposes no peak on cgroup v2), or a worker
     /// whose cgroup subtree could not be prepared.
     pub peak_memory: Option<i64>,
     /// Disk the build used on its worker, part by part. `None` where no
-    /// figure was reported: an older worker, or one without a storage pool.
+    /// figure was reported: a build from before figures were recorded, or a
+    /// worker without a storage pool.
     #[cfg_attr(feature = "db", sea_orm(skip))]
     #[serde(default)]
     pub disk_usage: Option<DiskUsage>,

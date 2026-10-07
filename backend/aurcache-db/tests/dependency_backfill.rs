@@ -1,3 +1,4 @@
+use aurcache_common::build_state::BuildState;
 use aurcache_db::migration::m20260508_000000_dependency_resolution_combined::backfill_dependencies;
 use aurcache_db::{
     dependencies,
@@ -99,12 +100,11 @@ async fn backfill_creates_dependency_links() {
 
     packages::ActiveModel {
         name: Set("parent-pkg".to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -243,12 +243,11 @@ async fn backfill_multi_dep_package() {
     // Pre-insert turso (as if it existed pre-migration)
     packages::ActiveModel {
         name: Set("turso".to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "turso".into(),
         }),
@@ -272,7 +271,7 @@ async fn backfill_multi_dep_package() {
         .unwrap()
         .expect("libaegis should have been inserted by backfill");
     assert!(!libaegis.directly_requested);
-    assert_eq!(libaegis.status, 3);
+    assert_eq!(libaegis.status, BuildState::Enqueued);
 
     // simsimd inserted as placeholder dep
     let simsimd = packages::Entity::find()
@@ -282,7 +281,7 @@ async fn backfill_multi_dep_package() {
         .unwrap()
         .expect("simsimd should have been inserted by backfill");
     assert!(!simsimd.directly_requested);
-    assert_eq!(simsimd.status, 3);
+    assert_eq!(simsimd.status, BuildState::Enqueued);
 
     // turso unchanged
     let turso = packages::Entity::find()
@@ -398,12 +397,11 @@ async fn backfill_resolves_provider_dependencies() {
 
     packages::ActiveModel {
         name: Set("parent-pkg".to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -521,12 +519,11 @@ async fn backfill_prefers_existing_local_provider() {
 
     packages::ActiveModel {
         name: Set("parent-pkg".to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "parent-pkg".into(),
         }),
@@ -541,12 +538,11 @@ async fn backfill_prefers_existing_local_provider() {
 
     let local_provider = packages::ActiveModel {
         name: Set("local-provider".to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0-1".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "local-provider".into(),
         }),

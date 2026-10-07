@@ -8,6 +8,9 @@ use aurcache_deps::AurClient;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// What the RPC answers when it knows none of the names asked about.
+const EMPTY_ANSWER: &str = r#"{"version":5,"type":"multiinfo","resultcount":0,"results":[]}"#;
+
 fn client_for(server: &MockServer) -> AurClient {
     AurClient::with_urls(format!("{}/rpc/v5", server.uri()))
 }
@@ -22,16 +25,16 @@ async fn a_bad_gateway_is_retried() {
         .mount(&server)
         .await;
     Mock::given(any())
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"snapshot".to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_ANSWER))
         .mount(&server)
         .await;
 
-    let bytes = client_for(&server)
-        .download_snapshot_bytes("hello")
+    let found = client_for(&server)
+        .multi_info_of(&["hello"])
         .await
         .expect("the second attempt succeeds");
 
-    assert_eq!(bytes, b"snapshot");
+    assert!(found.is_empty());
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
@@ -44,7 +47,7 @@ async fn a_not_found_is_an_answer_and_not_retried() {
         .await;
 
     client_for(&server)
-        .download_snapshot_bytes("hello")
+        .multi_info_of(&["hello"])
         .await
         .expect_err("a 404 fails");
 
@@ -77,11 +80,7 @@ async fn a_failed_query_does_not_list_its_packages() {
 async fn names_the_aur_does_not_know_are_an_empty_answer() {
     let server = MockServer::start().await;
     Mock::given(any())
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(
-                r#"{"version":5,"type":"multiinfo","resultcount":0,"results":[]}"#,
-            ),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_ANSWER))
         .mount(&server)
         .await;
 

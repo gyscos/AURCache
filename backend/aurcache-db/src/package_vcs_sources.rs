@@ -8,10 +8,8 @@
 //! (e.g. `mypkg::git+https://example.com/repo.git#branch=develop`), which
 //! already uniquely identifies each source line within a package.
 use sea_orm::entity::prelude::*;
-use serde::Serialize;
-use utoipa::ToSchema;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "package_vcs_sources")]
 pub struct Model {
     #[sea_orm(primary_key)]

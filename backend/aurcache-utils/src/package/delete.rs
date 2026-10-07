@@ -60,15 +60,10 @@ pub async fn package_delete(
     let remaining: Option<Vec<SourceData>> = match Packages::find()
         .select_only()
         .column(packages::Column::SourceData)
-        .into_tuple::<String>()
+        .into_tuple::<SourceData>()
         .all(db)
         .await
-        .map_err(anyhow::Error::from)
-        .and_then(|rows| {
-            rows.iter()
-                .map(|raw| raw.parse().map_err(|e| anyhow::anyhow!("{e}")))
-                .collect()
-        }) {
+    {
         Ok(rows) => Some(rows),
         Err(e) => {
             warn!("could not list packages, leaving source checkouts in place: {e}");

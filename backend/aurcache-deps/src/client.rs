@@ -99,13 +99,6 @@ impl Default for AurClient {
     }
 }
 
-/// Build a snapshot download URL for an AUR package from the RPC URL.
-/// Strips `/rpc/v5` from the RPC URL to derive the base domain (if present).
-pub(crate) fn snapshot_url(rpc_url: &str, pkgbase: &str) -> String {
-    let base = rpc_url.trim_end_matches("/rpc/v5").trim_end_matches('/');
-    format!("{base}/cgit/aur.git/snapshot/{pkgbase}.tar.gz")
-}
-
 /// What each source says about one dependency name.
 ///
 /// The columns of the truth table in [`AurClient::resolve_dependencies`],
@@ -544,14 +537,6 @@ impl AurClient {
         send_with_retry(|| self.http.get(url.clone()).send())
             .await
             .map_err(Error::Http)
-    }
-
-    /// Download the raw snapshot tarball for an AUR pkgbase.
-    pub async fn download_snapshot_bytes(&self, pkgbase: &str) -> Result<Vec<u8>, Error> {
-        let url = snapshot_url(&self.rpc_url, pkgbase);
-        let resp = self.retry_get(url).await?;
-        let bytes = resp.bytes().await?.to_vec();
-        Ok(bytes)
     }
 
     /// The AUR package base that declares `dep_name` in its `provides`.

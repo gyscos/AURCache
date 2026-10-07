@@ -83,30 +83,18 @@ pub struct SourcePreviewFileRequest {
 /// A partial update of a package: every field left `None` is left as it is.
 ///
 /// Absent fields are not sent, so a client builds one from `Default` and sets
-/// only what it changes. `name`, `status`, `out_of_date` and `latest_build`
-/// are server-managed and set by the add, build and version-check flows; they
-/// are accepted here, but no client of this crate sets them.
+/// only what it changes. Only what an operator configures is here: the name,
+/// status and versions belong to the add, build and version-check flows, and a
+/// package renamed from outside would lose its logs, artifacts and edges.
 #[derive(Deserialize, ToSchema, Serialize, Default, Clone, Debug, PartialEq, Eq)]
 pub struct PackagePatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub out_of_date: Option<i32>,
-    /// `Some(None)` clears it, sent as `null`.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "clearable"
-    )]
-    pub latest_build: Option<Option<i32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_flags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<String>>,
-    /// Multi-file unified diff applied on top of the fetched source.
-    /// `Some(None)` clears an existing patch, `None` leaves it untouched.
+    /// The source patch, as stored: a JSON object of one unified diff per
+    /// file, applied on top of the fetched source. `Some(None)` clears an
+    /// existing patch, `None` leaves it untouched.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -138,8 +126,8 @@ pub struct SimplePackage {
     /// The list leaves those out by default, so this is what tells the two
     /// apart once they are asked for together.
     pub directly_requested: bool,
-    pub status: i32,
-    pub outofdate: i32,
+    pub status: crate::build_state::BuildState,
+    pub outofdate: bool,
     pub latest_version: Option<String>,
     /// `None` until a version check has determined it. The column is nullable
     /// and rows land in this list before their first check — the dependency
@@ -163,8 +151,8 @@ pub struct ExtendedPackage {
     pub id: i32,
     pub name: String,
     pub directly_requested: bool,
-    pub status: i32,
-    pub outofdate: i32,
+    pub status: crate::build_state::BuildState,
+    pub outofdate: bool,
     pub latest_version: Option<String>,
     pub selected_platforms: Vec<String>,
     pub selected_build_flags: Option<Vec<String>>,
@@ -296,8 +284,8 @@ pub struct PackageDependency {
     pub name: String,
     /// What this relation requires, e.g. `>=1.3`. Empty when unconstrained.
     pub version_constraint: String,
-    /// Build state of the dependency itself, as a [`crate::build_state::BuildState`].
-    pub status: i32,
+    /// Build state of the dependency itself.
+    pub status: crate::build_state::BuildState,
     /// The version currently in the repository — the dependency's newest
     /// successful build. `None` when it has never built.
     pub built_version: Option<String>,

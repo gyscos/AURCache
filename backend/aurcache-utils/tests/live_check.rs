@@ -1,5 +1,6 @@
 //! What a removal collects, and what it leaves alone.
 
+use aurcache_common::build_state::BuildState;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::{self, SourceData};
 use aurcache_db::{dependencies, prelude::Dependencies};
@@ -30,12 +31,11 @@ async fn memory_db() -> DatabaseConnection {
 async fn package(db: &DatabaseConnection, name: &str, directly_requested: bool) -> i32 {
     packages::ActiveModel {
         name: Set(name.to_string()),
-        status: Set(3),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(None),
-        latest_build: Set(None),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur { name: name.into() }),
         directly_requested: Set(directly_requested),
         split_packages: Set(None),

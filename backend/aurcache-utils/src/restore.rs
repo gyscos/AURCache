@@ -22,7 +22,7 @@
 //! either -- an imported graph could disagree with today's AUR -- so the depends
 //! lists have to be rediscovered from the sources regardless.
 
-use aurcache_db::lists::ListColumn;
+use aurcache_db::lists::{BuildFlags, Platforms, WorkerList};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
@@ -32,7 +32,7 @@ use aurcache_common::api::dump::{
     PACKAGES_FILE, PATCH_DIR, RestoreEntry, RestoreOptions, RestoreOutcome, SETTINGS_FILE,
     SecretsPolicy, TOKENS_FILE, WORKERS_FILE,
 };
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::prelude::Packages;
 use aurcache_db::{packages, settings};
 use flate2::read::GzDecoder;
@@ -126,6 +126,10 @@ pub fn load_dump(bytes: &[u8]) -> anyhow::Result<LoadedDump> {
     for (pkgbase, package) in &packages {
         if package.platforms.is_empty() {
             anyhow::bail!("'{pkgbase}' lists no platforms, so nothing could build it");
+        }
+        for name in &package.platforms {
+            name.parse::<pacman_mirrors::platforms::Platform>()
+                .map_err(|e| anyhow::anyhow!("'{pkgbase}': {e}"))?;
         }
     }
 
@@ -438,6 +442,26 @@ pub async fn apply(
     {
         tracing::warn!("restore could not remove packages nothing needs: {e:#}");
     }
+
+    // Builds for everything that has none: what the dump carried, and the
+    // dependencies pass 3 brought in, each queued or left waiting on what it
+    // needs. The same scan a server runs when it starts, so a restored
+    // instance builds the same either way, without waiting for a restart.
+    if let Err(e) =
+        crate::package::enqueue::enqueue_missing_buildable_packages(db, &services.activity).await
+    {
+        let _ = progress
+            .send(RestoreEntry {
+                pkgbase: String::new(),
+                outcome: RestoreOutcome::Failed {
+                    error: format!(
+                        "the packages were imported, but their builds were not queued: {e:#}. \
+                         Restarting the server queues them."
+                    ),
+                },
+            })
+            .await;
+    }
 }
 
 /// Install the dump's CA and token hashes, when asked to.
@@ -673,15 +697,17 @@ async fn write_workers<C: sea_orm::ConnectionTrait>(
             name: Set(worker.name.clone()),
             status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
             cert_fingerprint: Set(worker.cert_fingerprint.clone()),
-            native_arches: Set(ListColumn::Worker.join(&worker.native_arches)),
-            emulated_arches: Set(ListColumn::Worker.join(&worker.emulated_arches)),
-            package_affinity: Set(ListColumn::Worker.join(&worker.package_affinity)),
+            native_arches: Set(WorkerList::new(&worker.native_arches)),
+            emulated_arches: Set(WorkerList::new(&worker.emulated_arches)),
+            package_affinity: Set(WorkerList::new(&worker.package_affinity)),
             priority: Set(worker.priority),
             concurrency: Set(worker.concurrency),
             signed_cert: Set(with_certificates
                 .then(|| worker.signed_cert.clone())
                 .flatten()),
             not_after: Set(with_certificates.then_some(worker.not_after).flatten()),
+            // Declared by the worker itself, when it next registers.
+            settings_declaration: Set("[]".to_string()),
             ..Default::default()
         }
         .insert(txn)
@@ -739,11 +765,22 @@ async fn write_tokens<C: sea_orm::ConnectionTrait>(
     Ok(())
 }
 
+/// The platforms a dump names for a package; [`load_dump`] has refused one
+/// naming a platform this version does not know.
+fn platforms(package: &DumpPackage) -> Platforms {
+    Platforms::new(
+        package
+            .platforms
+            .iter()
+            .filter_map(|name| name.parse().ok()),
+    )
+}
+
 /// The columns a dump owns. Everything else on the row is derived and is left
 /// to the passes that follow.
 fn apply_config(active: &mut packages::ActiveModel, package: &DumpPackage, patch: Option<String>) {
-    active.platforms = Set(ListColumn::Package.join(&package.platforms));
-    active.build_flags = Set(ListColumn::Package.join(&package.build_flags));
+    active.platforms = Set(platforms(package));
+    active.build_flags = Set(BuildFlags::new(&package.build_flags));
     active.directly_requested = Set(package.directly_requested);
     active.source_data = Set(package.source_data.clone());
     active.patch = Set(patch);
@@ -759,10 +796,10 @@ async fn insert_row<C: sea_orm::ConnectionTrait>(
         name: Set(pkgbase.to_string()),
         // Nothing is built for it here yet, which is what the add path
         // records for a new package too.
-        status: Set(BuildStates::ENQUEUED_BUILD),
-        out_of_date: Set(0),
-        platforms: Set(ListColumn::Package.join(&package.platforms)),
-        build_flags: Set(ListColumn::Package.join(&package.build_flags)),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
+        platforms: Set(platforms(package)),
+        build_flags: Set(BuildFlags::new(&package.build_flags)),
         source_data: Set(package.source_data.clone()),
         directly_requested: Set(package.directly_requested),
         patch: Set(patch),
@@ -784,41 +821,49 @@ async fn write_settings<C: sea_orm::ConnectionTrait>(
     dump: &LoadedDump,
     ids: &BTreeMap<String, i32>,
 ) -> anyhow::Result<()> {
-    let mut desired: Vec<(i32, &str, &str)> = Vec::new();
+    /// One value the dump sets, where it applies.
+    struct Desired<'a> {
+        /// The stored `pkg_id`; see [`settings::scope`].
+        scope: i32,
+        key: &'a str,
+        value: &'a str,
+    }
+    let mut desired: Vec<Desired> = Vec::new();
     for (key, value) in &dump.settings.global {
-        desired.push((crate::settings::general::GLOBAL_PKG_ID, key, value));
+        desired.push(Desired {
+            scope: settings::scope(None),
+            key,
+            value,
+        });
     }
     for (pkgbase, values) in &dump.settings.packages {
         // Validation guarantees the package is in the dump; this only skips one
         // that was left alone by `Skip`, whose own settings are already right.
         let Some(id) = ids.get(pkgbase) else { continue };
         for (key, value) in values {
-            desired.push((*id, key, value));
+            desired.push(Desired {
+                scope: settings::scope(Some(*id)),
+                key,
+                value,
+            });
         }
     }
     // A dump from before a setting was retired still carries it; restoring it
     // would bring back a row the migration removed and nothing reads.
-    desired.retain(|(_, key, _)| !aurcache_common::settings::RETIRED_SETTING_KEYS.contains(key));
+    desired.retain(|d| !aurcache_common::settings::RETIRED_SETTING_KEYS.contains(&d.key));
 
-    let pkg_ids: Vec<i32> = {
-        let mut seen = HashSet::new();
-        desired
-            .iter()
-            .map(|(pkg_id, _, _)| *pkg_id)
-            .filter(|pkg_id| seen.insert(*pkg_id))
-            .collect()
-    };
+    let scopes: HashSet<i32> = desired.iter().map(|d| d.scope).collect();
     let mut existing: BTreeMap<(i32, String), settings::Model> = settings::Entity::find()
-        .filter(settings::Column::PkgId.is_in(pkg_ids))
+        .filter(settings::Column::PkgId.is_in(scopes))
         .all(db)
         .await?
         .into_iter()
-        .filter_map(|row| row.pkg_id.map(|pkg_id| ((pkg_id, row.key.clone()), row)))
+        .map(|row| ((row.pkg_id, row.key.clone()), row))
         .collect();
 
     let mut missing = Vec::new();
-    for (pkg_id, key, value) in desired {
-        match existing.remove(&(pkg_id, key.to_string())) {
+    for Desired { scope, key, value } in desired {
+        match existing.remove(&(scope, key.to_string())) {
             // The settings table carries no timestamps, so a row that already
             // holds the restored value is done: rewriting it changes nothing.
             Some(row) if row.value.as_deref() == Some(value) => {}
@@ -830,7 +875,7 @@ async fn write_settings<C: sea_orm::ConnectionTrait>(
             None => missing.push(settings::ActiveModel {
                 key: Set(key.to_string()),
                 value: Set(Some(value.to_string())),
-                pkg_id: Set(Some(pkg_id)),
+                pkg_id: Set(scope),
                 ..Default::default()
             }),
         }
@@ -857,10 +902,8 @@ async fn fill_source_facts(
     let sourceinfo = store
         .sourceinfo(&row.source_data, row.patch.as_deref())
         .await?;
-    let deps = aurcache_deps::deps_from_srcinfo(
-        &sourceinfo,
-        &crate::pkg::architectures_for_platforms(&row.platforms),
-    );
+    let deps =
+        aurcache_deps::deps_from_srcinfo(&sourceinfo, &crate::pkg::architectures(&row.platforms));
 
     let mut active: packages::ActiveModel = row.into();
     active.split_packages = Set(split_packages_json(pkgbase, &deps.pkgnames)?);
@@ -874,6 +917,7 @@ async fn fill_source_facts(
 mod tests {
     use super::{clear_existing, load_dump};
     use aurcache_common::api::dump::DUMP_SCHEMA_VERSION;
+    use aurcache_common::build_state::BuildState;
 
     /// Build an archive from explicit file contents, so a test can write a
     /// malformed one as easily as a good one.
@@ -1004,10 +1048,10 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
         aurcache_db::packages::ActiveModel {
             name: Set("precious".to_string()),
-            status: Set(0),
-            out_of_date: Set(0),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            status: Set(BuildState::Active),
+            out_of_date: Set(false),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "precious".to_string(),
             }),

@@ -751,7 +751,7 @@ async fn a_workers_settings_say_where_each_value_came_from(session: &Session) {
     );
     session
         .wait_until("the page to say the worker has not taken it", |t| {
-            t.contains("has not taken any values from here yet")
+            t.contains("has not picked up the latest save yet")
         })
         .await;
 

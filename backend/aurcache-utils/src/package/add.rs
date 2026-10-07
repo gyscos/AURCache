@@ -1,3 +1,4 @@
+use crate::package::edges::{Declaration, Dependee, resolve_edges};
 use crate::package::enqueue::trigger_initial_builds;
 use crate::package::metadata::refresh_source_metadata;
 use crate::patch::SourcePatch;
@@ -6,14 +7,12 @@ use crate::snapshot::SnapshotStore;
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_activitylog::events::Event;
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::helpers::dependency_resolution::{PackageCandidate, TrackedPackages};
-use aurcache_db::lists::ListColumn;
+use aurcache_db::lists::{BuildFlags, Platforms};
 use aurcache_db::packages;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
-use aurcache_deps::DependencyResolution;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::QueryFilter;
 use sea_orm::prelude::Expr;
@@ -25,29 +24,23 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// How the packages an add inserts are to be built.
 pub(crate) struct AddContext {
-    platforms: Vec<Platform>,
-    build_flags: Vec<String>,
+    platforms: Platforms,
+    build_flags: BuildFlags,
 }
 
 impl AddContext {
-    /// A context from what a package row stores, for dependencies added on
-    /// behalf of an existing package. An unknown platform is skipped.
-    fn from_stored(platforms: &str, build_flags: &str) -> Self {
+    /// The context `dependent` was added with, for dependencies added on its
+    /// behalf: they are built the way the package needing them is.
+    fn of(dependent: &packages::Model) -> Self {
         Self {
-            platforms: Platform::parse_many(platforms)
-                .filter_map(Result::ok)
-                .collect(),
-            build_flags: ListColumn::Package.split(build_flags),
+            platforms: dependent.platforms.clone(),
+            build_flags: dependent.build_flags.clone(),
         }
     }
 
     /// The architectures whose dependencies the packages need.
     fn architectures(&self) -> Vec<alpm_types::SystemArchitecture> {
-        self.platforms
-            .iter()
-            .copied()
-            .map(crate::pkg::architecture)
-            .collect()
+        crate::pkg::architectures(&self.platforms)
     }
 }
 
@@ -130,17 +123,6 @@ impl AddPlan {
     }
 }
 
-/// Build flags with surrounding whitespace trimmed and blank entries dropped.
-pub fn normalize_build_flags(flags: Vec<String>) -> Vec<String> {
-    flags
-        .into_iter()
-        .filter_map(|flag| {
-            let trimmed = flag.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .collect()
-}
-
 pub(crate) fn build_add_context(
     platforms: Option<Vec<Platform>>,
     build_flags: Option<Vec<String>>,
@@ -148,16 +130,12 @@ pub(crate) fn build_add_context(
     // Platform names are validated where they enter as strings (the API's
     // `Platform::from_str`); by the time they are `Platform` values there is
     // nothing left to check.
-    let build_flags = normalize_build_flags(build_flags.unwrap_or_else(|| {
-        vec![
-            "--noconfirm".to_string(),
-            "--noprogressbar".to_string(),
-            "--nocolor".to_string(),
-        ]
-    }));
     AddContext {
-        platforms: platforms.unwrap_or_else(|| vec![Platform::X86_64]),
-        build_flags,
+        platforms: Platforms::new(platforms.unwrap_or_else(|| vec![Platform::X86_64])),
+        build_flags: build_flags.map_or_else(
+            || BuildFlags::new(["--noconfirm", "--noprogressbar", "--nocolor"]),
+            BuildFlags::new,
+        ),
     }
 }
 
@@ -259,11 +237,7 @@ async fn finalize_package_add(
     package_spec: PackageInsertSpec,
 ) -> anyhow::Result<AddedSource> {
     let Services {
-        client,
-        store,
-        db,
-        tx,
-        ..
+        client, store, db, ..
     } = services;
     if package_exists(db, &package_spec.pkgbase).await? {
         set_directly_requested(db, &package_spec.pkgbase).await?;
@@ -329,7 +303,13 @@ async fn finalize_package_add(
         .cloned()
         .ok_or_else(|| anyhow!("Package add produced no inserted packages"))?;
 
-    trigger_initial_builds(db, tx, &services.activity, &context.platforms, &added_order).await?;
+    trigger_initial_builds(
+        db,
+        &services.activity,
+        context.platforms.as_slice(),
+        &added_order,
+    )
+    .await?;
     Ok(AddedSource {
         pkgbase,
         already_tracked: false,
@@ -433,22 +413,21 @@ async fn plan_dependency_recursive(
     plan_package_with_deps(plan_context, package_spec, visited, plan).await
 }
 
-/// Insert `pkgbase` and every AUR dependency it needs as dependency-only rows,
-/// returning the pkgbases actually inserted.
+/// Insert `pkgbase` and every AUR dependency it needs as dependency-only rows
+/// of `dependent`, returning the pkgbases actually inserted.
 ///
 /// Rows only: nothing is queued. The update flow builds what it inserted
 /// through its own dependency readiness check; anything else wants
-/// [`add_dependency_package`].
-pub async fn ensure_aur_package_exists_recursive(
-    client: &aurcache_deps::AurClient,
-    store: &SnapshotStore,
-    db: &DatabaseConnection,
+/// [`add_dependency`].
+pub async fn insert_dependency(
+    services: &Services,
+    dependent: &packages::Model,
     pkgbase: &str,
-    platforms_str: &str,
-    build_flags_str: &str,
 ) -> anyhow::Result<Vec<String>> {
-    // The dependency rows are built the way the package needing them is.
-    let context = AddContext::from_stored(platforms_str, build_flags_str);
+    let Services {
+        client, store, db, ..
+    } = services;
+    let context = AddContext::of(dependent);
     let mut visited = HashSet::new();
     let mut plan = AddPlan::default();
     let tracked = TrackedPackages::load(db).await?;
@@ -469,37 +448,25 @@ pub async fn ensure_aur_package_exists_recursive(
     persist_plan(db, &context, plan).await
 }
 
-/// Add an AUR package as a dependency, and do everything an add does with it:
+/// Add an AUR package as a dependency of `dependent`, and do everything an add
+/// does with it:
 /// the rows for it and its own dependencies, their metadata, and their initial
 /// builds -- leaves queued, the rest waiting on them.
 ///
 /// For a dependency chosen by hand, such as a replacement. Without the builds
 /// the package would sit "Enqueued" with no build row for any worker to claim,
 /// and whatever depends on it would wait on it for ever.
-pub async fn add_dependency_package(
+pub async fn add_dependency(
     services: &Services,
+    dependent: &packages::Model,
     pkgbase: &str,
-    platforms_str: &str,
-    build_flags_str: &str,
 ) -> anyhow::Result<()> {
-    let platforms = Platform::parse_many(platforms_str)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow!("invalid platforms '{platforms_str}': {e}"))?;
-    let added = ensure_aur_package_exists_recursive(
-        &services.client,
-        &services.store,
-        &services.db,
-        pkgbase,
-        platforms_str,
-        build_flags_str,
-    )
-    .await?;
+    let added = insert_dependency(services, dependent, pkgbase).await?;
     refresh_source_metadata(&services.store, &services.db, &services.activity, &added).await;
     trigger_initial_builds(
         &services.db,
-        &services.tx,
         &services.activity,
-        &platforms,
+        AddContext::of(dependent).platforms.as_slice(),
         &added,
     )
     .await
@@ -516,108 +483,37 @@ async fn plan_package_with_deps(
     plan: &mut AddPlan,
 ) -> anyhow::Result<()> {
     let &PlanContext {
-        client, tracked, ..
+        client,
+        tracked,
+        activity,
+        ..
     } = plan_context;
-    // What the package answers to itself is never an edge: resolving it
-    // would let a co-provider (`flutter-bin` for `flutter`'s own `dart`) win.
-    let self_provided = crate::pkg::self_provided_names(
-        &package_spec.pkgbase,
-        &package_spec.pkgnames,
-        &package_spec.provides,
-    );
-    let declared: Vec<crate::pkg::Declared> = package_spec
-        .deps
-        .declared()
-        .into_iter()
-        .filter(|dep| !self_provided.contains(&dep.name))
-        .collect();
-    let resolved_deps = if declared.is_empty() {
-        aurcache_deps::Resolutions::default()
-    } else {
-        // Packages planned earlier in this add are not in the database yet, so
-        // they are offered alongside the rows that are.
-        aurcache_db::helpers::dependency_resolution::resolve_dependencies(
-            client,
-            tracked,
-            &declared
-                .iter()
-                .map(crate::pkg::Declared::as_dependency)
-                .collect::<Vec<_>>(),
-            &plan.candidates(),
-            // An add has no edges yet, so there is nothing to prefer.
-            &HashSet::new(),
-        )
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to resolve dependencies for {}: {e}",
-                package_spec.pkgbase
-            )
-        })?
-    };
+    // Packages planned earlier in this add are not in the database yet, so
+    // they are offered alongside the rows that are; an add has no edges yet,
+    // so there is nothing to prefer.
+    let edges = resolve_edges(
+        client,
+        tracked,
+        &Declaration {
+            pkgbase: &package_spec.pkgbase,
+            deps: &package_spec.deps,
+            pkgnames: &package_spec.pkgnames,
+            provides: &package_spec.provides,
+        },
+        &plan.candidates(),
+        &HashSet::new(),
+        activity,
+    )
+    .await?;
 
-    if !resolved_deps.unresolved.is_empty() {
-        // Not fatal: `makepkg` may still find it, and a PKGBUILD can name a
-        // dependency AURCache has no way to see. Worth saying out loud, though
-        // — this used to be where a typo, or a package dropped from the AUR,
-        // disappeared without trace and resurfaced as an opaque build failure.
-        match plan_context.activity {
-            Some(activity) => {
-                for dependency in &resolved_deps.unresolved {
-                    activity.emit(Event::DepsUnresolved {
-                        pkg: package_spec.pkgbase.as_str().into(),
-                        dependency: dependency.clone(),
-                    });
-                }
-            }
-            None => tracing::warn!(
-                "{}: nothing provides {}",
-                package_spec.pkgbase,
-                resolved_deps.unresolved.join(", ")
-            ),
+    for edge in edges {
+        if edge.dependee == Dependee::Aur {
+            plan_dependency_recursive(plan_context, &edge.pkgbase, visited, plan).await?;
         }
-    }
-
-    // Iterate the declared dependency order rather than the resolution map's:
-    // a HashMap's order varies per process, which would make the plan order —
-    // and therefore the order builds are enqueued in — differ between runs for
-    // identical input.
-    let mut dep_constraints_by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> =
-        HashMap::new();
-    let mut planned_pkgbases: HashSet<String> = HashSet::new();
-    for crate::pkg::Declared { name: dep_name, .. } in &declared {
-        let Some(resolution) = resolved_deps.get(dep_name) else {
-            continue;
-        };
-        let (dep_pkgbase, needs_building) = match resolution {
-            // Already installable as a binary: nothing to build, and no row to
-            // link to.
-            DependencyResolution::Available => continue,
-            DependencyResolution::Local { pkgbase } => (pkgbase, false),
-            DependencyResolution::Aur { pkgbase } => (pkgbase, true),
-        };
-        if dep_pkgbase == &package_spec.pkgbase {
-            continue;
-        }
-
-        // Several dependency names can share a pkgbase (a split package's
-        // outputs, or a name plus something it provides), so plan it once —
-        // but merge every one of their constraints onto the single edge.
-        if planned_pkgbases.insert(dep_pkgbase.clone()) && needs_building {
-            plan_dependency_recursive(plan_context, dep_pkgbase, visited, plan).await?;
-        }
-        crate::pkg::merge_bounds_into(
-            &mut dep_constraints_by_pkgbase,
-            dep_pkgbase,
-            package_spec.deps.constraints.get(dep_name),
-        )?;
-    }
-
-    for (dep_pkgbase, constraint) in dep_constraints_by_pkgbase {
         plan.edges.push(PlannedEdge {
             dependent: package_spec.pkgbase.clone(),
-            dependee: dep_pkgbase,
-            version_constraint: crate::pkg::join_constraints(&constraint),
+            dependee: edge.pkgbase,
+            version_constraint: crate::pkg::join_constraints(&edge.bounds),
         });
     }
 
@@ -656,10 +552,10 @@ async fn persist_plan(
             // `name` stores the pkgbase; this codebase keeps one row per package
             // base and tracks split package names separately.
             name: Set(pkg.pkgbase.clone()),
-            status: Set(BuildStates::ENQUEUED_BUILD),
+            status: Set(BuildState::Enqueued),
             upstream_version: Set(Some(pkg.version)),
-            platforms: Set(Platform::join_canonical(&context.platforms)),
-            build_flags: Set(ListColumn::Package.join(&context.build_flags)),
+            platforms: Set(context.platforms.clone()),
+            build_flags: Set(context.build_flags.clone()),
             source_data: Set(pkg.source_data),
             directly_requested: Set(pkg.directly_requested),
             split_packages: Set(pkg.split_packages),

@@ -127,15 +127,15 @@ fn SettingsSections(
                 save,
             }
             SettingRow {
-                setting: Setting::AutoUpdateInterval,
+                setting: Setting::AutoUpdateSchedule,
                 label: "Auto-update schedule",
                 description: schedule_zone.description,
                 warning: schedule_zone.warning,
                 // Distinct from a stored empty string, which is what
                 // "disabled" is: the field renders empty either way, and the
                 // source badge is what tells the two apart.
-                value: settings.auto_update_interval.value.clone().unwrap_or_default(),
-                source: settings.auto_update_interval.source,
+                value: settings.auto_update_schedule.value.clone().unwrap_or_default(),
+                source: settings.auto_update_schedule.source,
                 editor: Editor::Schedule { placeholder: "H 3 * * *".to_string() },
                 save,
             }

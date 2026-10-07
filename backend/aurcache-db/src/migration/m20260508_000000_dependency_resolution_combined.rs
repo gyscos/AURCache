@@ -12,7 +12,7 @@ use flate2::write::GzEncoder;
 use sea_orm::DbBackend;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, Set,
+    QueryFilter, QuerySelect, Set,
 };
 use sea_orm_migration::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -40,13 +40,14 @@ fn normalize_build_flags(build_flags: &str) -> String {
 
 async fn normalize_build_flags_in_db(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     for pkg in packages::Entity::find().all(db).await? {
-        let normalized = normalize_build_flags(&pkg.build_flags);
-        if normalized == pkg.build_flags {
+        let stored = pkg.build_flags.to_string();
+        let normalized = normalize_build_flags(&stored);
+        if normalized == stored {
             continue;
         }
 
         let mut active: packages::ActiveModel = pkg.into();
-        active.build_flags = Set(normalized);
+        active.build_flags = Set(normalized.parse().unwrap_or_default());
         active.save(db).await?;
     }
 
@@ -105,9 +106,15 @@ async fn normalize_package_names_and_merge_duplicates(
     }
 
     // Group packages by base_name; keep the row with the most recent build.
-    let latest_build: HashMap<i32, Option<i32>> = aur_packages
-        .iter()
-        .map(|p| (p.id, p.latest_build))
+    // Read by name: the column has since been dropped from the entity.
+    let latest_build: HashMap<i32, Option<i32>> = packages::Entity::find()
+        .select_only()
+        .column(packages::Column::Id)
+        .column_as(Expr::col(Alias::new("latest_build")), "latest_build")
+        .into_tuple::<(i32, Option<i32>)>()
+        .all(db)
+        .await?
+        .into_iter()
         .collect();
 
     let mut by_name: HashMap<String, Vec<i32>> = HashMap::new();
@@ -133,7 +140,7 @@ async fn normalize_package_names_and_merge_duplicates(
     if !dup_ids.is_empty() {
         packages::Entity::update_many()
             .col_expr(
-                packages::Column::LatestBuild,
+                Alias::new("latest_build"),
                 Expr::value(sea_orm::Value::Int(None)),
             )
             .filter(packages::Column::Id.is_in(dup_ids.clone()))
@@ -621,12 +628,17 @@ async fn ensure_deps(
         None => {
             let new_pkg = packages::ActiveModel {
                 name: Set(pkgbase.to_string()),
-                status: Set(3),
-                out_of_date: Set(0),
+                status: Set(aurcache_common::build_state::BuildState::Enqueued),
+                out_of_date: Set(false),
                 upstream_version: Set(None),
-                latest_build: Set(None),
-                build_flags: Set("--noconfirm;--noprogressbar;--nocolor".to_string()),
-                platforms: Set("x86_64".to_string()),
+                build_flags: Set(crate::lists::BuildFlags::new([
+                    "--noconfirm",
+                    "--noprogressbar",
+                    "--nocolor",
+                ])),
+                platforms: Set(crate::lists::Platforms::new([
+                    pacman_mirrors::platforms::Platform::X86_64,
+                ])),
                 source_data: Set(packages::SourceData::Aur {
                     name: pkgbase.to_string(),
                 }),

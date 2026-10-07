@@ -8,66 +8,46 @@ use dioxus::prelude::*;
 /// Shared so a package and a build in the same state read the same, while each
 /// keeps its own wording: a package is "up to date", the build that produced it
 /// is "successful".
-fn badge_class(state: Option<BuildState>) -> &'static str {
+fn badge_class(state: BuildState) -> &'static str {
     match state {
-        Some(BuildState::Active) => "badge-info",
-        Some(BuildState::Successful) => "badge-success",
-        Some(BuildState::Failed) => "badge-error",
+        BuildState::Active => "badge-info",
+        BuildState::Successful => "badge-success",
+        BuildState::Failed => "badge-error",
         // The two pending states are not failures and not progress, so they
         // stay uncoloured — but visible, or they read as an empty cell.
         // `badge-ghost` has no background on this theme.
-        Some(BuildState::Enqueued) => "badge-neutral",
-        Some(BuildState::WaitingForDeps) => "badge-outline",
+        BuildState::Enqueued => "badge-neutral",
+        BuildState::WaitingForDeps => "badge-outline",
         // Still under way, like building: the server is doing the last of it.
-        Some(BuildState::Publishing) => "badge-info",
-        // Only reachable against a newer server that added a state.
-        None => "badge-outline",
+        BuildState::Publishing => "badge-info",
     }
 }
 
 /// A build's status, worded for a build rather than for a package.
 #[component]
-pub fn BuildStatusBadge(status: i32) -> Element {
-    let state = BuildState::from_i32(status);
-    let label = match state {
-        Some(BuildState::Active) => "building",
-        Some(BuildState::Successful) => "successful",
-        Some(BuildState::Failed) => "failed",
-        Some(BuildState::Enqueued) => "enqueued",
-        Some(BuildState::WaitingForDeps) => "waiting for deps",
-        Some(BuildState::Publishing) => "publishing",
-        None => "unknown",
-    };
-    let class = badge_class(state);
+pub fn BuildStatusBadge(status: BuildState) -> Element {
+    let label = status.label();
+    let class = badge_class(status);
     rsx! { span { class: "badge {class} badge-sm whitespace-nowrap", "{label}" } }
 }
 
-/// Status as a coloured badge.
-///
-/// Matches on [`BuildState`] rather than on the raw integer: the arms are
-/// exhaustive, so adding a state server-side breaks this at compile time
-/// instead of silently rendering as "unknown". Writing this against bare
-/// numbers is how `WaitingForDeps` got missed the first time.
+/// A package's status as a coloured badge.
 #[component]
-pub fn StatusBadge(status: i32, outofdate: i32) -> Element {
-    let state = BuildState::from_i32(status);
+pub fn StatusBadge(status: BuildState, outofdate: bool) -> Element {
     // A package whose last build succeeded but that has newer sources upstream
     // is its own thing: successful, yet needing attention.
-    let outdated = matches!(state, Some(BuildState::Successful)) && outofdate != 0;
-    let label = match state {
-        Some(BuildState::Active) => "building",
-        Some(BuildState::Successful) if outdated => "out of date",
-        Some(BuildState::Successful) => "up to date",
-        Some(BuildState::Failed) => "failed",
-        Some(BuildState::Enqueued) => "enqueued",
-        Some(BuildState::WaitingForDeps) => "waiting for deps",
-        Some(BuildState::Publishing) => "publishing",
-        None => "unknown",
+    let outdated = status == BuildState::Successful && outofdate;
+    // Worded for a package where that differs: its build succeeding means
+    // it is up to date, or would be but for newer sources.
+    let label = match status {
+        BuildState::Successful if outdated => "out of date",
+        BuildState::Successful => "up to date",
+        state => state.label(),
     };
     let class = if outdated {
         "badge-warning"
     } else {
-        badge_class(state)
+        badge_class(status)
     };
     rsx! { span { class: "badge {class} badge-sm whitespace-nowrap", "{label}" } }
 }
@@ -77,7 +57,7 @@ mod tests {
     use super::*;
 
     /// Render the badge to HTML so its output can be asserted on.
-    fn render(status: i32, outofdate: i32) -> String {
+    fn render(status: BuildState, outofdate: bool) -> String {
         let mut dom =
             VirtualDom::new_with_props(StatusBadge, StatusBadgeProps { status, outofdate });
         dom.rebuild_in_place();
@@ -101,8 +81,8 @@ mod tests {
             ),
             (BuildState::Publishing, "publishing", "badge-info"),
         ] {
-            let status = state.as_i32();
-            let html = render(status, 0);
+            let status = state;
+            let html = render(status, false);
             assert!(
                 html.contains(label),
                 "{state:?} should render {label:?}: {html}"
@@ -115,17 +95,9 @@ mod tests {
     /// is current, and the distinction is easy to invert.
     #[test]
     fn a_successful_but_outdated_build_is_flagged() {
-        let html = render(BuildState::Successful.as_i32(), 1);
+        let html = render(BuildState::Successful, true);
         assert!(html.contains("out of date"), "{html}");
         assert!(html.contains("badge-warning"), "{html}");
-    }
-
-    /// A state this frontend does not know must not be styled as if it were
-    /// understood.
-    #[test]
-    fn an_unrecognised_state_renders_as_unknown() {
-        let html = render(99, 0);
-        assert!(html.contains("unknown"), "{html}");
     }
 
     /// No state may render as `badge-ghost`.
@@ -138,19 +110,18 @@ mod tests {
     #[test]
     fn no_state_renders_as_an_invisible_badge() {
         for status in [
-            BuildState::Active.as_i32(),
-            BuildState::Successful.as_i32(),
-            BuildState::Failed.as_i32(),
-            BuildState::Enqueued.as_i32(),
-            BuildState::WaitingForDeps.as_i32(),
-            // The unknown-state arm too.
-            99,
+            BuildState::Active,
+            BuildState::Successful,
+            BuildState::Failed,
+            BuildState::Enqueued,
+            BuildState::WaitingForDeps,
+            BuildState::Publishing,
         ] {
-            for outofdate in [0, 1] {
+            for outofdate in [false, true] {
                 let html = render(status, outofdate);
                 assert!(
                     !html.contains("badge-ghost"),
-                    "status {status} (outofdate {outofdate}) renders invisibly: {html}"
+                    "status {status:?} (outofdate {outofdate}) renders invisibly: {html}"
                 );
             }
         }

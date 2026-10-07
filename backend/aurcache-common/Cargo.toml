@@ -21,10 +21,9 @@ jiff = "0.2.35"
 tempfile = { workspace = true }
 
 [features]
-# The build-queue `Action` carries database models, which drags sea-orm and
-# sqlx in with it. Everything else here is plain serde types that a browser
-# frontend can use, so the database half is optional: wasm consumers take
-# `default-features = false` and still get the API types and enums.
+# Plain serde types that a browser frontend can use, with the database derives
+# optional: wasm consumers take `default-features = false` and still get the
+# API types and enums.
 default = ["db", "fs", "clock"]
 # Enables the sea-orm derives on types that are also stored in the database.
 # A browser frontend takes `default-features = false` and gets the same shapes

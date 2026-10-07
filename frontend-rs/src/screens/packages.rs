@@ -57,7 +57,7 @@ pub fn Packages(
     // rather than waiting out that timer — the dialog is a sibling of this
     // list, so it cannot restart the resource itself.
     let building = matches!(&*packages.read_unchecked(), Some(Ok(list))
-        if list.iter().any(|p| BuildState::from_i32(p.status).is_some_and(BuildState::is_in_progress)));
+        if list.iter().any(|p| Some(p.status).is_some_and(BuildState::is_in_progress)));
     crate::poll::use_poll(packages, building);
     crate::poll::use_refetch_on_package_change(packages);
 
@@ -367,20 +367,15 @@ impl Action {
 /// happening; a second request would either be refused or queue a duplicate,
 /// and a button cannot say which.
 #[must_use]
-pub fn row_action(status: i32, outofdate: i32) -> Option<Action> {
-    match BuildState::from_i32(status) {
-        Some(
-            BuildState::Active
-            | BuildState::Enqueued
-            | BuildState::WaitingForDeps
-            | BuildState::Publishing,
-        ) => None,
-        _ if outofdate != 0 => Some(Action::Update),
-        Some(BuildState::Failed) => Some(Action::Retry),
-        Some(BuildState::Successful) => Some(Action::Rebuild),
-        // A status this build of the frontend does not know. Offering an action
-        // for a state it cannot describe is worse than offering none.
-        None => None,
+pub fn row_action(status: BuildState, outofdate: bool) -> Option<Action> {
+    match status {
+        BuildState::Active
+        | BuildState::Enqueued
+        | BuildState::WaitingForDeps
+        | BuildState::Publishing => None,
+        _ if outofdate => Some(Action::Update),
+        BuildState::Failed => Some(Action::Retry),
+        BuildState::Successful => Some(Action::Rebuild),
     }
 }
 
@@ -453,23 +448,20 @@ mod tests {
     use super::{Action, row_action};
     use aurcache_common::build_state::BuildState;
 
-    const FRESH: i32 = 0;
-    const STALE: i32 = 1;
+    const FRESH: bool = false;
+    const STALE: bool = true;
 
     /// The four states the button is meant to distinguish, which one label for
     /// all of them could not.
     #[test]
     fn the_action_matches_what_the_package_needs() {
         assert_eq!(
-            row_action(BuildState::Successful.as_i32(), FRESH),
+            row_action(BuildState::Successful, FRESH),
             Some(Action::Rebuild)
         );
+        assert_eq!(row_action(BuildState::Failed, FRESH), Some(Action::Retry));
         assert_eq!(
-            row_action(BuildState::Failed.as_i32(), FRESH),
-            Some(Action::Retry)
-        );
-        assert_eq!(
-            row_action(BuildState::Successful.as_i32(), STALE),
+            row_action(BuildState::Successful, STALE),
             Some(Action::Update)
         );
     }
@@ -484,9 +476,9 @@ mod tests {
             BuildState::WaitingForDeps,
             BuildState::Publishing,
         ] {
-            assert_eq!(row_action(state.as_i32(), FRESH), None, "{state:?}");
+            assert_eq!(row_action(state, FRESH), None, "{state:?}");
             // Even out of date: the build under way is what resolves it.
-            assert_eq!(row_action(state.as_i32(), STALE), None, "{state:?}");
+            assert_eq!(row_action(state, STALE), None, "{state:?}");
         }
     }
 
@@ -494,10 +486,7 @@ mod tests {
     /// says Update rather than Retry.
     #[test]
     fn out_of_date_outranks_a_failed_build() {
-        assert_eq!(
-            row_action(BuildState::Failed.as_i32(), STALE),
-            Some(Action::Update)
-        );
+        assert_eq!(row_action(BuildState::Failed, STALE), Some(Action::Update));
     }
 
     /// Only `Update` has a new version to fetch; the others are asking for
@@ -507,11 +496,5 @@ mod tests {
         assert!(!Action::Update.force());
         assert!(Action::Retry.force());
         assert!(Action::Rebuild.force());
-    }
-
-    /// A status this build does not know is not an invitation to guess.
-    #[test]
-    fn an_unknown_status_offers_nothing() {
-        assert_eq!(row_action(99, FRESH), None);
     }
 }

@@ -2,7 +2,7 @@
 
 use super::logs::EntryText;
 use crate::dates::AbsoluteDate;
-use crate::format::{format_bytes, format_secs};
+use crate::format::{format_secs, format_size};
 use crate::listing::{SortDir, SortKey, ViewParams};
 use crate::routes::Route;
 use crate::status::{BuildStatusBadge, StatusBadge};
@@ -238,7 +238,7 @@ fn handled_text(handled: u64) -> Option<String> {
 fn queue_reason(build: &Build) -> Option<String> {
     if let Some(reason) = &build.waiting_reason {
         Some(reason.to_string())
-    } else if build.status == BuildState::WaitingForDeps.as_i32() {
+    } else if build.status == BuildState::WaitingForDeps {
         Some("waiting for dependencies".to_string())
     } else {
         None
@@ -694,7 +694,7 @@ fn StatTiles(stats: ListStats) -> Element {
             }
             StatTile {
                 label: "Repository",
-                value: format_bytes(stats.repo_size),
+                value: format_size(stats.repo_size),
             }
         }
     }
@@ -859,7 +859,7 @@ mod tests {
                     recent_successful: 1,
                     recent_failed: 3,
                     avg_build_time: 90,
-                    repo_size: 3 * 1024 * 1024 * 1024,
+                    repo_size: Some(3 * 1024 * 1024 * 1024),
                     requested_packages: 12,
                     dependency_packages: 4,
                     total_build_trend: 0.0,
@@ -1067,7 +1067,7 @@ mod tests {
             number: 1,
             pkg_name: "hello".to_string(),
             version: "1.0".to_string(),
-            status: BuildState::Enqueued.as_i32(),
+            status: BuildState::Enqueued,
             start_time: Some(100),
             end_time: None,
             platform: "x86_64".to_string(),
@@ -1086,7 +1086,7 @@ mod tests {
 
         // Held on dependencies, with no worker reason of its own.
         let held = Build {
-            status: BuildState::WaitingForDeps.as_i32(),
+            status: BuildState::WaitingForDeps,
             waiting_reason: None,
             ..reasoned.clone()
         };
@@ -1097,7 +1097,7 @@ mod tests {
 
         // Running normally, with nothing to explain.
         let plain = Build {
-            status: BuildState::Active.as_i32(),
+            status: BuildState::Active,
             waiting_reason: None,
             ..reasoned
         };

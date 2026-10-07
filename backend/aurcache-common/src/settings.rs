@@ -26,7 +26,8 @@ pub struct SettingsEntry<T> {
 #[derive(ToSchema, Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct ApplicationSettings {
     pub version_check_interval: SettingsEntry<u32>,
-    pub auto_update_interval: SettingsEntry<Option<String>>,
+    /// A crontab schedule; empty when off.
+    pub auto_update_schedule: SettingsEntry<Option<String>>,
     pub job_timeout: SettingsEntry<u32>,
     /// Largest package file a worker may upload, in bytes. Written as a size
     /// (`20G`); see [`Setting::MaxArtifactSize`].
@@ -53,7 +54,7 @@ pub struct SettingsMeta {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Setting {
     VersionCheckInterval,
-    AutoUpdateInterval,
+    AutoUpdateSchedule,
     BuildOnNewVersion,
     PersistentBuilddir,
     DateFormat,
@@ -97,7 +98,7 @@ impl Setting {
     /// changed through the API at all.
     pub const ALL: [Self; 10] = [
         Self::VersionCheckInterval,
-        Self::AutoUpdateInterval,
+        Self::AutoUpdateSchedule,
         Self::BuildOnNewVersion,
         Self::PersistentBuilddir,
         Self::DateFormat,
@@ -117,8 +118,8 @@ impl Setting {
                 env_name: Some("VERSION_CHECK_INTERVAL"),
                 default: "1h",
             },
-            Self::AutoUpdateInterval => SettingsMeta {
-                key: "auto_update_interval",
+            Self::AutoUpdateSchedule => SettingsMeta {
+                key: "auto_update_schedule",
                 env_name: Some("AUTO_UPDATE_SCHEDULE"),
                 default: "", // parses to None
             },
@@ -132,7 +133,7 @@ impl Setting {
                 default: "ymd-pad-24",
             },
             // Queue the rebuild the moment a new version is detected, rather
-            // than waiting for the `auto_update_interval` window. The version
+            // than waiting for the `auto_update_schedule` window. The version
             // check is the only thing that knows a package is out of date —
             // including VCS packages whose upstream moved without a pkgver
             // bump — so that is where the build belongs.
@@ -236,8 +237,8 @@ impl Setting {
                 }),
             // Empty is "off". The seed only moves `H` around, never makes a
             // schedule valid or not, so any will do here.
-            Self::AutoUpdateInterval if value.trim().is_empty() => Ok(()),
-            Self::AutoUpdateInterval => crate::schedule::Schedule::parse(value, 0)
+            Self::AutoUpdateSchedule if value.trim().is_empty() => Ok(()),
+            Self::AutoUpdateSchedule => crate::schedule::Schedule::parse(value, 0)
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
             _ => Ok(()),
@@ -263,7 +264,7 @@ mod tests {
 
     #[test]
     fn the_schedule_setting_is_validated() {
-        let setting = Setting::AutoUpdateInterval;
+        let setting = Setting::AutoUpdateSchedule;
         assert_eq!(setting.validate(""), Ok(()));
         assert_eq!(setting.validate("H 3 * * *"), Ok(()));
         assert!(setting.validate("0 0 3 * * *").is_err());
@@ -283,7 +284,7 @@ mod tests {
         fn position(setting: Setting) -> usize {
             match setting {
                 Setting::VersionCheckInterval => 0,
-                Setting::AutoUpdateInterval => 1,
+                Setting::AutoUpdateSchedule => 1,
                 Setting::BuildOnNewVersion => 2,
                 Setting::PersistentBuilddir => 3,
                 Setting::DateFormat => 4,

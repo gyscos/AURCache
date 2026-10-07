@@ -1,8 +1,9 @@
 use crate::models::aur::ApiPackage;
 use crate::models::authenticated::Authenticated;
+use crate::utils::error::{ApiError, err};
 use aurcache_utils::aur::api::{get_package_info, query_aur};
 use aurcache_utils::services::Services;
-use rocket::response::status::BadRequest;
+use rocket::http::Status;
 use rocket::serde::json::Json;
 use rocket::{State, get};
 use utoipa::OpenApi;
@@ -14,6 +15,7 @@ pub struct AURApi;
 #[utoipa::path(
     responses(
             (status = 200, description = "Matching AUR packages", body = [ApiPackage]),
+            (status = 502, description = "The AUR could not be asked"),
     ),
     params(
         ("query", description = "AUR query"),
@@ -25,7 +27,7 @@ pub async fn search(
     query: &str,
     services: &State<Services>,
     _a: Authenticated,
-) -> Result<Json<Vec<ApiPackage>>, BadRequest<String>> {
+) -> Result<Json<Vec<ApiPackage>>, ApiError> {
     // Chars, not bytes: a byte length miscounts non-ASCII queries against the
     // minimum the info endpoint needs. One shared tail, so the two branches
     // cannot drift apart again.
@@ -37,6 +39,7 @@ pub async fn search(
     } else {
         query_aur(&services.client, query).await
     };
-    let packages = result.map_err(|e| BadRequest(e.to_string()))?;
+    // The AUR's failure, not the request's.
+    let packages = result.map_err(|e| err(Status::BadGateway, e))?;
     Ok(Json(packages.into_iter().map(ApiPackage::from).collect()))
 }

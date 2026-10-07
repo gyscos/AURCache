@@ -1,5 +1,4 @@
 use crate::auth::has_api_token;
-use bigdecimal::ToPrimitive;
 
 use rocket::serde::json::Json;
 
@@ -16,17 +15,14 @@ use aurcache_common::api::builds::BuildSummary;
 use aurcache_common::api::log::LogEntry;
 use aurcache_common::api::package::SimplePackage;
 use aurcache_common::api::stats::{LONGEST_WINDOW_DAYS, RECENT_DAYS};
-use aurcache_common::build_state::BuildStates;
-use aurcache_common::fs::dir_size;
-use aurcache_common::settings::{ApplicationSettings, Setting};
+use aurcache_common::build_state::BuildState;
 use aurcache_db::builds;
 use aurcache_db::helpers::files::total_artifact_size_expr;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{packages, workers};
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use rocket::http::Status;
 use rocket::{State, get};
-use sea_orm::prelude::BigDecimal;
 use sea_orm::sea_query::{Alias, CaseStatement, Expr, ExprTrait, Func};
 use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
 use sea_orm::{DatabaseConnection, EntityTrait};
@@ -156,7 +152,7 @@ async fn get_graph_datapoints(db: &DatabaseConnection) -> anyhow::Result<Vec<Gra
     let bucket: Expr = bucket.into();
     let succeeded: Expr = CaseStatement::new()
         .case(
-            Expr::col(builds::Column::Status).eq(BuildStates::SUCCESSFUL_BUILD),
+            Expr::col(builds::Column::Status).eq(BuildState::Successful),
             1,
         )
         .finally(0)
@@ -215,32 +211,24 @@ async fn count_packages(db: &DatabaseConnection, requested: bool) -> anyhow::Res
 ///
 /// Missing or unrepresentable averages read as `0`.
 async fn avg_build_time(db: &DatabaseConnection) -> anyhow::Result<u32> {
-    #[derive(Debug, FromQueryResult)]
-    struct BuildTimeStruct {
-        avg_build_time: Option<BigDecimal>,
-    }
-
-    let unique: Option<BuildTimeStruct> = Builds::find()
+    let average: Option<Option<f64>> = Builds::find()
         .select_only()
+        // Cast because Postgres averages integers into `numeric`.
         .column_as(
             Expr::from(Func::avg(
                 Expr::col(builds::Column::EndTime).sub(Expr::col(builds::Column::StartTime)),
-            )),
+            ))
+            .cast_as(Alias::new("DOUBLE PRECISION")),
             "avg_build_time",
         )
         .filter(builds::Column::EndTime.is_not_null())
-        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
-        .into_model::<BuildTimeStruct>()
+        .filter(builds::Column::Status.eq(BuildState::Successful))
+        .into_tuple()
         .one(db)
         .await?;
-    // An aggregate without `GROUP BY` always returns a row, so "no rows" can
-    // only mean an empty table — which deserves a 0 average, not a failed
-    // `/stats` page. (The old `ok_or_else` arm was dead code that errored the
-    // whole endpoint exactly when there was nothing to average.)
-    Ok(unique
-        .and_then(|row| row.avg_build_time)
-        .and_then(|avg| avg.to_u32())
-        .unwrap_or(0))
+    // An aggregate without `GROUP BY` always returns a row, and its average
+    // is NULL over no rows: an empty table reads as 0, not as a failed page.
+    Ok(average.flatten().map_or(0, |avg| avg as u32))
 }
 
 /// Change over the last 30 days relative to the 30 days before it, as a
@@ -339,7 +327,7 @@ fn change(now: f64, before: f64) -> f32 {
 /// windowed count, since an unstarted build has not happened yet.
 async fn count_builds(
     db: &DatabaseConnection,
-    status: Option<i32>,
+    status: Option<BuildState>,
     since: Option<i64>,
 ) -> anyhow::Result<u32> {
     let mut query = Builds::find();
@@ -371,11 +359,11 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
         dependency_packages,
     ) = tokio::join!(
         count_builds(db, None, None),
-        count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), None),
-        count_builds(db, Some(BuildStates::FAILED_BUILD), None),
+        count_builds(db, Some(BuildState::Successful), None),
+        count_builds(db, Some(BuildState::Failed), None),
         count_builds(db, None, Some(cutoff)),
-        count_builds(db, Some(BuildStates::SUCCESSFUL_BUILD), Some(cutoff)),
-        count_builds(db, Some(BuildStates::FAILED_BUILD), Some(cutoff)),
+        count_builds(db, Some(BuildState::Successful), Some(cutoff)),
+        count_builds(db, Some(BuildState::Failed), Some(cutoff)),
         build_trends(db),
         avg_build_time(db),
         count_packages(db, true),
@@ -383,9 +371,7 @@ async fn get_stats(db: &DatabaseConnection) -> anyhow::Result<ListStats> {
     );
 
     let trends = trends?;
-    // Off the executor: it walks every file in the repository.
-    let repo_size =
-        tokio::task::spawn_blocking(|| dir_size(aurcache_utils::repository::REPO_ROOT)).await?;
+    let repo_size = aurcache_db::helpers::files::total_size(db).await?;
     Ok(ListStats {
         total_builds: total_builds?,
         successful_builds: successful_builds?,
@@ -474,7 +460,7 @@ async fn recent_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<BuildSumma
 
 async fn failed_packages(db: &DatabaseConnection) -> anyhow::Result<Vec<SimplePackage>> {
     Ok(package_row_select()
-        .filter(packages::Column::Status.eq(BuildStates::FAILED_BUILD))
+        .filter(packages::Column::Status.eq(BuildState::Failed))
         .order_by(packages::Column::Id, Order::Desc)
         .limit(DASHBOARD_LIMIT)
         .into_model::<SimplePackage>()
@@ -492,7 +478,7 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     // "View all" this card's link would otherwise fail to reproduce.
     let outdated: Vec<SimplePackage> = package_row_select()
         .filter(packages::Column::OutOfDate.ne(0))
-        .filter(packages::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+        .filter(packages::Column::Status.eq(BuildState::Successful))
         .order_by(packages::Column::Id, Order::Desc)
         .into_model::<SimplePackage>()
         .all(db)
@@ -512,21 +498,21 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     // human", `update.rs`). A per-package override is never consulted by
     // either job, so resolving it here would disagree with what the server
     // actually does.
-    let (build_on_new_version, auto_update_interval) = tokio::join!(
-        ApplicationSettings::get::<bool>(Setting::BuildOnNewVersion, None, db),
-        ApplicationSettings::get::<Option<String>>(Setting::AutoUpdateInterval, None, db),
+    let (build_on_new_version, auto_update_schedule) = tokio::join!(
+        settings::get(db, settings::key::BUILD_ON_NEW_VERSION, None),
+        settings::get(db, settings::key::AUTO_UPDATE_SCHEDULE, None),
     );
     // Whether the cron string itself parses is not re-checked here: an
     // invalid one already surfaces as a `ScheduleInvalid` warning, which the
     // Recent problems card shows.
     let auto_rebuild_configured =
-        build_on_new_version.value || auto_update_interval.value.is_some();
+        build_on_new_version.value || auto_update_schedule.value.is_some();
 
     let active: HashSet<i32> = Builds::find()
         .select_only()
         .column(builds::Column::PkgId)
         .filter(builds::Column::PkgId.is_in(pkg_ids))
-        .filter(builds::Column::Status.is_in(BuildStates::IN_PROGRESS))
+        .filter(builds::Column::Status.is_in(BuildState::IN_PROGRESS))
         .into_tuple::<i32>()
         .all(db)
         .await?
@@ -555,7 +541,7 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
 }
 
 async fn queue_slice(db: &DatabaseConnection) -> anyhow::Result<QueueSlice> {
-    let queued = [BuildStates::ENQUEUED_BUILD, BuildStates::WAITING_FOR_DEPS];
+    let queued = [BuildState::Enqueued, BuildState::WaitingForDeps];
     let depth: u64 = Builds::find()
         .filter(builds::Column::Status.is_in(queued))
         .count(db)
@@ -610,7 +596,7 @@ struct LongestRow {
     number: i32,
     pkg_name: String,
     version: String,
-    status: i32,
+    status: BuildState,
     start_time: Option<i64>,
     end_time: Option<i64>,
     platform: String,
@@ -637,7 +623,7 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
         .column(builds::Column::PeakMemory)
         .join(JoinType::LeftJoin, builds::Relation::Workers.def())
         .column_as(workers::Column::Name, "worker_name")
-        .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+        .filter(builds::Column::Status.eq(BuildState::Successful))
         .filter(builds::Column::StartTime.gte(since))
         .filter(builds::Column::EndTime.is_not_null())
         .order_by(duration, Order::Desc)
@@ -656,7 +642,7 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
                     .column(builds::Column::EndTime)
                     .filter(builds::Column::PkgId.eq(row.pkg_id))
                     .filter(builds::Column::Platform.eq(row.platform.as_str()))
-                    .filter(builds::Column::Status.eq(BuildStates::SUCCESSFUL_BUILD))
+                    .filter(builds::Column::Status.eq(BuildState::Successful))
                     .filter(builds::Column::StartTime.lt(started))
                     .order_by(builds::Column::StartTime, Order::Desc)
                     .limit(1)
@@ -698,18 +684,18 @@ async fn longest_builds(db: &DatabaseConnection) -> anyhow::Result<Vec<LongBuild
 #[cfg(test)]
 mod tests {
     use super::{
-        GraphMonth, build_trends, count_packages, failed_packages, get_graph_datapoints,
-        graph_months, largest_packages, longest_builds, out_of_date_slice, problem_entries,
-        queue_slice, recent_builds, recent_packages,
+        GraphMonth, avg_build_time, build_trends, count_packages, failed_packages,
+        get_graph_datapoints, graph_months, largest_packages, longest_builds, out_of_date_slice,
+        problem_entries, queue_slice, recent_builds, recent_packages,
     };
     use aurcache_common::api::activity::Severity;
-    use aurcache_common::build_state::BuildStates;
-    use aurcache_common::settings::{ApplicationSettings, Setting};
+    use aurcache_common::build_state::BuildState;
+    use aurcache_common::settings::Setting;
     use aurcache_db::helpers::time::now_secs;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::{self, SourceData};
     use aurcache_db::{builds, files, logs};
-    use aurcache_utils::settings::general::SettingsTraits;
+    use aurcache_utils::settings;
     use pacman_mirrors::platforms::Platform;
     use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
     use sea_orm_migration::MigratorTrait;
@@ -717,17 +703,16 @@ mod tests {
     async fn insert_package(
         db: &sea_orm::DatabaseConnection,
         name: &str,
-        out_of_date: i32,
+        out_of_date: bool,
         directly_requested: bool,
     ) -> i32 {
         packages::ActiveModel {
             name: Set(name.to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
+            status: Set(BuildState::Successful),
             out_of_date: Set(out_of_date),
             upstream_version: Set(Some("1.0-1".to_string())),
-            latest_build: Set(None),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: name.to_string(),
             }),
@@ -745,14 +730,14 @@ mod tests {
         db: &sea_orm::DatabaseConnection,
         pkg_id: i32,
         number: i32,
-        status: i32,
+        status: BuildState,
         start: Option<i64>,
         end: Option<i64>,
     ) {
         aurcache_db::prelude::Builds::insert(builds::ActiveModel {
             pkg_id: Set(pkg_id),
             number: Set(number),
-            status: Set(Some(status)),
+            status: Set(status),
             platform: Set(Platform::X86_64),
             version: Set("1.0-1".to_string()),
             start_time: Set(start),
@@ -764,6 +749,22 @@ mod tests {
         .expect("insert build");
     }
 
+    /// The average covers finished successful builds only, and nothing to
+    /// average reads as 0 rather than an error.
+    #[tokio::test]
+    async fn the_average_build_time_is_over_successful_builds() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        assert_eq!(avg_build_time(&db).await.unwrap(), 0);
+
+        let pkg = insert_package(&db, "hello", false, true).await;
+        insert_build(&db, pkg, 1, BuildState::Successful, Some(0), Some(100)).await;
+        insert_build(&db, pkg, 2, BuildState::Successful, Some(0), Some(200)).await;
+        insert_build(&db, pkg, 3, BuildState::Failed, Some(0), Some(9000)).await;
+        insert_build(&db, pkg, 4, BuildState::Successful, Some(0), None).await;
+        assert_eq!(avg_build_time(&db).await.unwrap(), 150);
+    }
+
     #[tokio::test]
     async fn stats_only_count_directly_requested_packages() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -771,12 +772,11 @@ mod tests {
 
         packages::ActiveModel {
             name: Set("top-level".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "top-level".into(),
             }),
@@ -790,12 +790,11 @@ mod tests {
 
         packages::ActiveModel {
             name: Set("transitive-dependency".to_string()),
-            status: Set(1),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "transitive-dependency".into(),
             }),
@@ -818,9 +817,9 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
-        insert_package(&db, "pkg-a", 0, true).await;
-        insert_package(&db, "pkg-b", 1, true).await;
-        insert_package(&db, "pkg-dep", 0, false).await;
+        insert_package(&db, "pkg-a", false, true).await;
+        insert_package(&db, "pkg-b", true, true).await;
+        insert_package(&db, "pkg-dep", false, false).await;
 
         let recent = recent_packages(&db).await.unwrap();
         assert_eq!(recent.len(), 2);
@@ -838,23 +837,23 @@ mod tests {
         // unique index forbids two queued builds for the same package on
         // the same platform.
         for number in 1..=7 {
-            let pkg_id = insert_package(&db, &format!("queued-pkg-{number}"), 0, true).await;
+            let pkg_id = insert_package(&db, &format!("queued-pkg-{number}"), false, true).await;
             insert_build(
                 &db,
                 pkg_id,
                 1,
-                BuildStates::ENQUEUED_BUILD,
+                BuildState::Enqueued,
                 Some(100 + number as i64),
                 None,
             )
             .await;
         }
-        let done_id = insert_package(&db, "done-pkg", 0, true).await;
+        let done_id = insert_package(&db, "done-pkg", false, true).await;
         insert_build(
             &db,
             done_id,
             1,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(200),
             Some(260),
         )
@@ -876,17 +875,9 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
-        let pkg_a = insert_package(&db, "needs-hand", 1, true).await;
-        let pkg_c = insert_package(&db, "queued-anyway", 1, true).await;
-        insert_build(
-            &db,
-            pkg_c,
-            1,
-            BuildStates::ENQUEUED_BUILD,
-            Some(now_secs()),
-            None,
-        )
-        .await;
+        let pkg_a = insert_package(&db, "needs-hand", true, true).await;
+        let pkg_c = insert_package(&db, "queued-anyway", true, true).await;
+        insert_build(&db, pkg_c, 1, BuildState::Enqueued, Some(now_secs()), None).await;
 
         // Auto-rebuild off globally: A needs a hand, C is handled by its
         // queued build regardless of the setting.
@@ -900,13 +891,13 @@ mod tests {
         // consults one, only the global value, so this dashboard card must
         // not either -- an override here would show A as handled while
         // nothing actually rebuilds it.
-        ApplicationSettings::patch(
+        settings::write(
             &db,
-            [(
-                Setting::BuildOnNewVersion,
-                Some(pkg_a),
-                Some("true".to_string()),
-            )],
+            [settings::Change {
+                setting: Setting::BuildOnNewVersion,
+                pkg_id: Some(pkg_a),
+                value: Some("true".to_string()),
+            }],
         )
         .await
         .unwrap();
@@ -915,9 +906,13 @@ mod tests {
         assert_eq!(slice.handled, 1);
 
         // Global on: A is handled too.
-        ApplicationSettings::patch(
+        settings::write(
             &db,
-            [(Setting::BuildOnNewVersion, None, Some("true".to_string()))],
+            [settings::Change {
+                setting: Setting::BuildOnNewVersion,
+                pkg_id: None,
+                value: Some("true".to_string()),
+            }],
         )
         .await
         .unwrap();
@@ -939,12 +934,11 @@ mod tests {
 
         packages::ActiveModel {
             name: Set("stale-and-broken".to_string()),
-            status: Set(BuildStates::FAILED_BUILD),
-            out_of_date: Set(1),
+            status: Set(BuildState::Failed),
+            out_of_date: Set(true),
             upstream_version: Set(Some("1.0-1".to_string())),
-            latest_build: Set(None),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "stale-and-broken".to_string(),
             }),
@@ -971,8 +965,8 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
 
-        let sized = insert_package(&db, "has-files", 0, true).await;
-        insert_package(&db, "no-files", 0, true).await;
+        let sized = insert_package(&db, "has-files", false, true).await;
+        insert_package(&db, "no-files", false, true).await;
         files::ActiveModel {
             filename: Set("has-files-1.0-1-x86_64.pkg.tar.zst".to_string()),
             platform: Set(Platform::X86_64),
@@ -1000,14 +994,14 @@ mod tests {
         Migrator::up(&db, None).await.unwrap();
 
         let now = now_secs();
-        let pkg_id = insert_package(&db, "long-pkg", 0, true).await;
+        let pkg_id = insert_package(&db, "long-pkg", false, true).await;
         // Outside the 30-day window: long enough to win if the window were
         // not applied, so its absence proves the filter.
         insert_build(
             &db,
             pkg_id,
             1,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - 40 * 24 * 60 * 60),
             Some(now - 40 * 24 * 60 * 60 + 1000),
         )
@@ -1016,7 +1010,7 @@ mod tests {
             &db,
             pkg_id,
             2,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - 10 * 24 * 60 * 60),
             Some(now - 10 * 24 * 60 * 60 + 60),
         )
@@ -1025,17 +1019,17 @@ mod tests {
             &db,
             pkg_id,
             3,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - 24 * 60 * 60),
             Some(now - 24 * 60 * 60 + 120),
         )
         .await;
-        let single_id = insert_package(&db, "single-pkg", 0, true).await;
+        let single_id = insert_package(&db, "single-pkg", false, true).await;
         insert_build(
             &db,
             single_id,
             1,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - 24 * 60 * 60),
             Some(now - 24 * 60 * 60 + 30),
         )
@@ -1177,7 +1171,7 @@ mod tests {
     async fn graph_and_trends_count_builds_by_when_they_started() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let pkg = insert_package(&db, "p", 0, true).await;
+        let pkg = insert_package(&db, "p", false, true).await;
         let now = now_secs();
         const DAY: i64 = 24 * 60 * 60;
         // Two in the last 30 days, one before that; one failed.
@@ -1185,7 +1179,7 @@ mod tests {
             &db,
             pkg,
             1,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - DAY),
             Some(now - DAY + 100),
         )
@@ -1194,7 +1188,7 @@ mod tests {
             &db,
             pkg,
             2,
-            BuildStates::FAILED_BUILD,
+            BuildState::Failed,
             Some(now - 2 * DAY),
             Some(now - 2 * DAY + 300),
         )
@@ -1203,7 +1197,7 @@ mod tests {
             &db,
             pkg,
             3,
-            BuildStates::SUCCESSFUL_BUILD,
+            BuildState::Successful,
             Some(now - 40 * DAY),
             Some(now - 40 * DAY + 100),
         )

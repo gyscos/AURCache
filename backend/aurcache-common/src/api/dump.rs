@@ -95,7 +95,9 @@ pub struct DumpSettings {
 pub struct DumpWorker {
     pub name: String,
     pub cert_fingerprint: String,
-    pub status: String,
+    /// Always `approved`: nothing else is dumped, and a restore approves
+    /// every worker it brings back.
+    pub status: crate::api::worker::ApprovalStatus,
     pub native_arches: Vec<String>,
     pub emulated_arches: Vec<String>,
     pub package_affinity: Vec<String>,

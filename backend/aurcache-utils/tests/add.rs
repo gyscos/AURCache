@@ -1,6 +1,5 @@
 use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_common::build_state::BuildStates;
-use aurcache_db::action::Action;
+use aurcache_common::build_state::BuildState;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Dependencies, Packages};
@@ -36,7 +35,6 @@ use std::sync::Arc;
 
 struct TestEnv {
     db: DatabaseConnection,
-    _rx: tokio::sync::broadcast::Receiver<Action>,
     server: MockServer,
     client: Arc<AurClient>,
     _repo_dir: TempDir,
@@ -86,14 +84,11 @@ async fn setup_env() -> TestEnv {
         .await
         .expect("failed to run migrations");
 
-    let (_, rx) = tokio::sync::broadcast::channel(100);
-
     let aur_root = tempfile::tempdir().expect("failed to create aur root tempdir");
     let checkout_dir = tempfile::tempdir().expect("failed to create checkout tempdir");
 
     TestEnv {
         db,
-        _rx: rx,
         server,
         client,
         _repo_dir: repo_dir,
@@ -374,7 +369,6 @@ fn multiinfo_json(results: &[serde_json::Value]) -> serde_json::Value {
 }
 
 async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
-    let (tx, _) = tokio::sync::broadcast::channel(100);
     let store = SnapshotStore::with_checkout_root_and_aur_base(
         env.checkout_dir.path().to_path_buf(),
         env.aur_root.path().to_string_lossy().to_string(),
@@ -382,7 +376,6 @@ async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
     package_add(
         &Services::new(
             env.db.clone(),
-            tx.clone(),
             Arc::new(store),
             env.client.clone(),
             Arc::new(aurcache_utils::repository::Repository::new(
@@ -427,7 +420,7 @@ async fn scenario_a_no_aur_deps() {
         .unwrap()
         .expect("package should exist");
     assert!(pkg.directly_requested, "directly_requested should be true");
-    assert_eq!(pkg.status, BuildStates::ENQUEUED_BUILD);
+    assert_eq!(pkg.status, BuildState::Enqueued);
     assert_eq!(pkg.upstream_version, Some("1.0.0-1".to_string()));
 
     let dep_count = Dependencies::find().count(&env.db).await.unwrap();
@@ -498,7 +491,7 @@ async fn scenario_b_one_aur_dep() {
     );
     assert_eq!(
         parent_builds[0].status,
-        Some(BuildStates::WAITING_FOR_DEPS),
+        BuildState::WaitingForDeps,
         "parent build should be in WAITING_FOR_DEPS state"
     );
 }
@@ -539,7 +532,7 @@ async fn scenario_c_cascade_after_dep_build() {
         .unwrap()
         .expect("child should have a build record from trigger_initial_builds");
     let mut build_active: builds::ActiveModel = child_build.into();
-    build_active.status = Set(Some(BuildStates::SUCCESSFUL_BUILD));
+    build_active.status = Set(BuildState::Successful);
     build_active.save(&env.db).await.unwrap();
 
     let parent = Packages::find()
@@ -564,7 +557,7 @@ async fn scenario_c_cascade_after_dep_build() {
         .unwrap();
     assert_eq!(
         child_build.status,
-        Some(BuildStates::SUCCESSFUL_BUILD),
+        BuildState::Successful,
         "child build should be successful"
     );
 
@@ -585,7 +578,7 @@ async fn scenario_c_cascade_after_dep_build() {
         .unwrap();
     assert_eq!(
         parent_build.status,
-        Some(BuildStates::WAITING_FOR_DEPS),
+        BuildState::WaitingForDeps,
         "parent build should still be WAITING_FOR_DEPS (not promoted by enqueue_missing_buildable_packages yet)"
     );
 }
@@ -761,7 +754,7 @@ async fn scenario_f_system_deps_only() {
         .unwrap()
         .expect("package should exist");
     assert!(pkg.directly_requested);
-    assert_eq!(pkg.status, BuildStates::ENQUEUED_BUILD);
+    assert_eq!(pkg.status, BuildState::Enqueued);
 
     let dep_count = Dependencies::find().count(&env.db).await.unwrap();
     assert_eq!(dep_count, 0, "no dependency rows for system packages");
@@ -988,12 +981,11 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
     let env = setup_env().await;
     packages::ActiveModel {
         name: Set("local-provider".to_string()),
-        status: Set(BuildStates::ENQUEUED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Enqueued),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "local-provider".into(),
         }),
@@ -1077,16 +1069,15 @@ async fn scenario_j_local_queued_provider_prevents_aur_dependency_addition() {
 /// nothing would ever rebuild it when the dependency was fixed.
 #[tokio::test]
 async fn scenario_l_settled_states_still_link_as_dependencies() {
-    for status in [BuildStates::FAILED_BUILD, BuildStates::WAITING_FOR_DEPS] {
+    for status in [BuildState::Failed, BuildState::WaitingForDeps] {
         let env = setup_env().await;
         packages::ActiveModel {
             name: Set("local-dep".to_string()),
             status: Set(status),
-            out_of_date: Set(0),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "local-dep".into(),
             }),
@@ -1118,7 +1109,7 @@ async fn scenario_l_settled_states_still_link_as_dependencies() {
         create_aur_git_repo(env.aur_root.path(), "parent-pkg", "1.0.0", &["local-dep"]);
 
         let result = add_pkg_via_rpc(&env, "parent-pkg").await;
-        assert!(result.is_ok(), "{status}: {result:?}");
+        assert!(result.is_ok(), "{status:?}: {result:?}");
 
         let parent = Packages::find()
             .filter(packages::Column::Name.eq("parent-pkg"))
@@ -1141,7 +1132,7 @@ async fn scenario_l_settled_states_still_link_as_dependencies() {
             .unwrap();
         assert!(
             link.is_some(),
-            "status {status} lost its dependency link to an already-built package"
+            "status {status:?} lost its dependency link to an already-built package"
         );
     }
 }
@@ -1361,16 +1352,14 @@ async fn scenario_k3_self_split_via_provides_with_version_is_ignored() {
 #[tokio::test]
 async fn scenario_h_queue_missing_buildable_packages_after_migration() {
     let env = setup_env().await;
-    let (tx, _) = tokio::sync::broadcast::channel(100);
 
     let root = packages::ActiveModel {
         name: Set("root".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1386,12 +1375,11 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
 
     let mid = packages::ActiveModel {
         name: Set("mid".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur { name: "mid".into() }),
         directly_requested: Set(false),
         split_packages: Set(None),
@@ -1405,12 +1393,11 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
 
     let leaf = packages::ActiveModel {
         name: Set("leaf".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),
@@ -1446,7 +1433,6 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
 
     let queued = enqueue_missing_buildable_packages(
         &env.db,
-        &tx,
         &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
     )
     .await
@@ -1473,7 +1459,7 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
     );
     assert_eq!(
         mid_builds[0].status,
-        Some(BuildStates::WAITING_FOR_DEPS),
+        BuildState::WaitingForDeps,
         "mid should be WAITING_FOR_DEPS while leaf has not built"
     );
 }
@@ -1481,16 +1467,14 @@ async fn scenario_h_queue_missing_buildable_packages_after_migration() {
 #[tokio::test]
 async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built() {
     let env = setup_env().await;
-    let (tx, _) = tokio::sync::broadcast::channel(100);
 
     let root = packages::ActiveModel {
         name: Set("root".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1506,12 +1490,11 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 
     let mid = packages::ActiveModel {
         name: Set("mid".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur { name: "mid".into() }),
         directly_requested: Set(false),
         split_packages: Set(None),
@@ -1525,12 +1508,11 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 
     let leaf = packages::ActiveModel {
         name: Set("leaf".to_string()),
-        status: Set(BuildStates::SUCCESSFUL_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Successful),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),
@@ -1566,7 +1548,7 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 
     builds::ActiveModel {
         pkg_id: Set(leaf.id),
-        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        status: Set(BuildState::Successful),
         start_time: Set(Some(1)),
         end_time: Set(Some(2)),
         platform: Set(Platform::X86_64),
@@ -1579,7 +1561,6 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 
     let queued = enqueue_missing_buildable_packages(
         &env.db,
-        &tx,
         &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
     )
     .await
@@ -1602,7 +1583,7 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
     );
     assert_eq!(
         root_builds[0].status,
-        Some(BuildStates::WAITING_FOR_DEPS),
+        BuildState::WaitingForDeps,
         "root build should be WAITING_FOR_DEPS"
     );
 
@@ -1620,16 +1601,14 @@ async fn scenario_i_queue_non_leaf_packages_when_dependencies_are_already_built(
 #[tokio::test]
 async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
     let env = setup_env().await;
-    let (tx, _) = tokio::sync::broadcast::channel(100);
 
     let root = packages::ActiveModel {
         name: Set("root".to_string()),
-        status: Set(BuildStates::FAILED_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Failed),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64;aarch64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64;aarch64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "root".into(),
         }),
@@ -1645,12 +1624,11 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
 
     let leaf = packages::ActiveModel {
         name: Set("leaf".to_string()),
-        status: Set(BuildStates::SUCCESSFUL_BUILD),
-        out_of_date: Set(0),
+        status: Set(BuildState::Successful),
+        out_of_date: Set(false),
         upstream_version: Set(Some("1.0.0".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-        platforms: Set("x86_64;aarch64".to_string()),
+        build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+        platforms: Set("x86_64;aarch64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: "leaf".into(),
         }),
@@ -1676,7 +1654,7 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
 
     builds::ActiveModel {
         pkg_id: Set(leaf.id),
-        status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+        status: Set(BuildState::Successful),
         start_time: Set(Some(1)),
         end_time: Set(Some(2)),
         platform: Set(Platform::X86_64),
@@ -1689,7 +1667,6 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
 
     let queued = enqueue_missing_buildable_packages(
         &env.db,
-        &tx,
         &aurcache_activitylog::activity_utils::ActivityLog::discarding(),
     )
     .await
@@ -1721,7 +1698,7 @@ async fn scenario_j_queue_only_platforms_with_satisfied_dependencies() {
     );
     assert_eq!(
         root_aarch64_builds[0].status,
-        Some(BuildStates::WAITING_FOR_DEPS),
+        BuildState::WaitingForDeps,
         "aarch64 root build should be WAITING_FOR_DEPS"
     );
 }

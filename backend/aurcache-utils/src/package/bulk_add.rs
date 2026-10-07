@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use aurcache_common::api::package::{BulkAddEntry, BulkAddOutcome};
+use aurcache_common::source::source_label;
 use aurcache_db::packages::SourceData;
 use pacman_mirrors::platforms::Platform;
 use tokio::sync::mpsc::Sender;
@@ -22,18 +23,6 @@ use tracing::info;
 
 use crate::package::add::{AddContext, AddedSource, add_resolved_source, build_add_context};
 use crate::services::Services;
-
-/// How a source was named in the request, for reporting it back.
-///
-/// A failure has to be attributable to what the caller asked for, and a name
-/// that never resolved has no pkgbase to report instead.
-fn source_label(source: &SourceData) -> String {
-    match source {
-        SourceData::Aur { name } => name.clone(),
-        SourceData::Git { spec } => spec.url.clone(),
-        SourceData::Upload { .. } => "upload".to_string(),
-    }
-}
 
 /// Resolve every AUR name in `sources` to its pkgbase, in as few requests as
 /// the RPC's URL budget allows.

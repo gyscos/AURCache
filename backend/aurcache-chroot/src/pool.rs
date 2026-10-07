@@ -208,16 +208,8 @@ impl Pool {
                         Image::Created => mkfs(path).await?,
                         Image::Existing => check_ours(path).await?,
                     }
-                    match attached_loop(path).await {
-                        // Attached by an older worker, without autoclear.
-                        Some(device) => {
-                            mount(&device, &mountpoint, !reserve, false, owner).await?;
-                        }
-                        None => {
-                            ensure_free_loop_node().await?;
-                            mount(path, &mountpoint, !reserve, true, owner).await?;
-                        }
-                    }
+                    ensure_free_loop_node().await?;
+                    mount(path, &mountpoint, !reserve, true, owner).await?;
                 }
                 loop_device = attached_loop(path).await;
                 if let Some(device) = &loop_device {
@@ -342,13 +334,7 @@ impl Pool {
         privileged(&["umount".as_ref(), self.mountpoint.as_os_str()])
             .await
             .with_context(|| format!("unmounting the pool at {}", self.mountpoint.display()))?;
-        // Normally gone already: a device the mount attached autoclears. One
-        // an older worker attached with `losetup` does not.
-        if let Backing::Image { path, .. } = &self.backing
-            && let Some(device) = attached_loop(path).await
-        {
-            privileged(&["losetup".as_ref(), "-d".as_ref(), device.as_os_str()]).await?;
-        }
+        // The loop device the mount attached autoclears with it.
         Ok(())
     }
 

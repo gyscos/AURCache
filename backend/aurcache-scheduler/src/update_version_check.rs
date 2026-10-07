@@ -1,7 +1,6 @@
 use anyhow::anyhow;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, RefreshTarget, SourceinfoPurpose};
-use aurcache_common::settings::{ApplicationSettings, Setting, SettingsEntry};
 use aurcache_db::helpers::builds::latest_successful_version_any_platform;
 use aurcache_db::packages;
 use aurcache_db::packages::SourceData;
@@ -10,8 +9,7 @@ use aurcache_utils::package::metadata::apply_source_metadata;
 use aurcache_utils::package::update::package_update_all_outdated;
 use aurcache_utils::pkg::vercmp;
 use aurcache_utils::services::Services;
-use aurcache_utils::settings::Seconds;
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use aurcache_utils::snapshot::Resolved;
 use aurcache_utils::vcs_check::{RoundCache, VcsSync, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
@@ -34,8 +32,8 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
                 });
             }
 
-            let check_interval: SettingsEntry<Seconds> =
-                ApplicationSettings::get(Setting::VersionCheckInterval, None, &services.db).await;
+            let check_interval =
+                settings::get(&services.db, settings::key::VERSION_CHECK_INTERVAL, None).await;
             tokio::time::sleep(Duration::from_secs(check_interval.value.0.max(1))).await;
         }
     })
@@ -58,12 +56,11 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
             // pkgbase differs from any child pkgname (e.g. czkawka → czkawka-cli),
             // query by the first split child so the RPC returns a result whose
             // package_base field can be matched below.
-            x.split_packages
-                .as_deref()
-                .and_then(|sp| serde_json::from_str::<Vec<String>>(sp).ok())
-                .filter(|names| names.len() > 1)
-                .and_then(|names| names.first().cloned())
-                .unwrap_or_else(|| x.name.clone())
+            let names = aurcache_db::lists::json_list(x.split_packages.as_deref());
+            match names.as_slice() {
+                [first, _, ..] => first.clone(),
+                _ => x.name.clone(),
+            }
         })
         .collect();
 
@@ -89,224 +86,98 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     let mut round = RoundCache::new();
 
     for package in packages {
-        let package_id = package.id;
         // Only what this sweep sets: the loop does network I/O per package
         // (AUR RPC, git fetches), so by the time a late package saves, a row
-        // cloned at the top is minutes stale — and a full-row `update()` would
+        // read at the top is minutes stale -- and a full-row `update()` would
         // write that staleness back over every column, including ones a
-        // concurrently finishing build just changed (status, latest build).
-        // A partial update touches the sweep's own columns and nothing else.
-        let mut package_model = packages::ActiveModel {
-            id: Set(package_id),
+        // concurrently finishing build just changed. A partial update touches
+        // the sweep's own columns and nothing else.
+        let mut model = packages::ActiveModel {
+            id: Set(package.id),
             ..Default::default()
         };
-
-        // Not scoped to a platform: this is compared against the upstream
-        // version to decide whether the package is out of date, which is a
-        // question about the package rather than about one architecture.
-        let latest_version = latest_successful_version_any_platform(db, package_id)
-            .await?
-            .filter(|version| !version.is_empty());
-
-        // The upstream version already reported, if the package was out of
-        // date going in.
-        let reported = (package.out_of_date != 0)
-            .then(|| package.upstream_version.clone())
-            .flatten();
-        let source_data = package.source_data;
-        match source_data {
+        let check = Check {
+            services,
+            package: &package,
+        };
+        match &package.source_data {
             SourceData::Aur { .. } => {
-                match by_base.get(package.name.as_str()) {
-                    None => {
-                        // Removed from the AUR. Recorded so the package page
-                        // can say so: its metadata still comes from the
-                        // checkout, which continues to exist, so absent
-                        // metadata no longer implies absence from the AUR.
-                        activity.emit(Event::AurMissing {
-                            pkg: package.name.as_str().into(),
-                        });
-                        package_model.aur_missing = Set(Some(true));
+                let Some(result) = by_base.get(package.name.as_str()) else {
+                    // Removed from the AUR. Recorded so the package page can
+                    // say so: its metadata still comes from the checkout,
+                    // which continues to exist.
+                    activity.emit(Event::AurMissing {
+                        pkg: package.name.as_str().into(),
+                    });
+                    model.aur_missing = Set(Some(true));
+                    save_package(db, activity, model, &package.name).await;
+                    continue;
+                };
+                // The AUR's own out-of-date marker is the one thing here it
+                // alone knows.
+                model.aur_flagged_outdated = Set(Some(result.out_of_date.unwrap_or(0) != 0));
+                model.aur_missing = Set(Some(false));
+                // The version is the AUR's; the checkout is only read for the
+                // metadata and the `git+` sources, so one that cannot be read
+                // costs those and not the version check.
+                let resolved = match check.resolve().await {
+                    Ok(resolved) => Some(resolved),
+                    Err(e) => {
+                        check.sourceinfo_failed(SourceinfoPurpose::Vcs, &e);
+                        None
                     }
-                    Some(result) => {
-                        package_model.upstream_version = Set(Some(result.version.clone()));
-                        // The AUR's own out-of-date marker is the one thing
-                        // here it alone knows; the rest of the page's metadata
-                        // is read from the checkout below, which also covers
-                        // git-sourced packages that have no AUR entry.
-                        package_model.aur_flagged_outdated =
-                            Set(Some(result.out_of_date.unwrap_or(0) != 0));
-                        package_model.aur_missing = Set(Some(false));
-                        // Only mark out of date when upstream is strictly newer than the
-                        // locally built version.  This prevents VCS packages (-git etc.)
-                        // from looping: the AUR-reported version is the one from when the
-                        // PKGBUILD was last touched, which may be *older* than what was
-                        // actually built from the live VCS source.
-                        let mut upstream = Upstream {
-                            newer: upstream_is_newer(
-                                &result.version,
-                                latest_version.as_deref(),
-                                &package.name,
-                                activity,
-                            ),
-                            vcs_moved: false,
-                        };
-
-                        // `pkgver` alone doesn't catch VCS packages (-git etc.)
-                        // whose upstream repo moved without the AUR PKGBUILD's
-                        // version being bumped. Resolve any git+ VCS sources
-                        // and flag out-of-date if any of them changed.
-                        match store
-                            .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
-                            .await
-                        {
-                            Ok(Resolved {
-                                sourceinfo,
-                                metadata,
-                            }) => {
-                                apply_source_metadata(&mut package_model, &metadata);
-                                upstream.vcs_moved = vcs_moved(
-                                    services,
-                                    &package.name,
-                                    package_id,
-                                    &sourceinfo,
-                                    &mut round,
-                                )
-                                .await;
-                            }
-                            Err(e) => activity.emit(Event::SourceinfoFailed {
-                                pkg: package.name.as_str().into(),
-                                purpose: SourceinfoPurpose::Vcs,
-                                error: format!("{e:#}"),
-                            }),
-                        }
-
-                        package_model.out_of_date = Set(i32::from(upstream.is_outdated()));
-                        report_detected(
-                            activity,
-                            &package.name,
-                            reported.as_deref(),
-                            &result.version,
-                            latest_version,
-                            upstream,
-                        );
-
-                        // The AUR RPC `/info` response is a cheap way to know
-                        // whether the package has actually changed upstream
-                        // (via `version`/`last_modified`); only refresh the
-                        // (git-backed) snapshot cache -- which requires a
-                        // `git fetch` -- when it looks like something changed,
-                        // instead of unconditionally re-fetching every package
-                        // on every check.
-                        if upstream.is_outdated()
-                            && let Err(e) = store.refresh(&source_data).await
-                        {
-                            activity.emit(Event::SourceRefreshFailed {
-                                pkg: package.name.as_str().into(),
-                                target: RefreshTarget::Snapshot,
-                                error: format!("{e:#}"),
-                            });
-                        }
-                    }
+                };
+                let upstream = check
+                    .record(&mut model, &result.version, resolved.as_ref(), &mut round)
+                    .await?;
+                // Only now refresh the snapshot -- a `git fetch` -- and only
+                // when something looks new, rather than re-fetching every
+                // package on every check.
+                if upstream.is_outdated()
+                    && let Err(e) = store.refresh(&package.source_data).await
+                {
+                    check.refresh_failed(RefreshTarget::Snapshot, &e);
                 }
             }
             SourceData::Git { .. } => {
-                // No cheap upstream-metadata API for arbitrary git remotes,
-                // so always refresh: this is an incremental `git fetch`
-                // against the persistent checkout, not a full re-clone.
-                if let Err(e) = store.refresh(&source_data).await {
-                    activity.emit(Event::SourceRefreshFailed {
-                        pkg: package.name.as_str().into(),
-                        target: RefreshTarget::Git,
-                        error: format!("{e:#}"),
-                    });
-                    // Nothing set yet, so nothing to save: persisting the
-                    // empty update would write no columns at all.
+                // No cheap metadata API for arbitrary git remotes, so always
+                // refresh: an incremental `git fetch` of the checkout.
+                if let Err(e) = store.refresh(&package.source_data).await {
+                    check.refresh_failed(RefreshTarget::Git, &e);
                     continue;
                 }
-                // A failure here (e.g. a patch that no longer applies
-                // cleanly against a new upstream commit) must not abort
-                // version-checking for the remaining packages - it only
-                // means this package's own out-of-date/version tracking
-                // can't be updated this round; the actual build for this
-                // package will separately fail later with the same error,
-                // which is the desired outcome for an unapplicable patch.
-                let Resolved {
-                    sourceinfo,
-                    metadata,
-                } = match store
-                    .sourceinfo_and_metadata(&source_data, package.patch.as_deref())
-                    .await
-                {
+                // A patch that no longer applies against a new upstream commit
+                // costs this package its tracking this round, not the rest of
+                // the check; its build will fail the same way later.
+                let resolved = match check.resolve().await {
                     Ok(resolved) => resolved,
                     Err(e) => {
-                        activity.emit(Event::SourceinfoFailed {
-                            pkg: package.name.as_str().into(),
-                            purpose: SourceinfoPurpose::Version,
-                            error: format!("{e:#}"),
-                        });
-                        // As above: no columns set yet, nothing to persist.
+                        check.sourceinfo_failed(SourceinfoPurpose::Version, &e);
                         continue;
                     }
                 };
-                // This still only tracks the version in PKGBUILD/.SRCINFO; a ref
-                // moving without a version bump will not mark the package outdated
-                // by itself - the VCS-source check below covers that case.
-                let version = sourceinfo.base.version.to_string();
-
-                package_model.upstream_version = Set(Some(version.clone()));
-                // A git-sourced package has no AUR entry, so this is the only
-                // place its description, licenses and maintainer come from.
-                apply_source_metadata(&mut package_model, &metadata);
-                // Same logic as for AUR packages: only mark out of date when the
-                // upstream PKGBUILD version is strictly newer than what was built.
-                let upstream = Upstream {
-                    newer: upstream_is_newer(
-                        &version,
-                        latest_version.as_deref(),
-                        &package.name,
-                        activity,
-                    ),
-                    vcs_moved: vcs_moved(
-                        services,
-                        &package.name,
-                        package_id,
-                        &sourceinfo,
-                        &mut round,
-                    )
-                    .await,
-                };
-
-                package_model.out_of_date = Set(i32::from(upstream.is_outdated()));
-                report_detected(
-                    activity,
-                    &package.name,
-                    reported.as_deref(),
-                    &version,
-                    latest_version,
-                    upstream,
-                );
+                // Only the version in the PKGBUILD; a ref moving without a
+                // version bump is what the `git+` source check catches.
+                let version = resolved.sourceinfo.base.version.to_string();
+                check
+                    .record(&mut model, &version, Some(&resolved), &mut round)
+                    .await?;
             }
-            SourceData::Upload { .. } => {
-                // noop since update is only triggered by new upload — and in
-                // particular no columns are set, so there is nothing the
-                // save below could write.
-                continue;
-            }
+            // Updated only by a new upload, so nothing to check.
+            SourceData::Upload { .. } => continue,
         }
-
-        save_package(db, activity, package_model, &package.name).await;
+        save_package(db, activity, model, &package.name).await;
     }
 
     // Detection is the only thing that knows a package went out of date —
     // including a VCS package whose upstream moved without a pkgver bump — so
     // with this on, the rebuild is queued here rather than waiting for the
-    // separate `auto_update_interval` window, which could be a day away.
+    // auto-update schedule, which could be a day away.
     //
     // Reuses the auto-update job's own selection rather than restating it:
     // out-of-date packages whose last build succeeded. A package whose build
     // is failing stays flagged for a human instead of being retried in a loop.
-    let build_now: SettingsEntry<bool> =
-        ApplicationSettings::get(Setting::BuildOnNewVersion, None, db).await;
+    let build_now = settings::get(db, settings::key::BUILD_ON_NEW_VERSION, None).await;
     if build_now.value
         && let Err(e) = package_update_all_outdated(services).await
     {
@@ -316,6 +187,99 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// One package's turn in a version check.
+struct Check<'a> {
+    services: &'a Services,
+    package: &'a packages::Model,
+}
+
+impl Check<'_> {
+    /// The package's `.SRCINFO` and the metadata beside it, from its checkout.
+    async fn resolve(&self) -> anyhow::Result<Resolved> {
+        self.services
+            .store
+            .sourceinfo_and_metadata(&self.package.source_data, self.package.patch.as_deref())
+            .await
+    }
+
+    /// Record what the check found -- the upstream version, the metadata the
+    /// checkout gave, whether the package is out of date -- and log a version
+    /// that is news.
+    async fn record(
+        &self,
+        model: &mut packages::ActiveModel,
+        version: &str,
+        resolved: Option<&Resolved>,
+        round: &mut RoundCache,
+    ) -> anyhow::Result<Upstream> {
+        let Services { db, activity, .. } = self.services;
+        let name = &self.package.name;
+        // Not scoped to a platform: this is a question about the package
+        // rather than about one architecture.
+        let built = latest_successful_version_any_platform(db, self.package.id).await?;
+        let mut vcs_moved = false;
+        if let Some(resolved) = resolved {
+            apply_source_metadata(model, &resolved.metadata);
+            vcs_moved = self.vcs_moved(&resolved.sourceinfo, round).await;
+        }
+        // Only newer counts, never merely different: a VCS package's AUR
+        // version is from when its PKGBUILD was last touched, which may be
+        // older than what was built from the live source.
+        let upstream = Upstream {
+            newer: upstream_is_newer(version, built.as_deref(), name, activity),
+            vcs_moved,
+        };
+        model.upstream_version = Set(Some(version.to_string()));
+        model.out_of_date = Set(upstream.is_outdated());
+        // The upstream version already reported, if the package was out of
+        // date going in.
+        let reported = self
+            .package
+            .out_of_date
+            .then_some(self.package.upstream_version.as_deref())
+            .flatten();
+        report_detected(activity, name, reported, version, built, upstream);
+        Ok(upstream)
+    }
+
+    /// Whether one of the package's `git+` sources moved since the last check.
+    ///
+    /// A sync that fails is logged and counts as not moved: a later round
+    /// retries.
+    async fn vcs_moved(
+        &self,
+        sourceinfo: &alpm_srcinfo::SourceInfoV1,
+        round: &mut RoundCache,
+    ) -> bool {
+        match sync_vcs_sources(&self.services.db, self.package.id, sourceinfo, round).await {
+            Ok(sync) => sync == VcsSync::Moved,
+            Err(e) => {
+                self.services.activity.emit(Event::VcsSyncFailed {
+                    pkg: self.package.name.as_str().into(),
+                    error: format!("{e:#}"),
+                });
+                false
+            }
+        }
+    }
+
+    fn sourceinfo_failed(&self, purpose: SourceinfoPurpose, error: &anyhow::Error) {
+        self.services.activity.emit(Event::SourceinfoFailed {
+            pkg: self.package.name.as_str().into(),
+            purpose,
+            error: format!("{error:#}"),
+        });
+    }
+
+    fn refresh_failed(&self, target: RefreshTarget, error: &anyhow::Error) {
+        self.services.activity.emit(Event::SourceRefreshFailed {
+            pkg: self.package.name.as_str().into(),
+            target,
+            error: format!("{error:#}"),
+        });
+    }
 }
 
 /// What a version check found about one package's upstream.
@@ -330,28 +294,6 @@ struct Upstream {
 impl Upstream {
     const fn is_outdated(self) -> bool {
         self.newer || self.vcs_moved
-    }
-}
-
-/// Whether one of the package's `git+` sources moved since the last check.
-///
-/// A sync that fails is logged and counts as not moved: a later round retries.
-async fn vcs_moved(
-    services: &Services,
-    pkgbase: &str,
-    package_id: i32,
-    sourceinfo: &alpm_srcinfo::SourceInfoV1,
-    round: &mut RoundCache,
-) -> bool {
-    match sync_vcs_sources(&services.db, package_id, sourceinfo, round).await {
-        Ok(sync) => sync == VcsSync::Moved,
-        Err(e) => {
-            services.activity.emit(Event::VcsSyncFailed {
-                pkg: pkgbase.into(),
-                error: format!("{e:#}"),
-            });
-            false
-        }
     }
 }
 

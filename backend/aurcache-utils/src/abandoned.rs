@@ -10,7 +10,6 @@ use crate::build_logger::append_build_output;
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, QueueCause};
 use aurcache_common::api::log::BuildRef;
-use aurcache_common::build_state::EndReason;
 use aurcache_db::helpers::worker_jobs::Abandoned;
 use sea_orm::DatabaseConnection;
 
@@ -53,9 +52,7 @@ async fn explain(activity: &ActivityLog, abandoned: &Abandoned) {
     let Some(build) = abandoned.build_ref() else {
         return;
     };
-    let reason = EndReason::from_i32(abandoned.end_reason)
-        .map_or("it was abandoned", EndReason::explanation);
-    let text = format!("Abandoned: {reason}.\n");
+    let text = format!("Abandoned: {}.\n", abandoned.end_reason.explanation());
     if let Err(e) = append_build_output(&build.pkgbase, build.number, &text).await {
         activity.emit(Event::BuildLogAppendFailed {
             build,

@@ -5,7 +5,7 @@
 //! the caller's wrapper.
 
 use anyhow::{Context, Result};
-use aurcache_common::worker::{CompleteReport, JobDescriptor};
+use aurcache_common::worker::{BuildOutcome, CompleteReport, JobDescriptor};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use aurcache_worker_core::client::WorkerClient;
-use aurcache_worker_core::protocol::{log, remote_cancel, report_warning, upload_artifacts};
+use aurcache_worker_core::protocol::{Stop, StopWatch, log, report_warning, upload_artifacts};
 use aurcache_worker_core::{artifacts, report};
 
 use crate::build;
@@ -356,7 +356,7 @@ async fn run_job_inner(
         };
         let report = run_build(&ctx, client, job, &pkgdir, &cache, &binds, cancel).await?;
         // Before the lease goes, and the packages with it.
-        if report.success {
+        if report.outcome == BuildOutcome::Succeeded {
             upload_artifacts(client, build_id, &pkgdir).await?;
         }
         Ok(report)
@@ -422,7 +422,7 @@ async fn run_job_inner(
     // An unsuccessful build never leaves its tree for the next one: whatever
     // the keep did not take -- no keep, a keep that failed, a tree that could
     // not move -- goes here. See `Cache::discard_builddir` for why.
-    if !report.success && job.persistent_builddir {
+    if report.outcome != BuildOutcome::Succeeded && job.persistent_builddir {
         let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
         let discarded = join_cache_task(
             tokio::task::spawn_blocking(move || cache.discard_builddir(&arch, &pkgbase)),
@@ -735,12 +735,9 @@ async fn run_build(
         }
     };
 
-    // Poll for cancellation / timeout while the child runs. Local self-abort and
-    // the build timeout are checked every 5s (cheap, in-process); the remote
-    // cancel flag is polled less often (an HTTP round-trip) to avoid hammering
-    // the server, and — now that the client carries connect/read timeouts — can
-    // no longer block this loop indefinitely.
-    let started = std::time::Instant::now();
+    // Watched for cancellation and the timeout while the child runs; see
+    // `StopWatch` for how often each is looked at.
+    let mut watch = StopWatch::start(ctx.cfg.core.build_timeout, cancel, build_id);
     // Forward both streams to the build log. Held so they can be awaited after
     // the child exits, which is what guarantees the final lines are sent.
     let pumps = [
@@ -760,28 +757,13 @@ async fn run_build(
     })
     .collect::<Vec<_>>();
 
-    let timeout = ctx.cfg.core.build_timeout;
-    let remote_poll = Duration::from_secs(30);
-    let mut last_remote_poll = std::time::Instant::now();
-    let mut canceled = false;
-    let mut timed_out = false;
+    let mut stopped = None;
     let status = loop {
         tokio::select! {
             res = child.wait() => break res.context("awaiting build")?,
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                let hit_timeout = timeout > 0 && started.elapsed().as_secs() >= timeout;
-                if hit_timeout {
-                    timed_out = true;
-                }
-                if cancel.load(Ordering::SeqCst) {
-                    canceled = true;
-                } else if last_remote_poll.elapsed() >= remote_poll {
-                    last_remote_poll = std::time::Instant::now();
-                    if remote_cancel(client, build_id).await {
-                        canceled = true;
-                    }
-                }
-                if canceled || hit_timeout {
+            () = tokio::time::sleep(StopWatch::TICK) => {
+                stopped = watch.check(client).await;
+                if stopped.is_some() {
                     // Kill the whole build tree, not just makechrootpkg:
                     // cgroup.kill (recursive over descendants) when the cgroup
                     // is available, else the process-group SIGKILL the
@@ -833,7 +815,9 @@ async fn run_build(
             let _ = pump.await;
         }
     };
-    if canceled || timed_out {
+    let canceled = stopped == Some(Stop::Canceled);
+    let timed_out = stopped == Some(Stop::TimedOut);
+    if stopped.is_some() {
         if tokio::time::timeout(KILLED_OUTPUT_GRACE, drain)
             .await
             .is_err()
@@ -849,7 +833,7 @@ async fn run_build(
     }
 
     let mut report = if timed_out {
-        report::timeout_failure(started.elapsed().as_secs())
+        report::timeout_failure(watch.elapsed().as_secs())
     } else {
         report::classify_exit(status, canceled)
     };
@@ -858,7 +842,7 @@ async fn run_build(
     // on every future build. Only for a success: a failure's tree is moved
     // beside the keep or discarded by the caller, after the keep decision, and
     // measuring it first would walk a tree about to go.
-    if job.persistent_builddir && report.success {
+    if job.persistent_builddir && report.outcome == BuildOutcome::Succeeded {
         let (cache, arch, pkgbase) = (cache.clone(), job.arch.clone(), job.pkgbase.clone());
         let _ = join_cache_task(
             tokio::task::spawn_blocking(move || cache.record_builddir_size(&arch, &pkgbase)),
@@ -878,7 +862,7 @@ async fn run_build(
     // SRCDEST guard and no sibling can have fetched into the mirror. Only for a
     // success: nothing else is ever consulted as a baseline, and a failure has
     // no business moving one.
-    if report.success {
+    if report.outcome == BuildOutcome::Succeeded {
         report.vcs_commits =
             crate::built_sources::resolve(&job.vcs_sources, srcdest.as_deref()).await;
     }
@@ -886,7 +870,7 @@ async fn run_build(
     // A process the kernel killed for memory looks, from makepkg's exit code,
     // like any other failure -- a compiler "terminated by signal", an error
     // several screens up the log. Say what happened where it is looked for.
-    if !report.success
+    if report.outcome != BuildOutcome::Succeeded
         && !canceled
         && !timed_out
         && let Some(kills) = build_cgroup
@@ -915,7 +899,7 @@ async fn run_build(
     // Running out of disk looks like any other failure too: whichever write
     // hit the quota fails with "Disk quota exceeded", somewhere in the log.
     // The quota group's own figures say whether that is what happened.
-    if !report.success
+    if report.outcome != BuildOutcome::Succeeded
         && !canceled
         && !timed_out
         && !out_of_memory
@@ -979,8 +963,7 @@ fn should_keep(build_id: i32, report: &CompleteReport) -> bool {
     // `classify_exit`'s mapping of a bare 124): a build that genuinely exited
     // 124 reads as timed out everywhere already.
     const TIMEOUT_EXIT: i32 = 124;
-    !report.success
-        && !report.canceled
+    report.outcome == BuildOutcome::Failed
         && report.exit_code != Some(TIMEOUT_EXIT)
         && build_id != crate::chroots::ONE_SHOT_BUILD_ID
 }

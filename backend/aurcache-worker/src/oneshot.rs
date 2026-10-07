@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+use aurcache_common::worker::BuildOutcome;
 use aurcache_worker_core::{artifacts, report};
 
 use crate::build;
@@ -85,7 +86,7 @@ pub async fn build_once(cfg: &Config, path: &Path, flags: &[String]) -> Result<(
         .await?;
 
     let report = report::classify_exit(status, false);
-    if report.success {
+    if report.outcome == BuildOutcome::Succeeded {
         let artifacts = artifacts::discover_artifacts(&pkgdir);
         tracing::info!("Build succeeded: {} artifact(s)", artifacts.len());
         for a in artifacts {

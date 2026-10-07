@@ -28,19 +28,9 @@ use utoipa::ToSchema;
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum ValueKind {
     /// A whole number, optionally bounded. Both bounds are inclusive.
-    Integer {
-        #[serde(default)]
-        min: Option<i64>,
-        #[serde(default)]
-        max: Option<i64>,
-    },
+    Integer { min: Option<i64>, max: Option<i64> },
     /// A fractional number, optionally bounded. Both bounds are inclusive.
-    Float {
-        #[serde(default)]
-        min: Option<f64>,
-        #[serde(default)]
-        max: Option<f64>,
-    },
+    Float { min: Option<f64>, max: Option<f64> },
     /// `true` or `false`.
     Bool,
     /// A byte count written the way configuration writes one (`450G`), read by
@@ -177,12 +167,10 @@ pub struct SettingDecl {
     ///
     /// The *real* fallback rather than the built-in one, so resetting a value
     /// shows what the worker would return to.
-    #[serde(default)]
     pub default: Option<String>,
     /// The environment variable that pins this setting on the worker's own
     /// machine. `<env_var>_DEFAULT` sets a default the server may override
     /// instead.
-    #[serde(default)]
     pub env_var: Option<String>,
     pub applies: Applies,
 }
@@ -220,13 +208,11 @@ pub enum SettingStatus {
 pub struct EffectiveSetting {
     /// The value in use, written the way it was configured. `None` where the
     /// setting is unset and unset means unlimited.
-    #[serde(default)]
     pub value: Option<String>,
     pub source: EffectiveSource,
     pub status: SettingStatus,
     /// Why, for anything an operator would otherwise have to guess at: a value
     /// that was refused, or a pin shadowing something.
-    #[serde(default)]
     pub reason: Option<String>,
 }
 
@@ -235,10 +221,9 @@ pub struct EffectiveSetting {
 pub struct EffectiveConfig {
     /// The revision of the last [`ConfigSnapshot`] this reflects.
     ///
-    /// `None` from a worker that has been sent nothing: it is running its
+    /// `None` while the worker has been sent nothing: it is running its
     /// environment and its defaults, which is a complete answer and not a
     /// missing one.
-    #[serde(default)]
     pub received_revision: Option<String>,
     pub settings: BTreeMap<String, EffectiveSetting>,
 }

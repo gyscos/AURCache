@@ -17,25 +17,23 @@ use aurcache_common::api::log::{BuildRef, WorkerRef};
 use aurcache_common::api::worker::{
     ApprovalStatus, WorkerConfigUpdate, WorkerConfigView, WorkerJoinInfo, WorkerSummary,
 };
-use aurcache_common::build_state::BuildStates;
-use aurcache_common::settings::{ApplicationSettings, Setting};
+use aurcache_common::build_state::BuildState;
 use aurcache_common::worker::{
-    ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor, JobStatus,
-    MirrorlistPreference, RegisterRequest, RegisterStatus, WorkerLogReport,
+    BuildOutcome, ClaimRequest, CompleteReport, Heartbeat, HeartbeatResponse, JobDescriptor,
+    JobStatus, MirrorlistPreference, RegisterRequest, RegisterStatus, WorkerLogReport,
 };
 use aurcache_common::worker_config::{
     ConfigSnapshot, EffectiveConfig, SettingDecl, SettingStatus, validate_value,
 };
 use aurcache_db::helpers::time::now_secs;
 use aurcache_db::helpers::{worker_jobs, worker_store};
-use aurcache_db::lists::ListColumn;
 use aurcache_db::prelude::{Builds, Packages};
 use aurcache_db::{builds, workers};
 use aurcache_utils::build_logger::append_build_output;
 use aurcache_utils::job_config::{JobConfig, build_job_config, mirrorlist_dir, mirrorlist_for};
 use aurcache_utils::publish::publish_build;
 use aurcache_utils::repository::Repository;
-use aurcache_utils::settings::general::SettingsTraits;
+use aurcache_utils::settings;
 use aurcache_utils::snapshot::SnapshotStore;
 use aurcache_utils::vcs_check::job_vcs_sources;
 use aurcache_utils::worker_complete;
@@ -203,8 +201,8 @@ impl<'r> FromRequest<'r> for WorkerAuth {
             return Outcome::Error((Status::InternalServerError, "no db".to_string()));
         };
         match worker_store::find_worker_by_fingerprint(db, &fingerprint).await {
-            Ok(Some(worker)) if worker.status == ApprovalStatus::Approved => {
-                let _ = worker_store::touch_last_seen(db, worker.id, None).await;
+            Ok(Some(mut worker)) if worker.status == ApprovalStatus::Approved => {
+                let _ = worker_store::touch_last_seen(db, &mut worker, None).await;
                 Outcome::Success(Self { worker })
             }
             Ok(_) => Outcome::Error((Status::Forbidden, "worker not approved".to_string())),
@@ -302,19 +300,15 @@ pub async fn register_worker(
         .map_err(|e| err(Status::InternalServerError, e))?
         .is_some();
 
-    // Stored as the JSON the worker sent, because the server renders a
-    // declaration and never reasons about it: a setting whose kind this server
-    // predates has to survive the trip to the page that shows it.
-    let declaration = input.settings.as_ref().and_then(|settings| {
-        serde_json::to_string(settings)
-            .map_err(|e| {
-                al.emit(Event::WorkerReportFailed {
-                    worker: input.name.as_str().into(),
-                    report: WorkerReport::Declaration,
-                    error: e.to_string(),
-                });
-            })
-            .ok()
+    // Stored as JSON, because the server renders a declaration and never
+    // reasons about it.
+    let declaration = serde_json::to_string(&input.settings).unwrap_or_else(|e| {
+        al.emit(Event::WorkerReportFailed {
+            worker: input.name.as_str().into(),
+            report: WorkerReport::Declaration,
+            error: e.to_string(),
+        });
+        "[]".to_string()
     });
 
     let worker = worker_store::register_worker(
@@ -322,17 +316,17 @@ pub async fn register_worker(
         &worker_store::WorkerRegistration {
             name: &input.name,
             fingerprint: &fingerprint,
-            native_arches: &ListColumn::Worker.join(&input.native_arches),
-            emulated_arches: &ListColumn::Worker.join(&input.emulated_arches),
+            native_arches: &input.native_arches,
+            emulated_arches: &input.emulated_arches,
             version: &input.version,
             kind: &input.kind,
-            package_affinity: &ListColumn::Worker.join(&input.packages),
+            package_affinity: &input.packages,
             priority: input.priority,
             // Clamped to at least 1: a worker reporting 0 would be treated as
             // permanently full and could never block a lower-priority worker,
             // silently defeating its own priority.
             concurrency: i32::try_from(input.concurrency.max(1)).unwrap_or(i32::MAX),
-            settings_declaration: declaration.as_deref(),
+            settings_declaration: &declaration,
         },
     )
     .await
@@ -380,9 +374,9 @@ pub async fn register_worker(
     }
 
     // Non-interactive enrollment: auto-approve when a configured mode matches.
-    // Eligibility (pending only) is enforced inside `auto_approve_from_env`, so
+    // Eligibility (pending only) is enforced inside `env_auto_approves`, so
     // a revoked worker is never re-approved by re-registering.
-    if crate::worker_enroll::auto_approve_from_env(
+    if crate::worker_enroll::env_auto_approves(
         worker.status,
         &fingerprint,
         input.enrollment_token.as_deref(),
@@ -467,12 +461,11 @@ pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, ApiError> {
 
 /// Claim the next buildable job for this worker, or 204 if none.
 ///
-/// The [`ClaimRequest`] body is accepted for wire compatibility but its contents
-/// are **not** used: routing reads arches, package affinity and priority from
-/// the worker's stored row. Each worker's decision depends on what every *other*
-/// worker declared, so those values must come from one consistent source rather
-/// than from whatever the caller asserts about itself. The row is refreshed on
-/// every re-registration, which happens on each worker boot.
+/// Routing reads arches, package affinity and priority from the worker's
+/// stored row, not from the claim: each worker's decision depends on what
+/// every *other* worker declared, so those values must come from one
+/// consistent source. The row is refreshed on every re-registration, which
+/// happens on each worker boot.
 #[post("/worker/jobs/claim", data = "<claim>")]
 pub async fn claim_job(
     db: &State<DatabaseConnection>,
@@ -556,12 +549,12 @@ async fn build_descriptor(
         Err(_) => (Vec::new(), Vec::new()),
     };
 
-    let build_flags = ListColumn::Package.split(&pkg.build_flags);
+    let build_flags = pkg.build_flags.as_slice().to_vec();
 
     // Resolved here rather than on the worker: settings are the server's,
     // with the package overriding the global default.
     let persistent_builddir =
-        ApplicationSettings::get::<bool>(Setting::PersistentBuilddir, Some(build.pkg_id), db)
+        settings::get(db, settings::key::PERSISTENT_BUILDDIR, Some(build.pkg_id))
             .await
             .value;
 
@@ -752,12 +745,7 @@ pub async fn job_artifact(
     // disk, not a statement about what a package should weigh -- which is why
     // it is a setting, and per package: `unreal-engine` is past 20 GiB, and
     // allowing it that should not allow everything else the same.
-    let limit = ApplicationSettings::get::<aurcache_utils::settings::ByteSize>(
-        Setting::MaxArtifactSize,
-        Some(build.pkg_id),
-        db,
-    )
-    .await;
+    let limit = settings::get(db, settings::key::MAX_ARTIFACT_SIZE, Some(build.pkg_id)).await;
     let (limit, source) = (limit.value.0, limit.source);
     let too_large = || {
         err(
@@ -887,12 +875,12 @@ async fn complete_job_inner(
     // A real ownership check: without it, any authenticated worker that
     // guessed an id could remove another worker's staging directory.
     if build.worker_id == Some(auth.worker.id) {
-        let failed = build.status == Some(BuildStates::FAILED_BUILD);
-        let acknowledged_abort = report.canceled && !report.success && failed;
-        let repeated_success = report.success
+        let failed = build.status == BuildState::Failed;
+        let acknowledged_abort = report.outcome == BuildOutcome::Canceled && failed;
+        let repeated_success = report.outcome == BuildOutcome::Succeeded
             && (matches!(
                 build.status,
-                Some(BuildStates::PUBLISHING | BuildStates::SUCCESSFUL_BUILD)
+                BuildState::Publishing | BuildState::Successful
             ) || (failed && build.end_reason.is_none()));
         if acknowledged_abort {
             let _ = tokio::fs::remove_dir_all(repo.staging_dir(build_id)).await;
@@ -942,12 +930,12 @@ async fn complete_job_inner(
         record_failed("kept chroot", e.to_string());
     }
 
-    if report.success {
+    if report.outcome == BuildOutcome::Succeeded {
         // What the worker actually checked out replaces what the server
         // guessed when it queued the build. Only from a success, and only when
-        // the worker reported something: one that predates this, or could not
-        // resolve a source, leaves the queue-time record standing -- the older
-        // commit, so the error is a redundant rebuild rather than a missed one.
+        // the worker reported something: one that could not resolve a source
+        // leaves the queue-time record standing -- the older commit, so the
+        // error is a redundant rebuild rather than a missed one.
         if !report.vcs_commits.is_empty()
             && let Err(e) = aurcache_db::helpers::builds::record_build_vcs_sources(
                 db,
@@ -983,9 +971,10 @@ async fn complete_job_inner(
     {
         record_failed("failure reason", e.to_string());
     }
+    // Refused like a success above when the lease was lost in the meantime.
     worker_complete::complete_failure(db, build_id, auth.worker.id)
         .await
-        .map_err(|e| err(Status::InternalServerError, e))?;
+        .map_err(|e| err(Status::Forbidden, e))?;
     if let Some(build) = named {
         activity.emit(Event::BuildFailed {
             build,
@@ -1005,13 +994,13 @@ async fn complete_job_inner(
 #[post("/worker/heartbeat", data = "<input>")]
 pub async fn heartbeat(
     db: &State<DatabaseConnection>,
-    auth: WorkerAuth,
+    mut auth: WorkerAuth,
     al: &State<ActivityLog>,
     input: Json<Heartbeat>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
     let db = db.inner();
     let hb = input.into_inner();
-    worker_store::touch_last_seen(db, auth.worker.id, Some(&hb.version))
+    worker_store::touch_last_seen(db, &mut auth.worker, Some(&hb.version))
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
     // Sent only when it changed, so this is normally absent. A report that
@@ -1097,16 +1086,13 @@ pub async fn heartbeat(
 
 /// The values set for this worker, when it does not hold them yet.
 ///
-/// Only for a worker that declared its settings -- an older one could do
-/// nothing with them. Read after the leases are renewed and never allowed to
-/// fail the heartbeat: a snapshot that cannot be read this time is sent on the
+/// Read after the leases are renewed and never allowed to fail the heartbeat: a snapshot that cannot be read this time is sent on the
 /// next one, while a heartbeat that failed would cost the worker its builds.
 async fn snapshot_for(
     db: &DatabaseConnection,
     worker: &workers::Model,
     received: Option<&str>,
 ) -> Option<ConfigSnapshot> {
-    worker.settings_declaration.as_ref()?;
     let values = worker_store::worker_setting_values(db, worker.id)
         .await
         .map_err(|e| tracing::warn!("reading worker {}'s settings: {e}", worker.id))
@@ -1141,12 +1127,12 @@ pub async fn job_status(
         .map_err(|e| err(Status::InternalServerError, e))?
         .ok_or_else(|| err(Status::NotFound, "build not found"))?;
     let mine = build.worker_id == Some(auth.worker.id);
-    if build.status == Some(BuildStates::ACTIVE_BUILD) && !mine {
+    if build.status == BuildState::Active && !mine {
         return Err(err(Status::Forbidden, "not owner"));
     }
     // Cancel is signalled by leaving ACTIVE while owned, or by no longer being
     // this worker's to run.
-    let cancel_requested = build.status != Some(BuildStates::ACTIVE_BUILD) || !mine;
+    let cancel_requested = build.status != BuildState::Active || !mine;
     Ok(Json(JobStatus { cancel_requested }))
 }
 
@@ -1166,7 +1152,7 @@ struct BuildTally {
 #[derive(sea_orm::FromQueryResult)]
 struct StatusCount {
     worker_id: Option<i32>,
-    status: Option<i32>,
+    status: BuildState,
     count: i64,
 }
 
@@ -1192,7 +1178,7 @@ async fn build_tallies(
 
     let mut tallies: HashMap<i32, BuildTally> = HashMap::new();
     for row in rows {
-        let (Some(worker_id), Some(status)) = (row.worker_id, row.status) else {
+        let Some(worker_id) = row.worker_id else {
             continue;
         };
         // Saturating because these are display counts: a repository with more
@@ -1200,10 +1186,10 @@ async fn build_tallies(
         // not panic the list.
         let count = i32::try_from(row.count).unwrap_or(i32::MAX);
         let tally = tallies.entry(worker_id).or_default();
-        match status {
-            BuildStates::ACTIVE_BUILD => tally.active = count,
-            BuildStates::SUCCESSFUL_BUILD => tally.successful = count,
-            BuildStates::FAILED_BUILD => tally.failed = count,
+        match row.status {
+            BuildState::Active => tally.active = count,
+            BuildState::Successful => tally.successful = count,
+            BuildState::Failed => tally.failed = count,
             // Enqueued and waiting-for-deps belong to no worker yet.
             _ => {}
         }
@@ -1221,9 +1207,9 @@ fn summarise(worker: workers::Model, tally: BuildTally, now: i64, timeout: i64) 
         name: worker.name,
         status: worker.status,
         cert_fingerprint: worker.cert_fingerprint,
-        native_arches: ListColumn::Worker.split(&worker.native_arches),
-        emulated_arches: ListColumn::Worker.split(&worker.emulated_arches),
-        package_affinity: ListColumn::Worker.split(&worker.package_affinity),
+        native_arches: worker.native_arches.into_vec(),
+        emulated_arches: worker.emulated_arches.into_vec(),
+        package_affinity: worker.package_affinity.into_vec(),
         priority: worker.priority,
         last_seen: worker.last_seen,
         version: worker.version,
@@ -1339,11 +1325,7 @@ pub async fn update_worker_config(
 ) -> Result<Json<WorkerConfigView>, ApiError> {
     let db = db.inner();
     let worker = find_or_404(db, id).await?;
-    let declared: Option<Vec<SettingDecl>> = worker
-        .settings_declaration
-        .as_deref()
-        .and_then(|json| parse_stored(json, id, "declaration"));
-    let changes = checked_changes(declared.as_deref(), input.into_inner().settings)
+    let changes = checked_changes(&declaration(&worker), input.into_inner().settings)
         .map_err(|e| err(Status::BadRequest, e))?;
 
     let saved = worker_store::save_worker_settings(db, id, &changes)
@@ -1369,7 +1351,7 @@ pub async fn update_worker_config(
 /// fields wrong hears about both rather than fixing them one round trip at a
 /// time.
 fn checked_changes(
-    declared: Option<&[SettingDecl]>,
+    declared: &[SettingDecl],
     changes: BTreeMap<String, Option<String>>,
 ) -> Result<BTreeMap<String, Option<String>>, String> {
     let mut refused = Vec::new();
@@ -1381,19 +1363,16 @@ fn checked_changes(
             None => None,
             Some(raw) => {
                 let value = raw.trim().to_string();
-                let problem = match declared {
-                    None => Some(
-                        "this worker's version does not accept settings from the server"
-                            .to_string(),
-                    ),
-                    // Blank is how a worker's environment spells "unset", so a
-                    // stored blank would read as nothing at all.
-                    Some(_) if value.is_empty() => Some(format!(
+                // Blank is how a worker's environment spells "unset", so a
+                // stored blank would read as nothing at all.
+                let problem = if value.is_empty() {
+                    Some(format!(
                         "{key}: remove the value rather than saving it empty"
-                    )),
-                    Some(declared) => validate_value(declared, &key, &value)
+                    ))
+                } else {
+                    validate_value(declared, &key, &value)
                         .err()
-                        .map(|why| format!("{key}: {why}")),
+                        .map(|why| format!("{key}: {why}"))
                 };
                 if let Some(problem) = problem {
                     refused.push(problem);
@@ -1429,21 +1408,22 @@ async fn config_view(
     let values = worker_store::worker_setting_values(db, id)
         .await
         .map_err(|e| err(Status::InternalServerError, e))?;
-    let settings: Option<Vec<SettingDecl>> = worker
-        .settings_declaration
-        .as_deref()
-        .and_then(|json| parse_stored(json, id, "declaration"));
     Ok(WorkerConfigView {
         worker_id: id,
-        // Only a worker that takes snapshots has a revision worth comparing.
-        revision: settings.as_ref().map(|_| config_revision(&values)),
-        settings,
+        revision: config_revision(&values),
+        settings: declaration(&worker),
         effective: worker
             .effective_config
             .as_deref()
             .and_then(|json| parse_stored(json, id, "configuration report")),
         values,
     })
+}
+
+/// What `worker` declared it accepts; nothing, when the stored declaration
+/// cannot be read.
+fn declaration(worker: &workers::Model) -> Vec<SettingDecl> {
+    parse_stored(&worker.settings_declaration, worker.id, "declaration").unwrap_or_default()
 }
 
 /// Read one of the stored worker-configuration blobs, saying so rather than
@@ -1579,7 +1559,9 @@ mod repo_template_tests {
     /// The checksum a worker sent `list` would hold.
     fn checksum_sent_with(list: &str) -> String {
         match super::resolve_mirrorlist(
-            &MirrorlistPreference::default(),
+            &MirrorlistPreference::Server {
+                checksums: BTreeMap::new(),
+            },
             "x86_64",
             Some(list.to_string()),
         ) {
@@ -1589,12 +1571,13 @@ mod repo_template_tests {
     }
 
     /// A worker that holds nothing is sent the content, with the checksum it
-    /// should echo back next time. This is also what a worker predating the
-    /// field does, since `MirrorlistPreference` defaults to holding nothing.
+    /// should echo back next time.
     #[test]
     fn a_worker_holding_nothing_is_sent_the_mirrorlist() {
         let offer = super::resolve_mirrorlist(
-            &MirrorlistPreference::default(),
+            &MirrorlistPreference::Server {
+                checksums: BTreeMap::new(),
+            },
             "x86_64",
             Some("Server = http://mirror/\n".to_string()),
         );
@@ -1750,11 +1733,8 @@ mod config_tests {
     /// space does not make the same value a different revision.
     #[test]
     fn a_valid_value_is_stored_trimmed() {
-        let checked = checked_changes(
-            Some(&declared()),
-            save(&[("build_memory_max", Some(" 32G "))]),
-        )
-        .unwrap();
+        let checked =
+            checked_changes(&declared(), save(&[("build_memory_max", Some(" 32G "))])).unwrap();
         assert_eq!(checked["build_memory_max"].as_deref(), Some("32G"));
     }
 
@@ -1763,7 +1743,7 @@ mod config_tests {
     #[test]
     fn every_refusal_is_reported_together() {
         let why = checked_changes(
-            Some(&declared()),
+            &declared(),
             save(&[
                 ("build_memory_max", Some("lots")),
                 ("build_user", Some("root")),
@@ -1778,18 +1758,16 @@ mod config_tests {
     /// rather than stored as a value that does nothing.
     #[test]
     fn a_blank_value_is_refused() {
-        assert!(
-            checked_changes(Some(&declared()), save(&[("build_memory_max", Some("  "))])).is_err()
-        );
+        assert!(checked_changes(&declared(), save(&[("build_memory_max", Some("  "))])).is_err());
     }
 
     /// Removing needs no declaration: a value for a key the worker has since
     /// dropped, or one set before it was upgraded away, must stay clearable.
     #[test]
     fn a_removal_needs_no_declaration() {
-        let checked = checked_changes(None, save(&[("gone", None)])).unwrap();
+        let checked = checked_changes(&[], save(&[("gone", None)])).unwrap();
         assert_eq!(checked["gone"], None);
-        let refused = checked_changes(None, save(&[("build_memory_max", Some("32G"))]));
+        let refused = checked_changes(&[], save(&[("build_memory_max", Some("32G"))]));
         assert!(
             refused.is_err(),
             "a worker that declares nothing cannot take a value"

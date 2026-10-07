@@ -191,7 +191,6 @@ pub fn init_api(services: Services, version: ServerVersion, ca_dir: CaDirectory)
             // skip images, video, archives and `text/event-stream`.
             .attach(Compression::with_level(Level::Precise(4)))
             .manage(services.db.clone())
-            .manage(services.tx.clone())
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(services.activity.clone())
             // Also managed on their own: a route that needs one of them says

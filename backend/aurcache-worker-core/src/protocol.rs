@@ -4,6 +4,8 @@
 use anyhow::{Context, Result};
 use aurcache_common::api::activity::Severity;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::artifacts;
 use crate::client::WorkerClient;
@@ -42,12 +44,85 @@ pub async fn report_error(client: &WorkerClient, build_id: Option<i32>, message:
     }
 }
 
-/// True when the server has recorded a cancel request for this build.
-pub async fn remote_cancel(client: &WorkerClient, build_id: i32) -> bool {
+/// Whether the server has asked for this build to stop. An unreachable server
+/// has not: the lease, not this poll, decides when a build is abandoned.
+pub async fn cancel_requested(client: &WorkerClient, build_id: i32) -> bool {
     client
         .job_status(build_id)
         .await
         .is_ok_and(|s| s.cancel_requested)
+}
+
+/// Why a running build is being stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The worker abandoned it, or the server asked for it to stop.
+    Canceled,
+    /// It ran past the build timeout.
+    TimedOut,
+}
+
+/// Decides, while a build runs, whether it has to be stopped -- the same way
+/// for every executor, so a build ends for the same reason whichever one ran
+/// it.
+pub struct StopWatch<'a> {
+    started: Instant,
+    /// Seconds; `0` is no limit.
+    timeout: u64,
+    /// Set when this worker has given up on the build itself.
+    cancel: &'a AtomicBool,
+    build_id: i32,
+    last_poll: Instant,
+}
+
+impl<'a> StopWatch<'a> {
+    /// How often a running build is looked at: [`Self::check`] belongs on a
+    /// timer of this period.
+    pub const TICK: Duration = Duration::from_secs(5);
+
+    /// How often the server is asked about a cancel. With N builds running, a
+    /// round trip per tick is N requests every five seconds for no gain:
+    /// cancel latency is dominated by build granularity anyway.
+    const POLL: Duration = Duration::from_secs(30);
+
+    /// Start timing a build that has just started.
+    #[must_use]
+    pub fn start(timeout: u64, cancel: &'a AtomicBool, build_id: i32) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            timeout,
+            cancel,
+            build_id,
+            last_poll: now,
+        }
+    }
+
+    /// How long the build has been running.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Whether to stop the build now, and why.
+    ///
+    /// A cancel wins over a timeout reached at the same tick: the build is
+    /// reported as what was asked for, and the server, which has already moved
+    /// a cancelled build on, would refuse a timeout report for it.
+    pub async fn check(&mut self, client: &WorkerClient) -> Option<Stop> {
+        // `>=`: a timeout of N means N seconds, not N+1.
+        let timed_out = self.timeout > 0 && self.elapsed().as_secs() >= self.timeout;
+        if self.cancel.load(Ordering::SeqCst) {
+            return Some(Stop::Canceled);
+        }
+        if !timed_out && self.last_poll.elapsed() >= Self::POLL {
+            self.last_poll = Instant::now();
+            if cancel_requested(client, self.build_id).await {
+                return Some(Stop::Canceled);
+            }
+        }
+        timed_out.then_some(Stop::TimedOut)
+    }
 }
 
 /// Upload every built artifact to the server's staging area.

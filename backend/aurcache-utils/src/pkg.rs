@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use alpm_types::{Version, VersionRequirement};
+use aurcache_db::lists::Platforms;
 
 pub use aurcache_deps::{parse_dep, satisfies_constraint};
 
@@ -484,9 +485,11 @@ mod tests {
 /// should not stop a package's dependency graph from being computed for the
 /// platforms that *are* valid.
 #[must_use]
-pub fn architectures_for_platforms(platforms: &str) -> Vec<alpm_types::SystemArchitecture> {
-    pacman_mirrors::platforms::Platform::parse_many(platforms)
-        .filter_map(Result::ok)
+pub fn architectures(platforms: &Platforms) -> Vec<alpm_types::SystemArchitecture> {
+    platforms
+        .as_slice()
+        .iter()
+        .copied()
         .map(architecture)
         .collect()
 }
@@ -507,17 +510,18 @@ pub const fn architecture(
 
 #[cfg(test)]
 mod architecture_tests {
-    use super::architectures_for_platforms;
+    use super::architectures;
     use alpm_types::SystemArchitecture;
+    use aurcache_db::lists::Platforms;
 
     #[test]
     fn each_platform_maps_to_its_alpm_architecture() {
         assert_eq!(
-            architectures_for_platforms("x86_64;aarch64;armv7h"),
+            architectures(&"x86_64;aarch64;armv7h".parse::<Platforms>().unwrap()),
             vec![
-                SystemArchitecture::X86_64,
                 SystemArchitecture::Aarch64,
                 SystemArchitecture::Armv7h,
+                SystemArchitecture::X86_64,
             ]
         );
     }
@@ -527,18 +531,8 @@ mod architecture_tests {
     #[test]
     fn a_single_platform_does_not_pull_in_x86_64() {
         assert_eq!(
-            architectures_for_platforms("aarch64"),
+            architectures(&"aarch64".parse::<Platforms>().unwrap()),
             vec![SystemArchitecture::Aarch64]
         );
-    }
-
-    /// One bad entry must not lose the good ones.
-    #[test]
-    fn unparseable_platforms_are_skipped() {
-        assert_eq!(
-            architectures_for_platforms("x86_64;sparc;aarch64"),
-            vec![SystemArchitecture::X86_64, SystemArchitecture::Aarch64]
-        );
-        assert!(architectures_for_platforms("").is_empty());
     }
 }

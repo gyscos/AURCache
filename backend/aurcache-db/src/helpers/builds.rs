@@ -1,8 +1,10 @@
 //! Build-row queries shared across the update, dependency and completion paths.
 
+use crate::lists::Platforms;
 use crate::prelude::Builds;
 use crate::{builds, packages};
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
+use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
@@ -38,7 +40,7 @@ fn newest_success_query(pkg_id: i32, column: builds::Column) -> Select<Builds> {
         .select_only()
         .column(column)
         .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(builds::Column::Status.eq(Some(BuildStates::SUCCESSFUL_BUILD)))
+        .filter(builds::Column::Status.eq(BuildState::Successful))
         .order_by(recency(), Order::Desc)
         .order_by(builds::Column::Id, Order::Desc)
         .limit(1)
@@ -120,7 +122,7 @@ pub async fn pending_build<C: ConnectionTrait>(
     Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform))
-        .filter(builds::Column::Status.is_in(BuildStates::IN_PROGRESS.map(Some)))
+        .filter(builds::Column::Status.is_in(BuildState::IN_PROGRESS))
         .one(db)
         .await
 }
@@ -222,14 +224,104 @@ pub fn latest_successful_version_expr() -> Expr {
                     .equals((packages::Entity, packages::Column::Id)),
             )
             .and_where(
-                Expr::col((builds::Entity, builds::Column::Status))
-                    .eq(BuildStates::SUCCESSFUL_BUILD),
+                Expr::col((builds::Entity, builds::Column::Status)).eq(BuildState::Successful),
             )
             .order_by_expr(recency(), Order::Desc)
             .order_by((builds::Entity, builds::Column::Id), Order::Desc)
             .limit(1)
             .to_owned(),
     )
+}
+
+/// The status a package shows, from the states of its newest build on each
+/// platform it is built for.
+///
+/// Anything still under way leads, the most active first -- a package building
+/// on one platform and queued on another is building -- then a failure, then a
+/// success. `None` when it has no build on any of them.
+#[must_use]
+pub fn combined_status(states: impl IntoIterator<Item = BuildState>) -> Option<BuildState> {
+    const PRECEDENCE: [BuildState; 6] = [
+        BuildState::Active,
+        BuildState::Publishing,
+        BuildState::Enqueued,
+        BuildState::WaitingForDeps,
+        BuildState::Failed,
+        BuildState::Successful,
+    ];
+    let rank = |state: &BuildState| PRECEDENCE.iter().position(|s| s == state);
+    states.into_iter().min_by_key(rank)
+}
+
+/// Bring `pkg_id`'s status in line with its builds; see [`combined_status`].
+///
+/// The one way `packages.status` is written once a package has builds, so it
+/// cannot disagree with them: every change to a build's status calls this, in
+/// the same transaction. A package with no build on any configured platform is
+/// left as it is.
+pub async fn refresh_package_status<C: ConnectionTrait>(db: &C, pkg_id: i32) -> Result<(), DbErr> {
+    // Optional: a row written before the column had a default holds NULL.
+    let Some(configured) = packages::Entity::find_by_id(pkg_id)
+        .select_only()
+        .column(packages::Column::Platforms)
+        .into_tuple::<Option<Platforms>>()
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    let configured = configured.unwrap_or_default();
+
+    // The newest build per platform: the one whose number is the highest of
+    // that package and platform.
+    let latest = Alias::new("latest");
+    let newest_number = Query::select()
+        .expr(Expr::col((latest.clone(), builds::Column::Number)).max())
+        .from_as(builds::Entity, latest.clone())
+        .and_where(
+            Expr::col((latest.clone(), builds::Column::PkgId))
+                .equals((builds::Entity, builds::Column::PkgId)),
+        )
+        .and_where(
+            Expr::col((latest, builds::Column::Platform))
+                .equals((builds::Entity, builds::Column::Platform)),
+        )
+        .to_owned();
+    let newest: Vec<(Platform, BuildState)> = Builds::find()
+        .select_only()
+        .column(builds::Column::Platform)
+        .column(builds::Column::Status)
+        .filter(builds::Column::PkgId.eq(pkg_id))
+        .filter(Expr::col((builds::Entity, builds::Column::Number)).eq(Expr::from(newest_number)))
+        .into_tuple()
+        .all(db)
+        .await?;
+
+    let Some(status) = combined_status(
+        newest
+            .into_iter()
+            .filter(|(platform, _)| configured.contains(*platform))
+            .map(|(_, status)| status),
+    ) else {
+        return Ok(());
+    };
+    packages::Entity::update_many()
+        .col_expr(packages::Column::Status, status.into())
+        .filter(packages::Column::Id.eq(pkg_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Delete a build row; its package's status follows, in the same transaction.
+pub async fn delete_build<C: ConnectionTrait + sea_orm::TransactionTrait>(
+    db: &C,
+    build: &builds::Model,
+) -> Result<(), DbErr> {
+    let txn = db.begin().await?;
+    Builds::delete_by_id(build.id).exec(&txn).await?;
+    refresh_package_status(&txn, build.pkg_id).await?;
+    sea_orm::TransactionSession::commit(txn).await
 }
 
 /// Name builds the way everything outside the database does: by package and
@@ -265,7 +357,7 @@ mod tests {
         record_build_vcs_sources,
     };
     use crate::migration::Migrator;
-    use aurcache_common::build_state::BuildStates;
+    use aurcache_common::build_state::BuildState;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseConnection, EntityTrait, QueryFilter,
         QuerySelect,
@@ -308,10 +400,17 @@ mod tests {
             .unwrap()
     }
 
-    async fn build(db: &DatabaseConnection, number: i32, status: i32, version: &str, start: i64) {
+    async fn build(
+        db: &DatabaseConnection,
+        number: i32,
+        status: BuildState,
+        version: &str,
+        start: i64,
+    ) {
         db.execute_unprepared(&format!(
             "INSERT INTO builds (pkg_id, number, status, start_time, platform, version) \
-             VALUES (1, {number}, {status}, {start}, 'x86_64', '{version}')"
+             VALUES (1, {number}, {}, {start}, 'x86_64', '{version}')",
+            status.as_i32()
         ))
         .await
         .unwrap();
@@ -326,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_build_is_not_a_built_version() {
         let db = setup().await;
-        build(&db, 6, BuildStates::FAILED_BUILD, "1.4.1-1", 100).await;
+        build(&db, 6, BuildState::Failed, "1.4.1-1", 100).await;
 
         assert_eq!(
             latest_successful_version_any_platform(&db, 1)
@@ -341,8 +440,8 @@ mod tests {
     #[tokio::test]
     async fn a_later_failure_does_not_hide_an_earlier_success() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "1.4.0-1", 100).await;
-        build(&db, 6, BuildStates::FAILED_BUILD, "1.4.1-1", 200).await;
+        build(&db, 5, BuildState::Successful, "1.4.0-1", 100).await;
+        build(&db, 6, BuildState::Failed, "1.4.1-1", 200).await;
 
         assert_eq!(
             latest_successful_version_any_platform(&db, 1)
@@ -358,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_build_reports_its_version() {
         let db = setup().await;
-        build(&db, 6, BuildStates::SUCCESSFUL_BUILD, "1.4.1-1", 100).await;
+        build(&db, 6, BuildState::Successful, "1.4.1-1", 100).await;
 
         assert_eq!(
             latest_successful_version_any_platform(&db, 1)
@@ -374,8 +473,8 @@ mod tests {
     #[tokio::test]
     async fn the_baseline_is_what_the_last_successful_build_was_made_from() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
-        build(&db, 6, BuildStates::FAILED_BUILD, "r2.bbb-1", 200).await;
+        build(&db, 5, BuildState::Successful, "r1.aaa-1", 100).await;
+        build(&db, 6, BuildState::Failed, "r2.bbb-1", 200).await;
         let (success, failure) = (build_id(&db, 5).await, build_id(&db, 6).await);
 
         record_build_vcs_sources(&db, success, &sources(&[(&url(), "aaa")]))
@@ -397,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn a_build_with_no_record_reports_nothing() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        build(&db, 5, BuildState::Successful, "r1.aaa-1", 100).await;
 
         assert!(
             latest_successful_build_vcs_sources(&db, 1)
@@ -413,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn several_sources_are_recorded_and_re_recording_replaces() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        build(&db, 5, BuildState::Successful, "r1.aaa-1", 100).await;
         let id = build_id(&db, 5).await;
 
         let two = sources(&[
@@ -440,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn recording_nothing_clears_the_record() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        build(&db, 5, BuildState::Successful, "r1.aaa-1", 100).await;
         let id = build_id(&db, 5).await;
         record_build_vcs_sources(&db, id, &sources(&[(&url(), "aaa")]))
             .await
@@ -463,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn unreadable_json_reads_as_unknown() {
         let db = setup().await;
-        build(&db, 5, BuildStates::SUCCESSFUL_BUILD, "r1.aaa-1", 100).await;
+        build(&db, 5, BuildState::Successful, "r1.aaa-1", 100).await;
         let id = build_id(&db, 5).await;
         db.execute_unprepared(&format!(
             "UPDATE builds SET vcs_sources = 'not json' WHERE id = {id}"
@@ -477,6 +576,55 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A package's status follows its newest build on each configured
+    /// platform: an older build does not count, and neither does a platform
+    /// the package is no longer built for.
+    #[tokio::test]
+    async fn the_package_status_is_its_newest_builds() {
+        use super::refresh_package_status;
+        let db = setup().await;
+        db.execute_unprepared("UPDATE packages SET platforms = 'x86_64' WHERE id = 1")
+            .await
+            .unwrap();
+        let status = || async {
+            crate::prelude::Packages::find_by_id(1)
+                .select_only()
+                .column(crate::packages::Column::Status)
+                .into_tuple::<BuildState>()
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        build(&db, 1, BuildState::Failed, "1-1", 100).await;
+        build(&db, 2, BuildState::Successful, "1-1", 200).await;
+        refresh_package_status(&db, 1).await.unwrap();
+        assert_eq!(
+            status().await,
+            BuildState::Successful,
+            "the older failure is over"
+        );
+
+        db.execute_unprepared(&format!(
+            "INSERT INTO builds (pkg_id, number, status, start_time, platform, version) \
+             VALUES (1, 3, {}, 300, 'aarch64', '1-1')",
+            BuildState::Failed.as_i32()
+        ))
+        .await
+        .unwrap();
+        refresh_package_status(&db, 1).await.unwrap();
+        assert_eq!(
+            status().await,
+            BuildState::Successful,
+            "aarch64 is not a platform it is built for"
+        );
+
+        build(&db, 4, BuildState::Enqueued, "1-2", 400).await;
+        refresh_package_status(&db, 1).await.unwrap();
+        assert_eq!(status().await, BuildState::Enqueued);
     }
 
     /// Both forms of "newest successful build" order the same way on both

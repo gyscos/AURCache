@@ -2,6 +2,7 @@
 
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_common::api::dump::{DUMP_SCHEMA_VERSION, MANIFEST_FILE, PACKAGES_FILE};
+use aurcache_common::build_state::BuildState;
 use aurcache_common::source::GitSourceSpec;
 use aurcache_db::migration::Migrator;
 use aurcache_db::packages::SourceData;
@@ -37,12 +38,11 @@ async fn package(
         name: Set(name.to_string()),
         // Derived state, deliberately set to something a restore must not
         // carry over: the dump should describe the package, not its history.
-        status: Set(1),
-        out_of_date: Set(1),
+        status: Set(BuildState::Successful),
+        out_of_date: Set(true),
         upstream_version: Set(Some("9.9.9".to_string())),
-        latest_build: Set(None),
-        build_flags: Set("--noconfirm;;--nocolor".to_string()),
-        platforms: Set("x86_64;aarch64".to_string()),
+        build_flags: Set("--noconfirm;;--nocolor".parse().unwrap()),
+        platforms: Set("x86_64;aarch64".parse().unwrap()),
         source_data: Set(SourceData::Aur {
             name: name.to_string(),
         }),
@@ -94,7 +94,7 @@ async fn a_dump_carries_configuration_and_not_history() {
     let dump = build_dump(&db, "test", None).await.unwrap();
     let pkg = dump.packages.get("hello").expect("package missing");
 
-    assert_eq!(pkg.platforms, ["x86_64", "aarch64"]);
+    assert_eq!(pkg.platforms, ["aarch64", "x86_64"]);
     // The empty entry from `--noconfirm;;--nocolor` is dropped: it means the
     // same set, and a restore should not inherit the difference.
     assert_eq!(pkg.build_flags, ["--noconfirm", "--nocolor"]);
@@ -161,14 +161,13 @@ async fn settings_are_keyed_by_pkgbase() {
     let pkg_id = package(&db, "hello", true, None).await;
 
     for (key, value, scope) in [
-        // Global settings live under the sentinel id, not NULL.
-        ("version_check_interval", "600", Some(-1)),
+        ("version_check_interval", "600", None),
         ("build_flags", "--nocheck", Some(pkg_id)),
     ] {
         settings::ActiveModel {
             key: Set(key.to_string()),
             value: Set(Some(value.to_string())),
-            pkg_id: Set(scope),
+            pkg_id: Set(settings::scope(scope)),
             ..Default::default()
         }
         .insert(&db)
@@ -211,11 +210,12 @@ async fn only_approved_workers_are_carried() {
             name: Set(name.to_string()),
             status: Set(status),
             cert_fingerprint: Set(format!("fp-{name}")),
-            native_arches: Set("x86_64".to_string()),
-            emulated_arches: Set(String::new()),
-            package_affinity: Set(String::new()),
+            native_arches: Set("x86_64".parse().unwrap()),
+            emulated_arches: Set(Default::default()),
+            package_affinity: Set(Default::default()),
             priority: Set(0),
             concurrency: Set(1),
+            settings_declaration: Set("[]".to_string()),
             ..Default::default()
         }
         .insert(&db)
@@ -279,10 +279,10 @@ async fn a_git_source_is_carried_whole() {
     let db = db().await;
     packages::ActiveModel {
         name: Set("mine".to_string()),
-        status: Set(0),
-        out_of_date: Set(0),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        status: Set(BuildState::Active),
+        out_of_date: Set(false),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Git {
             spec: GitSourceSpec {
                 url: "https://example.com/mine.git".to_string(),
@@ -407,37 +407,6 @@ async fn overwrite_is_reported_as_overwrite() {
     assert!(matches!(entries[0].outcome, RestoreOutcome::Overwritten));
 }
 
-/// The invariant the whole ordering rests on: an imported row must land in a
-/// status `resolve_local_dependency_resolutions` actually queries. In any other
-/// state the row is invisible to resolution, and a dependency on it would fall
-/// through to the AUR and adopt a package in place of the one just imported --
-/// exactly what importing it was meant to prevent.
-#[tokio::test]
-async fn an_imported_row_is_visible_to_dependency_resolution() {
-    let source = db().await;
-    package(&source, "hello", true, None).await;
-    let bytes = dump_bytes(&source).await;
-
-    let target = db().await;
-    let loaded = load_dump(&bytes).unwrap();
-    aurcache_utils::restore::write_rows(&target, &test_repo(), &loaded, &RestoreOptions::default())
-        .await
-        .unwrap();
-
-    let row = Packages::find().one(&target).await.unwrap().unwrap();
-    // The set `resolve_local_dependency_resolutions` filters on.
-    let visible = [
-        aurcache_common::build_state::BuildStates::ACTIVE_BUILD,
-        aurcache_common::build_state::BuildStates::SUCCESSFUL_BUILD,
-        aurcache_common::build_state::BuildStates::ENQUEUED_BUILD,
-    ];
-    assert!(
-        visible.contains(&row.status),
-        "an imported package is invisible to dependency resolution (status {})",
-        row.status
-    );
-}
-
 /// Skip leaves an existing package exactly as it was. The default has to be
 /// the one that cannot destroy configuration nobody meant to replace.
 #[tokio::test]
@@ -455,7 +424,7 @@ async fn skip_leaves_the_existing_configuration_alone() {
         .unwrap()
         .unwrap()
         .into();
-    existing.platforms = Set("aarch64".to_string());
+    existing.platforms = Set("aarch64".parse().unwrap());
     existing.update(&target).await.unwrap();
 
     let loaded = load_dump(&bytes).unwrap();
@@ -473,7 +442,11 @@ async fn skip_leaves_the_existing_configuration_alone() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.platforms, "aarch64", "skip overwrote the target");
+    assert_eq!(
+        row.platforms.to_string(),
+        "aarch64",
+        "skip overwrote the target"
+    );
     assert!(
         applied.touched.is_empty(),
         "a skipped package should not be re-resolved: it was already here"
@@ -495,7 +468,7 @@ async fn overwrite_replaces_the_configuration() {
         .unwrap()
         .unwrap()
         .into();
-    existing.platforms = Set("aarch64".to_string());
+    existing.platforms = Set("aarch64".parse().unwrap());
     existing.update(&target).await.unwrap();
 
     let loaded = load_dump(&bytes).unwrap();
@@ -517,7 +490,11 @@ async fn overwrite_replaces_the_configuration() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.platforms, "x86_64;aarch64", "overwrite did not apply");
+    assert_eq!(
+        row.platforms.to_string(),
+        "aarch64;x86_64",
+        "overwrite did not apply"
+    );
 }
 
 /// Settings come back under the right package, having travelled by name.
@@ -526,13 +503,13 @@ async fn settings_are_restored_against_the_right_package() {
     let source = db().await;
     let pkg_id = package(&source, "hello", true, None).await;
     for (key, value, scope) in [
-        ("version_check_interval", "600", Some(-1)),
+        ("version_check_interval", "600", None),
         ("build_flags", "--nocheck", Some(pkg_id)),
     ] {
         settings::ActiveModel {
             key: Set(key.to_string()),
             value: Set(Some(value.to_string())),
-            pkg_id: Set(scope),
+            pkg_id: Set(settings::scope(scope)),
             ..Default::default()
         }
         .insert(&source)
@@ -553,10 +530,10 @@ async fn settings_are_restored_against_the_right_package() {
         .iter()
         .find(|r| r.key == "version_check_interval")
         .unwrap();
-    assert_eq!(global.pkg_id, Some(-1));
+    assert_eq!(settings::package_of(global.pkg_id), None);
     let scoped = rows.iter().find(|r| r.key == "build_flags").unwrap();
     assert_eq!(
-        scoped.pkg_id,
+        settings::package_of(scoped.pkg_id),
         Some(new_id),
         "a per-package setting landed on the wrong package"
     );
@@ -572,7 +549,7 @@ async fn a_retired_setting_is_not_restored() {
         settings::ActiveModel {
             key: Set(key.to_string()),
             value: Set(Some("600".to_string())),
-            pkg_id: Set(Some(-1)),
+            pkg_id: Set(settings::scope(None)),
             ..Default::default()
         }
         .insert(&source)
@@ -617,10 +594,10 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     let source = db().await;
     packages::ActiveModel {
         name: Set("broken".to_string()),
-        status: Set(0),
-        out_of_date: Set(0),
-        build_flags: Set(String::new()),
-        platforms: Set("x86_64".to_string()),
+        status: Set(BuildState::Active),
+        out_of_date: Set(false),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
         source_data: Set(SourceData::Git {
             spec: GitSourceSpec {
                 // Unroutable by construction, so this needs no network to fail.
@@ -642,7 +619,6 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
         tempfile::tempdir().unwrap().keep(),
     ));
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
     // Drained only after `apply` returns, so the bound must exceed the
     // dump's entries; production recorders drain live on the smaller
     // shared bound.
@@ -652,7 +628,6 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
-            tx.clone(),
             store.clone(),
             Arc::new(client),
             Arc::new(aurcache_utils::repository::Repository::new(
@@ -705,6 +680,90 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     assert_eq!(Packages::find().all(&target).await.unwrap().len(), 1);
 }
 
+/// A restored package builds without waiting for the server to restart: the
+/// restore queues what it brought in, as an add does.
+#[tokio::test]
+async fn a_restored_package_is_queued_to_build() {
+    // A git source on disk, with a `.SRCINFO` that parses without the bridge.
+    let remote = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(remote.path()).unwrap();
+    std::fs::write(
+        remote.path().join("PKGBUILD"),
+        "pkgname=hello\npkgver=1.0\npkgrel=1\narch=('x86_64')\n",
+    )
+    .unwrap();
+    std::fs::write(
+        remote.path().join(".SRCINFO"),
+        "pkgbase = hello\n\tpkgver = 1.0\n\tpkgrel = 1\n\tarch = x86_64\n\npkgname = hello\n",
+    )
+    .unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("PKGBUILD")).unwrap();
+    index.add_path(std::path::Path::new(".SRCINFO")).unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+        .unwrap();
+
+    let source = db().await;
+    packages::ActiveModel {
+        name: Set("hello".to_string()),
+        status: Set(BuildState::Successful),
+        out_of_date: Set(false),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
+        source_data: Set(SourceData::Git {
+            spec: GitSourceSpec {
+                url: remote.path().to_string_lossy().to_string(),
+                r#ref: "HEAD".to_string(),
+                subfolder: String::new(),
+            },
+        }),
+        directly_requested: Set(true),
+        ..Default::default()
+    }
+    .insert(&source)
+    .await
+    .unwrap();
+    let bytes = dump_bytes(&source).await;
+
+    let target = db().await;
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
+    let (client, _official) = client_with_empty_official_repos().await;
+    aurcache_utils::restore::apply(
+        &Services::new(
+            target.clone(),
+            Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
+                tempfile::tempdir().unwrap().keep(),
+            )),
+            Arc::new(client),
+            Arc::new(test_repo()),
+            ActivityLog::discarding(),
+        ),
+        &tempfile::tempdir().unwrap().keep(),
+        load_dump(&bytes).unwrap(),
+        RestoreOptions::default(),
+        progress_tx,
+    )
+    .await;
+    while let Ok(entry) = progress_rx.try_recv() {
+        assert!(
+            !matches!(entry.outcome, RestoreOutcome::Failed { .. }),
+            "{entry:?}"
+        );
+    }
+
+    let builds = aurcache_db::prelude::Builds::find()
+        .all(&target)
+        .await
+        .unwrap();
+    assert_eq!(builds.len(), 1, "{builds:?}");
+    assert_eq!(
+        builds[0].status,
+        aurcache_common::build_state::BuildState::Enqueued
+    );
+}
+
 /// `--clear` replaces rather than adds: what was here and is not in the dump
 /// is gone, and what the dump carries is present.
 #[tokio::test]
@@ -749,11 +808,12 @@ async fn workers_are_restored_by_fingerprint() {
         name: Set("builder".to_string()),
         status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
         cert_fingerprint: Set("fp-1".to_string()),
-        native_arches: Set("x86_64".to_string()),
-        emulated_arches: Set(String::new()),
-        package_affinity: Set(String::new()),
+        native_arches: Set("x86_64".parse().unwrap()),
+        emulated_arches: Set(Default::default()),
+        package_affinity: Set(Default::default()),
         priority: Set(7),
         concurrency: Set(3),
+        settings_declaration: Set("[]".to_string()),
         ..Default::default()
     }
     .insert(&source)
@@ -807,11 +867,12 @@ async fn a_workers_lists_travel_as_lists() {
         name: Set("builder".to_string()),
         status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
         cert_fingerprint: Set("fp-1".to_string()),
-        native_arches: Set("x86_64,aarch64".to_string()),
-        emulated_arches: Set("armv7h".to_string()),
-        package_affinity: Set("big-one,other".to_string()),
+        native_arches: Set("x86_64,aarch64".parse().unwrap()),
+        emulated_arches: Set("armv7h".parse().unwrap()),
+        package_affinity: Set("big-one,other".parse().unwrap()),
         priority: Set(0),
         concurrency: Set(1),
+        settings_declaration: Set("[]".to_string()),
         ..Default::default()
     }
     .insert(&source)
@@ -828,8 +889,8 @@ async fn a_workers_lists_travel_as_lists() {
         .await
         .unwrap();
     let restored = workers::Entity::find().one(&target).await.unwrap().unwrap();
-    assert_eq!(restored.native_arches, "x86_64,aarch64");
-    assert_eq!(restored.package_affinity, "big-one,other");
+    assert_eq!(restored.native_arches.to_string(), "x86_64,aarch64");
+    assert_eq!(restored.package_affinity.to_string(), "big-one,other");
 }
 
 /// A worker already trusted here keeps the routing this instance gave it. The
@@ -842,11 +903,12 @@ async fn an_already_trusted_worker_keeps_its_routing() {
         name: Set("builder".to_string()),
         status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
         cert_fingerprint: Set("fp-1".to_string()),
-        native_arches: Set("x86_64".to_string()),
-        emulated_arches: Set(String::new()),
-        package_affinity: Set(String::new()),
+        native_arches: Set("x86_64".parse().unwrap()),
+        emulated_arches: Set(Default::default()),
+        package_affinity: Set(Default::default()),
         priority: Set(7),
         concurrency: Set(3),
+        settings_declaration: Set("[]".to_string()),
         ..Default::default()
     }
     .insert(&source)
@@ -859,11 +921,12 @@ async fn an_already_trusted_worker_keeps_its_routing() {
         name: Set("same-machine-other-name".to_string()),
         status: Set(aurcache_common::api::worker::ApprovalStatus::Approved),
         cert_fingerprint: Set("fp-1".to_string()),
-        native_arches: Set("x86_64".to_string()),
-        emulated_arches: Set(String::new()),
-        package_affinity: Set(String::new()),
+        native_arches: Set("x86_64".parse().unwrap()),
+        emulated_arches: Set(Default::default()),
+        package_affinity: Set(Default::default()),
         priority: Set(1),
         concurrency: Set(9),
+        settings_declaration: Set("[]".to_string()),
         ..Default::default()
     }
     .insert(&target)
@@ -936,11 +999,12 @@ async fn a_private_dump_carries_the_ca_and_says_so() {
         cert_fingerprint: Set("fp-1".to_string()),
         signed_cert: Set(Some("-----BEGIN CERTIFICATE-----".to_string())),
         not_after: Set(Some(99)),
-        native_arches: Set("x86_64".to_string()),
-        emulated_arches: Set(String::new()),
-        package_affinity: Set(String::new()),
+        native_arches: Set("x86_64".parse().unwrap()),
+        emulated_arches: Set(Default::default()),
+        package_affinity: Set(Default::default()),
         priority: Set(0),
         concurrency: Set(1),
+        settings_declaration: Set("[]".to_string()),
         ..Default::default()
     }
     .insert(&source)
@@ -993,7 +1057,6 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
     let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
         tempfile::tempdir().unwrap().keep(),
     ));
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
     // Drained only after `apply` returns, so the bound must exceed the
     // dump's entries; production recorders drain live on the smaller
     // shared bound.
@@ -1003,7 +1066,6 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
-            tx.clone(),
             store.clone(),
             Arc::new(client),
             Arc::new(aurcache_utils::repository::Repository::new(
@@ -1063,7 +1125,6 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
     let store = std::sync::Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
         tempfile::tempdir().unwrap().keep(),
     ));
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
     // Drained only after `apply` returns, so the bound must exceed the
     // dump's entries; production recorders drain live on the smaller
     // shared bound.
@@ -1073,7 +1134,6 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
-            tx.clone(),
             store.clone(),
             Arc::new(client),
             Arc::new(aurcache_utils::repository::Repository::new(
@@ -1125,7 +1185,7 @@ async fn merge_patches_adopts_a_patch_the_instance_lacks() {
         .unwrap()
         .unwrap()
         .into();
-    existing.platforms = Set("aarch64".to_string());
+    existing.platforms = Set("aarch64".parse().unwrap());
     existing.update(&target).await.unwrap();
 
     let loaded = load_dump(&bytes).unwrap();
@@ -1148,7 +1208,8 @@ async fn merge_patches_adopts_a_patch_the_instance_lacks() {
         .unwrap();
     assert_eq!(row.patch.as_deref(), Some("--- from-dump\n"));
     assert_eq!(
-        row.platforms, "aarch64",
+        row.platforms.to_string(),
+        "aarch64",
         "merge-patches overwrote configuration"
     );
     assert!(matches!(
@@ -1330,10 +1391,10 @@ async fn a_dependency_only_package_survives_the_restore() {
         let spec = git_package(&dir, name, depends);
         packages::ActiveModel {
             name: Set(name.to_string()),
-            status: Set(0),
-            out_of_date: Set(0),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            status: Set(BuildState::Active),
+            out_of_date: Set(false),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Git { spec }),
             directly_requested: Set(requested),
             ..Default::default()
@@ -1346,12 +1407,10 @@ async fn a_dependency_only_package_survives_the_restore() {
 
     let target = db().await;
     let (client, _official) = client_with_empty_official_repos().await;
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
-            tx,
             Arc::new(aurcache_utils::snapshot::SnapshotStore::with_checkout_root(
                 tempfile::tempdir().unwrap().keep(),
             )),

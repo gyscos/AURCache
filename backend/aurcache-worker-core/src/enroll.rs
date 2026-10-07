@@ -45,7 +45,7 @@ pub fn register_request(cfg: &CoreConfig, csr_pem: String, kind: &str) -> Regist
         packages: cfg.packages.clone(),
         priority: cfg.priority,
         concurrency: cfg.concurrency as u32,
-        settings: Some(cfg.settings.declare()),
+        settings: cfg.settings.declare(),
     }
 }
 

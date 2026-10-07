@@ -436,11 +436,8 @@ pub(crate) fn stage(stored: Option<&str>, typed: &str) -> Option<Option<String>>
 pub(crate) enum Delivery {
     /// It is running the latest save, or nothing has been saved for it.
     Current,
-    /// It has taken values before, but not the latest ones yet.
+    /// It has not taken the latest save yet.
     Pending,
-    /// It has never reported taking any: it has not checked in since it
-    /// started, or its version predates settings set from the server.
-    Never,
 }
 
 #[must_use]
@@ -449,13 +446,11 @@ pub(crate) fn delivery(view: &WorkerConfigView) -> Delivery {
         .effective
         .as_ref()
         .and_then(|e| e.received_revision.as_deref());
-    match (view.revision.as_deref(), received) {
-        (None, _) => Delivery::Current,
-        (Some(latest), Some(held)) if latest == held => Delivery::Current,
-        (Some(_), Some(_)) => Delivery::Pending,
+    match received {
+        Some(held) if held == view.revision => Delivery::Current,
         // Nothing to take is nothing missing.
-        (Some(_), None) if view.values.is_empty() => Delivery::Current,
-        (Some(_), None) => Delivery::Never,
+        None if view.values.is_empty() => Delivery::Current,
+        _ => Delivery::Pending,
     }
 }
 
@@ -540,18 +535,10 @@ fn WorkerConfig(id: i32) -> Element {
                     div { class: "alert alert-error alert-soft text-sm", "{e}" }
                 },
                 Some(Ok(view)) => match &view.settings {
-                    // Not "no settings": an older worker declares nothing
-                    // because it cannot, and saying so points at the remedy.
-                    None => rsx! {
-                        div { class: "text-sm opacity-70",
-                            "This worker's version does not report what it can be configured with, "
-                            "so nothing can be set for it here. Upgrading it fills this in."
-                        }
-                    },
-                    Some(declared) if declared.is_empty() => rsx! {
+                    declared if declared.is_empty() => rsx! {
                         div { class: "text-sm opacity-70", "This worker declares no settings." }
                     },
-                    Some(declared) => rsx! {
+                    declared => rsx! {
                         DeliveryNote { view: view.clone() }
                         SettingsTable {
                             declared: declared.clone(),
@@ -592,13 +579,6 @@ fn DeliveryNote(view: WorkerConfigView) -> Element {
             div { class: "alert alert-info alert-soft text-sm mb-3",
                 "The worker has not picked up the latest save yet. It does on its next "
                 "heartbeat, or when it next checks in if it is offline."
-            }
-        },
-        Delivery::Never => rsx! {
-            div { class: "alert alert-warning alert-soft text-sm mb-3",
-                "The worker has not taken any values from here yet. If this stays, its "
-                "version predates settings set from AURCache and it is ignoring them; "
-                "upgrading it is the fix."
             }
         },
     }
@@ -1082,14 +1062,10 @@ mod tests {
         assert_eq!(stage(None, "  "), None);
     }
 
-    fn view(
-        values: &[(&str, &str)],
-        revision: Option<&str>,
-        held: Option<&str>,
-    ) -> WorkerConfigView {
+    fn view(values: &[(&str, &str)], revision: &str, held: Option<&str>) -> WorkerConfigView {
         WorkerConfigView {
             worker_id: 1,
-            settings: Some(Vec::new()),
+            settings: Vec::new(),
             effective: Some(EffectiveConfig {
                 received_revision: held.map(str::to_string),
                 settings: BTreeMap::new(),
@@ -1098,32 +1074,27 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
-            revision: revision.map(str::to_string),
+            revision: revision.to_string(),
         }
     }
 
     #[test]
     fn delivery_compares_what_is_saved_with_what_the_worker_holds() {
         assert_eq!(
-            delivery(&view(&[("a", "1")], Some("r2"), Some("r2"))),
+            delivery(&view(&[("a", "1")], "r2", Some("r2"))),
             Delivery::Current
         );
         assert_eq!(
-            delivery(&view(&[("a", "1")], Some("r2"), Some("r1"))),
+            delivery(&view(&[("a", "1")], "r2", Some("r1"))),
             Delivery::Pending
         );
-        // A worker that never reported taking anything is either new or too
-        // old to take values -- worth saying only when there is a value.
+        // A worker that has taken nothing yet is behind only when there is
+        // something to take.
         assert_eq!(
-            delivery(&view(&[("a", "1")], Some("r1"), None)),
-            Delivery::Never
+            delivery(&view(&[("a", "1")], "r1", None)),
+            Delivery::Pending
         );
-        assert_eq!(delivery(&view(&[], Some("r0"), None)), Delivery::Current);
-        // A worker that declares nothing has no revision to compare.
-        assert_eq!(
-            delivery(&view(&[("a", "1")], None, None)),
-            Delivery::Current
-        );
+        assert_eq!(delivery(&view(&[], "r0", None)), Delivery::Current);
     }
 
     /// The warning that matters most: an immediate change reaches builds

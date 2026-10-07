@@ -16,12 +16,12 @@
 //! cause — "no workers enrolled" and "no worker builds x86_64" are one finding
 //! reported from both ends.
 
-use crate::OutputFormat;
+use crate::cli::OutputFormat;
 use anyhow::{Result, bail};
 use aurcache_client::{
     ApiReachability, ApprovalStatus, AurCacheClient, Build, WaitingReason, Worker,
 };
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use serde::Serialize;
 
 /// How many builds to inspect for the queue check.
@@ -164,7 +164,7 @@ pub fn check_workers(workers: &[Worker]) -> Check {
 pub fn check_queue(builds: &[Build]) -> Check {
     let queued = builds
         .iter()
-        .filter(|b| b.status == BuildStates::ENQUEUED_BUILD)
+        .filter(|b| b.status == BuildState::Enqueued)
         .count();
 
     let stuck: Vec<&Build> = builds
@@ -308,7 +308,7 @@ pub async fn run_doctor(client: &AurCacheClient, format: OutputFormat) -> Result
 
 fn finish(format: OutputFormat, report: Report) -> Result<()> {
     match format {
-        OutputFormat::Json => crate::print_json(&report)?,
+        OutputFormat::Json => crate::output::print_json(&report)?,
         OutputFormat::Text => print_report(&report),
     }
 
@@ -358,7 +358,7 @@ fn print_report(report: &Report) {
 mod tests {
     use super::{Status, check_queue, check_workers};
     use aurcache_client::{ApprovalStatus, Build, WaitingReason, Worker};
-    use aurcache_common::build_state::BuildStates;
+    use aurcache_common::build_state::BuildState;
 
     fn worker(id: i32, status: ApprovalStatus, online: bool) -> Worker {
         Worker {
@@ -382,7 +382,7 @@ mod tests {
         }
     }
 
-    fn build(number: i32, status: i32, waiting_reason: Option<WaitingReason>) -> Build {
+    fn build(number: i32, status: BuildState, waiting_reason: Option<WaitingReason>) -> Build {
         Build {
             number,
             pkg_name: "hello".to_string(),
@@ -474,7 +474,7 @@ mod tests {
     /// A build waiting behind a busy worker carries no reason, and is normal.
     #[test]
     fn a_queue_with_no_stated_reason_is_healthy() {
-        let check = check_queue(&[build(1, BuildStates::ENQUEUED_BUILD, None)]);
+        let check = check_queue(&[build(1, BuildState::Enqueued, None)]);
         assert_eq!(check.status, Status::Pass);
         assert!(check.detail.contains("1 queued"), "{:?}", check.detail);
     }
@@ -488,7 +488,7 @@ mod tests {
     fn a_stuck_build_reports_the_servers_own_reason_and_a_fix() {
         let check = check_queue(&[build(
             3,
-            BuildStates::ENQUEUED_BUILD,
+            BuildState::Enqueued,
             Some(WaitingReason::Arch {
                 arch: "aarch64".to_string(),
             }),
@@ -513,7 +513,7 @@ mod tests {
     fn an_affinity_reservation_names_the_workers_holding_it() {
         let check = check_queue(&[build(
             1,
-            BuildStates::ENQUEUED_BUILD,
+            BuildState::Enqueued,
             Some(WaitingReason::Affinity {
                 workers: vec!["big-iron".to_string()],
             }),
@@ -533,7 +533,7 @@ mod tests {
     /// A successful build is not queue trouble, however many of them there are.
     #[test]
     fn finished_builds_do_not_count_towards_the_queue() {
-        let check = check_queue(&[build(1, BuildStates::SUCCESSFUL_BUILD, None)]);
+        let check = check_queue(&[build(1, BuildState::Successful, None)]);
         assert_eq!(check.status, Status::Pass);
         assert!(
             check.detail.contains("nothing queued"),

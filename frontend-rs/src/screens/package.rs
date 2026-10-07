@@ -30,10 +30,7 @@ const BUILD_SAMPLE: u64 = 20;
 /// Whether this build's output is what the repository serves for its
 /// architecture.
 fn succeeded(build: &Build) -> bool {
-    matches!(
-        BuildState::from_i32(build.status),
-        Some(BuildState::Successful)
-    )
+    matches!(Some(build.status), Some(BuildState::Successful))
 }
 
 /// The architectures this package has builds for, ordered the way the platform
@@ -162,8 +159,8 @@ pub fn Package(pkgbase: String) -> Element {
     // flight, so a build finishing updates the status and the build summary
     // without a reload; a slow tick otherwise as a catch-all.
     let busy = matches!(&*data.read_unchecked(), Some(Ok((pkg, builds)))
-        if BuildState::from_i32(pkg.status).is_some_and(BuildState::is_in_progress)
-            || builds.iter().any(|b| BuildState::from_i32(b.status).is_some_and(BuildState::is_in_progress)));
+        if Some(pkg.status).is_some_and(BuildState::is_in_progress)
+            || builds.iter().any(|b| Some(b.status).is_some_and(BuildState::is_in_progress)));
     crate::poll::use_poll(data, busy);
 
     rsx! {
@@ -1809,7 +1806,7 @@ mod tests {
             number,
             pkg_name: "hello".to_string(),
             version: "1.0-1".to_string(),
-            status: status.as_i32(),
+            status,
             start_time: start,
             end_time: end,
             platform: platform.to_string(),
@@ -1980,8 +1977,8 @@ mod tests {
             id: 1,
             name: "hello".to_string(),
             directly_requested: true,
-            status: BuildState::Successful.as_i32(),
-            outofdate: 0,
+            status: BuildState::Successful,
+            outofdate: false,
             latest_version: Some("1.0-1".to_string()),
             selected_platforms: vec!["x86_64".to_string()],
             selected_build_flags: None,

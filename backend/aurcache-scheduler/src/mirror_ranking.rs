@@ -46,7 +46,10 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
         let mut reported = false;
         loop {
             // A schedule with no next run (`0 0 31 2 *`) waits and says so.
-            if sleep_until_next_fire(&schedule, "mirror ranking").await == Wake::Fired {
+            // Fixed at startup, so there is nothing to read again meanwhile.
+            if sleep_until_next_fire(&schedule, "mirror ranking", Duration::MAX).await
+                == Wake::Fired
+            {
                 match update_mirrorlist().await {
                     Ok(()) => {
                         info!("Mirror ranking finished");

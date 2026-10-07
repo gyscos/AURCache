@@ -61,12 +61,9 @@ pub fn looks_like_git_url(s: &str) -> bool {
 /// are the same source, which is what duplicate checks rely on — and a
 /// failure is reported against what the request carried.
 ///
-/// Shared for the same reason as [`looks_like_git_url`]: the add dialog and
-/// the progress cards each had a copy, with only punctuation drift between
-/// them.
-///
-/// (The server's bulk-add path keeps its own shorter form — a bare URL and
-/// `"upload"` — because it reports back into API responses, not onto chips.)
+/// Shared for the same reason as [`looks_like_git_url`]: the add dialog, the
+/// progress cards and the server's bulk-add report each had a copy, with only
+/// punctuation drift between them.
 #[must_use]
 pub fn source_label(source: &SourceData) -> String {
     match source {

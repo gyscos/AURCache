@@ -1,25 +1,24 @@
-use crate::package::add::{
-    ensure_aur_package_exists_recursive, provides_json, split_packages_json,
-};
+use crate::package::add::{insert_dependency, provides_json, split_packages_json};
+use crate::package::edges::{Declaration, resolve_edges};
 use crate::services::Services;
 use crate::vcs_check::{SourcesMoved, resolve_vcs_commits, vcs_sources_moved};
 use anyhow::{anyhow, bail};
 use async_recursion::async_recursion;
 use aurcache_activitylog::events::{Event, QueueCause, RefreshTarget};
-use aurcache_common::build_state::BuildStates;
+use aurcache_common::build_state::BuildState;
 use aurcache_common::build_state::BuildTrigger;
-use aurcache_db::action::Action;
-use aurcache_db::helpers::build_enqueue::{enqueue_build_if_missing, promote_waiting_build};
+use aurcache_db::helpers::build_enqueue::{
+    Pending, enqueue_build_if_missing, promote_waiting_build,
+};
 use aurcache_db::prelude::{Dependencies, PackageVcsSources, Packages};
 use aurcache_db::{dependencies, package_vcs_sources, packages};
-use aurcache_deps::{DependencyResolution, PkgDeps};
+use aurcache_deps::PkgDeps;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
-use tokio::sync::broadcast::Sender;
 use tracing::{info, warn};
 
 /// The packages `pkg_id` depends on directly, as its edges stand now.
@@ -70,7 +69,7 @@ async fn collect_dropped(services: &Services, pkg_id: i32, former: &[i32]) -> an
 pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<Vec<i32>> {
     let db = &services.db;
     let pkg_models: Vec<packages::Model> = Packages::find()
-        .filter(packages::Column::OutOfDate.eq(1))
+        .filter(packages::Column::OutOfDate.eq(true))
         .order_by_asc(packages::Column::Name)
         .all(db)
         .await?;
@@ -104,10 +103,11 @@ pub async fn package_update_all_outdated(services: &Services) -> anyhow::Result<
     // skipping every package after it, every round, while the offender stayed
     // out of date. Each package is handled on its own and moves on.
     for pkg in pkg_models {
-        if pkg.status != BuildStates::SUCCESSFUL_BUILD {
+        if pkg.status != BuildState::Successful {
             info!(
                 "Package auto update was not triggered for package {} because of prev. build status: {}",
-                pkg.name, pkg.status
+                pkg.name,
+                pkg.status.label()
             );
             continue;
         }
@@ -196,7 +196,7 @@ pub(crate) async fn resync_graph(
         .map_err(|e| anyhow!("Failed to resolve source info: {e:#}"))?;
     let deps = aurcache_deps::deps_from_srcinfo(
         &sourceinfo,
-        &crate::pkg::architectures_for_platforms(&pkg_model.platforms),
+        &crate::pkg::architectures(&pkg_model.platforms),
     );
 
     sync_dependency_graph(services, pkg_model, &deps).await?;
@@ -241,7 +241,7 @@ async fn package_update_inner(
     let upstream_version = sourceinfo.base.version.to_string();
     let deps = aurcache_deps::deps_from_srcinfo(
         &sourceinfo,
-        &crate::pkg::architectures_for_platforms(&pkg_model.platforms),
+        &crate::pkg::architectures(&pkg_model.platforms),
     );
 
     let former = direct_dependees(&services.db, pkg_model.id).await?;
@@ -262,6 +262,12 @@ async fn package_update_inner(
     )
     .await?;
 
+    // Where the package's `git+` sources are now: what the up-to-date check
+    // below compares with the last build, and what the queued builds are
+    // recorded as made from. One `ls-remote` per source, and nothing at all
+    // for a package that has none.
+    let queued_commits = resolve_vcs_commits(&sourceinfo).await;
+
     if !force {
         // A VCS package's published `pkgver` says when its PKGBUILD was last
         // touched, not what upstream is at, so the version comparison below
@@ -269,7 +275,7 @@ async fn package_update_inner(
         // AUR against `1:r14632.02cac3259-1` that `pkgver()` produced, which
         // never match, and every unforced update rebuilt. The sources are what
         // it should be asking about.
-        match vcs_sources_moved(&services.db, pkg_model.id, &sourceinfo).await {
+        match vcs_sources_moved(&services.db, pkg_model.id, &queued_commits).await {
             Ok(SourcesMoved::Unmoved) => bail!(
                 "Latest build is already up to date (no tracked source has moved; \
                  use --force to rebuild anyway)"
@@ -308,11 +314,9 @@ async fn package_update_inner(
     // with whatever it last happened to look at. Queue time rather than build
     // time: recording the earlier commit errs toward one redundant rebuild
     // rather than a missed one, and a worker that reports what it actually
-    // used overwrites this. Resolving costs one
-    // `ls-remote` per VCS source and nothing at all for a package that has
-    // none. Best-effort: an unrecorded build reads as unknown later, which
-    // costs a redundant rebuild, where failing here would cost the build.
-    let queued_commits = resolve_vcs_commits(&sourceinfo).await;
+    // used overwrites this. Best-effort: an unrecorded build reads as unknown
+    // later, which costs a redundant rebuild, where failing here would cost
+    // the build.
     if !queued_commits.is_empty() {
         for result in &platform_results {
             if let Err(e) = aurcache_db::helpers::builds::record_build_vcs_sources(
@@ -334,21 +338,11 @@ async fn package_update_inner(
         }
     }
 
-    let any_enqueued = platform_results.iter().any(|r| r.enqueued);
-    let has_waiting = platform_results.iter().any(|r| !r.enqueued);
-
     let pkgbase = sourceinfo.base.name.to_string();
-    let initial_status = if has_waiting && !any_enqueued {
-        BuildStates::WAITING_FOR_DEPS
-    } else {
-        BuildStates::ENQUEUED_BUILD
-    };
-    // Four columns, not the whole row (which carries the large `source_data`
-    // JSON), and no transaction: this is one statement, so there is nothing
-    // to make atomic.
+    // The status is not written here: queueing the builds above brought it in
+    // line with them.
     packages::ActiveModel {
         id: Set(pkg_model.id),
-        status: Set(initial_status),
         upstream_version: Set(Some(upstream_version.clone())),
         split_packages: Set(split_packages_json(&pkgbase, &deps.pkgnames)?),
         provides: Set(provides_json(&deps.provides)?),
@@ -385,19 +379,6 @@ async fn sync_dependency_graph(
 
     ensure_missing_dependency_packages(services, pkg_model, &dep_constraints_by_pkgbase).await?;
 
-    if dep_constraints_by_pkgbase.is_empty() {
-        sync_dependency_rows(
-            &services.db,
-            pkg_model.id,
-            &dep_constraints_by_pkgbase,
-            &HashMap::new(),
-        )
-        .await?;
-        return Ok(DependencyGraph {
-            deps: HashMap::new(),
-        });
-    }
-
     let dep_packages = fetch_dep_packages_map(&services.db, &dep_constraints_by_pkgbase).await?;
 
     sync_dependency_rows(
@@ -430,76 +411,35 @@ async fn sync_dependency_graph(
 
 /// The dependency edges `pkg_model` should have, keyed by dependee pkgbase.
 ///
-/// The same reduction the add path performs in `plan_package_with_deps`:
-/// resolve every declared dependency, drop the ones already available as
-/// binaries, and merge the constraints of every name that landed on the same
-/// pkgbase onto one edge. The difference is only what happens afterwards —
-/// an add plans rows, a resync reconciles the ones already there.
+/// See [`resolve_edges`], which the add path plans its rows from too.
 async fn resolve_dependency_edges(
     services: &Services,
     pkg_model: &packages::Model,
     deps: &PkgDeps,
 ) -> anyhow::Result<HashMap<String, Vec<crate::pkg::Constraint>>> {
     let declared = crate::pkg::DependencySet::of(deps)?;
-    if declared.names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // As on the add path: what the package answers to itself is never an edge.
-    let self_provided =
-        crate::pkg::self_provided_names(&pkg_model.name, &deps.pkgnames, &deps.provides);
-    let wanted: Vec<crate::pkg::Declared> = declared
-        .declared()
-        .into_iter()
-        .filter(|dep| !self_provided.contains(&dep.name))
-        .collect();
     // One package, one resolution, so the snapshot lives no longer than this
     // call.
     let tracked =
         aurcache_db::helpers::dependency_resolution::TrackedPackages::load(&services.db).await?;
-    let resolved_deps = aurcache_db::helpers::dependency_resolution::resolve_dependencies(
+    let edges = resolve_edges(
         &services.client,
         &tracked,
-        &wanted
-            .iter()
-            .map(crate::pkg::Declared::as_dependency)
-            .collect::<Vec<_>>(),
+        &Declaration {
+            pkgbase: &pkg_model.name,
+            deps: &declared,
+            pkgnames: &deps.pkgnames,
+            provides: &deps.provides,
+        },
         &[],
         &current_dependee_names(&services.db, pkg_model.id).await?,
+        Some(&services.activity),
     )
     .await?;
-
-    if !resolved_deps.unresolved.is_empty() {
-        for dependency in &resolved_deps.unresolved {
-            services.activity.emit(Event::DepsUnresolved {
-                pkg: pkg_model.name.as_str().into(),
-                dependency: dependency.clone(),
-            });
-        }
-    }
-
-    let mut by_pkgbase: HashMap<String, Vec<crate::pkg::Constraint>> = HashMap::new();
-    for crate::pkg::Declared { name: dep_name, .. } in &wanted {
-        let Some(resolution) = resolved_deps.get(dep_name) else {
-            continue;
-        };
-        let dep_pkgbase = match resolution {
-            DependencyResolution::Available => continue,
-            DependencyResolution::Local { pkgbase } | DependencyResolution::Aur { pkgbase } => {
-                pkgbase
-            }
-        };
-        if dep_pkgbase == &pkg_model.name {
-            continue;
-        }
-        crate::pkg::merge_bounds_into(
-            &mut by_pkgbase,
-            dep_pkgbase,
-            declared.constraints.get(dep_name),
-        )?;
-    }
-
-    Ok(by_pkgbase)
+    Ok(edges
+        .into_iter()
+        .map(|edge| (edge.pkgbase, edge.bounds))
+        .collect())
 }
 
 /// The package bases this package already depends on.
@@ -561,15 +501,7 @@ async fn ensure_missing_dependency_packages(
         .collect();
     for dep_pkgbase in dep_constraints_by_pkgbase.keys() {
         if !tracked.contains(dep_pkgbase) {
-            ensure_aur_package_exists_recursive(
-                &services.client,
-                &services.store,
-                &services.db,
-                dep_pkgbase,
-                &pkg_model.platforms,
-                &pkg_model.build_flags,
-            )
-            .await?;
+            insert_dependency(services, pkg_model, dep_pkgbase).await?;
         }
     }
     Ok(())
@@ -580,6 +512,9 @@ async fn fetch_dep_packages_map(
     db: &DatabaseConnection,
     dep_constraints_by_pkgbase: &HashMap<String, Vec<crate::pkg::Constraint>>,
 ) -> anyhow::Result<HashMap<String, packages::Model>> {
+    if dep_constraints_by_pkgbase.is_empty() {
+        return Ok(HashMap::new());
+    }
     Ok(Packages::find()
         .filter(packages::Column::Name.is_in(dep_constraints_by_pkgbase.keys().cloned()))
         .all(db)
@@ -648,13 +583,14 @@ async fn sync_dependency_rows(
     Ok(())
 }
 
-/// Check whether every dependency in the graph is satisfied, or already has a
-/// pending build, on a single platform.
+/// Whether every dependency in the graph is satisfied on a single platform.
 ///
-/// If a dependency needs a rebuild and no build is pending, this triggers the
-/// recursive update so the dependency will be available when the dependent
-/// starts. Packages whose last build failed are never auto-retriggered — the
-/// user has to retry those explicitly.
+/// Every dependency that is not gets a build of its own if it has none
+/// pending, so it will be available when the dependent starts -- all of them,
+/// not only the first: the dependent is promoted once *every* dependency is
+/// satisfied, so one left without a build would hold it back for ever.
+/// Packages whose last build failed are never auto-retriggered — the user has
+/// to retry those explicitly.
 async fn dependencies_ready_for_platform(
     services: &Services,
     platform: &Platform,
@@ -663,6 +599,7 @@ async fn dependencies_ready_for_platform(
     visited: &mut HashSet<i32>,
     needed_by: &str,
 ) -> anyhow::Result<bool> {
+    let mut ready = true;
     for dep_info in graph.deps.values() {
         // The same check the builder makes when this dependency's build
         // lands, against the constraint as the edge stores it.
@@ -676,6 +613,7 @@ async fn dependencies_ready_for_platform(
         {
             continue;
         }
+        ready = false;
 
         let has_pending_build = aurcache_db::helpers::builds::pending_build(
             &services.db,
@@ -686,7 +624,7 @@ async fn dependencies_ready_for_platform(
         .is_some();
 
         // A dependency whose last build failed is not auto-retried.
-        if !has_pending_build && dep_info.package.status != BuildStates::FAILED_BUILD {
+        if !has_pending_build && dep_info.package.status != BuildState::Failed {
             let results =
                 package_update_inner(services, dep_info.package.clone(), true, trigger, visited)
                     .await?;
@@ -700,11 +638,9 @@ async fn dependencies_ready_for_platform(
                 ));
             }
         }
-
-        return Ok(false);
     }
 
-    Ok(true)
+    Ok(ready)
 }
 
 /// What to build and its resolved dependency graph.
@@ -771,12 +707,9 @@ async fn enqueue_platform_builds(
     request: BuildRequest<'_>,
     visited: &mut HashSet<i32>,
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
-    let configured_platforms =
-        Platform::parse_many(&request.pkg_model.platforms).collect::<Result<Vec<_>, _>>()?;
-
     let mut results = Vec::new();
 
-    for platform in &configured_platforms {
+    for platform in request.pkg_model.platforms.as_slice() {
         let ready = dependencies_ready_for_platform(
             services,
             platform,
@@ -790,11 +723,10 @@ async fn enqueue_platform_builds(
         if ready {
             let result = update_platform(
                 *platform,
-                request.pkg_model.clone(),
-                request.version.to_string(),
+                request.pkg_model.id,
+                request.version,
                 request.trigger,
                 &services.db,
-                &services.tx,
             )
             .await?;
             results.push(PlatformUpdateResult {
@@ -805,19 +737,16 @@ async fn enqueue_platform_builds(
                 version: request.version.to_string(),
             });
         } else {
-            let txn = services.db.begin().await?;
-            let start_time = aurcache_db::helpers::time::now_secs();
             let waiting = enqueue_build_if_missing(
-                &txn,
+                &services.db,
                 request.pkg_model.id,
                 *platform,
                 request.version,
-                start_time,
-                BuildStates::WAITING_FOR_DEPS,
+                aurcache_db::helpers::time::now_secs(),
+                Pending::WaitingForDeps,
                 request.trigger,
             )
             .await?;
-            txn.commit().await?;
             results.push(PlatformUpdateResult {
                 platform: *platform,
                 build_id: waiting.build.id,
@@ -831,56 +760,42 @@ async fn enqueue_platform_builds(
     Ok(results)
 }
 
-/// Create or reuse the pending build entry for a package on one platform.
+/// Create or reuse the pending build entry for package `pkg_id` on one platform.
 ///
 /// If a `WAITING_FOR_DEPS` build already exists for this `(pkg, platform)`, it is promoted to
-/// `ENQUEUED` and dispatched rather than inserting a duplicate.  This happens when a dependency
+/// `ENQUEUED` rather than inserting a duplicate.  This happens when a dependency
 /// finishes and the dependent was already in the pending queue waiting for it.
 pub async fn update_platform(
     platform: Platform,
-    pkg: packages::Model,
-    new_version: String,
+    pkg_id: i32,
+    new_version: &str,
     trigger: BuildTrigger,
     db: &DatabaseConnection,
-    tx: &Sender<Action>,
 ) -> anyhow::Result<aurcache_db::helpers::build_enqueue::EnqueueBuildResult> {
-    // Fast path: promote an existing WAITING_FOR_DEPS build if one is present.
-    if let Some(promoted) = promote_waiting_build(db, pkg.id, platform).await? {
-        let _ = tx.send(Action::Build(Box::new(pkg), Box::new(promoted.clone())));
+    if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {
         return Ok(aurcache_db::helpers::build_enqueue::EnqueueBuildResult {
             build: promoted,
             inserted: true,
         });
     }
 
-    let txn = db.begin().await?;
-    let start_time = aurcache_db::helpers::time::now_secs();
-    let enqueue_result = enqueue_build_if_missing(
-        &txn,
-        pkg.id,
+    Ok(enqueue_build_if_missing(
+        db,
+        pkg_id,
         platform,
-        &new_version,
-        start_time,
-        BuildStates::ENQUEUED_BUILD,
+        new_version,
+        aurcache_db::helpers::time::now_secs(),
+        Pending::Enqueued,
         trigger,
     )
-    .await?;
-    txn.commit().await?;
-
-    if enqueue_result.inserted {
-        let _ = tx.send(Action::Build(
-            Box::new(pkg),
-            Box::new(enqueue_result.build.clone()),
-        ));
-    }
-    Ok(enqueue_result)
+    .await?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::package_update;
     use aurcache_activitylog::activity_utils::ActivityLog;
-    use aurcache_common::build_state::{BuildTrigger, BuildTriggers};
+    use aurcache_common::build_state::BuildTrigger;
     /// A repository of its own for a test that never publishes to it.
     fn test_repo() -> Arc<crate::repository::Repository> {
         Arc::new(crate::repository::Repository::new(
@@ -889,8 +804,7 @@ mod tests {
     }
     use crate::services::Services;
     use crate::snapshot::SnapshotStore;
-    use aurcache_common::build_state::BuildStates;
-    use aurcache_db::action::Action;
+    use aurcache_common::build_state::BuildState;
     use aurcache_db::migration::Migrator;
     use aurcache_db::packages::SourceData;
     use aurcache_db::prelude::{Dependencies, Packages};
@@ -1161,7 +1075,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
@@ -1184,12 +1097,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1205,12 +1117,11 @@ mod tests {
 
         let child = packages::ActiveModel {
             name: Set("child".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1236,7 +1147,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1251,7 +1162,6 @@ mod tests {
         let results = package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -1290,13 +1200,13 @@ mod tests {
         );
         assert_eq!(
             parent_builds[0].status,
-            Some(BuildStates::WAITING_FOR_DEPS),
+            BuildState::WaitingForDeps,
             "parent build should be WAITING_FOR_DEPS"
         );
         // The request's own trigger, on the build left waiting as much as on
         // one queued outright -- it used to be `AutoUpdate` for everything,
         // which made an operator's rebuild indistinguishable from the scheduler.
-        assert_eq!(parent_builds[0].trigger, BuildTriggers::USER);
+        assert_eq!(parent_builds[0].trigger, BuildTrigger::User);
 
         let child_builds = builds::Entity::find()
             .filter(builds::Column::PkgId.eq(child.id))
@@ -1310,11 +1220,11 @@ mod tests {
         );
         let rebuild = child_builds
             .iter()
-            .find(|b| b.status != Some(BuildStates::SUCCESSFUL_BUILD))
+            .find(|b| b.status != BuildState::Successful)
             .expect("the dependency's new build");
         assert_eq!(
             rebuild.trigger,
-            BuildTriggers::USER,
+            BuildTrigger::User,
             "a dependency rebuilt for the request is part of the request"
         );
 
@@ -1323,8 +1233,123 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(parent_after.status, BuildStates::WAITING_FOR_DEPS);
+        assert_eq!(parent_after.status, BuildState::WaitingForDeps);
         assert_eq!(parent_after.upstream_version.as_deref(), Some("2.0.0-1"));
+    }
+
+    /// A package built at 1.0, depended on by whatever the test links to it.
+    async fn built_package(
+        db: &DatabaseConnection,
+        name: &str,
+        requested: bool,
+    ) -> packages::Model {
+        let pkg = packages::ActiveModel {
+            name: Set(name.to_string()),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
+            upstream_version: Set(Some("1.0.0".to_string())),
+            build_flags: Set("--noconfirm".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
+            source_data: Set(SourceData::Aur { name: name.into() }),
+            directly_requested: Set(requested),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        builds::ActiveModel {
+            pkg_id: Set(pkg.id),
+            status: Set(BuildState::Successful),
+            start_time: Set(Some(1)),
+            end_time: Set(Some(2)),
+            platform: Set(Platform::X86_64),
+            version: Set("1.0.0".to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        pkg
+    }
+
+    /// Every dependency the update leaves unsatisfied gets a build, not only
+    /// the first one found: the parent is promoted once all of them are
+    /// satisfied, so a second one left unbuilt would hold it back for ever.
+    #[tokio::test]
+    async fn package_update_queues_every_unsatisfied_dependency() {
+        let server = MockServer::start().await;
+        let (client, _official) =
+            client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        let aur_root = tempdir().unwrap();
+        create_aur_git_repo(
+            aur_root.path(),
+            "parent",
+            "2.0.0",
+            &["one>=2.0", "two>=2.0"],
+        );
+        create_aur_git_repo(aur_root.path(), "one", "2.0.0", &[]);
+        create_aur_git_repo(aur_root.path(), "two", "2.0.0", &[]);
+        for name in ["one", "two"] {
+            Mock::given(method("GET"))
+                .and(path("/rpc/v5/info"))
+                .and(query_param("arg[]", name))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(multiinfo_json(vec![rpc_deps_json(
+                        name,
+                        name,
+                        &[],
+                        &[],
+                        "2.0.0",
+                    )])),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let parent = built_package(&db, "parent", true).await;
+        let mut dependees = vec![];
+        for name in ["one", "two"] {
+            let dependee = built_package(&db, name, false).await;
+            dependencies::ActiveModel {
+                dependent_id: Set(parent.id),
+                dependee_id: Set(dependee.id),
+                version_constraint: Set(">=1.0".to_string()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            dependees.push(dependee);
+        }
+
+        let (store, _checkout_dir) = test_store(aur_root.path());
+        package_update(
+            &Services::new(
+                db.clone(),
+                Arc::new(store),
+                Arc::new(client),
+                test_repo(),
+                ActivityLog::discarding(),
+            ),
+            parent,
+            false,
+            BuildTrigger::User,
+        )
+        .await
+        .unwrap();
+
+        for dependee in dependees {
+            let pending = builds::Entity::find()
+                .filter(builds::Column::PkgId.eq(dependee.id))
+                .filter(builds::Column::Status.ne(BuildState::Successful))
+                .count(&db)
+                .await
+                .unwrap();
+            assert_eq!(pending, 1, "{} must get a build of its own", dependee.name);
+        }
     }
 
     #[tokio::test]
@@ -1334,7 +1359,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
@@ -1373,12 +1397,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1394,12 +1417,11 @@ mod tests {
 
         let child = packages::ActiveModel {
             name: Set("child".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1415,12 +1437,11 @@ mod tests {
 
         let grandchild = packages::ActiveModel {
             name: Set("grandchild".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "grandchild".into(),
             }),
@@ -1456,7 +1477,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1469,7 +1490,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(grandchild.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1484,7 +1505,6 @@ mod tests {
         let results = package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -1514,7 +1534,7 @@ mod tests {
         );
         assert_eq!(
             parent_builds[0].status,
-            Some(BuildStates::WAITING_FOR_DEPS),
+            BuildState::WaitingForDeps,
             "parent build should be WAITING_FOR_DEPS"
         );
 
@@ -1530,7 +1550,7 @@ mod tests {
         );
         let child_pending = child_builds
             .iter()
-            .find(|b| b.status == Some(BuildStates::WAITING_FOR_DEPS));
+            .find(|b| b.status == BuildState::WaitingForDeps);
         assert!(
             child_pending.is_some(),
             "child should have a WAITING_FOR_DEPS build"
@@ -1551,7 +1571,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(child_after.status, BuildStates::WAITING_FOR_DEPS);
+        assert_eq!(child_after.status, BuildState::WaitingForDeps);
         assert_eq!(child_after.upstream_version.as_deref(), Some("2.0.0-1"));
     }
 
@@ -1562,7 +1582,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "parent", "2.0.0", &["child>=2.0"]);
@@ -1601,12 +1620,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -1622,12 +1640,11 @@ mod tests {
 
         let child = packages::ActiveModel {
             name: Set("child".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -1643,12 +1660,11 @@ mod tests {
 
         let grandchild = packages::ActiveModel {
             name: Set("grandchild".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "grandchild".into(),
             }),
@@ -1684,7 +1700,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1697,7 +1713,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(grandchild.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1712,7 +1728,6 @@ mod tests {
         let results = package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -1742,7 +1757,7 @@ mod tests {
         );
         assert_eq!(
             parent_builds[0].status,
-            Some(BuildStates::WAITING_FOR_DEPS),
+            BuildState::WaitingForDeps,
             "parent build should be WAITING_FOR_DEPS"
         );
 
@@ -1758,7 +1773,7 @@ mod tests {
         );
         let child_pending = child_builds
             .iter()
-            .find(|b| b.status == Some(BuildStates::WAITING_FOR_DEPS));
+            .find(|b| b.status == BuildState::WaitingForDeps);
         assert!(
             child_pending.is_some(),
             "child should have a WAITING_FOR_DEPS build during forced rebuild"
@@ -1782,7 +1797,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         Mock::given(method("GET"))
             .and(path("/rpc/v5/info"))
@@ -1805,12 +1819,11 @@ mod tests {
 
         let parent = packages::ActiveModel {
             name: Set("git-parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(packages::SourceData::Git {
                 spec: packages::GitSourceSpec {
                     url: dir.path().to_string_lossy().to_string(),
@@ -1830,12 +1843,11 @@ mod tests {
 
         let old_dep = packages::ActiveModel {
             name: Set("old-dep".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "old-dep".into(),
             }),
@@ -1851,12 +1863,11 @@ mod tests {
 
         let new_dep = packages::ActiveModel {
             name: Set("new-dep".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("2.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "new-dep".into(),
             }),
@@ -1882,7 +1893,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(parent.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1895,7 +1906,7 @@ mod tests {
 
         builds::ActiveModel {
             pkg_id: Set(new_dep.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -1913,7 +1924,6 @@ mod tests {
         let build_ids = package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -1964,12 +1974,11 @@ mod tests {
     async fn two_providers_of_one_name(db: &DatabaseConnection, repo_path: &Path) -> TwoProviders {
         let parent = packages::ActiveModel {
             name: Set("git-parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set(String::new()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set(Default::default()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(packages::SourceData::Git {
                 spec: packages::GitSourceSpec {
                     url: repo_path.to_string_lossy().to_string(),
@@ -1990,12 +1999,11 @@ mod tests {
         let provider = async |name: &str, provides: Option<serde_json::Value>| {
             packages::ActiveModel {
                 name: Set(name.to_string()),
-                status: Set(BuildStates::SUCCESSFUL_BUILD),
-                out_of_date: Set(0),
+                status: Set(BuildState::Successful),
+                out_of_date: Set(false),
                 upstream_version: Set(Some("1.0.0".to_string())),
-                latest_build: Set(None),
-                build_flags: Set(String::new()),
-                platforms: Set("x86_64".to_string()),
+                build_flags: Set(Default::default()),
+                platforms: Set("x86_64".parse().unwrap()),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 // Requested, so the loser is not swept as an orphan and the
                 // assertion is about the edge and nothing else.
@@ -2032,7 +2040,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -2060,7 +2067,6 @@ mod tests {
         super::package_resync_dependencies(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -2093,7 +2099,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -2108,7 +2113,6 @@ mod tests {
         super::package_resync_dependencies(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -2135,7 +2139,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "mypkg", "1.0.0", &[]);
@@ -2143,12 +2146,11 @@ mod tests {
         // Simulate package that previously failed its first build.
         let pkg = packages::ActiveModel {
             name: Set("mypkg".to_string()),
-            status: Set(BuildStates::FAILED_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Failed),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "mypkg".into(),
             }),
@@ -2165,7 +2167,7 @@ mod tests {
         // The first (failed) build record.
         builds::ActiveModel {
             pkg_id: Set(pkg.id),
-            status: Set(Some(BuildStates::FAILED_BUILD)),
+            status: Set(BuildState::Failed),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -2176,14 +2178,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Drain any stale messages before the force-rebuild call.
-        while rx.try_recv().is_ok() {}
-
         let (store, _checkout_dir) = test_store(aur_root.path());
         let build_ids = package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),
@@ -2202,16 +2200,10 @@ mod tests {
             "force rebuild should queue exactly one build"
         );
 
-        // Verify Action::Build was sent.
-        assert!(
-            rx.try_recv().is_ok(),
-            "Action::Build should have been sent on the channel"
-        );
-
         // Verify the new build row exists with ENQUEUED status.
         let enqueued_build = builds::Entity::find()
             .filter(builds::Column::PkgId.eq(pkg.id))
-            .filter(builds::Column::Status.eq(Some(BuildStates::ENQUEUED_BUILD)))
+            .filter(builds::Column::Status.eq(BuildState::Enqueued))
             .one(&db)
             .await
             .unwrap();
@@ -2240,19 +2232,17 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _rx) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "mypkg", "1.0.0", &[]);
 
         let pkg = packages::ActiveModel {
             name: Set("mypkg".to_string()),
-            status: Set(BuildStates::FAILED_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Failed),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "mypkg".into(),
             }),
@@ -2269,7 +2259,6 @@ mod tests {
         let (store, _checkout_dir) = test_store(aur_root.path());
         let services = Services::new(
             db.clone(),
-            tx.clone(),
             Arc::new(store),
             Arc::new(client),
             test_repo(),
@@ -2291,7 +2280,7 @@ mod tests {
             .unwrap()
         {
             let mut active = build.into_active_model();
-            active.status = Set(Some(BuildStates::FAILED_BUILD));
+            active.status = Set(BuildState::Failed);
             active.update(&db).await.unwrap();
         }
 
@@ -2305,7 +2294,7 @@ mod tests {
 
         let versions: Vec<String> = builds::Entity::find()
             .filter(builds::Column::PkgId.eq(pkg.id))
-            .filter(builds::Column::Status.eq(Some(BuildStates::ENQUEUED_BUILD)))
+            .filter(builds::Column::Status.eq(BuildState::Enqueued))
             .all(&db)
             .await
             .unwrap()
@@ -2329,7 +2318,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _rx) = tokio::sync::broadcast::channel::<Action>(100);
 
         let aur_root = tempdir().unwrap();
         let mut ids = std::collections::HashMap::new();
@@ -2338,12 +2326,11 @@ mod tests {
             // Built at the version its source still reports, and flagged anyway.
             let pkg = packages::ActiveModel {
                 name: Set(name.to_string()),
-                status: Set(BuildStates::SUCCESSFUL_BUILD),
-                out_of_date: Set(1),
+                status: Set(BuildState::Successful),
+                out_of_date: Set(true),
                 upstream_version: Set(Some("1.0.0-1".to_string())),
-                latest_build: Set(None),
-                build_flags: Set(String::new()),
-                platforms: Set("x86_64".to_string()),
+                build_flags: Set(Default::default()),
+                platforms: Set("x86_64".parse().unwrap()),
                 source_data: Set(SourceData::Aur { name: name.into() }),
                 directly_requested: Set(true),
                 split_packages: Set(None),
@@ -2356,7 +2343,7 @@ mod tests {
             .unwrap();
             builds::ActiveModel {
                 pkg_id: Set(pkg.id),
-                status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+                status: Set(BuildState::Successful),
                 start_time: Set(Some(1)),
                 end_time: Set(Some(2)),
                 platform: Set(Platform::X86_64),
@@ -2382,7 +2369,6 @@ mod tests {
         let (store, _checkout_dir) = test_store(aur_root.path());
         let services = Services::new(
             db.clone(),
-            tx,
             Arc::new(store),
             Arc::new(client),
             test_repo(),
@@ -2414,14 +2400,14 @@ mod tests {
         );
         let scheduled = builds::Entity::find()
             .filter(builds::Column::PkgId.eq(ids["tracks-git"]))
-            .filter(builds::Column::Status.eq(BuildStates::ENQUEUED_BUILD))
+            .filter(builds::Column::Status.eq(BuildState::Enqueued))
             .one(&db)
             .await
             .unwrap()
             .expect("the queued rebuild");
         assert_eq!(
             scheduled.trigger,
-            BuildTriggers::AUTO_UPDATE,
+            BuildTrigger::AutoUpdate,
             "the scheduler's builds say they are the scheduler's"
         );
     }
@@ -2433,7 +2419,6 @@ mod tests {
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
-        let (tx, _) = tokio::sync::broadcast::channel::<Action>(100);
 
         // A v2.0.0 no longer depends on B
         let aur_root = tempdir().unwrap();
@@ -2442,12 +2427,11 @@ mod tests {
         // Insert parent (directly requested, with a successful build)
         let parent = packages::ActiveModel {
             name: Set("parent".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "parent".into(),
             }),
@@ -2464,12 +2448,11 @@ mod tests {
         // Insert child (not directly requested)
         let child = packages::ActiveModel {
             name: Set("child".to_string()),
-            status: Set(BuildStates::SUCCESSFUL_BUILD),
-            out_of_date: Set(0),
+            status: Set(BuildState::Successful),
+            out_of_date: Set(false),
             upstream_version: Set(Some("1.0.0".to_string())),
-            latest_build: Set(None),
-            build_flags: Set("--noconfirm;--noprogressbar".to_string()),
-            platforms: Set("x86_64".to_string()),
+            build_flags: Set("--noconfirm;--noprogressbar".parse().unwrap()),
+            platforms: Set("x86_64".parse().unwrap()),
             source_data: Set(SourceData::Aur {
                 name: "child".into(),
             }),
@@ -2497,7 +2480,7 @@ mod tests {
         // Successful build record for child
         builds::ActiveModel {
             pkg_id: Set(child.id),
-            status: Set(Some(BuildStates::SUCCESSFUL_BUILD)),
+            status: Set(BuildState::Successful),
             start_time: Set(Some(1)),
             end_time: Set(Some(2)),
             platform: Set(Platform::X86_64),
@@ -2512,7 +2495,6 @@ mod tests {
         package_update(
             &Services::new(
                 db.clone(),
-                tx.clone(),
                 Arc::new(store),
                 Arc::new(client),
                 test_repo(),

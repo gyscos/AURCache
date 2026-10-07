@@ -1,16 +1,34 @@
 use crate::builds;
+use crate::helpers::builds::refresh_package_status;
 use crate::prelude::Builds;
-use aurcache_common::build_state::{BuildStates, BuildTrigger};
+use aurcache_common::build_state::{BuildState, BuildTrigger};
 use pacman_mirrors::platforms::Platform;
 use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict, Query};
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    IntoActiveModel, QueryFilter,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
 
 pub struct EnqueueBuildResult {
     pub build: builds::Model,
     pub inserted: bool,
+}
+
+/// The states a new build can be queued in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pending {
+    /// Ready for a worker to claim.
+    Enqueued,
+    /// Held until what it depends on is built.
+    WaitingForDeps,
+}
+
+impl Pending {
+    /// The state the row is written with.
+    #[must_use]
+    pub const fn state(self) -> BuildState {
+        match self {
+            Self::Enqueued => BuildState::Enqueued,
+            Self::WaitingForDeps => BuildState::WaitingForDeps,
+        }
+    }
 }
 
 // See the race explanation in `enqueue_build_if_missing`.
@@ -34,10 +52,9 @@ fn next_build_number_expr(pkg_id: i32) -> Expr {
     )
 }
 
-/// Insert a new pending build with the given `initial_status` if no pending build already exists
-/// for `(pkg_id, platform)`.
+/// Insert a new pending build, queued as `pending`, if no pending build already exists
+/// for `(pkg_id, platform)`; the package's status follows.
 ///
-/// `initial_status` must be one of [`BuildStates::ENQUEUED_BUILD`] or [`BuildStates::WAITING_FOR_DEPS`].
 /// The partial unique index on `builds(pkg_id, platform)` covering all pending
 /// states (ACTIVE, ENQUEUED, WAITING_FOR_DEPS) ensures at most one pending row
 /// per `(pkg_id, platform)` at any time.
@@ -50,7 +67,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     platform: Platform,
     version: &str,
     start_time: i64,
-    initial_status: i32,
+    pending: Pending,
     // What the row is for. The retry budget for abandoned builds reads this
     // column, so every creation path has to say.
     trigger: BuildTrigger,
@@ -86,7 +103,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
             ])
             .values([
                 pkg_id.into(),
-                initial_status.into(),
+                pending.state().into(),
                 start_time.into(),
                 platform_str.to_owned().into(),
                 version.to_owned().into(),
@@ -102,10 +119,11 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
         let existing = crate::helpers::builds::pending_build(db, pkg_id, platform_str).await?;
 
         if let Some(build) = existing {
-            return Ok(EnqueueBuildResult {
-                build,
-                inserted: result.rows_affected() == 1,
-            });
+            let inserted = result.rows_affected() == 1;
+            if inserted {
+                refresh_package_status(db, pkg_id).await?;
+            }
+            return Ok(EnqueueBuildResult { build, inserted });
         }
         // Nothing inserted and nothing pending: the number was taken. Try again
         // with a freshly read maximum.
@@ -121,6 +139,10 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
 ///
 /// Returns the updated build row if a `WAITING_FOR_DEPS` build was found and promoted,
 /// or `None` if no such build exists (e.g. the build was never queued or was already promoted).
+///
+/// The write is pinned to `status = WAITING_FOR_DEPS`, like
+/// [`demote_enqueued_build`]: a cancel landing between the read and the write
+/// would otherwise be overwritten, putting a cancelled build back in the queue.
 pub async fn promote_waiting_build<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
@@ -129,17 +151,27 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
     let Some(build) = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(BuildStates::WAITING_FOR_DEPS)))
+        .filter(builds::Column::Status.eq(BuildState::WaitingForDeps))
         .one(db)
         .await?
     else {
         return Ok(None);
     };
 
-    let mut active = build.into_active_model();
-    active.status = Set(Some(BuildStates::ENQUEUED_BUILD));
-    let updated = active.update(db).await?;
-    Ok(Some(updated))
+    let res = Builds::update_many()
+        .col_expr(builds::Column::Status, Expr::value(BuildState::Enqueued))
+        .filter(builds::Column::Id.eq(build.id))
+        .filter(builds::Column::Status.eq(BuildState::WaitingForDeps))
+        .exec(db)
+        .await?;
+    if res.rows_affected == 0 {
+        return Ok(None);
+    }
+    refresh_package_status(db, pkg_id).await?;
+    Ok(Some(builds::Model {
+        status: BuildState::Enqueued,
+        ..build
+    }))
 }
 
 /// Put an `ENQUEUED` build back to `WAITING_FOR_DEPS`, because something it
@@ -156,7 +188,6 @@ pub async fn promote_waiting_build<C: ConnectionTrait>(
 /// between a read and a write -- and demoting it then would take a build a
 /// worker is already running and put it back in the queue. Pinning the update to
 /// `status = ENQUEUED` makes that a no-op instead.
-///
 pub async fn demote_enqueued_build<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
@@ -165,13 +196,16 @@ pub async fn demote_enqueued_build<C: ConnectionTrait>(
     let res = Builds::update_many()
         .col_expr(
             builds::Column::Status,
-            Expr::value(BuildStates::WAITING_FOR_DEPS),
+            Expr::value(BuildState::WaitingForDeps),
         )
         .filter(builds::Column::PkgId.eq(pkg_id))
         .filter(builds::Column::Platform.eq(platform.as_str()))
-        .filter(builds::Column::Status.eq(Some(BuildStates::ENQUEUED_BUILD)))
+        .filter(builds::Column::Status.eq(BuildState::Enqueued))
         .exec(db)
         .await?;
+    if res.rows_affected > 0 {
+        refresh_package_status(db, pkg_id).await?;
+    }
     Ok(if res.rows_affected > 0 {
         Demotion::Demoted
     } else {

@@ -21,12 +21,8 @@ use dioxus::prelude::*;
 /// counted *enqueued* and *waiting for deps* as over, which showed a freshly
 /// queued build as finished and stopped the page updating when it later
 /// started.
-///
-/// An unrecognised state from a newer server does not settle: being wrong that
-/// way costs one poll per interval, while being wrong the other way is the bug
-/// above.
-fn settled(status: i32) -> bool {
-    BuildState::from_i32(status).is_some_and(|s| !s.is_in_progress())
+fn settled(status: BuildState) -> bool {
+    !status.is_in_progress()
 }
 
 /// Whether the build page is still waiting on something, so its header keeps
@@ -37,7 +33,7 @@ fn settled(status: i32) -> bool {
 /// its lookup re-runs — without this a finished build read "successful" below
 /// a header that still said "building". Nothing fetched yet counts as idle,
 /// the same as elsewhere: the initial load is already in flight.
-fn build_page_busy(build_status: Option<i32>, package_status: Option<i32>) -> bool {
+fn build_page_busy(build_status: Option<BuildState>, package_status: Option<BuildState>) -> bool {
     [build_status, package_status]
         .into_iter()
         .flatten()
@@ -53,7 +49,7 @@ fn build_page_busy(build_status: Option<i32>, package_status: Option<i32>) -> bo
 /// which is the one to get right: saying "no log" there is false for as long
 /// as a large log takes to download. And a build still going may not have
 /// written its first line.
-fn empty_log_placeholder(finished: bool, status: Option<i32>) -> &'static str {
+fn empty_log_placeholder(finished: bool, status: Option<BuildState>) -> &'static str {
     if finished {
         "no log for this build"
     } else if status.is_some_and(settled) {
@@ -69,14 +65,12 @@ mod tests {
 
     #[test]
     fn only_terminal_states_settle() {
-        assert!(settled(BuildState::Successful.as_i32()));
-        assert!(settled(BuildState::Failed.as_i32()));
-        assert!(!settled(BuildState::Active.as_i32()));
+        assert!(settled(BuildState::Successful));
+        assert!(settled(BuildState::Failed));
+        assert!(!settled(BuildState::Active));
         // The regression: queued is not finished.
-        assert!(!settled(BuildState::Enqueued.as_i32()));
-        assert!(!settled(BuildState::WaitingForDeps.as_i32()));
-        // A state this build of the UI has never heard of keeps it polling.
-        assert!(!settled(99));
+        assert!(!settled(BuildState::Enqueued));
+        assert!(!settled(BuildState::WaitingForDeps));
     }
 
     /// The header stays live while either side is still moving: the bug was a
@@ -84,8 +78,8 @@ mod tests {
     /// said "building", because only the log's loop kept polling.
     #[test]
     fn the_header_stays_busy_while_either_side_is_still_moving() {
-        let active = Some(BuildState::Active.as_i32());
-        let successful = Some(BuildState::Successful.as_i32());
+        let active = Some(BuildState::Active);
+        let successful = Some(BuildState::Successful);
         assert!(build_page_busy(active, active));
         assert!(build_page_busy(successful, active));
         assert!(build_page_busy(active, successful));
@@ -97,13 +91,13 @@ mod tests {
 
     #[test]
     fn empty_log_placeholder_tells_loading_from_missing() {
-        let failed = Some(BuildState::Failed.as_i32());
+        let failed = Some(BuildState::Failed);
         // The regression: an old build whose log is still downloading is not
         // one without a log.
         assert_eq!(empty_log_placeholder(false, failed), "loading log…");
         assert_eq!(empty_log_placeholder(true, failed), "no log for this build");
         assert_eq!(
-            empty_log_placeholder(false, Some(BuildState::Active.as_i32())),
+            empty_log_placeholder(false, Some(BuildState::Active)),
             "waiting for output…"
         );
         // Before the first status poll answers, nothing is known yet.
@@ -409,7 +403,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
     // The build's real state, not just "is it over". "Not building" also covers
     // *enqueued* and *waiting for deps*, and collapsing those into a boolean is
     // what told someone their freshly queued build had already finished.
-    let status = use_signal(|| None::<i32>);
+    let status = use_signal(|| None::<BuildState>);
     // Filled from the same poll that decides when the log stops, so a build
     // claimed while this page is open names its worker without a reload.
     let worker_name = use_signal(|| None::<String>);
@@ -706,12 +700,10 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                     // Stop a build that is not over yet: running, enqueued, or
                     // waiting for deps. Same `settled` gate as the poll loop,
                     // so a build that just started is stoppable the moment this
-                    // page opens and a state from a newer server is too. Not
+                    // page opens. Not
                     // one being published: it has already been built, and the
                     // server would refuse.
-                    if status().is_some_and(|s| {
-                        !settled(s) && BuildState::from_i32(s) != Some(BuildState::Publishing)
-                    }) {
+                    if status().is_some_and(|s| !settled(s) && s != BuildState::Publishing) {
                         button {
                             disabled: canceling(),
                             class: "btn btn-xs btn-error btn-outline",
@@ -731,7 +723,7 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                                     "Stop {pkgbase_for_stop} build #{number_for_stop}?"
                                 }
                                 p { class: "text-sm opacity-70 pt-2",
-                                    if status() == Some(BuildState::Active as i32) {
+                                    if status() == Some(BuildState::Active) {
                                         "It is killed where it is and ends as canceled. Nothing it has built so \
                                          far is published; retrying it starts the build again."
                                     } else {

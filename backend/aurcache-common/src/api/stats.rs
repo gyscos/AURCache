@@ -21,7 +21,9 @@ pub struct ListStats {
     pub recent_failed: u32,
 
     pub avg_build_time: u32,
-    pub repo_size: u64,
+    /// Bytes of every artifact in the repository; `None` while any of them
+    /// has no recorded size.
+    pub repo_size: Option<i64>,
 
     /// Packages somebody asked for by name.
     ///

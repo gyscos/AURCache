@@ -341,7 +341,7 @@ pub fn parse_pkgbuild(path: &Path, network: bool) -> anyhow::Result<SourceInfoV1
     let bridge = Bridge::from_env(network)?;
     bridge
         .parse(path)
-        .or_else(|error| retry_fixed(&bridge, error, &std::fs::read_to_string(path)?, network))
+        .or_else(|error| retry_fixed(&bridge, error, &std::fs::read_to_string(path)?))
 }
 
 /// Parse PKGBUILD content held in memory, applying the same workarounds as
@@ -351,7 +351,7 @@ pub fn parse_pkgbuild(path: &Path, network: bool) -> anyhow::Result<SourceInfoV1
 /// other part of this function touches disk.
 pub fn parse_pkgbuild_content(content: &str, network: bool) -> anyhow::Result<SourceInfoV1> {
     let bridge = Bridge::from_env(network)?;
-    parse_in_temp(&bridge, content).or_else(|error| retry_fixed(&bridge, error, content, network))
+    parse_in_temp(&bridge, content).or_else(|error| retry_fixed(&bridge, error, content))
 }
 
 /// Parse `content` from a temporary `PKGBUILD`.
@@ -373,11 +373,10 @@ fn retry_fixed(
     bridge: &Bridge,
     error: anyhow::Error,
     content: &str,
-    network: bool,
 ) -> anyhow::Result<SourceInfoV1> {
     let fixed = fix_source_urls(content);
     if fixed == content {
-        return Err(explain_network_need(error, content, network));
+        return Err(explain_network_need(error, content, bridge.network));
     }
     parse_in_temp(bridge, &fixed)
 }
