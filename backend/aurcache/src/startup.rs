@@ -13,7 +13,6 @@ use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirro
 use aurcache_utils::publish;
 use aurcache_utils::repository::{REPO_ROOT, Repository};
 use aurcache_utils::snapshot::SnapshotStore;
-use pacman_mirrors::benchmark::gen_mirrorlist;
 use pacman_mirrors::platforms::Platform;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
 use sea_orm::{QueryFilter, QueryOrder};
@@ -92,9 +91,6 @@ fn warn_about_ephemeral_data() {
         }
     }
 }
-
-/// The one architecture AURCache can rank mirrors for itself.
-const RANKABLE_ARCH: &str = "x86_64";
 
 /// Copy a mounted `mirrorlist` into this host's `mirrorlist.<arch>` slot.
 ///
@@ -186,22 +182,8 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
         );
     }
 
-    // Ranking only knows how to rank x86_64 mirrors, so that is the one
-    // architecture AURCache can populate for itself when nothing is configured.
-    // Every other arch is configured or absent, and absent is fine: the worker
-    // then uses its own image's mirrorlist.
-    let ranked = job_config::mirrorlist_path(RANKABLE_ARCH);
-    if !fs::try_exists(&ranked).await.unwrap_or(false) {
-        info!("Perform initial load of pacman mirrorlist");
-        match pacman_mirrors::get_status(Platform::X86_64).await {
-            Ok(status) => {
-                fs::write(&ranked, gen_mirrorlist(&status.urls.0)).await?;
-                info!("Wrote mirrorlist to {}", ranked.display());
-            }
-            Err(e) => {
-                warn!("Failed to get mirror list: {e}");
-            }
-        }
+    if let Err(e) = aurcache_scheduler::mirror_ranking::seed_mirrorlist().await {
+        warn!("Failed to write an initial mirrorlist: {e:#}");
     }
 
     Ok(())

@@ -26,7 +26,7 @@ Status: **Proposed** · Last updated: 2026-09-28
 ## Ground rules
 
 - **A scenario is a list of `aurcli` commands.** Assertions are the CLI's exit
-  status (`--wait`, `--fail-on-requeue`) or a `jq -e` over `--format json`.
+  status (`--wait`) or a `jq -e` over `--format json`.
   If an assertion cannot be written that way, the first fix is to make the CLI
   or API say it. The previous examples are `disk_usage` and `--wait`; the fact
   then serves users as well as the test. A scenario that greps container logs
@@ -194,8 +194,8 @@ line, but anything larger belongs in a separate scenario.
 worker=$(e2e-pick-worker)
 aurcli worker config "$worker" --set packages=hello
 
-aurcli pkg add hello --platform x86_64 --persist-build-dir --wait --fail-on-requeue
-aurcli pkg update hello --force --wait --fail-on-requeue
+aurcli pkg add hello --platform x86_64 --persist-build-dir --wait
+aurcli pkg update hello --force --wait
 aurcli --format json builds get hello/2 \
     | jq -e --arg w "$worker" '.worker_name == $w and .build_tree_reused'
 e2e-install hello
@@ -313,7 +313,7 @@ the initial scenarios need, checked against the current CLI.
 **Already covered:**
 
 - `pkg add` / `pkg update` / `builds retry` with `--wait`,
-  `--wait-timeout`, `--wait-stall-after` and `--fail-on-requeue`;
+  `--wait-timeout` and `--wait-stall-after`;
 - `builds list --worker --status --package` and `builds get` with
   `worker_name` and `disk_usage` in its JSON;
 - `worker list` with `name`, `status`, `online`, `paused` and
@@ -324,7 +324,7 @@ the initial scenarios need, checked against the current CLI.
 **Missing:**
 
 - **Distinct exit codes for `--wait`**: one for "a build failed", another for
-  "the wait gave up" (timeout, stall, requeue). They get documented constants
+  "the wait gave up" (timeout, stall). They get documented constants
   that the harness exports as `AURCLI_EXIT_*`. Without them, an expected
   failure cannot be told apart from a hung queue.
 - **Workers addressed by name.** `worker config`, `pause`, `resume` and

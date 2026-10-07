@@ -669,14 +669,6 @@ pub(crate) struct WatchArgs {
     /// Seconds between progress lines while work is in flight.
     #[arg(long, default_value_t = 60)]
     pub(crate) heartbeat: u64,
-    /// Fail if a build returns to the queue after running.
-    ///
-    /// That means the server refused the worker's completion, which repeats
-    /// indefinitely — the build runs, is rejected, and is queued again. Normal
-    /// operation can requeue a build whose worker was lost, so this is opt-in
-    /// and intended for tests.
-    #[arg(long = "fail-on-requeue")]
-    pub(crate) fail_on_requeue: bool,
     /// Follow this build even if it has already finished, e.g. `hello/3`.
     /// Repeat for several.
     ///
@@ -707,10 +699,6 @@ pub(crate) struct WaitOpts {
     /// Fail if nothing changes for this long while nothing is building.
     #[arg(long = "wait-stall-after", default_value_t = 120)]
     pub(crate) wait_stall_after: u64,
-    /// Fail if a build returns to the queue after running. See
-    /// `builds watch --fail-on-requeue`.
-    #[arg(long = "fail-on-requeue")]
-    pub(crate) fail_on_requeue: bool,
 }
 
 impl WaitOpts {
@@ -724,7 +712,6 @@ impl WaitOpts {
             timeout: self.wait_timeout,
             stall_after: self.wait_stall_after,
             heartbeat: 60,
-            fail_on_requeue: self.fail_on_requeue,
             builds: Vec::new(),
         }
     }

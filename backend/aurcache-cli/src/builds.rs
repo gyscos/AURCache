@@ -371,17 +371,6 @@ pub(crate) async fn follow_builds(
         for build in &watched {
             let key = build_ref(build);
             if seen.get(&key) != Some(&build.status) {
-                if args.fail_on_requeue
-                    && seen.get(&key) == Some(&BuildState::Active)
-                    && build.status == BuildState::Enqueued
-                {
-                    bail!(
-                        "{}/{} was requeued after running: the server refused the \
-                         worker's completion, which will repeat indefinitely",
-                        build.pkg_name,
-                        build.number
-                    );
-                }
                 let elapsed = start.elapsed().as_secs();
                 let reason = build
                     .waiting_reason

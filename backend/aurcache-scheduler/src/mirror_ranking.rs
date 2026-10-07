@@ -27,22 +27,6 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
     })?;
 
     Ok(tokio::spawn(async move {
-        // The scheduled job normally only runs on its cron cadence (e.g.
-        // weekly), which would leave dependency resolution against the
-        // official repos broken until then on a fresh install. If no
-        // mirrorlist exists yet, rank one immediately so official-repo
-        // lookups (used to distinguish AUR deps from `pacman`/`glibc`/etc.)
-        // work right away.
-        if !mirrorlist_exists() {
-            info!("No mirrorlist found yet; ranking one immediately at startup");
-            match update_mirrorlist().await {
-                Ok(()) => info!("Initial mirror ranking finished"),
-                Err(e) => activity.emit(Event::MirrorRankFailed {
-                    error: format!("{e:#}"),
-                }),
-            }
-        }
-
         let mut reported = false;
         loop {
             // A schedule with no next run (`0 0 31 2 *`) waits and says so.
@@ -76,6 +60,26 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
 
 /// The architecture `pacman_mirrors` can rank for; mirrorlists are per-arch.
 const RANKED_ARCH: &str = "x86_64";
+
+/// Write an unranked [`RANKED_ARCH`] mirrorlist when there is none yet.
+///
+/// Run at startup, before anything resolves dependencies: official-repo
+/// lookups -- what tells `glibc` from an AUR package -- need a mirrorlist, and
+/// ranking one takes far longer than fetching the mirror status. The
+/// scheduled ranking replaces it on its next run. Every other architecture is
+/// configured or absent, and absent is fine: the worker then uses its own
+/// image's mirrorlist.
+pub async fn seed_mirrorlist() -> anyhow::Result<()> {
+    let target = mirrorlist_path(RANKED_ARCH);
+    if fs::try_exists(&target).await.unwrap_or(false) {
+        return Ok(());
+    }
+    info!("Perform initial load of pacman mirrorlist");
+    let status = pacman_mirrors::get_status(Platform::X86_64).await?;
+    fs::write(&target, gen_mirrorlist(&status.urls.0)).await?;
+    info!("Wrote mirrorlist to {}", target.display());
+    Ok(())
+}
 
 /// Whether a mounted mirrorlist owns the slot ranking would write.
 ///
@@ -119,12 +123,6 @@ async fn update_mirrorlist() -> anyhow::Result<()> {
     fs::write(&target, mirrorlist).await?;
     info!("Wrote mirrorlist to {}", target.display());
     Ok(())
-}
-
-/// Returns `true` if a `mirrorlist` file is already present at the path the
-/// scheduled job would write to.
-fn mirrorlist_exists() -> bool {
-    mirrorlist_path(RANKED_ARCH).exists()
 }
 
 #[cfg(test)]

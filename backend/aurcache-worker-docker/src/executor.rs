@@ -152,15 +152,11 @@ impl DockerExecutor {
         job: &JobDescriptor,
         cancel: &AtomicBool,
     ) -> Result<CompleteReport> {
-        let build_id = job.build_id;
-        let BuildDirs {
-            host: host_dir,
-            local: local_dir,
-        } = self.job_dirs(cfg, build_id);
+        let dirs = self.job_dirs(cfg, job.build_id);
 
         // A crash mid-job could have left a tree behind under this id.
-        let _ = std::fs::remove_dir_all(&local_dir);
-        let src_dir = local_dir.join("src");
+        let _ = std::fs::remove_dir_all(&dirs.local);
+        let src_dir = dirs.local.join("src");
         std::fs::create_dir_all(&src_dir)
             .with_context(|| format!("creating {}", src_dir.display()))?;
         // The build container runs as its image's own unprivileged user, whose
@@ -168,8 +164,32 @@ impl DockerExecutor {
         // write sources, `makepkg.conf` and finished packages here, so the
         // directory is world-writable — as the pre-worker builder also made it.
         // It lives inside a per-build directory that is removed afterwards.
-        world_writable(&local_dir);
+        world_writable(&dirs.local);
         world_writable(&src_dir);
+
+        // Removed on every path, not just the happy one: any early return in
+        // `build_in` -- a failed download, pull, container or upload -- would
+        // otherwise leave the whole directory behind.
+        let outcome = self.build_in(cfg, client, job, cancel, &dirs).await;
+        let _ = std::fs::remove_dir_all(&dirs.local);
+        outcome
+    }
+
+    /// Build `job` in its prepared directories and upload what it produced.
+    async fn build_in(
+        &self,
+        cfg: &Config,
+        client: &Arc<WorkerClient>,
+        job: &JobDescriptor,
+        cancel: &AtomicBool,
+        dirs: &BuildDirs,
+    ) -> Result<CompleteReport> {
+        let build_id = job.build_id;
+        let BuildDirs {
+            host: host_dir,
+            local: local_dir,
+        } = dirs;
+        let src_dir = local_dir.join("src");
 
         let source = client
             .source(build_id)
@@ -276,19 +296,11 @@ impl DockerExecutor {
             )
             .await;
 
-        // Removed on every path, not just the happy one: each `?` below used
-        // to return first, so every failed build (and failed upload) left its
-        // whole directory behind.
-        let outcome = async {
-            let report = result?;
-            if report.outcome == BuildOutcome::Succeeded {
-                upload_artifacts(client, build_id, &local_dir).await?;
-            }
-            Ok(report)
+        let report = result?;
+        if report.outcome == BuildOutcome::Succeeded {
+            upload_artifacts(client, build_id, local_dir).await?;
         }
-        .await;
-        let _ = std::fs::remove_dir_all(&local_dir);
-        outcome
+        Ok(report)
     }
 
     /// Start the container, stream its output, and wait for it while honouring

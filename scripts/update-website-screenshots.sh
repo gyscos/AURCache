@@ -127,7 +127,7 @@ build_packages() {
     for pkg in $PACKAGES; do
         log "Adding package: $pkg"
         "$CLI_BIN" pkg add "$pkg" --platform x86_64 \
-            --wait --wait-timeout "$BUILD_TIMEOUT" --fail-on-requeue \
+            --wait --wait-timeout "$BUILD_TIMEOUT" \
             || fail "package $pkg failed to build"
     done
 }

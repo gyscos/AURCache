@@ -199,7 +199,7 @@ before the request returned, and including the dependency builds that are queued
 later as the graph fans out. It exits non-zero if any of them fails.
 
 `pkg add`, `pkg update` and `builds retry` all take it, with
-`--wait-timeout`, `--wait-stall-after` and `--fail-on-requeue`. Under
+`--wait-timeout` and `--wait-stall-after`. Under
 `--format json` the progress lines go to stderr so stdout stays a single
 document.
 

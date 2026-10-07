@@ -254,14 +254,13 @@ request_package() {
     # is this run's, however fast it failed. It reports the count the same way
     # this script used to — dependency resolution is recursive, so an
     # implausible number of builds shows a mis-resolved tree long before any of
-    # them fails. Progress reporting, stall detection and requeue detection are
-    # the CLI's for the same reason they always were: this script has no
-    # business re-encoding build status codes or re-parsing `waiting_reason`.
+    # them fails. Progress reporting and stall detection are the CLI's for the
+    # same reason they always were: this script has no business re-encoding
+    # build status codes or re-parsing `waiting_reason`.
     if ! aurcache_cli pkg add "$PACKAGE" --platform x86_64 \
         --wait \
         --wait-timeout "$BUILD_TIMEOUT" \
-        --wait-stall-after "${STALL_AFTER:-120}" \
-        --fail-on-requeue; then
+        --wait-stall-after "${STALL_AFTER:-120}"; then
         # A dead container explains a failure better than the build log does, so
         # check that first.
         assert_services_alive
