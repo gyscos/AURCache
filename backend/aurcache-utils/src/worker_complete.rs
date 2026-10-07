@@ -236,8 +236,7 @@ pub async fn trigger_dependents<C: ConnectionTrait>(
     let deps_by_dependent = load_dependencies_for_dependents_of(db, pkg_id).await?;
     let mut promoted = vec![];
     for (dependent_id, all_deps) in &deps_by_dependent {
-        if aurcache_db::helpers::builds::dependencies_satisfied(db, all_deps, platform.as_str())
-            .await?
+        if aurcache_db::helpers::builds::dependencies_satisfied(db, all_deps, platform).await?
             && let Some(build) = promote_dependent(db, *dependent_id, platform).await?
         {
             promoted.push(build);
@@ -272,10 +271,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
 ) -> Result<Vec<i32>, DbErr> {
     let pending: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(
-            builds::Column::Status
-                .is_in([Some(BuildState::Enqueued), Some(BuildState::WaitingForDeps)]),
-        )
+        .filter(builds::Column::Status.is_in([BuildState::Enqueued, BuildState::WaitingForDeps]))
         .all(db)
         .await?;
     if pending.is_empty() {
@@ -291,8 +287,7 @@ pub async fn resync_pending_builds<C: ConnectionTrait>(
     for build in pending {
         let platform = build.platform;
         let ready =
-            aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform.as_str())
-                .await?;
+            aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform).await?;
         match (build.status, ready) {
             (BuildState::WaitingForDeps, true) => {
                 if let Some(promoted) = promote_waiting_build(db, pkg_id, platform).await? {

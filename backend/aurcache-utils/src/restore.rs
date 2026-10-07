@@ -484,7 +484,7 @@ fn write_secrets(
     let Some(secrets) = &dump.secrets else {
         return Ok(false);
     };
-    if options.secrets == SecretsPolicy::Ignore && !options.clear {
+    if !take_secrets(options) {
         return Ok(false);
     }
 
@@ -918,6 +918,7 @@ mod tests {
     use super::{clear_existing, load_dump};
     use aurcache_common::api::dump::DUMP_SCHEMA_VERSION;
     use aurcache_common::build_state::BuildState;
+    use std::collections::BTreeMap;
 
     /// Build an archive from explicit file contents, so a test can write a
     /// malformed one as easily as a good one.
@@ -950,8 +951,9 @@ mod tests {
     const ONE_PACKAGE: &str = r#"{"hello":{"source_data":{"type":"aur","name":"hello"},
         "platforms":["x86_64"],"build_flags":[],"directly_requested":true}}"#;
 
-    fn good() -> Vec<(&'static str, String)> {
-        vec![
+    /// A minimal dump's files, by path.
+    fn good() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
             ("manifest.json", manifest(DUMP_SCHEMA_VERSION)),
             ("packages.json", ONE_PACKAGE.to_string()),
             (
@@ -959,10 +961,10 @@ mod tests {
                 r#"{"global":{},"packages":{}}"#.to_string(),
             ),
             ("workers.json", "[]".to_string()),
-        ]
+        ])
     }
 
-    fn load(files: Vec<(&str, String)>) -> anyhow::Result<super::LoadedDump> {
+    fn load(files: BTreeMap<&str, String>) -> anyhow::Result<super::LoadedDump> {
         let owned: Vec<(&str, &str)> = files.iter().map(|(a, b)| (*a, b.as_str())).collect();
         load_dump(&archive(&owned))
     }
@@ -979,7 +981,7 @@ mod tests {
     #[test]
     fn a_newer_dump_is_refused() {
         let mut files = good();
-        files[0] = ("manifest.json", manifest(DUMP_SCHEMA_VERSION + 1));
+        files.insert("manifest.json", manifest(DUMP_SCHEMA_VERSION + 1));
         let error = load(files).unwrap_err().to_string();
         assert!(error.contains("upgrade AURCache"), "unhelpful: {error}");
     }
@@ -998,7 +1000,7 @@ mod tests {
     #[test]
     fn a_patch_without_its_package_is_refused() {
         let mut files = good();
-        files.push(("patches/ghost.patch", "--- a\n".to_string()));
+        files.insert("patches/ghost.patch", "--- a\n".to_string());
         let error = load(files).unwrap_err().to_string();
         assert!(error.contains("no matching package"), "unhelpful: {error}");
     }
@@ -1007,7 +1009,7 @@ mod tests {
     #[test]
     fn a_setting_for_an_absent_package_is_refused() {
         let mut files = good();
-        files[2] = (
+        files.insert(
             "settings.json",
             r#"{"global":{},"packages":{"ghost":{"k":"v"}}}"#.to_string(),
         );
@@ -1020,7 +1022,7 @@ mod tests {
     #[test]
     fn a_package_with_no_platforms_is_refused() {
         let mut files = good();
-        files[1] = (
+        files.insert(
             "packages.json",
             r#"{"hello":{"source_data":{"type":"aur","name":"hello"},
                 "platforms":[],"build_flags":[],"directly_requested":true}}"#
@@ -1092,7 +1094,7 @@ mod tests {
     #[test]
     fn worker_certificates_without_a_ca_are_refused() {
         let mut files = good();
-        files[3] = (
+        files.insert(
             "workers.json",
             r#"[{"name":"w","cert_fingerprint":"fp","status":"approved","native_arches":["x86_64"],
                  "emulated_arches":[],"package_affinity":[],"priority":0,"concurrency":1,
@@ -1107,7 +1109,7 @@ mod tests {
     #[test]
     fn a_ca_certificate_without_its_key_is_refused() {
         let mut files = good();
-        files.push(("ca-cert.pem", "-----BEGIN CERTIFICATE-----".to_string()));
+        files.insert("ca-cert.pem", "-----BEGIN CERTIFICATE-----".to_string());
         let error = load(files).unwrap_err().to_string();
         assert!(error.contains("half a CA"), "unhelpful: {error}");
     }
@@ -1119,8 +1121,8 @@ mod tests {
     #[test]
     fn a_manifest_that_lies_about_secrets_is_refused() {
         let mut files = good();
-        files.push(("ca-cert.pem", "cert".to_string()));
-        files.push(("ca-key.pem", "key".to_string()));
+        files.insert("ca-cert.pem", "cert".to_string());
+        files.insert("ca-key.pem", "key".to_string());
         // The manifest still says includes_secrets: false.
         let error = load(files).unwrap_err().to_string();
         assert!(error.contains("manifest says"), "unhelpful: {error}");
@@ -1130,18 +1132,18 @@ mod tests {
     #[test]
     fn a_dump_with_secrets_loads() {
         let mut files = good();
-        files[0] = (
+        files.insert(
             "manifest.json",
             format!(
                 r#"{{"schema_version":{DUMP_SCHEMA_VERSION},"aurcache_version":"t","created_at":0,"includes_secrets":true}}"#
             ),
         );
-        files.push(("ca-cert.pem", "cert".to_string()));
-        files.push(("ca-key.pem", "key".to_string()));
-        files.push((
+        files.insert("ca-cert.pem", "cert".to_string());
+        files.insert("ca-key.pem", "key".to_string());
+        files.insert(
             "tokens.json",
             r#"[{"username":"alice","token_hash":"abc"}]"#.to_string(),
-        ));
+        );
 
         let loaded = load(files).unwrap();
         let secrets = loaded.secrets.expect("secrets were dropped");
@@ -1154,7 +1156,7 @@ mod tests {
     #[test]
     fn a_patch_is_matched_to_its_package() {
         let mut files = good();
-        files.push(("patches/hello.patch", "--- a\n+++ b\n".to_string()));
+        files.insert("patches/hello.patch", "--- a\n+++ b\n".to_string());
         let loaded = load(files).unwrap();
         assert_eq!(
             loaded.patches.get("hello").map(String::as_str),

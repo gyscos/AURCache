@@ -600,7 +600,7 @@ fn SettingsTable(
             }
         }
         div { class: "flex flex-col gap-4",
-            for (category, settings) in groups {
+            for Category { name: category, settings } in groups {
                 div { key: "{category}",
                     div { class: "text-xs uppercase tracking-wide opacity-60 mb-1", "{category}" }
                     div { class: "overflow-x-auto",
@@ -673,15 +673,24 @@ fn Retired(
 /// Grouped rather than sorted: the worker's order puts related settings
 /// together, and a category can be declared in two tables (the protocol's and
 /// the executor's) without showing up twice.
-fn group_by_category(declared: &[SettingDecl]) -> Vec<(String, Vec<&SettingDecl>)> {
-    let mut groups: Vec<(String, Vec<&SettingDecl>)> = Vec::new();
+fn group_by_category(declared: &[SettingDecl]) -> Vec<Category<'_>> {
+    let mut groups: Vec<Category<'_>> = Vec::new();
     for decl in declared {
-        match groups.iter_mut().find(|(name, _)| *name == decl.category) {
-            Some((_, settings)) => settings.push(decl),
-            None => groups.push((decl.category.clone(), vec![decl])),
+        match groups.iter_mut().find(|group| group.name == decl.category) {
+            Some(group) => group.settings.push(decl),
+            None => groups.push(Category {
+                name: decl.category.clone(),
+                settings: vec![decl],
+            }),
         }
     }
     groups
+}
+
+/// The declared settings of one category; see [`group_by_category`].
+struct Category<'a> {
+    name: String,
+    settings: Vec<&'a SettingDecl>,
 }
 
 /// One setting: a field holding the value set here, what the worker is
@@ -1035,9 +1044,9 @@ mod tests {
             decl("build_memory_max", "Build limits"),
         ];
         let groups = group_by_category(&declared);
-        let names: Vec<_> = groups.iter().map(|(name, _)| name.as_str()).collect();
+        let names: Vec<_> = groups.iter().map(|group| group.name.as_str()).collect();
         assert_eq!(names, ["Build limits", "Signatures"]);
-        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[0].settings.len(), 2);
     }
 
     /// Categories appear in the order the worker first mentioned them, which is
@@ -1222,7 +1231,7 @@ mod tests {
             decl("cache_ttl", "Caches"),
         ];
         let groups = group_by_category(&declared);
-        assert_eq!(groups[0].0, "Scheduling");
-        assert_eq!(groups[1].0, "Caches");
+        assert_eq!(groups[0].name, "Scheduling");
+        assert_eq!(groups[1].name, "Caches");
     }
 }

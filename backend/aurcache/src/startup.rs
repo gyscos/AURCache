@@ -209,7 +209,7 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 /// Fill in `files.size` for rows that predate the column.
 ///
-/// `repo_ingest` records the size from the bytes it already holds, so this only
+/// Publishing records the size from the bytes it already holds, so this only
 /// covers rows written before that existed. Best-effort throughout: a file that
 /// is gone stays `NULL` and the page reports its size as unknown, which beats
 /// failing startup over a display field. Idempotent, so it also repairs a row
@@ -284,17 +284,19 @@ async fn backfill_build_sizes(db: &DatabaseConnection) {
     let mut filled = 0;
     for ((pkg_id, platform), total) in totals {
         let Some(total) = total else { continue };
+        // The newest successful build, whether or not it has a size: filtering
+        // on a missing size here would find an older build once the newest has
+        // one, and hand it the newest's total.
         let newest = Builds::find()
             .filter(builds::Column::PkgId.eq(pkg_id))
             .filter(builds::Column::Platform.eq(platform))
             .filter(builds::Column::Status.eq(BuildState::Successful))
-            .filter(builds::Column::Size.is_null())
             .order_by_desc(builds::Column::Number)
             .one(db)
             .await;
         let build = match newest {
-            Ok(Some(build)) => build,
-            Ok(None) => continue,
+            Ok(Some(build)) if build.size.is_none() => build,
+            Ok(_) => continue,
             Err(e) => {
                 warn!("could not find a build to record a size for: {e}");
                 continue;

@@ -428,7 +428,7 @@ async fn record(
     }
 
     Packages::update_many()
-        .col_expr(packages::Column::OutOfDate, 0.into())
+        .col_expr(packages::Column::OutOfDate, false.into())
         .col_expr(
             packages::Column::UpstreamVersion,
             Some(plan.version.clone()).into(),

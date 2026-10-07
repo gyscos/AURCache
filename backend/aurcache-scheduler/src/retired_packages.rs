@@ -4,12 +4,11 @@
 //! Publishing a new version takes the old one out of `repo.db` straight away
 //! but leaves its file in place: a client that ran `pacman -Sy` just before
 //! still has the old `repo.db`, and asks for the old file. This job deletes
-//! such files once they have been unlisted for `RETIRED_PACKAGE_GRACE` seconds
-//! (see [`Repository::sweep`]).
+//! such files once they have been unlisted for `RETIRED_PACKAGE_GRACE` (see
+//! [`Repository::sweep`]).
 
 use aurcache_activitylog::events::Event;
 use aurcache_utils::repository::Repository;
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -17,19 +16,14 @@ use tracing::info;
 
 /// How long a retired package file stays downloadable, by default: a day,
 /// comfortably longer than any upgrade takes between syncing and downloading.
-const DEFAULT_GRACE_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The longest the job sleeps between sweeps. A file is deleted at most this
 /// long after its grace runs out.
 const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 fn grace() -> Duration {
-    Duration::from_secs(
-        env::var("RETIRED_PACKAGE_GRACE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_GRACE_SECS),
-    )
+    crate::env_duration("RETIRED_PACKAGE_GRACE", DEFAULT_GRACE)
 }
 
 /// Sweep often enough that a short grace is honoured roughly, without
@@ -70,9 +64,6 @@ mod tests {
     fn the_interval_follows_the_grace_within_bounds() {
         assert_eq!(interval(Duration::from_secs(10)), Duration::from_secs(60));
         assert_eq!(interval(Duration::from_secs(600)), Duration::from_secs(300));
-        assert_eq!(
-            interval(Duration::from_secs(DEFAULT_GRACE_SECS)),
-            MAX_INTERVAL
-        );
+        assert_eq!(interval(DEFAULT_GRACE), MAX_INTERVAL);
     }
 }

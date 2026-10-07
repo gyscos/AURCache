@@ -11,24 +11,23 @@
 //! These tests pin that down, because it is invisible until someone adds one of
 //! those packages.
 
-use std::sync::Arc;
+mod common;
 
-use aurcache_activitylog::activity_utils::ActivityLog;
+use common::{TestApi, test_api};
+use std::convert::identity;
+
 use aurcache_common::build_state::BuildState;
 use aurcache_db::builds;
 use aurcache_db::dependencies;
-use aurcache_db::migration::Migrator;
 use aurcache_db::packages;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::{Builds, Dependencies, Packages};
-use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ActiveValue::Set;
-use sea_orm::{Database, DatabaseConnection, EntityTrait};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{DatabaseConnection, EntityTrait};
 
 /// Names that exercise every character the AUR actually uses, plus the two
 /// fully-numeric names that exist (`1337`, `67`) — those are why the routes
@@ -84,55 +83,11 @@ async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
         .last_insert_id
 }
 
-/// Mounts the *real* route table, so the test exercises the same URL matching
-/// and decoding production does rather than a reduced stand-in. That means
-/// supplying every piece of state the mounted routes declare, even the ones
-/// these tests never call — Rocket verifies that up front.
-async fn test_client() -> (Client, DatabaseConnection) {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-
-    let checkouts = tempfile::tempdir().expect("tempdir");
-    let rocket = rocket::build()
-        .manage(db.clone())
-        .manage(ActivityLog::discarding())
-        // Routes that act on packages take the bundle; these tests never reach
-        // one, but Rocket refuses to launch with an unmanaged type.
-        .manage(Arc::new(SnapshotStore::with_checkout_root(
-            checkouts.path().to_path_buf(),
-        )))
-        .manage(aurcache_utils::services::Services::new(
-            db.clone(),
-            Arc::new(SnapshotStore::with_checkout_root(
-                checkouts.path().to_path_buf(),
-            )),
-            Arc::new(aurcache_deps::AurClient::new()),
-            Arc::new(aurcache_utils::repository::Repository::new(
-                checkouts.path().join("repo"),
-            )),
-            ActivityLog::discarding(),
-        ))
-        // The dump route reports which AURCache wrote a dump. Rocket's
-        // sentinels refuse to launch without it, which is the point: a route
-        // needing unmanaged state would otherwise 500 in production.
-        .manage(aurcache_api::init::ServerVersion("test".to_string()))
-        // Dump and restore both move the CA's files, so both need to know
-        // where they are. Rocket's sentinels refuse to launch without it.
-        .manage(aurcache_api::init::CaDirectory(std::path::PathBuf::from(
-            "/nonexistent-ca-dir",
-        )))
-        .mount("/api", aurcache_api::backend::build_api());
-    // The checkout root only has to outlive Rocket's construction; nothing in
-    // these tests fetches sources.
-    std::mem::forget(checkouts);
-    (Client::tracked(rocket).await.unwrap(), db)
-}
-
 /// A pkgbase containing `+` must resolve to *that* package, not to a
 /// space-mangled name and not to a different row.
 #[rocket::async_test]
 async fn packages_with_special_characters_resolve_by_name() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     for name in NAMES {
         seed(&db, name).await;
     }
@@ -156,7 +111,7 @@ async fn packages_with_special_characters_resolve_by_name() {
 /// would resolve to whatever row happens to hold that id.
 #[rocket::async_test]
 async fn a_numeric_pkgbase_is_a_name_not_an_id() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     // Seed something else first so ids and names cannot coincide by accident.
     seed(&db, "first-package").await;
     let numeric_id = seed(&db, "1337").await;
@@ -175,7 +130,7 @@ async fn a_numeric_pkgbase_is_a_name_not_an_id() {
 /// route does, so they need the same guarantee.
 #[rocket::async_test]
 async fn sub_resources_accept_a_plus_in_the_pkgbase() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     seed(&db, "aewm++").await;
 
     for path in [
@@ -195,7 +150,7 @@ async fn sub_resources_accept_a_plus_in_the_pkgbase() {
 /// An unknown pkgbase is a 404, not a wrong package.
 #[rocket::async_test]
 async fn an_unknown_pkgbase_is_not_found() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     seed(&db, "aewm++").await;
 
     // `aewm  ` is what `aewm++` decodes to if it is ever put through
@@ -272,7 +227,7 @@ fn a_git_source_round_trips_through_json() {
 /// "no version", depending on which URL you asked.
 #[rocket::async_test]
 async fn a_package_with_no_build_has_no_version_on_either_route() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     seed(&db, "hello").await;
 
     let listed = client
@@ -306,7 +261,7 @@ async fn a_package_with_no_build_has_no_version_on_either_route() {
 /// empty string. That is "not known", and must not read as a real version.
 #[rocket::async_test]
 async fn an_enqueued_builds_empty_version_is_not_a_version() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     Builds::insert(builds::ActiveModel {
@@ -341,7 +296,7 @@ async fn an_enqueued_builds_empty_version_is_not_a_version() {
 /// not simply blank the field out.
 #[rocket::async_test]
 async fn a_completed_builds_version_is_reported() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     Builds::insert(builds::ActiveModel {
@@ -384,7 +339,7 @@ async fn a_completed_builds_version_is_reported() {
 /// fails to decode, taking down the whole route rather than one row.
 #[rocket::async_test]
 async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
 
     Packages::insert(packages::ActiveModel {
         name: Set("promoted-dep".to_string()),
@@ -425,7 +380,7 @@ async fn a_package_with_no_upstream_version_yet_does_not_break_the_list() {
 /// failed silently stopped being flagged as out of date.
 #[rocket::async_test]
 async fn a_failed_build_does_not_become_the_reported_version() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     // The version that is actually in the repository.
@@ -480,7 +435,7 @@ async fn a_failed_build_does_not_become_the_reported_version() {
 /// A build still running is not in the repository either.
 #[rocket::async_test]
 async fn an_in_progress_build_does_not_become_the_reported_version() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     Builds::insert(builds::ActiveModel {
@@ -533,7 +488,7 @@ async fn an_in_progress_build_does_not_become_the_reported_version() {
 /// reason a package will not build.
 #[rocket::async_test]
 async fn dependencies_report_whether_they_are_satisfied() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let app = seed(&db, "app").await;
     let ready = seed(&db, "ready-dep").await;
     let stale = seed(&db, "stale-dep").await;
@@ -598,7 +553,7 @@ async fn dependencies_report_whether_they_are_satisfied() {
 /// none at all only because there is nothing in the repository to use.
 #[rocket::async_test]
 async fn an_unconstrained_dependency_only_needs_to_have_built() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let app = seed(&db, "app").await;
     let dep = seed(&db, "any-version").await;
     insert_build(&db, dep, BuildState::Successful, "0.0.1-1").await;
@@ -630,7 +585,7 @@ async fn an_unconstrained_dependency_only_needs_to_have_built() {
 /// so a route that still reached for the AUR would fail here.
 #[rocket::async_test]
 async fn package_metadata_is_served_from_the_row() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     // What the version-check scheduler mirrors onto the row.
@@ -673,7 +628,7 @@ async fn package_metadata_is_served_from_the_row() {
 /// removed from the AUR still has.
 #[rocket::async_test]
 async fn a_package_the_aur_no_longer_lists_reads_as_not_found() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let pkg_id = seed(&db, "hello").await;
 
     packages::ActiveModel {
@@ -760,7 +715,7 @@ async fn listed(client: &Client, path: &str) -> Vec<Listed> {
 /// build keeps its worker, so the history lists too.
 #[rocket::async_test]
 async fn builds_filter_by_worker_and_state() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let hello = seed(&db, "hello").await;
     let world = seed(&db, "world").await;
     // Its own package: at most one pending build per package and platform.
@@ -812,7 +767,7 @@ async fn builds_filter_by_worker_and_state() {
 #[rocket::async_test]
 async fn a_builds_disk_usage_is_listed_with_it() {
     use sea_orm::ConnectionTrait;
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_api("test", identity).await;
     let hello = seed(&db, "hello").await;
     let world = seed(&db, "world").await;
     insert_build(&db, hello, BuildState::Successful, "1.0-1").await;

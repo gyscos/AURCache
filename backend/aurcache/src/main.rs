@@ -47,7 +47,10 @@ async fn main() {
     // The one task that writes the log. Everything else records through a
     // handle to it and never touches the table, so no call site has to decide
     // what to do about a write that did not land.
-    let (activity, activity_writer_handle) = activitylog::spawn(db.clone());
+    let activitylog::Writer {
+        log: activity,
+        task: activity_writer_handle,
+    } = activitylog::spawn(db.clone());
 
     // A line for the process starting. It says which version came up, which is
     // what lines a deploy up against whatever happened after it -- and it is

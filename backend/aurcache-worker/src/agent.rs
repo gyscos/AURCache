@@ -70,17 +70,6 @@ impl BuildAgent {
     pub fn socket(&self) -> &Path {
         &self.socket
     }
-
-    /// The directory to bind into a build chroot.
-    ///
-    /// The *directory* rather than the socket itself: a bind mount of a socket
-    /// breaks when the agent is restarted and the inode is replaced, while the
-    /// directory outlives it.
-    #[must_use]
-    pub fn bind_dir(&self) -> &Path {
-        // `socket` is `<dir>/agent.sock`, so its parent is the directory.
-        self.socket.parent().unwrap_or(&self.socket)
-    }
 }
 
 impl Drop for BuildAgent {

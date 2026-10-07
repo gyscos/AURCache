@@ -523,9 +523,6 @@ pub fn BuildLog(pkgbase: String, number: i32) -> Element {
                 // states on the right side of it; testing for `Active` alone
                 // treated an enqueued build as over, so the page announced
                 // "finished" and never updated again when the build started.
-                // An unrecognised state from a newer server counts as in
-                // progress: being wrong that way costs one poll per interval,
-                // while being wrong the other way is this bug.
                 let settled_now = build.as_ref().is_some_and(|b| settled(b.status));
 
                 // Output, gated on the header above. Frozen while not following

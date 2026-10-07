@@ -58,14 +58,12 @@ pub struct WorkerSummary {
     /// -- a size that did not parse, a number out of range.
     ///
     /// Carried in the list so a worker running something other than what its
-    /// machine was configured with is visible without opening it. `None` from a
-    /// worker version that does not report its configuration, which is not the
-    /// same answer as a worker that reports no problems.
-    #[serde(default)]
+    /// machine was configured with is visible without opening it. `None` until
+    /// the worker has reported its configuration, which is not the same answer
+    /// as a worker that reports no problems.
     pub settings_rejected: Option<i32>,
     /// Asked to take no new builds and let the ones it holds finish. Still
     /// approved and still heartbeating; resuming it is one click.
-    #[serde(default)]
     pub paused: bool,
 }
 

@@ -212,18 +212,6 @@ pub fn cert_fingerprint(cert_pem: &str) -> anyhow::Result<String> {
     Ok(sha256_hex(&doc.contents))
 }
 
-/// SHA-256 fingerprint (hex, lowercase) of the public key in a certificate PEM.
-pub fn fingerprint_from_cert_pem(cert_pem: &str) -> anyhow::Result<String> {
-    fingerprint_from_cert_der(&pem_to_der(cert_pem)?)
-}
-
-/// SHA-256 fingerprint (hex, lowercase) of the public key in a certificate's DER.
-pub fn fingerprint_from_cert_der(der: &[u8]) -> anyhow::Result<String> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der)
-        .map_err(|e| anyhow!("parsing certificate: {e}"))?;
-    Ok(sha256_hex(cert.tbs_certificate.subject_pki.raw))
-}
-
 /// SHA-256 fingerprint (hex, lowercase) of the public key in a CSR PEM.
 pub fn fingerprint_from_csr_pem(csr_pem: &str) -> anyhow::Result<String> {
     use x509_parser::prelude::FromDer;
@@ -283,6 +271,15 @@ pub fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA-256 fingerprint (hex, lowercase) of the public key in a certificate
+    /// PEM, to check an issued certificate against the CSR it was signed from.
+    fn fingerprint_from_cert_pem(cert_pem: &str) -> anyhow::Result<String> {
+        let der = pem_to_der(cert_pem)?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|e| anyhow!("parsing certificate: {e}"))?;
+        Ok(sha256_hex(cert.tbs_certificate.subject_pki.raw))
+    }
 
     /// A certificate this CA signed is recognised as its own.
     #[test]

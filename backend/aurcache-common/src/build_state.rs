@@ -225,7 +225,7 @@ pub enum BuildTrigger {
     /// A version check found the package outdated and requeued it.
     #[cfg_attr(feature = "db", sea_orm(num_value = 1))]
     AutoUpdate = 1,
-    /// Automatic retry of a build the server abandoned (this design).
+    /// Automatic retry of a build the server abandoned.
     #[cfg_attr(feature = "db", sea_orm(num_value = 2))]
     TimeoutRetry = 2,
 }

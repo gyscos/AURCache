@@ -9,7 +9,7 @@
 //!
 //! It asserts the server wired the pieces together correctly (mTLS cert ->
 //! approved worker mapping, claim -> `JobDescriptor`, artifact staging, and
-//! `complete{success}` -> repo ingest + `files` table) and that the safety
+//! `complete{success}` -> publishing + `files` table) and that the safety
 //! rails fire (wrong artifact name rejected, revoked worker refused).
 //!
 //! It is fully offline: the seeded package points at a nonexistent local git

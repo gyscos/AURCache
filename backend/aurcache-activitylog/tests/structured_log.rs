@@ -4,7 +4,7 @@
 //! being tested is the storage: the entity index written beside each entry, and
 //! the filters built on it.
 
-use aurcache_activitylog::activity_utils::spawn;
+use aurcache_activitylog::activity_utils::{Writer, spawn};
 use aurcache_activitylog::events::{Event, RefreshTarget};
 use aurcache_activitylog::log_store::{LogFilter, LogStore};
 use aurcache_common::api::activity::Severity;
@@ -28,7 +28,7 @@ async fn an_event_reaches_the_log_with_its_payload() {
     // No package rows at all: an entry names what it names, whether or not
     // it is still there.
 
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit_by(
         Event::VersionCompareFallback {
             pkg: "baz".into(),
@@ -89,7 +89,7 @@ async fn an_event_reaches_the_log_with_its_payload() {
 #[tokio::test]
 async fn the_entity_filter_finds_a_row_in_any_role() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit(Event::VcsSyncFailed {
         pkg: "baz".into(),
         error: "boom".to_string(),
@@ -153,7 +153,7 @@ async fn the_entity_filter_finds_a_row_in_any_role() {
 #[tokio::test]
 async fn severity_narrows_to_this_and_worse() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit(Event::AurMissing { pkg: "baz".into() });
     log.emit(Event::VcsSyncFailed {
         pkg: "hello".into(),
@@ -216,7 +216,7 @@ async fn a_scope_is_indexed_like_any_other_reference() {
         number: 7,
     };
 
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     // Emitted *during* the build: the payload names it nowhere.
     log.scoped(build.clone())
         .emit(Event::AurMissing { pkg: "baz".into() });
@@ -244,7 +244,7 @@ async fn a_scope_is_indexed_like_any_other_reference() {
 #[tokio::test]
 async fn since_boot_without_a_marker_shows_everything() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit(Event::AurMissing {
         pkg: "hello".into(),
     });
@@ -270,7 +270,7 @@ async fn since_boot_without_a_marker_shows_everything() {
 #[tokio::test]
 async fn a_consolidated_kind_keeps_which_case_it_was() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit(Event::SourceRefreshFailed {
         pkg: "hello".into(),
         target: RefreshTarget::Git,
@@ -321,7 +321,7 @@ async fn a_consolidated_kind_keeps_which_case_it_was() {
 #[tokio::test]
 async fn pruning_removes_the_index_too() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     log.emit(Event::AurMissing { pkg: "baz".into() });
     drop(log);
     writer.await.unwrap();
@@ -432,7 +432,7 @@ async fn pages_do_not_drop_or_repeat_an_entry() {
 #[tokio::test]
 async fn a_package_filter_finds_entries_about_its_builds() {
     let db = db().await;
-    let (log, writer) = spawn(db.clone());
+    let Writer { log, task: writer } = spawn(db.clone());
     let build = BuildRef {
         pkgbase: "yay".into(),
         number: 7,

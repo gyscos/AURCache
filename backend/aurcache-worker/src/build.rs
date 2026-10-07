@@ -43,14 +43,23 @@ fn makechrootpkg_path() -> String {
 /// runs as: file ownership is what keeps the worker's identity and credentials
 /// out of reach of the code a PKGBUILD executes.
 ///
-/// `binds` become `-d src:dest` arguments. devtools appends these *after* its
+/// A directory of the worker's mounted into a build's chroot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindMount {
+    /// Where it is on the worker.
+    pub host: PathBuf,
+    /// Where the build sees it.
+    pub chroot: PathBuf,
+}
+
+/// `binds` become `-d host:chroot` arguments. devtools appends these *after* its
 /// own binds, so a bind here overrides one devtools made for the same target —
 /// which is how the per-job pacman cache replaces the shared one. There is no
 /// supported flag for that; `SRCDEST`, which does have one, uses it instead.
 pub fn build_command(
     chroot_root: &Path,
     copy_label: &str,
-    binds: &[(PathBuf, PathBuf)],
+    binds: &[BindMount],
     build_flags: &[String],
     build_user: &str,
 ) -> Vec<String> {
@@ -89,7 +98,7 @@ pub fn build_command(
     // `SRCDEST` is passed through the environment instead of a bind mount:
     // devtools reads it directly and binds it itself, which avoids competing
     // with its own `--bind=$SRCDEST:/srcdest`.
-    for (host, chroot) in binds {
+    for BindMount { host, chroot } in binds {
         argv.push("-d".to_string());
         argv.push(format!("{}:{}", host.display(), chroot.display()));
     }
@@ -226,11 +235,14 @@ mod tests {
     #[test]
     fn build_command_adds_bind_mounts() {
         let binds = vec![
-            (
-                PathBuf::from("/job/secrets"),
-                PathBuf::from("/build-secrets"),
-            ),
-            (PathBuf::from("/host/netrc"), PathBuf::from("/etc/netrc")),
+            BindMount {
+                host: PathBuf::from("/job/secrets"),
+                chroot: PathBuf::from("/build-secrets"),
+            },
+            BindMount {
+                host: PathBuf::from("/host/netrc"),
+                chroot: PathBuf::from("/etc/netrc"),
+            },
         ];
         let cmd = build_command(Path::new("/chroot"), "job-7", &binds, &[], "builder");
         let joined = cmd.join(" ");

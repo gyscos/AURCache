@@ -178,7 +178,7 @@ mod tests {
     use super::*;
 
     /// Write `bytes` to a temp file named `filename` and run the real
-    /// server-side ingest over it: this is the exact function publish calls,
+    /// server-side read over it: this is the exact function publish calls,
     /// so passing here means the demo archive publishes.
     fn describe(filename: &str, bytes: &[u8]) -> pacman_repo_utils::PackageEntry {
         let dir = tempfile::tempdir().unwrap();

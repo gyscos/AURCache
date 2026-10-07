@@ -578,7 +578,7 @@ pub(crate) struct AddPackageArgs {
     /// `--patch ./PKGBUILD` patches `PKGBUILD`). Repeat for multiple files.
     /// Only valid when adding a single package.
     #[arg(long = "patch", value_parser = parse_patch_arg)]
-    pub(crate) patches: Vec<(String, String)>,
+    pub(crate) patches: Vec<PatchArg>,
 
     #[command(flatten)]
     pub(crate) wait: WaitOpts,
@@ -616,7 +616,7 @@ pub(crate) struct PatchPackageArgs {
     /// (e.g. `--patch ./PKGBUILD` patches `PKGBUILD`). Repeat for multiple
     /// files.
     #[arg(long = "patch", value_parser = parse_patch_arg)]
-    pub(crate) patches: Vec<(String, String)>,
+    pub(crate) patches: Vec<PatchArg>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -834,16 +834,27 @@ impl From<OnExisting> for ExistingPackagePolicy {
     }
 }
 
+/// One `--patch`: which source file to replace, and the local file to replace
+/// it with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PatchArg {
+    pub(crate) source_path: String,
+    pub(crate) local_file: String,
+}
+
 /// Parses a single `--patch` argument, accepting either
 /// `SOURCE_PATH=LOCAL_FILE` or just `LOCAL_FILE` (in which case the file's
 /// own base name is used as the source path).
-pub(crate) fn parse_patch_arg(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_patch_arg(s: &str) -> Result<PatchArg, String> {
     match s.split_once('=') {
         Some((path, file)) => {
             if path.is_empty() {
                 return Err("invalid --patch value: SOURCE_PATH must not be empty".to_string());
             }
-            Ok((path.to_string(), file.to_string()))
+            Ok(PatchArg {
+                source_path: path.to_string(),
+                local_file: file.to_string(),
+            })
         }
         None => {
             let path = Path::new(s)
@@ -851,7 +862,10 @@ pub(crate) fn parse_patch_arg(s: &str) -> Result<(String, String), String> {
                 .ok_or_else(|| format!("invalid --patch value `{s}`"))?
                 .to_string_lossy()
                 .into_owned();
-            Ok((path, s.to_string()))
+            Ok(PatchArg {
+                source_path: path,
+                local_file: s.to_string(),
+            })
         }
     }
 }
@@ -1245,8 +1259,14 @@ mod tests {
         assert_eq!(
             args.patches,
             vec![
-                ("PKGBUILD".to_string(), "./fixed-PKGBUILD".to_string()),
-                ("other.conf".to_string(), "./other.conf".to_string()),
+                PatchArg {
+                    source_path: "PKGBUILD".to_string(),
+                    local_file: "./fixed-PKGBUILD".to_string(),
+                },
+                PatchArg {
+                    source_path: "other.conf".to_string(),
+                    local_file: "./other.conf".to_string(),
+                },
             ]
         );
     }
@@ -1272,7 +1292,10 @@ mod tests {
         assert_eq!(args.platforms, vec!["x86_64"]);
         assert_eq!(
             args.patches,
-            vec![("PKGBUILD".to_string(), "./file".to_string())]
+            vec![PatchArg {
+                source_path: "PKGBUILD".to_string(),
+                local_file: "./file".to_string(),
+            }]
         );
     }
 }

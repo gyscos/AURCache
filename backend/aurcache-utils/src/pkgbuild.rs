@@ -381,11 +381,6 @@ fn retry_fixed(
     parse_in_temp(bridge, &fixed)
 }
 
-/// Render PKGBUILD content as `.SRCINFO`.
-pub fn pkgbuild_to_srcinfo(content: &str, network: bool) -> anyhow::Result<String> {
-    Ok(parse_pkgbuild_content(content, network)?.as_srcinfo())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -753,11 +748,12 @@ pub(crate) mod tests {
             eprintln!("skipping: aurcache-sandbox or alpm-pkgbuild-bridge not installed");
             return;
         }
-        let srcinfo = pkgbuild_to_srcinfo(
+        let srcinfo = parse_pkgbuild_content(
             "pkgname=demo\npkgver=1.2\npkgrel=3\narch=(any)\npackage() { :; }\n",
             false,
         )
-        .unwrap();
+        .unwrap()
+        .as_srcinfo();
         assert!(srcinfo.contains("pkgbase = demo"), "{srcinfo}");
         assert!(srcinfo.contains("pkgver = 1.2"), "{srcinfo}");
     }

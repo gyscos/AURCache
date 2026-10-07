@@ -34,16 +34,6 @@ pub async fn report_warning(client: &WorkerClient, build_id: Option<i32>, messag
     }
 }
 
-/// As [`report_warning`], for something the worker could not recover from.
-pub async fn report_error(client: &WorkerClient, build_id: Option<i32>, message: &str) {
-    if let Err(e) = client
-        .report_problem(Severity::Error, build_id, message)
-        .await
-    {
-        tracing::debug!("worker error report failed: {e}");
-    }
-}
-
 /// Whether the server has asked for this build to stop. An unreachable server
 /// has not: the lease, not this poll, decides when a build is abandoned.
 pub async fn cancel_requested(client: &WorkerClient, build_id: i32) -> bool {

@@ -13,7 +13,6 @@ pub struct AddPackage {
     /// the source's pristine content itself. Lets a package that fails to
     /// parse upstream (e.g. a malformed PKGBUILD) be fixed up and added in
     /// one step, instead of having to add it broken and edit it afterwards.
-    #[serde(default)]
     pub patched_files: Option<BTreeMap<String, String>>,
 }
 
@@ -29,8 +28,7 @@ pub struct SourceFileList {
     pub files: Vec<String>,
     /// The files the package's stored patch changes, so a file list can mark
     /// them without opening each one. Empty for a source that is not a package
-    /// yet, which has no patch; absent from an older server, hence the default.
-    #[serde(default)]
+    /// yet, which has no patch.
     pub patched: Vec<String>,
 }
 
@@ -240,7 +238,6 @@ pub struct BulkAddEntry {
     /// name that may differ from its base, or a git URL -- while this is the row
     /// the package now has. `None` for anything that never got that far, which
     /// is every failure that happened during resolution.
-    #[serde(default)]
     pub pkgbase: Option<String>,
     #[serde(flatten)]
     pub outcome: BulkAddOutcome,

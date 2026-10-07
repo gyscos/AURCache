@@ -46,6 +46,16 @@ impl SourcePatch {
         Ok(serde_json::to_string(&self)?)
     }
 
+    /// What `packages.patch` holds for this patch: nothing for one that
+    /// changes nothing, so an emptied patch reads as no patch at all.
+    pub fn stored(&self) -> anyhow::Result<Option<String>> {
+        if self.is_empty() {
+            Ok(None)
+        } else {
+            self.to_json().map(Some)
+        }
+    }
+
     /// List the files touched by this patch.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)

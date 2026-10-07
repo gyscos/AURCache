@@ -42,8 +42,12 @@ fn create_missing(path: &Path, name: &str, suffix: &str) -> anyhow::Result<()> {
         );
         let tar_gz = File::create(&archive_path)?;
         let enc = GzEncoder::new(tar_gz, Compression::default());
-        let mut tar = tar::Builder::new(enc);
-        tar.finish().context("failed to create repo archive")?;
+        let tar = tar::Builder::new(enc);
+        // Finish explicitly: dropping the encoder would swallow a compression
+        // error.
+        tar.into_inner()
+            .and_then(GzEncoder::finish)
+            .context("failed to create repo archive")?;
     }
     // `symlink_metadata`, so a dangling link counts as present rather than
     // making `symlink` fail on an existing name.

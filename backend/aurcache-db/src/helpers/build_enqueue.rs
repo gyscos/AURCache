@@ -55,9 +55,9 @@ fn next_build_number_expr(pkg_id: i32) -> Expr {
 /// Insert a new pending build, queued as `pending`, if no pending build already exists
 /// for `(pkg_id, platform)`; the package's status follows.
 ///
-/// The partial unique index on `builds(pkg_id, platform)` covering all pending
-/// states (ACTIVE, ENQUEUED, WAITING_FOR_DEPS) ensures at most one pending row
-/// per `(pkg_id, platform)` at any time.
+/// The partial unique index on `builds(pkg_id, platform)` covering every state
+/// in [`BuildState::IN_PROGRESS`] ensures at most one pending row per
+/// `(pkg_id, platform)` at any time.
 ///
 /// If a pending build already exists the insert is skipped (`inserted = false`) and the existing
 /// row is returned, regardless of its status.
@@ -72,8 +72,6 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     // column, so every creation path has to say.
     trigger: BuildTrigger,
 ) -> Result<EnqueueBuildResult, DbErr> {
-    let platform_str = platform.as_str();
-
     // Two conflicts can stop this insert, and they mean opposite things.
     //
     // `(pkg_id, platform)` means a pending build already exists — the intended
@@ -105,7 +103,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
                 pkg_id.into(),
                 pending.state().into(),
                 start_time.into(),
-                platform_str.to_owned().into(),
+                platform.into(),
                 version.to_owned().into(),
                 next_number,
                 trigger.as_i32().into(),
@@ -116,7 +114,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
 
         let result = db.execute(&insert).await?;
 
-        let existing = crate::helpers::builds::pending_build(db, pkg_id, platform_str).await?;
+        let existing = crate::helpers::builds::pending_build(db, pkg_id, platform).await?;
 
         if let Some(build) = existing {
             let inserted = result.rows_affected() == 1;
@@ -130,7 +128,7 @@ pub async fn enqueue_build_if_missing<C: ConnectionTrait>(
     }
 
     Err(DbErr::Custom(format!(
-        "Could not assign a build number for package {pkg_id} on platform {platform_str} \
+        "Could not assign a build number for package {pkg_id} on platform {platform} \
          after {NUMBER_RACE_ATTEMPTS} attempts"
     )))
 }

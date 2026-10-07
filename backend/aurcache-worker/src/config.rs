@@ -22,7 +22,7 @@ pub struct Config {
     pub ssh_known_hosts: Option<PathBuf>,
     /// Extra `host:chroot` bind mounts exposed to every build, for credentials
     /// that are not SSH (a `.netrc`, an API token, a licence file).
-    pub bind_mounts: Vec<(PathBuf, PathBuf)>,
+    pub bind_mounts: Vec<crate::build::BindMount>,
     /// Directory the storage pool lives under by default: its image and its
     /// mount point.
     pub chroot_dir: PathBuf,

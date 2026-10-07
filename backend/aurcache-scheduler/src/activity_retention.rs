@@ -14,24 +14,20 @@
 use aurcache_activitylog::log_store::LogStore;
 use aurcache_db::helpers::time::now_secs;
 use sea_orm::DatabaseConnection;
-use std::env;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 /// How long an entry is kept by default: long enough that "what happened around
 /// the time that package broke" is still answerable a season later.
-const DEFAULT_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+const DEFAULT_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// How often to sweep. A log entry is not urgent to delete, and reading the
 /// whole table more than once an hour would cost more than it saves.
 const INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 fn retention_secs() -> u64 {
-    env::var("ACTIVITY_RETENTION")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_RETENTION_SECS)
+    crate::env_duration("ACTIVITY_RETENTION", DEFAULT_RETENTION).as_secs()
 }
 
 /// Spawn the sweep loop.
@@ -41,7 +37,9 @@ pub fn start_activity_retention(db: DatabaseConnection) -> JoinHandle<()> {
         let keep = retention_secs();
         if keep == 0 {
             info!("Log retention disabled; entries are kept for ever");
-            return;
+            // Parked rather than returned: the server runs for as long as every
+            // one of its tasks does, and this one finishing would stop it.
+            return std::future::pending().await;
         }
         info!("Log retention: keeping {keep}s of entries");
 

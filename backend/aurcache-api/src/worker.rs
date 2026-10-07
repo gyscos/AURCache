@@ -776,7 +776,8 @@ pub async fn job_artifact(
     let dest = dir.join(name);
     // `open` stops reading at the limit without saying so; `is_complete` is the
     // only thing that tells a whole artifact from one cut off there. `into_file`
-    // also flushes, so the file is fully written by the time ingest reads it.
+    // also flushes, so the file is fully written by the time publishing reads
+    // it.
     let stored = data.open(limit.bytes()).into_file(&dest).await;
     let problem = match &stored {
         // The request parsed: a write failure is the server's disk, not the
@@ -788,7 +789,7 @@ pub async fn job_artifact(
         Ok(_) => None,
     };
     if let Some(problem) = problem {
-        // Leave no partial file behind for the later ingest to trip over.
+        // Leave no partial file behind for publishing to trip over.
         drop(stored);
         let _ = tokio::fs::remove_file(&dest).await;
         return Err(problem);
@@ -986,11 +987,11 @@ async fn complete_job_inner(
     Ok(())
 }
 
-/// Liveness heartbeat: renews leases for reported builds, requeues any this
+/// Liveness heartbeat: renews leases for reported builds, abandons any this
 /// worker silently dropped, and returns the builds the server wants it to stop
 /// (abandoned, or cancelled by an operator). The abort list rides this same
-/// answer rather than a second poll, so a cancelled or lost build is usually
-/// stopped on the next 5 s tick.
+/// answer rather than a second poll, so a cancelled or lost build is stopped on
+/// the worker's next heartbeat.
 #[post("/worker/heartbeat", data = "<input>")]
 pub async fn heartbeat(
     db: &State<DatabaseConnection>,
@@ -1086,8 +1087,9 @@ pub async fn heartbeat(
 
 /// The values set for this worker, when it does not hold them yet.
 ///
-/// Read after the leases are renewed and never allowed to fail the heartbeat: a snapshot that cannot be read this time is sent on the
-/// next one, while a heartbeat that failed would cost the worker its builds.
+/// Read after the leases are renewed and never allowed to fail the heartbeat:
+/// a snapshot that cannot be read this time is sent on the next one, while a
+/// heartbeat that failed would cost the worker its builds.
 async fn snapshot_for(
     db: &DatabaseConnection,
     worker: &workers::Model,
@@ -1190,8 +1192,9 @@ async fn build_tallies(
             BuildState::Active => tally.active = count,
             BuildState::Successful => tally.successful = count,
             BuildState::Failed => tally.failed = count,
-            // Enqueued and waiting-for-deps belong to no worker yet.
-            _ => {}
+            // Queued builds belong to no worker yet, and a publishing one is
+            // counted once it has settled.
+            BuildState::Enqueued | BuildState::WaitingForDeps | BuildState::Publishing => {}
         }
     }
     Ok(tallies)

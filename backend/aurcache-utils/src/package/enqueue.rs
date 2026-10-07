@@ -67,7 +67,7 @@ pub async fn trigger_initial_builds(
         let mut ready = vec![];
         let mut waiting = vec![];
         for platform in platforms {
-            if !has_deps.contains(&pkg.id) || dependencies_satisfied(db, pkg.id, platform).await? {
+            if !has_deps.contains(&pkg.id) || dependencies_satisfied(db, pkg.id, *platform).await? {
                 ready.push(*platform);
             } else {
                 waiting.push(*platform);
@@ -103,9 +103,9 @@ pub async fn enqueue_missing_buildable_packages(
     let mut queued = 0;
     for pkg in packages {
         for &platform in pkg.platforms.as_slice() {
-            let deps_ok = dependencies_satisfied(db, pkg.id, &platform).await?;
+            let deps_ok = dependencies_satisfied(db, pkg.id, platform).await?;
 
-            match pending_build(db, pkg.id, platform.as_str()).await? {
+            match pending_build(db, pkg.id, platform).await? {
                 Some(b) if b.status == BuildState::WaitingForDeps => {
                     if deps_ok {
                         // All deps are now satisfied – promote it.
@@ -129,7 +129,7 @@ pub async fn enqueue_missing_buildable_packages(
                 }
                 None => {
                     // No pending build.  Skip if there is any historical (terminal) build.
-                    if build_exists_for_platform(db, pkg.id, &platform).await? {
+                    if build_exists_for_platform(db, pkg.id, platform).await? {
                         continue;
                     }
                     // Completely fresh: queue according to dep readiness.
@@ -151,11 +151,11 @@ pub async fn enqueue_missing_buildable_packages(
 async fn build_exists_for_platform(
     db: &DatabaseConnection,
     pkg_id: i32,
-    platform: &Platform,
+    platform: Platform,
 ) -> anyhow::Result<bool> {
     Ok(Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))
-        .filter(builds::Column::Platform.eq(platform.as_str()))
+        .filter(builds::Column::Platform.eq(platform))
         .count(db)
         .await?
         != 0)
@@ -165,13 +165,13 @@ async fn build_exists_for_platform(
 async fn dependencies_satisfied(
     db: &DatabaseConnection,
     dependent_id: i32,
-    platform: &Platform,
+    platform: Platform,
 ) -> anyhow::Result<bool> {
     let deps = Dependencies::find()
         .filter(dependencies::Column::DependentId.eq(dependent_id))
         .all(db)
         .await?;
-    Ok(aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform.as_str()).await?)
+    Ok(aurcache_db::helpers::builds::dependencies_satisfied(db, &deps, platform).await?)
 }
 
 /// Create or reuse a pending build entry for `pkg` on each of `platforms`.

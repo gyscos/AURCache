@@ -497,15 +497,9 @@ pub async fn package_source_file_update(
         .unwrap_or_default();
     patch.merge_file(&input.path, &original, &input.content);
 
-    let new_patch = if patch.is_empty() {
-        None
-    } else {
-        Some(
-            patch
-                .to_json()
-                .map_err(|e| err(Status::InternalServerError, e))?,
-        )
-    };
+    let new_patch = patch
+        .stored()
+        .map_err(|e| err(Status::InternalServerError, e))?;
 
     // No need to validate the patch applies cleanly here: it was just
     // diffed fresh against the current pristine content above, so applying
@@ -926,7 +920,7 @@ fn package_source(pkg: &packages::Model) -> Result<PackageSource, ApiError> {
 /// The artifacts currently in the repository for a package.
 ///
 /// Read straight from the `files` rows rather than by listing the repository
-/// directory: those rows are what the ingest and the delete path both maintain,
+/// directory: those rows are what publishing and the delete path both maintain,
 /// so this is the same list the server acts on, and the size comes with them
 /// instead of costing a `stat` per artifact per page view.
 ///

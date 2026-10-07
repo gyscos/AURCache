@@ -178,21 +178,28 @@ impl ActivityLog {
     }
 }
 
-/// Start the one task that writes the log, and hand back a handle to it.
-///
-/// The task ends when the last handle is dropped, draining what is queued
-/// first.
+/// The one task that writes the log, and a handle to record through it.
+pub struct Writer {
+    pub log: ActivityLog,
+    /// Ends when the last handle is dropped, draining what is queued first.
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+/// Start the one task that writes the log.
 #[must_use]
-pub fn spawn(db: DatabaseConnection) -> (ActivityLog, tokio::task::JoinHandle<()>) {
+pub fn spawn(db: DatabaseConnection) -> Writer {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogRecord>(QUEUE);
-    let writer = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(record) = rx.recv().await {
             if let Err(e) = write(&db, record).await {
                 tracing::warn!("could not write to the log: {e}");
             }
         }
     });
-    (ActivityLog { tx, scope: None }, writer)
+    Writer {
+        log: ActivityLog { tx, scope: None },
+        task,
+    }
 }
 
 /// Write one entry and the index of what it refers to.

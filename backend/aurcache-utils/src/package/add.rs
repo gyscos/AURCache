@@ -181,11 +181,7 @@ async fn build_patch_from_files(
         let original = store.read_file(source_data, None, &path).await?;
         patch.merge_file(&path, &original, &new_content);
     }
-    if patch.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(patch.to_json()?))
-    }
+    patch.stored()
 }
 
 async fn resolve_srcinfo_to_spec(
@@ -298,10 +294,6 @@ async fn finalize_package_add(
     // no description or maintainer for up to an hour. Read from the checkouts
     // the plan just resolved, so nothing is fetched again.
     refresh_source_metadata(store, db, &services.activity, &added_order).await;
-    let pkgbase = added_order
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("Package add produced no inserted packages"))?;
 
     trigger_initial_builds(
         db,
@@ -311,7 +303,7 @@ async fn finalize_package_add(
     )
     .await?;
     Ok(AddedSource {
-        pkgbase,
+        pkgbase: requested,
         already_tracked: false,
     })
 }

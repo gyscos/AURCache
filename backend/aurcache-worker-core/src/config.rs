@@ -8,7 +8,7 @@
 //! this (see `aurcache_worker::config::Config`).
 
 use crate::settings::{WorkerSettings, keys, protocol_settings};
-pub use aurcache_common::units::{parse_duration, parse_size};
+use aurcache_common::units::parse_duration;
 use std::path::PathBuf;
 
 /// Worker configuration shared by every executor.
@@ -43,7 +43,7 @@ pub struct CoreConfig {
     /// Heartbeat cadence in seconds.
     pub heartbeat_interval: u64,
     /// Lease TTL in seconds; the worker self-aborts a build it cannot report
-    /// for longer than this (the server will have requeued it).
+    /// for longer than this (the server will have abandoned it).
     pub lease_ttl: u64,
     /// Poll interval when no job is available, in seconds.
     pub poll_interval: u64,
@@ -128,23 +128,6 @@ where
             None
         }
     }
-}
-
-/// Read a byte size from the environment, as [`parse_size`] reads one.
-///
-/// Like [`env_parse`], a value that does not parse is reported and treated as
-/// unset.
-#[must_use]
-pub fn env_size(key: &str) -> Option<u64> {
-    let raw = env_opt(key)?;
-    let size = parse_size(&raw);
-    if size.is_none() {
-        tracing::warn!(
-            "ignoring {key}={raw:?} (expected bytes, or a size such as 500M, 450G, 450GiB \
-             or 450GB); using the default"
-        );
-    }
-    size
 }
 
 /// Read a duration in seconds from the environment, as [`parse_duration`]

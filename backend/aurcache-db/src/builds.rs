@@ -37,7 +37,9 @@ pub struct Model {
     pub disk_workdir: Option<i64>,
     pub disk_sources: Option<i64>,
     pub disk_build_tree: Option<i64>,
-    /// Id of the worker that holds the active lease on this build, if any.
+    /// The worker that claimed this build: the holder of its lease while it is
+    /// `ACTIVE`, and afterwards the record of which machine ran it. `None` for
+    /// a build no worker has claimed.
     pub worker_id: Option<i32>,
     /// Epoch seconds when the current worker's lease expires. Renewed by
     /// heartbeats; a passed value means the worker went silent.

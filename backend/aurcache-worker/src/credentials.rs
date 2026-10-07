@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+use crate::build::BindMount;
 use crate::config::Config;
 
 /// Directory the staged credential lives in — on the worker only.
@@ -242,14 +243,14 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// Parse `WORKER_BIND_MOUNTS` (`host:chroot,host:chroot`) into pairs.
+/// Parse `WORKER_BIND_MOUNTS` (`host:chroot,host:chroot`).
 ///
 /// Entries without exactly one `:` are dropped rather than guessed at: a
 /// half-parsed bind mount would silently expose the wrong path into a build.
 /// Each one dropped is reported, since a mount the operator asked for and
 /// the build never sees is otherwise only discovered as a failing build.
 #[must_use]
-pub fn parse_bind_mounts(raw: &str) -> Vec<(PathBuf, PathBuf)> {
+pub fn parse_bind_mounts(raw: &str) -> Vec<BindMount> {
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -265,7 +266,10 @@ pub fn parse_bind_mounts(raw: &str) -> Vec<(PathBuf, PathBuf)> {
                     "ignoring WORKER_BIND_MOUNTS entry {entry:?} (expected host:chroot)"
                 );
             }
-            pair.map(|(host, chroot)| (PathBuf::from(host), PathBuf::from(chroot)))
+            pair.map(|(host, chroot)| BindMount {
+                host: PathBuf::from(host),
+                chroot: PathBuf::from(chroot),
+            })
         })
         .collect()
 }
@@ -503,8 +507,14 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                (PathBuf::from("/host/a"), PathBuf::from("/chroot/a")),
-                (PathBuf::from("/host/b"), PathBuf::from("/chroot/b")),
+                BindMount {
+                    host: PathBuf::from("/host/a"),
+                    chroot: PathBuf::from("/chroot/a"),
+                },
+                BindMount {
+                    host: PathBuf::from("/host/b"),
+                    chroot: PathBuf::from("/chroot/b"),
+                },
             ]
         );
         // Guessing at a half-specified mount could expose the wrong path.

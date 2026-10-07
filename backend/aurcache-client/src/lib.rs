@@ -9,7 +9,6 @@ use reqwest::Url;
 // this client, and the browser frontend alike. What is declared below is the
 // client's own: how it builds requests and reports failures.
 pub use aurcache_common::api::activity::Severity;
-pub use aurcache_common::api::aur::ApiPackage;
 pub use aurcache_common::api::builds::BuildSummary as Build;
 pub use aurcache_common::api::dump::{
     ExistingPackagePolicy, RestoreAccepted, RestoreEntry, RestoreOutcome, RestoreProgress,

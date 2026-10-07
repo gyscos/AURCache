@@ -151,8 +151,12 @@ pub struct JobDescriptor {
     /// Package names this build is expected to produce: the pkgbase plus any
     /// split-package names recorded for it.
     pub packages: Vec<String>,
-    /// Full version (`pkgver-pkgrel`) the produced archives must carry in
-    /// their filenames.
+    /// Full version (`pkgver-pkgrel`) the build is expected to produce.
+    ///
+    /// Read only by a worker that fabricates its archives (the demo worker):
+    /// a real build's version is whatever makepkg makes of the PKGBUILD, which
+    /// for a VCS package is not known until it runs, and publishing takes it
+    /// from the archives' names.
     pub version: String,
 }
 
@@ -169,7 +173,7 @@ pub struct JobVcsSource {
 }
 
 /// Periodic liveness signal. Carries the set of builds the worker is actively
-/// running so the server can renew their leases and requeue any it dropped.
+/// running so the server can renew their leases and abandon any it dropped.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct Heartbeat {
     pub active_build_ids: Vec<i32>,

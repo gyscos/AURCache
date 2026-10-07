@@ -3,7 +3,7 @@
 use crate::builds::{WatchScope, follow_builds, list_watched_builds, snapshot_builds};
 use crate::cli::{
     AddPackageArgs, BuildRef, DependencyCommand, ListPackagesArgs, OutputFormat, PackagesCommand,
-    PatchPackageArgs, UpdatePackageArgs, WaitOpts,
+    PatchArg, PatchPackageArgs, UpdatePackageArgs, WaitOpts,
 };
 use crate::output::{
     PROGRESS_POLL_INTERVAL_SECS, Progress, bool_label, join_or_dash, option_text,
@@ -311,14 +311,16 @@ pub(crate) fn bulk_add_result(progress: &BulkAddProgress) -> Result<()> {
 
 /// Reads the local files referenced by `--patch` arguments into a
 /// path -> content map suitable for [`AddPackageRequest::patched_files`].
-pub(crate) fn read_patch_files(
-    patches: &[(String, String)],
-) -> Result<Option<BTreeMap<String, String>>> {
+pub(crate) fn read_patch_files(patches: &[PatchArg]) -> Result<Option<BTreeMap<String, String>>> {
     if patches.is_empty() {
         return Ok(None);
     }
     let mut files = BTreeMap::new();
-    for (source_path, local_file) in patches {
+    for PatchArg {
+        source_path,
+        local_file,
+    } in patches
+    {
         let content = std::fs::read_to_string(local_file)
             .with_context(|| format!("failed to read patch file `{local_file}`"))?;
         if files.insert(source_path.clone(), content).is_some() {

@@ -5,6 +5,7 @@
 
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_activitylog::events::{Event, FileAction};
+use aurcache_common::repo::REPO_NAME;
 use aurcache_db::files;
 use aurcache_db::prelude::Files;
 use pacman_mirrors::platforms::Platform;
@@ -26,7 +27,6 @@ pub const REPO_ROOT: &str = "./repo";
 /// upload is never downloadable before it is published.
 const STAGING_DIR: &str = ".staging";
 
-use aurcache_common::repo::REPO_NAME;
 /// `<REPO_NAME>.db.tar.gz`; a test keeps the two in step.
 const DB_ARCHIVE: &str = "repo.db.tar.gz";
 /// `<REPO_NAME>.files.tar.gz`, likewise.

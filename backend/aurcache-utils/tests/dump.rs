@@ -57,6 +57,13 @@ async fn package(
     .id
 }
 
+/// A client, and the directory its official repositories are read from,
+/// which goes when this does.
+struct TestClient {
+    client: aurcache_deps::AurClient,
+    _repos: tempfile::TempDir,
+}
+
 /// The headline: authored state in, derived state out.
 /// An AUR client whose official repositories are read and hold nothing.
 ///
@@ -64,7 +71,7 @@ async fn package(
 /// client that has never read them refuses to answer. Present-and-empty is how
 /// a test says "the repositories hold nothing" -- absent would mean "could not
 /// ask", which is a different answer and deliberately fatal.
-async fn client_with_empty_official_repos() -> (aurcache_deps::AurClient, tempfile::TempDir) {
+async fn client_with_empty_official_repos() -> TestClient {
     let dir = tempfile::tempdir().unwrap();
     for repo in ["core", "extra", "multilib"] {
         let mut archive = Vec::new();
@@ -83,7 +90,10 @@ async fn client_with_empty_official_repos() -> (aurcache_deps::AurClient, tempfi
         dir.path().to_path_buf(),
     );
     client.official.refresh().await.unwrap();
-    (client, dir)
+    TestClient {
+        client,
+        _repos: dir,
+    }
 }
 
 #[tokio::test]
@@ -624,7 +634,7 @@ async fn a_package_whose_source_fails_is_reported_as_failed() {
     // shared bound.
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
 
-    let (client, _official) = client_with_empty_official_repos().await;
+    let TestClient { client, _repos } = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
@@ -729,7 +739,7 @@ async fn a_restored_package_is_queued_to_build() {
 
     let target = db().await;
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
-    let (client, _official) = client_with_empty_official_repos().await;
+    let TestClient { client, _repos } = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
@@ -1062,7 +1072,7 @@ async fn restoring_does_not_touch_the_ca_unless_asked() {
     // shared bound.
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1024);
 
-    let (client, _official) = client_with_empty_official_repos().await;
+    let TestClient { client, _repos } = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
@@ -1130,7 +1140,7 @@ async fn copying_secrets_replaces_the_ca_and_protects_the_key() {
     // shared bound.
     let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(1024);
 
-    let (client, _official) = client_with_empty_official_repos().await;
+    let TestClient { client, _repos } = client_with_empty_official_repos().await;
     aurcache_utils::restore::apply(
         &Services::new(
             target.clone(),
@@ -1406,7 +1416,7 @@ async fn a_dependency_only_package_survives_the_restore() {
     let bytes = dump_bytes(&source).await;
 
     let target = db().await;
-    let (client, _official) = client_with_empty_official_repos().await;
+    let TestClient { client, _repos } = client_with_empty_official_repos().await;
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(1024);
     aurcache_utils::restore::apply(
         &Services::new(

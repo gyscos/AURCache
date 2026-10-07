@@ -11,33 +11,24 @@ use tokio::io::AsyncSeekExt;
 #[derive(Debug, Clone)]
 pub struct CustomFileServer {
     root: PathBuf,
-    rank: isize,
 }
 
 impl CustomFileServer {
-    /// The default rank use by `FileServer` routes.
-    const DEFAULT_RANK: isize = 10;
+    /// The rank Rocket's own `FileServer` routes use.
+    const RANK: isize = 10;
 
     #[track_caller]
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref();
         Self {
-            root: path.into(),
-            rank: Self::DEFAULT_RANK,
+            root: path.as_ref().into(),
         }
-    }
-
-    #[must_use]
-    pub fn rank(mut self, rank: isize) -> Self {
-        self.rank = rank;
-        self
     }
 }
 
 impl From<CustomFileServer> for Vec<Route> {
     fn from(server: CustomFileServer) -> Self {
         let source = figment::Source::File(server.root.clone());
-        let mut route = Route::ranked(server.rank, Method::Get, "/<path..>", server);
+        let mut route = Route::ranked(CustomFileServer::RANK, Method::Get, "/<path..>", server);
         route.name = Some(format!("FileServer: {source}").into());
         vec![route]
     }
@@ -50,8 +41,8 @@ impl Handler for CustomFileServer {
             .segments::<Segments<'_, rocket::http::uri::fmt::Path>>(0..)
             .ok()
             // No dot segments: nothing pacman fetches is dot-named, and the
-            // repository root also holds uploads being staged for ingest
-            // (`.staging`) and artifacts mid-publish, neither of which is
+            // repository root also holds uploads being staged for publishing
+            // (`.staging`) and databases mid-commit, neither of which is
             // anyone's to download.
             .and_then(|segments| segments.to_path_buf(false).ok());
 

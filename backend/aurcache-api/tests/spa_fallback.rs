@@ -7,61 +7,26 @@
 
 #![cfg(feature = "static")]
 
-use aurcache_common::build_state::BuildState;
-use std::sync::Arc;
+mod common;
 
-use aurcache_activitylog::activity_utils::ActivityLog;
-use aurcache_db::migration::Migrator;
+use aurcache_common::build_state::BuildState;
+use common::{TestApi, test_api};
+
 use aurcache_db::packages;
 use aurcache_db::packages::SourceData;
 use aurcache_db::prelude::Packages;
-use aurcache_utils::snapshot::SnapshotStore;
 use rocket::http::Status;
-use rocket::local::asynchronous::Client;
 use sea_orm::ActiveValue::Set;
-use sea_orm::{Database, DatabaseConnection, EntityTrait};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{DatabaseConnection, EntityTrait};
 
 /// Mounts the API *and* the asset handler, in the same order and at the same
 /// paths production does. Mount order is the point: the fallback must not
 /// shadow the API.
-async fn test_client() -> (Client, DatabaseConnection) {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-
-    let checkouts = tempfile::tempdir().expect("tempdir");
-    let rocket = rocket::build()
-        .manage(db.clone())
-        .manage(ActivityLog::discarding())
-        // Routes that act on packages take the bundle; these tests never reach
-        // one, but Rocket refuses to launch with an unmanaged type.
-        .manage(Arc::new(SnapshotStore::with_checkout_root(
-            checkouts.path().to_path_buf(),
-        )))
-        .manage(aurcache_utils::services::Services::new(
-            db.clone(),
-            Arc::new(SnapshotStore::with_checkout_root(
-                checkouts.path().to_path_buf(),
-            )),
-            Arc::new(aurcache_deps::AurClient::new()),
-            Arc::new(aurcache_utils::repository::Repository::new(
-                checkouts.path().join("repo"),
-            )),
-            ActivityLog::discarding(),
-        ))
-        // The dump route reports which AURCache wrote a dump. Rocket's
-        // sentinels refuse to launch without it, which is the point: a route
-        // needing unmanaged state would otherwise 500 in production.
-        .manage(aurcache_api::init::ServerVersion("test".to_string()))
-        // Dump and restore both move the CA's files, so both need to know
-        // where they are. Rocket's sentinels refuse to launch without it.
-        .manage(aurcache_api::init::CaDirectory(std::path::PathBuf::from(
-            "/nonexistent-ca-dir",
-        )))
-        .mount("/api", aurcache_api::backend::build_api())
-        .mount("/", aurcache_api::embed::CustomHandler);
-    std::mem::forget(checkouts);
-    (Client::tracked(rocket).await.unwrap(), db)
+async fn test_client() -> TestApi {
+    test_api("test", |rocket| {
+        rocket.mount("/", aurcache_api::embed::CustomHandler)
+    })
+    .await
 }
 
 async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
@@ -88,7 +53,7 @@ async fn seed(db: &DatabaseConnection, name: &str) -> i32 {
 /// link is pasted fresh, while working when reached by clicking.
 #[rocket::async_test]
 async fn frontend_routes_are_served_the_app_shell() {
-    let (client, _db) = test_client().await;
+    let TestApi { client, .. } = test_client().await;
 
     for path in [
         "/builds",
@@ -119,7 +84,7 @@ async fn frontend_routes_are_served_the_app_shell() {
 /// API route has to keep winning over it.
 #[rocket::async_test]
 async fn the_fallback_does_not_shadow_the_api() {
-    let (client, db) = test_client().await;
+    let TestApi { client, db } = test_client().await;
     seed(&db, "hello").await;
 
     let response = client.get("/api/package/hello").dispatch().await;
@@ -135,7 +100,7 @@ async fn the_fallback_does_not_shadow_the_api() {
 /// HTML where it expects JSON, turning a clear status into a parse error.
 #[rocket::async_test]
 async fn unmatched_api_paths_still_404() {
-    let (client, _db) = test_client().await;
+    let TestApi { client, .. } = test_client().await;
 
     for path in ["/api/nope", "/api/package/hello/not-a-thing", "/api"] {
         let response = client.get(path).dispatch().await;
@@ -151,7 +116,7 @@ async fn unmatched_api_paths_still_404() {
 /// loads and renders its own "not found". Only the API knows the difference.
 #[rocket::async_test]
 async fn an_unknown_package_is_still_a_frontend_route() {
-    let (client, _db) = test_client().await;
+    let TestApi { client, .. } = test_client().await;
 
     let response = client.get("/package/does-not-exist").dispatch().await;
     assert_eq!(response.status(), Status::Ok);

@@ -251,7 +251,10 @@ pub fn init_worker_api(
     tokio::spawn(async move {
         let Some(tls) = worker_tls_config(&ca) else {
             error!("Worker TLS could not be configured; worker protocol listener disabled");
-            return;
+            // Parked rather than returned: the server runs for as long as every
+            // one of its tasks does, and the API and the repository are still
+            // worth serving without workers.
+            return std::future::pending().await;
         };
 
         let port = worker_port();

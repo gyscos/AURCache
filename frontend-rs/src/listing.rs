@@ -287,15 +287,10 @@ impl StatusFilter {
         // build that newer sources are ahead of. The flag is only ever
         // meaningful for such a package in practice, but matching the badge
         // keeps a filter result and a row's label from disagreeing.
-        if self.out_of_date && Some(status) == Some(BuildState::Successful) && outofdate {
+        if self.out_of_date && status == BuildState::Successful && outofdate {
             return true;
         }
-        if let Some(state) = Some(status)
-            && self.states.contains(state)
-        {
-            return true;
-        }
-        false
+        self.states.contains(status)
     }
 }
 
@@ -341,13 +336,12 @@ fn lowered_query(query: &str) -> String {
 /// sorting by status is asking "what needs me", so failures lead and
 /// up-to-date packages trail.
 fn status_rank(status: BuildState) -> u8 {
-    match Some(status) {
-        Some(BuildState::Failed) => 0,
-        Some(BuildState::Active | BuildState::Publishing) => 1,
-        Some(BuildState::WaitingForDeps) => 2,
-        Some(BuildState::Enqueued) => 3,
-        Some(BuildState::Successful) => 4,
-        None => 5,
+    match status {
+        BuildState::Failed => 0,
+        BuildState::Active | BuildState::Publishing => 1,
+        BuildState::WaitingForDeps => 2,
+        BuildState::Enqueued => 3,
+        BuildState::Successful => 4,
     }
 }
 

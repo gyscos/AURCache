@@ -15,13 +15,13 @@ const RECHECK: Duration = Duration::from_mins(5);
 pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
     tokio::spawn(async move {
         // What the log was last told about the schedule. Re-checked every
-        // quarter hour, and recording the same complaint each time would bury
+        // few minutes, and recording the same complaint each time would bury
         // everything else; a schedule that is fixed and broken again says so.
         let mut reported: Option<String> = None;
         let mut report = |error: String| {
             if reported.as_deref() != Some(error.as_str()) {
                 services.activity.emit(Event::ScheduleInvalid {
-                    job: "auto_update".to_string(),
+                    job: Job::AutoUpdate.name().to_string(),
                     error: error.clone(),
                 });
                 reported = Some(error);

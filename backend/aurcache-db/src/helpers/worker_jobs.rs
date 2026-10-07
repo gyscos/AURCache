@@ -253,6 +253,20 @@ impl Fleet {
     }
 }
 
+/// Where a queued build stands in one worker's claim order, compared field by
+/// field: affine jobs first, then native ones, then the oldest, then the id.
+///
+/// The first two are negated because `false < true`. A worker that *is* affine
+/// for a package should take that job ahead of one anybody could have taken,
+/// since it may be the only worker that can.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ClaimRank {
+    not_affine: bool,
+    emulated: bool,
+    queued_at: i64,
+    id: i32,
+}
+
 /// Whether a worker last seen at `last_seen` counts as up at `now`.
 ///
 /// One that has never checked in does not, which is a different statement from
@@ -328,7 +342,7 @@ pub async fn claim_job<C: ConnectionTrait>(
     let names = package_names(db, &candidates).await?;
 
     let now = now_secs();
-    let mut ranked: Vec<(bool, bool, i64, i32)> = Vec::new();
+    let mut ranked: Vec<ClaimRank> = Vec::new();
     for build in &candidates {
         let Some(pkg) = names.get(&build.pkg_id) else {
             continue;
@@ -346,20 +360,16 @@ pub async fn claim_job<C: ConnectionTrait>(
         if age < spill_delay_secs && fleet.blocked(me, platform, pkg, now, liveness_timeout_secs) {
             continue;
         }
-        // Keys are negated because `false < true`: affine jobs first, then
-        // native ones, then oldest. A worker that *is* affine for a package
-        // should take that job ahead of one anybody could have taken, since it
-        // may be the only worker that can.
-        ranked.push((
-            !fleet.affine(me.id, pkg),
-            !me.native.iter().any(|a| a == platform),
-            build.start_time.unwrap_or(0),
-            build.id,
-        ));
+        ranked.push(ClaimRank {
+            not_affine: !fleet.affine(me.id, pkg),
+            emulated: !me.native.iter().any(|a| a == platform),
+            queued_at: build.start_time.unwrap_or(0),
+            id: build.id,
+        });
     }
     ranked.sort_unstable();
 
-    for (_, _, _, id) in ranked {
+    for ClaimRank { id, .. } in ranked {
         let res = Builds::update_many()
             .col_expr(builds::Column::Status, BuildState::Active.into())
             .col_expr(builds::Column::WorkerId, worker_id.into())
@@ -732,12 +742,6 @@ pub async fn abandon_worker_builds<C: ConnectionTrait + TransactionTrait>(
     Ok(abandoned)
 }
 
-/// Result of a reaper pass: every build it failed.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ReapOutcome {
-    pub abandoned: Vec<Abandoned>,
-}
-
 impl Abandoned {
     /// The build as everything outside the database names it; `None` once its
     /// package is gone.
@@ -747,28 +751,6 @@ impl Abandoned {
             pkgbase: self.pkgbase.clone()?,
             number: self.number,
         })
-    }
-}
-
-impl ReapOutcome {
-    /// Ids of the builds failed for good, with no replacement.
-    #[must_use]
-    pub fn failed(&self) -> Vec<i32> {
-        self.abandoned
-            .iter()
-            .filter(|a| a.retry.is_none())
-            .map(|a| a.build_id)
-            .collect()
-    }
-
-    /// Ids of the builds that got a fresh attempt in their place.
-    #[must_use]
-    pub fn retried(&self) -> Vec<i32> {
-        self.abandoned
-            .iter()
-            .filter(|a| a.retry.is_some())
-            .map(|a| a.build_id)
-            .collect()
     }
 }
 
@@ -790,7 +772,8 @@ pub struct Abandoned {
 }
 
 /// Reaper pass: reclaim `ACTIVE` builds whose owning worker went silent, and
-/// backstop builds that have run implausibly long.
+/// backstop builds that have run implausibly long. Returns every build it
+/// abandoned.
 ///
 /// A build is reaped when either:
 /// * its lease has expired (`lease_expires_at < now`, or `NULL` — no live
@@ -812,7 +795,7 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
     now: i64,
     max_attempts: i32,
     max_build_age: i64,
-) -> Result<ReapOutcome, DbErr> {
+) -> Result<Vec<Abandoned>, DbErr> {
     let backstop_before = now - max_build_age;
     let candidates: Vec<builds::Model> = Builds::find()
         .filter(builds::Column::Status.eq(BuildState::Active))
@@ -825,7 +808,7 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
         .all(db)
         .await?;
 
-    let mut outcome = ReapOutcome::default();
+    let mut abandoned = Vec::new();
     for build in candidates {
         // `abandon_build` pins the CAS to the row revision observed here
         // (`status`, `worker_id`, `lease_expires_at`), so a build a concurrent
@@ -839,11 +822,9 @@ pub async fn reap_expired_builds<C: ConnectionTrait + TransactionTrait>(
         } else {
             EndReason::LeaseExpired
         };
-        outcome
-            .abandoned
-            .extend(abandon_build(db, &build, end_reason, max_attempts).await?);
+        abandoned.extend(abandon_build(db, &build, end_reason, max_attempts).await?);
     }
-    Ok(outcome)
+    Ok(abandoned)
 }
 
 #[cfg(test)]
@@ -867,6 +848,24 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
         db
+    }
+
+    /// Ids of the abandoned builds failed for good, with no replacement.
+    fn failed(abandoned: &[Abandoned]) -> Vec<i32> {
+        abandoned
+            .iter()
+            .filter(|a| a.retry.is_none())
+            .map(|a| a.build_id)
+            .collect()
+    }
+
+    /// Ids of the abandoned builds that got a fresh attempt in their place.
+    fn retried(abandoned: &[Abandoned]) -> Vec<i32> {
+        abandoned
+            .iter()
+            .filter(|a| a.retry.is_some())
+            .map(|a| a.build_id)
+            .collect()
     }
 
     /// An approved worker row. Defaults are a live, idle, native-x86_64 worker
@@ -1874,7 +1873,7 @@ mod tests {
         let reaped = reap_expired_builds(&db, now_secs() + 100_000, 3, 1)
             .await
             .unwrap();
-        assert!(reaped.abandoned.is_empty(), "abandoned by the reaper");
+        assert!(reaped.is_empty(), "abandoned by the reaper");
         assert!(
             abandon_worker_builds(&db, 5, 3).await.unwrap().is_empty(),
             "abandoned by a revocation"
@@ -1953,8 +1952,8 @@ mod tests {
         // build is queued in its place.
         let far = now_secs() + 10_000;
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
-        assert!(out.failed().is_empty());
-        assert_eq!(out.retried().len(), 2);
+        assert!(failed(&out).is_empty());
+        assert_eq!(retried(&out).len(), 2);
 
         for old_id in [60, 61] {
             let b = Builds::find_by_id(old_id).one(&db).await.unwrap().unwrap();
@@ -2077,8 +2076,8 @@ mod tests {
         let out = reap_expired_builds(&db, now_secs(), 3, 100_000)
             .await
             .unwrap();
-        assert!(out.retried().is_empty());
-        assert!(out.failed().is_empty());
+        assert!(retried(&out).is_empty());
+        assert!(failed(&out).is_empty());
         let b = Builds::find_by_id(70).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, BuildState::Active);
     }
@@ -2102,7 +2101,7 @@ mod tests {
         // relative to a `now` well past it, even though the lease is fresh.
         let now = now_secs() + 10_000;
         let out = reap_expired_builds(&db, now, 3, 1).await.unwrap();
-        assert_eq!(out.retried().len(), 1, "80 must get a fresh attempt");
+        assert_eq!(retried(&out).len(), 1, "80 must get a fresh attempt");
         let b = Builds::find_by_id(80).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, BuildState::Failed);
         assert_eq!(b.end_reason, Some(EndReason::MaxDuration));
@@ -2162,8 +2161,8 @@ mod tests {
 
         let far = now_secs() + 10_000;
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
-        assert_eq!(out.failed(), vec![90]);
-        assert!(out.retried().is_empty());
+        assert_eq!(failed(&out), vec![90]);
+        assert!(retried(&out).is_empty());
 
         let b = Builds::find_by_id(90).one(&db).await.unwrap().unwrap();
         assert_eq!(b.status, BuildState::Failed);
@@ -2288,10 +2287,10 @@ mod tests {
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
 
         assert!(
-            out.failed().is_empty(),
+            failed(&out).is_empty(),
             "aarch64's retries spent x86_64's budget"
         );
-        assert_eq!(out.retried().len(), 1);
+        assert_eq!(retried(&out).len(), 1);
     }
 
     /// A package shows every platform it builds for: a spent budget on one
@@ -2312,7 +2311,7 @@ mod tests {
         let far = now_secs() + 10_000;
         let out = reap_expired_builds(&db, far, 3, 100_000).await.unwrap();
 
-        assert_eq!(out.failed(), vec![95], "the budget is spent");
+        assert_eq!(failed(&out), vec![95], "the budget is spent");
         assert_eq!(pkg_status(&db, 95).await, BuildState::Failed);
     }
 

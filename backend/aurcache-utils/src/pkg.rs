@@ -477,13 +477,9 @@ mod tests {
 
 /// The alpm architectures a package's configured platforms correspond to.
 ///
-/// `packages.platforms` is a semicolon-delimited list of this project's
-/// `Platform`; `.SRCINFO` is keyed by alpm's `SystemArchitecture`. Dependency
-/// extraction needs the second, so the two have to be bridged somewhere.
-///
-/// Unparseable entries are skipped rather than failing: a bad platform string
-/// should not stop a package's dependency graph from being computed for the
-/// platforms that *are* valid.
+/// `packages.platforms` holds this project's `Platform`s; `.SRCINFO` is keyed by
+/// alpm's `SystemArchitecture`. Dependency extraction needs the second, so the
+/// two have to be bridged somewhere.
 #[must_use]
 pub fn architectures(platforms: &Platforms) -> Vec<alpm_types::SystemArchitecture> {
     platforms

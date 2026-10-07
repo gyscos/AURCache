@@ -48,7 +48,6 @@ pub struct KeptBuild {
     /// when the failed build kept one. Bound over `/build/<pkgbase>` it puts
     /// the failed state back in place; `None` for a build with no persistent
     /// tree, or one whose tree could not move and was discarded instead.
-    #[serde(default)]
     pub tree: Option<String>,
 }
 
@@ -88,14 +87,12 @@ pub struct BuildSummary {
     /// figure was reported: a build from before figures were recorded, or a
     /// worker without a storage pool.
     #[cfg_attr(feature = "db", sea_orm(skip))]
-    #[serde(default)]
     pub disk_usage: Option<DiskUsage>,
     /// The failed chroot the worker kept for inspection, when it kept one.
     /// `None` for every build that did not fail in a keepable way, on a
     /// worker with keeping off -- and, eventually, for one whose keep ran
     /// out, though the row does not say so.
     #[cfg_attr(feature = "db", sea_orm(skip))]
-    #[serde(default)]
     pub kept: Option<KeptBuild>,
     /// The worker that ran this build, by name.
     ///

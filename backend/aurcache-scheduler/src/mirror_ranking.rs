@@ -21,7 +21,7 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
         // In the activity log as well as the error: a schedule left in the
         // old syntax is otherwise only a startup log line, and ranking stops.
         activity.emit(Event::ScheduleInvalid {
-            job: "mirror_ranking".to_string(),
+            job: Job::MirrorRanking.name().to_string(),
             error: e.to_string(),
         });
     })?;
@@ -63,7 +63,7 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
                 // start firing later.
                 if !reported {
                     activity.emit(Event::ScheduleInvalid {
-                        job: "mirror_ranking".to_string(),
+                        job: Job::MirrorRanking.name().to_string(),
                         error: format!("'{cron_str}' never fires again"),
                     });
                     reported = true;

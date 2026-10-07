@@ -371,7 +371,7 @@ pub async fn replace(
                 )));
             }
 
-            repoint_edge(&services.db, edge, dependent.id, package.id)
+            repoint_edge(&services.db, edge, package.id)
                 .await
                 .map_err(|e| ReplaceError::Internal(e.into()))?;
             services.activity.emit_by(
@@ -430,11 +430,10 @@ pub async fn replace(
 async fn repoint_edge(
     db: &DatabaseConnection,
     edge: dependencies::Model,
-    dependent_id: i32,
     replacement_id: i32,
 ) -> Result<(), sea_orm::DbErr> {
     let collides = Dependencies::find()
-        .filter(dependencies::Column::DependentId.eq(dependent_id))
+        .filter(dependencies::Column::DependentId.eq(edge.dependent_id))
         .filter(dependencies::Column::DependeeId.eq(replacement_id))
         .one(db)
         .await?
@@ -623,9 +622,7 @@ mod dependency_tests {
         edge(&db, dependent.id, old.id, ">=1.0").await;
 
         let moving = Dependencies::find().one(&db).await.unwrap().unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
+        repoint_edge(&db, moving, new.id).await.unwrap();
         let checkouts = tempfile::tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
         let repo = Repository::new(checkouts.path().join("repo"));
@@ -668,9 +665,7 @@ mod dependency_tests {
             .await
             .unwrap()
             .unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
+        repoint_edge(&db, moving, new.id).await.unwrap();
 
         assert_eq!(Dependencies::find().count(&db).await.unwrap(), 1);
         let remaining = Dependencies::find().one(&db).await.unwrap().unwrap();
@@ -696,9 +691,7 @@ mod dependency_tests {
             .await
             .unwrap()
             .unwrap();
-        repoint_edge(&db, moving, dependent.id, new.id)
-            .await
-            .unwrap();
+        repoint_edge(&db, moving, new.id).await.unwrap();
         let checkouts = tempfile::tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root(checkouts.path().to_path_buf());
         let repo = Repository::new(checkouts.path().join("repo"));

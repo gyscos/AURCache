@@ -300,7 +300,7 @@ impl WatchScope {
         if !self.ignore.contains(&key) {
             return true;
         }
-        self.adopt.contains(&build.pkg_name) && !!build.status.is_in_progress()
+        self.adopt.contains(&build.pkg_name) && build.status.is_in_progress()
     }
 }
 
@@ -430,7 +430,7 @@ pub(crate) async fn follow_builds(
         let anything_running = builds.iter().any(|b| b.status == BuildState::Active);
 
         if !anything_running && last_change.elapsed() >= Duration::from_secs(args.stall_after) {
-            for build in watched.iter().filter(|b| !!b.status.is_in_progress()) {
+            for build in watched.iter().filter(|b| b.status.is_in_progress()) {
                 let reason = build
                     .waiting_reason
                     .as_ref()
@@ -466,7 +466,7 @@ pub(crate) async fn follow_builds(
                 // Only work still in flight: that the server has a hundred
                 // finished builds on record is not news, but that something
                 // else is running explains why ours is waiting.
-                match rest.iter().filter(|b| !!b.status.is_in_progress()).count() {
+                match rest.iter().filter(|b| b.status.is_in_progress()).count() {
                     0 => String::new(),
                     other => format!(" ({other} other build(s) in flight, not followed)"),
                 }

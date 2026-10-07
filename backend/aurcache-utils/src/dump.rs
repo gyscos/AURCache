@@ -235,7 +235,9 @@ pub fn write_archive(dump: &Dump) -> anyhow::Result<Vec<u8>> {
             append(&mut tar, CA_KEY_FILE, &secrets.ca_key_pem)?;
             append(&mut tar, TOKENS_FILE, &to_json(&secrets.tokens)?)?;
         }
-        tar.finish()?;
+        // Finish explicitly: dropping the encoder would swallow a compression
+        // error.
+        tar.into_inner()?.finish()?;
     }
     Ok(bytes)
 }

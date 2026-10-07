@@ -1,7 +1,7 @@
 //! Terminal build reports, shared by every executor.
 //!
 //! A worker must always send exactly one [`CompleteReport`] per claimed job —
-//! staying silent forces the server to wait out the lease and requeue. These
+//! staying silent forces the server to wait out the lease and abandon it. These
 //! constructors are the vocabulary for that report; how the build itself ran is
 //! the executor's business.
 

@@ -593,7 +593,7 @@ async fn sync_dependency_rows(
 /// to retry those explicitly.
 async fn dependencies_ready_for_platform(
     services: &Services,
-    platform: &Platform,
+    platform: Platform,
     graph: &DependencyGraph,
     trigger: BuildTrigger,
     visited: &mut HashSet<i32>,
@@ -606,7 +606,7 @@ async fn dependencies_ready_for_platform(
         if aurcache_db::helpers::builds::dependency_satisfied(
             &services.db,
             dep_info.package.id,
-            platform.as_str(),
+            platform,
             &crate::pkg::join_constraints(&dep_info.constraint),
         )
         .await?
@@ -618,7 +618,7 @@ async fn dependencies_ready_for_platform(
         let has_pending_build = aurcache_db::helpers::builds::pending_build(
             &services.db,
             dep_info.package.id,
-            platform.as_str(),
+            platform,
         )
         .await?
         .is_some();
@@ -709,7 +709,7 @@ async fn enqueue_platform_builds(
 ) -> anyhow::Result<Vec<PlatformUpdateResult>> {
     let mut results = Vec::new();
 
-    for platform in request.pkg_model.platforms.as_slice() {
+    for &platform in request.pkg_model.platforms.as_slice() {
         let ready = dependencies_ready_for_platform(
             services,
             platform,
@@ -722,7 +722,7 @@ async fn enqueue_platform_builds(
 
         if ready {
             let result = update_platform(
-                *platform,
+                platform,
                 request.pkg_model.id,
                 request.version,
                 request.trigger,
@@ -730,7 +730,7 @@ async fn enqueue_platform_builds(
             )
             .await?;
             results.push(PlatformUpdateResult {
-                platform: *platform,
+                platform,
                 build_id: result.build.id,
                 build_number: result.build.number,
                 enqueued: result.inserted,
@@ -740,7 +740,7 @@ async fn enqueue_platform_builds(
             let waiting = enqueue_build_if_missing(
                 &services.db,
                 request.pkg_model.id,
-                *platform,
+                platform,
                 request.version,
                 aurcache_db::helpers::time::now_secs(),
                 Pending::WaitingForDeps,
@@ -748,7 +748,7 @@ async fn enqueue_platform_builds(
             )
             .await?;
             results.push(PlatformUpdateResult {
-                platform: *platform,
+                platform,
                 build_id: waiting.build.id,
                 build_number: waiting.build.number,
                 enqueued: false,
@@ -961,16 +961,26 @@ mod tests {
             .unwrap();
     }
 
+    /// A store, and the directory its checkouts live in, which goes when this
+    /// does.
+    struct TestStore {
+        store: SnapshotStore,
+        _checkouts: tempfile::TempDir,
+    }
+
     /// Build a `SnapshotStore` for tests: AUR sources resolve against local
     /// git repos under `aur_root` instead of the real AUR, and checkouts are
     /// kept under a fresh temp dir.
-    fn test_store(aur_root: &Path) -> (SnapshotStore, tempfile::TempDir) {
+    fn test_store(aur_root: &Path) -> TestStore {
         let checkout_dir = tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root_and_aur_base(
             checkout_dir.path().to_path_buf(),
             aur_root.to_string_lossy().to_string(),
         );
-        (store, checkout_dir)
+        TestStore {
+            store,
+            _checkouts: checkout_dir,
+        }
     }
 
     fn git_pkgbuild(version: &str, depends: &[&str]) -> String {
@@ -1034,6 +1044,13 @@ mod tests {
         repo.checkout_head(None).unwrap();
     }
 
+    /// A client, and the directory its official repositories are read from,
+    /// which goes when this does.
+    struct TestClient {
+        client: AurClient,
+        _repos: tempfile::TempDir,
+    }
+
     /// A client whose official-repo cache is present and empty.
     ///
     /// Resolution asks the official repositories about every dependency, and
@@ -1041,7 +1058,7 @@ mod tests {
     /// what stops a mirror outage from sending `git` to the AUR. A test that
     /// wants the repositories to hold nothing therefore has to say so, by
     /// handing over a cache that is present, fresh and empty.
-    async fn client_with_empty_official_repos(rpc_url: String) -> (AurClient, tempfile::TempDir) {
+    async fn client_with_empty_official_repos(rpc_url: String) -> TestClient {
         let dir = tempfile::tempdir().unwrap();
         for repo in ["core", "extra", "multilib"] {
             let mut archive = Vec::new();
@@ -1065,13 +1082,16 @@ mod tests {
         // opposed to "they could not be read", which resolution refuses to
         // answer.
         client.official.refresh().await.unwrap();
-        (client, dir)
+        TestClient {
+            client,
+            _repos: dir,
+        }
     }
 
     #[tokio::test]
     async fn package_update_queues_dependency_builds_before_parent_when_constraints_tighten() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -1158,7 +1178,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let results = package_update(
             &Services::new(
                 db.clone(),
@@ -1278,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn package_update_queues_every_unsatisfied_dependency() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -1325,7 +1345,7 @@ mod tests {
             dependees.push(dependee);
         }
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         package_update(
             &Services::new(
                 db.clone(),
@@ -1355,7 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn package_update_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -1501,7 +1521,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let results = package_update(
             &Services::new(
                 db.clone(),
@@ -1578,7 +1598,7 @@ mod tests {
     #[tokio::test]
     async fn force_rebuild_does_not_queue_non_leaf_dependency_builds() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -1724,7 +1744,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let results = package_update(
             &Services::new(
                 db.clone(),
@@ -1793,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn git_update_refreshes_dependency_rows() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2036,7 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn a_repointed_dependency_survives_a_resync() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2095,7 +2115,7 @@ mod tests {
     #[tokio::test]
     async fn ranking_picks_the_provider_when_there_is_no_edge_yet() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2135,7 +2155,7 @@ mod tests {
     #[tokio::test]
     async fn force_rebuild_after_failure_queues_new_build() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2178,7 +2198,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let build_ids = package_update(
             &Services::new(
                 db.clone(),
@@ -2228,7 +2248,7 @@ mod tests {
     #[tokio::test]
     async fn forced_rebuild_refreshes_the_snapshot_before_building() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2256,7 +2276,7 @@ mod tests {
         .try_into_model()
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let services = Services::new(
             db.clone(),
             Arc::new(store),
@@ -2314,7 +2334,7 @@ mod tests {
     #[tokio::test]
     async fn auto_update_forces_only_packages_with_vcs_sources() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2366,7 +2386,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let services = Services::new(
             db.clone(),
             Arc::new(store),
@@ -2415,7 +2435,7 @@ mod tests {
     #[tokio::test]
     async fn update_removes_orphaned_dependency_package() {
         let server = MockServer::start().await;
-        let (client, _official) =
+        let TestClient { client, _repos } =
             client_with_empty_official_repos(format!("{}/rpc/v5", server.uri())).await;
         let db = Database::connect("sqlite::memory:").await.unwrap();
         Migrator::up(&db, None).await.unwrap();
@@ -2491,7 +2511,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         package_update(
             &Services::new(
                 db.clone(),

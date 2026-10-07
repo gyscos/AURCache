@@ -1,7 +1,7 @@
 //! The long-lived worker loop: claim jobs up to the concurrency limit, run each
 //! in its own task with panic-safe completion, and heartbeat liveness. If the
 //! server becomes unreachable for longer than the lease TTL, in-flight builds
-//! self-abort (the server will have requeued them).
+//! self-abort (the server will have abandoned them and queued fresh ones).
 //!
 //! The heartbeat is also how values set on the server reach the worker: its
 //! answer carries a snapshot whenever the worker does not hold the current one,
@@ -313,7 +313,8 @@ impl<E: Executor> Runner<E> {
     }
 
     /// Send the terminal completion, retrying briefly so a transient network
-    /// blip does not drop the report (which would force a lease-expiry requeue).
+    /// blip does not drop the report (which would cost the build to the lease
+    /// reaper).
     async fn report_completion(&self, build_id: i32, report: &CompleteReport) {
         for attempt in 0..5 {
             match self.client.complete(build_id, report).await {
@@ -332,13 +333,15 @@ impl<E: Executor> Runner<E> {
                 Err(e) => {
                     // `{e:#}` for the cause chain, not just the outermost
                     // context: the server's reason is what tells a lost lease
-                    // from an ingest that cannot publish.
+                    // from anything else it refused.
                     tracing::warn!("reporting completion for {build_id} failed: {e:#}");
                     tokio::time::sleep(Duration::from_secs(2 * (attempt + 1))).await;
                 }
             }
         }
-        tracing::error!("gave up reporting completion for {build_id}; server will requeue");
+        tracing::error!(
+            "gave up reporting completion for {build_id}; the server will abandon it when its lease expires"
+        );
     }
 
     /// Background heartbeat + self-abort watchdog.
@@ -402,7 +405,7 @@ impl<E: Executor> Runner<E> {
         }
 
         // Self-abort: if the server has been unreachable past the lease TTL,
-        // the builds we hold have already been requeued — stop them to avoid
+        // the builds we hold have already been abandoned — stop them to avoid
         // a zombie upload.
         if !active_build_ids.is_empty() && self.since_contact() > cfg.lease_ttl {
             tracing::error!(

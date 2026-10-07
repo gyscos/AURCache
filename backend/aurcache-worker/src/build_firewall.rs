@@ -466,7 +466,7 @@ mod tests {
     /// child-scoped `PATH` (this process's environment is never touched).
     /// Note `$2`, not `$1`: the stub runs as `sudo iptables …`, so the tool
     /// name itself occupies `$1`.
-    fn fake_toolbox() -> (tempfile::TempDir, std::path::PathBuf) {
+    fn fake_toolbox() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("calls.log");
         let state = dir.path().join("present");
@@ -493,13 +493,13 @@ mod tests {
             let path = dir.path().join(tool);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let bin = dir.path().to_path_buf();
-        (dir, bin)
+        dir
     }
 
     #[test]
     fn ensure_is_check_then_add_then_stable() {
-        let (_dir, bin) = fake_toolbox();
+        let toolbox = fake_toolbox();
+        let bin = toolbox.path();
         // Child-scoped `PATH`: the fake `sudo`/`iptables` are found by the
         // stubbed runs only, and the real environment is never mutated.
         let path = format!(

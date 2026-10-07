@@ -220,8 +220,7 @@ pub async fn list_package_builds(
 /// Which builds a list is narrowed to.
 struct BuildFilter {
     pkg_id: Option<i32>,
-    /// The worker that ran the build, or holds its lease now. A requeued
-    /// build loses it, so it lists under whoever runs it next.
+    /// The worker that ran the build, or is running it.
     worker: Option<i32>,
     /// Empty means every state.
     states: Vec<BuildState>,
@@ -266,8 +265,7 @@ async fn list_builds_impl(
         query = query.filter(builds::Column::WorkerId.eq(worker));
     }
     if !filter.states.is_empty() {
-        query = query
-            .filter(builds::Column::Status.is_in(filter.states.iter().map(|state| state.as_i32())));
+        query = query.filter(builds::Column::Status.is_in(filter.states.iter().copied()));
     }
     let rows = query
         .into_model::<BuildRow>()

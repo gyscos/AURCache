@@ -370,7 +370,7 @@ pub async fn upsert_worker_setting<C: ConnectionTrait>(
 /// How fresh `last_seen` may be before a touch is skipped.
 ///
 /// Liveness resolves at minute granularity (the timeout is 60 s), so
-/// rewriting the row on every log chunk or 5 s heartbeat is write
+/// rewriting the row on every log chunk or heartbeat is write
 /// amplification for no signal. A touch that carries a *changed* version
 /// still writes through immediately — the version is data, not liveness.
 const TOUCH_THROTTLE_SECS: i64 = 10;
@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// Liveness touches are throttled: a fresh row is not rewritten, so log
-    /// chunks and 5 s heartbeats stop paying a write per request — but a
+    /// chunks and heartbeats stop paying a write per request — but a
     /// stale row still refreshes and a changed version still writes through.
     #[tokio::test]
     async fn touch_skips_fresh_rows_but_records_staleness_and_versions() {

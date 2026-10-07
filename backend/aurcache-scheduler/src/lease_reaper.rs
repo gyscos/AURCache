@@ -47,25 +47,24 @@ pub fn start_lease_reaper(db: DatabaseConnection, activity: ActivityLog) -> Join
                 .saturating_add(grace);
 
             match reap_expired_builds(&db, now_secs(), max_attempts, max_build_age).await {
-                Ok(out) => {
-                    if !out.abandoned.is_empty() {
-                        warn!(
-                            "Lease reaper: retried {:?}, gave up on {:?} (silent/hung workers)",
-                            out.retried(),
-                            out.failed()
-                        );
+                Ok(abandoned) => {
+                    if !abandoned.is_empty() {
                         // One entry for the pass, not one per build: the reaper
                         // finds them together and they have one cause. Named
                         // as the operator knows them -- the build they were
                         // watching, not the fresh row standing in for it.
-                        let named = aurcache_utils::abandoned::named(&out.abandoned);
+                        let named = aurcache_utils::abandoned::named(&abandoned);
+                        warn!(
+                            "Lease reaper: retried {:?}, gave up on {:?} (silent/hung workers)",
+                            named.retried, named.failed
+                        );
                         activity.emit(Event::WorkerReaped {
-                            workers: worker_names(&db, &out.abandoned).await,
+                            workers: worker_names(&db, &abandoned).await,
                             retried: named.retried,
                             failed: named.failed,
                         });
                     }
-                    aurcache_utils::abandoned::report(&db, &activity, &out.abandoned).await;
+                    aurcache_utils::abandoned::report(&db, &activity, &abandoned).await;
                 }
                 Err(e) => warn!("Lease reaper pass failed: {e}"),
             }

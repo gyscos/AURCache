@@ -30,7 +30,7 @@ const BUILD_SAMPLE: u64 = 20;
 /// Whether this build's output is what the repository serves for its
 /// architecture.
 fn succeeded(build: &Build) -> bool {
-    matches!(Some(build.status), Some(BuildState::Successful))
+    build.status == BuildState::Successful
 }
 
 /// The architectures this package has builds for, ordered the way the platform
@@ -113,14 +113,19 @@ fn produced_names(pkg: &ExtendedPackage) -> Vec<String> {
     }
 }
 
-async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), LoadError> {
+/// What the package page shows: the package, and its most recent builds.
+struct PackagePage {
+    package: ExtendedPackage,
+    builds: Vec<Build>,
+}
+
+async fn load(pkgbase: String) -> Result<PackagePage, LoadError> {
     let client = client()?;
 
-    // Issued together rather than one after the other. They share no data, and
-    // the package request is the slow one — it makes a live AUR lookup
-    // server-side — so running them in sequence added the build query's latency
-    // on top of it for no reason. The browser is the executor; this is
-    // concurrency, not threads.
+    // Issued together rather than one after the other: they share no data, so
+    // running them in sequence would add one round trip's latency to the
+    // other's for no reason. The browser is the executor; this is concurrency,
+    // not threads.
     let (package, builds) = futures_util::future::join(
         client.get_package(&pkgbase),
         client.list_builds(Some(&pkgbase), Some(BUILD_SAMPLE), None),
@@ -129,7 +134,10 @@ async fn load(pkgbase: String) -> Result<(ExtendedPackage, Vec<Build>), LoadErro
 
     // A failed build query should not lose the package itself: the build
     // summary is secondary, and the rest of the page is still worth showing.
-    Ok((package?, builds.unwrap_or_default()))
+    Ok(PackagePage {
+        package: package?,
+        builds: builds.unwrap_or_default(),
+    })
 }
 
 #[component]
@@ -158,9 +166,8 @@ pub fn Package(pkgbase: String) -> Element {
     // Refresh while this package or one of its recent builds is still in
     // flight, so a build finishing updates the status and the build summary
     // without a reload; a slow tick otherwise as a catch-all.
-    let busy = matches!(&*data.read_unchecked(), Some(Ok((pkg, builds)))
-        if Some(pkg.status).is_some_and(BuildState::is_in_progress)
-            || builds.iter().any(|b| Some(b.status).is_some_and(BuildState::is_in_progress)));
+    let busy = matches!(&*data.read_unchecked(), Some(Ok(PackagePage { package, builds }))
+        if package.status.is_in_progress() || builds.iter().any(|b| b.status.is_in_progress()));
     crate::poll::use_poll(data, busy);
 
     rsx! {
@@ -174,7 +181,7 @@ pub fn Package(pkgbase: String) -> Element {
             Some(Err(e)) => rsx! {
                 div { class: "alert alert-error", span { "Could not load {pkgbase}: {e}" } }
             },
-            Some(Ok((pkg, builds))) => rsx! {
+            Some(Ok(PackagePage { package: pkg, builds })) => rsx! {
                 div { class: "space-y-4",
                     PackageHeader {
                         pkg: pkg.clone(),
@@ -814,21 +821,25 @@ fn offers_for(loaded: &[(String, aurcache_client::DependencyOptions)]) -> Vec<Of
 ///
 /// `None` for a dependent means nothing selected can serve it: it has to be
 /// removed, or the package it needs stays.
-fn assign(
-    offers: &[Offer],
-    selected: &[Choice],
-    dependents: &[String],
-) -> Vec<(String, Option<Choice>)> {
+fn assign(offers: &[Offer], selected: &[Choice], dependents: &[String]) -> Vec<Assignment> {
     dependents
         .iter()
-        .map(|dependent| {
-            let choice = offers
+        .map(|dependent| Assignment {
+            dependent: dependent.clone(),
+            choice: offers
                 .iter()
                 .find(|offer| selected.contains(&offer.choice) && offer.serves.contains(dependent))
-                .map(|offer| offer.choice.clone());
-            (dependent.clone(), choice)
+                .map(|offer| offer.choice.clone()),
         })
         .collect()
+}
+
+/// One dependent, and the selected offer that will serve it; see [`assign`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Assignment {
+    dependent: String,
+    /// `None` when nothing selected can serve it.
+    choice: Option<Choice>,
 }
 
 /// Send one dependency somewhere else. `None` drops it.
@@ -2079,7 +2090,7 @@ mod tests {
 
 #[cfg(test)]
 mod shared_candidate_tests {
-    use super::{Choice, Offer, assign, offers_for, shared_candidates};
+    use super::{Assignment, Choice, Offer, assign, offers_for, shared_candidates};
     use aurcache_client::{
         CandidateSource, DependencyCandidate, DependencyOptions, ReplacementVerdict,
     };
@@ -2248,11 +2259,14 @@ mod shared_candidate_tests {
         assert_eq!(
             assigned,
             vec![
-                ("one".to_string(), Some(Choice::Package("left".to_string()))),
-                (
-                    "two".to_string(),
-                    Some(Choice::Package("right".to_string()))
-                ),
+                Assignment {
+                    dependent: "one".to_string(),
+                    choice: Some(Choice::Package("left".to_string())),
+                },
+                Assignment {
+                    dependent: "two".to_string(),
+                    choice: Some(Choice::Package("right".to_string())),
+                },
             ]
         );
     }
@@ -2272,7 +2286,7 @@ mod shared_candidate_tests {
             &[Choice::Official, Choice::Package("also".to_string())],
             &["one".to_string()],
         );
-        assert_eq!(assigned[0].1, Some(Choice::Official));
+        assert_eq!(assigned[0].choice, Some(Choice::Official));
 
         let without = assign(
             &offers,
@@ -2280,7 +2294,7 @@ mod shared_candidate_tests {
             &["one".to_string()],
         );
         assert_eq!(
-            without[0].1,
+            without[0].choice,
             Some(Choice::Package("also".to_string())),
             "and the later one takes it when the first is not selected"
         );
@@ -2298,7 +2312,13 @@ mod shared_candidate_tests {
             &["one".to_string(), "two".to_string()],
         );
 
-        assert_eq!(assigned[1], ("two".to_string(), None));
+        assert_eq!(
+            assigned[1],
+            Assignment {
+                dependent: "two".to_string(),
+                choice: None,
+            }
+        );
     }
 
     /// An offer that could serve a dependent does nothing until it is picked.
@@ -2306,7 +2326,7 @@ mod shared_candidate_tests {
     fn an_unselected_offer_serves_nobody() {
         let offers = vec![offer(Choice::Package("some".to_string()), &["one"])];
         let assigned = assign(&offers, &[], &["one".to_string()]);
-        assert_eq!(assigned[0].1, None);
+        assert_eq!(assigned[0].choice, None);
     }
 }
 
@@ -2763,17 +2783,19 @@ fn ReplaceAndRemoveDialog(
                         // which is the button this card exists to replace.
                         let unaccounted = assignments
                             .iter()
-                            .filter(|(dependent, choice)| {
-                                choice.is_none() && !removing().contains(dependent)
+                            .filter(|assignment| {
+                                assignment.choice.is_none()
+                                    && !removing().contains(&assignment.dependent)
                             })
                             .count();
                         let ready = unaccounted == 0;
 
                         let to_apply: Vec<(String, Choice)> = assignments
                             .iter()
-                            .filter(|(dependent, _)| !removing().contains(dependent))
-                            .filter_map(|(dependent, choice)| {
-                                choice.clone().map(|choice| (dependent.clone(), choice))
+                            .filter(|assignment| !removing().contains(&assignment.dependent))
+                            .filter_map(|assignment| {
+                                let choice = assignment.choice.clone()?;
+                                Some((assignment.dependent.clone(), choice))
                             })
                             .collect();
 
@@ -2821,7 +2843,7 @@ fn ReplaceAndRemoveDialog(
                                 div {
                                     h4 { class: "font-semibold text-sm pb-1", "Dependents" }
                                     ul { class: "divide-y divide-base-300 max-h-72 overflow-y-auto",
-                                        for (dependent, choice) in assignments.iter() {
+                                        for Assignment { dependent, choice } in assignments.iter() {
                                             DependentRow {
                                                 key: "{dependent}",
                                                 dependent: dependent.clone(),

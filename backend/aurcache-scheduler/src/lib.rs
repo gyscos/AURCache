@@ -7,8 +7,32 @@ pub mod retired_packages;
 pub mod update_version_check;
 
 use aurcache_common::schedule::Schedule;
+use aurcache_common::units::parse_duration;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// A duration from the environment variable `key`, as [`parse_duration`] reads
+/// one (`90d`, `12h`, or plain seconds); `default` when it is unset.
+///
+/// A value that does not parse is the default too, with a warning: `90d` read
+/// as a plain number silently meant the default, which is how a typo goes
+/// unnoticed.
+pub(crate) fn env_duration(key: &str, default: Duration) -> Duration {
+    let Some(raw) = std::env::var(key).ok().filter(|v| !v.trim().is_empty()) else {
+        return default;
+    };
+    parse_duration(&raw).map_or_else(
+        || {
+            warn!(
+                "ignoring {key}={raw:?} (expected seconds, or a duration such as 12h or 90d); \
+                 using {}s",
+                default.as_secs()
+            );
+            default
+        },
+        Duration::from_secs,
+    )
+}
 
 /// Sleep until the schedule's next run, or for `at_most` if that comes first.
 ///

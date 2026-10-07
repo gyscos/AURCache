@@ -1,7 +1,7 @@
 //! Formatting shared by the screens that show build timing.
 
-/// Build timestamps are Unix **seconds**, not milliseconds — `stats.rs`
-/// compares them against `strftime('%s', 'now')`.
+/// Now, in Unix **seconds** rather than milliseconds: the unit every
+/// timestamp the server sends is in.
 pub fn now_secs() -> i64 {
     (js_sys::Date::now() / 1000.0) as i64
 }

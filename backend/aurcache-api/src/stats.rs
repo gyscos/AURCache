@@ -472,12 +472,12 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     // Matches what the rest of the UI calls "out of date": a package whose
     // last build succeeded but that upstream has moved past
     // (`StatusFilter::matches` on the frontend). `out_of_date` is only ever
-    // cleared on a successful build (`worker_complete.rs`, `publish.rs`), not
+    // cleared on a successful build (`publish.rs`), not
     // on a failed one, so a package whose rebuild attempt just failed can
     // still carry the flag -- that package belongs on the Failed card, whose
     // "View all" this card's link would otherwise fail to reproduce.
     let outdated: Vec<SimplePackage> = package_row_select()
-        .filter(packages::Column::OutOfDate.ne(0))
+        .filter(packages::Column::OutOfDate.eq(true))
         .filter(packages::Column::Status.eq(BuildState::Successful))
         .order_by(packages::Column::Id, Order::Desc)
         .into_model::<SimplePackage>()

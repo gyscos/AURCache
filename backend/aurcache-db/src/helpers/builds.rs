@@ -64,7 +64,7 @@ fn known_version(version: String) -> Option<String> {
 pub async fn latest_successful_version<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
-    platform: &str,
+    platform: Platform,
 ) -> Result<Option<String>, DbErr> {
     newest_success_query(pkg_id, builds::Column::Version)
         .filter(builds::Column::Platform.eq(platform))
@@ -87,7 +87,7 @@ pub async fn latest_successful_version<C: ConnectionTrait>(
 pub async fn dependency_satisfied<C: ConnectionTrait>(
     db: &C,
     dependee_id: i32,
-    platform: &str,
+    platform: Platform,
     constraint: &str,
 ) -> Result<bool, DbErr> {
     Ok(latest_successful_version(db, dependee_id, platform)
@@ -100,7 +100,7 @@ pub async fn dependency_satisfied<C: ConnectionTrait>(
 pub async fn dependencies_satisfied<C: ConnectionTrait>(
     db: &C,
     deps: &[crate::dependencies::Model],
-    platform: &str,
+    platform: Platform,
 ) -> Result<bool, DbErr> {
     for dep in deps {
         if !dependency_satisfied(db, dep.dependee_id, platform, &dep.version_constraint).await? {
@@ -117,7 +117,7 @@ pub async fn dependencies_satisfied<C: ConnectionTrait>(
 pub async fn pending_build<C: ConnectionTrait>(
     db: &C,
     pkg_id: i32,
-    platform: &str,
+    platform: Platform,
 ) -> Result<Option<builds::Model>, DbErr> {
     Builds::find()
         .filter(builds::Column::PkgId.eq(pkg_id))

@@ -30,8 +30,18 @@ use crate::git::checkout::ls_remote;
 /// `name::` prefix and `#fragment` are for), and two different sources
 /// always have different `source_url`s.
 #[derive(Clone)]
-pub struct VcsSource {
-    pub source_url: String,
+struct VcsSource {
+    source_url: String,
+    repo_url: String,
+    /// The ref makepkg checks out: a branch or tag name, or `HEAD`.
+    git_ref: String,
+}
+
+/// What two sources must share for one remote lookup to answer both: the
+/// repository and the ref, never the `.SRCINFO` string, which also carries the
+/// per-package `name::` prefix.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Remote {
     repo_url: String,
     git_ref: String,
 }
@@ -42,21 +52,15 @@ impl VcsSource {
     ///
     /// Blocking: performs network I/O and must be run via
     /// `tokio::task::spawn_blocking` from async code.
-    pub fn resolve_commit(&self) -> anyhow::Result<String> {
+    fn resolve_commit(&self) -> anyhow::Result<String> {
         ls_remote(&self.repo_url, &self.git_ref)
     }
 
-    /// The ref makepkg checks out: a branch or tag name, or `HEAD`.
-    #[must_use]
-    pub fn git_ref(&self) -> &str {
-        &self.git_ref
-    }
-
-    /// What two sources must share for one remote lookup to answer both: the
-    /// repository and the ref, never the `.SRCINFO` string, which also carries
-    /// the per-package `name::` prefix.
-    fn remote_key(&self) -> (String, String) {
-        (self.repo_url.clone(), self.git_ref.clone())
+    fn remote(&self) -> Remote {
+        Remote {
+            repo_url: self.repo_url.clone(),
+            git_ref: self.git_ref.clone(),
+        }
     }
 }
 
@@ -70,8 +74,7 @@ impl VcsSource {
 /// Derived on the server and sent to the worker rather than worked out at both
 /// ends: two implementations of this rule drifting apart would key a commit to
 /// a `source_url` nobody compares against, and nothing would look wrong.
-#[must_use]
-pub fn makepkg_source_dir(filename: Option<&str>, url: &str) -> String {
+fn makepkg_source_dir(filename: Option<&str>, url: &str) -> String {
     if let Some(name) = filename {
         return name.to_string();
     }
@@ -116,7 +119,7 @@ pub fn job_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<JobVcsSource> {
 /// `#tag=`/`#branch=` values that are themselves a full commit SHA.
 /// Non-git VCS types (`svn+`, `hg+`, `bzr+`, `fossil+`) are not yet
 /// supported and are skipped.
-pub fn extract_git_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<VcsSource> {
+fn extract_git_vcs_sources(sourceinfo: &SourceInfoV1) -> Vec<VcsSource> {
     sourceinfo
         .base
         .sources
@@ -363,7 +366,7 @@ fn gap_before_lookup(previous_lookups: u64) -> Option<Duration> {
 /// thing that decides whether upstream has moved.
 #[derive(Default)]
 pub struct RoundCache {
-    seen: HashMap<(String, String), String>,
+    seen: HashMap<Remote, String>,
     lookups: u64,
 }
 
@@ -379,7 +382,7 @@ impl RoundCache {
     /// A failure is not cached: the next package naming the same remote should
     /// get its own attempt rather than inheriting a transient error.
     async fn resolve(&mut self, source: VcsSource) -> anyhow::Result<String> {
-        let key = source.remote_key();
+        let key = source.remote();
         if let Some(commit) = self.seen.get(&key) {
             return Ok(commit.clone());
         }
@@ -597,16 +600,16 @@ mod tests {
         let tagged = srcinfo_with_source("git+https://example.test/repo.git#tag=v1.5.6");
         let tagged = extract_git_vcs_sources(&tagged);
         assert_eq!(tagged.len(), 1);
-        assert_eq!(tagged[0].git_ref(), "v1.5.6");
+        assert_eq!(tagged[0].git_ref, "v1.5.6");
 
         let branched = srcinfo_with_source("git+https://example.test/repo.git#branch=main");
         let branched = extract_git_vcs_sources(&branched);
         assert_eq!(branched.len(), 1);
-        assert_eq!(branched[0].git_ref(), "main");
+        assert_eq!(branched[0].git_ref, "main");
 
         let bare = srcinfo_with_source("git+https://example.test/repo.git");
         let bare = extract_git_vcs_sources(&bare);
         assert_eq!(bare.len(), 1);
-        assert_eq!(bare[0].git_ref(), "HEAD");
+        assert_eq!(bare[0].git_ref, "HEAD");
     }
 }

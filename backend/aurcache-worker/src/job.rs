@@ -16,7 +16,7 @@ use aurcache_worker_core::client::WorkerClient;
 use aurcache_worker_core::protocol::{Stop, StopWatch, log, report_warning, upload_artifacts};
 use aurcache_worker_core::{artifacts, report};
 
-use crate::build;
+use crate::build::{self, BindMount};
 use crate::cache::Cache;
 use crate::cgroup::Hierarchy;
 use crate::chroot;
@@ -236,9 +236,10 @@ async fn run_job_inner(
     // Private writable pacman cache for this job. Concurrent builds otherwise
     // share one writable cache directory and race on the same partial
     // download; the shared cache remains available read-only for hits.
-    let pkg_cache_bind = cache
-        .pacman_pkg_job(&job_label)
-        .map(|dir| (dir, PathBuf::from(chroot::PER_JOB_CACHE_MOUNT)));
+    let pkg_cache_bind = cache.pacman_pkg_job(&job_label).map(|dir| BindMount {
+        host: dir,
+        chroot: PathBuf::from(chroot::PER_JOB_CACHE_MOUNT),
+    });
 
     // Operator-configured mounts, then this job's private pacman cache. Ours
     // land last on the systemd-nspawn command line, which is what lets the
@@ -281,7 +282,10 @@ async fn run_job_inner(
         // this did, handed every build every other package's tree to read
         // and rewrite.
         if let Some(tree) = cache.builddir_tree(&job.arch, &job.pkgbase) {
-            binds.push((tree, Path::new(chroot::BUILDDIR_MOUNT).join(&job.pkgbase)));
+            binds.push(BindMount {
+                host: tree,
+                chroot: Path::new(chroot::BUILDDIR_MOUNT).join(&job.pkgbase),
+            });
         } else {
             let msg = format!(
                 "{} asked for a persistent build directory but one could not be \
@@ -312,7 +316,10 @@ async fn run_job_inner(
     // authenticated fetches only ever happen through `source=` was what left
     // that unbuildable.
     if let Some(dir) = agent_socket().as_deref().and_then(Path::parent) {
-        binds.push((dir.to_path_buf(), dir.to_path_buf()));
+        binds.push(BindMount {
+            host: dir.to_path_buf(),
+            chroot: dir.to_path_buf(),
+        });
     }
 
     // The lease is settled on every path -- kept for inspection on a
@@ -624,7 +631,7 @@ async fn run_build(
     job: &JobDescriptor,
     pkgdir: &Path,
     cache: &Cache,
-    binds: &[(PathBuf, PathBuf)],
+    binds: &[BindMount],
     cancel: &AtomicBool,
 ) -> Result<CompleteReport> {
     let build_id = job.build_id;

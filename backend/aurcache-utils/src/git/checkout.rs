@@ -30,7 +30,7 @@ fn resolve_remote_ref<'a>(
         // neither. `origin/HEAD` is the fallback for a checkout that is
         // detached because it previously resolved a tag or pinned SHA.
         head_branch(repo)
-            .map(|(_, shorthand)| format!("refs/remotes/origin/{shorthand}"))
+            .map(|branch| format!("refs/remotes/origin/{}", branch.shorthand))
             .into_iter()
             .chain(["refs/remotes/origin/HEAD".to_string()])
             .collect()
@@ -76,17 +76,24 @@ impl std::fmt::Display for EmptyRepository {
 
 impl std::error::Error for EmptyRepository {}
 
-/// The branch HEAD is on, as `(full ref name, shorthand)`, or `None` when the
-/// checkout is detached.
-fn head_branch(repo: &Repository) -> Option<(String, String)> {
+/// A local branch, by both of its names.
+struct Branch {
+    /// The full ref name, `refs/heads/main`.
+    name: String,
+    /// `main`.
+    shorthand: String,
+}
+
+/// The branch HEAD is on, or `None` when the checkout is detached.
+fn head_branch(repo: &Repository) -> Option<Branch> {
     let head = repo.head().ok()?;
     if !head.is_branch() {
         return None;
     }
-    Some((
-        head.name().ok()?.to_string(),
-        head.shorthand().ok()?.to_string(),
-    ))
+    Some(Branch {
+        name: head.name().ok()?.to_string(),
+        shorthand: head.shorthand().ok()?.to_string(),
+    })
 }
 
 /// Resolve `git_ref` to an object in `repo` and checkout its tree, updating HEAD.
@@ -125,9 +132,9 @@ fn resolve_and_checkout(repo: &Repository, git_ref: &str) -> anyhow::Result<Oid>
         // branch would lag forever — and keeping HEAD on a branch is what lets
         // the next call read the default branch's name back off the checkout
         // instead of guessing it.
-        (None, Some((branch_ref, _))) => {
-            repo.reference(&branch_ref, object.id(), true, "follow upstream")?;
-            repo.set_head(&branch_ref)?;
+        (None, Some(branch)) => {
+            repo.reference(&branch.name, object.id(), true, "follow upstream")?;
+            repo.set_head(&branch.name)?;
         }
         // A tag or pinned SHA: nothing to track, so detach. This is a
         // read-only source cache; nothing commits here.

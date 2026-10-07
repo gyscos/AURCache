@@ -961,10 +961,9 @@ fn fallback_pkgbase(package_dir: &Path) -> String {
         .unwrap_or_else(|| "source".to_string())
 }
 
-/// Apply `patch` on top of an already-fetched (unpatched) `archive_bytes`
-/// tar.gz, regenerating `.SRCINFO` from the patched `PKGBUILD` and
-/// re-packaging the result into a new tar.gz with the same `{pkgbase}/`
-/// layout.
+/// Apply `patch` on top of an already-fetched (unpatched) snapshot,
+/// regenerating `.SRCINFO` from the patched `PKGBUILD` and re-packaging the
+/// result into a new tar.gz with the same `{pkgbase}/` layout.
 ///
 /// This operates entirely in memory: the archive is unpacked into a
 /// `{relative path -> bytes}` map, the patch is applied to that map, and the
@@ -974,13 +973,13 @@ fn fallback_pkgbase(package_dir: &Path) -> String {
 /// that needs a real path to `source` - the file is removed again as soon as
 /// parsing finishes.
 fn apply_patch_to_archive(
-    archive_bytes: &[u8],
+    raw: &SourceSnapshot,
     patch: &SourcePatch,
     network: bool,
-) -> anyhow::Result<(Vec<u8>, SourceInfoV1)> {
+) -> anyhow::Result<SourceSnapshot> {
     use crate::pkgbuild::parse_pkgbuild_content;
 
-    let mut archive = extract_tar_gz_to_memory(archive_bytes)?;
+    let mut archive = extract_tar_gz_to_memory(&raw.archive_bytes)?;
 
     for rel_path in patch.paths() {
         // A file keeps its mode; one the patch creates is an ordinary 0644.
@@ -1015,9 +1014,11 @@ fn apply_patch_to_archive(
         .map_err(|_| anyhow::anyhow!("PKGBUILD is not valid UTF-8, cannot parse"))?;
     let sourceinfo = parse_pkgbuild_content(pkgbuild, network)?;
 
-    let tar_gz_bytes = create_archive_from_memory(&archive)?;
-
-    Ok((tar_gz_bytes, sourceinfo))
+    Ok(SourceSnapshot {
+        archive_bytes: create_archive_from_memory(&archive)?,
+        sourceinfo: Some(sourceinfo),
+        pkgbase: raw.pkgbase.clone(),
+    })
 }
 
 /// Build a [`CacheEntry`] from a fresh raw snapshot, applying `patch` on top
@@ -1038,13 +1039,7 @@ fn build_cache_entry(
             history: tokio::sync::OnceCell::new(),
         }),
         Some(patch) => {
-            let (patched_bytes, patched_sourceinfo) =
-                apply_patch_to_archive(&raw.archive_bytes, &patch, network)?;
-            let patched = SourceSnapshot {
-                archive_bytes: patched_bytes,
-                sourceinfo: Some(patched_sourceinfo),
-                pkgbase: raw.pkgbase.clone(),
-            };
+            let patched = apply_patch_to_archive(&raw, &patch, network)?;
             Arc::new(CacheEntry {
                 commit,
                 active: patched,
@@ -1499,18 +1494,25 @@ license=('MIT')
             return;
         }
 
-        let archive_bytes = make_fixture_archive("foo", PKGBUILD);
+        let raw = SourceSnapshot {
+            archive_bytes: make_fixture_archive("foo", PKGBUILD),
+            sourceinfo: None,
+            pkgbase: "foo".to_string(),
+        };
 
         let mut patch = SourcePatch::default();
         let patched_pkgbuild = PKGBUILD.replace("pkgver=1.0", "pkgver=2.0");
         patch.merge_file("PKGBUILD", PKGBUILD, &patched_pkgbuild);
 
-        let (new_archive_bytes, sourceinfo) =
-            apply_patch_to_archive(&archive_bytes, &patch, false).unwrap();
+        let patched = apply_patch_to_archive(&raw, &patch, false).unwrap();
+        let new_archive_bytes = patched.archive_bytes;
 
         // .SRCINFO was regenerated from the patched PKGBUILD (version 2.0),
         // not copied over from the (stale, unpatched) shipped .SRCINFO.
-        assert_eq!(sourceinfo.base.version.to_string(), "2.0-1");
+        assert_eq!(
+            patched.sourceinfo.unwrap().base.version.to_string(),
+            "2.0-1"
+        );
 
         let files = list_files_in_archive(&new_archive_bytes, "foo").unwrap();
         assert!(files.contains(&"PKGBUILD".to_string()));
@@ -1596,7 +1598,7 @@ license=('MIT')
         )
         .unwrap();
 
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -1606,15 +1608,25 @@ license=('MIT')
         assert_eq!(sourceinfo.base.version.to_string(), "1.0-1");
     }
 
+    /// A store, and the directory its checkouts live in, which goes when this
+    /// does.
+    struct TestStore {
+        store: SnapshotStore,
+        _checkouts: tempfile::TempDir,
+    }
+
     /// Build a `SnapshotStore` for tests: AUR sources resolve against local
     /// git repos under `aur_root` instead of the real AUR.
-    fn test_store(aur_root: &Path) -> (SnapshotStore, tempfile::TempDir) {
+    fn test_store(aur_root: &Path) -> TestStore {
         let checkout_dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::with_checkout_root_and_aur_base(
             checkout_dir.path().to_path_buf(),
             aur_root.to_string_lossy().to_string(),
         );
-        (store, checkout_dir)
+        TestStore {
+            store,
+            _checkouts: checkout_dir,
+        }
     }
 
     fn some_patch(new_pkgver: &str) -> SourcePatch {
@@ -1708,7 +1720,10 @@ license=('MIT')
     async fn fetched_archive_excludes_git_metadata() {
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
-        let (store, checkout_dir) = test_store(aur_root.path());
+        let TestStore {
+            store,
+            _checkouts: checkout_dir,
+        } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -1745,7 +1760,7 @@ license=('MIT')
     async fn concurrent_first_reads_of_one_source_all_succeed() {
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let store = Arc::new(store);
         let source = SourceData::Aur {
             name: "bar".to_string(),
@@ -1778,7 +1793,7 @@ license=('MIT')
 
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -1826,7 +1841,7 @@ license=('MIT')
 
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "bar", "1.0");
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -1869,7 +1884,7 @@ license=('MIT')
 
         let aur_root = tempfile::tempdir().unwrap();
         let remote = create_aur_git_repo(aur_root.path(), "bar", "1.0");
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "bar".to_string(),
         };
@@ -1898,7 +1913,7 @@ license=('MIT')
         let repo = Repository::init(repo_dir.path()).unwrap();
         commit_to_repo(&repo, "v1", "init");
 
-        let (store, _checkout_dir) = test_store(Path::new("unused"));
+        let TestStore { store, _checkouts } = test_store(Path::new("unused"));
         let source = SourceData::Git {
             spec: aurcache_db::packages::GitSourceSpec {
                 url: repo_dir.path().to_string_lossy().to_string(),
@@ -1937,7 +1952,7 @@ license=('MIT')
 
         let aur_root = tempfile::tempdir().unwrap();
         let repo_path = create_aur_git_repo(aur_root.path(), "foo", "1.0");
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "foo".to_string(),
         };
@@ -1982,7 +1997,10 @@ license=('MIT')
     async fn remove_checkout_takes_the_directory_and_the_cached_entry() {
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "foo", "1.0");
-        let (store, checkout_dir) = test_store(aur_root.path());
+        let TestStore {
+            store,
+            _checkouts: checkout_dir,
+        } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "foo".to_string(),
         };
@@ -2008,7 +2026,7 @@ license=('MIT')
     #[tokio::test]
     async fn remove_checkout_is_a_noop_when_there_is_nothing_to_remove() {
         let aur_root = tempfile::tempdir().unwrap();
-        let (store, _checkout_dir) = test_store(aur_root.path());
+        let TestStore { store, _checkouts } = test_store(aur_root.path());
 
         store
             .remove_checkout(
@@ -2027,7 +2045,10 @@ license=('MIT')
     async fn remove_checkout_keeps_a_directory_a_remaining_package_shares() {
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "foo", "1.0");
-        let (store, checkout_dir) = test_store(aur_root.path());
+        let TestStore {
+            store,
+            _checkouts: checkout_dir,
+        } = test_store(aur_root.path());
         let source = SourceData::Aur {
             name: "foo".to_string(),
         };
@@ -2051,7 +2072,10 @@ license=('MIT')
         let aur_root = tempfile::tempdir().unwrap();
         create_aur_git_repo(aur_root.path(), "kept", "1.0");
         create_aur_git_repo(aur_root.path(), "stranded", "1.0");
-        let (store, checkout_dir) = test_store(aur_root.path());
+        let TestStore {
+            store,
+            _checkouts: checkout_dir,
+        } = test_store(aur_root.path());
 
         let kept = SourceData::Aur {
             name: "kept".to_string(),
