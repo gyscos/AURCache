@@ -18,8 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
-/// Where the repository lives, relative to the server's working directory.
-pub const REPO_ROOT: &str = "./repo";
+pub use aurcache_common::fs::REPO_ROOT;
 
 /// Where uploads wait to be published, under the repository root.
 ///

@@ -368,21 +368,26 @@ fn multiinfo_json(results: &[serde_json::Value]) -> serde_json::Value {
     })
 }
 
-async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
+/// The services a test drives, over its mock AUR and local git sources.
+fn services(env: &TestEnv) -> Services {
     let store = SnapshotStore::with_checkout_root_and_aur_base(
         env.checkout_dir.path().to_path_buf(),
         env.aur_root.path().to_string_lossy().to_string(),
     );
+    Services::new(
+        env.db.clone(),
+        Arc::new(store),
+        env.client.clone(),
+        Arc::new(aurcache_utils::repository::Repository::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+        ActivityLog::discarding(),
+    )
+}
+
+async fn add_pkg_via_rpc(env: &TestEnv, name: &str) -> anyhow::Result<String> {
     package_add(
-        &Services::new(
-            env.db.clone(),
-            Arc::new(store),
-            env.client.clone(),
-            Arc::new(aurcache_utils::repository::Repository::new(
-                tempfile::tempdir().unwrap().keep(),
-            )),
-            ActivityLog::discarding(),
-        ),
+        &services(env),
         None,
         None,
         SourceData::Aur {
@@ -1798,4 +1803,77 @@ async fn a_failed_add_commits_nothing() {
 
     let builds = builds::Entity::find().all(&env.db).await.unwrap();
     assert!(builds.is_empty(), "a failed add must enqueue no builds");
+}
+
+/// A package from before dependencies were tracked has none recorded; the
+/// backfill the upgrade queues records them, adding the dependency itself,
+/// and runs once.
+#[tokio::test]
+async fn a_queued_backfill_records_dependencies() {
+    use aurcache_db::helpers::operations;
+    use aurcache_utils::package::backfill::{Backfill, backfill_dependencies};
+
+    let env = setup_env().await;
+    mock_rpc_info(
+        &env.server,
+        "parent-pkg",
+        rpc_deps_json("parent-pkg", "parent-pkg", &["child-pkg"], &[], "2.0.0"),
+    )
+    .await;
+    create_aur_git_repo(env.aur_root.path(), "parent-pkg", "2.0.0", &["child-pkg"]);
+    mock_rpc_info(
+        &env.server,
+        "child-pkg",
+        rpc_deps_json("child-pkg", "child-pkg", &[], &[], "1.0.0"),
+    )
+    .await;
+    create_aur_git_repo(env.aur_root.path(), "child-pkg", "1.0.0", &[]);
+
+    let parent = packages::ActiveModel {
+        name: Set("parent-pkg".to_string()),
+        status: Set(BuildState::Successful),
+        out_of_date: Set(false),
+        build_flags: Set(Default::default()),
+        platforms: Set("x86_64".parse().unwrap()),
+        source_data: Set(SourceData::Aur {
+            name: "parent-pkg".to_string(),
+        }),
+        directly_requested: Set(true),
+        ..Default::default()
+    }
+    .insert(&env.db)
+    .await
+    .unwrap();
+    let queued = operations::create(&env.db, operations::KIND_DEPENDENCY_BACKFILL, 1)
+        .await
+        .unwrap();
+
+    let services = services(&env);
+    assert_eq!(
+        backfill_dependencies(&services).await.unwrap(),
+        Backfill::Ran
+    );
+
+    let child = Packages::find()
+        .filter(packages::Column::Name.eq("child-pkg"))
+        .one(&env.db)
+        .await
+        .unwrap()
+        .expect("the dependency is added");
+    assert!(!child.directly_requested);
+    Dependencies::find()
+        .filter(dependencies::Column::DependentId.eq(parent.id))
+        .filter(dependencies::Column::DependeeId.eq(child.id))
+        .one(&env.db)
+        .await
+        .unwrap()
+        .expect("the edge is recorded");
+    let operation = operations::get(&env.db, queued).await.unwrap().unwrap();
+    assert!(operation.finished_at.is_some(), "the operation is closed");
+    assert_eq!(operation.completed, 1);
+
+    assert_eq!(
+        backfill_dependencies(&services).await.unwrap(),
+        Backfill::NotQueued
+    );
 }

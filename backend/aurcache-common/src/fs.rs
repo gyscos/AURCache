@@ -58,6 +58,9 @@ pub fn build_log_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("./build_logs"))
 }
 
+/// Where the repository lives, relative to the server's working directory.
+pub const REPO_ROOT: &str = "./repo";
+
 /// Where the server keeps the internal CA that signs every worker's
 /// certificate.
 #[must_use]

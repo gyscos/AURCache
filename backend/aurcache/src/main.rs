@@ -127,6 +127,34 @@ async fn main() {
         });
     }
 
+    // An upgrade from 0.5.0 queues its packages' dependencies to be recorded.
+    // In the background: it resolves every package's source, and nothing
+    // below waits on it. What it adds is queued to build once it is done.
+    tokio::spawn({
+        let services = services.clone();
+        async move {
+            use aurcache_utils::package::backfill::{Backfill, backfill_dependencies};
+            match backfill_dependencies(&services).await {
+                Ok(Backfill::Ran) => {}
+                Ok(Backfill::NotQueued) => return,
+                Err(e) => {
+                    tracing::error!("Dependency backfill stopped: {e:#}");
+                    return;
+                }
+            }
+            if let Err(e) = aurcache_utils::package::enqueue::enqueue_missing_buildable_packages(
+                &services.db,
+                &services.activity,
+            )
+            .await
+            {
+                services.activity.emit(Event::StartupEnqueueFailed {
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+    });
+
     let version_check_handle = start_update_version_checking(services.clone());
     let auto_update_handle = start_auto_update_job(services.clone());
 

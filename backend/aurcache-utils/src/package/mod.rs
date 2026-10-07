@@ -1,4 +1,5 @@
 pub mod add;
+pub mod backfill;
 pub mod bulk_add;
 pub mod delete;
 pub(crate) mod edges;

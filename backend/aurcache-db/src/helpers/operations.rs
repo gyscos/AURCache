@@ -29,7 +29,8 @@ use serde::de::DeserializeOwned;
 /// The kinds the `kind` column holds, named once for the server and its
 /// clients alike.
 pub use aurcache_common::api::operations::kind::{
-    BULK_ADD as KIND_BULK_ADD, RESTORE as KIND_RESTORE,
+    BULK_ADD as KIND_BULK_ADD, DEPENDENCY_BACKFILL as KIND_DEPENDENCY_BACKFILL,
+    RESTORE as KIND_RESTORE,
 };
 
 /// Start an operation, returning its id.
@@ -121,13 +122,30 @@ pub fn entries_after<T: DeserializeOwned>(log: &str, after: usize) -> Vec<T> {
 /// report itself running forever and an observer would poll for progress that
 /// cannot come. Whatever was already done stays done -- each item is committed
 /// as it goes.
+///
+/// A dependency backfill is the exception: the server starts it, not a
+/// request, so it is started again rather than closed; see [`pending`].
 pub async fn close_orphaned<C: ConnectionTrait>(db: &C) -> Result<u64, DbErr> {
     let res = Operations::update_many()
         .col_expr(operations::Column::FinishedAt, Some(now_secs()).into())
         .filter(operations::Column::FinishedAt.is_null())
+        .filter(operations::Column::Kind.ne(KIND_DEPENDENCY_BACKFILL))
         .exec(db)
         .await?;
     Ok(res.rows_affected)
+}
+
+/// The oldest unfinished operation of `kind`, if one is waiting.
+pub async fn pending<C: ConnectionTrait>(
+    db: &C,
+    kind: &str,
+) -> Result<Option<operations::Model>, DbErr> {
+    Operations::find()
+        .filter(operations::Column::Kind.eq(kind))
+        .filter(operations::Column::FinishedAt.is_null())
+        .order_by_asc(operations::Column::Id)
+        .one(db)
+        .await
 }
 
 /// Operations still running, oldest first.

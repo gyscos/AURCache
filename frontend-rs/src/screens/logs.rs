@@ -219,6 +219,9 @@ fn RunningRow(operation: ActiveOperation, jobs: Signal<Vec<crate::progress::Job>
     let label = match operation.kind.as_str() {
         operation_kind::BULK_ADD => format!("Adding {} packages", operation.total),
         operation_kind::RESTORE => format!("Restoring {} packages", operation.total),
+        operation_kind::DEPENDENCY_BACKFILL => {
+            format!("Recording dependencies of {} packages", operation.total)
+        }
         // A kind this build does not know about, from a newer server. Saying so
         // beats hiding it.
         other => format!("{other} ({} items)", operation.total),

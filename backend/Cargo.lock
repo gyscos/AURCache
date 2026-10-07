@@ -758,7 +758,6 @@ name = "aurcache-db"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "async-recursion",
  "aurcache-common",
  "aurcache-deps",
  "flate2",
@@ -771,7 +770,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "wiremock",
 ]
 
 [[package]]

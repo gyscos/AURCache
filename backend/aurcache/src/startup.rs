@@ -1,21 +1,17 @@
 use aurcache_activitylog::activity_utils::ActivityLog;
-use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use aurcache_common::build_state::BuildState;
 use aurcache_common::source::SourceData;
 use aurcache_db::helpers::operations;
-use aurcache_db::prelude::{Builds, Files, Packages};
-use aurcache_db::{builds, files};
+use aurcache_db::prelude::Packages;
 use aurcache_utils::job_config::{self, mirrorlist_dir, native_arch, shared_mirrorlist_path};
 use aurcache_utils::publish;
 use aurcache_utils::repository::{REPO_ROOT, Repository};
 use aurcache_utils::snapshot::SnapshotStore;
 use pacman_mirrors::platforms::Platform;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait};
-use sea_orm::{QueryFilter, QueryOrder};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -137,8 +133,6 @@ async fn adopt_shared_mirrorlist() {
 /// still waiting for one. Failing them here -- what this did when builds ran
 /// inside the server -- failed every build under way on every redeploy.
 pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
-    backfill_file_sizes(db).await;
-    backfill_build_sizes(db).await;
     close_orphaned_operations(db).await;
 
     let mirrorlist_dir = mirrorlist_dir();
@@ -187,116 +181,6 @@ pub async fn post_startup_tasks(db: &DatabaseConnection) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Fill in `files.size` for rows that predate the column.
-///
-/// Publishing records the size from the bytes it already holds, so this only
-/// covers rows written before that existed. Best-effort throughout: a file that
-/// is gone stays `NULL` and the page reports its size as unknown, which beats
-/// failing startup over a display field. Idempotent, so it also repairs a row
-/// whose file was replaced out of band.
-async fn backfill_file_sizes(db: &DatabaseConnection) {
-    let rows = match Files::find()
-        .filter(files::Column::Size.is_null())
-        .all(db)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("could not look up files needing a size backfill: {e}");
-            return;
-        }
-    };
-    if rows.is_empty() {
-        return;
-    }
-
-    info!("Backfilling size for {} package files", rows.len());
-    let mut filled = 0;
-    for row in rows {
-        let path = Path::new(REPO_ROOT)
-            .join(row.platform.to_string())
-            .join(&row.filename);
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
-        let active = files::ActiveModel {
-            id: Set(row.id),
-            size: Set(Some(size)),
-            ..Default::default()
-        };
-        match active.update(db).await {
-            Ok(_) => filled += 1,
-            Err(e) => warn!("could not record size for {}: {e}", row.filename),
-        }
-    }
-    info!("Recorded size for {filled} package files");
-}
-
-/// Fill in `builds.size` for the newest successful build of each package and
-/// platform, from the artifacts currently in the repository.
-///
-/// Runs after [`backfill_file_sizes`], which is where those sizes come from.
-/// Only the newest successful build can be recovered: it is the one whose
-/// output is still on disk, and older builds' artifacts were replaced by it, so
-/// they keep a `NULL` that honestly says the size is not known rather than a
-/// number borrowed from a different build.
-///
-/// A group with any unrecorded file size is skipped entirely, matching what the
-/// package page and list do with a partial total.
-async fn backfill_build_sizes(db: &DatabaseConnection) {
-    let rows = match Files::find().all(db).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("could not load files for the build-size backfill: {e}");
-            return;
-        }
-    };
-
-    let mut totals: HashMap<(i32, Platform), Option<i64>> = HashMap::new();
-    for row in rows {
-        let entry = totals
-            .entry((row.package_id, row.platform))
-            .or_insert(Some(0));
-        *entry = entry.and_then(|acc| row.size.map(|size| acc + size));
-    }
-
-    let mut filled = 0;
-    for ((pkg_id, platform), total) in totals {
-        let Some(total) = total else { continue };
-        // The newest successful build, whether or not it has a size: filtering
-        // on a missing size here would find an older build once the newest has
-        // one, and hand it the newest's total.
-        let newest = Builds::find()
-            .filter(builds::Column::PkgId.eq(pkg_id))
-            .filter(builds::Column::Platform.eq(platform))
-            .filter(builds::Column::Status.eq(BuildState::Successful))
-            .order_by_desc(builds::Column::Number)
-            .one(db)
-            .await;
-        let build = match newest {
-            Ok(Some(build)) if build.size.is_none() => build,
-            Ok(_) => continue,
-            Err(e) => {
-                warn!("could not find a build to record a size for: {e}");
-                continue;
-            }
-        };
-        let active = builds::ActiveModel {
-            id: Set(build.id),
-            size: Set(Some(total)),
-            ..Default::default()
-        };
-        match active.update(db).await {
-            Ok(_) => filled += 1,
-            Err(e) => warn!("could not record size for build {}: {e}", build.id),
-        }
-    }
-    if filled > 0 {
-        info!("Recorded output size for {filled} builds");
-    }
 }
 
 /// Remove source checkouts left behind by packages that no longer exist.

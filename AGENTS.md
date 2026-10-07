@@ -50,7 +50,7 @@ cargo check
 cargo test --all
 
 # run a single Rust integration test
-cargo test -p aurcache-db --test dependency_backfill backfill_creates_dependency_links
+cargo test -p aurcache-db --lib m20261008_000000_from_0_5
 cargo test -p aurcache-utils --test add scenario_b_one_aur_dep
 
 # Rust frontend (its own workspace: it only builds for wasm32-unknown-unknown,
@@ -215,6 +215,13 @@ defect this frontend has had was of that kind.
   still depends on one of them -- all of that goes together or none of it does -- so collecting a chain
   or a cycle passes the whole set at once, as `live_check` does. An orphaned `files` row is not a
   harmless leak: publishing reads it as "already produced by another package" unless its owner is gone.
+- Migrations are upstream 0.5.0's seven, then `m20261008_000000_from_0_5`, which takes a 0.5.0
+  database to the current schema in one step (it replaced the fork's own chain, which no public
+  instance ran). A new migration goes after it. Read and write rows in a migration through explicit
+  columns (sea-query, or a `FromQueryResult` of the columns needed), not through the entities: an
+  entity has every column the code knows today, so a migration that loads one breaks as soon as a
+  later migration adds a column -- which is how the old chain failed to upgrade a 0.5.0 Postgres
+  database.
 - The schema's foreign keys are enforced, on SQLite too — sqlx opens connections with `foreign_keys` on
   and `init.rs` sets it explicitly. `files.package_id` and both of `dependencies`' package columns
   cascade. A test that inserts a child row has to insert its package first.

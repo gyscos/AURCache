@@ -18,6 +18,9 @@ pub mod kind {
     pub const BULK_ADD: &str = "bulk_add";
     /// Restoring an instance from a dump.
     pub const RESTORE: &str = "restore";
+    /// Recording the dependencies of packages from before AURCache tracked
+    /// them; queued by the upgrade from 0.5.0 and run once at startup.
+    pub const DEPENDENCY_BACKFILL: &str = "dependency_backfill";
 }
 
 /// One operation in flight.

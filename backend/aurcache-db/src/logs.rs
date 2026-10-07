@@ -1,7 +1,7 @@
 //! `SeaORM` entities for the structured operation log.
 //!
 //! See `design/implemented/structured-logs.md`; the schema is created by
-//! `migration::m20260917_000003_structured_logs`.
+//! `migration::m20261008_000000_from_0_5`.
 
 use aurcache_common::api::activity::Severity;
 use sea_orm::entity::prelude::*;
