@@ -14,9 +14,9 @@
 //! [`job_seed`]), so two servers -- or two jobs on one -- spread apart.
 //!
 //! The shortcuts are Jenkins's, which use `H` for the same reason: `@hourly`
-//! is `H * * * *`, `@daily` (or `@midnight`) `H H * * *`, `@weekly`
-//! `H H * * H`, `@monthly` `H H H * *` and `@yearly` (or `@annually`)
-//! `H H H H *`. A hashed day of the month is at most the 28th, so it falls in
+//! is `H * * * *`, `@daily` `H H * * *`, `@midnight` `H H(0-2) * * *` (some
+//! time after midnight, as its name says), `@weekly` `H H * * H`, `@monthly`
+//! `H H H * *` and `@yearly` (or `@annually`) `H H H H *`. A hashed day of the month is at most the 28th, so it falls in
 //! every month.
 //!
 //! Times are read in the zone of the `now` handed to
@@ -114,7 +114,8 @@ impl Schedule {
         let expr = expr.trim();
         let expanded = match expr.to_ascii_lowercase().as_str() {
             "@hourly" => "H * * * *",
-            "@daily" | "@midnight" => "H H * * *",
+            "@daily" => "H H * * *",
+            "@midnight" => "H H(0-2) * * *",
             "@weekly" => "H H * * H",
             "@monthly" => "H H H * *",
             "@yearly" | "@annually" => "H H H H *",
@@ -515,6 +516,15 @@ mod tests {
         let weekly = Schedule::parse("@weekly", 7).unwrap();
         assert_eq!(weekly, Schedule::parse("H H * * H", 7).unwrap());
         assert_eq!(weekly.weekdays.count_ones(), 1);
+        // Every hour, at a picked minute.
+        let hourly = Schedule::parse("@hourly", 7).unwrap();
+        assert_eq!(hourly, Schedule::parse("H * * * *", 7).unwrap());
+        assert_eq!(hourly.minutes.count_ones(), 1);
+        assert_eq!(hourly.hours.count_ones(), 24);
+        // Once a day, within the hours after midnight.
+        let midnight = Schedule::parse("@midnight", 7).unwrap();
+        assert_eq!(midnight.hours.count_ones(), 1);
+        assert!(bits(midnight.hours).next().unwrap() <= 2);
         assert!(Schedule::parse("@fortnightly", 7).is_err());
     }
 

@@ -102,7 +102,7 @@ top of the same hour. It is the same value every time:
 | `H H(1-5) * * *` | every day, at a fixed time between 01:00 and 05:59 |
 | `H/15 * * * *`| every 15 minutes, from a fixed offset                 |
 | `0 3 * * 1-5` | at 03:00 sharp on weekdays                            |
-| `@daily`      | `H H * * *`; also `@hourly`, `@weekly`, `@monthly`, `@yearly` |
+| `@daily`      | `H H * * *`; also `@hourly` (`H * * * *`), `@midnight` (`H H(0-2) * * *`), `@weekly`, `@monthly`, `@yearly` |
 
 The settings page shows the next runs as a schedule is typed.
 
