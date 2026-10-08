@@ -136,7 +136,7 @@ fn SettingsSections(
                 // source badge is what tells the two apart.
                 value: settings.auto_update_schedule.value.clone().unwrap_or_default(),
                 source: settings.auto_update_schedule.source,
-                editor: Editor::Schedule { placeholder: "H 3 * * *".to_string() },
+                editor: Editor::Schedule { placeholder: "@daily".to_string() },
                 save,
             }
             SettingRow {
@@ -746,7 +746,8 @@ struct ScheduleZone {
 fn schedule_zone(server: Option<&Timezone>, viewer: &Timezone) -> ScheduleZone {
     const BASE: &str = "When to rebuild what is out of date, as crontab: minute hour \
         day-of-month month day-of-week. H picks a fixed value of this server's own, \
-        so H 3 * * * is some minute past 3. Empty disables it.";
+        so H 3 * * * is some minute past 3; @hourly, @daily and @weekly pick them all. \
+        Empty disables it.";
     let Some(server) = server else {
         return ScheduleZone {
             description: BASE.to_string(),

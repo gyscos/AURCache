@@ -73,7 +73,7 @@ services:
       - DB_USER=aurcache
       - DB_PWD=<DB_PWD_HERE>
       - DB_HOST=dbhost
-      - AUTO_UPDATE_SCHEDULE=H 1 * * *
+      - AUTO_UPDATE_SCHEDULE=@daily
       - LOG_LEVEL=DEBUG
       - OAUTH_AUTH_URI=https://sso.heili.eu/application/o/authorize/
       - OAUTH_TOKEN_URI=https://sso.heili.eu/application/o/token/

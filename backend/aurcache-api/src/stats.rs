@@ -881,8 +881,30 @@ mod tests {
         let pkg_c = insert_package(&db, "queued-anyway", true, true).await;
         insert_build(&db, pkg_c, 1, BuildState::Enqueued, Some(now_secs()), None).await;
 
+        // By default both rebuild paths are on, so nothing needs a hand.
+        let slice = out_of_date_slice(&db).await.unwrap();
+        assert_eq!(slice.needs_hand.len(), 0);
+        assert_eq!(slice.handled, 2);
+
         // Auto-rebuild off globally: A needs a hand, C is handled by its
         // queued build regardless of the setting.
+        settings::write(
+            &db,
+            [
+                settings::Change {
+                    setting: Setting::BuildOnNewVersion,
+                    pkg_id: None,
+                    value: Some("false".to_string()),
+                },
+                settings::Change {
+                    setting: Setting::AutoUpdateSchedule,
+                    pkg_id: None,
+                    value: Some(String::new()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
         let slice = out_of_date_slice(&db).await.unwrap();
         assert_eq!(slice.needs_hand.len(), 1);
         assert_eq!(slice.needs_hand[0].name, "needs-hand");

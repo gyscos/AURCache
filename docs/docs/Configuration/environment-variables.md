@@ -39,7 +39,8 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | Variable               | Type          | Description                                                           | Default |
 |------------------------|---------------|-----------------------------------------------------------------------|---------|
 | VERSION_CHECK_INTERVAL | Duration      | How often to check package versions (`1h`, `30m`, or seconds)         | `1h`    |
-| AUTO_UPDATE_SCHEDULE   | String (crontab) | When to rebuild out-of-date packages, as a [schedule](#schedules) (empty to disable) | empty   |
+| AUTO_UPDATE_SCHEDULE   | String (crontab) | When to rebuild out-of-date packages, as a [schedule](#schedules) (empty to disable) | `@daily` |
+| BUILD_ON_NEW_VERSION   | Boolean       | Queue a rebuild as soon as a version check finds a package out of date, rather than waiting for the auto-update schedule | `true`  |
 | TZ                     | String        | Timezone cron schedules (`AUTO_UPDATE_SCHEDULE`, `MIRROR_RANK_SCHEDULE`) are read in, e.g. `Europe/Paris`. The compose files forward the host's `/etc/localtime` and pass `TZ` through when it is set where compose runs | the host's, else UTC |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
 | JOB_TIMEOUT            | Duration      | Longest a build may run before the server reclaims it (`3h`, seconds) | `1h`    |
@@ -102,12 +103,17 @@ top of the same hour. It is the same value every time:
 | `H H(1-5) * * *` | every day, at a fixed time between 01:00 and 05:59 |
 | `H/15 * * * *`| every 15 minutes, from a fixed offset                 |
 | `0 3 * * 1-5` | at 03:00 sharp on weekdays                            |
-| `@daily`      | `H H * * *`; also `@hourly` (`H * * * *`), `@midnight` (`H H(0-2) * * *`), `@weekly`, `@monthly`, `@yearly` |
+| `@daily`      | `H H * * *`: every day, at a fixed time               |
+
+The shortcuts are the simplest way to write one, and pick the hashed values
+for you: `@hourly` (`H * * * *`), `@daily` (`H H * * *`), `@midnight`
+(`H H(0-2) * * *`), `@weekly` (`H H * * H`), `@monthly` (`H H H * *`) and
+`@yearly` (`H H H H *`).
 
 The settings page shows the next runs as a schedule is typed.
 
 Schedules used to be written with a leading seconds field and Sunday as 1
-(`0 0 2 * * 1`). A stored schedule is rewritten on upgrade; one set in the
-environment is refused, and the activity log gives the same schedule in the
-new form.
+(`0 0 2 * * 1`). A stored schedule is rewritten on upgrade. One set in the
+environment is still read, as the schedule it means, and the activity log
+gives it in the new form to write instead.
 

@@ -14,9 +14,10 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle<()>> {
-    // Sunday night, at a minute of its own: mirrors see every instance
-    // ranking them, and `H` keeps them from all doing it at 02:00 sharp.
-    let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "H 2 * * sun".to_string());
+    // Once a week, on a day and at a time of its own: mirrors see every
+    // instance ranking them, and the hashed `@weekly` keeps them from all
+    // doing it at once.
+    let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "@weekly".to_string());
     let read = schedule(Job::MirrorRanking, &cron_str).inspect_err(|e| {
         // In the activity log as well as the error: a schedule left in the
         // old syntax is otherwise only a startup log line, and ranking stops.

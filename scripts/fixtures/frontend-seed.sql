@@ -147,10 +147,15 @@ JOIN packages e ON e.name = v.dependee;
 -- set for the fixture server), stored, and never set. Stored is the state a
 -- user is in the moment after they save one, and the only one that offers a
 -- Reset. `-1` is the global scope; a real package id would make it per-package.
--- Not an auto-rebuild setting: either of those makes every out-of-date
--- package "rebuilding on its own", and the dashboard's Out of date card, which
--- lists the ones that need a hand, would collapse.
-INSERT INTO settings (key, value, pkg_id) VALUES ('job_timeout', '7200', -1);
+--
+-- Both auto-rebuild paths are on by default, which makes every out-of-date
+-- package "rebuilding on its own" and collapses the dashboard's Out of date
+-- card, which lists the ones that need a hand. So both are stored off: a
+-- schedule left empty, and building on a new version disabled.
+INSERT INTO settings (key, value, pkg_id) VALUES
+  ('job_timeout', '7200', -1),
+  ('auto_update_schedule', '', -1),
+  ('build_on_new_version', 'false', -1);
 
 -- A few lines of the log. Each is what the server would have written: the
 -- kind, the severity it implies (0 info, 1 warning, 2 error), the sentence it

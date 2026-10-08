@@ -24,7 +24,7 @@ substituting the architecture. It has to be configured separately.
 ## Env Config
 | Variable               | Type         | Description                                                                    | Default                   |
 |------------------------|--------------|--------------------------------------------------------------------------------|---------------------------|
-| MIRROR_RANK_SCHEDULE                | String (crontab) | When to re-rank the mirrors, as a [schedule](environment-variables.md#schedules) | H 2 * * sun (Sunday, some minute past 2) |
+| MIRROR_RANK_SCHEDULE                | String (crontab) | When to re-rank the mirrors, as a [schedule](environment-variables.md#schedules) | `@weekly` (once a week, on a day and at a time picked for this server) |
 | MIRRORLIST_PATH_X86_64                | String       | directory containing mirrorlist inside aurcache container                 | /app/config/pacman_x86_64 |
 | MIRRORLIST_SERVERS_X86_64                | String       | semicolon-separated list of mirror URLs (disables auto ranking)                 | null |
 | MIRRORLIST_SERVERS_AARCH64                | String       | the same, for aarch64 workers (no auto ranking for this arch)                 | null |
@@ -71,7 +71,7 @@ services:
       - DB_PWD=YOUR_SECURE_PWD
       - DB_HOST=dbhost
       ## HERE
-      - MIRROR_RANK_SCHEDULE=H 2 * * sun
+      - MIRROR_RANK_SCHEDULE=@weekly
       ## END HERE
     networks:
       aurcache_network:

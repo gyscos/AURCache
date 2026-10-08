@@ -130,10 +130,12 @@ impl Setting {
                 default: "1h",
                 scope: Scope::Global,
             },
+            // Once a day, at a time of this server's own: a cache exists to
+            // keep its packages current. Empty turns it off.
             Self::AutoUpdateSchedule => SettingsMeta {
                 key: "auto_update_schedule",
                 env_name: Some("AUTO_UPDATE_SCHEDULE"),
-                default: "", // parses to None
+                default: "@daily",
                 scope: Scope::Global,
             },
             // How the web UI writes absolute dates: field order, zero
@@ -152,12 +154,14 @@ impl Setting {
             // including VCS packages whose upstream moved without a pkgver
             // bump — so that is where the build belongs.
             //
-            // Off by default: the existing behaviour is to flag a package and
-            // leave rebuilding to an opt-in schedule.
+            // On by default, for the same reason the auto-update schedule is:
+            // what is out of date is rebuilt without anyone asking. Only
+            // packages whose last build succeeded are, so one that keeps
+            // failing waits for a person rather than retrying every check.
             Self::BuildOnNewVersion => SettingsMeta {
                 key: "build_on_new_version",
                 env_name: Some("BUILD_ON_NEW_VERSION"),
-                default: "false",
+                default: "true",
                 scope: Scope::Global,
             },
             // On by default. This is what an AUR helper on a workstation
