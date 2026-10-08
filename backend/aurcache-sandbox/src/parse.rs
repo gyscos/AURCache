@@ -342,8 +342,10 @@ fn check_closed(path: &Path, user: ParseUser) -> Result<(), String> {
     };
     if metadata.uid() == user.uid {
         return Err(format!(
-            "{} is owned by {PARSE_USER}, whom it must be kept from",
-            path.display()
+            "{} is owned by uid {}, which is {PARSE_USER}'s: a PKGBUILD parsed as \
+             {PARSE_USER} could reach it",
+            path.display(),
+            user.uid
         ));
     }
     let mode = metadata.mode() & 0o777;

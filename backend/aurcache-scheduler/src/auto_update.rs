@@ -15,18 +15,16 @@ const RECHECK: Duration = Duration::from_mins(5);
 pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
     tokio::spawn(async move {
         // What the log was last told about the schedule. Re-checked every
-        // few minutes, and recording the same complaint each time would bury
+        // few minutes, and recording the same news each time would bury
         // everything else; a schedule that is fixed and broken again says so.
-        let mut reported: Option<String> = None;
-        let mut report = |error: String| {
-            if reported.as_deref() != Some(error.as_str()) {
-                services.activity.emit(Event::ScheduleInvalid {
-                    job: Job::AutoUpdate.name().to_string(),
-                    error: error.clone(),
-                });
-                reported = Some(error);
+        let mut reported: Option<Event> = None;
+        let mut report = |event: Event| {
+            if reported.as_ref() != Some(&event) {
+                services.activity.emit(event.clone());
+                reported = Some(event);
             }
         };
+        let job = || Job::AutoUpdate.name().to_string();
         loop {
             // Read on every turn: it is a setting, and may have changed.
             let interval =
@@ -36,11 +34,21 @@ pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
                 // Off.
                 None => tokio::time::sleep(RECHECK).await,
                 Some(Err(e)) => {
-                    report(e.to_string());
+                    report(Event::ScheduleInvalid {
+                        job: job(),
+                        error: e.to_string(),
+                    });
                     tokio::time::sleep(RECHECK).await;
                 }
-                Some(Ok(schedule)) => {
-                    match sleep_until_next_fire(&schedule, "update", RECHECK).await {
+                Some(Ok(read)) => {
+                    if let (Some(written), Some(read_as)) = (expr.as_deref(), &read.rewritten) {
+                        report(Event::ScheduleOutdated {
+                            job: job(),
+                            written: written.to_string(),
+                            read_as: read_as.clone(),
+                        });
+                    }
+                    match sleep_until_next_fire(&read.schedule, "update", RECHECK).await {
                         Wake::Fired => {
                             info!("Executing scheduled auto-update");
                             if let Err(e) = package_update_all_outdated(&services).await {
@@ -51,7 +59,10 @@ pub fn start_auto_update_job(services: Services) -> JoinHandle<()> {
                         }
                         Wake::Recheck => {}
                         Wake::Exhausted => {
-                            report("the schedule never fires again".to_string());
+                            report(Event::ScheduleInvalid {
+                                job: job(),
+                                error: "the schedule never fires again".to_string(),
+                            });
                             tokio::time::sleep(RECHECK).await;
                         }
                     }

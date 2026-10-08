@@ -17,7 +17,7 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
     // Sunday night, at a minute of its own: mirrors see every instance
     // ranking them, and `H` keeps them from all doing it at 02:00 sharp.
     let cron_str = env::var("MIRROR_RANK_SCHEDULE").unwrap_or_else(|_| "H 2 * * sun".to_string());
-    let schedule = schedule(Job::MirrorRanking, &cron_str).inspect_err(|e| {
+    let read = schedule(Job::MirrorRanking, &cron_str).inspect_err(|e| {
         // In the activity log as well as the error: a schedule left in the
         // old syntax is otherwise only a startup log line, and ranking stops.
         activity.emit(Event::ScheduleInvalid {
@@ -25,6 +25,14 @@ pub fn start_mirror_rank_job(activity: ActivityLog) -> anyhow::Result<JoinHandle
             error: e.to_string(),
         });
     })?;
+    if let Some(read_as) = &read.rewritten {
+        activity.emit(Event::ScheduleOutdated {
+            job: Job::MirrorRanking.name().to_string(),
+            written: cron_str.clone(),
+            read_as: read_as.clone(),
+        });
+    }
+    let schedule = read.schedule;
 
     Ok(tokio::spawn(async move {
         let mut reported = false;

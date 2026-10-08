@@ -13,7 +13,7 @@ use aurcache_utils::settings;
 use aurcache_utils::snapshot::Resolved;
 use aurcache_utils::vcs_check::{RoundCache, VcsSync, sync_vcs_sources};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -21,9 +21,10 @@ use tracing::{error, info};
 #[must_use]
 pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut unreadable = Unreadable::default();
         loop {
             info!("performing aur version checks");
-            if let Err(e) = check_versions(&services).await {
+            if let Err(e) = check_versions(&services, &mut unreadable).await {
                 error!("Failed to perform aur version check: {e}");
                 // Nothing was found to be out of date this pass, which looks
                 // exactly like nothing *being* out of date unless it says so.
@@ -39,7 +40,16 @@ pub fn start_update_version_checking(services: Services) -> JoinHandle<()> {
     })
 }
 
-async fn check_versions(services: &Services) -> anyhow::Result<()> {
+/// Packages whose checkout could not be read, already reported.
+///
+/// The check runs every hour, and the same failure every hour is not news: a
+/// dozen packages that will not parse filled the log with hundreds of
+/// identical warnings. Kept across rounds, and forgotten once a package reads
+/// again, so a later failure is reported afresh.
+#[derive(Default)]
+struct Unreadable(HashSet<i32>);
+
+async fn check_versions(services: &Services, unreadable: &mut Unreadable) -> anyhow::Result<()> {
     let Services {
         db,
         store,
@@ -120,13 +130,7 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // The version is the AUR's; the checkout is only read for the
                 // metadata and the `git+` sources, so one that cannot be read
                 // costs those and not the version check.
-                let resolved = match check.resolve().await {
-                    Ok(resolved) => Some(resolved),
-                    Err(e) => {
-                        check.sourceinfo_failed(SourceinfoPurpose::Vcs, &e);
-                        None
-                    }
-                };
+                let resolved = check.read(SourceinfoPurpose::Vcs, unreadable).await;
                 let upstream = check
                     .record(&mut model, &result.version, resolved.as_ref(), &mut round)
                     .await?;
@@ -149,12 +153,9 @@ async fn check_versions(services: &Services) -> anyhow::Result<()> {
                 // A patch that no longer applies against a new upstream commit
                 // costs this package its tracking this round, not the rest of
                 // the check; its build will fail the same way later.
-                let resolved = match check.resolve().await {
-                    Ok(resolved) => resolved,
-                    Err(e) => {
-                        check.sourceinfo_failed(SourceinfoPurpose::Version, &e);
-                        continue;
-                    }
+                let Some(resolved) = check.read(SourceinfoPurpose::Version, unreadable).await
+                else {
+                    continue;
                 };
                 // Only the version in the PKGBUILD; a ref moving without a
                 // version bump is what the `git+` source check catches.
@@ -196,12 +197,38 @@ struct Check<'a> {
 }
 
 impl Check<'_> {
-    /// The package's `.SRCINFO` and the metadata beside it, from its checkout.
-    async fn resolve(&self) -> anyhow::Result<Resolved> {
-        self.services
+    /// The package's `.SRCINFO` and the metadata beside it, from its
+    /// checkout; `None` when it cannot be read, which is reported the first
+    /// time in a row it happens.
+    async fn read(
+        &self,
+        purpose: SourceinfoPurpose,
+        unreadable: &mut Unreadable,
+    ) -> Option<Resolved> {
+        let package = self.package;
+        match self
+            .services
             .store
-            .sourceinfo_and_metadata(&self.package.source_data, self.package.patch.as_deref())
+            .sourceinfo_and_metadata(&package.source_data, package.patch.as_deref())
             .await
+        {
+            Ok(resolved) => {
+                unreadable.0.remove(&package.id);
+                Some(resolved)
+            }
+            Err(e) if unreadable.0.insert(package.id) => {
+                self.services.activity.emit(Event::SourceinfoFailed {
+                    pkg: package.name.as_str().into(),
+                    purpose,
+                    error: format!("{e:#}"),
+                });
+                None
+            }
+            Err(e) => {
+                tracing::debug!("{} still cannot be read: {e:#}", package.name);
+                None
+            }
+        }
     }
 
     /// Record what the check found -- the upstream version, the metadata the
@@ -263,14 +290,6 @@ impl Check<'_> {
                 false
             }
         }
-    }
-
-    fn sourceinfo_failed(&self, purpose: SourceinfoPurpose, error: &anyhow::Error) {
-        self.services.activity.emit(Event::SourceinfoFailed {
-            pkg: self.package.name.as_str().into(),
-            purpose,
-            error: format!("{error:#}"),
-        });
     }
 
     fn refresh_failed(&self, target: RefreshTarget, error: &anyhow::Error) {

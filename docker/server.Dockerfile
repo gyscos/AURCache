@@ -97,12 +97,19 @@ FROM debian:bookworm-slim
 # `aurcache-parse` is who a PKGBUILD parse runs as on a kernel without
 # Landlock (see backend/aurcache-sandbox/src/parse.rs); private-state.sh closes
 # the server's directories to it at every start.
+#
+# Its uid is fixed, and away from the system range: left to `useradd
+# --system` it got 999, which is also the postgres image's uid -- the owner
+# of a database directory a deployment keeps under the server's own data,
+# which the parse must not reach (and the sandbox then rightly refused to
+# parse at all).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates bash tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /etc/localtime /etc/timezone \
-    && useradd --system --no-create-home --home-dir /nonexistent \
-        --shell /usr/sbin/nologin aurcache-parse
+    && groupadd --gid 58400 aurcache-parse \
+    && useradd --system --uid 58400 --gid 58400 --no-create-home \
+        --home-dir /nonexistent --shell /usr/sbin/nologin aurcache-parse
 # Copy the built binary from the previous stage
 COPY --from=builder --chmod=0755 /app/backend/target/aurcache /usr/local/bin/aurcache
 COPY --chmod=0755 docker/entrypoint.sh /entrypoint.sh

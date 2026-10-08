@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Serializes to `{"kind": .., "data": {..}}` -- the two columns a row is
 /// stored in.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum Event {
     // -----------------------------------------------------------------------
@@ -498,6 +498,17 @@ pub enum Event {
         error: String,
     },
 
+    /// A schedule written in 0.5.0's seconds-first syntax, read as the
+    /// five-field schedule it means. The job runs; the setting is worth
+    /// rewriting.
+    #[serde(rename = "schedule.outdated")]
+    ScheduleOutdated {
+        /// Which job: `auto_update` or `mirror_ranking`.
+        job: String,
+        written: String,
+        read_as: String,
+    },
+
     /// Somebody signed in with an account that is not allowed.
     #[serde(rename = "auth.sign_in_refused")]
     SignInRefused { user: String },
@@ -843,6 +854,11 @@ pub const KINDS: &[Kind] = &[
         label: "Schedule unusable",
     },
     Kind {
+        kind: "schedule.outdated",
+        group: "Settings and access",
+        label: "Schedule in old syntax",
+    },
+    Kind {
         kind: "auth.sign_in_refused",
         group: "Settings and access",
         label: "Sign-in refused",
@@ -1140,6 +1156,7 @@ impl Event {
             Self::SettingChanged { .. } => "setting.changed",
             Self::SettingReset { .. } => "setting.reset",
             Self::ScheduleInvalid { .. } => "schedule.invalid",
+            Self::ScheduleOutdated { .. } => "schedule.outdated",
             Self::SignInRefused { .. } => "auth.sign_in_refused",
             Self::TokenRegenerated {} => "auth.token_regenerated",
             Self::DumpExported { .. } => "dump.exported",
@@ -1213,6 +1230,7 @@ impl Event {
             | Self::UpdateSkipped { .. }
             | Self::BulkAddResolveFailed { .. }
             | Self::ScheduleInvalid { .. }
+            | Self::ScheduleOutdated { .. }
             | Self::SignInRefused { .. }
             | Self::RestorePackageFailed { .. }
             | Self::RestoreCaReplaced {}
@@ -1610,6 +1628,15 @@ impl Event {
                 "the {} schedule cannot be used: {error}",
                 job.replace('_', " ")
             ))],
+            Self::ScheduleOutdated {
+                job,
+                written,
+                read_as,
+            } => vec![text(format!(
+                "the {} schedule {written:?} is in the old seconds-first syntax and is read \
+                 as `{read_as}`; write it that way",
+                job.replace('_', " ")
+            ))],
             Self::SignInRefused { user } => {
                 vec![text(format!(
                     "refused a sign-in by {user}: not an allowed user"
@@ -1895,6 +1922,11 @@ mod tests {
             Event::ScheduleInvalid {
                 job: "auto_update".to_string(),
                 error: error(),
+            },
+            Event::ScheduleOutdated {
+                job: "auto_update".to_string(),
+                written: "0 0 * * * *".to_string(),
+                read_as: "0 * * * *".to_string(),
             },
             Event::SignInRefused {
                 user: "mallory@example.com".to_string(),
