@@ -505,8 +505,11 @@ async fn out_of_date_slice(db: &DatabaseConnection) -> anyhow::Result<OutOfDateS
     // Whether the cron string itself parses is not re-checked here: an
     // invalid one already surfaces as a `ScheduleInvalid` warning, which the
     // Recent problems card shows.
-    let auto_rebuild_configured =
-        build_on_new_version.value || auto_update_schedule.value.is_some();
+    let auto_rebuild_configured = build_on_new_version.value
+        || auto_update_schedule
+            .value
+            .as_deref()
+            .is_some_and(|expr| !aurcache_common::schedule::is_off(expr));
 
     // By name, which is unique and all the rows carry.
     let active: HashSet<String> = Builds::find()

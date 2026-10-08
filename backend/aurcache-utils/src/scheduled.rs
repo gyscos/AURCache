@@ -8,7 +8,7 @@
 //! all start in the same minute, and each keeps its minute across restarts.
 
 use aurcache_common::api::settings::SchedulePreview;
-use aurcache_common::schedule::{Schedule, ScheduleError, from_seconds_syntax, job_seed};
+use aurcache_common::schedule::{Schedule, ScheduleError, from_seconds_syntax, is_off, job_seed};
 use std::sync::LazyLock;
 
 /// A job that runs on a schedule.
@@ -89,7 +89,7 @@ pub fn schedule(job: Job, expr: &str) -> Result<JobSchedule, ScheduleError> {
 /// current local time.
 #[must_use]
 pub fn preview(job: Job, expr: &str, count: usize) -> SchedulePreview {
-    if expr.trim().is_empty() {
+    if is_off(expr) {
         return SchedulePreview::Disabled;
     }
     // Strict, unlike `schedule`: this previews what saving would store, and
@@ -125,6 +125,10 @@ mod tests {
     #[test]
     fn a_preview_says_what_kind_of_answer_it_is() {
         assert_eq!(preview(Job::AutoUpdate, "  ", 2), SchedulePreview::Disabled);
+        assert_eq!(
+            preview(Job::AutoUpdate, "@never", 2),
+            SchedulePreview::Disabled
+        );
         assert_eq!(
             preview(Job::AutoUpdate, "0 0 31 2 *", 2),
             SchedulePreview::Never

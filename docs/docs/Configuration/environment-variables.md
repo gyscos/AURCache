@@ -39,7 +39,7 @@ The UI badges reflect the source: `(default)`, `(inherited)` (= global),
 | Variable               | Type          | Description                                                           | Default |
 |------------------------|---------------|-----------------------------------------------------------------------|---------|
 | VERSION_CHECK_INTERVAL | Duration      | How often to check package versions (`1h`, `30m`, or seconds)         | `1h`    |
-| AUTO_UPDATE_SCHEDULE   | String (crontab) | When to rebuild out-of-date packages, as a [schedule](#schedules) (empty to disable) | `@daily` |
+| AUTO_UPDATE_SCHEDULE   | String (crontab) | When to rebuild out-of-date packages, as a [schedule](#schedules) (`@never` to disable) | `@daily` |
 | BUILD_ON_NEW_VERSION   | Boolean       | Queue a rebuild as soon as a version check finds a package out of date, rather than waiting for the auto-update schedule | `true`  |
 | TZ                     | String        | Timezone cron schedules (`AUTO_UPDATE_SCHEDULE`, `MIRROR_RANK_SCHEDULE`) are read in, e.g. `Europe/Paris`. The compose files forward the host's `/etc/localtime` and pass `TZ` through when it is set where compose runs | the host's, else UTC |
 | LOG_LEVEL              | String        | Log level                                                             | INFO    |
@@ -108,7 +108,7 @@ top of the same hour. It is the same value every time:
 The shortcuts are the simplest way to write one, and pick the hashed values
 for you: `@hourly` (`H * * * *`), `@daily` (`H H * * *`), `@midnight`
 (`H H(0-2) * * *`), `@weekly` (`H H * * H`), `@monthly` (`H H H * *`) and
-`@yearly` (`H H H H *`).
+`@yearly` (`H H H H *`). `@never` turns a job off; an empty value does too.
 
 The settings page shows the next runs as a schedule is typed.
 

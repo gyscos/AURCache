@@ -24,6 +24,17 @@
 
 use std::fmt;
 
+/// The schedule that never runs, for saying "off" rather than leaving the
+/// setting empty -- which means the same.
+pub const NEVER: &str = "@never";
+
+/// Whether `expr` turns its job off: empty, or [`NEVER`].
+#[must_use]
+pub fn is_off(expr: &str) -> bool {
+    let expr = expr.trim();
+    expr.is_empty() || expr.eq_ignore_ascii_case(NEVER)
+}
+
 /// A parsed schedule, its `H` fields resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
@@ -508,6 +519,17 @@ mod tests {
             assert!(bits(s.days).all(|d| (1..=28).contains(&d)));
             // A hashed weekday is 0-6, never the 7 that means Sunday too.
             assert!(bits(s.weekdays).all(|w| w <= 6));
+        }
+    }
+
+    /// "Off" can be said out loud, and empty still means it.
+    #[test]
+    fn never_and_empty_are_off() {
+        for off in ["", "  ", "@never", "@NEVER", " @never "] {
+            assert!(is_off(off), "{off:?}");
+        }
+        for on in ["@daily", "H * * * *"] {
+            assert!(!is_off(on), "{on:?}");
         }
     }
 

@@ -150,11 +150,11 @@ JOIN packages e ON e.name = v.dependee;
 --
 -- Both auto-rebuild paths are on by default, which makes every out-of-date
 -- package "rebuilding on its own" and collapses the dashboard's Out of date
--- card, which lists the ones that need a hand. So both are stored off: a
--- schedule left empty, and building on a new version disabled.
+-- card, which lists the ones that need a hand. So both are stored off: the
+-- schedule as `@never`, and building on a new version disabled.
 INSERT INTO settings (key, value, pkg_id) VALUES
   ('job_timeout', '7200', -1),
-  ('auto_update_schedule', '', -1),
+  ('auto_update_schedule', '@never', -1),
   ('build_on_new_version', 'false', -1);
 
 -- A few lines of the log. Each is what the server would have written: the

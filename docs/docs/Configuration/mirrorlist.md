@@ -52,7 +52,7 @@ To enable auto mirror ranking set `MIRROR_RANK_SCHEDULE` to your desired [schedu
 
 ## Manually set mirrorlist
 To manually set a mirrorlist mount a directory containing your `mirrorlist` to the same path as `MIRRORLIST_PATH_X86_64` with a volume or bind mount.
-(And unset `MIRROR_RANK_SCHEDULE` since it would overwrite your mirrorlist when the cron schedule triggers)
+Ranking stands down on its own while a mirrorlist is mounted, rather than overwrite it. To turn it off anyway, set `MIRROR_RANK_SCHEDULE=@never`.
 ## Example
 ### Auto Ranking
 ```ỳaml

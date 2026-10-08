@@ -260,9 +260,9 @@ impl Setting {
                         "{value:?} is not a duration (expected e.g. 1h, 90m or a number of seconds)"
                     )
                 }),
-            // Empty is "off". The seed only moves `H` around, never makes a
-            // schedule valid or not, so any will do here.
-            Self::AutoUpdateSchedule if value.trim().is_empty() => Ok(()),
+            // Empty or `@never` is "off". The seed only moves `H` around,
+            // never makes a schedule valid or not, so any will do here.
+            Self::AutoUpdateSchedule if crate::schedule::is_off(value) => Ok(()),
             Self::AutoUpdateSchedule => crate::schedule::Schedule::parse(value, 0)
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
@@ -291,6 +291,7 @@ mod tests {
     fn the_schedule_setting_is_validated() {
         let setting = Setting::AutoUpdateSchedule;
         assert_eq!(setting.validate(""), Ok(()));
+        assert_eq!(setting.validate("@never"), Ok(()));
         assert_eq!(setting.validate("H 3 * * *"), Ok(()));
         assert!(setting.validate("0 0 3 * * *").is_err());
         assert!(setting.validate("daily").is_err());

@@ -747,7 +747,7 @@ fn schedule_zone(server: Option<&Timezone>, viewer: &Timezone) -> ScheduleZone {
     const BASE: &str = "When to rebuild what is out of date, as crontab: minute hour \
         day-of-month month day-of-week. H picks a fixed value of this server's own, \
         so H 3 * * * is some minute past 3; @hourly, @daily and @weekly pick them all. \
-        Empty disables it.";
+        @never (or empty) turns it off.";
     let Some(server) = server else {
         return ScheduleZone {
             description: BASE.to_string(),
