@@ -245,7 +245,7 @@ impl WorkerClient {
             .context("claim request")?;
         match resp.status() {
             StatusCode::OK => Ok(Some(resp.json().await.context("decoding job")?)),
-            StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(None),
+            StatusCode::NO_CONTENT => Ok(None),
             other => {
                 // A body that will not read is its own failure, not an empty
                 // explanation: without this a truncated error renders as

@@ -478,6 +478,13 @@ async fn fake_worker_protocol_roundtrip() {
     assert!(evil_rows.is_empty(), "a wrong-named artifact was published");
     assert!(!repo_root.join("x86_64").join(&bad_name).exists());
 
+    // --- An empty queue is "nothing to do" (204), not an error: an idle
+    // worker asks every few seconds, and a 404 there filled the server's log.
+    assert!(
+        client.claim(&claim_req).await.unwrap().is_none(),
+        "nothing is left to claim"
+    );
+
     // --- Safety rail: a revoked worker is refused at the mTLS auth guard.
     let workers = worker_store::list_workers(&db).await.unwrap();
     let worker_id = workers.first().expect("one enrolled worker").id;

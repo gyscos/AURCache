@@ -6,6 +6,7 @@ use crate::custom_file_server::CustomFileServer;
 use crate::embed::CustomHandler;
 use crate::models::authenticated::OauthEnabled;
 use crate::utils::config::{ALLOWED_USERS_ENV, allowed_users, oauth_config_from_env};
+use crate::utils::failed_requests::{FailedRequests, plain_status};
 use aurcache_activitylog::activity_utils::ActivityLog;
 use aurcache_utils::repository::Repository;
 use aurcache_utils::services::Services;
@@ -13,7 +14,7 @@ use aurcache_utils::snapshot::SnapshotStore;
 use rocket::config::SecretKey;
 use rocket::fairing::AdHoc;
 use rocket::http::private::cookie::Key;
-use rocket::{Config, routes};
+use rocket::{Config, catchers, routes};
 use rocket_async_compression::{Compression, Level};
 use rocket_oauth2::HyperRustlsAdapter;
 use sea_orm::DatabaseConnection;
@@ -190,6 +191,8 @@ pub fn init_api(services: Services, version: ServerVersion, ca_dir: CaDirectory)
             // and must never be re-compressed. The fairing's own defaults also
             // skip images, video, archives and `text/event-stream`.
             .attach(Compression::with_level(Level::Precise(4)))
+            .attach(FailedRequests)
+            .register("/", catchers![plain_status])
             .manage(services.db.clone())
             .manage(OauthEnabled(oauth_config.is_ok()))
             .manage(services.activity.clone())
@@ -272,6 +275,8 @@ pub fn init_worker_api(
             // A worker enrolling or being auto-approved is worth a line in the
             // log, and this listener is where both happen.
             .manage(activity)
+            .attach(FailedRequests)
+            .register("/", catchers![plain_status])
             .manage(db)
             .manage(ca)
             .manage(store)
@@ -306,6 +311,9 @@ pub fn init_repo(repo: Arc<Repository>) -> JoinHandle<()> {
         };
 
         let launch_result = rocket::custom(config)
+            // A missing signature is a 404 pacman expects, so it is not
+            // logged; it gets an answer without Rocket warning for each one.
+            .register("/", catchers![plain_status])
             .mount("/", CustomFileServer::new(repo.root()))
             .launch()
             .await;

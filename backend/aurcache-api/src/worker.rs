@@ -431,6 +431,20 @@ pub fn get_ca_fingerprint(ca: &State<Ca>) -> Result<String, ApiError> {
 // Job lifecycle (approved worker certificate required)
 // ----------------------------------------------------------------------------
 
+/// What a claim gets: a job, or nothing to do.
+// Built once per request and handed straight to Rocket; boxing the job to
+// shrink it would buy nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(rocket::Responder)]
+pub enum Claim {
+    Job(Json<JobDescriptor>),
+    /// `204 No Content`: the queue has nothing for this worker. An idle
+    /// worker asks every few seconds, so this is the common answer and must
+    /// not read as an error.
+    #[response(status = 204)]
+    Idle(()),
+}
+
 /// Claim the next buildable job for this worker, or 204 if none.
 ///
 /// Routing reads arches, package affinity and priority from the worker's
@@ -445,7 +459,7 @@ pub async fn claim_job(
     al: &State<ActivityLog>,
     auth: WorkerAuth,
     claim: Json<ClaimRequest>,
-) -> Result<Option<Json<JobDescriptor>>, ApiError> {
+) -> Result<Claim, ApiError> {
     let db = db.inner();
 
     let Some(build) = worker_jobs::claim_job(
@@ -458,7 +472,7 @@ pub async fn claim_job(
     .await
     .map_err(|e| err(Status::InternalServerError, e))?
     else {
-        return Ok(None);
+        return Ok(Claim::Idle(()));
     };
 
     let descriptor = build_descriptor(db, store, &build, &claim.mirrorlist)
@@ -471,7 +485,7 @@ pub async fn claim_job(
         },
         worker: auth.worker.name.as_str().into(),
     });
-    Ok(Some(Json(descriptor)))
+    Ok(Claim::Job(Json(descriptor)))
 }
 
 async fn build_descriptor(
